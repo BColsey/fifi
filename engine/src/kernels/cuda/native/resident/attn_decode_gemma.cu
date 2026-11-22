@@ -51,21 +51,23 @@ struct GemmaRow {
     const unsigned short *v_scales;
     int kv_len;
     unsigned int *status;
+    int cells;
 };
 
 template <bool kMany>
 __device__ inline GemmaRow gemma_row(const signed char *k_codes, const unsigned short *k_scales,
                                      const signed char *v_codes, const unsigned short *v_scales,
-                                     const int *kv_len_word, unsigned int *status,
+                                     const int *kv_len_word, unsigned int *status, int cells,
                                      const inference_cuda_kv_row *rows, int t) {
     if constexpr (kMany) {
         const inference_cuda_kv_row &r = rows[t];
         return {(const signed char *)r.k_codes, (const unsigned short *)r.k_scales,
                 (const signed char *)r.v_codes, (const unsigned short *)r.v_scales,
                 *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET),
-                (unsigned int *)((char *)r.step + INFERENCE_CUDA_STEP_STATUS_OFFSET)};
+                (unsigned int *)((char *)r.step + INFERENCE_CUDA_STEP_STATUS_OFFSET),
+                (int)r.cells};
     } else {
-        return {k_codes, k_scales, v_codes, v_scales, *kv_len_word, status};
+        return {k_codes, k_scales, v_codes, v_scales, *kv_len_word, status, cells};
     }
 }
 
@@ -90,9 +92,9 @@ __global__ void attn_decode_gemma_kernel(
     const int nwarps = (int)blockDim.x / 32;
     const int kvh = (int)(((long long)qh * n_kv_head) / n_q_head);
     const GemmaRow rw = gemma_row<kMany>(k_codes, k_scales, v_codes, v_scales, kv_len_word, status,
-                                         rows, token);
+                                         cells, rows, token);
     const int64_t requested_len = (int64_t)rw.kv_len + (kMany ? 0 : token);
-    const int out_of_range = !gemma_len_ok(requested_len, cells, ring);
+    const int out_of_range = !gemma_len_ok(requested_len, rw.cells, ring);
     const size_t out_base = ((size_t)token * n_q_head + qh) * (size_t)head_dim;
     if (out_of_range) {
         for (int d = tid; d < head_dim; d += blockDim.x)
@@ -112,7 +114,7 @@ __global__ void attn_decode_gemma_kernel(
     float run_m = -INFINITY;
     float run_l = 0.0f;
     for (int cell = first + warp; cell < kv_len; cell += nwarps) {
-        const size_t at = (size_t)kvh * cells + gemma_cell(cell, ring);
+        const size_t at = (size_t)kvh * rw.cells + gemma_cell(cell, ring);
         const size_t plane = at * (size_t)head_dim;
         const size_t sbase = at * (size_t)groups;
         float partial = 0.0f;
@@ -191,9 +193,9 @@ __global__ void __launch_bounds__(256) attn_decode_gemma_part_k(
     const int nwarps = (int)blockDim.x / 32;
     const int kvh = (int)(((long long)qh * n_kv_head) / n_q_head);
     const GemmaRow rw = gemma_row<kMany>(k_codes, k_scales, v_codes, v_scales, kv_len_word, status,
-                                         rows, token);
+                                         cells, rows, token);
     const int64_t requested_len = (int64_t)rw.kv_len + (kMany ? 0 : token);
-    if (!gemma_len_ok(requested_len, cells, ring)) {
+    if (!gemma_len_ok(requested_len, rw.cells, ring)) {
         // The combine kernel owns the NaN output and the status word; nothing to stage.
         if (tid == 0 && rw.status != NULL) atomicOr(rw.status, 4u);
         return;
@@ -216,7 +218,7 @@ __global__ void __launch_bounds__(256) attn_decode_gemma_part_k(
     float run_m = -INFINITY;
     float run_l = 0.0f;
     for (int cell = begin + warp; cell < end; cell += nwarps) {
-        const size_t at = (size_t)kvh * cells + gemma_cell(cell, ring);
+        const size_t at = (size_t)kvh * rw.cells + gemma_cell(cell, ring);
         const size_t plane = at * (size_t)head_dim;
         const size_t sbase = at * (size_t)groups;
         float partial = 0.0f;
@@ -294,12 +296,14 @@ __global__ void __launch_bounds__(D) attn_decode_gemma_combine_k(
     // many-rows instance takes the length and status words of its row's step block.
     int64_t requested_len = (int64_t)*kv_len_word + t;
     unsigned int *row_status = status;
+    int row_cells = cells;
     if constexpr (kMany) {
         const char *step = (const char *)rows[t].step;
         requested_len = *(const int *)(step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET);
         row_status = (unsigned int *)((char *)step + INFERENCE_CUDA_STEP_STATUS_OFFSET);
+        row_cells = (int)rows[t].cells;
     }
-    if (!gemma_len_ok(requested_len, cells, ring)) {
+    if (!gemma_len_ok(requested_len, row_cells, ring)) {
         // Same contract as the single-pass kernel: NaN out, status bit 4.
         *o = __int_as_float(0x7fc00000);
         if (d == 0 && row_status != NULL) atomicOr(row_status, 4u);

@@ -50,6 +50,10 @@ use crate::kernels::cuda::resident::gdn_delta::{
 use crate::kernels::cuda::resident::kv8_append::{GROUP as QUANT_GROUP, Kv8CodeScale, Kv8Shape};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
+/// Bytes of one row record of a KV table, and of the step block a row names.
+pub(crate) const ROW_RECORD_BYTES: usize = KV_ROW_BYTES;
+pub(crate) const STEP_BLOCK_BYTES: usize = STEP_BYTES;
+
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("multi_row: {tag}: {detail}"))
 }
@@ -86,17 +90,41 @@ pub(crate) struct KvRow<'b> {
     pub(crate) v_codes: DeviceRange<'b>,
     pub(crate) v_scales: DeviceRange<'b>,
     pub(crate) step: DeviceRange<'b>,
+    /// Plane cells per head of this row's planes. Rows of one launch may differ (a pooled session
+    /// holds the cells its request was sized to); every entry reads the row's own count for its
+    /// bounds and plane strides, and a `cells` field of a call is not read.
+    pub(crate) cells: usize,
+}
+
+/// Where the records of a [`KvRows`] sit on the device: a buffer of its own, or a range of a
+/// buffer the caller keeps and rewrites per step.
+enum KvTable<'b> {
+    Owned(DeviceBuffer),
+    Placed(DeviceRange<'b>),
 }
 
 /// The records of `n` rows in a device table.
 pub(crate) struct KvRows<'b> {
-    table: DeviceBuffer,
+    table: KvTable<'b>,
     rows: Vec<KvRow<'b>>,
 }
 
-impl<'b> KvRows<'b> {
+impl KvRows<'_> {
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// The fewest cells of any row.
+    fn min_cells(&self) -> usize {
+        self.rows.iter().map(|row| row.cells).min().unwrap_or(0)
+    }
+
+    /// The `n` records as a device range.
+    fn range(&self) -> Result<DeviceRange<'_>, EngError> {
+        match &self.table {
+            KvTable::Owned(buffer) => buffer.range(0, self.rows.len() * KV_ROW_BYTES),
+            KvTable::Placed(range) => Ok(*range),
+        }
     }
 }
 
@@ -133,10 +161,53 @@ impl CudaContext {
     /// more than 256, a step block under 32 bytes or a plane that is not 4-byte aligned or belongs
     /// to another context.
     pub(crate) fn kv_rows<'b>(&self, rows: &[KvRow<'b>]) -> Result<KvRows<'b>, EngError> {
+        let bytes = self.kv_table_bytes(rows)?;
+        Ok(KvRows {
+            table: KvTable::Owned(self.upload(&bytes)?),
+            rows: rows.to_vec(),
+        })
+    }
+
+    /// Writes the tables of several layers into `table`, one after the other from byte 0, in one
+    /// stream-ordered copy, and returns one [`KvRows`] per layer. A caller that steps every token
+    /// keeps `table` and calls this once per step, so no allocation or synchronization happens in
+    /// the step. `table` must hold `64 * (the rows of all layers)` bytes at 8-byte alignment; every
+    /// layer is checked as [`Self::kv_rows`] does.
+    pub(crate) fn kv_rows_layers<'b>(
+        &self,
+        stream: &DeviceStream,
+        table: &'b DeviceBuffer,
+        layers: &[Vec<KvRow<'b>>],
+    ) -> Result<Vec<KvRows<'b>>, EngError> {
+        let mut bytes = Vec::new();
+        let mut spans = Vec::with_capacity(layers.len());
+        for rows in layers {
+            let at = bytes.len();
+            bytes.extend_from_slice(&self.kv_table_bytes(rows)?);
+            spans.push((at, rows.len() * KV_ROW_BYTES));
+        }
+        if bytes.is_empty() {
+            return Err(rule("rows", "no layer has a row"));
+        }
+        table.write_at_enqueue(stream, 0, &bytes)?;
+        layers
+            .iter()
+            .zip(spans)
+            .map(|(rows, (at, len))| {
+                Ok(KvRows {
+                    table: KvTable::Placed(table.range(at, len)?),
+                    rows: rows.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The device image of the records of `rows`, after every check of [`Self::kv_rows`].
+    fn kv_table_bytes(&self, rows: &[KvRow<'_>]) -> Result<Vec<u8>, EngError> {
         check_rows_count(rows.len())?;
         let mut bytes = Vec::with_capacity(rows.len() * KV_ROW_BYTES);
         for row in rows {
-            let addr = |range: &DeviceRange<'b>, align: usize, name: &str| {
+            let addr = |range: &DeviceRange<'_>, align: usize, name: &str| {
                 if !range.offset().is_multiple_of(align) {
                     return Err(rule(
                         name,
@@ -152,7 +223,9 @@ impl CudaContext {
                 v_codes: addr(&row.v_codes, 4, "v_codes")?,
                 v_scales: addr(&row.v_scales, 4, "v_scales")?,
                 step: addr(&row.step, 4, "step")?,
-                reserved: [0; 3],
+                cells: u64::try_from(row.cells)
+                    .map_err(|_| rule("cells", "the row's cell count overflows"))?,
+                reserved: [0; 2],
             };
             for word in [
                 raw.k_codes,
@@ -160,6 +233,7 @@ impl CudaContext {
                 raw.v_codes,
                 raw.v_scales,
                 raw.step,
+                raw.cells,
             ]
             .into_iter()
             .chain(raw.reserved)
@@ -188,20 +262,23 @@ impl CudaContext {
                 }
             }
         }
-        Ok(KvRows {
-            table: self.upload(&bytes)?,
-            rows: rows.to_vec(),
-        })
+        Ok(bytes)
     }
 }
 
 /// The geometry the planes of every row of a call must hold, and the check that they do.
 fn check_planes(rows: &KvRows<'_>, shape: &Kv8Shape, write: bool) -> Result<(), EngError> {
+    // Each row's planes hold its own cells; `shape.cells` is not read.
+    let own = |row: &KvRow<'_>| Kv8Shape {
+        cells: row.cells,
+        ..*shape
+    };
     for row in &rows.rows {
-        require_fit("k_codes", &row.k_codes, shape.code_bytes(), 4)?;
-        require_fit("v_codes", &row.v_codes, shape.code_bytes(), 4)?;
-        require_fit("k_scales", &row.k_scales, shape.scale_bytes(), 4)?;
-        require_fit("v_scales", &row.v_scales, shape.scale_bytes(), 4)?;
+        let sized = own(row);
+        require_fit("k_codes", &row.k_codes, sized.code_bytes(), 4)?;
+        require_fit("v_codes", &row.v_codes, sized.code_bytes(), 4)?;
+        require_fit("k_scales", &row.k_scales, sized.scale_bytes(), 4)?;
+        require_fit("v_scales", &row.v_scales, sized.scale_bytes(), 4)?;
     }
     if !write {
         return Ok(());
@@ -210,10 +287,11 @@ fn check_planes(rows: &KvRows<'_>, shape: &Kv8Shape, write: bool) -> Result<(), 
     // or of the same row's other plane.
     let mut claims = Vec::with_capacity(rows.rows.len() * 4);
     for row in &rows.rows {
-        claims.push(Claim::of("k_codes", &row.k_codes, shape.code_bytes()));
-        claims.push(Claim::of("v_codes", &row.v_codes, shape.code_bytes()));
-        claims.push(Claim::of("k_scales", &row.k_scales, shape.scale_bytes()));
-        claims.push(Claim::of("v_scales", &row.v_scales, shape.scale_bytes()));
+        let sized = own(row);
+        claims.push(Claim::of("k_codes", &row.k_codes, sized.code_bytes()));
+        claims.push(Claim::of("v_codes", &row.v_codes, sized.code_bytes()));
+        claims.push(Claim::of("k_scales", &row.k_scales, sized.scale_bytes()));
+        claims.push(Claim::of("v_scales", &row.v_scales, sized.scale_bytes()));
     }
     for (i, claim) in claims.iter().enumerate() {
         for other in &claims[i + 1..] {
@@ -238,6 +316,29 @@ fn apart_from_rows(
         if let Some((codes, scales)) = planes {
             require_apart(&claim, &Claim::of("k_codes", &row.k_codes, codes))?;
             require_apart(&claim, &Claim::of("v_codes", &row.v_codes, codes))?;
+            require_apart(&claim, &Claim::of("k_scales", &row.k_scales, scales))?;
+            require_apart(&claim, &Claim::of("v_scales", &row.v_scales, scales))?;
+        }
+    }
+    Ok(())
+}
+
+/// As [`apart_from_rows`] with the plane sizes given per cell `(codes, scales)`: each row's planes
+/// hold its own cells.
+fn apart_from_rows_per_cell(
+    rows: &KvRows<'_>,
+    name: &'static str,
+    range: &DeviceRange<'_>,
+    bytes: usize,
+    per_cell: (usize, usize),
+) -> Result<(), EngError> {
+    let claim = Claim::of(name, range, bytes);
+    for row in &rows.rows {
+        let (codes, scales) = (per_cell.0 * row.cells, per_cell.1 * row.cells);
+        require_apart(&claim, &Claim::of("step", &row.step, STEP_BYTES))?;
+        require_apart(&claim, &Claim::of("k_codes", &row.k_codes, codes))?;
+        require_apart(&claim, &Claim::of("v_codes", &row.v_codes, codes))?;
+        if scales > 0 {
             require_apart(&claim, &Claim::of("k_scales", &row.k_scales, scales))?;
             require_apart(&claim, &Claim::of("v_scales", &row.v_scales, scales))?;
         }
@@ -272,7 +373,6 @@ pub(crate) struct PrepMultiCall<'b> {
     pub(crate) n_head: usize,
     pub(crate) n_kv_head: usize,
     pub(crate) n_rot: usize,
-    pub(crate) cells: usize,
     pub(crate) ld: usize,
     pub(crate) rope: RopeParams,
     pub(crate) proj: DeviceRange<'b>,
@@ -311,7 +411,6 @@ pub(crate) struct DecodeGemmaMultiCall<'b> {
     pub(crate) n_q_head: usize,
     pub(crate) n_kv_head: usize,
     pub(crate) head_dim: usize,
-    pub(crate) cells: usize,
     pub(crate) window: usize,
     pub(crate) ring: usize,
     pub(crate) scale: f32,
@@ -454,7 +553,8 @@ impl CudaContext {
         let heads_ok = (1..=256).contains(&call.n_head) && (1..=64).contains(&call.n_kv_head);
         let rot_ok = (2..=HEAD_DIM).contains(&call.n_rot) && call.n_rot.is_power_of_two();
         let row_w = (call.n_head * 2 + call.n_kv_head * 2) * HEAD_DIM;
-        if !(heads_ok && rot_ok && call.ld >= row_w && (1..(1 << 30)).contains(&call.cells)) {
+        let cells = call.rows.min_cells();
+        if !(heads_ok && rot_ok && call.ld >= row_w && (1..(1 << 30)).contains(&cells)) {
             return Err(rule(
                 "shape",
                 "heads, n_rot, ld or cells are outside the limits",
@@ -487,16 +587,16 @@ impl CudaContext {
                 require_apart(write, other)?;
             }
         }
-        let planes = (
-            call.n_kv_head * call.cells * HEAD_DIM,
-            call.n_kv_head * call.cells * (HEAD_DIM / QUANT_GROUP) * 2,
+        let per_cell = (
+            call.n_kv_head * HEAD_DIM,
+            call.n_kv_head * (HEAD_DIM / QUANT_GROUP) * 2,
         );
         for (name, range, bytes) in [
             ("q", &call.q, q_bytes),
             ("k_rows", &call.k_rows, kv_bytes),
             ("v_rows", &call.v_rows, kv_bytes),
         ] {
-            apart_from_rows(call.rows, name, range, bytes, Some(planes))?;
+            apart_from_rows_per_cell(call.rows, name, range, bytes, per_cell)?;
         }
         for (name, range, bytes) in [
             ("proj", &call.proj, ((n - 1) * call.ld + row_w) * f),
@@ -512,12 +612,12 @@ impl CudaContext {
             k_rows: self.raw_range(&call.k_rows)?,
             v_rows: self.raw_range(&call.v_rows)?,
             q: self.raw_range(&call.q)?,
-            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            table: self.raw_range(&call.rows.range()?)?,
             n,
             ld: call.ld,
             heads: [call.n_head, call.n_kv_head],
             n_rot: call.n_rot,
-            cells: call.cells,
+            cells,
             eps: call.rope.eps,
             rope_base: call.rope.rope_base,
         };
@@ -534,8 +634,10 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let n = call.rows.len();
+        // The planes of each row hold its own cells; the launch's cell count is the fewest.
         let shape = Kv8Shape {
             rows: n,
+            cells: call.rows.min_cells(),
             ..call.shape
         };
         let geometry_ok = (1..=64).contains(&shape.n_kv_head)
@@ -552,13 +654,16 @@ impl CudaContext {
         require_fit("k", &call.k, shape.row_bytes(), 4)?;
         require_fit("v", &call.v, shape.row_bytes(), 4)?;
         check_planes(call.rows, &shape, true)?;
-        let planes = Some((shape.code_bytes(), shape.scale_bytes()));
-        apart_from_rows(call.rows, "k", &call.k, shape.row_bytes(), planes)?;
-        apart_from_rows(call.rows, "v", &call.v, shape.row_bytes(), planes)?;
+        let per_cell = (
+            shape.n_kv_head * shape.head_dim,
+            shape.n_kv_head * (shape.head_dim / QUANT_GROUP) * 2,
+        );
+        apart_from_rows_per_cell(call.rows, "k", &call.k, shape.row_bytes(), per_cell)?;
+        apart_from_rows_per_cell(call.rows, "v", &call.v, shape.row_bytes(), per_cell)?;
         let raw = AppendMultiRaw {
             k: self.raw_range(&call.k)?,
             v: self.raw_range(&call.v)?,
-            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            table: self.raw_range(&call.rows.range()?)?,
             n,
             n_kv_head: shape.n_kv_head,
             head_dim: shape.head_dim,
@@ -584,11 +689,12 @@ impl CudaContext {
         let n = call.rows.len();
         let shape = &call.shape;
         same_rows("decode", shape.m, n)?;
+        // Each row's planes hold its own cells; the call's `shape.cells` is not read.
+        let cells = call.rows.min_cells();
         let shape_ok = shape.n_head == shape.n_kv_head * GROUP
             && (1..=64).contains(&shape.n_kv_head)
             && (shape.head_dim == 128 || shape.head_dim == 256)
-            && shape.cells >= 1
-            && shape.cells < (1 << 30)
+            && (1..(1 << 30)).contains(&cells)
             && (1..=128).contains(&call.split.max_splits)
             && call.split.min_keys >= 64
             && call.split.min_keys.is_multiple_of(64)
@@ -599,7 +705,7 @@ impl CudaContext {
             && call.span.ring >= 0
             && (call.span.ring == 0
                 || (call.span.window > 0
-                    && call.span.ring <= shape.cells as i64
+                    && call.span.ring <= cells as i64
                     && call.span.ring >= call.span.window));
         if !(shape_ok && span_ok) {
             return Err(rule(
@@ -618,7 +724,7 @@ impl CudaContext {
             n,
             shape.n_kv_head,
             shape.head_dim,
-            shape.cells,
+            cells,
             Kv8CodeScale::StoredHalf,
         );
         check_planes(call.rows, &plane, false)?;
@@ -643,20 +749,23 @@ impl CudaContext {
             require_apart(&out, &claim)?;
             require_apart(&part, &claim)?;
         }
-        let planes = Some((plane.code_bytes(), plane.scale_bytes()));
-        apart_from_rows(call.rows, "out", &call.out, n * width * f, planes)?;
-        apart_from_rows(call.rows, "part", &call.part, part_bytes, planes)?;
+        let per_cell = (
+            shape.n_kv_head * shape.head_dim,
+            shape.n_kv_head * (shape.head_dim / QUANT_GROUP) * 2,
+        );
+        apart_from_rows_per_cell(call.rows, "out", &call.out, n * width * f, per_cell)?;
+        apart_from_rows_per_cell(call.rows, "part", &call.part, part_bytes, per_cell)?;
         let raw = DecodeMultiRaw {
             q: self.raw_range(&call.q)?,
             proj: call.proj.as_ref().map(|p| self.raw_range(p)).transpose()?,
-            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            table: self.raw_range(&call.rows.range()?)?,
             part: self.raw_range(&call.part)?,
             out: self.raw_range(&call.out)?,
             n,
             ld: shape.ld,
             heads: [shape.n_head, shape.n_kv_head],
             head_dim: shape.head_dim,
-            cells: shape.cells,
+            cells,
             split: [call.split.max_splits, call.split.min_keys],
             span: [call.span.window as usize, call.span.ring as usize],
             scale: call.scale,
@@ -677,14 +786,15 @@ impl CudaContext {
         self.ensure_usable()?;
         let n = call.rows.len();
         admit_gemma_heads(call.n_q_head, call.n_kv_head)?;
+        // Each row's planes hold its own cells; the window and the ring must fit the fewest.
+        let cells = call.rows.min_cells();
         let shape_ok = (call.head_dim == 256 || call.head_dim == 512)
-            && call.cells >= 1
-            && call.cells < (1 << 30)
-            && call.window <= call.cells
+            && (1..(1 << 30)).contains(&cells)
+            && call.window <= cells
             && call.scale.is_finite()
             && call.scale.abs() < 1e30;
-        let ring_ok = call.ring == 0
-            || (call.window >= 1 && call.ring >= call.window && call.ring <= call.cells);
+        let ring_ok =
+            call.ring == 0 || (call.window >= 1 && call.ring >= call.window && call.ring <= cells);
         if !(shape_ok && ring_ok) {
             return Err(rule(
                 "shape",
@@ -699,7 +809,7 @@ impl CudaContext {
             rows: n,
             n_kv_head: call.n_kv_head,
             head_dim: call.head_dim,
-            cells: call.cells,
+            cells,
             code_scale: Kv8CodeScale::StoredHalf,
             ring: 0,
         };
@@ -723,22 +833,25 @@ impl CudaContext {
             part_raw = Some(self.raw_range(&plan.part)?);
             split = [plan.max_splits, plan.min_keys];
         }
-        let planes = Some((plane.code_bytes(), plane.scale_bytes()));
-        apart_from_rows(call.rows, "out", &call.out, q_bytes, planes)?;
+        let per_cell = (
+            call.n_kv_head * call.head_dim,
+            call.n_kv_head * (call.head_dim / QUANT_GROUP) * 2,
+        );
+        apart_from_rows_per_cell(call.rows, "out", &call.out, q_bytes, per_cell)?;
         apart_from_rows(call.rows, "q", &call.q, q_bytes, None)?;
         if let Some(plan) = &call.split {
             let part_bytes = n * call.n_q_head * plan.max_splits * (2 + call.head_dim) * f;
-            apart_from_rows(call.rows, "part", &plan.part, part_bytes, planes)?;
+            apart_from_rows_per_cell(call.rows, "part", &plan.part, part_bytes, per_cell)?;
         }
         let raw = GemmaMultiRaw {
             q: self.raw_range(&call.q)?,
-            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            table: self.raw_range(&call.rows.range()?)?,
             part: part_raw,
             out: self.raw_range(&call.out)?,
             n,
             heads: [call.n_q_head, call.n_kv_head],
             head_dim: call.head_dim,
-            cells: call.cells,
+            cells,
             window: call.window,
             ring: call.ring,
             split,
@@ -759,17 +872,15 @@ mod tests;
 pub(crate) struct Append16MultiCall<'b> {
     pub(crate) n_kv_head: usize,
     pub(crate) head_dim: usize,
-    pub(crate) cells: usize,
     pub(crate) k: DeviceRange<'b>,
     pub(crate) v: DeviceRange<'b>,
     pub(crate) rows: &'b KvRows<'b>,
 }
 
-/// Bytes of one fp16 plane of a row: `[cells][n_kv_head][head_dim]` halves.
-fn plane16_bytes(cells: usize, n_kv_head: usize, head_dim: usize) -> Result<usize, EngError> {
-    cells
-        .checked_mul(n_kv_head)
-        .and_then(|v| v.checked_mul(head_dim))
+/// Bytes of one cell of an fp16 plane: `[n_kv_head][head_dim]` halves.
+fn plane16_per_cell(n_kv_head: usize, head_dim: usize) -> Result<usize, EngError> {
+    n_kv_head
+        .checked_mul(head_dim)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| rule("size overflow", "the fp16 plane size overflows"))
 }
@@ -780,11 +891,13 @@ fn plane16_bytes(cells: usize, n_kv_head: usize, head_dim: usize) -> Result<usiz
 /// other plane.
 fn check_planes16(
     rows: &KvRows<'_>,
-    bytes: usize,
+    per_cell: usize,
     align: usize,
     write: bool,
 ) -> Result<(), EngError> {
+    // Each row's planes hold its own cells.
     for row in &rows.rows {
+        let bytes = per_cell * row.cells;
         require_fit("k_codes", &row.k_codes, bytes, align)?;
         require_fit("v_codes", &row.v_codes, bytes, align)?;
     }
@@ -793,6 +906,7 @@ fn check_planes16(
     }
     let mut claims = Vec::with_capacity(rows.rows.len() * 2);
     for row in &rows.rows {
+        let bytes = per_cell * row.cells;
         claims.push(Claim::of("k_codes", &row.k_codes, bytes));
         claims.push(Claim::of("v_codes", &row.v_codes, bytes));
     }
@@ -813,10 +927,11 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let n = call.rows.len();
+        let cells = call.rows.min_cells();
         let geometry_ok = (1..=64).contains(&call.n_kv_head)
             && (32..=1024).contains(&call.head_dim)
             && call.head_dim.is_multiple_of(32)
-            && (1..(1 << 30)).contains(&call.cells);
+            && (1..(1 << 30)).contains(&cells);
         if !geometry_ok {
             return Err(rule(
                 "shape",
@@ -826,18 +941,18 @@ impl CudaContext {
         let row_bytes = n * call.n_kv_head * call.head_dim * size_of::<f32>();
         require_fit("k", &call.k, row_bytes, 4)?;
         require_fit("v", &call.v, row_bytes, 4)?;
-        let plane = plane16_bytes(call.cells, call.n_kv_head, call.head_dim)?;
-        check_planes16(call.rows, plane, 4, true)?;
-        apart_from_rows(call.rows, "k", &call.k, row_bytes, Some((plane, 0)))?;
-        apart_from_rows(call.rows, "v", &call.v, row_bytes, Some((plane, 0)))?;
+        let per_cell = plane16_per_cell(call.n_kv_head, call.head_dim)?;
+        check_planes16(call.rows, per_cell, 4, true)?;
+        apart_from_rows_per_cell(call.rows, "k", &call.k, row_bytes, (per_cell, 0))?;
+        apart_from_rows_per_cell(call.rows, "v", &call.v, row_bytes, (per_cell, 0))?;
         let raw = Append16MultiRaw {
             k: self.raw_range(&call.k)?,
             v: self.raw_range(&call.v)?,
-            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            table: self.raw_range(&call.rows.range()?)?,
             n,
             n_kv_head: call.n_kv_head,
             head_dim: call.head_dim,
-            cells: call.cells,
+            cells,
         };
         self.launch_on(stream, move |raw_stream| {
             kv16_append_multi_launch(raw_stream, raw)
@@ -856,11 +971,11 @@ impl CudaContext {
         let n = call.rows.len();
         let shape = &call.shape;
         same_rows("decode", shape.m, n)?;
+        let cells = call.rows.min_cells();
         let shape_ok = shape.n_head == shape.n_kv_head * GROUP
             && (1..=64).contains(&shape.n_kv_head)
             && (shape.head_dim == 128 || shape.head_dim == 256)
-            && shape.cells >= 1
-            && shape.cells < (1 << 30)
+            && (1..(1 << 30)).contains(&cells)
             && (1..=128).contains(&call.split.max_splits)
             && call.split.min_keys >= 32
             && call.split.min_keys.is_multiple_of(32)
@@ -871,7 +986,7 @@ impl CudaContext {
             && call.span.ring >= 0
             && (call.span.ring == 0
                 || (call.span.window > 0
-                    && call.span.ring <= shape.cells as i64
+                    && call.span.ring <= cells as i64
                     && call.span.ring >= call.span.window));
         if !(shape_ok && span_ok) {
             return Err(rule(
@@ -886,8 +1001,8 @@ impl CudaContext {
         let part_bytes =
             attn_q8_part_bytes(n, shape.n_kv_head, shape.head_dim, call.split.max_splits)?;
         require_fit("part", &call.part, part_bytes, 16)?;
-        let plane = plane16_bytes(shape.cells, shape.n_kv_head, shape.head_dim)?;
-        check_planes16(call.rows, plane, 16, false)?;
+        let per_cell = plane16_per_cell(shape.n_kv_head, shape.head_dim)?;
+        check_planes16(call.rows, per_cell, 16, false)?;
         let proj_bytes = match &call.proj {
             Some(proj) => {
                 if shape.ld < shape.n_head * 2 * shape.head_dim {
@@ -909,20 +1024,19 @@ impl CudaContext {
             require_apart(&out, &claim)?;
             require_apart(&part, &claim)?;
         }
-        let planes = Some((plane, 0));
-        apart_from_rows(call.rows, "out", &call.out, n * width * f, planes)?;
-        apart_from_rows(call.rows, "part", &call.part, part_bytes, planes)?;
+        apart_from_rows_per_cell(call.rows, "out", &call.out, n * width * f, (per_cell, 0))?;
+        apart_from_rows_per_cell(call.rows, "part", &call.part, part_bytes, (per_cell, 0))?;
         let raw = DecodeMultiRaw {
             q: self.raw_range(&call.q)?,
             proj: call.proj.as_ref().map(|p| self.raw_range(p)).transpose()?,
-            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            table: self.raw_range(&call.rows.range()?)?,
             part: self.raw_range(&call.part)?,
             out: self.raw_range(&call.out)?,
             n,
             ld: shape.ld,
             heads: [shape.n_head, shape.n_kv_head],
             head_dim: shape.head_dim,
-            cells: shape.cells,
+            cells,
             split: [call.split.max_splits, call.split.min_keys],
             span: [call.span.window as usize, call.span.ring as usize],
             scale: call.scale,

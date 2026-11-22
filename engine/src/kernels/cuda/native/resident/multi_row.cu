@@ -152,7 +152,7 @@ __global__ void attn_prep_multi_k(PrepMulti a) {
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const char *step = (const char *)a.rows[t].step;
     const long long first = *(const int *)(step + INFERENCE_CUDA_STEP_POS_OFFSET);
-    if (first < 0 || first + 1 > a.cells) {
+    if (first < 0 || first + 1 > a.rows[t].cells) {
         if (blockIdx.x == 0 && threadIdx.x == 0)
             atomicOr((int *)(step + INFERENCE_CUDA_STEP_STATUS_OFFSET), kStatusInvalidStepState);
         if (head < a.n_head) a.q[((size_t)t * a.n_head + head) * D + d] = __int_as_float(0x7fc00000);
@@ -279,11 +279,11 @@ namespace {
 // the position word and the status word are the row's own; the value is rounded to nearest even,
 // as the single-sequence attn_prep rounds the rows it appends to an fp16 cache.
 __global__ void kv16_append_multi_k(const float *k, const float *v, const inference_cuda_kv_row *rows,
-                                    int n_kv_head, int head_dim, int cells) {
+                                    int n_kv_head, int head_dim) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const char *step = (const char *)rows[t].step;
     const long long pos = *(const int *)(step + INFERENCE_CUDA_STEP_POS_OFFSET);
-    if (pos < 0 || pos >= cells) {
+    if (pos < 0 || pos >= rows[t].cells) {
         if (h == 0 && d == 0) atomicOr((int *)(step + INFERENCE_CUDA_STEP_STATUS_OFFSET), kStatusInvalidStepState);
         return;
     }
@@ -306,7 +306,7 @@ extern "C" int inference_cuda_kv16_append_multi_launch(const inference_cuda_kv16
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         kv16_append_multi_k<<<dim3(a->n_kv_head, a->n), a->head_dim, 0, (cudaStream_t)stream>>>(
-            (const float *)a->k, (const float *)a->v, a->rows, a->n_kv_head, a->head_dim, a->cells);
+            (const float *)a->k, (const float *)a->v, a->rows, a->n_kv_head, a->head_dim);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

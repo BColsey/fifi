@@ -50,7 +50,11 @@ typedef struct inference_cuda_kv_row {
     void *v_codes;
     void *v_scales;
     void *step;
-    void *reserved[3];
+    long long cells;      /* plane cells per head of THIS row's planes (rows of one launch may differ):
+                           * every entry reads the row's own count for its bounds and plane strides;
+                           * the `cells` argument of an entry only has to be valid (set it to the
+                           * fewest of the rows) */
+    void *reserved[2];
 } inference_cuda_kv_row;
 
 typedef struct inference_cuda_gdn_conv_multi_args {

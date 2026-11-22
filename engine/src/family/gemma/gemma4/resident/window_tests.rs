@@ -504,8 +504,18 @@ fn a_window_of_sessions_equals_the_solo_runs() {
         .reserve_window(Bolt::WINDOW_ROWS)
         .expect("window buffers");
     let lengths = [5usize, 17, 1, 130, 40, 2, 9, 77];
-    let seqs: Vec<_> = (0..Bolt::WINDOW_ROWS)
-        .map(|_| model.new_seq_cells(2048).expect("sequence"))
+    let mut seqs: Vec<_> = (0..Bolt::WINDOW_ROWS)
+        .enumerate()
+        .map(|(slot, _)| {
+            // Sessions of different sizes share a window: each row reads its own cells. Slot 3
+            // starts at the sliding window and grows after its prompt, as a served session does.
+            let cells = match slot {
+                3 => 512,
+                _ if slot % 2 == 0 => 2048,
+                _ => 1536,
+            };
+            model.new_seq_cells(cells).expect("sequence")
+        })
         .collect();
     for width in [2usize, 3, 4, 5, 8] {
         let prompts: Vec<Vec<u32>> = (0..width)
@@ -521,6 +531,12 @@ fn a_window_of_sessions_equals_the_solo_runs() {
         for slot in 0..width {
             dirty(&mut model, &seqs[slot], slot + 20);
             prefill(&mut model, &seqs[slot], &prompts[slot]);
+        }
+        // The grown session keeps the cells it fed and runs in larger planes than its solo run.
+        if width > 3 {
+            model
+                .make_room(&mut seqs[3], prompts[3].len() - 1, 800)
+                .expect("the session grows");
         }
         let join: Vec<usize> = (0..width).map(|slot| slot % 3).collect();
         let last: Vec<usize> = (0..width).map(|slot| STEPS - slot % 4).collect();

@@ -43,10 +43,15 @@ pub(in crate::kernels::cuda) struct KvRowRaw {
     pub(in crate::kernels::cuda) v_codes: u64,
     pub(in crate::kernels::cuda) v_scales: u64,
     pub(in crate::kernels::cuda) step: u64,
-    pub(in crate::kernels::cuda) reserved: [u64; 3],
+    pub(in crate::kernels::cuda) cells: u64,
+    pub(in crate::kernels::cuda) reserved: [u64; 2],
 }
 
-const _: () = assert!(size_of::<KvRowRaw>() == KV_ROW_BYTES && offset_of!(KvRowRaw, step) == 32);
+const _: () = assert!(
+    size_of::<KvRowRaw>() == KV_ROW_BYTES
+        && offset_of!(KvRowRaw, step) == 32
+        && offset_of!(KvRowRaw, cells) == 40
+);
 
 #[repr(C)]
 struct ConvArgsRaw {

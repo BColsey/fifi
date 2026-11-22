@@ -71,6 +71,7 @@ struct RowView {
     const __half *k_cache;
     const __half *v_cache;
     int kv_len;
+    int rows;  // cache rows of this row's planes
 };
 
 template <bool kMany>
@@ -78,9 +79,10 @@ __device__ inline RowView row_of(const Args &a, int t) {
     if constexpr (kMany) {
         const inference_cuda_kv_row &r = a.rows[t];
         return {(const __half *)r.k_codes, (const __half *)r.v_codes,
-                *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET)};
+                *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET),
+                (int)r.cells};
     } else {
-        return {a.k_cache, a.v_cache, *a.kv_len};
+        return {a.k_cache, a.v_cache, *a.kv_len, a.cache_rows};
     }
 }
 
@@ -98,9 +100,9 @@ __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int 
 // kv_len must leave room for the m tokens in a linear cache; a ring takes any positive length.
 // Otherwise both kernels treat the call as invalid.
 template <bool kMany>
-__device__ inline bool kv_ok(const Args &a, int kv_len) {
+__device__ inline bool kv_ok(const Args &a, int kv_len, int cache_rows) {
     // A many-rows launch appends one token per row, so a linear cache needs no headroom.
-    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= a.cache_rows - (kMany ? 0 : a.m - 1));
+    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= cache_rows - (kMany ? 0 : a.m - 1));
 }
 
 // Visible keys of token t: the last min(n_keys, window) positions. first = position of key 0.
@@ -164,7 +166,7 @@ __global__ void __launch_bounds__(256, 2) attn_part_k(Args a) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const RowView rw = row_of<kMany>(a, t);
     const int kv_len = rw.kv_len;
-    if (!kv_ok<kMany>(a, kv_len)) {
+    if (!kv_ok<kMany>(a, kv_len, rw.rows)) {
         return;
     }
     const int n_keys = kMany ? kv_len : kv_len + t;
@@ -303,8 +305,9 @@ __global__ void __launch_bounds__(D) attn_combine_k(Args a) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const int kvh = h / G, g = h % G;
     float *o = a.out + ((size_t)t * a.n_head + h) * D + d;
-    const int kv_len = row_of<kMany>(a, t).kv_len;
-    if (!kv_ok<kMany>(a, kv_len)) {
+    const RowView rw = row_of<kMany>(a, t);
+    const int kv_len = rw.kv_len;
+    if (!kv_ok<kMany>(a, kv_len, rw.rows)) {
         *o = __int_as_float(0x7fc00000);  // NaN: the caller's non-finite check ends the job
         return;
     }

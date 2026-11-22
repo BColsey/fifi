@@ -58,6 +58,9 @@ use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::resident::multi_row::{
+    AppendMultiCall, DecodeGemmaMultiCall, KvRow, KvRows, ROW_RECORD_BYTES, STEP_BLOCK_BYTES,
+};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
@@ -280,6 +283,11 @@ pub(crate) struct BoltSeq {
     pos: DeviceBuffer,
     /// The key count the first row attends over (`pos + 1`).
     kv_len: DeviceBuffer,
+    /// The 32-byte step block a window's rows read: the position at byte 4 and the key count at
+    /// byte 8 (the layout of `StepParams`), so one launch can read the words of every row. A
+    /// window writes this block and not the two words above; a chunk or a lone token writes
+    /// those and not this block.
+    step: DeviceBuffer,
 }
 
 /// A copy of the cache cells of one sequence below a position, in host memory. The planes of the
@@ -324,6 +332,8 @@ pub(crate) struct WindowBuffers {
     rows: usize,
     logits: Vector,
     capped: Vector,
+    /// The row records of every physical layer of one step, rewritten each step.
+    tables: DeviceBuffer,
 }
 
 /// What the rows of one step are.
@@ -331,7 +341,12 @@ enum Rows<'a> {
     /// `m` consecutive positions of one sequence from `pos`: a prompt chunk or one decode token.
     Chunk { seq: &'a BoltSeq, pos: usize },
     /// One token of each of several sequences, in window order.
-    Window { seqs: &'a [&'a BoltSeq] },
+    Window {
+        seqs: &'a [&'a BoltSeq],
+        /// The row records of each layer's own planes, by layer; `None` for a layer that reads
+        /// another layer's cache.
+        tables: &'a [Option<KvRows<'a>>],
+    },
 }
 
 impl Rows<'_> {
@@ -916,6 +931,7 @@ impl Bolt {
             kv: Vec::new(),
             pos: zero(&self.ctx, 4)?,
             kv_len: zero(&self.ctx, 4)?,
+            step: zero(&self.ctx, STEP_BLOCK_BYTES)?,
         };
         self.fill_seq(&mut seq)?;
         Ok(seq)
@@ -1212,6 +1228,9 @@ impl Bolt {
             rows,
             logits: vector_filled(&self.ctx, rows * VOCAB, 0.0)?,
             capped: vector_filled(&self.ctx, rows * VOCAB, 0.0)?,
+            tables: self
+                .ctx
+                .allocate(rows * PHYSICAL_LAYERS * ROW_RECORD_BYTES)?,
         });
         Ok(())
     }
@@ -1245,6 +1264,49 @@ impl Bolt {
                     .collect()
             })
             .collect())
+    }
+
+    /// The row records of a window: for each physical layer, one record per sequence naming that
+    /// sequence's planes of the layer, their cells and its step block, written in one copy into the
+    /// window's table buffer. The cache append and the attention of every layer read them, so each
+    /// is one launch over all rows.
+    fn window_tables<'a>(
+        &'a self,
+        seqs: &'a [&'a BoltSeq],
+    ) -> Result<Vec<Option<KvRows<'a>>>, EngError> {
+        let held = self
+            .window
+            .as_ref()
+            .expect("the window buffers are reserved");
+        let mut per_layer: Vec<Vec<KvRow<'a>>> = Vec::with_capacity(PHYSICAL_LAYERS);
+        let mut index_of = Vec::with_capacity(PHYSICAL_LAYERS);
+        for (index, layer) in self.layers.iter().enumerate() {
+            if !layer.physical() {
+                continue;
+            }
+            let mut rows = Vec::with_capacity(seqs.len());
+            for seq in seqs {
+                let own = seq.kv[index].as_ref().expect("a physical layer has planes");
+                rows.push(KvRow {
+                    k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                    k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                    v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                    v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                    step: seq.step.range(0, STEP_BLOCK_BYTES)?,
+                    cells: own.shape.cells,
+                });
+            }
+            per_layer.push(rows);
+            index_of.push(index);
+        }
+        let built = self
+            .ctx
+            .kv_rows_layers(&self.stream, &held.tables, &per_layer)?;
+        let mut tables: Vec<Option<KvRows<'a>>> = (0..LAYERS).map(|_| None).collect();
+        for (index, table) in index_of.into_iter().zip(built) {
+            tables[index] = Some(table);
+        }
+        Ok(tables)
     }
 
     /// Steps one token of each sequence together, as [`Self::decode_rows`], and leaves the capped
@@ -1285,12 +1347,23 @@ impl Bolt {
         let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         self.scratch.ids.write_at_enqueue(&self.stream, 0, &ids)?;
         for (seq, &pos) in seqs.iter().zip(positions) {
-            seq.pos
-                .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
-            seq.kv_len
-                .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
+            // Position at byte 4 and key count at byte 8 of the step block, in one copy.
+            let mut words = [0u8; 8];
+            words[..4].copy_from_slice(&(pos as i32).to_le_bytes());
+            words[4..].copy_from_slice(&((pos as i32) + 1).to_le_bytes());
+            seq.step.write_at_enqueue(&self.stream, 4, &words)?;
         }
-        self.decode_body(&Rows::Window { seqs }, true, m)?;
+        {
+            let tables = self.window_tables(seqs)?;
+            self.decode_body(
+                &Rows::Window {
+                    seqs,
+                    tables: &tables,
+                },
+                true,
+                m,
+            )?;
+        }
         self.graph_mode.note_eager();
         Ok(())
     }
@@ -1867,8 +1940,9 @@ impl Bolt {
     }
 
     /// Rotation, cache append and attention of one layer. A chunk runs them once over its
-    /// consecutive rows against its sequence; a window runs them once per row against that
-    /// row's sequence, with the launch a lone row makes.
+    /// consecutive rows against its sequence. A window rotates each row against its own position
+    /// word, then runs the append and the attention once over all rows, each reading its own
+    /// planes, cells, position and key count from its record.
     fn rope_append_attend(&self, index: usize, rows: &Rows<'_>, m: usize) -> Result<(), EngError> {
         let layer = &self.layers[index];
         let ctx = &self.ctx;
@@ -1889,13 +1963,10 @@ impl Bolt {
                 min_keys: ATTN_SPLIT_MIN_KEYS,
             }
         });
-        // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
-        // row sits at cell `first`.
-        let group =
-            |seq: &BoltSeq, row: usize, count: usize, first: usize| -> Result<(), EngError> {
-                let own = seq.kv[source]
-                    .as_ref()
-                    .expect("the shared-KV source layer is physical");
+        // The rotation of `count` rows starting at row `row` of the scratch, the position read
+        // from `pos_word`.
+        let rotate =
+            |row: usize, count: usize, pos_word: DeviceRange<'_>| -> Result<(), EngError> {
                 let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
                 let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
                 // A shared layer rotates its query only; the rope kernel requires at least one k
@@ -1909,7 +1980,7 @@ impl Bolt {
                         } else {
                             sc.k_normed.buf.range(0, kv_rows * 4)?
                         },
-                        pos: seq.pos.range(0, 4)?,
+                        pos: pos_word,
                         factors: match (&self.rope_freqs, layer.global) {
                             (Some(freqs), true) => Some(freqs.buf.range(0, freqs.bytes())?),
                             _ => None,
@@ -1921,7 +1992,18 @@ impl Bolt {
                         head_dim: head,
                         global_mode: layer.global,
                     },
-                )?;
+                )
+            };
+        // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
+        // row sits at cell `first`.
+        let group =
+            |seq: &BoltSeq, row: usize, count: usize, first: usize| -> Result<(), EngError> {
+                let own = seq.kv[source]
+                    .as_ref()
+                    .expect("the shared-KV source layer is physical");
+                let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
+                let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
+                rotate(row, count, seq.pos.range(0, 4)?)?;
                 if physical {
                     let data = Kv8Data {
                         k: sc.k_normed.buf.range(kat, kbytes)?,
@@ -2008,10 +2090,47 @@ impl Bolt {
             };
         match rows {
             Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
-            Rows::Window { seqs } => seqs
-                .iter()
-                .enumerate()
-                .try_for_each(|(row, seq)| group(seq, row, 1, 0)),
+            Rows::Window { seqs, tables } => {
+                // Each row rotates against its own position word; the cache append and the
+                // attention then run once over all rows, each reading its own planes, cells,
+                // position and key count from its record.
+                for (row, seq) in seqs.iter().enumerate() {
+                    rotate(row, 1, seq.step.range(4, 4)?)?;
+                }
+                let table = tables[source]
+                    .as_ref()
+                    .expect("a window table for every layer that owns planes");
+                let rows = seqs.len();
+                let own = seqs[0].kv[source]
+                    .as_ref()
+                    .expect("the shared-KV source layer is physical");
+                if physical {
+                    ctx.kv8_append_multi(
+                        stream,
+                        AppendMultiCall {
+                            shape: Kv8Shape { rows, ..own.shape },
+                            k: sc.k_normed.buf.range(0, rows * kv_rows * 4)?,
+                            v: sc.v_normed.buf.range(0, rows * kv_rows * 4)?,
+                            rows: table,
+                        },
+                    )?;
+                }
+                ctx.attn_decode_gemma_multi(
+                    stream,
+                    DecodeGemmaMultiCall {
+                        n_q_head: HEADS,
+                        n_kv_head: KV_HEADS,
+                        head_dim: head,
+                        window: if layer.global { 0 } else { LOCAL_WINDOW },
+                        ring: 0,
+                        scale: 1.0,
+                        q: sc.q_normed.buf.range(0, rows * q_rows * 4)?,
+                        rows: table,
+                        split: attn_split,
+                        out: sc.ctx_out.buf.range(0, rows * q_rows * 4)?,
+                    },
+                )
+            }
         }
     }
 

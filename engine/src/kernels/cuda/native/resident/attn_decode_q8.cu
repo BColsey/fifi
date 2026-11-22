@@ -78,6 +78,7 @@ struct RowView {
     const signed char *v_codes;
     const unsigned short *v_scales;
     int kv_len;
+    int cells;  // plane cells per head of this row's planes
 };
 
 template <bool kMany>
@@ -86,9 +87,10 @@ __device__ inline RowView row_of(const Args &a, int t) {
         const inference_cuda_kv_row &r = a.rows[t];
         return {(const signed char *)r.k_codes, (const unsigned short *)r.k_scales,
                 (const signed char *)r.v_codes, (const unsigned short *)r.v_scales,
-                *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET)};
+                *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET),
+                (int)r.cells};
     } else {
-        return {a.k_codes, a.k_scales, a.v_codes, a.v_scales, *a.kv_len};
+        return {a.k_codes, a.k_scales, a.v_codes, a.v_scales, *a.kv_len, a.cells};
     }
 }
 
@@ -106,9 +108,9 @@ __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int 
 
 // kv_len must leave room for the m tokens in a linear cache; a ring takes any positive length.
 template <bool kMany>
-__device__ inline bool kv_ok(const Args &a, int kv_len) {
+__device__ inline bool kv_ok(const Args &a, int kv_len, int cells) {
     // A many-rows launch appends one token per row, so a linear cache needs no headroom.
-    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= a.cells - (kMany ? 0 : a.m - 1));
+    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= cells - (kMany ? 0 : a.m - 1));
 }
 
 // Visible keys of token t: the last min(n_keys, window) positions. first = position of key 0.
@@ -170,7 +172,7 @@ __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const RowView rw = row_of<kMany>(a, t);
     const int kv_len = rw.kv_len;
-    if (!kv_ok<kMany>(a, kv_len)) {
+    if (!kv_ok<kMany>(a, kv_len, rw.cells)) {
         return;
     }
     const int n_keys = kMany ? kv_len : kv_len + t;
@@ -183,8 +185,8 @@ __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
     }
     const int k_begin = s * chunk, k_end = min(count, k_begin + chunk);
     const int groups = D / kQuant;
-    const size_t code_stride = (size_t)a.cells * D;    // cells of one kv head of codes
-    const size_t scale_stride = (size_t)a.cells * groups;
+    const size_t code_stride = (size_t)rw.cells * D;    // cells of one kv head of codes
+    const size_t scale_stride = (size_t)rw.cells * groups;
     const bool own = tid < D;  // one dimension per thread; with D 128 only threads 0..127 own one
 
     // This lane's dims are 4 * lane .. +3, and for D 256 also 128 + 4 * lane .. +3; the group of
@@ -351,7 +353,7 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
 #endif
     const RowView rw = row_of<kMany>(a, t);
     const int kv_len = rw.kv_len;
-    if (!kv_ok<kMany>(a, kv_len)) {
+    if (!kv_ok<kMany>(a, kv_len, rw.cells)) {
         return;
     }
     const int n_keys = kMany ? kv_len : kv_len + t;
@@ -364,8 +366,8 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
     }
     const int k_begin = s * chunk, k_end = min(count, k_begin + chunk);
     const int groups = D / kQuant;
-    const size_t code_stride = (size_t)a.cells * D;    // cells of one kv head of codes
-    const size_t scale_stride = (size_t)a.cells * groups;
+    const size_t code_stride = (size_t)rw.cells * D;    // cells of one kv head of codes
+    const size_t scale_stride = (size_t)rw.cells * groups;
     const bool own = tid < D;  // one dimension per thread; with D 128 only threads 0..127 own one
 
     // This lane's dims are 4 * lane .. +3, and for D 256 also 128 + 4 * lane .. +3; the group of
@@ -529,7 +531,7 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
 #endif
     const RowView rw = row_of<kMany>(a, t);
     const int kv_len = rw.kv_len;
-    if (!kv_ok<kMany>(a, kv_len)) {
+    if (!kv_ok<kMany>(a, kv_len, rw.cells)) {
         return;
     }
     const int n_keys = kMany ? kv_len : kv_len + t;
@@ -542,8 +544,8 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
     }
     const int k_begin = s * chunk, k_end = min(count, k_begin + chunk);
     const int groups = D / kQuant;
-    const size_t code_stride = (size_t)a.cells * D;    // cells of one kv head of codes
-    const size_t scale_stride = (size_t)a.cells * groups;
+    const size_t code_stride = (size_t)rw.cells * D;    // cells of one kv head of codes
+    const size_t scale_stride = (size_t)rw.cells * groups;
     const bool own = tid < D;  // one dimension per thread; with D 128 only threads 0..127 own one
 
     // This lane's dims are 4 * lane .. +3, and for D 256 also 128 + 4 * lane .. +3; the group
@@ -745,7 +747,7 @@ __global__ void __launch_bounds__(D) attn_q8_combine_k(Args a) {
     float *o = a.out + ((size_t)t * a.n_head + h) * D + d;
     const RowView rw = row_of<kMany>(a, t);
     const int kv_len = rw.kv_len;
-    if (!kv_ok<kMany>(a, kv_len)) {
+    if (!kv_ok<kMany>(a, kv_len, rw.cells)) {
         *o = __int_as_float(0x7fc00000);  // NaN: the caller's non-finite check ends the job
         return;
     }
