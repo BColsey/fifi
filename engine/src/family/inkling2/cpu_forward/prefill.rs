@@ -18,11 +18,11 @@ struct PromptRow<'a> {
     stream: Stream,
     prelude: Option<Stream>,
     bank: Option<MessageBank>,
-    journal: Option<VerifyRow<'a>>,
+    taps: TapRow<'a>,
+    journal: Option<VerifyRow>,
 }
 
-struct VerifyRow<'a> {
-    taps: TapRow<'a>,
+struct VerifyRow {
     attention: Option<AttentionUndo>,
     undo: Vec<VisitUndo>,
 }
@@ -52,15 +52,26 @@ struct MlpRow {
 
 impl CpuForward {
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
-        !self.draft_window_enabled()
-            && matches!(&self.weights, Weights::Gguf(weights) if weights.supports_grouped_prefill())
+        if self.draft_window_enabled() {
+            self.grouped_draft_prefill
+        } else {
+            matches!(&self.weights, Weights::Gguf(weights) if weights.supports_grouped_prefill())
+        }
+    }
+
+    pub(in crate::family::inkling2) fn enable_grouped_draft_prefill(&mut self) {
+        self.grouped_draft_prefill = self.supports_exact_draft_grouping();
     }
 
     pub(in crate::family::inkling2) fn enable_grouped_verify(&mut self) -> bool {
-        self.grouped_verify = self.draft_window_enabled()
-            && matches!(&self.weights, Weights::Gguf(weights)
-                if weights.supports_grouped_verify(self.spec.stored_layers()));
+        self.grouped_verify = self.supports_exact_draft_grouping();
         self.grouped_verify
+    }
+
+    fn supports_exact_draft_grouping(&self) -> bool {
+        self.draft_window_enabled()
+            && matches!(&self.weights, Weights::Gguf(weights)
+                if weights.supports_grouped_verify(self.spec.stored_layers()))
     }
 
     pub(in crate::family::inkling2) fn grouped_verify_workspace_bytes(
@@ -139,7 +150,7 @@ impl CpuForward {
         &mut self,
         tokens: &[u32],
     ) -> Result<(), EngError> {
-        if self.draft_window_enabled() {
+        if self.draft_window_enabled() && !self.grouped_draft_prefill {
             return Err(bad("Inkling speculation requires token-major prefill"));
         }
         if self.failed {
@@ -157,9 +168,21 @@ impl CpuForward {
                 "prefill rows or tokens are outside the Inkling text limits",
             ));
         }
+        self.window = None;
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);
-        self.run_grouped_rows(&mut state, tokens, false)?;
+        let rows = self.run_grouped_rows(&mut state, tokens, false)?;
+        if !self.taps.is_empty() {
+            // Complete every terminal tap before publishing the committed piece.
+            let features = rows
+                .into_iter()
+                .map(|row| {
+                    self.finish_row(&row.stream, row.taps, false)
+                        .map(|row| row.features)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.features.extend(features.into_iter().flatten());
+        }
         self.state = state;
         self.position += tokens.len();
         self.failed = false;
@@ -175,7 +198,7 @@ impl CpuForward {
             .into_iter()
             .map(|row| {
                 let journal = row.journal.expect("grouped verify row has a journal");
-                let forward = self.finish_row(&row.stream, journal.taps, true)?;
+                let forward = self.finish_row(&row.stream, row.taps, true)?;
                 PendingRow::new(journal.undo, forward)
             })
             .collect()
@@ -197,8 +220,8 @@ impl CpuForward {
                     stream: self.embed(id)?,
                     prelude: None,
                     bank: None,
+                    taps: TapRow::new(&self.taps, self.hidden()),
                     journal: verify.then(|| VerifyRow {
-                        taps: TapRow::new(&self.taps, self.hidden()),
                         attention: None,
                         undo: Vec::with_capacity(self.visits.len()),
                     }),
@@ -242,8 +265,8 @@ impl CpuForward {
             .into_iter()
             .flatten();
         let inputs = rows.iter_mut().map(|row| {
+            row.taps.capture(visit.state_slot, &row.stream.current);
             if let Some(journal) = &mut row.journal {
-                journal.taps.capture(visit.state_slot, &row.stream.current);
                 journal.attention =
                     Some(state.checkpoint_attention(self.kv_capacity(visit.attention)));
             }
@@ -273,8 +296,7 @@ impl CpuForward {
                 })
                 .collect::<Result<_, EngError>>()?
         };
-        let verify = rows[0].journal.is_some();
-        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp, verify)?;
+        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp)?;
         for (row, output) in rows.iter_mut().zip(outputs) {
             if let Some(journal) = &mut row.journal {
                 let attention = journal
@@ -333,7 +355,6 @@ impl CpuForward {
         layer: usize,
         prefix: &str,
         mlp: &[MlpRow],
-        verify: bool,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let routes: Vec<_> = mlp
             .iter()
@@ -356,9 +377,9 @@ impl CpuForward {
         )? {
             return Ok(output);
         }
-        // Verification uses the same device activation and rank reduction as the
-        // scalar expert group. Its fallback must preserve that arithmetic.
-        let batch = if verify {
+        // Draft conditioning and verification preserve the scalar expert group's
+        // device activation and rank reduction, including on fallback.
+        let batch = if self.draft_window_enabled() {
             None
         } else {
             weights.prefill_experts(names, layer as u32, &routes, |gate, up| {
@@ -394,6 +415,81 @@ fn prefill_projection_batch_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS").as_deref() == Ok("1")
     })
+}
+
+#[test]
+#[ignore = "requires a leased CUDA device and a fully resident packed Inkling 2 Mini GGUF"]
+fn grouped_draft_prefill_matches_serial_taps_and_restored_state() {
+    use crate::family::{session::TokenStepper, speculate::driver::WindowModel};
+    use std::{env, path::Path, sync::Arc};
+
+    let directory = env::var_os("FIFI_INKLING_MODEL_DIR").expect("set the Inkling GGUF");
+    let mut model = CpuForward::open(Path::new(&directory), 11).unwrap();
+    model.spec.sliding_window_size = 2;
+    model.prepare_draft(vec![5, 23, 41, 48], 3).unwrap();
+    model.enable_cuda(0).unwrap();
+    assert!(!model.supports_grouped_prefill());
+
+    model.feed_rows(&[1, 2, 3]).unwrap();
+    let prefix = model.snapshot();
+    let suffix = [4, 5, 6, 7, 8, 9];
+    model.feed_rows(&suffix).unwrap();
+    let serial = model.snapshot();
+    let logits = model.logits(10).unwrap();
+    assert_eq!(serial.features.len(), serial.position);
+    assert!(
+        serial
+            .features
+            .iter()
+            .all(|row| row.len() == 4 * model.hidden())
+    );
+    model.enable_grouped_draft_prefill();
+    assert!(model.supports_grouped_prefill());
+
+    for width in [2, 4] {
+        let old_lineage = Arc::clone(&model.draft_lineage);
+        model.restore(&prefix);
+        assert!(!Arc::ptr_eq(&old_lineage, &model.draft_lineage));
+        assert_eq!(model.features, prefix.features);
+        assert_eq!(model.position(), prefix.position);
+        assert!(model.feed_rows(&[suffix[0], model.vocab_size()]).is_err());
+        assert_eq!(model.features, prefix.features);
+        assert_eq!(model.position(), prefix.position);
+
+        model.run_window(&suffix[..1]).unwrap();
+        let resumed_lineage = Arc::clone(&model.draft_lineage);
+        for chunk in suffix.chunks(width) {
+            model.feed_rows(chunk).unwrap();
+            assert_eq!(model.features.len(), model.position());
+        }
+        assert!(model.window.is_none());
+        assert!(Arc::ptr_eq(&resumed_lineage, &model.draft_lineage));
+        assert_eq!(model.position(), serial.position);
+        for (visit, (actual, expected)) in model.state.iter().zip(&serial.visits).enumerate() {
+            assert!(
+                actual == expected,
+                "width {width}, visit {visit} state differed"
+            );
+        }
+        for (row, (actual, expected)) in model.features.iter().zip(&serial.features).enumerate() {
+            assert!(
+                actual
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(expected.iter().map(|x| x.to_bits())),
+                "width {width}, row {row} tap bits differed"
+            );
+        }
+        assert!(
+            model
+                .logits(10)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(logits.iter().map(|x| x.to_bits())),
+            "width {width} continuation logits differed"
+        );
+    }
 }
 
 #[test]

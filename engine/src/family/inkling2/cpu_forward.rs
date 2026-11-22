@@ -68,6 +68,8 @@ pub(super) struct CpuForward {
     window_limit: usize,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     grouped_verify: bool,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    grouped_draft_prefill: bool,
 }
 
 pub(super) struct PrefixState {
@@ -178,6 +180,8 @@ impl CpuForward {
             window_limit: 0,
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             grouped_verify: false,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            grouped_draft_prefill: false,
         })
     }
 

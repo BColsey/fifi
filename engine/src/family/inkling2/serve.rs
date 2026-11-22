@@ -54,7 +54,10 @@ pub(crate) fn start_engine(
             }
             forward.prepare_draft(std::mem::take(&mut draft.taps), draft.max_drafts)?;
         }
-        let planning_rows = if forward.draft_window_enabled() {
+        let grouped_draft_prefill_requested = backend == TextBackend::Cuda
+            && forward.draft_window_enabled()
+            && std::env::var("FIFI_INKLING_DSPARK_GROUPED_PREFILL").as_deref() == Ok("1");
+        let planning_rows = if forward.draft_window_enabled() && !grouped_draft_prefill_requested {
             1
         } else {
             requested_rows
@@ -88,6 +91,10 @@ pub(crate) fn start_engine(
                 "Inkling CUDA grouped verify {}",
                 serde_json::json!({"enabled": enabled, "host_workspace_admitted": plan.grouped_verify})
             );
+        }
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if grouped_draft_prefill_requested && plan.prefill_rows > 1 {
+            forward.enable_grouped_draft_prefill();
         }
         let prefill_rows = if supports_grouped_prefill(&forward) {
             plan.prefill_rows
@@ -327,6 +334,7 @@ impl TextSettings {
                 }
                 #[cfg(feature = "native-cuda")]
                 {
+                    let mut plan = plan;
                     let capacity = admission.payload_spare();
                     if grouped_verify_requested {
                         let extra = forward.grouped_verify_workspace_bytes()?;
@@ -337,25 +345,23 @@ impl TextSettings {
                             extra,
                             capacity,
                         ) {
-                            return Ok(HostPrefillPlan {
-                                grouped_verify: true,
-                                ..HostPrefillPlan::serial(host_reserve)
-                            });
+                            plan.grouped_verify = true;
+                            plan.host_reserve = host_reserve;
                         }
                     }
                     if requested_rows > 1 {
+                        // The pinned expert prefill arena may outlive prefill.
                         let (prefill_rows, host_reserve) = fit_prefill(
                             requested_rows,
                             forward.context,
-                            host_reserve,
+                            plan.host_reserve,
                             forward.prefill_workspace_bytes_per_row()?,
                             capacity,
                         );
-                        return Ok(HostPrefillPlan {
-                            prefill_rows,
-                            ..HostPrefillPlan::serial(host_reserve)
-                        });
+                        plan.prefill_rows = prefill_rows;
+                        plan.host_reserve = host_reserve;
                     }
+                    return Ok(plan);
                 }
             }
         }

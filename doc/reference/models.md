@@ -68,6 +68,8 @@ Set `"prefix_reuse": true` in the server configuration to reuse saved chat prefi
 
 Set `FIFI_INKLING_CUDA_PREFILL_ROWS` from 2 to 16 to group prompt tokens on the GGUF CUDA backend with shared expert streaming. Each attention and convolution state advances in token order. The CUDA staging banks upload each missing expert once per layer visit and prompt chunk. `FIFI_INKLING_CUDA_PROFILE=1` records expert uploads in the shared request log. A value of 1 uses single-token prefill and is the default.
 
+Set `FIFI_INKLING_DSPARK_GROUPED_PREFILL=1` to capture target features during grouped prompt prefill on the same compatible CUDA backend as grouped verification. Set `FIFI_INKLING_CUDA_PREFILL_ROWS` above one to request a group width. The host memory planner admits the width, and the startup prefill report shows the admitted value. The prefill and verification switches can be enabled independently. Token-major feature capture is the default.
+
 ## Tokenizer files
 
 Engines that use external tokenizer files read `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.
