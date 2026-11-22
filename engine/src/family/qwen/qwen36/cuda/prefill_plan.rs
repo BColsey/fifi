@@ -905,6 +905,42 @@ mod card_tests {
         }
     }
 
+    /// The incident: a UD-IQ4_XS default start chose fp16 at 243,712 positions with a budget of
+    /// 4,864,344,064 bytes after the load, and the prefill kept one token per step. The figures
+    /// the admission charged then go through the admission's own rule: the state alone exceeds the
+    /// budget at 243,712, and the stepped-down 223,232 passes.
+    #[test]
+    fn the_incident_context_is_refused_and_the_stepped_down_one_passes() {
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let state_at =
+            |context: usize| state_bytes(&dims, KvMode::Fp16, context, 1).expect("state");
+        assert_eq!(state_at(243_712), 5_057_086_208);
+        assert_eq!(state_at(223_232), 4_637_655_808);
+        let budget = 4_864_344_064;
+        let tip = 65_863_680;
+        let decode = 2_238_724;
+        let passes = |context: usize| {
+            smallest_chunk_passes(&dims, 82, budget, (decode, tip), state_at(context))
+                .expect("the rule answers")
+        };
+        assert!(!passes(243_712), "the state alone exceeds the budget");
+        assert!(passes(223_232), "the chosen context leaves the arena room");
+        // The boundary is monotone: no longer context passes where a shorter one is refused.
+        let mut refused = false;
+        for context in (200_000..262_144).step_by(1024) {
+            let ok = passes(context);
+            assert!(!(refused && ok), "{context}");
+            refused |= !ok;
+        }
+        assert!(refused);
+    }
+
     /// The default start of every local Qwen3.6-architecture GGUF on a free 3090: the context the
     /// card fit picks without and with the prefill admission asked first, and the figures the
     /// admission charges at each. Reads headers only.
@@ -982,14 +1018,14 @@ mod card_tests {
                     .saturating_sub(weights)
                     .saturating_sub(crate::family::mem::DEVICE.load_unplanned)
                     .saturating_sub(1 << 30) as usize;
-                let admits = |kv: KvDtype, context: u32| {
+                let admits = |kv: KvDtype, context: u32| -> Result<bool, EngError> {
                     let mode = if kv == KvDtype::Q8 {
                         KvMode::Int8G32
                     } else {
                         KvMode::Fp16
                     };
                     if mode != KvMode::Fp16 {
-                        return true;
+                        return Ok(true);
                     }
                     let options = StepOptions {
                         kv_mode: mode,
@@ -1002,9 +1038,9 @@ mod card_tests {
                     let state = StateLayout::new(&dims, &options)
                         .and_then(|layout| layout.bytes())
                         .expect("state");
-                    smallest_chunk_passes(&dims, 82, budget, (3 << 20, tip), state).expect("passes")
+                    smallest_chunk_passes(&dims, 82, budget, (3 << 20, tip), state)
                 };
-                let fit = |admits: &dyn Fn(KvDtype, u32) -> bool| {
+                let fit = |admits: &dyn Fn(KvDtype, u32) -> Result<bool, EngError>| {
                     choose_cuda_fit(
                         &QWEN3_6_35B_A3B,
                         CudaFitAsk {
@@ -1019,7 +1055,7 @@ mod card_tests {
                     )
                     .unwrap()
                 };
-                let (without, with) = (fit(&|_, _| true), fit(&admits));
+                let (without, with) = (fit(&|_, _| Ok(true)), fit(&admits));
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 eprintln!(
                     "{name:60.60} weights {:.2} GiB | without {without:?} | with {with:?}",

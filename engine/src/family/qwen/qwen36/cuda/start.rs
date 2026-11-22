@@ -1433,15 +1433,17 @@ fn int8_cache_usable() -> bool {
 }
 
 /// Whether the prefill admission keeps a chunk arena for a cache form at a context, from the free
-/// bytes before the weights are uploaded: the admission's own rule (`smallest_chunk_passes`) over
-/// the state at that context, with what the weight load takes beyond its planned tensor bytes, the
+/// bytes before the weights are uploaded: the admission's own rule for the form (the unfixed
+/// ladder for fp16, `fixed_kv8_passes` for int8) over the state at that context, with what the
+/// weight load takes beyond its planned tensor bytes and the measurement band held back, the
 /// headroom, the decode arena and the device prefix tip charged as the admission charges them.
+/// A question it cannot answer is an error, never a yes.
 fn prefill_admits_of<'a>(
     projector: &CudaProjector,
     settings: &'a Q36Settings,
     plan: &'a StartupPlan,
     (free, weights): (u64, u64),
-) -> Result<impl Fn(KvDtype, u32) -> bool + 'a, EngError> {
+) -> Result<impl Fn(KvDtype, u32) -> Result<bool, EngError> + 'a, EngError> {
     let dims = StepDims::new(
         &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?,
         &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
@@ -1453,33 +1455,60 @@ fn prefill_admits_of<'a>(
         }
         _ => 0,
     };
+    let cap = chunk_prefill_rows(std::env::var_os(CHUNK_ROWS_VAR).as_deref())? as usize;
     let after_load = free
         .saturating_sub(weights)
-        .saturating_sub(crate::family::mem::DEVICE.load_unplanned);
-    let budget = after_load.saturating_sub(prefill_headroom(plan.modes.fixed_admission) as u64);
+        .saturating_sub(crate::family::mem::DEVICE.load_unplanned)
+        .saturating_sub(crate::family::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let bytes = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
     Ok(move |kv: KvDtype, context: u32| {
-        // The fixed KV8 admission has its own rule; only the fp16 cache is asked here.
-        let Ok(mode @ KvMode::Fp16) = kv_mode_of(kv, WeightLayout::Native) else {
-            return true;
-        };
-        let Ok(options) = step_options(context, WeightLayout::Native, mode) else {
-            return true;
-        };
-        let Ok(state) = StateLayout::new(&dims, &options).and_then(|layout| layout.bytes()) else {
-            return true;
-        };
-        let decode = KernelScratch::for_dims(&dims, STEP_ROWS, mode)
-            .and_then(|scratch| StepPlan::new(&dims, STEP_ROWS, &options, &scratch))
-            .map_or(0, |step| step.arena_bytes());
-        super::prefill_plan::smallest_chunk_passes(
-            &dims,
-            nsm,
-            usize::try_from(budget).unwrap_or(usize::MAX),
-            (decode, tip as usize),
-            state,
-        )
-        .unwrap_or(true)
+        let mode = kv_mode_of(kv, WeightLayout::Native)?;
+        let options = step_options(context, WeightLayout::Native, mode)?;
+        let state = StateLayout::new(&dims, &options)?.bytes()?;
+        let scratch = KernelScratch::for_dims(&dims, STEP_ROWS, mode)?;
+        let decode = StepPlan::new(&dims, STEP_ROWS, &options, &scratch)?.arena_bytes();
+        match mode {
+            KvMode::Fp16 => super::prefill_plan::smallest_chunk_passes(
+                &dims,
+                nsm,
+                bytes(after_load.saturating_sub(prefill_headroom(false) as u64)),
+                (decode, bytes(tip)),
+                state,
+            ),
+            KvMode::Int8G32 => {
+                let resident = (state as u64) + (decode as u64) + tip;
+                super::prefill_driver::fixed_kv8_passes(
+                    &dims,
+                    nsm,
+                    (
+                        bytes(after_load.saturating_sub(prefill_headroom(true) as u64)),
+                        bytes(after_load.saturating_sub(resident)),
+                    ),
+                    (decode, bytes(tip)),
+                    (state, context as usize, cap),
+                )
+            }
+        }
     })
+}
+
+/// Asks the card fit again with no prefill gate: whether a fit exists at all. A fit that exists
+/// without the gate and not with it means the card holds the weights and a cache but leaves no
+/// room for a prefill arena at any context, which the start refuses by name.
+fn require_prefill_room(
+    settings: &Q36Settings,
+    ask: CudaFitAsk,
+    load_need: &dyn Fn(KvDtype, u32) -> Option<u64>,
+) -> Result<(), EngError> {
+    match choose_cuda_fit(&settings.spec, ask, load_need, &|_, _| Ok(true))? {
+        Some(_) => Err(EngError::MemoryPlan(
+            "q36 cuda: the card holds the weights and a KV cache but leaves no room for a prefill \
+             arena at any context; name a smaller context_limit or a cache form that leaves \
+             room"
+                .to_owned(),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The cache form and context of a start that left them to the card, asked before any weight is
@@ -1503,19 +1532,22 @@ fn card_fit(
     }
     let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    let ask = CudaFitAsk {
+        free,
+        weights,
+        int8_usable: int8_cache_usable(),
+        kv: (!settings.kv_auto).then_some(settings.kv),
+        context: (!settings.context_auto).then_some(settings.context_limit),
+    };
+    let load_need = load_need_of(settings, plan);
     let Some(fit) = choose_cuda_fit(
         &settings.spec,
-        CudaFitAsk {
-            free,
-            weights,
-            int8_usable: int8_cache_usable(),
-            kv: (!settings.kv_auto).then_some(settings.kv),
-            context: (!settings.context_auto).then_some(settings.context_limit),
-        },
-        &load_need_of(settings, plan),
+        ask,
+        &load_need,
         &prefill_admits_of(projector, settings, plan, (free, weights))?,
     )?
     else {
+        require_prefill_room(settings, ask, &load_need)?;
         return Ok(None);
     };
     let variant = Q36Settings {

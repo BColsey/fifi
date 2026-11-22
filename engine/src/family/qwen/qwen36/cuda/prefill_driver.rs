@@ -363,6 +363,43 @@ pub(super) fn admit_fixed_staged(
     }
 }
 
+/// Whether the fixed KV8 admission keeps a chunk arena at `context` rows: the admission's own
+/// ladder (`admit_fixed_staged`) over the default stage, the live free bytes left once the state,
+/// the decode arena and the device prefix tip are resident, and the budget the admission compares.
+/// `Ok(false)` is a budget or live-room refusal; any other error surfaces.
+pub(super) fn fixed_kv8_passes(
+    dims: &StepDims,
+    nsm: usize,
+    (budget, live_free): (usize, usize),
+    (decode_arena, tip): (usize, usize),
+    (state, context, cap): (usize, usize, usize),
+) -> Result<bool, EngError> {
+    let a = &dims.shape.attn;
+    let staging = Kv8StagingPlan::for_context(fixed_staging_rows(context), a.heads_kv, a.head_dim)?;
+    let facts = AdmitFacts {
+        budget,
+        decode_arena,
+        state_planned: state,
+        state_allocated: state,
+        cap: fixed_chunk_rows(context, cap),
+    };
+    let extras = if tip > 0 {
+        vec![Extra {
+            name: "device-prefix-delta",
+            fixed: tip,
+            bytes_per_token: 0,
+        }]
+    } else {
+        Vec::new()
+    };
+    let costs = super::prefill_plan::chunk_costs(dims, nsm)?;
+    match admit_fixed_staged(&facts, &extras, &costs, staging, None, live_free, context) {
+        Ok(_) => Ok(true),
+        Err(EngError::MemoryPlan(_)) => Ok(false),
+        Err(other) => Err(other),
+    }
+}
+
 /// The architectural stage floor: the segmented-attention split bound for the context,
 /// so every rung the ladder may keep satisfies `capacity.div_ceil(rung) <= CPF_ATTN_MAX_SPLITS`.
 /// Pinned by tests: 262144 -> 2048, 180224 -> 1408.
