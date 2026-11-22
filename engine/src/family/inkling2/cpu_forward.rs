@@ -510,6 +510,19 @@ impl CpuForward {
         bank: Option<&MessageBank>,
         attention: AttentionInput,
     ) -> Result<Vec<f32>, EngError> {
+        let input = self.mlp_residual(visit, layer, state, stream, bank, attention)?;
+        self.finish_mlp_input(input, bank, visit.weight_layer, layer)
+    }
+
+    fn mlp_residual(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        state: &mut VisitState,
+        stream: &mut Stream,
+        bank: Option<&MessageBank>,
+        attention: AttentionInput,
+    ) -> Result<Vec<f32>, EngError> {
         let physical = visit.weight_layer;
         let query = self.weights.vec(
             &format!("model.llm.attn_res.mlp_queries.{physical}"),
@@ -539,10 +552,19 @@ impl CpuForward {
             add(&mut stream.current, &attn, 1.0);
         }
 
-        let mut mlp_input = stream.mix(0, &query);
-        self.control(&mut mlp_input, bank, physical, layer, Role::Mlp)?;
-        self.norm(&mut mlp_input, &format!("{layer}.mlp_norm.weight"))?;
-        Ok(mlp_input)
+        Ok(stream.mix(0, &query))
+    }
+
+    fn finish_mlp_input(
+        &self,
+        mut input: Vec<f32>,
+        bank: Option<&MessageBank>,
+        physical: usize,
+        layer: &str,
+    ) -> Result<Vec<f32>, EngError> {
+        self.control(&mut input, bank, physical, layer, Role::Mlp)?;
+        self.norm(&mut input, &format!("{layer}.mlp_norm.weight"))?;
+        Ok(input)
     }
 
     fn finish_layer(

@@ -2,14 +2,16 @@
 //! order, then computes the routed expert outputs using the shared CUDA banks.
 
 use super::{
-    AttentionInput, CpuForward, LayerVisit, MessageBank, MoeRoute, Stream, TapRow, VisitState,
-    Weights, add, bad, controller_batch::controller_batch_enabled, window::PendingRow,
+    AttentionInput, CpuForward, LayerVisit, MessageBank, MoeRoute, Role, Stream, TapRow,
+    VisitState, Weights, add, apply_control, bad, control_names,
+    controller_batch::{controller_batch_enabled, multirow_controllers_enabled},
+    window::PendingRow,
 };
 use crate::{
     EngError,
     family::inkling2::{
         cpu_attention::{AttentionUndo, VisitUndo},
-        cuda_projection::gguf::streaming::PrefillRoute,
+        cuda_projection::gguf::{BatchController, streaming::PrefillRoute},
         gguf_weights::GgufTextWeights,
     },
 };
@@ -134,6 +136,11 @@ impl CpuForward {
                     + 18 * size_of::<crate::kernels::cuda::resident::dense_gemv::DenseGemvCall<'_>>(
                     )) as u128;
             }
+        }
+        if multirow_controllers_enabled() {
+            // MLP residuals/messages/gates/projections plus the tile's host transfer copies.
+            projection_values += 12 * hidden;
+            projection_metadata += (8 * size_of::<Vec<f32>>()) as u128;
         }
         // Batched router logits coexist with the selected rows' scores.
         let numeric_bytes =
@@ -272,29 +279,49 @@ impl CpuForward {
             .prompt_attention_inputs(visit, &layer, rows, weights)?
             .into_iter()
             .flatten();
+        let router = format!("{prefix}.gate.weight");
+        let batch_router = weights.batch_prefill_router(physical as u32, &router);
+        // Without the resident batched router, preserve the interleave between
+        // per-row prefetch and route observation on cold expert layers.
+        let controller = if batch_router
+            && multirow_controllers_enabled()
+            && rows.first().is_some_and(|row| row.bank.is_some())
+        {
+            let names = control_names(&layer, Role::Mlp);
+            weights.batch_controller(
+                names.each_ref().map(String::as_str),
+                [self.spec.core.gate_rank as usize, self.hidden()],
+                rows.len(),
+            )?
+        } else {
+            None
+        };
         let inputs = rows.iter_mut().map(|row| {
             row.taps.capture(visit.state_slot, &row.stream.current);
             if let Some(journal) = &mut row.journal {
                 journal.attention =
                     Some(state.checkpoint_attention(self.kv_capacity(visit.attention)));
             }
-            self.mlp_input(
+            let input = self.mlp_residual(
                 visit,
                 &layer,
                 state,
                 &mut row.stream,
                 row.bank.as_ref(),
                 AttentionInput::Grouped(projected.next()),
-            )
+            )?;
+            if controller.is_some() {
+                Ok(input)
+            } else {
+                self.finish_mlp_input(input, row.bank.as_ref(), physical, &layer)
+            }
         });
-        let router = format!("{prefix}.gate.weight");
-        let mlp = if weights.batch_prefill_router(physical as u32, &router) {
-            self.prompt_routes(
-                weights,
-                physical,
-                &prefix,
-                inputs.collect::<Result<_, _>>()?,
-            )?
+        let mlp = if batch_router {
+            let mut inputs = inputs.collect::<Result<Vec<_>, _>>()?;
+            if let Some(controller) = controller {
+                self.prompt_mlp_control(visit, &layer, rows, &mut inputs, controller)?;
+            }
+            self.prompt_routes(weights, physical, &prefix, inputs)?
         } else {
             inputs
                 .map(|input| {
@@ -314,6 +341,39 @@ impl CpuForward {
                 journal.undo.push(attention.with_mlp(state));
             }
             self.finish_layer(&layer, state, &mut row.stream, output)?;
+        }
+        Ok(())
+    }
+
+    fn prompt_mlp_control(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        rows: &[PromptRow<'_>],
+        inputs: &mut [Vec<f32>],
+        controller: BatchController<'_>,
+    ) -> Result<(), EngError> {
+        let _span = self.phase_span(super::Work::Controller);
+        let controls = inputs
+            .iter()
+            .zip(rows)
+            .map(|(input, row)| {
+                let bank = row
+                    .bank
+                    .as_ref()
+                    .ok_or_else(|| bad("Inkling grouped MLP lost a message bank"))?;
+                self.control_input(input, bank, visit.weight_layer, Role::Mlp)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let gates: Vec<_> = controls
+            .iter()
+            .map(|control| control.gate.as_slice())
+            .collect();
+        let projections = controller.project(&gates, "mlp")?;
+        let norm = format!("{layer}.mlp_norm.weight");
+        for ((input, control), projection) in inputs.iter_mut().zip(controls).zip(projections) {
+            apply_control(input, control.message, projection);
+            self.norm(input, &norm)?;
         }
         Ok(())
     }

@@ -22,6 +22,7 @@ use super::{Resident, bad};
 
 mod attention_prefill;
 mod controlled_attention;
+mod controller_prefill;
 mod draft_head;
 
 pub(in crate::family::inkling2) use controlled_attention::ControlledAttentionInput;
@@ -707,6 +708,85 @@ fn float_bytes(len: usize) -> Result<usize, EngError> {
 mod controller_tests {
     use super::*;
     use crate::{family::inkling2::cuda_projection::upload_tensor, kernels::cuda::device_present};
+
+    #[test]
+    fn multirow_controller_tiles_match_scalar_bits_and_validate_inputs() {
+        if !device_present("Inkling multirow controller tiles") {
+            return;
+        }
+        let context = CudaContext::new().unwrap();
+        let shape @ [rank, hidden] = [32, 48];
+        let step = |rows| {
+            let plan =
+                DensePlan::new([rows * (4 * hidden + rank), 2 * hidden], hidden, rank).unwrap();
+            DenseStep::new(&context, &plan).unwrap()
+        };
+        let narrow = step(1);
+        let step = step(2);
+        assert_eq!(step.controller_batch_capacity(shape).unwrap(), 2);
+        let matrices = [[rank, 2 * hidden], [hidden, rank], [hidden, rank]];
+        let dtypes = [DenseDtype::Bf16, DenseDtype::F32, DenseDtype::Bf16];
+        let weights: [Resident; 3] = std::array::from_fn(|index| {
+            let shape = matrices[index];
+            let bytes: Vec<_> = (0..shape[0] * shape[1])
+                .flat_map(|i| {
+                    let value = (((i * (3 + index) + index) % 41) as f32 - 20.0) / 128.0;
+                    if dtypes[index] == DenseDtype::F32 {
+                        value.to_ne_bytes().to_vec()
+                    } else {
+                        ((value.to_bits() >> 16) as u16).to_ne_bytes().to_vec()
+                    }
+                })
+                .collect();
+            Resident {
+                codes: upload_tensor(&context, &bytes).unwrap(),
+                shape,
+            }
+        });
+        let weights = std::array::from_fn(|i| (&weights[i], dtypes[i]));
+        let inputs: Vec<Vec<f32>> = (0..5)
+            .map(|row| {
+                (0..2 * hidden)
+                    .map(|col| ((row * 5 + col * 7) % 71) as f32 * 0.013 - 0.4)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
+        assert!(
+            narrow
+                .project_controller_batch(&context, &refs, weights, shape)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            step.project_controller_batch(&context, &refs[..1], weights, shape)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            step.project_controller_batch(&context, &[refs[0], &refs[1][1..]], weights, shape)
+                .is_err()
+        );
+        let invalid = vec![f32::NAN; 2 * hidden];
+        assert!(
+            step.project_controller_batch(&context, &[refs[0], &invalid], weights, shape)
+                .is_err()
+        );
+        let actual = step
+            .project_controller_batch(&context, &refs, weights, shape)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.len(), refs.len());
+        for (row, input) in actual.iter().zip(refs) {
+            let expected = step.controller(&context, weights, input).unwrap();
+            assert_ne!(expected[0], expected[1]);
+            assert_eq!(
+                row.each_ref()
+                    .map(|plane| plane.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
+                expected.map(|plane| plane.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+            );
+        }
+    }
 
     #[test]
     fn grouped_controller_tiles_match_scalar_bits() {

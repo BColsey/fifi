@@ -862,6 +862,18 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn batch_controller(
+        &self,
+        names: [&str; 3],
+        shape: [usize; 2],
+        rows: usize,
+    ) -> Result<Option<super::cuda_projection::gguf::BatchController<'_>>, EngError> {
+        self.cuda
+            .as_ref()
+            .map_or(Ok(None), |cuda| cuda.batch_controller(names, shape, rows))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn attention_controllers(
         &self,
         names: [[&str; 3]; 3],

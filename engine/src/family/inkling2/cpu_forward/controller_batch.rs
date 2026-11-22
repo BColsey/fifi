@@ -106,7 +106,7 @@ impl CpuForward {
             .iter()
             .map(|row| row.each_ref().map(|item| item.control.gate.as_slice()))
             .collect();
-        let projections = controllers.project(&inputs)?;
+        let projections = controllers.project(&inputs, multirow_controllers_enabled())?;
         let local = visit.attention == Attention::Local;
         let mut result = Vec::with_capacity(prepared.len());
         for (row, projections) in prepared.into_iter().zip(projections) {
@@ -154,6 +154,13 @@ fn name_refs(names: &[[String; 3]; 3]) -> [[&str; 3]; 3] {
     names
         .each_ref()
         .map(|names| names.each_ref().map(String::as_str))
+}
+
+pub(super) fn multirow_controllers_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FIFI_INKLING_CUDA_MULTIROW_CONTROLLERS").as_deref() == Ok("1")
+    })
 }
 
 pub(super) fn controller_batch_enabled() -> bool {

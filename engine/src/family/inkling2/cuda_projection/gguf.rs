@@ -69,6 +69,38 @@ type ControllerOutput = Option<[Vec<f32>; 2]>;
 
 pub(in crate::family::inkling2) use super::dense::ControlledAttentionInput;
 
+pub(in crate::family::inkling2) struct BatchController<'a> {
+    cuda: &'a GgufCuda,
+    weights: ControllerWeights<'a>,
+    shape: [usize; 2],
+    capacity: usize,
+}
+
+impl BatchController<'_> {
+    pub(in crate::family::inkling2) fn project(
+        &self,
+        inputs: &[&[f32]],
+        role: &str,
+    ) -> Result<Vec<[Vec<f32>; 2]>, EngError> {
+        let values = self
+            .cuda
+            .step
+            .project_controller_batch(&self.cuda.context, inputs, self.weights, self.shape)?
+            .ok_or_else(|| bad("CUDA controller batch was not admitted"))?;
+        let receipt = || {
+            serde_json::json!({
+                "role": role, "rows": inputs.len(), "tiles": inputs.len().div_ceil(self.capacity),
+            })
+        };
+        static USED: std::sync::Once = std::sync::Once::new();
+        USED.call_once(|| eprintln!("Inkling CUDA used multirow controller {}", receipt()));
+        if self.cuda.prefill_report.is_some() {
+            eprintln!("Inkling CUDA multirow controller tile report {}", receipt());
+        }
+        Ok(values)
+    }
+}
+
 pub(in crate::family::inkling2) struct AttentionControllers<'a> {
     cuda: &'a GgufCuda,
     weights: [Option<ControllerWeights<'a>>; 3],
@@ -96,7 +128,31 @@ impl AttentionControllers<'_> {
     pub(in crate::family::inkling2) fn project(
         &self,
         inputs: &[[&[f32]; 3]],
+        multirow: bool,
     ) -> Result<Vec<[ControllerOutput; 3]>, EngError> {
+        if multirow && inputs.len() > 1 {
+            let capacity = self.cuda.step.controller_batch_capacity(self.shape)?;
+            if capacity >= 2 {
+                let mut result = vec![[None, None, None]; inputs.len()];
+                for (index, weights) in self.weights.into_iter().enumerate() {
+                    let Some(weights) = weights else { continue };
+                    let controller = BatchController {
+                        cuda: self.cuda,
+                        weights,
+                        shape: self.shape,
+                        capacity,
+                    };
+                    let role = ["q", "k", "v"][index];
+                    let gates: Vec<_> = inputs.iter().map(|row| row[index]).collect();
+                    for (row, projection) in
+                        result.iter_mut().zip(controller.project(&gates, role)?)
+                    {
+                        row[index] = Some(projection);
+                    }
+                }
+                return Ok(result);
+            }
+        }
         let rows: Vec<_> = inputs
             .iter()
             .flat_map(|row| self.weights.into_iter().zip(row))
@@ -670,6 +726,30 @@ impl GgufCuda {
             return Some(Err(bad("bad GGUF CUDA controller projection shape")));
         }
         Some(Ok(weights.map(|(w, dtype)| (w, *dtype))))
+    }
+
+    pub(in crate::family::inkling2) fn batch_controller(
+        &self,
+        names: [&str; 3],
+        shape: [usize; 2],
+        rows: usize,
+    ) -> Result<Option<BatchController<'_>>, EngError> {
+        let capacity = self.step.controller_batch_capacity(shape)?;
+        if rows < 2 || capacity < 2 {
+            return Ok(None);
+        }
+        let Some(weights) = self
+            .controller_weights(names, 2 * shape[1], shape)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(BatchController {
+            cuda: self,
+            weights,
+            shape,
+            capacity,
+        }))
     }
 
     pub(in crate::family::inkling2) fn attention_controllers(
