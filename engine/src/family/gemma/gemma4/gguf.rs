@@ -123,12 +123,31 @@ fn read_window(header: &crate::weights::GgufHeader, most: u64) -> Result<usize, 
     Ok(window as usize)
 }
 
-/// One expected tensor: storage type and dimensions in file order. An expected Q8_0 stands for
-/// a matrix: the file may store it in any type a native kernel reads, which is how the Q8_0
-/// original and its K-quant and IQ requants share one inventory.
+/// How the file stores one expected tensor.
+#[derive(Clone, Copy)]
+pub(super) enum Stored {
+    /// Exactly this type (the norms and scales, which every file keeps in F32).
+    Exact(GgufType),
+    /// A matrix: any type a native kernel reads, which is how the Q8_0 original and its K-quant
+    /// and IQ requants share one inventory.
+    Matrix,
+}
+
+impl Stored {
+    /// The type a test fixture writes for this tensor: the exact one, or Q8_0 for a matrix.
+    #[cfg(test)]
+    pub(super) fn fixture(self) -> GgufType {
+        match self {
+            Self::Exact(ty) => ty,
+            Self::Matrix => GgufType::Q80,
+        }
+    }
+}
+
+/// One expected tensor: how it is stored and its dimensions in file order.
 pub(super) struct Expected {
     pub(super) name: String,
-    pub(super) ty: GgufType,
+    pub(super) ty: Stored,
     pub(super) dims: Vec<u64>,
 }
 
@@ -137,17 +156,17 @@ pub(super) fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
     let mut expected = Vec::with_capacity(667);
     expected.push(Expected {
         name: "token_embd.weight".to_owned(),
-        ty: GgufType::Q80,
+        ty: Stored::Matrix,
         dims: vec![HIDDEN, VOCAB],
     });
     expected.push(Expected {
         name: "output_norm.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![HIDDEN],
     });
     expected.push(Expected {
         name: "rope_freqs.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![256],
     });
     for (layer, &heads) in kv.iter().enumerate() {
@@ -161,12 +180,12 @@ pub(super) fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
         let base = format!("blk.{layer}.");
         let norm = |suffix: &str, width: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::F32,
+            ty: Stored::Exact(GgufType::F32),
             dims: vec![width],
         };
         let matrix = |suffix: &str, rows: u64, cols: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::Q80,
+            ty: Stored::Matrix,
             dims: vec![rows, cols],
         };
         expected.push(norm("attn_norm.weight", HIDDEN));
@@ -209,9 +228,9 @@ fn check_inventory(
     // The missing-tensor refusal below names the first absent entry in this
     // order; sorting keeps that name stable regardless of inventory build order.
     expected.sort_by(|left, right| left.name.cmp(&right.name));
-    let table: std::collections::HashMap<&str, (&GgufType, &[u64])> = expected
+    let table: std::collections::HashMap<&str, (Stored, &[u64])> = expected
         .iter()
-        .map(|item| (item.name.as_str(), (&item.ty, item.dims.as_slice())))
+        .map(|item| (item.name.as_str(), (item.ty, item.dims.as_slice())))
         .collect();
     for tensor in header.tensors() {
         // A tensor the recipe does not read and that cannot change the result (a file's own extras)
@@ -223,21 +242,23 @@ fn check_inventory(
             continue;
         };
         let stored = tensor.ggml_type();
-        let matrix = **ty == GgufType::Q80;
-        if matrix && !stored.has_native_kernel() {
-            return Err(reject(format!(
-                "tensor {} has type {}, expected a matrix type with a native kernel",
-                tensor.name(),
-                stored.name()
-            )));
-        }
-        if !matrix && stored != **ty {
-            return Err(reject(format!(
-                "tensor {} has type {}, expected {}",
-                tensor.name(),
-                stored.name(),
-                ty.name()
-            )));
+        match ty {
+            Stored::Matrix if !stored.has_native_kernel() => {
+                return Err(reject(format!(
+                    "tensor {} has type {}, expected a matrix type with a native kernel",
+                    tensor.name(),
+                    stored.name()
+                )));
+            }
+            Stored::Exact(want) if stored != *want => {
+                return Err(reject(format!(
+                    "tensor {} has type {}, expected {}",
+                    tensor.name(),
+                    stored.name(),
+                    want.name()
+                )));
+            }
+            _ => {}
         }
         if tensor.dims() != *dims {
             return Err(reject(format!(
@@ -629,33 +650,33 @@ fn bolt_expected_inventory(spelling: BoltSpelling) -> Vec<Expected> {
     let mut expected = Vec::with_capacity(707);
     expected.push(Expected {
         name: "token_embd.weight".to_owned(),
-        ty: GgufType::Q80,
+        ty: Stored::Matrix,
         dims: vec![BOLT_HIDDEN, BOLT_VOCAB],
     });
     expected.push(Expected {
         name: "output_norm.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![BOLT_HIDDEN],
     });
     expected.push(Expected {
         name: "rope_freqs.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![BOLT_GLOBAL_HEAD / 2],
     });
     expected.push(Expected {
         name: spelling.ple_model_proj().to_owned(),
-        ty: GgufType::Q80,
+        ty: Stored::Matrix,
         dims: vec![BOLT_HIDDEN, BOLT_PER_LAYER_INPUT * BOLT_LAYERS as u64],
     });
     expected.push(Expected {
         name: spelling.ple_proj_norm().to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![BOLT_PER_LAYER_INPUT],
     });
     if let Some(name) = spelling.per_layer_token_embd() {
         expected.push(Expected {
             name: name.to_owned(),
-            ty: GgufType::Q80,
+            ty: Stored::Matrix,
             dims: vec![BOLT_PER_LAYER_INPUT * BOLT_LAYERS as u64, BOLT_VOCAB],
         });
     }
@@ -670,12 +691,12 @@ fn bolt_expected_inventory(spelling: BoltSpelling) -> Vec<Expected> {
         let base = format!("blk.{layer}.");
         let norm = |suffix: &str, width: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::F32,
+            ty: Stored::Exact(GgufType::F32),
             dims: vec![width],
         };
         let matrix = |suffix: &str, rows: u64, cols: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::Q80,
+            ty: Stored::Matrix,
             dims: vec![rows, cols],
         };
         expected.push(norm("attn_norm.weight", BOLT_HIDDEN));

@@ -1131,6 +1131,25 @@ fn a_k_quant_merged_table_slices_by_its_own_blocks() {
         }
     }
     assert!(ple_rows_from_merged(&merged, GgufType::Q4K, 3, 256, layers, vocab).is_err());
+    // A merged table whose length is not `vocab` rows of every layer's blocks is refused, the
+    // short one by a byte and the long one by a block.
+    let short = ple_rows_from_merged(
+        &merged[..merged.len() - 1],
+        GgufType::Q4K,
+        0,
+        256,
+        layers,
+        vocab,
+    )
+    .expect_err("a table one byte short");
+    assert!(
+        short.describe().contains("merged per-layer table holds"),
+        "{}",
+        short.describe()
+    );
+    let mut long = merged.clone();
+    long.extend([0u8; 144]);
+    assert!(ple_rows_from_merged(&long, GgufType::Q4K, 0, 256, layers, vocab).is_err());
     assert!(ple_rows_from_merged(&merged, GgufType::Q4K, 0, 100, layers, vocab).is_err());
 }
 
@@ -1392,7 +1411,7 @@ fn a_humanizer_gguf_is_accepted_by_its_geometry_and_names_its_own_window() {
         .collect();
     let tensors: Vec<_> = super::gguf::expected_inventory(&kv)
         .into_iter()
-        .map(|item| (item.name, item.ty, item.dims))
+        .map(|item| (item.name, item.ty.fixture(), item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut digests = Vec::new();
@@ -1413,7 +1432,7 @@ fn a_humanizer_window_of_zero_or_past_the_resident_limit_is_refused() {
         .collect();
     let tensors: Vec<_> = super::gguf::expected_inventory(&kv)
         .into_iter()
-        .map(|item| (item.name, item.ty, item.dims))
+        .map(|item| (item.name, item.ty.fixture(), item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
     for window in [0u32, 8193] {
@@ -1433,7 +1452,7 @@ fn an_extra_tensor_that_would_change_the_result_is_refused_and_a_harmless_one_is
         .collect();
     let complete: Vec<_> = super::gguf::expected_inventory(&kv)
         .into_iter()
-        .map(|item| (item.name, item.ty, item.dims))
+        .map(|item| (item.name, item.ty.fixture(), item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("humanizer-extra.gguf");

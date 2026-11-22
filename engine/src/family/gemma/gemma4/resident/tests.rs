@@ -180,3 +180,76 @@ fn traces_first_position_top_five() {
         serde_json::to_string(&trace).expect("json")
     );
 }
+
+/// The path a K-quant per-layer table takes at load: the merged payload sliced by layer, uploaded
+/// as native blocks and gathered by token id. Each gathered row is the host decode of the blocks
+/// of that token and layer.
+#[test]
+#[ignore = "requires a device; use --test-threads=1"]
+fn a_k_quant_merged_table_slices_uploads_and_gathers_each_layers_rows() {
+    use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
+    use crate::kernels::cuda::resident::embed::EmbedNativeCall;
+    use crate::weights::{GgufType, dequantize};
+
+    let (layers, vocab, ple) = (3usize, 5usize, 256usize);
+    let mut merged = vec![0u8; vocab * layers * 144];
+    for (index, block) in merged.as_chunks_mut::<144>().0.iter_mut().enumerate() {
+        for (at, byte) in block.iter_mut().enumerate() {
+            *byte = ((index * 31 + at * 7) % 251) as u8;
+        }
+        // Finite binary16 scales: d = 0.0625 and dmin = 0.03125.
+        block[0..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x2800u16.to_le_bytes());
+    }
+    let ctx = crate::kernels::cuda::CudaContext::with_admission(
+        &crate::family::project::cuda::served_admission(),
+    )
+    .expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ids = [4i32, 0, 2];
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    let ids_buffer = ctx.upload(&id_bytes).expect("ids");
+    let status = ctx.upload(&[0u8; 4]).expect("status");
+    for layer in 0..layers {
+        let bytes = ple_rows_from_merged(&merged, GgufType::Q4K, layer, ple, layers, vocab)
+            .expect("the layer slice");
+        let weight = super::matrix_from_bytes(&ctx, "table", GgufType::Q4K, ple, vocab, &bytes)
+            .expect("native upload");
+        let out = ctx.upload(&vec![0u8; ids.len() * ple * 4]).expect("out");
+        ctx.embed_native(
+            &stream,
+            EmbedNativeCall {
+                weight: &weight,
+                ids: ids_buffer.range(0, id_bytes.len()).expect("ids range"),
+                x: out.range(0, ids.len() * ple * 4).expect("x range"),
+                status: status.range(0, 4).expect("status range"),
+                m: ids.len(),
+            },
+        )
+        .expect("gather");
+        stream.synchronize().expect("sync");
+        let mut raw = vec![0u8; ids.len() * ple * 4];
+        ctx.download(&out, &mut raw).expect("download");
+        let got: Vec<f32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        for (row, &id) in ids.iter().enumerate() {
+            let at = id as usize * 144;
+            let want = dequantize(GgufType::Q4K, &bytes[at..at + 144]).expect("host decode");
+            let peak = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            for (column, (a, b)) in got[row * ple..(row + 1) * ple]
+                .iter()
+                .zip(&want)
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() <= 1e-5 * peak,
+                    "layer {layer} token {id} column {column}: {a} against {b}"
+                );
+            }
+        }
+    }
+}
