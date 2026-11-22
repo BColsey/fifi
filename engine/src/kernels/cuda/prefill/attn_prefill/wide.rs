@@ -418,6 +418,7 @@ impl WideAttention {
                     out: part(call.out, done * row_bytes, rows * row_bytes)?,
                     rows,
                     p0: call.p0 + done,
+                    cells: call.cells,
                 },
             )?;
             done += rows;

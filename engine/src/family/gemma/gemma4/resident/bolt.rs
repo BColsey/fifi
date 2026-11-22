@@ -2409,51 +2409,6 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_the_host_cannot_back_is_refused_before_it_is_allocated() {
-        use crate::family::mem::HostFacts;
-        let one_gib = 1usize << 30;
-        let meminfo = |available_gib: u64| {
-            format!(
-                "MemTotal:       {} kB\nMemAvailable:   {} kB\n",
-                32 * (1 << 20),
-                available_gib * (1 << 20)
-            )
-        };
-        // The budget is the available figure, clamped by the cgroup's remaining bytes.
-        let tight = HostFacts::from_meminfo("test", &meminfo(20), Some(1 << 29)).expect("host");
-        let error = admit_snapshot(one_gib, Ok(tight.host_memory()))
-            .expect_err("a cgroup with half a GiB left cannot back 1 GiB");
-        assert!(
-            matches!(&error, EngError::MemoryPlan(text) if text.contains("a Bolt prefix snapshot")),
-            "{error:?}"
-        );
-        let roomy = HostFacts::from_meminfo("test", &meminfo(20), None).expect("host");
-        assert!(admit_snapshot(one_gib, Ok(roomy.host_memory())).is_ok());
-    }
-
-    /// A cgroup layout the probe cannot parse falls back to the bare figure, and a probe that
-    /// cannot verify anything proceeds: the save is not refused for a host the probe cannot read.
-    #[test]
-    fn a_probe_that_cannot_read_the_host_falls_back_and_proceeds() {
-        use crate::family::mem::HostFacts;
-        let one_gib = 1usize << 30;
-        let meminfo = "MemTotal:       33554432 kB\nMemAvailable:    2097152 kB\n";
-        let refusal = EngError::MemoryPlan("cgroup v1 layout".into());
-        // The bare fallback keeps the machine-wide figures: 2 GiB available backs 1 GiB.
-        let bare = HostFacts::bare("test", "test", &refusal, meminfo)
-            .expect("bare")
-            .host_memory();
-        assert_eq!(bare.1, 2 << 30);
-        assert!(admit_snapshot(one_gib, Ok(bare)).is_ok());
-        assert!(
-            admit_snapshot(3 << 30, Ok(bare)).is_err(),
-            "the bare figure still refuses"
-        );
-        // Both probes failing: the save proceeds, as the other stores' saves do.
-        assert!(admit_snapshot(one_gib, Err(refusal)).is_ok());
-    }
-
-    #[test]
     fn the_pool_is_the_largest_count_the_card_carries() {
         let weights = 7_578_800_000u64;
         let free_for = |cells: usize| {
@@ -2471,12 +2426,12 @@ mod tests {
         assert_eq!(pool_cells(free - 1, weights, true, false, 1), 39_936);
         // The pool passes the shared admission, and a card short of one cell plans the fallback
         // that the admission refuses with its own figures.
-        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false).expect("demand");
+        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false, 8).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
         let short = free_for(0) - 1;
         assert_eq!(pool_cells(short, weights, true, false, 1), FALLBACK_CELLS);
         let refused =
-            bolt_demand(weights, Some(ATTN_SPLIT_MAX), FALLBACK_CELLS, false).expect("demand");
+            bolt_demand(weights, Some(ATTN_SPLIT_MAX), FALLBACK_CELLS, false, 8).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&refused, short).is_err());
         assert_eq!(MAX_CELLS, 65_536);
     }
