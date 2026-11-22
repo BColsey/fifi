@@ -44,32 +44,6 @@ pub struct ExpertLocator {
     shape: ExpertShape,
 }
 
-/// The routed-expert refusal's shared-expert twin: every layer's three shexp
-/// tensors (`blk.{l}.ffn_{gate,up,down}_shexp.weight`, llama.cpp names) must
-/// exist and be Q4_K. WHY: the tiered chunk facts assert a Q4_K shared expert
-/// without reading the tensor, so the attach that builds the locator also proves
-/// that fact; anything else refuses the load before the banks exist.
-pub fn require_q4k_shexp(header: &GgufHeader, layers: usize) -> Result<(), LocatorError> {
-    for layer in 0..layers {
-        for part in ["gate", "up", "down"] {
-            let name = format!("blk.{layer}.ffn_{part}_shexp.weight");
-            let tensor = header
-                .tensor(&name)
-                .ok_or_else(|| LocatorError::MissingTensor { name: name.clone() })?;
-            if tensor.ggml_type() != GgufType::Q4K {
-                return Err(LocatorError::BadTensor {
-                    name,
-                    why: format!(
-                        "shared expert expected type Q4_K, found {}",
-                        tensor.ggml_type().name()
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 impl ExpertLocator {
     /// Validates and indexes `layers` layers: every named tensor must exist,
     /// be Q4_K and 3-dimensional, with gate/up dims `[hidden, inter, experts]`
@@ -400,57 +374,6 @@ pub(crate) mod tests {
 
     /// One layer's shexp trio: Q4_K everywhere passes; a wrong type names the
     /// tensor; a missing tensor names what the load needed.
-    #[test]
-    fn shexp_refusal_names_the_offending_tensor() {
-        let mut rng = Lcg(0x514D_3252_0000_0030);
-        let shape = ExpertShape {
-            hidden: 256,
-            inter: 256,
-        };
-        let mut entries = expert_entries(&mut rng, 1, 4, shape);
-        for part in ["gate", "up", "down"] {
-            entries.push(Entry {
-                name: format!("blk.0.ffn_{part}_shexp.weight"),
-                dims: [256, 256, 1],
-                type_id: 12, // Q4_K
-                data_offset: 0,
-                payload: random_q4k(&mut rng, 256 * 256 / 32),
-            });
-        }
-        place_sequential(&mut entries);
-        let (bytes, _) = write_gguf(&entries);
-        let header = parse(&bytes);
-        super::require_q4k_shexp(&header, 1).unwrap();
-        assert_eq!(
-            super::require_q4k_shexp(&header, 2).unwrap_err(),
-            LocatorError::MissingTensor {
-                name: "blk.1.ffn_gate_shexp.weight".to_owned()
-            }
-        );
-
-        let last = entries.last_mut().unwrap();
-        last.type_id = 0; // F32: unblocked, so give it a 4-byte body to match.
-        last.dims = [1, 1, 1];
-        last.payload = vec![0u8; 4];
-        let (bytes, _) = write_gguf(&entries);
-        let header = parse(&bytes);
-        match super::require_q4k_shexp(&header, 1).unwrap_err() {
-            LocatorError::BadTensor { name, why } => {
-                assert!(name.contains("ffn_down_shexp"));
-                assert!(why.contains("Q4_K"));
-            }
-            other => panic!("wrong error: {other:?}"),
-        }
-
-        entries.pop();
-        let (bytes, _) = write_gguf(&entries);
-        let header = parse(&bytes);
-        match super::require_q4k_shexp(&header, 1).unwrap_err() {
-            LocatorError::MissingTensor { name } => assert!(name.contains("ffn_down_shexp")),
-            other => panic!("wrong error: {other:?}"),
-        }
-    }
-
     #[test]
     fn standard_names_are_the_gguf_convention() {
         // The literal spellings of the stacked expert tensors; `{layer}` stays

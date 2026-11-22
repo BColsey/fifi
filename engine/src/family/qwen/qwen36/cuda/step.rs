@@ -1610,9 +1610,14 @@ impl<'a> QwenResidentStep<'a> {
         let m = rows.len();
         let chunk_rows = ChunkRows::new(p0, m, state.layout().kv.capacity, arena.m_sess())?;
         let ids = chunk_ids(rows, widths.verdict)?;
+        let shared_types: Vec<[Option<crate::kernels::cuda::resident::matvec_q::QuantType>; 3]> =
+            self.tiered
+                .as_ref()
+                .map(|runtime| runtime.borrow().shared_quants())
+                .unwrap_or_default();
         let weights = match globals.embed {
             super::resources::GlobalWeight::Native(embed) => {
-                ChunkWeights::new(mixers.weights(), moe, embed)
+                ChunkWeights::new(mixers.weights(), moe, embed).with_shared(&shared_types)
             }
             super::resources::GlobalWeight::Bf16(table) => {
                 ChunkWeights::exl3(mixers.weights(), exl3_moe, table)

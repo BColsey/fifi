@@ -197,31 +197,16 @@ fn the_tiered_load_builds_its_pool_through_tier_pool_and_names_no_kernel() {
 }
 
 #[test]
-fn the_tiered_load_asks_for_a_q4k_shared_expert_only_on_the_chunk_path() {
-    // The pinned Q4_K_M file keeps the shared expert as Q8_0, which the per-token tiered path
-    // reads as stored. The Q4_K requirement belongs to the tiered chunk arm alone: a check that
-    // ran for every tiered start would refuse the automatic card-short rung of that file, and a
-    // file the arm cannot read prefills per token with a notice instead of a refusal.
-    let source = include_str!("tiered_load.rs");
-    let arm = pinned(section_of(
-        source,
-        "tiered_load.rs",
-        "pub(super) fn tiered_chunk_arm(",
-    ));
-    let guard = arm
-        .find("prefill::tiered_chunk_enabled(")
-        .expect("the chunk-path guard");
-    let check = arm
-        .find("require_q4k_shexp(header,dims.shape.kinds.len())")
-        .expect("the shared-expert check");
-    assert!(guard < check, "guard {guard}, check {check}");
-    assert!(arm.contains("Ok(false)"), "{arm}");
-    let build = pinned(section_of(
-        source,
+fn the_tiered_load_takes_the_shared_expert_in_the_type_the_file_stores() {
+    // The pinned Q4_K_M file keeps the shared expert as Q8_0. The chunk arm reads the type of
+    // each shared projection from the loaded weight, so no start refuses a file for it.
+    let body = pinned(section_of(
+        include_str!("tiered_load.rs"),
         "tiered_load.rs",
         "pub(super) fn build_tiered(",
     ));
-    assert!(!build.contains("require_q4k_shexp("), "{build}");
+    assert!(!body.contains("shexp"), "{body}");
+    assert!(!body.contains("tiered_chunk_enabled("), "{body}");
 }
 
 #[test]

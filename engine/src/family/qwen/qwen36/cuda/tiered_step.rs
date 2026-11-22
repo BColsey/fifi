@@ -25,7 +25,7 @@ use super::run_report::HostSyncs;
 use crate::EngError;
 use crate::kernels::cuda::{
     CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
-    ExpertBankGeometry, NativeWeight, PinnedBuf,
+    ExpertBankGeometry, NativeWeight, PinnedBuf, resident::matvec_q::QuantType,
 };
 
 /// The cold staging bank of the chunked tiered prefill: ONE zero-initialised
@@ -461,6 +461,25 @@ impl<'w> TieredRuntime<'w> {
             shared_up: parts.shared_up,
             shared_down: parts.shared_down,
         })
+    }
+
+    /// The type of each layer's shared gate, up and down projections as loaded, for the chunk
+    /// path's checks: the shared expert is read in the type its file stores.
+    pub(super) fn shared_quants(&self) -> Vec<[Option<QuantType>; 3]> {
+        let of = |weight: &DenseWeight<'_>| match weight {
+            DenseWeight::Native(native) => Some(native.quant()),
+            _ => None,
+        };
+        self.parts
+            .iter()
+            .map(|part| {
+                [
+                    of(&part.shared_gate),
+                    of(&part.shared_up),
+                    of(&part.shared_down),
+                ]
+            })
+            .collect()
     }
 
     /// The bank depth every layer was built with (the tiered plan's slots per layer).

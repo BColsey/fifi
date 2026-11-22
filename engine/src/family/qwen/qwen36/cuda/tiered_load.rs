@@ -15,7 +15,7 @@ use super::super::settings::SlotRequest;
 use super::super::tiered::cpu_pool::{CpuPool, ExpertKernel, MappedRegion, PoolError};
 use super::super::tiered::guess::{GuessError, LayerRouter, RouterGuess};
 use super::super::tiered::host::TieredHost;
-use super::super::tiered::locator::{ExpertLocator, ExpertTensorNames, require_q4k_shexp};
+use super::super::tiered::locator::{ExpertLocator, ExpertTensorNames};
 use super::super::tiered::{PolicyMode, TieredConfig};
 use super::dims::{StepDims, TieredPlan};
 use super::step::QwenResidentStep;
@@ -205,22 +205,20 @@ pub(super) fn cold_cap_for(
     COLD_TARGET.min(usize::try_from(spare / per_expert.max(1)).unwrap_or(0))
 }
 
-/// Whether the tiered session takes the chunked prefill arm: `Q36_TIERED_CHUNK=1` and a file
-/// whose routed stacks (every layer) and shared experts are Q4_K, the one type that arm reads.
-/// With the variable set and another file the arm stays off and one notice line says why: the
-/// prompt prefills per token, as it does without the variable. The per-token tiered path reads
-/// the shared expert in whatever type the file stores it.
+/// Whether the tiered session takes the chunked prefill arm: the chunk arm is on unless
+/// `Q36_TIERED_CHUNK=0`, and a file whose routed stacks are not Q4_K in every layer (the one routed
+/// type this arm reads before the any-type kernels) prefills per token with one notice line. The
+/// shared expert is read in the type the file stores.
 pub(super) fn tiered_chunk_arm(header: &GgufHeader, dims: &StepDims) -> Result<bool, EngError> {
     if !super::prefill::tiered_chunk_enabled(
         std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
     ) {
         return Ok(false);
     }
-    let shared = require_q4k_shexp(header, dims.shape.kinds.len());
     let routed = expert_quant(header, dims)?;
-    let unsupported = chunk_arm_refusal(shared.err().map(|error| format!("{error:?}")), &routed);
+    let unsupported = chunk_arm_refusal(None, &routed);
     if let Some(why) = &unsupported {
-        eprintln!("q36 cuda: Q36_TIERED_CHUNK=1 ignored, the chunk arm reads Q4_K experts: {why}");
+        eprintln!("q36 cuda: the tiered chunk arm reads Q4_K experts, prefilling per token: {why}");
     }
     Ok(unsupported.is_none())
 }

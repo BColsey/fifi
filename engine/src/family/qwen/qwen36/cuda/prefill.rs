@@ -1003,7 +1003,7 @@ fn model_facts_with(
                 k: 0,
             },
         };
-        let ChunkWeights::Native { moe, .. } = weights else {
+        let ChunkWeights::Native { moe, shared, .. } = weights else {
             return Err(EngError::BadRequest(
                 "prefill chunk: layout: the facts of a Native model need Native weights".to_owned(),
             ));
@@ -1044,6 +1044,9 @@ fn model_facts_with(
                     dims.shape.hidden,
                 );
                 let q = Some(QuantType::Q4K);
+                // The shared expert's types come from the loaded weights, whatever the file
+                // stores; a layer without them is "not loaded native" and the check refuses it.
+                let types = shared.get(layer).copied().unwrap_or([None; 3]);
                 (
                     [
                         StackFacts {
@@ -1068,12 +1071,10 @@ fn model_facts_with(
                             k: i,
                         },
                     ],
-                    // The shared expert is loaded for tiered (it's a non-expert
-                    // weight); its quant comes from the model's format.
                     [
-                        (Role::FfnGateShexp, Some(QuantType::Q4K)),
-                        (Role::FfnUpShexp, Some(QuantType::Q4K)),
-                        (Role::FfnDownShexp, Some(QuantType::Q4K)),
+                        (Role::FfnGateShexp, types[0]),
+                        (Role::FfnUpShexp, types[1]),
+                        (Role::FfnDownShexp, types[2]),
                     ],
                 )
             }
@@ -1104,6 +1105,9 @@ pub(super) enum ChunkWeights<'a, 'w> {
         mixer: &'a MixerWeights<'w>,
         moe: &'a [MoeLayerWeights<'w>],
         embed: &'w NativeWeight,
+        /// A tiered load keeps the shared expert in its runtime, not in `moe`: the type of its
+        /// gate, up and down projections per layer. Empty for a load that holds `moe`.
+        shared: &'a [[Option<QuantType>; 3]],
     },
     /// An EXL3 pack: the embedding is the stored BF16 table.
     Exl3 {
@@ -1312,7 +1316,20 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
         moe: &'a [MoeLayerWeights<'w>],
         embed: &'w NativeWeight,
     ) -> Self {
-        Self::Native { mixer, moe, embed }
+        Self::Native {
+            mixer,
+            moe,
+            embed,
+            shared: &[],
+        }
+    }
+
+    /// The same weights of a tiered load, with the type of each layer's shared projections.
+    pub(super) fn with_shared(mut self, types: &'a [[Option<QuantType>; 3]]) -> Self {
+        if let Self::Native { shared, .. } = &mut self {
+            *shared = types;
+        }
+        self
     }
 
     pub(super) fn exl3(
@@ -2603,11 +2620,12 @@ pub(super) struct MoeChunkIo<'b> {
     pub(super) scratch: &'b ChunkViews<'b>,
 }
 
-/// Whether tiered sessions may run chunked prefill (`Q36_TIERED_CHUNK=1`). Default
-/// off: the chunk arm is complete but the gate ships dark until device-qualified.
+/// Whether tiered sessions run chunked prefill: always, unless `Q36_TIERED_CHUNK=0` asks for the
+/// one-token path. The chunk arm reads each weight in the type its file stores, so nothing about
+/// the file turns it off; the session's own checks (an arena, the byte budget) do.
 pub(super) const TIERED_CHUNK_VAR: &str = "Q36_TIERED_CHUNK";
 pub(super) fn tiered_chunk_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
+    value != Some(std::ffi::OsStr::new("0"))
 }
 
 pub(super) enum ChunkMoe<'a, 'w> {
