@@ -647,6 +647,81 @@ fn mapped_expert_rows_match_indexed_cuda_matvec() {
     assert_eq!(checked, 3, "expected gate, up and down expert stacks");
 }
 
+#[test]
+#[ignore = "needs verified full expert samples and an admitted CUDA device"]
+fn full_expert_device_stacks_match_host() {
+    use super::expert_layout::ExpertDeviceStacks;
+    use crate::{kernels::cuda::resident::matvec_expert::ExpertMatvecCall, weights::dequantize};
+    full_expert_fixture_integrity();
+    let path = std::env::var_os("FIFI_FLASH_EXPERT_FIXTURE").unwrap();
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[256]).unwrap();
+    let ids = ctx.allocate(4).unwrap();
+    ids.write_at(&stream, 0, &0i32.to_ne_bytes()).unwrap();
+    let mut checked = 0;
+    for (tensor, expert) in projection_samples(&model).filter(|(_, expert)| expert.is_some()) {
+        let k = tensor.dims[0] as usize;
+        let rows = tensor.dims[1] as usize;
+        assert_eq!(rows % 4, 0);
+        let input: Vec<f32> = (0..k).map(|n| if n % 5 < 2 { -1.0 } else { 1.0 }).collect();
+        let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let x = ctx.allocate(bytes.len()).unwrap();
+        x.write_at(&stream, 0, &bytes).unwrap();
+        let qbytes = q8_1_bytes(k, 1).unwrap();
+        let q = ctx.allocate(qbytes).unwrap();
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x.range(0, bytes.len()).unwrap(),
+                y: q.range(0, qbytes).unwrap(),
+                k,
+                ncols: 1,
+            },
+        )
+        .unwrap();
+        let y = ctx.allocate(rows * 4).unwrap();
+        ctx.matvec_expert(
+            &stream,
+            ExpertMatvecCall {
+                ty: QuantType::from_gguf(tensor.ty).unwrap(),
+                w_stack: bank.part(checked).unwrap(),
+                ids: ids.range(0, 4).unwrap(),
+                x_q8: q.range(0, qbytes).unwrap(),
+                x_per_slot: false,
+                y: y.range(0, rows * 4).unwrap(),
+                y_slot_stride: rows,
+                k,
+                rows,
+                n_expert: 1,
+                n_used: 1,
+                glu_gate: None,
+            },
+        )
+        .unwrap();
+        let mut out = vec![0; rows * 4];
+        y.read_at(&stream, 0, &mut out).unwrap();
+        let blocks = mapped_blocks(&model, tensor, expert, 0..rows as u64).unwrap();
+        let weights = dequantize(tensor.ty, &blocks).unwrap();
+        for (index, (chunk, row)) in out.chunks_exact(4).zip(weights.chunks_exact(k)).enumerate() {
+            let got = f32::from_ne_bytes(chunk.try_into().unwrap());
+            let want: f32 = row.iter().zip(&input).map(|(a, b)| a * b).sum();
+            let scale: f32 = row.iter().map(|v| v.abs()).sum();
+            assert!(
+                (got - want).abs() <= 0.003 * scale + 1e-5,
+                "{} row {index}: {got} != {want}",
+                tensor.name
+            );
+        }
+        eprintln!("checked {} {:?} {rows} rows", tensor.name, tensor.ty);
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}
+
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
 #[test]
 #[ignore = "requires the complete pinned GGUF and an admitted CUDA device"]
