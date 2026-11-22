@@ -27,6 +27,10 @@ pub(crate) struct HostFacts {
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
+    // What the tightest cgroup ancestor leaves once its reclaimable file cache (`inactive_file`
+    // of `memory.stat`) is counted as free: `max - (current - inactive_file)`. Equal to
+    // `cgroup_remaining` when no cache figure was read. None means no limit.
+    cgroup_room: Option<u64>,
     provenance: Provenance,
     // This process's resident set when the facts were read; 0 when it could not be read.
     process_rss: u64,
@@ -114,6 +118,7 @@ impl HostFacts {
             mem_total: physical,
             mem_available: physical,
             cgroup_remaining: None,
+            cgroup_room: None,
             provenance: Provenance::Unified,
             process_rss: 0,
         }
@@ -167,7 +172,10 @@ impl HostFacts {
         let mounts = read_admission_file(label, &proc.join("self/mountinfo"))?;
         let group = cgroup_from_proc(label, root, &membership, &mounts, pid)?;
         let root = std::fs::canonicalize(root).map_err(|error| root_error(root_label, error))?;
-        Self::from_meminfo(label, &meminfo, cgroup_remaining_in(label, &root, &group)?)
+        let mut facts =
+            Self::from_meminfo(label, &meminfo, cgroup_remaining_in(label, &root, &group)?)?;
+        facts.cgroup_room = cgroup_room_in(label, &root, &group)?;
+        Ok(facts)
     }
 
     /// Private to `verified_in` except for the host tests of the memory plans, which build the
@@ -189,6 +197,7 @@ impl HostFacts {
             mem_total: total,
             mem_available: available,
             cgroup_remaining,
+            cgroup_room: cgroup_remaining,
             provenance: Provenance::Verified,
             process_rss: 0,
         })
@@ -242,32 +251,25 @@ impl HostFacts {
         self.process_rss
     }
 
-    /// What this process still adds to its own footprint beyond the payload an admission names:
-    /// heap growth, the CUDA context's host side, staging and allocator slack. Taken from the
-    /// resident set now (the process is about to roughly double what it holds while it loads)
-    /// plus the shared host margin.
-    pub(crate) fn process_overhead(&self) -> u64 {
-        self.process_rss.saturating_add(super::HOST_MARGIN_BYTES)
-    }
-
     /// What an admission that charges only its payload may spend: [`HostFacts::spare`], and
-    /// inside a binding cgroup (where no OS floor is charged) the cgroup's remainder less the
-    /// process's own overhead, so a payload that fills the cgroup cannot be killed by the heap
-    /// the process still has to grow.
+    /// inside a binding cgroup (where no OS floor is charged) the cgroup's room less the shared
+    /// host margin for the heap, CUDA context and staging the process still grows.
+    ///
+    /// The room is `max - (current - inactive_file)`: `memory.current` already holds the
+    /// process's resident set once, and the file cache a model read left behind is reclaimable,
+    /// so neither the resident set nor the cache is charged a second time.
     pub(crate) fn payload_spare(&self) -> u64 {
         let above_floor = self.mem_available.saturating_sub(self.os_floor());
-        self.cgroup_remaining.map_or(above_floor, |remaining| {
-            above_floor.min(remaining.saturating_sub(self.process_overhead()))
-        })
+        self.cgroup_payload_room()
+            .map_or(above_floor, |room| above_floor.min(room))
     }
 
-    /// What the enclosing cgroup leaves a payload: its remainder less the process's own overhead
-    /// (the term [`HostFacts::payload_spare`] charges inside a binding cgroup), or `None` when no
-    /// cgroup limit binds. A store funded up to this figure is never refused by
-    /// [`HostFacts::admit_payload`] for the cgroup's sake.
+    /// What the enclosing cgroup leaves a payload: its room (`max - (current - inactive_file)`)
+    /// less the shared host margin, or `None` when no cgroup limit binds. A store funded up to
+    /// this figure is never refused by [`HostFacts::admit_payload`] for the cgroup's sake.
     pub(crate) fn cgroup_payload_room(&self) -> Option<u64> {
-        self.cgroup_remaining
-            .map(|remaining| remaining.saturating_sub(self.process_overhead()))
+        self.cgroup_room
+            .map(|room| room.saturating_sub(super::HOST_MARGIN_BYTES))
     }
 
     /// The bytes of the budget a payload-only admission keeps back.
@@ -295,7 +297,7 @@ impl HostFacts {
     }
 
     /// The admission check for a payload (a store, a snapshot, a pinned pool): the payload must
-    /// fit [`HostFacts::payload_spare`], so the process's own overhead is always charged beside
+    /// fit [`HostFacts::payload_spare`], so the host margin is always charged beside
     /// it and no caller can leave it out. The refusal names the caller.
     #[cfg_attr(
         not(test),
@@ -449,6 +451,55 @@ fn cgroup_remaining_in(
         if let Some(remaining) = remaining {
             minimum = Some(minimum.map_or(remaining, |previous| previous.min(remaining)));
         }
+    }
+    Ok(minimum)
+}
+
+/// The tightest room of the cgroup and its ancestors with a memory limit, counting each one's
+/// reclaimable file cache (`inactive_file` of its `memory.stat`, zero when unreadable) as free:
+/// `max - (current - inactive_file)`. The same walk as [`cgroup_remaining_in`].
+#[cfg(any(test, target_os = "linux"))]
+fn cgroup_room_in(
+    label: &'static str,
+    root: &std::path::Path,
+    cgroup: &std::path::Path,
+) -> Result<Option<u64>, EngError> {
+    let room_of = |group: &std::path::Path| -> Result<Option<u64>, EngError> {
+        let remaining = cgroup_remaining_bytes(
+            label,
+            &read_admission_file(label, &group.join("memory.max"))?,
+            &read_admission_file(label, &group.join("memory.current"))?,
+        )?;
+        let inactive = std::fs::read_to_string(group.join("memory.stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.lines().find_map(|line| {
+                    line.strip_prefix("inactive_file ")
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                })
+            })
+            .unwrap_or(0);
+        Ok(remaining.map(|remaining| remaining.saturating_add(inactive)))
+    };
+    let mut minimum: Option<u64> = None;
+    let mut group = cgroup;
+    while group != root {
+        let parent = group.parent().ok_or_else(|| {
+            EngError::MemoryPlan(format!("{label} cgroup has no controller ancestor."))
+        })?;
+        if read_admission_file(label, &parent.join("cgroup.subtree_control"))?
+            .split_whitespace()
+            .any(|controller| controller == "memory")
+            && let Some(room) = room_of(group)?
+        {
+            minimum = Some(minimum.map_or(room, |previous| previous.min(room)));
+        }
+        group = parent;
+    }
+    if root.join("memory.max").exists()
+        && let Some(room) = room_of(root)?
+    {
+        minimum = Some(minimum.map_or(room, |previous| previous.min(room)));
     }
     Ok(minimum)
 }
@@ -1401,6 +1452,7 @@ mod tests {
             mem_total: 40 << 30,
             mem_available: u64::MAX,
             cgroup_remaining: None,
+            cgroup_room: None,
             provenance: Provenance::Verified,
             process_rss: 0,
         };
@@ -1418,6 +1470,7 @@ mod tests {
             mem_total: 40 << 30,
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
+            cgroup_room: Some(required + floor),
             provenance: Provenance::Verified,
             process_rss: 0,
         };
@@ -1523,26 +1576,74 @@ mod tests {
         assert!(HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
     }
 
-    /// A payload inside a binding cgroup keeps the process's own overhead back: the Flint expert
-    /// cache charges only its payload, and under `MemoryMax=12G` a payload that fills the cgroup
-    /// would be killed by the heap and CUDA context the process still grows while it loads.
+    /// A payload inside a binding cgroup keeps the shared margin back: the Flint expert cache
+    /// charges only its payload, and under `MemoryMax=12G` a payload that fills the cgroup would be
+    /// killed by the heap and CUDA context the process still grows. The resident set is already in
+    /// `memory.current`, so it is not charged again.
     #[test]
-    fn a_payload_under_a_twelve_gib_cap_keeps_the_process_overhead_back() {
+    fn a_payload_under_a_twelve_gib_cap_keeps_the_margin_back() {
         const FLINT: &str = "Flint expert cache";
         // 62 GiB host, 50 GiB available, a 12 GiB cgroup with 1.5 GiB of it already resident.
         let meminfo = "MemTotal: 65011712 kB\nMemAvailable: 52428800 kB\n";
         let mut host =
             HostFacts::from_meminfo(FLINT, meminfo, Some(12 * (1 << 30) - (3 << 29))).unwrap();
         host.process_rss = 3 << 29;
-        assert_eq!(host.process_overhead(), (3 << 29) + (2 << 30));
-        // 10.5 GiB remain in the cgroup; 3.5 GiB of overhead leave 7 GiB for the payload.
-        assert_eq!(host.payload_spare(), 7 << 30);
-        assert!(host.admit(FLINT, 7 << 30).is_ok());
+        // 10.5 GiB remain in the cgroup; the 2 GiB margin leaves 8.5 GiB for the payload.
+        assert_eq!(host.payload_spare(), (17 << 29));
+        assert!(host.admit(FLINT, 17 << 29).is_ok());
         let refusal = host.admit(FLINT, 9 << 30).unwrap_err().describe();
         assert!(refusal.contains("Flint expert cache needs"), "{refusal}");
         // The same host without a cap charges the floor, as before.
         let uncapped = HostFacts::from_meminfo(FLINT, meminfo, None).unwrap();
         assert_eq!(uncapped.payload_spare(), (50u64 << 30) - 8 * (1 << 30));
+    }
+
+    /// The glue from a cgroup tree to the store budget: `read_in` over a fake tree carrying a large
+    /// `inactive_file` gives `max - (current - inactive_file)` less the margin, the file cache a
+    /// model read left behind does not shrink it, the resident set is counted once (inside
+    /// `memory.current`), and the save admission admits exactly that figure.
+    #[test]
+    fn the_cgroup_room_counts_the_reclaimable_file_cache_as_free() {
+        const GIB: u64 = 1 << 30;
+        let room_with = |inactive: Option<u64>| {
+            let (_root, _proc, directory, proc_dir) = namespace_root("12884901888\n", "memory\n");
+            std::fs::write(directory.join("memory.current"), "10737418240\n").unwrap();
+            if let Some(inactive) = inactive {
+                std::fs::write(
+                    directory.join("memory.stat"),
+                    format!("anon 1\ninactive_file {inactive}\nactive_file 7\n"),
+                )
+                .unwrap();
+            }
+            let facts = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+            assert_eq!(
+                facts.budget(),
+                2 * GIB,
+                "the plan figure still reads max - current"
+            );
+            facts
+        };
+        // 12 GiB limit, 10 GiB current: with no cache figure the room is 2 GiB less the margin.
+        let bare = room_with(None);
+        assert_eq!(bare.cgroup_payload_room(), Some(0));
+        // 8 GiB of that current is reclaimable cache: 10 GiB of room less the 2 GiB margin.
+        let cached = room_with(Some(8 * GIB));
+        assert_eq!(cached.cgroup_payload_room(), Some(8 * GIB));
+        // More cache never shrinks the budget.
+        let more = room_with(Some(9 * GIB));
+        assert!(more.cgroup_payload_room() >= cached.cgroup_payload_room());
+        // The resident set is not charged beside memory.current.
+        let mut resident = room_with(Some(8 * GIB));
+        resident.process_rss = 3 * GIB;
+        assert_eq!(resident.cgroup_payload_room(), Some(8 * GIB));
+        // The save admission is the same rule: the room, no more.
+        assert!(cached.admit_payload(8 * GIB, "a stored entry").is_ok());
+        assert!(cached.admit_payload(8 * GIB + 1, "a stored entry").is_err());
+        // The store's budget under that tree is the room, not the host's figure.
+        assert_eq!(
+            crate::family::mem::host_store_budget_of(32 * GIB, GIB, cached.cgroup_payload_room()),
+            8 * GIB
+        );
     }
 
     /// The resident set comes from `<proc>/self/status`, and a missing file reads as zero.

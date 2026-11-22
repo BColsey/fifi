@@ -54,10 +54,22 @@ pub(crate) fn tier_available_bytes(label: &'static str) -> Option<u64> {
 /// then refuses. `None` when the machine's memory is unknown.
 pub(crate) fn host_store_budget(resident: u64) -> Option<u64> {
     let total = physical_memory_bytes()?;
-    let cgroup = HostFacts::read("kv disk", "kv disk")
-        .ok()
-        .and_then(|host| host.cgroup_payload_room());
+    let host = {
+        #[cfg(test)]
+        let fake = FAKE_HOST.with(|fake| fake.borrow().clone());
+        #[cfg(not(test))]
+        let fake: Option<HostFacts> = None;
+        fake.or_else(|| HostFacts::read("kv disk", "kv disk").ok())
+    };
+    let cgroup = host.and_then(|host| host.cgroup_payload_room());
     Some(host_store_budget_of(total, resident, cgroup))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The host facts a test makes [`host_store_budget`] read instead of this machine's.
+    pub(crate) static FAKE_HOST: std::cell::RefCell<Option<HostFacts>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// [`host_store_budget`] of a machine with `total` bytes, `resident` bytes held and `cgroup`
@@ -119,7 +131,7 @@ const MAX_OS_FLOOR_SHARE: u64 = 4;
 /// `floor` is what a plan that carries its own process terms (heap, margin, staging) keeps back:
 /// the OS floor while the host is the binding limit, nothing while a cgroup is (the cgroup
 /// already fences the process off from the host). `payload_floor` is what a plan that charges only
-/// a payload keeps back: the same, plus the process's own overhead when a cgroup binds. Both are
+/// a payload keeps back: the same, plus the host margin when a cgroup binds. Both are
 /// read from one [`HostFacts`], so a plan and the guard that checks it agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostMemory {
@@ -302,7 +314,7 @@ mod tests {
         // A fake 12 GiB cgroup remainder: the budget is the cgroup's room, not the host's.
         let fenced = HostFacts::from_meminfo("test", text, Some(12 * GIB)).unwrap();
         let room = fenced.cgroup_payload_room().expect("a limit binds");
-        assert_eq!(room, 12 * GIB - fenced.process_overhead());
+        assert_eq!(room, 12 * GIB - HOST_MARGIN_BYTES);
         let budget = host_store_budget_of(total, GIB, Some(room));
         assert_eq!(budget, room);
         assert!(

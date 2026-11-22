@@ -717,14 +717,14 @@ pub(crate) trait DiskOwner {
 
     /// One start line with the bytes of snapshots the host store may hold before the oldest go to
     /// disk: the operator's bound, else the family's planner room or the machine's memory less
-    /// the OS floor and what the engine holds.
+    /// the OS floor, what the engine holds and what the enclosing cgroup limit leaves.
     fn log_host_budget(&mut self) {
         if let Some(parts) = self.disk_parts(None)
             && parts.disk.host_bytes.is_none()
         {
             match parts.family.host_budget() {
                 Some(bytes) => eprintln!(
-                    "{}: kv disk host budget {bytes} B at start (the planner's room, else the machine's memory less the OS floor and what the engine holds): older entries go to disk past it",
+                    "{}: kv disk host budget {bytes} B at start (the planner's room, else the machine's memory less the OS floor, what the engine holds and what the cgroup limit leaves): older entries go to disk past it",
                     parts.disk.label
                 ),
                 None => eprintln!(
