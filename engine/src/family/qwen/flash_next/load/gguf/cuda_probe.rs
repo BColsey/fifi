@@ -505,11 +505,44 @@ fn full_expert_fixture_integrity() {
 }
 
 #[test]
+#[ignore = "needs two-expert sparse fixture and single-expert negative control"]
+fn second_expert_fixture_integrity() {
+    use super::expert_layout::ExpertLayout;
+    use sha2::{Digest, Sha256};
+    let hashes = [
+        "ac0f9bfdd7ec13f0d982a235686c747b7e31737d170ed1d7a54faa71f424cd6a",
+        "3730d2e7670e0c512ccbbd9c5d21e15badb7c21096f2c336222a8915e1dede6f",
+        "113aa44f068b315a90dd7ece5b35e836bf595af188b345af3110f073fac1fb19",
+    ];
+    for (key, expected) in [
+        ("FIFI_FLASH_TWO_EXPERT_FIXTURE", true),
+        ("FIFI_FLASH_EXPERT_FIXTURE", false),
+    ] {
+        let path = std::env::var_os(key).unwrap();
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let layout = ExpertLayout::for_layer(&model, 0).unwrap();
+        let mut record = vec![0; layout.bytes];
+        layout.read(&model, 0, 257, &mut record).unwrap();
+        let valid = layout.parts.iter().zip(hashes).all(|(part, hash)| {
+            format!("{:x}", Sha256::digest(&record[part.bytes.clone()])) == hash
+        });
+        assert_eq!(valid, expected, "{key}");
+    }
+}
+
+#[test]
 #[ignore = "emits a complete expert sample plan from pinned GGUF headers"]
 fn write_full_expert_sample_plan() {
     let model = projection_model();
+    let requested: u64 = std::env::var("FIFI_FLASH_EXPERT_ID")
+        .unwrap_or_else(|_| "256".into())
+        .parse()
+        .unwrap();
     let samples: Vec<_> = projection_samples(&model).filter_map(|(tensor, expert)| {
-        let expert = expert?;
+        expert?;
+        let expert = requested;
         let (begin, bytes) = tensor.row_span(Some(expert), 0..tensor.dims[1]).unwrap();
         let stored = model.weights.header().tensor(&tensor.name).unwrap();
         Some(serde_json::json!({"name": tensor.name, "shard": stored.shard(),
