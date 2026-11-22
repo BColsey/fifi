@@ -779,6 +779,44 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "reports expert layout accounting from the pinned split GGUF headers"]
+    fn pinned_header_expert_stack_accounting() {
+        use super::super::expert_layout::{ExpertLayout, ExpertStacks};
+        let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let sizes = model.sizes().unwrap();
+        let slots = model.config().top_k() + 1;
+        let mut packed = 0u64;
+        let mut aligned = 0u64;
+        let mut largest = 0u64;
+        let mut distinct = std::collections::BTreeSet::new();
+        for layer in 0..model.config().layers() {
+            let record = ExpertLayout::for_layer(&model, layer).unwrap();
+            let stacks = ExpertStacks::new(&record, slots).unwrap();
+            packed = packed
+                .checked_add((record.bytes as u64).checked_mul(slots as u64).unwrap())
+                .unwrap();
+            aligned = aligned.checked_add(stacks.bytes as u64).unwrap();
+            largest = largest.max(record.bytes as u64);
+            distinct.insert(record.bytes);
+        }
+        let planned = sizes.shape.expert_bytes * model.config().layers() as u64 * slots as u64;
+        assert_eq!(largest, sizes.record_bytes_max);
+        assert!(aligned >= packed && planned >= packed && distinct.len() > 1);
+        // Specific to this pinned layout and slot count, not a general planner guarantee.
+        assert_eq!(aligned, planned);
+        eprintln!(
+            "layers {} slots {slots}: packed {packed} aligned {aligned} mean-plan {planned} padding {} plan-margin {} distinct-record-sizes {}",
+            model.config().layers(),
+            aligned - packed,
+            planned - packed,
+            distinct.len()
+        );
+    }
+
+    #[test]
     #[ignore = "reports kernel gaps from a header-only pinned fixture"]
     fn pinned_header_kernel_gap_report() {
         let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
