@@ -3,10 +3,24 @@
 #[cfg(test)]
 mod tests;
 
+use std::sync::OnceLock;
+
 use crate::EngError;
 use crate::kernels::cuda::{
-    CudaContext, DeviceRange, DeviceStream, native::resident::inkling_controller::launch,
+    CudaContext, DeviceRange, DeviceStream,
+    native::resident::inkling_controller::{Arithmetic, launch},
 };
+
+fn controller_arithmetic() -> Arithmetic {
+    static MODE: OnceLock<Arithmetic> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var("FIFI_INKLING_CUDA_CONTROLLER_CPU_PARITY").as_deref() == Ok("1") {
+            Arithmetic::CpuParity
+        } else {
+            Arithmetic::Generic
+        }
+    })
+}
 
 impl CudaContext {
     /// The workspace packs three [input, message, gamma] triples, three
@@ -29,11 +43,30 @@ impl CudaContext {
         stream: &DeviceStream,
         workspace: DeviceRange<'_>,
         health: DeviceRange<'_>,
+        shape_eps: ([usize; 2], f32),
+    ) -> Result<(), EngError> {
+        self.inkling_controller_norm_with_arithmetic(
+            stream,
+            workspace,
+            health,
+            shape_eps,
+            controller_arithmetic(),
+        )
+    }
+
+    fn inkling_controller_norm_with_arithmetic(
+        &self,
+        stream: &DeviceStream,
+        workspace: DeviceRange<'_>,
+        health: DeviceRange<'_>,
         (shape, eps): ([usize; 2], f32),
+        arithmetic: Arithmetic,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let workspace = self.raw_range(&workspace)?;
         let health = self.raw_range(&health)?;
-        self.launch_on(stream, |raw| launch(raw, workspace, health, shape, eps))
+        self.launch_on(stream, |raw| {
+            launch(raw, workspace, health, shape, eps, arithmetic)
+        })
     }
 }

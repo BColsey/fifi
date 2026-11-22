@@ -4,6 +4,13 @@ use std::ffi::{c_int, c_void};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
+#[derive(Clone, Copy)]
+#[repr(i32)]
+pub(in crate::kernels::cuda) enum Arithmetic {
+    Generic = 0,
+    CpuParity = 1,
+}
+
 unsafe extern "C" {
     fn inference_cuda_inkling_controller_norm(
         workspace: *mut c_void,
@@ -11,6 +18,7 @@ unsafe extern "C" {
         width: c_int,
         roles: c_int,
         eps: f32,
+        cpu_parity: c_int,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -22,6 +30,7 @@ pub(in crate::kernels::cuda) fn launch(
     health: RawRange<'_>,
     [width, roles]: [usize; 2],
     eps: f32,
+    arithmetic: Arithmetic,
 ) -> Result<(), DeviceFailure> {
     if !(1..=4096).contains(&width)
         || !(1..=1536).contains(&roles)
@@ -50,6 +59,7 @@ pub(in crate::kernels::cuda) fn launch(
             width as c_int,
             roles as c_int,
             eps,
+            arithmetic as c_int,
             stream.0.as_ptr(),
             &mut stage,
         )
