@@ -528,11 +528,12 @@ fn start_flint(
         config.flint.as_ref(),
         ready_note,
     )?;
-    let effective = crate::capability::effective::flint_effective_for_build(
-        config.flint.as_ref(),
-        // The order the open actually served, so a retried load reports the token-major walk.
-        flint::prefill_order::served().as_ref(),
-    )?;
+    // CUDA stages the rows on its worker after the executor opens with its final order.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    let effective = Vec::new();
+    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+    let effective =
+        crate::capability::effective::flint_effective_for_build(config.flint.as_ref(), None)?;
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
