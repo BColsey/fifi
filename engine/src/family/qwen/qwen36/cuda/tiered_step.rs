@@ -232,10 +232,40 @@ impl TieredLayerHost for HostAdapter<'_, '_> {
     }
 }
 
-/// The device half of a bank change: blocking writes of one expert's three slices.
+/// The copy stream of the bank fills and the event recorded behind the last fill queued on it.
+/// Fills run here, beside the compute stream, so a swap never drains the compute work and the
+/// copies of one boundary overlap the next token.
+pub(super) struct FillQueue {
+    stream: DeviceStream,
+    event: DeviceEvent,
+    queued: bool,
+}
+
+impl FillQueue {
+    pub(super) fn new(ctx: &CudaContext) -> Result<Self, EngError> {
+        Ok(Self {
+            stream: ctx.stream()?,
+            event: ctx.event()?,
+            queued: false,
+        })
+    }
+
+    /// Waits for every fill queued so far. Nothing is waited when none is queued.
+    pub(super) fn wait(&mut self) -> Result<(), EngError> {
+        if self.queued {
+            self.event.synchronize()?;
+            self.queued = false;
+        }
+        Ok(())
+    }
+}
+
+/// The device half of a bank change: the three slices of one expert are queued into a slot on
+/// the copy stream. A slot becomes readable only when the host has waited the fill and
+/// published it, which orders the copy before every launch that reads the slot.
 pub(super) struct BankFill<'d> {
     pub(super) banks: &'d [ExpertBank],
-    pub(super) stream: &'d DeviceStream,
+    pub(super) queue: &'d mut FillQueue,
 }
 
 impl BankDevice for BankFill<'_> {
@@ -257,14 +287,31 @@ impl BankDevice for BankFill<'_> {
                 .get(range.clone())
                 .ok_or_else(|| device(format!("expert range {range:?} is outside the region")))
         };
+        let queue = &mut *self.queue;
         bank.fill(
-            self.stream,
+            &queue.stream,
             slot,
             cut(&ranges.gate)?,
             cut(&ranges.up)?,
             cut(&ranges.down)?,
         )
-        .map_err(|error| device(format!("{error:?}")))
+        .map_err(|error| device(format!("{error:?}")))?;
+        queue
+            .stream
+            .record(&queue.event)
+            .map_err(|error| device(format!("{error:?}")))?;
+        queue.queued = true;
+        Ok(())
+    }
+
+    fn wait_fills(&mut self) -> Result<(), HostError> {
+        self.queue
+            .wait()
+            .map_err(|error| HostError::Device(format!("{error:?}")))
+    }
+
+    fn defers_publication(&self) -> bool {
+        true
     }
 }
 
@@ -273,6 +320,8 @@ pub(super) struct TieredRuntime<'w> {
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
+    /// The copy stream the bank fills run on.
+    fills: FillQueue,
     /// The cold staging bank of the chunked prefill: `None` when admission left no
     /// spare VRAM for it (the chunk path then keeps the CPU pool for every miss).
     cold: Option<ColdStaging>,
@@ -349,6 +398,7 @@ impl<'w> TieredRuntime<'w> {
         banks: Vec<ExpertBank>,
         scratch: TieredScratch,
         host: TieredHost,
+        fills: FillQueue,
         cold: Option<ColdStaging>,
     ) -> Result<Self, EngError> {
         if parts.len() != banks.len() {
@@ -364,6 +414,7 @@ impl<'w> TieredRuntime<'w> {
             banks,
             scratch,
             host,
+            fills,
             cold,
             slot_count,
             syncs: HostSyncs::default(),
@@ -859,7 +910,7 @@ impl<'w> TieredRuntime<'w> {
         };
         let mut fills = BankFill {
             banks: &self.banks,
-            stream: launch.stream,
+            queue: &mut self.fills,
         };
         let made = run_moe_block_tiered(
             launch,
@@ -901,10 +952,10 @@ impl<'w> TieredRuntime<'w> {
         Ok(())
     }
 
-    pub(super) fn preload(&mut self, stream: &DeviceStream) -> Result<usize, EngError> {
+    pub(super) fn preload(&mut self) -> Result<usize, EngError> {
         let mut fills = BankFill {
             banks: &self.banks,
-            stream,
+            queue: &mut self.fills,
         };
         self.host.preload_all(&mut fills).map_err(host_error)
     }
@@ -919,14 +970,13 @@ impl<'w> TieredRuntime<'w> {
         std::mem::take(&mut self.syncs)
     }
 
-    pub(super) fn end_token(&mut self, stream: &DeviceStream) -> Result<TokenReport, EngError> {
+    pub(super) fn end_token(&mut self) -> Result<TokenReport, EngError> {
         let mut fills = BankFill {
             banks: &self.banks,
-            stream,
+            queue: &mut self.fills,
         };
         let end_t0 = std::time::Instant::now();
         let report = self.host.end_token(&mut fills).map_err(host_error)?;
-        self.syncs.writes += report.swaps * ExpertBank::FILL_WRITES;
         if super::moe::tiered::tiered_probe() {
             self.probe_end_ns += end_t0.elapsed().as_nanos();
             self.probe_report.merge(&report);

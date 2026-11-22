@@ -140,9 +140,6 @@ impl ExpertBankGeometry {
 }
 
 impl ExpertBank {
-    /// The blocking writes of one [`Self::fill`] (gate, up, down): the run report counts them.
-    pub(crate) const FILL_WRITES: u32 = 3;
-
     /// Device bytes of a bank of `slots` slots: three stacks. A pure checked function, so
     /// admission can size a bank before allocating it.
     pub(crate) fn bytes_for(geometry: ExpertBankGeometry, slots: usize) -> Result<u64, EngError> {
@@ -229,10 +226,12 @@ impl ExpertBank {
         self.geometry.slice_bytes()
     }
 
-    /// Copies one expert into `slot` with [`Self::FILL_WRITES`] blocking writes behind the work
-    /// queued on `stream`. Refuses before any copy for a slot out of range or a slice of the wrong
-    /// length. An error from a write itself can leave the slot half written: the caller treats
-    /// it as a failed fill and never publishes the slot.
+    /// Queues the copy of one expert into `slot` (three copies, gate, up, down) behind the work
+    /// queued on `stream` and returns without waiting for it. The slices must stay valid and
+    /// unchanged until `stream` completes the copies when they are page-locked memory (a pageable
+    /// source is consumed before the call returns). Refuses before any copy for a slot out of
+    /// range or a slice of the wrong length. An error from a copy itself can leave the slot half
+    /// written: the caller treats it as a failed fill and never publishes the slot.
     pub(crate) fn fill(
         &self,
         stream: &DeviceStream,
@@ -258,9 +257,13 @@ impl ExpertBank {
         }
         self.gate
             .buffer()
-            .write_at(stream, slot * gate_bytes, gate)?;
-        self.up.buffer().write_at(stream, slot * up_bytes, up)?;
-        self.down.buffer().write_at(stream, slot * down_bytes, down)
+            .write_at_enqueue(stream, slot * gate_bytes, gate)?;
+        self.up
+            .buffer()
+            .write_at_enqueue(stream, slot * up_bytes, up)?;
+        self.down
+            .buffer()
+            .write_at_enqueue(stream, slot * down_bytes, down)
     }
 }
 
@@ -276,12 +279,10 @@ mod tests {
     const REAL: ExpertBankGeometry = ExpertBankGeometry::q4k(2048, 512, 8);
     const SLICE: usize = 512 * 8 * 144; // 589,824 bytes: gate, up and down are all this size
 
-    /// The run report counts `FILL_WRITES` blocking writes per fill; the constant must be what
-    /// `fill` really makes, so a fourth copy (or a dropped one) fails here without a device. The
-    /// count is textual: it skips whole-line comments and does not see block comments, trailing
-    /// comments or the `DeviceBuffer::write_at(&buffer, ...)` call form.
+    /// Every copy of a fill is an enqueue: a blocking write would drain the stream the fill
+    /// is meant to leave running. The count is textual: it skips whole-line comments.
     #[test]
-    fn fill_writes_counts_the_write_at_calls_of_fill() {
+    fn fill_queues_its_three_copies_and_blocks_on_none() {
         let source = include_str!("expert_bank.rs");
         let start = source
             .find("pub(crate) fn fill(")
@@ -294,8 +295,8 @@ mod tests {
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect();
-        let writes = code.matches(".write_at(").count();
-        assert_eq!(writes, ExpertBank::FILL_WRITES as usize, "{code}");
+        assert_eq!(code.matches(".write_at_enqueue(").count(), 3, "{code}");
+        assert_eq!(code.matches(".write_at(").count(), 0, "{code}");
     }
 
     #[test]
@@ -464,6 +465,7 @@ mod tests {
             )
             .unwrap();
         }
+        stream.synchronize().unwrap();
         let x_gate = quantized_row(&ctx, &stream, 2048, &mut rng);
         let x_down = quantized_row(&ctx, &stream, 512, &mut rng);
         let via_full_ids: [i32; 8] = picks.map(|e| e as i32);
@@ -541,6 +543,7 @@ mod tests {
             );
         }
         bank.fill(&stream, 2, &a, &b, &c).unwrap();
+        stream.synchronize().unwrap();
         for (stack, byte) in [
             (bank.gate(), 0x11u8),
             (bank.up(), 0x22),
@@ -575,6 +578,7 @@ mod tests {
             let down = reference::build_weight(QuantType::Q4K, 2048, 512, &mut rng);
             bank.fill(&stream, slot, &gate, &up, &down).unwrap();
         }
+        stream.synchronize().unwrap();
         let x = quantized_row(&ctx, &stream, 2048, &mut rng);
         for first in [0i32, 8] {
             let ids: [i32; 8] = std::array::from_fn(|i| first + i as i32);

@@ -306,8 +306,8 @@ fn the_tiered_token_report_carries_the_layer_waits_and_the_bank_fills() {
         "pub(super) fn end_token(",
     ));
     assert!(
-        boundary.contains("self.syncs.writes+=report.swaps*ExpertBank::FILL_WRITES;"),
-        "{boundary}"
+        !boundary.contains("syncs.writes"),
+        "the boundary's fills run on the copy stream and count no host write: {boundary}"
     );
     let abort = pinned(section_of(
         include_str!("tiered_step.rs"),

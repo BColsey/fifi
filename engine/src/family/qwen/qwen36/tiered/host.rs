@@ -93,6 +93,14 @@ pub trait BankDevice {
     fn wait_fills(&mut self) -> Result<(), HostError> {
         Ok(())
     }
+
+    /// Whether this device copies on a stream of its own, so the token boundary may leave its
+    /// fills in flight while the next token computes. The next boundary then waits them (they
+    /// have long finished by then) and publishes them; a blocking device keeps the default and
+    /// has every fill landed and published when `end_token` returns.
+    fn defers_publication(&self) -> bool {
+        false
+    }
 }
 
 /// What the device launches of one layer need: per pick the bank slot to read and the
@@ -918,7 +926,9 @@ impl TieredHost {
     /// through the residency state machine (unpublish the victim, begin the fill, copy
     /// through `device`, complete the event) and publishes what landed. Returns the
     /// token's counters and starts the next token. A failed fill publishes what was
-    /// already filled, poisons the host and returns the error.
+    /// already filled, poisons the host and returns the error. A device that
+    /// [`defers publication`](BankDevice::defers_publication) keeps this boundary's fills in
+    /// flight: they publish at the next boundary.
     pub fn end_token(&mut self, device: &mut dyn BankDevice) -> Result<TokenReport, HostError> {
         if self.poisoned {
             return Err(HostError::Poisoned);
@@ -953,7 +963,9 @@ impl TieredHost {
                 return Err(error);
             }
         }
-        self.drain_fills(device)?;
+        if !device.defers_publication() {
+            self.drain_fills(device)?;
+        }
         let mut report = std::mem::take(&mut self.report);
         report.swaps = u32::try_from(swaps.len()).unwrap_or(u32::MAX);
         let (hits, total) = self.meter.counts();
@@ -1844,7 +1856,7 @@ mod tests {
     fn run_token(
         f: &mut Fixture,
         picks: &[Vec<i32>],
-        device: &mut MockDevice,
+        device: &mut dyn BankDevice,
     ) -> Result<TokenReport, HostError> {
         for (layer, ids) in picks.iter().enumerate() {
             let weights = vec![1.0 / ids.len() as f32; ids.len()];
@@ -1882,6 +1894,70 @@ mod tests {
         let report = run_token(&mut f, &picks, &mut device).unwrap();
         assert_eq!((report.bank_hits, report.cpu_served), (9, 3));
         f.host.check_consistency().unwrap();
+    }
+
+    /// A device that copies on a stream of its own: its fills land only when waited.
+    #[derive(Default)]
+    struct DeferredDevice {
+        inner: MockDevice,
+    }
+
+    impl BankDevice for DeferredDevice {
+        fn fill_slot(
+            &mut self,
+            layer: usize,
+            slot: usize,
+            ranges: &ExpertRanges,
+            region: &Arc<dyn MappedRegion>,
+        ) -> Result<(), HostError> {
+            self.inner.fill_slot(layer, slot, ranges, region)
+        }
+
+        fn wait_fills(&mut self) -> Result<(), HostError> {
+            self.inner.wait_fills()
+        }
+
+        fn defers_publication(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_deferring_device_publishes_its_fills_at_the_next_boundary() {
+        let mut f = fixture();
+        let mut device = DeferredDevice::default();
+        let picks = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![1, 3, 5, 7]];
+        let first = run_token(&mut f, &picks, &mut device).unwrap();
+        assert_eq!(first.swaps, 9);
+        assert_eq!(device.inner.fills.len(), 9, "the fills were queued");
+        assert_eq!(
+            device.inner.waits, 1,
+            "only the drain before the swaps waited"
+        );
+        assert!(
+            !f.host.is_resident(0, 2),
+            "a queued fill is not published at the boundary that queued it"
+        );
+        let second = run_token(&mut f, &picks, &mut device).unwrap();
+        assert_eq!(
+            (second.bank_hits, second.cpu_served),
+            (0, 12),
+            "the second token still sees every expert as missed"
+        );
+        assert!(f.host.is_resident(0, 2), "the next boundary published them");
+        let third = run_token(&mut f, &picks, &mut device).unwrap();
+        assert_eq!((third.bank_hits, third.cpu_served), (9, 3));
+        f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn a_blocking_device_still_publishes_at_the_boundary_that_queued_the_fills() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        assert!(!device.defers_publication());
+        let picks = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![1, 3, 5, 7]];
+        run_token(&mut f, &picks, &mut device).unwrap();
+        assert!(f.host.is_resident(0, 2));
     }
 
     #[test]

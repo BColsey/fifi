@@ -1408,8 +1408,9 @@ impl<'a> QwenResidentStep<'a> {
         })?;
         let moe = &self.moe_dims;
         let scratch = TieredScratch::new(self.context, moe.hidden, moe.top_k)?;
+        let fills = super::tiered_step::FillQueue::new(self.context)?;
         self.tiered = Some(std::cell::RefCell::new(TieredRuntime::new(
-            parts, banks, scratch, host, cold,
+            parts, banks, scratch, host, fills, cold,
         )?));
         Ok(())
     }
@@ -1420,7 +1421,7 @@ impl<'a> QwenResidentStep<'a> {
         let runtime = self.tiered.as_ref().ok_or_else(|| {
             EngError::BadRequest("step: the tiered runtime is not attached".to_owned())
         })?;
-        runtime.borrow_mut().preload(&self.stream)
+        runtime.borrow_mut().preload()
     }
 
     /// The counters of the last token's tiered boundary (all zero on a plain step).
@@ -2155,7 +2156,7 @@ impl<'a> QwenResidentStep<'a> {
     /// fills, the counters. A failure poisons the state: the bank and the policy may disagree.
     fn end_tiered_token(&mut self) -> Result<(), EngError> {
         let ended = match self.tiered.as_ref() {
-            Some(runtime) => runtime.borrow_mut().end_token(&self.stream),
+            Some(runtime) => runtime.borrow_mut().end_token(),
             None => Err(EngError::BadRequest(
                 "step: the tiered runtime is not attached".to_owned(),
             )),

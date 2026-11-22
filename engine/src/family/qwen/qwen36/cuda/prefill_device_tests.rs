@@ -2220,7 +2220,14 @@ fn chunk_moe_tiered_arm_fails_clean_on_empty_banks() {
         let host = TieredHost::new(config, locator, region, pool, Duration::from_secs(1))
             .map_err(|error| EngError::BadRequest(format!("the tiered fixture: {error:?}")))?;
         let scratch = TieredScratch::new(&ctx, DIMS.hidden, DIMS.top_k)?;
-        let mut runtime = TieredRuntime::new(Vec::new(), Vec::new(), scratch, host, None)?;
+        let mut runtime = TieredRuntime::new(
+            Vec::new(),
+            Vec::new(),
+            scratch,
+            host,
+            super::tiered_step::FillQueue::new(&ctx)?,
+            None,
+        )?;
         // A valid MoeChunkIo over small buffers, all NaN-prefilled.
         let m = 4usize;
         let hidden = DIMS.hidden;

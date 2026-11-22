@@ -18,7 +18,7 @@ use super::native_moe_device_tests::{
 };
 use super::run_report::HostSyncs;
 use super::tiered_load::tier_pool;
-use super::tiered_step::BankFill;
+use super::tiered_step::{BankFill, FillQueue};
 use crate::EngError;
 use crate::family::exl3::launch::Launch;
 use crate::family::project::cuda::WeightLayout;
@@ -81,6 +81,7 @@ fn full_bank(
         );
         bank.fill(stream, slot, gate, up, down)?;
     }
+    stream.synchronize()?;
     Ok(bank)
 }
 
@@ -758,12 +759,12 @@ fn bank_fill_writes_the_slices_the_ranges_name_into_the_slot_and_refuses_the_res
     let slot = 3;
     let (stacks, refusals) = {
         let ctx = CudaContext::new()?;
-        let stream = ctx.stream()?;
         let geometry = ExpertBankGeometry::q4k(DIMS.hidden, DIMS.inter, DIMS.top_k);
         let banks = [ExpertBank::new(&ctx, geometry, DIMS.n_expert)?];
+        let mut queue = FillQueue::new(&ctx)?;
         let mut fill = BankFill {
             banks: &banks,
-            stream: &stream,
+            queue: &mut queue,
         };
         fill.fill_slot(0, slot, &ranges, &region)
             .map_err(|error| backend(&format!("{error:?}")))?;
@@ -776,7 +777,8 @@ fn bank_fill_writes_the_slices_the_ranges_name_into_the_slot_and_refuses_the_res
             fill.fill_slot(0, DIMS.n_expert, &ranges, &region).is_err(),
             fill.fill_slot(0, 5, &outside, &region).is_err(),
         ];
-        stream.synchronize()?;
+        fill.wait_fills()
+            .map_err(|error| backend(&format!("{error:?}")))?;
         let mut stacks = Vec::new();
         for stack in [banks[0].gate(), banks[0].up(), banks[0].down()] {
             let mut bytes = vec![0u8; DIMS.n_expert * SLICE];
