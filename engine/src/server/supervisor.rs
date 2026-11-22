@@ -2,16 +2,17 @@
 //!
 //! A runtime-added engine of a family that keeps its card memory for
 //! the process lifetime (`holds_memory_until_restart`) can be served
-//! by a supervised `enginesrv serve --model` child process instead of
+//! by a supervised `enginesrv serve --config` child process instead of
 //! loading in the process: stopping such an engine ends the worker
 //! and the operating system frees its memory, where an in-process
 //! stop cannot. The front server routes requests to a ready worker
 //! and reports the worker's own loader state, so admission and load
 //! failures surface exactly as they would in-process.
 //!
-//! The worker is the same binary (`current_exe`) with the same
-//! discovery path (`serve --model`), listening on a loopback port the
-//! kernel picks; the first `enginesrv listening on <addr>` line on its
+//! The worker is the same binary (`current_exe`), started from the
+//! configuration the front derived, written to a file the child reads
+//! once, on a loopback port the kernel picks; the first `enginesrv
+//! listening on <addr>` line on its
 //! stdout names the port. Its API key is generated per worker and set
 //! through the child environment, and the front replaces the caller's
 //! auth headers with it while proxying.
@@ -31,16 +32,21 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use super::model_serve::ModelServeArgs;
+use super::config::Config;
+use super::model_serve::config_json;
 use super::state::AppState;
 
-/// The environment variable a worker reads its API key from: the
-/// constant `serve --model` builds its configuration with.
+/// The environment variable a worker reads its API key from: the one
+/// every configuration built here names.
 const WORKER_KEY_ENV: &str = "ENGINESRV_API_KEY";
 
 /// The line `run` prints once the listener is bound: the worker's
 /// port discovery, so no fixed port is ever contended.
 const LISTEN_PREFIX: &str = "enginesrv listening on ";
+
+/// The worker listens here: a loopback port the kernel picks, named
+/// on the listen line the front reads.
+const WORKER_LISTEN: &str = "127.0.0.1:0";
 
 /// How long the front waits for the listen line before calling the
 /// worker failed: a start that does not bind within this window is
@@ -80,6 +86,18 @@ struct Worker {
     addr: Mutex<Option<String>>,
     child: Arc<Mutex<Option<Child>>>,
     status: Mutex<WorkerStatus>,
+    /// The configuration file the child was started from. The child
+    /// reads it once, so it goes when the last handle to the worker
+    /// does.
+    config_path: Option<PathBuf>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Some(path) = &self.config_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn poison<T>(error: std::sync::PoisonError<T>) -> T {
@@ -88,12 +106,25 @@ fn poison<T>(error: std::sync::PoisonError<T>) -> T {
 
 pub(crate) struct WorkerSupervisor {
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    /// The worker executable; `None` is this binary, `enginesrv`.
+    binary: Option<PathBuf>,
 }
 
 impl WorkerSupervisor {
     pub(crate) fn new() -> Self {
         Self {
             workers: Mutex::new(HashMap::new()),
+            binary: None,
+        }
+    }
+
+    /// A supervisor that starts a stand-in executable, so a test can
+    /// drive the real child-process path.
+    #[cfg(test)]
+    pub(crate) fn with_worker_binary(binary: PathBuf) -> Self {
+        Self {
+            binary: Some(binary),
+            ..Self::new()
         }
     }
 
@@ -160,44 +191,61 @@ impl WorkerSupervisor {
     }
 
     /// Start one worker. The id is the front's own engine id; the
-    /// worker's internal id stays whatever `serve --model` derives,
-    /// because the front routes by its id and never exposes the
-    /// worker's.
+    /// worker's internal id stays whatever the derived configuration
+    /// carries, because the front routes by its id and never exposes
+    /// the worker's. The child starts from the configuration the front
+    /// derived, so nothing is derived twice and no family needs a
+    /// simplified startup of its own.
     pub(crate) fn spawn(
         &self,
         id: &str,
-        args: &ModelServeArgs,
+        config: Config,
         model: Option<String>,
     ) -> Result<(), String> {
-        let binary = std::env::current_exe()
-            .map_err(|error| format!("the supervised worker needs this binary's path: {error}"))?;
+        if self.contains(id) {
+            return Err(format!("engine {id} already exists; pass a different id"));
+        }
+        if config.engines.is_empty() {
+            // Writing this would read the engine it does not have, and a
+            // panic here ends the front.
+            return Err("the derived configuration carries no engine".to_string());
+        }
+        let binary = match &self.binary {
+            Some(binary) => binary.clone(),
+            None => std::env::current_exe().map_err(|error| {
+                format!("the supervised worker needs this binary's path: {error}")
+            })?,
+        };
         let key = worker_key(id);
-        let mut command = Command::new(binary);
-        command
+        let mut config = config;
+        config.listen = WORKER_LISTEN.to_string();
+        let model_dir = config
+            .engines
+            .first()
+            .map(|engine| engine.model_dir.clone())
+            .unwrap_or_default();
+        let config_path =
+            std::env::temp_dir().join(format!("fifi-worker-{}-{id}.json", std::process::id()));
+        std::fs::write(&config_path, config_json(&config)).map_err(|error| {
+            format!("the supervised worker needs a configuration file: {error}")
+        })?;
+        let child = Command::new(binary)
             .arg("serve")
-            .arg("--model")
-            .arg(&args.model_dir)
-            .arg("--listen")
-            .arg("127.0.0.1:0")
+            .arg("--config")
+            .arg(&config_path)
             .env(WORKER_KEY_ENV, &key)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(dir) = &args.tokenizer_dir {
-            command.arg("--tokenizer-dir").arg(dir);
-        }
-        if let Some(family) = &args.family {
-            command.arg("--family").arg(family);
-        }
-        if let Some(context) = args.context_limit {
-            command.arg("--context").arg(context.to_string());
-        }
-        if let Some(kv) = &args.kv_dtype {
-            command.arg("--kv").arg(kv);
-        }
-        let mut child = command
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("the supervised worker failed to start: {error}"))?;
+            .map_err(|error| format!("the supervised worker failed to start: {error}"));
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&config_path);
+                return Err(error);
+            }
+        };
         let stdout = child.stdout.take().expect("stdout is piped above");
         let stderr = child.stderr.take().expect("stderr is piped above");
         // Both pipes drain on their own threads; a full pipe would
@@ -240,7 +288,7 @@ impl WorkerSupervisor {
             // before the worker's engine can report one; the health
             // poll refreshes it once it can.
             model: Mutex::new(model),
-            model_dir: args.model_dir.clone(),
+            model_dir,
             key,
             addr: Mutex::new(None),
             child: Arc::new(Mutex::new(Some(child))),
@@ -250,6 +298,7 @@ impl WorkerSupervisor {
                 error: None,
                 context_limit: None,
             }),
+            config_path: Some(config_path),
         });
         let mut workers = self.workers.lock().unwrap_or_else(poison);
         if workers.contains_key(id) {
@@ -306,8 +355,7 @@ impl WorkerSupervisor {
 
     /// A worker entry the tests insert directly, standing in for a
     /// spawned child: the proxy, list and stop paths run unchanged,
-    /// while the real child-process mechanics belong to the host
-    /// smoke.
+    /// while the real child-process path has its own test below.
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, id: &str, model: &str, addr: &str, key: &str) {
         let worker = Arc::new(Worker {
@@ -323,6 +371,7 @@ impl WorkerSupervisor {
                 error: None,
                 context_limit: None,
             }),
+            config_path: None,
         });
         self.workers
             .lock()
@@ -743,6 +792,7 @@ fn worker_error(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::model_serve::{ModelServeArgs, bare_config};
     use crate::server::router::router;
     use crate::server::testkit;
     use axum::body::Body;
@@ -792,6 +842,137 @@ mod tests {
         let (status, _headers, bytes) =
             testkit::send(&app, testkit::post_json("/v1/chat/completions", &body)).await;
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A configuration with no engine is refused before any file or
+    /// process exists: writing it would read the engine it lacks.
+    #[test]
+    fn a_worker_is_refused_a_configuration_without_an_engine() {
+        let args = ModelServeArgs::default();
+        let mut config = bare_config(&args, crate::family::qwen::flash_next::factory::FAMILY);
+        config.engines.clear();
+        let supervisor = WorkerSupervisor::new();
+        let refused = supervisor
+            .spawn("none", config, None)
+            .expect_err("a worker without an engine");
+        assert!(refused.contains("carries no engine"), "{refused}");
+        assert!(supervisor.snapshot().is_empty());
+        let unwritten =
+            std::env::temp_dir().join(format!("fifi-worker-{}-none.json", std::process::id()));
+        assert!(!unwritten.exists(), "{}", unwritten.display());
+    }
+
+    /// The real child-process path. The front writes the configuration
+    /// it derived, starts `serve --config <file>`, learns the address
+    /// from the child's listen line, and the file goes with the worker.
+    /// A shell script stands in for `enginesrv`: it copies the file
+    /// aside for the assertions and names the address of a second
+    /// server that requires the key the spawn generated.
+    #[tokio::test]
+    async fn a_spawned_worker_starts_from_the_derived_config_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker port");
+        let addr = listener.local_addr().expect("worker address").to_string();
+        let scratch = std::env::temp_dir();
+        let tag = format!("fifi-worker-test-{}", std::process::id());
+        let script = scratch.join(format!("{tag}.sh"));
+        let copied = scratch.join(format!("{tag}.json"));
+        let model_dir = scratch.join(&tag);
+        std::fs::create_dir_all(&model_dir).expect("model directory");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 # $1 $2 are `serve --config`; $3 names the file\n\
+                 cp \"$3\" {}\n\
+                 echo \"enginesrv listening on {addr}\"\n\
+                 exec sleep 60\n",
+                copied.display()
+            ),
+        )
+        .expect("write the stand-in worker");
+        let executable = Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status()
+            .expect("chmod")
+            .success();
+        assert!(executable, "chmod +x on the stand-in worker");
+
+        let args = ModelServeArgs {
+            model_dir: model_dir.clone(),
+            ..ModelServeArgs::default()
+        };
+        let family = crate::family::qwen::flash_next::factory::FAMILY;
+        let supervisor = WorkerSupervisor::with_worker_binary(script.clone());
+        supervisor
+            .spawn("flash", bare_config(&args, family), None)
+            .expect("spawn");
+        let key = supervisor
+            .workers
+            .lock()
+            .unwrap_or_else(poison)
+            .get("flash")
+            .map(|worker| worker.key.clone())
+            .expect("the worker is listed");
+        let engine = testkit::engine(testkit::script("unused"));
+        let entry = testkit::entry("worker-engine", "fake-model", &engine, 128);
+        let state = Arc::new(AppState::new(&key, vec![entry]));
+        let app = router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let config_path = scratch.join(format!("fifi-worker-{}-flash.json", std::process::id()));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let state = loop {
+            let row = supervisor
+                .snapshot()
+                .into_iter()
+                .find(|worker| worker.id == "flash")
+                .expect("the worker is listed");
+            if row.status.state != "starting" {
+                break row.status.state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker stayed `starting`"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            state, "ready",
+            "the health poll reached the child's address"
+        );
+
+        let written = Config::from_file(&copied).expect("the child read a configuration file");
+        assert_eq!(written.listen, "127.0.0.1:0");
+        // The child reads this variable for the key the spawn set.
+        assert_eq!(written.api_key_env, WORKER_KEY_ENV);
+        let engine = &written.engines[0];
+        assert_eq!(engine.family, family);
+        assert!(
+            engine.model_dir.ends_with(&tag),
+            "{}",
+            engine.model_dir.display()
+        );
+        assert!(engine.tokenizer_dir.ends_with(&tag));
+        assert!(engine.flash_next.is_none(), "every option at its default");
+
+        assert!(config_path.is_file(), "the worker's configuration file");
+        assert_eq!(supervisor.stop("flash").as_deref(), Some("flash"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while config_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the configuration file outlived the worker"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for path in [script, copied] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[tokio::test]

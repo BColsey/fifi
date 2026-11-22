@@ -177,6 +177,17 @@ pub(crate) async fn add(
     let derive = state.derive();
     let scrub_model = model_dir.clone();
     let scrub_tokenizer = tokenizer_dir.clone();
+    // Under supervision the request names a family that `serve --model`
+    // cannot derive (Flash-Next has no simplified startup) instead of
+    // leaving it to detection: the worker reads the bare entry a boot
+    // configuration carries.
+    let bare_family = body.family.clone().filter(|family| {
+        state.supervised_engines()
+            && super::run::holds_memory_until_restart(family)
+            && !crate::server::model_serve::DETECTABLE_FAMILIES
+                .iter()
+                .any(|(name, _)| name == family)
+    });
     let derivation = tokio::task::spawn_blocking(move || {
         let args = crate::server::model_serve::ModelServeArgs {
             model_dir,
@@ -187,7 +198,18 @@ pub(crate) async fn add(
             listen: None,
             print_config: false,
         };
-        let mut config = derive(&args)?;
+        let mut config = match &bare_family {
+            Some(family) => {
+                if !args.model_dir.is_dir() {
+                    return Err(crate::server::StartupError(format!(
+                        "model_dir {} is not a directory",
+                        args.model_dir.display()
+                    )));
+                }
+                crate::server::model_serve::bare_config(&args, family)
+            }
+            None => derive(&args)?,
+        };
         let mut engines = std::mem::take(&mut config.engines);
         if engines.is_empty() {
             return Err(crate::server::StartupError(
@@ -197,7 +219,7 @@ pub(crate) async fn add(
         // `build_config` always assembles exactly one engine; the
         // guard above keeps that assumption honest if it ever changes.
         let engine_config = engines.swap_remove(0);
-        Ok::<_, crate::server::StartupError>((args, config.prefix_reuse, engine_config))
+        Ok::<_, crate::server::StartupError>((config, engine_config))
     })
     .await
     .map_err(|_| EngError::BadRequest("engine derivation failed".into()))?
@@ -208,16 +230,20 @@ pub(crate) async fn add(
             scrub_tokenizer.as_deref(),
         ))
     })?;
-    let (worker_args, file_prefix_reuse, mut engine_config) = derivation;
+    let (mut config, mut engine_config) = derivation;
     engine_config.id = id.clone();
     if state.supervised_engines() && super::run::holds_memory_until_restart(&engine_config.family) {
         // A process-lifetime family starts a supervised worker, so
         // stopping the engine ends the process and frees its memory:
         // the refusal below belongs to the in-process path only.
         let model_name = engine_config.model.clone().unwrap_or_default();
+        let model_dir = engine_config.model_dir.display().to_string();
+        // The worker reads its engine from this configuration: back in
+        // it goes, for the in-process path alone took it out.
+        config.engines.push(engine_config);
         return state
             .workers()
-            .spawn(&id, &worker_args, Some(model_name.clone()))
+            .spawn(&id, config, Some(model_name.clone()))
             .map_err(|error| {
                 ServerError::from(EngError::BadRequest(scrub_paths(
                     &error,
@@ -231,7 +257,7 @@ pub(crate) async fn add(
                     Json(serde_json::json!({
                         "id": id,
                         "model": model_name,
-                        "model_dir": engine_config.model_dir.display().to_string(),
+                        "model_dir": model_dir,
                         "state": "starting",
                         "supervised": true,
                     })),
@@ -240,7 +266,7 @@ pub(crate) async fn add(
     }
     refuse_pinned_family(&state, &engine_config.family)?;
     let started = tokio::task::spawn_blocking(move || {
-        crate::server::run::start_one(&engine_config, file_prefix_reuse)
+        crate::server::run::start_one(&engine_config, config.prefix_reuse)
     })
     .await
     .map_err(|_| EngError::BadRequest("engine start failed".into()))?

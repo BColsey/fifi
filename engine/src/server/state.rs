@@ -582,6 +582,15 @@ impl AppState {
         &self.workers
     }
 
+    /// A test drives the real spawn with a stand-in for `enginesrv`.
+    #[cfg(test)]
+    pub(crate) fn with_worker_binary(mut self, binary: std::path::PathBuf) -> Self {
+        self.workers = Arc::new(super::supervisor::WorkerSupervisor::with_worker_binary(
+            binary,
+        ));
+        self
+    }
+
     /// Whether runtime-added pinned-family engines start supervised
     /// workers: the config's `supervised_engines` setting.
     pub(crate) fn supervised_engines(&self) -> bool {

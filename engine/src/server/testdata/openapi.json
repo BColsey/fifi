@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "d960df65d2549697ed5fa10da353c30fd95fd338868334b42560338b51953f83",
+ "x-source-sha256": "1c52bc26a5842e2a0bf69d4041c7326eb3f476cf9506b57caef4a4494a2df6d9",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -3515,7 +3515,7 @@
    "post": {
     "operationId": "addEngine",
     "summary": "Start one engine at runtime (server extension)",
-    "description": "Server extension. Boots one engine in the running process through the exact CLI boot path, so a model the GUI downloaded to the hub cache is served without a restart. model_dir accepts a local model directory or org/repo, resolved to the hub cache the way serve --model does. The load is asynchronous; the state surfaces report progress. Only engines this route added can be removed by DELETE /v1/engines/{id}. An id is 1 to 64 characters of letters, digits, dot, underscore or dash; at most eight runtime engines run at once. Error text names directories as model_dir and tokenizer_dir, not by their host paths. When the configuration sets supervised_engines, an add of a family that keeps its memory for the process lifetime starts a supervised worker process instead, and its loader stages and failures surface through these same state routes.",
+    "description": "Server extension. Boots one engine in the running process through the exact CLI boot path, so a model the GUI downloaded to the hub cache is served without a restart. model_dir accepts a local model directory or org/repo, resolved to the hub cache the way serve --model does. The load is asynchronous; the state surfaces report progress. Only engines this route added can be removed by DELETE /v1/engines/{id}. An id is 1 to 64 characters of letters, digits, dot, underscore or dash; at most eight runtime engines run at once. Error text names directories as model_dir and tokenizer_dir, not by their host paths. When the configuration sets supervised_engines, an add of a family that keeps its memory for the process lifetime starts a supervised worker process from the derived configuration instead, and its loader stages and failures surface through these same state routes. There family also names a family that serve --model cannot derive on its own (qwen3_8_flash_next): the worker then starts from the bare entry a configuration file carries, with every option at its default. Without supervised_engines such an add is refused.",
     "requestBody": {
      "required": true,
      "content": {

@@ -358,6 +358,24 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
 /// Assemble the in-memory `Config` — the document a `--config` file
 /// would carry, headed for the identical serve path.
 fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
+    let simplified = uses_qwen36_options(&discovered.family);
+    let mut config = bare_config(args, &discovered.family);
+    let engine = &mut config.engines[0];
+    engine.tokenizer_dir = discovered.tokenizer_dir.clone();
+    if simplified {
+        engine.id = "q36".to_string();
+        engine.qwen36 = Some(discovered.options.clone());
+    }
+    config
+}
+
+/// The configuration a supervised worker reads for a family that has
+/// no simplified startup (Flash-Next): the bare entry a `--config`
+/// file carries, with the family named rather than detected and every
+/// option left to its default. `serve --model` still refuses such a
+/// family on its own, because a command line has nothing to name it
+/// by.
+pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
     Config {
         listen: args
             .listen
@@ -369,14 +387,13 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         supervised_engines: false,
         web_dir: None,
         engines: vec![EngineConfig {
-            id: if uses_qwen36_options(&discovered.family) {
-                "q36".to_string()
-            } else {
-                discovered.family.clone()
-            },
+            id: family.to_string(),
             model_dir: args.model_dir.clone(),
-            tokenizer_dir: discovered.tokenizer_dir.clone(),
-            family: discovered.family.clone(),
+            tokenizer_dir: args
+                .tokenizer_dir
+                .clone()
+                .unwrap_or_else(|| args.model_dir.clone()),
+            family: family.to_string(),
             model: None,
             context_limit: None,
             think_replay: None,
@@ -384,7 +401,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             kv_cache: None,
             fake: None,
             flash_next: None,
-            qwen36: uses_qwen36_options(&discovered.family).then(|| discovered.options.clone()),
+            qwen36: None,
             nemotron: None,
             gemma4: None,
             flint: None,

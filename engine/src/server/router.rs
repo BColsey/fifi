@@ -1394,6 +1394,83 @@ mod tests {
         assert_eq!(body["error"]["message"], "model_dir is required");
     }
 
+    /// The supervised add as one piece: the handler's derivation and the
+    /// real spawn. The in-process path takes the engine out of the derived
+    /// configuration; the worker's configuration must still carry it.
+    #[tokio::test]
+    async fn a_supervised_add_hands_the_worker_its_engine() {
+        let scratch = std::env::temp_dir();
+        let tag = format!("fifi-supervised-add-{}", std::process::id());
+        let model_dir = scratch.join(&tag);
+        std::fs::create_dir_all(&model_dir).expect("model directory");
+        // Nothing listens there: the front keeps the worker `starting`.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a free port")
+            .local_addr()
+            .expect("address")
+            .port();
+        let script = scratch.join(format!("{tag}.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"enginesrv listening on 127.0.0.1:{port}\"\n\
+                 exec sleep 60\n"
+            ),
+        )
+        .expect("the stand-in worker");
+        assert!(
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod")
+                .success()
+        );
+        let engine = testkit::engine(testkit::script("unused"));
+        let entry = testkit::entry("boot", "fake-model", &engine, 128);
+        let family = crate::family::qwen::flash_next::factory::FAMILY;
+        let state = Arc::new(
+            AppState::new(testkit::API_KEY, vec![entry]).with_worker_binary(script.clone()),
+        );
+        state.set_supervised_engines(true);
+        let body = serde_json::json!({ "id": "flash", "family": family, "model_dir": model_dir });
+        let (status, _headers, bytes) =
+            testkit::send(&router(Arc::clone(&state)), post_engines(&body.to_string())).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(testkit::json_of(&bytes)["supervised"], true);
+
+        let config_path = scratch.join(format!("fifi-worker-{}-flash.json", std::process::id()));
+        let written = crate::server::config::Config::from_file(&config_path)
+            .expect("the worker's configuration file");
+        let engine = &written.engines[0];
+        assert_eq!(engine.family, family);
+        assert!(
+            engine.model_dir.ends_with(&tag),
+            "{}",
+            engine.model_dir.display()
+        );
+
+        let request = testkit::request("DELETE", "/v1/engines/flash", Some(testkit::API_KEY));
+        let (status, _headers, _body) = testkit::send(&router(state), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while config_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the configuration file outlived the worker"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir(&model_dir);
+    }
+
     #[tokio::test]
     async fn adding_an_engine_from_a_missing_directory_carries_the_cli_error_without_the_path() {
         let (state, _engine) = one_engine_state();

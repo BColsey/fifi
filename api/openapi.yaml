@@ -2743,8 +2743,13 @@ paths:
         model_dir and tokenizer_dir, not by their host paths. When the
         configuration sets supervised_engines, an add of a family that
         keeps its memory for the process lifetime starts a supervised
-        worker process instead, and its loader stages and failures
-        surface through these same state routes.
+        worker process from the derived configuration instead, and its
+        loader stages and failures surface through these same state
+        routes. There family also names a family that serve --model
+        cannot derive on its own (qwen3_8_flash_next): the worker then
+        starts from the bare entry a configuration file carries, with
+        every option at its default. Without supervised_engines such an
+        add is refused.
       requestBody:
         required: true
         content:
