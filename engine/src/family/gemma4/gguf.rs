@@ -27,6 +27,8 @@ const BOLT_LIMITS: GgufLimits = GgufLimits {
     // sits just above it (the legacy per-tensor ceiling was ~712 MiB).
     max_tensor_bytes: 3 << 30,
 };
+/// The most the Humanizer's resident ring and attention kernels take as a window.
+const HUMANIZER_MAX_WINDOW: u64 = 4096;
 const LAYERS: usize = 48;
 const HIDDEN: u64 = 3840;
 const FEED_FORWARD: u64 = 15360;
@@ -38,13 +40,8 @@ const GLOBAL_KV_HEADS: u64 = 1;
 const GLOBAL_HEAD: u64 = 512;
 const GGUF_I32: u32 = 5;
 const GGUF_BOOL: u32 = 7;
-/// The eoa/eoi ids both conversions name; each suppresses them on the text
-/// path.
-const SUPPRESSED_TOKENS: [i32; 2] = [258_883, 258_882];
-
-const HUMANIZER_INT_SCALARS: [(&str, u64); 16] = [
+const HUMANIZER_INT_SCALARS: [(&str, u64); 11] = [
     ("gemma4.block_count", LAYERS as u64),
-    ("gemma4.context_length", 262_144),
     ("gemma4.embedding_length", HIDDEN),
     ("gemma4.feed_forward_length", FEED_FORWARD),
     ("gemma4.attention.head_count", QUERY_HEADS),
@@ -52,13 +49,9 @@ const HUMANIZER_INT_SCALARS: [(&str, u64); 16] = [
     ("gemma4.attention.key_length_swa", LOCAL_HEAD),
     ("gemma4.attention.value_length", GLOBAL_HEAD),
     ("gemma4.attention.value_length_swa", LOCAL_HEAD),
-    ("gemma4.attention.sliding_window", 1024),
     ("gemma4.attention.shared_kv_layers", 0),
     ("gemma4.rope.dimension_count", 512),
     ("gemma4.rope.dimension_count_swa", 256),
-    ("tokenizer.ggml.bos_token_id", 2),
-    ("tokenizer.ggml.eos_token_id", 1),
-    ("tokenizer.ggml.unknown_token_id", 3),
 ];
 
 const FLOAT_SCALARS: [(&str, f64); 4] = [
@@ -74,23 +67,31 @@ const FLOAT_SCALARS: [(&str, f64); 4] = [
 /// name the offending metadata key or tensor. Failures of GgufWeights::open
 /// pass through unchanged, so a parse or header-hash failure keeps its own
 /// gguf: prefix and a tensor over the limit stays EngError::MemoryPlan.
-pub fn open_humanizer_q8(path: &Path, header_sha256: Option<&str>) -> Result<(), EngError> {
-    open_humanizer_weights(path, header_sha256).map(|_| ())
+pub fn open_humanizer_q8(path: &Path) -> Result<(), EngError> {
+    open_humanizer_weights(path).map(|_| ())
 }
 
-/// Opens the pinned checkpoint and returns the checked reader, for the resident
-/// loader. Applies exactly the checks of open_humanizer_q8.
-pub(crate) fn open_humanizer_weights(
-    path: &Path,
-    header_sha256: Option<&str>,
-) -> Result<GgufWeights, EngError> {
-    let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+/// A checked Humanizer file: the reader and the sliding window its header declares.
+pub(crate) struct HumanizerFile {
+    pub(crate) weights: GgufWeights,
+    pub(crate) window: usize,
+}
+
+/// Opens a Gemma 4 Humanizer-geometry checkpoint and returns the checked reader and the window
+/// its header names, for the resident loader. The file is accepted by what its header says, not by
+/// which file it is: the layer counts, widths, head shapes and the five-local, one-full pattern
+/// must be the ones the resident code is built for, and the window is read from the header.
+/// Applies exactly the checks of open_humanizer_q8.
+pub(crate) fn open_humanizer_weights(path: &Path) -> Result<HumanizerFile, EngError> {
+    let weights = GgufWeights::open(path, LIMITS, None)?;
     weights.require_single_file("the Gemma 4 engine")?;
     let header = weights.header();
     check_architecture(header)?;
     check_int_scalars(header, &HUMANIZER_INT_SCALARS)?;
     check_float_scalars(header)?;
     check_bool_scalar(header, "tokenizer.ggml.add_bos_token", true)?;
+    let window = read_window(header, HUMANIZER_MAX_WINDOW)?;
     let kv = read_i32_array(
         &weights,
         header,
@@ -105,32 +106,41 @@ pub(crate) fn open_humanizer_weights(
         LAYERS,
         GGUF_BOOL,
     )?;
-    let suppressed = read_i32_array(
-        &weights,
-        header,
-        "tokenizer.ggml.suppress_tokens",
-        SUPPRESSED_TOKENS.len(),
-        GGUF_I32,
-    )?;
     check_layer_pattern(&kv, &pattern)?;
-    if suppressed != SUPPRESSED_TOKENS {
+    check_inventory(header, LAYERS, expected_inventory(&kv))?;
+    Ok(HumanizerFile { weights, window })
+}
+
+/// The sliding window of the header: present, positive and at most `most`.
+fn read_window(header: &crate::weights::GgufHeader, most: u64) -> Result<usize, EngError> {
+    let key = "gemma4.attention.sliding_window";
+    let window = match header.meta(key) {
+        Some(MetaValue::U32(value)) => u64::from(*value),
+        Some(MetaValue::U64(value)) => *value,
+        Some(_) => {
+            return Err(reject(format!(
+                "metadata key {key} is not an unsigned integer"
+            )));
+        }
+        None => return Err(reject(format!("metadata key {key} is missing"))),
+    };
+    if window == 0 || window > most {
         return Err(reject(format!(
-            "metadata key tokenizer.ggml.suppress_tokens is {suppressed:?}, expected {SUPPRESSED_TOKENS:?}"
+            "metadata key {key} is {window}, expected 1 to {most}"
         )));
     }
-    check_inventory(header, expected_inventory(&kv))?;
-    Ok(weights)
+    Ok(window as usize)
 }
 
 /// One expected tensor: storage type and dimensions in file order.
-struct Expected {
-    name: String,
-    ty: GgufType,
-    dims: Vec<u64>,
+pub(super) struct Expected {
+    pub(super) name: String,
+    pub(super) ty: GgufType,
+    pub(super) dims: Vec<u64>,
 }
 
 /// Builds the exact 667-tensor inventory driven by the checked KV-head array.
-fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
+pub(super) fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
     let mut expected = Vec::with_capacity(667);
     expected.push(Expected {
         name: "token_embd.weight".to_owned(),
@@ -187,8 +197,20 @@ fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
     expected
 }
 
+/// Whether an unlisted tensor changes what the model computes if the recipe ignores it: an untied
+/// output head, any bias, or any further tensor of a layer the recipe runs.
+fn changes_the_result(name: &str, layers: usize) -> bool {
+    let in_a_layer = name
+        .strip_prefix("blk.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|index| index.parse::<usize>().ok())
+        .is_some_and(|index| index < layers);
+    name == "output.weight" || name.ends_with(".bias") || in_a_layer
+}
+
 fn check_inventory(
     header: &crate::weights::GgufHeader,
+    layers: usize,
     mut expected: Vec<Expected>,
 ) -> Result<(), EngError> {
     // The missing-tensor refusal below names the first absent entry in this
@@ -199,8 +221,13 @@ fn check_inventory(
         .map(|item| (item.name.as_str(), (&item.ty, item.dims.as_slice())))
         .collect();
     for tensor in header.tensors() {
+        // A tensor the recipe does not read and that cannot change the result (a file's own extras)
+        // does not stop it from running; one that would change it is refused by name.
         let Some((ty, dims)) = table.get(tensor.name()) else {
-            return Err(reject(format!("unexpected tensor {}", tensor.name())));
+            if changes_the_result(tensor.name(), layers) {
+                return Err(reject(format!("unexpected tensor {}", tensor.name())));
+            }
+            continue;
         };
         if tensor.ggml_type() != **ty {
             return Err(reject(format!(
@@ -394,11 +421,12 @@ const BOLT_LOCAL_HEAD: u64 = 256;
 const BOLT_GLOBAL_HEAD: u64 = 512;
 /// Width of the per-layer input the E4B checkpoint feeds every decoder layer.
 const BOLT_PER_LAYER_INPUT: u64 = 256;
+/// The window the Bolt resident code is built for; it takes the header's window once bolt.rs does.
+pub(super) const BOLT_WINDOW: u64 = 512;
 const BOLT_PHYSICAL_LAYERS: usize = BOLT_LAYERS - BOLT_SHARED;
 
-const BOLT_INT_SCALARS: [(&str, u64); 16] = [
+const BOLT_INT_SCALARS: [(&str, u64); 12] = [
     ("gemma4.block_count", BOLT_LAYERS as u64),
-    ("gemma4.context_length", 65_536),
     ("gemma4.embedding_length", BOLT_HIDDEN),
     ("gemma4.feed_forward_length", BOLT_FEED_FORWARD),
     ("gemma4.attention.head_count", BOLT_QUERY_HEADS),
@@ -406,13 +434,10 @@ const BOLT_INT_SCALARS: [(&str, u64); 16] = [
     ("gemma4.attention.key_length_swa", BOLT_LOCAL_HEAD),
     ("gemma4.attention.value_length", BOLT_GLOBAL_HEAD),
     ("gemma4.attention.value_length_swa", BOLT_LOCAL_HEAD),
-    ("gemma4.attention.sliding_window", 512),
+    ("gemma4.attention.sliding_window", BOLT_WINDOW),
     ("gemma4.attention.shared_kv_layers", BOLT_SHARED as u64),
     ("gemma4.rope.dimension_count", BOLT_GLOBAL_HEAD),
     ("gemma4.rope.dimension_count_swa", BOLT_LOCAL_HEAD),
-    ("tokenizer.ggml.bos_token_id", 2),
-    ("tokenizer.ggml.eos_token_id", 1),
-    ("tokenizer.ggml.unknown_token_id", 3),
 ];
 
 /// Which of the two accepted Bolt GGUF spellings a file uses: the legacy
@@ -492,18 +517,15 @@ impl BoltSpelling {
 /// Opens the converted Bolt Q8_0 GGUF and checks its metadata and tensors.
 /// Applies the checks of open_humanizer_q8 against the Bolt geometry: two KV
 /// heads on the 24 physical layers and none on the 18 shared layers.
-pub fn open_bolt_q8(path: &Path, header_sha256: Option<&str>) -> Result<(), EngError> {
-    open_bolt_weights(path, header_sha256).map(|_| ())
+pub fn open_bolt_q8(path: &Path) -> Result<(), EngError> {
+    open_bolt_weights(path).map(|_| ())
 }
 
 /// Opens the converted Bolt checkpoint and returns the checked reader plus
 /// the spelling its tensors use, for the resident loader. Applies exactly
 /// the checks of open_bolt_q8.
-pub(crate) fn open_bolt_weights(
-    path: &Path,
-    header_sha256: Option<&str>,
-) -> Result<(GgufWeights, BoltSpelling), EngError> {
-    let weights = GgufWeights::open(path, BOLT_LIMITS, header_sha256)?;
+pub(crate) fn open_bolt_weights(path: &Path) -> Result<(GgufWeights, BoltSpelling), EngError> {
+    let weights = GgufWeights::open(path, BOLT_LIMITS, None)?;
     weights.require_single_file("the Bolt engine")?;
     let header = weights.header();
     check_architecture(header)?;
@@ -524,21 +546,9 @@ pub(crate) fn open_bolt_weights(
         BOLT_LAYERS,
         GGUF_BOOL,
     )?;
-    let suppressed = read_i32_array(
-        &weights,
-        header,
-        "tokenizer.ggml.suppress_tokens",
-        SUPPRESSED_TOKENS.len(),
-        GGUF_I32,
-    )?;
     check_bolt_layer_pattern(&kv, &pattern)?;
-    if suppressed != SUPPRESSED_TOKENS {
-        return Err(reject(format!(
-            "metadata key tokenizer.ggml.suppress_tokens is {suppressed:?}, expected {SUPPRESSED_TOKENS:?}"
-        )));
-    }
     let spelling = bolt_spelling(header)?;
-    check_inventory(header, bolt_expected_inventory(spelling))?;
+    check_inventory(header, BOLT_LAYERS, bolt_expected_inventory(spelling))?;
     Ok((weights, spelling))
 }
 
@@ -745,8 +755,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = crate::weights::write_two_shard_set(dir.path(), "gemma");
         for error in [
-            open_humanizer_weights(&first, None).expect_err("a split set is refused"),
-            open_bolt_weights(&first, None)
+            open_humanizer_weights(&first)
+                .map(|_| ())
+                .expect_err("a split set is refused"),
+            open_bolt_weights(&first)
                 .map(|_| ())
                 .expect_err("a split set is refused"),
         ] {

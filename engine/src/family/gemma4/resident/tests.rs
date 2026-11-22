@@ -7,10 +7,8 @@ fn decodes_one_token_against_the_pinned_checkpoint() {
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         return;
     };
-    let header = std::env::var("GEMMA4_Q8_HEADER_SHA256").ok();
     let load_start = std::time::Instant::now();
-    let mut model: Gemma =
-        super::load(std::path::Path::new(&path), header.as_deref()).expect("load");
+    let mut model: Gemma = super::load(std::path::Path::new(&path)).expect("load");
     eprintln!("load_seconds={:.3}", load_start.elapsed().as_secs_f64());
     let step_start = std::time::Instant::now();
     model.decode(2, 0).expect("decode");
@@ -46,8 +44,7 @@ fn measures_matvec_bandwidth() {
         return;
     };
     let reps: usize = reps.parse().expect("probe count");
-    let header = std::env::var("GEMMA4_Q8_HEADER_SHA256").ok();
-    let model: Gemma = super::load(std::path::Path::new(&path), header.as_deref()).expect("load");
+    let model: Gemma = super::load(std::path::Path::new(&path)).expect("load");
     // The embedding is the one matrix that stays in the checkpoint's native Q8_0 layout,
     // so it is what the vendored matvec probe can measure.
     let embed = &model.embed;
@@ -158,8 +155,7 @@ fn each_layer_reads_the_previous_layers_output() {
 #[ignore = "requires the pinned Humanizer file and an exclusive device lease"]
 fn traces_first_position_top_five() {
     let path = std::env::var("GEMMA4_Q8_FILE").expect("checkpoint path required");
-    let header = std::env::var("GEMMA4_Q8_HEADER_SHA256").expect("header pin required");
-    let mut model = super::load(std::path::Path::new(&path), Some(&header)).expect("load");
+    let mut model = super::load(std::path::Path::new(&path)).expect("load");
     let prompt: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/testdata/gemma4/parity-prompt.json"

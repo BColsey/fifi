@@ -406,7 +406,7 @@ fn rejects_a_file_without_the_gemma4_architecture_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("empty.gguf");
     std::fs::write(&path, minimal_gguf_v3()).expect("write fixture");
-    match open_humanizer_q8(&path, None) {
+    match open_humanizer_q8(&path) {
         Err(crate::EngError::Checkpoint(message)) => assert!(
             message.contains("general.architecture"),
             "checkpoint error {message:?} does not name general.architecture"
@@ -414,8 +414,6 @@ fn rejects_a_file_without_the_gemma4_architecture_key() {
         other => panic!("expected Checkpoint naming general.architecture, got {other:?}"),
     }
 }
-
-const REAL_HEADER_SHA256: &str = "ca46011b7b65ad6dcc3944d86319d8d051c61cffc2b98551bbcf133888fb77b1";
 
 struct Kv {
     key: String,
@@ -595,7 +593,7 @@ fn open(bytes: &[u8]) -> Result<(), crate::EngError> {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("humanizer.gguf");
     std::fs::write(&path, bytes).expect("write fixture");
-    open_humanizer_q8(&path, None)
+    open_humanizer_q8(&path)
 }
 
 fn expect_rejection(result: Result<(), crate::EngError>, expect: &str) {
@@ -665,12 +663,6 @@ fn rejects_broken_per_layer_attention_arrays() {
         open(&build_gguf(&kvs, &globals())),
         "sliding_window_pattern is 0 at layer 0",
     );
-
-    let kvs: Vec<Kv> = base_kvs(&["tokenizer.ggml.suppress_tokens"])
-        .into_iter()
-        .chain([kv_i32_array("tokenizer.ggml.suppress_tokens", &[1, 2])])
-        .collect();
-    expect_rejection(open(&build_gguf(&kvs, &globals())), "suppress_tokens");
 }
 
 #[test]
@@ -683,6 +675,7 @@ fn rejects_missing_unexpected_and_mistyped_tensors() {
 
     let mut tensors = globals();
     tensors.push(("blk.0.extra.weight", crate::weights::GgufType::F32, &[1]));
+    // A layer tensor the recipe does not list is refused by name, before any missing tensor.
     expect_rejection(
         open(&build_gguf(&kvs, &tensors)),
         "unexpected tensor blk.0.extra.weight",
@@ -712,28 +705,21 @@ fn rejects_missing_unexpected_and_mistyped_tensors() {
 }
 
 #[test]
-fn accepts_the_pinned_humanizer_q8_file_when_provided() {
+fn accepts_a_humanizer_q8_file_when_provided() {
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         eprintln!("GEMMA4_Q8_FILE not set; skipping the real-file check");
         return;
     };
-    open_humanizer_q8(std::path::Path::new(&path), Some(REAL_HEADER_SHA256))
-        .expect("the pinned Humanizer Q8_0 file opens");
-    let wrong = open_humanizer_q8(std::path::Path::new(&path), Some(&"0".repeat(64)));
-    expect_rejection(wrong, "header");
+    open_humanizer_q8(std::path::Path::new(&path)).expect("the Humanizer Q8_0 file opens");
 }
 
 #[test]
-fn accepts_the_pinned_bolt_q8_file_when_provided() {
+fn accepts_a_bolt_q8_file_when_provided() {
     let Ok(path) = std::env::var("BOLT_Q8_FILE") else {
         eprintln!("BOLT_Q8_FILE not set; skipping the real-file check");
         return;
     };
-    let pinned = std::env::var("BOLT_Q8_HEADER_SHA256").ok();
-    open_bolt_q8(std::path::Path::new(&path), pinned.as_deref())
-        .expect("the pinned Bolt Q8_0 file opens");
-    let wrong = open_bolt_q8(std::path::Path::new(&path), Some(&"0".repeat(64)));
-    expect_rejection(wrong, "header");
+    open_bolt_q8(std::path::Path::new(&path)).expect("the Bolt Q8_0 file opens");
 }
 
 #[test]
@@ -972,7 +958,7 @@ fn open_bolt(
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bolt.gguf");
     write_bolt_gguf(kvs, tensors, &path);
-    open_bolt_q8(&path, None)
+    open_bolt_q8(&path)
 }
 
 #[test]
@@ -1296,21 +1282,34 @@ fn rejects_a_bolt_gguf_with_a_wrong_sliding_window_pattern() {
 }
 
 #[test]
-fn rejects_a_bolt_gguf_with_wrong_suppress_tokens() {
-    let kvs: Vec<Kv> = bolt_base_kvs(&["tokenizer.ggml.suppress_tokens"])
-        .into_iter()
-        .chain([kv_i32_array("tokenizer.ggml.suppress_tokens", &[1, 2])])
-        .collect();
-    expect_rejection(open_bolt(&kvs, &bolt_tensors()), "suppress_tokens");
-}
-
-#[test]
-fn rejects_a_bolt_gguf_with_a_bad_header_hash() {
+fn a_bolt_gguf_is_accepted_by_its_geometry_not_its_identity() {
+    // Same geometry, different header bytes (a fine-tune's name, other tokenizer ids, other
+    // suppress tokens): both open, and their header digests differ.
+    let limits = crate::weights::GgufLimits {
+        max_header_bytes: 100_000_000,
+        max_tensor_bytes: 3 << 30,
+    };
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("bolt.gguf");
-    write_bolt_gguf(&bolt_base_kvs(&[]), &bolt_tensors(), &path);
-    let wrong = open_bolt_q8(&path, Some(&"0".repeat(64)));
-    expect_rejection(wrong, "header");
+    let mut digests = Vec::new();
+    for (name, bos, suppress) in [("a", 2u32, [258_883, 258_882]), ("b", 7, [1, 2])] {
+        let kvs: Vec<Kv> = bolt_base_kvs(&[
+            "tokenizer.ggml.suppress_tokens",
+            "tokenizer.ggml.bos_token_id",
+        ])
+        .into_iter()
+        .chain([
+            kv_string("general.name", name),
+            kv_u32("tokenizer.ggml.bos_token_id", bos),
+            kv_i32_array("tokenizer.ggml.suppress_tokens", &suppress),
+        ])
+        .collect();
+        let path = dir.path().join(format!("bolt-{name}.gguf"));
+        write_bolt_gguf(&kvs, &bolt_tensors(), &path);
+        open_bolt_q8(&path).expect("a file of the supported geometry opens");
+        let weights = crate::weights::GgufWeights::open(&path, limits, None).expect("reader");
+        digests.push(weights.header().header_sha256());
+    }
+    assert_ne!(digests[0], digests[1]);
 }
 
 #[test]
@@ -1350,4 +1349,111 @@ fn accepts_gguf_rms_epsilon_in_its_stored_float_precision() {
             "missing tensor blk.0.attn_k.weight",
         );
     }
+}
+
+/// The Humanizer's scalar metadata with `window` as its sliding window.
+fn humanizer_kvs(window: u32, name: &str) -> Vec<Kv> {
+    base_kvs(&["gemma4.attention.sliding_window"])
+        .into_iter()
+        .chain([
+            kv_u32("gemma4.attention.sliding_window", window),
+            kv_string("general.name", name),
+        ])
+        .collect()
+}
+
+#[test]
+fn a_humanizer_gguf_is_accepted_by_its_geometry_and_names_its_own_window() {
+    let kv: Vec<i32> = (0..48)
+        .map(|layer| if layer % 6 != 5 { 8 } else { 1 })
+        .collect();
+    let tensors: Vec<_> = super::gguf::expected_inventory(&kv)
+        .into_iter()
+        .map(|item| (item.name, item.ty, item.dims))
+        .collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut digests = Vec::new();
+    for (window, name) in [(1024u32, "base"), (512, "tuned")] {
+        let path = dir.path().join(format!("humanizer-{name}.gguf"));
+        write_bolt_gguf(&humanizer_kvs(window, name), &tensors, &path);
+        let file = super::gguf::open_humanizer_weights(&path).expect("the geometry is supported");
+        assert_eq!(file.window, window as usize);
+        digests.push(file.weights.header().header_sha256());
+    }
+    assert_ne!(digests[0], digests[1], "different headers, both accepted");
+}
+
+#[test]
+fn a_humanizer_window_of_zero_or_past_the_resident_limit_is_refused() {
+    let kv: Vec<i32> = (0..48)
+        .map(|layer| if layer % 6 != 5 { 8 } else { 1 })
+        .collect();
+    let tensors: Vec<_> = super::gguf::expected_inventory(&kv)
+        .into_iter()
+        .map(|item| (item.name, item.ty, item.dims))
+        .collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    for window in [0u32, 4097] {
+        let path = dir.path().join(format!("humanizer-{window}.gguf"));
+        write_bolt_gguf(&humanizer_kvs(window, "w"), &tensors, &path);
+        expect_rejection(
+            super::gguf::open_humanizer_weights(&path).map(|_| ()),
+            "gemma4.attention.sliding_window",
+        );
+    }
+}
+
+#[test]
+fn an_extra_tensor_that_would_change_the_result_is_refused_and_a_harmless_one_is_not() {
+    let kv: Vec<i32> = (0..48)
+        .map(|layer| if layer % 6 != 5 { 8 } else { 1 })
+        .collect();
+    let complete: Vec<_> = super::gguf::expected_inventory(&kv)
+        .into_iter()
+        .map(|item| (item.name, item.ty, item.dims))
+        .collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("humanizer-extra.gguf");
+    let load = |extra: &str| {
+        let mut tensors = complete.clone();
+        tensors.push((extra.to_owned(), crate::weights::GgufType::F32, vec![8]));
+        write_bolt_gguf(&humanizer_kvs(1024, "extra"), &tensors, &path);
+        super::gguf::open_humanizer_weights(&path).map(|_| ())
+    };
+    for refused in [
+        "output.weight",
+        "blk.3.attn_q.bias",
+        "blk.5.attn_v.weight",
+        "blk.0.extra.weight",
+        "token_embd.bias",
+    ] {
+        expect_rejection(load(refused), &format!("unexpected tensor {refused}"));
+    }
+    // Outside every layer the recipe runs, an extra tensor changes nothing.
+    load("blk.48.extra.weight").expect("a tensor past the last layer is ignored");
+    load("mm.extra.weight").expect("an unrelated tensor is ignored");
+}
+
+#[test]
+fn the_bolt_configuration_takes_its_own_context_and_ids_but_only_the_built_window() {
+    let edit = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut config: serde_json::Value = serde_json::from_slice(BOLT_CONFIG).unwrap();
+        change(&mut config["text_config"]);
+        serde_json::to_vec(&config).unwrap()
+    };
+    check_bolt_config(&edit(&|text| {
+        text["max_position_embeddings"] = 131_072.into();
+        text["eos_token_id"] = 106.into();
+        text["bos_token_id"] = 3.into();
+        text["pad_token_id"] = 5.into();
+    }))
+    .expect("another context and other ids are the checkpoint's own");
+    assert_bolt_field(
+        &edit(&|text| text["sliding_window"] = 256.into()),
+        "text_config.sliding_window",
+    );
+    assert_bolt_field(
+        &edit(&|text| text["max_position_embeddings"] = 256.into()),
+        "text_config.max_position_embeddings",
+    );
 }

@@ -61,11 +61,10 @@ pub(crate) struct GemmaExecutor {
 impl GemmaExecutor {
     pub(crate) fn load(
         path: &std::path::Path,
-        header_sha256: Option<&str>,
         sampling: Sampling,
         eos: u32,
     ) -> Result<Self, EngError> {
-        let model = super::resident::load(path, header_sha256)?;
+        let model = super::resident::load(path)?;
         let ctx = &model.ctx;
         Ok(Self {
             sampler: DeviceSampler::new(ctx, VOCAB)?,
@@ -346,15 +345,9 @@ mod tests {
         };
         let cells: usize = cells.parse().expect("context tokens");
         assert!(cells > 8 && cells <= CELLS, "context above the plan");
-        let header = std::env::var("GEMMA4_Q8_HEADER_SHA256").ok();
         let load_started = std::time::Instant::now();
-        let mut engine = GemmaExecutor::load(
-            std::path::Path::new(&path),
-            header.as_deref(),
-            Sampling::default(),
-            1,
-        )
-        .expect("load");
+        let mut engine =
+            GemmaExecutor::load(std::path::Path::new(&path), Sampling::default(), 1).expect("load");
         eprintln!("timing load {:?}", load_started.elapsed());
         let body = cells - 4;
         let prompt: Vec<u32> = (0..body).map(|i| 2 + (i as u32 % 1000)).collect();
@@ -399,15 +392,9 @@ mod tests {
         let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
             return;
         };
-        let header = std::env::var("GEMMA4_Q8_HEADER_SHA256").ok();
         let load_started = std::time::Instant::now();
-        let mut engine = GemmaExecutor::load(
-            std::path::Path::new(&path),
-            header.as_deref(),
-            Sampling::default(),
-            1,
-        )
-        .expect("load");
+        let mut engine =
+            GemmaExecutor::load(std::path::Path::new(&path), Sampling::default(), 1).expect("load");
         eprintln!("timing load {:?}", load_started.elapsed());
         let mut session = GemmaSession::default();
         engine.check_prompt(2).expect("two prompt tokens fit");

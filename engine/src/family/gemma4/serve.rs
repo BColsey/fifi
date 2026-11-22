@@ -637,7 +637,7 @@ mod device {
         // ready.
         let (announce, resolved) = std::sync::mpsc::sync_channel::<Announcement<usize>>(1);
         let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
-            let loaded = bolt::load_choosing(&files, None, seqs, &|cells| {
+            let loaded = bolt::load_choosing(&files, seqs, &|cells| {
                 let _ = announce.try_send(Ok(cells));
             });
             announce_failure(&loaded, Some(&announce));
@@ -771,7 +771,7 @@ mod device {
         #[test]
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_restore_past_a_decode_matches_the_cold_replay() {
-            let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
             let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..3_000u32).map(|index| 100 + (index % 977)).collect();
             feed(&mut model, &seq, &prompt);
@@ -823,7 +823,7 @@ mod device {
         #[test]
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_graphed_greedy_run_matches_the_eager_run() {
-            let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
             let seq = model.new_seq().expect("sequence");
             assert!(
                 !model.graph_mode.active(),
@@ -895,7 +895,7 @@ mod device {
         #[test]
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_graphed_split_run_matches_the_eager_split_run() {
-            let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
             let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             // The chain AND the logits bits per step: matching the greedy
@@ -1031,7 +1031,7 @@ mod device {
         }
 
         fn restore_matches_a_cold_run(base_len: usize) {
-            let mut serve = serve_of(bolt::load(&pinned_bolt(), None).expect("load"));
+            let mut serve = serve_of(bolt::load(&pinned_bolt()).expect("load"));
             let mut source = serve.new_session().expect("source");
             let mut target = serve.new_session().expect("target");
             let mut cold = serve.new_session().expect("cold");
@@ -1095,7 +1095,7 @@ mod device {
         #[test]
         #[ignore = "requires the pinned Bolt file and a device"]
         fn the_store_answers_only_for_a_key_the_prompt_extends() {
-            let mut serve = serve_of(bolt::load(&pinned_bolt(), None).expect("load"));
+            let mut serve = serve_of(bolt::load(&pinned_bolt()).expect("load"));
             let mut first = serve.new_session().expect("first");
             let first_key = prompt(64, 0);
             let other_key = prompt(64, 300);

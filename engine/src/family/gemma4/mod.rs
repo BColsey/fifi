@@ -22,5 +22,5 @@ pub use config::{check_bolt_config, check_humanizer_config};
 #[cfg(feature = "native-cuda")]
 pub(crate) use gguf::open_bolt_weights;
 #[cfg(feature = "native-cuda")]
-pub(crate) use gguf::open_humanizer_weights;
+pub(crate) use gguf::{HumanizerFile, open_humanizer_weights};
 pub use gguf::{open_bolt_q8, open_humanizer_q8};

@@ -497,7 +497,7 @@ fn planned_sessions(seqs: super::super::config::MaxSeqs) -> Result<usize, EngErr
     })
 }
 
-pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
+pub(crate) fn load(path: &std::path::Path) -> Result<Bolt, EngError> {
     let bytes = std::fs::metadata(path)
         .map_err(|error| EngError::MemoryPlan(format!("the Bolt weights file: {error}")))?
         .len();
@@ -506,7 +506,6 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
             path: path.to_path_buf(),
             bytes,
         }],
-        header_sha256,
         super::super::config::MaxSeqs::Count(1),
         &|_| {},
     )
@@ -517,7 +516,6 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
 /// KV cells the load serves as soon as they are known, before any weight is uploaded.
 pub(crate) fn load_choosing(
     files: &[crate::family::gguf_select::GgufFile],
-    header_sha256: Option<&str>,
     seqs: super::super::config::MaxSeqs,
     planned: &dyn Fn(usize),
 ) -> Result<Bolt, EngError> {
@@ -551,7 +549,7 @@ pub(crate) fn load_choosing(
         eprintln!("{line}");
     }
     let path = choice.chosen.path.as_path();
-    let (weights, spelling) = super::super::open_bolt_weights(path, header_sha256)?;
+    let (weights, spelling) = super::super::open_bolt_weights(path)?;
     let weights_identity = crate::weights::sha256_hex(
         &crate::weights::gguf_identity_digest(weights.header(), path, None)
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
@@ -2860,7 +2858,7 @@ mod tests {
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
     fn trace_two_single_steps() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
-        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        let mut model = super::load(std::path::Path::new(&path)).expect("load");
         let seq = model.new_seq().expect("sequence");
         for (pos, token) in [2u32, 19].into_iter().enumerate() {
             if pos == 0 {
@@ -2880,7 +2878,7 @@ mod tests {
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
     fn trace_full_prompt_logits() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
-        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        let mut model = super::load(std::path::Path::new(&path)).expect("load");
         let seq = model.new_seq().expect("sequence");
         for pos in 0..32u32 {
             let token = 2 + pos * 17;
@@ -2898,7 +2896,6 @@ mod tests {
         let bytes = std::fs::metadata(&path).expect("model file").len();
         let mut model = load_choosing(
             &[crate::family::gguf_select::GgufFile { path, bytes }],
-            None,
             crate::family::gemma4::config::MaxSeqs::Auto,
             &|_| {},
         )
@@ -2944,8 +2941,7 @@ mod tests {
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
     fn batched_prefill_matches_single_steps() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
-        let header = std::env::var("BOLT_Q8_HEADER_SHA256").ok();
-        let mut model = super::load(std::path::Path::new(&path), header.as_deref()).expect("load");
+        let mut model = super::load(std::path::Path::new(&path)).expect("load");
         // This test pins the row attention's batched chunks to its single steps within 2e-5; the
         // wide attention rounds to fp16 and has its own comparison below.
         model.use_wide_prefill(false);
@@ -3077,7 +3073,7 @@ mod tests {
             .filter(|n| !n.is_empty())
             .map(|n| n.parse().expect("a batch width"))
             .collect();
-        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        let mut model = super::load(std::path::Path::new(&path)).expect("load");
         assert!(
             model.use_wide_prefill(true),
             "this device has the wide path"
@@ -3188,7 +3184,7 @@ mod tests {
         let docs = std::fs::read_to_string(std::env::var("BOLT_SCORE_TOKENS").expect("token file"))
             .expect("token documents");
         let out_path = std::env::var("BOLT_SCORE_OUT").expect("output file");
-        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        let mut model = super::load(std::path::Path::new(&path)).expect("load");
         assert!(
             model.use_wide_prefill(true),
             "this device has the wide path"
@@ -3281,7 +3277,7 @@ mod tests {
         for width in [Bolt::PREFILL_BATCH, 3, 1] {
             // Fresh load per width: the cache starts zeroed, so a missing
             // skip-path write here is not masked by the last width's cells.
-            let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+            let mut model = super::load(std::path::Path::new(&path)).expect("load");
             // Both prefills use the row attention here, so the 2e-5 bar compares the skip
             // structure alone.
             model.use_wide_prefill(false);

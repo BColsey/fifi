@@ -223,8 +223,6 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
         ("num_global_key_value_heads", 1),
         ("head_dim", 256),
         ("global_head_dim", 512),
-        ("max_position_embeddings", 262144),
-        ("sliding_window", 1024),
         ("vocab_size", 262144),
         ("vocab_size_per_layer_input", 262144),
         ("bos_token_id", 2),
@@ -233,6 +231,10 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     ] {
         expect_u32(text, name, expected)?;
     }
+    // The context and the window are the checkpoint's own: any positive window the resident
+    // ring takes, and any context that holds it.
+    let window = u32_in(text, "sliding_window", 1, 4096)?;
+    u32_in(text, "max_position_embeddings", window, u32::MAX)?;
     Ok(())
 }
 
@@ -322,16 +324,15 @@ pub fn check_bolt_config(json: &[u8]) -> Result<(), EngError> {
         ("hidden_size_per_layer_input", 256),
         ("head_dim", 256),
         ("global_head_dim", 512),
-        ("max_position_embeddings", 65_536),
-        ("sliding_window", 512),
         ("vocab_size", 262_144),
         ("vocab_size_per_layer_input", 262_144),
-        ("bos_token_id", 2),
-        ("eos_token_id", 1),
-        ("pad_token_id", 0),
     ] {
         expect_u32(text, name, expected)?;
     }
+    // The resident code is built for one window; the context is the checkpoint's own.
+    let window = super::gguf::BOLT_WINDOW as u32;
+    u32_in(text, "sliding_window", window, window)?;
+    u32_in(text, "max_position_embeddings", window, u32::MAX)?;
     Ok(())
 }
 
@@ -384,6 +385,10 @@ fn required<'a>(object: &'a Value, name: &str) -> Result<&'a Value, EngError> {
 }
 
 fn expect_u32(object: &Value, name: &str, expected: u32) -> Result<(), EngError> {
+    u32_in(object, name, expected, expected).map(|_| ())
+}
+
+fn u32_in(object: &Value, name: &str, least: u32, most: u32) -> Result<u32, EngError> {
     let path = format!("text_config.{name}");
     let value = required(object, name)
         .map_err(|_| EngError::Checkpoint(format!("configuration lacks {path}")))?;
@@ -393,12 +398,17 @@ fn expect_u32(object: &Value, name: &str, expected: u32) -> Result<(), EngError>
         .ok_or_else(|| {
             EngError::Checkpoint(format!("configuration {path} must be a u32 integer"))
         })?;
-    if found != expected {
+    if !(least..=most).contains(&found) {
+        let want = if least == most {
+            least.to_string()
+        } else {
+            format!("{least} to {most}")
+        };
         return Err(EngError::Checkpoint(format!(
-            "configuration {path} is {found}, expected {expected}"
+            "configuration {path} is {found}, expected {want}"
         )));
     }
-    Ok(())
+    Ok(found)
 }
 
 fn check_layer_types(text: &Value, layers: usize) -> Result<(), EngError> {

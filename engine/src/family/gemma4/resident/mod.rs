@@ -49,7 +49,6 @@ pub(crate) const VOCAB: usize = 262_144;
 pub(crate) const HEADS: usize = 16;
 /// KV cells held per head: the 8,192-token combined context of the goal.
 pub(crate) const CELLS: usize = 8192;
-pub(crate) const LOCAL_WINDOW: usize = 1024;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 pub(crate) const FFN: usize = 15360;
 
@@ -165,6 +164,8 @@ pub(crate) struct Gemma {
     pub(crate) eps: f32,
     /// The wide prefill attention of the global layers, when the device runs it.
     pub(crate) wide_prefill: Option<WideAttention>,
+    /// The sliding window of the local layers, from the file's header.
+    pub(crate) window: usize,
 }
 
 /// What the wide prefill attention sees of the global layers: one kv head of 512-wide planes
@@ -173,8 +174,8 @@ fn wide_geometry() -> WideGeometry {
     WideGeometry::unscaled(HEADS, 1, CELLS, Gemma::PREFILL_BATCH)
 }
 
-pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Gemma, EngError> {
-    let weights = super::open_humanizer_weights(path, header_sha256)?;
+pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
+    let super::HumanizerFile { weights, window } = super::open_humanizer_weights(path)?;
     let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;
     let stream = ctx.stream()?;
     let mut layers = Vec::with_capacity(LAYERS);
@@ -183,9 +184,9 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         let head = if global { 512 } else { 256 };
         let n_kv = if global { 1 } else { 8 };
         let base = format!("blk.{layer}.");
-        // A local layer reaches the last LOCAL_WINDOW positions, so it keeps a ring of that many
+        // A local layer reaches the last `window` positions, so it keeps a ring of that many
         // cells plus one prefill batch; a global layer keeps every position.
-        let geometry = KvRing::sliding(if global { 0 } else { LOCAL_WINDOW }, Gemma::PREFILL_BATCH);
+        let geometry = KvRing::sliding(if global { 0 } else { window }, Gemma::PREFILL_BATCH);
         let cells = geometry.cells(CELLS);
         let kv = Kv {
             k_codes: zero(&ctx, n_kv * cells * head)?,
@@ -324,6 +325,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         logits_capped,
         eps,
         wide_prefill,
+        window,
     })
 }
 

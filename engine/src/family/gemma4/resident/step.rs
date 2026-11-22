@@ -1,6 +1,6 @@
 //! Decode and bounded prompt batches of the resident Gemma 4 Humanizer model.
 
-use super::{CELLS, FFN, Gemma, HEADS, HIDDEN, LOCAL_WINDOW, SOFT_CAP, VOCAB};
+use super::{CELLS, FFN, Gemma, HEADS, HIDDEN, SOFT_CAP, VOCAB};
 use crate::EngError;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideCall};
@@ -427,7 +427,7 @@ impl Gemma {
                     n_kv_head: n_kv,
                     head_dim: head,
                     cells: layer.kv.shape.cells,
-                    window: if layer.global { 0 } else { LOCAL_WINDOW },
+                    window: if layer.global { 0 } else { self.window },
                     ring: layer.kv.shape.ring,
                     scale: 1.0,
                     split: None,
@@ -651,9 +651,7 @@ mod tests {
     #[ignore = "requires the pinned Humanizer file and Xavier; use --release --test-threads=1"]
     fn batched_prefill_matches_single_steps() {
         let path = std::env::var("GEMMA4_Q8_FILE").expect("pinned model path");
-        let header = std::env::var("GEMMA4_Q8_HEADER_SHA256").expect("pinned header hash");
-        let mut model =
-            super::super::load(std::path::Path::new(&path), Some(&header)).expect("load");
+        let mut model = super::super::load(std::path::Path::new(&path)).expect("load");
         assert!(matches!(
             model.prefill_batch(&[], 0, false),
             Err(EngError::BadRequest(_))

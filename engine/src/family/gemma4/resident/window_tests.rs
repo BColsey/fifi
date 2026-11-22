@@ -576,7 +576,7 @@ fn solo_run(model: &mut Bolt, seq: &super::bolt::BoltSeq, prompt: &[u32]) -> Vec
 #[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
 fn a_window_of_sessions_equals_the_solo_runs() {
     let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
-    let mut model = super::bolt::load(std::path::Path::new(&path), None).expect("load");
+    let mut model = super::bolt::load(std::path::Path::new(&path)).expect("load");
     model
         .reserve_window(Bolt::PREFILL_BATCH)
         .expect("window buffers");
