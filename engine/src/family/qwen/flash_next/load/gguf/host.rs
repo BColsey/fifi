@@ -798,6 +798,59 @@ mod tests {
         std::fs::write(output, serde_json::to_vec_pretty(&items).unwrap()).unwrap();
     }
 
+    // SHA-256 of byte ranges retrieved from the pinned publisher revision. These detect
+    // fixture corruption or sparse holes; they are not publisher full-shard verification.
+    const DELTA_DIGESTS: [&str; 9] = [
+        "c7f5666e403b1959924995e4a69b421efc2ea4d7c5684c8dde31ef8d715d0428",
+        "42dc982fd458f06d8ebfdb1af3faea8fa1621c9c75e33f3dd4e4eaf1a9e17032",
+        "9d8237ffbd8a955f0c77cebca4250a18027e1292257f72b9444716371d2756ff",
+        "3177daafc8955dbf7cd57c31bc376cd8e3af530bae8a339e870cb990cc888bdb",
+        "89140f4a519d9848dcfe5c590d28b924f249622ef81e15636303a8aa8efde502",
+        "86971b2b293c0f8d662169eac001156cb7d5d81bbb28fe75d78e358f1c39b476",
+        "6e38a1018f33d34678019e53974ad84738381bd8ac092f65596d4cf800ded59d",
+        "61f670e1bfb6524a4ea2aa4bb8f9dbaeaba94c752f7485380ca626b336b8f0c6",
+        "d27dd7b8d5dae1f3cc9880dd0367825008d8d7873ea0030aa92175634ae08e17",
+    ];
+
+    fn matches_digest(bytes: &[u8], expected: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes)) == expected
+    }
+
+    fn verify_delta_fixture(model: &GgufModel) -> Result<(), EngError> {
+        for (entry, expected) in delta_entries(model, 0)?.iter().zip(DELTA_DIGESTS) {
+            let (_, data) = model.weights.read_tensor(&entry.name)?;
+            if !matches_digest(&data, expected) {
+                return Err(refuse(format!(
+                    "pinned DeltaNet digest mismatch: {}",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delta_digest_rejects_changed_and_missing_bytes() {
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(matches_digest(b"abc", hash));
+        assert!(!matches_digest(b"abd", hash));
+        assert!(!matches_digest(b"", hash));
+    }
+
+    #[test]
+    #[ignore = "requires DeltaNet fixture and projection-only sparse negative fixture"]
+    fn delta_fixture_integrity() {
+        let open = |key| {
+            let path = std::env::var_os(key).unwrap();
+            GgufModel::open(std::path::Path::new(&path))
+                .unwrap()
+                .unwrap()
+        };
+        verify_delta_fixture(&open("FIFI_FLASH_DELTA_FIXTURE")).unwrap();
+        assert!(verify_delta_fixture(&open("FIFI_FLASH_GGUF_PROJECTION_FIXTURE")).is_err());
+    }
+
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
     #[ignore = "needs staged real DeltaNet tensors and an admitted CUDA device"]
@@ -811,6 +864,7 @@ mod tests {
         let model = GgufModel::open(std::path::Path::new(&path))
             .unwrap()
             .unwrap();
+        verify_delta_fixture(&model).expect("complete pinned DeltaNet tensor payloads");
         let weights = load_delta(&model, 0).unwrap();
         let shape = model.config().model_shape().unwrap();
         let ngram = model.ngram().unwrap();
