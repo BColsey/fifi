@@ -32,6 +32,8 @@ mod driver_glue_tests;
 pub(in crate::family::qwen::flash_next) mod gguf_device;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::qwen::flash_next) mod gguf_moe;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::qwen::flash_next) mod gguf_stream;
 mod moe_block;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod moe_block_device_tests;

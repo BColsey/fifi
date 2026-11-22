@@ -16,12 +16,14 @@ use super::{GgufModel, plan::Card};
 use crate::{
     EngError,
     family::{
+        expert_bank::{bank_tier::TierChoice, layer_stream::StreamBudget},
         mem::Facts,
         project::cuda::CudaProjector,
         qwen::flash_next::{
             cuda::{
                 executor::{CudaRules, FlashCudaExecutor},
                 gguf_device::gguf_driver,
+                gguf_stream::{layer_stacks, stream_plan},
                 start::ple_threads,
             },
             host_plan::{HOST_LABELS, HostMemory},
@@ -35,6 +37,9 @@ use crate::{
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::{TokenizerBundle, TokenizerPin},
 };
+
+/// Staging slots of the streamed experts: one computes while the next layer loads.
+const STAGING_SLOTS: usize = 2;
 
 /// Host bytes one native tensor read holds while a tensor is uploaded.
 const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
@@ -128,17 +133,21 @@ pub(in crate::family::qwen::flash_next) fn start(
     if !gaps.is_empty() {
         return Err(model.kernel_refusal(&gaps));
     }
+    // The routed experts that do not fit beside the trunk and the K/V stream through the shared
+    // layer placement: layers on the card, in pinned memory, or read from the file in place.
     let experts = model.config().dims.experts as usize;
-    let slots = load.context.plan.slots_per_layer();
-    if slots < experts {
-        return Err(EngError::MemoryPlan(format!(
-            "Flash-Next GGUF {}: the plan holds {slots} of {experts} experts per layer on the card \
-             and the rest in {}; the executor serves a model whose experts all fit on the card \
-             and does not stream experts from a GGUF yet",
-            model.first_path().display(),
-            tier_line(&load)
-        )));
-    }
+    let tier = load.context.plan;
+    let stacks = layer_stacks(model)?;
+    let budget = StreamBudget {
+        card_bytes: tier.bank_bytes() + tier.vram_left(),
+        host_bytes: match tier.store_tier() {
+            TierChoice::Disk | TierChoice::CardDisk { .. } => tier.host_spare_bytes(),
+            _ => tier.cold_bytes() + tier.host_spare_bytes(),
+        },
+        staging_slots: STAGING_SLOTS,
+    };
+    let stream = stream_plan(&stacks, experts, budget)?;
+    eprintln!("flash-next gguf: routed experts: {stream}");
 
     let vocab = model.config().model_shape()?.vocab;
     let bundle = TokenizerBundle::load(
@@ -171,6 +180,7 @@ pub(in crate::family::qwen::flash_next) fn start(
     let identity = PrefixIdentity {
         weights: crate::weights::sha256_hex(&weights_digest).into(),
         tokenizer: crate::weights::sha256_hex(&tokenizer_digest).into(),
+        ..PrefixIdentity::default()
     };
     let prefill_chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK) as usize;
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
@@ -183,6 +193,7 @@ pub(in crate::family::qwen::flash_next) fn start(
             UPLOAD_CHUNK_BYTES,
             context as usize,
             ple_threads(),
+            stream,
         )?;
         FlashCudaExecutor::new(driver, rules, identity)
     })?;

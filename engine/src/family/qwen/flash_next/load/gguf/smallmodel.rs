@@ -8,10 +8,13 @@ use std::path::PathBuf;
 
 use super::{
     config::GgufConfig,
-    tensors::Role,
+    tensors::Slot,
     testkit::{LIMITS, TensorSpec, kv_f32, kv_str, kv_u32, kv_u32s, kv_u64s, write_gguf},
 };
-use crate::weights::{GgufType, GgufWeights};
+use crate::{
+    family::recipe::{Global, Role as Wanted, SiteTensor},
+    weights::{GgufType, GgufWeights},
+};
 
 pub(super) const HIDDEN: usize = 256;
 pub(super) const VOCAB: usize = 512;
@@ -36,10 +39,16 @@ fn head_ranges() -> (Vec<u64>, Vec<u64>, u64) {
 
 /// The metadata of the small model.
 pub(super) fn small_kvs() -> Vec<Vec<u8>> {
+    small_kvs_for(LAYERS, 8)
+}
+
+/// The metadata of a small model of `layers` layers (a QSA layer closes every group of four)
+/// whose indexer keeps `top_k` positions.
+pub(super) fn small_kvs_for(layers: usize, top_k: u32) -> Vec<Vec<u8>> {
     let (offsets, vocab, _) = head_ranges();
     vec![
         kv_str("general.architecture", "qwen4exp"),
-        kv_u32("qwen4exp.block_count", LAYERS as u32),
+        kv_u32("qwen4exp.block_count", layers as u32),
         kv_u32("qwen4exp.context_length", 4096),
         kv_u32("qwen4exp.embedding_length", HIDDEN as u32),
         kv_u32("qwen4exp.attention.head_count", 2),
@@ -64,8 +73,13 @@ pub(super) fn small_kvs() -> Vec<Vec<u8>> {
         kv_u32("qwen4exp.hyper_connection.low_rank", 32),
         kv_u32("qwen4exp.attention.indexer.head_count", 2),
         kv_u32("qwen4exp.attention.indexer.key_length", 128),
-        kv_u32("qwen4exp.attention.indexer.top_k", 8),
-        kv_u32s("qwen4exp.attention.compress_ratios", &[0, 0, 0, 4]),
+        kv_u32("qwen4exp.attention.indexer.top_k", top_k),
+        kv_u32s(
+            "qwen4exp.attention.compress_ratios",
+            &(0..layers)
+                .map(|layer| if layer % 4 == 3 { 4 } else { 0 })
+                .collect::<Vec<u32>>(),
+        ),
         kv_u32s("qwen4exp.ple.layers", &[1]),
         kv_u32("qwen4exp.ple.ngram_size", 3),
         kv_u32("qwen4exp.ple.heads_per_ngram", 8),
@@ -143,34 +157,37 @@ fn q8_0(values: &[f32]) -> Vec<u8> {
 }
 
 /// What the stored values of a role look like.
-fn values_for(role: Role, count: usize, rng: &mut Lcg) -> Vec<f32> {
+fn values_for(role: Slot, count: usize, rng: &mut Lcg) -> Vec<f32> {
     let mut draw = |scale: f32, shift: f32| -> Vec<f32> {
         (0..count).map(|_| shift + scale * rng.unit()).collect()
     };
+    use SiteTensor as Part;
     match role {
         // 1 + w gammas.
-        Role::HyperNorm(_)
-        | Role::QsaQNorm
-        | Role::QsaKNorm
-        | Role::QsaIndexQNorm
-        | Role::QsaIndexKNorm
-        | Role::PleNormKey
-        | Role::PleNormQuery
-        | Role::PleNormConv => draw(0.2, 1.0),
+        Slot::Layer(Wanted::Hyper(_, Part::Norm))
+        | Slot::Global(Global::HeadSite(Part::Norm))
+        | Slot::Layer(
+            Wanted::QNorm
+            | Wanted::KNorm
+            | Wanted::IndexQNorm
+            | Wanted::IndexKNorm
+            | Wanted::PleNormKey
+            | Wanted::PleNormQuery
+            | Wanted::PleNormConv,
+        ) => draw(0.2, 1.0),
         // -exp(A_log).
-        Role::DeltaDecay => draw(0.5, -1.0),
-        Role::DeltaDtBias => draw(0.3, 0.0),
-        Role::DeltaNorm => draw(0.2, 1.0),
-        Role::DeltaConv | Role::PleConv => draw(0.4, 0.0),
-        Role::Router => draw(0.3, 0.0),
-        Role::SharedScalar => draw(0.3, 0.0),
-        Role::HyperInject(_) => draw(0.2, 0.0),
-        Role::NgramTable => draw(0.5, 0.0),
-        Role::Embedding => draw(0.5, 0.0),
-        Role::Head => draw(0.3, 0.0),
-        Role::HyperDown(_) | Role::HyperUp(_) => draw(0.15, 0.0),
-        Role::QsaIndexQ | Role::QsaIndexK => draw(0.1, 0.0),
-        Role::ExpertGate | Role::ExpertUp | Role::ExpertDown => draw(0.12, 0.0),
+        Slot::Layer(Wanted::DeltaDecay) => draw(0.5, -1.0),
+        Slot::Layer(Wanted::DeltaDtBias) => draw(0.3, 0.0),
+        Slot::Layer(Wanted::DeltaNorm) => draw(0.2, 1.0),
+        Slot::Layer(Wanted::DeltaConv | Wanted::PleConv) => draw(0.4, 0.0),
+        Slot::Layer(Wanted::Router | Wanted::SharedRouterGate) => draw(0.3, 0.0),
+        Slot::Layer(Wanted::Hyper(_, Part::Inject)) => draw(0.2, 0.0),
+        Slot::Global(Global::NgramTable | Global::Embedding) => draw(0.5, 0.0),
+        Slot::Global(Global::Head) => draw(0.3, 0.0),
+        Slot::Layer(Wanted::Hyper(_, Part::Down | Part::Up))
+        | Slot::Global(Global::HeadSite(Part::Down | Part::Up)) => draw(0.15, 0.0),
+        Slot::Layer(Wanted::IndexProj | Wanted::IndexKey) => draw(0.1, 0.0),
+        Slot::Layer(Wanted::ExpertGate | Wanted::ExpertUp | Wanted::ExpertDown) => draw(0.12, 0.0),
         _ => draw(0.08, 0.0),
     }
 }
@@ -198,8 +215,13 @@ pub(super) struct Small {
 }
 
 pub(super) fn write_small(seed: u64) -> Small {
+    write_small_with(seed, LAYERS, 8)
+}
+
+/// [`write_small`] with `layers` layers and an indexer that keeps `top_k` positions.
+pub(super) fn write_small_with(seed: u64, layers: usize, top_k: u32) -> Small {
     let dir = tempfile::tempdir().expect("tempdir");
-    let kvs = small_kvs();
+    let kvs = small_kvs_for(layers, top_k);
     let config = {
         let probe = dir.path().join("probe.gguf");
         let embed = TensorSpec {
@@ -219,16 +241,16 @@ pub(super) fn write_small(seed: u64) -> Small {
     let mut tensors = Vec::new();
     for item in super::tensors::inventory(&config) {
         let mut dims = item.dims.clone();
-        if item.role == Role::NgramTable {
+        if item.role == Slot::Global(Global::NgramTable) {
             dims[1] = rows;
         }
-        if item.role == Role::Embedding || item.role == Role::Head {
+        if item.role == Slot::Global(Global::Embedding) || item.role == Slot::Global(Global::Head) {
             dims[1] = VOCAB as u64;
         }
         let ty = match item.role {
-            Role::NgramTable => GgufType::F16,
-            Role::QsaIndexQ | Role::QsaIndexK => GgufType::Bf16,
-            Role::HyperInject(_) => GgufType::F32,
+            Slot::Global(Global::NgramTable) => GgufType::F16,
+            Slot::Layer(Wanted::IndexProj | Wanted::IndexKey) => GgufType::Bf16,
+            Slot::Layer(Wanted::Hyper(_, SiteTensor::Inject)) => GgufType::F32,
             _ if item.vector => GgufType::F32,
             _ => GgufType::Q80,
         };

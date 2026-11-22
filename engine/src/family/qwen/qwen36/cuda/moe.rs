@@ -1525,6 +1525,26 @@ pub(super) fn run_moe_block_marked(
     Ok(())
 }
 
+/// The ops of [`run_moe_block`] from position `from` up to (not including) `to` in the block's
+/// op list, for a caller that has to act between two of them (a family that stages the picked
+/// experts after the router has chosen them). The list starts with the router, so `0..1` is the
+/// router alone and `1..usize::MAX` is everything after it.
+pub(in crate::family) fn run_moe_ops(
+    launch: &Launch<'_>,
+    weights: &MoeLayerWeights<'_>,
+    bufs: &MoeBuffers<'_>,
+    dims: &MoeDims,
+    ops: std::ops::Range<usize>,
+) -> Result<(), EngError> {
+    check_block(dims, &weights.facts(), &bufs.facts())?;
+    let list = moe_sequence(dims.top_k, bufs.expert.packs.kind().layout());
+    let end = ops.end.min(list.len());
+    for &op in list.get(ops.start..end).unwrap_or_default() {
+        launch_op(launch, weights, bufs, op)?;
+    }
+    Ok(())
+}
+
 pub(super) mod tiered;
 
 #[cfg(test)]

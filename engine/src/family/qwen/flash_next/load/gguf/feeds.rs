@@ -8,10 +8,11 @@
 
 use super::{
     GgufModel,
-    tensors::{Convention, Mapped, Role},
+    tensors::{Convention, Mapped, Slot},
 };
 use crate::{
     EngError,
+    family::recipe::{Global, Role as Wanted},
     family::qwen::flash_next::cuda::{
         pack_feeds::{EmbeddingRows, PackFeeds},
         ple_feed::{HostMatrix, HostProjection, PleFeed, PleVectors},
@@ -75,11 +76,11 @@ pub(in crate::family::qwen::flash_next) fn gguf_feeds(
     let map = model.map();
     let shape = config.model_shape()?.ple;
     let layer = Some(config.ple_layer());
-    let get = |role: Role, layer| {
+    let get = |role: Slot, layer| {
         map.get(role, layer)
             .ok_or_else(|| refuse(format!("{role:?} is not mapped")))
     };
-    let embed = get(Role::Embedding, None)?;
+    let embed = get(Slot::Global(Global::Embedding), None)?;
     let hidden = embed.dims[0] as usize;
     let branches = config.dims.branches as usize;
     let block = embed.ty.block_elems() as usize;
@@ -97,20 +98,20 @@ pub(in crate::family::qwen::flash_next) fn gguf_feeds(
     };
     let width = hidden * branches;
     let ple_embed = shape.embed();
-    let matrix = |role, rows: usize| -> Result<HostMatrix, EngError> {
-        let entry = get(role, layer)?;
+    let matrix = |role: Wanted, rows: usize| -> Result<HostMatrix, EngError> {
+        let entry = get(Slot::Layer(role), layer)?;
         HostMatrix::new(rows, ple_embed, read_floats(&model.weights, entry)?)
     };
     let projection = HostProjection::new(
-        matrix(Role::PleKey, width)?,
-        matrix(Role::PleValue, hidden)?,
+        matrix(Wanted::PleKey, width)?,
+        matrix(Wanted::PleValue, hidden)?,
         threads,
     );
     let vectors = PleVectors::from_parts(
-        read_floats(&model.weights, get(Role::PleNormKey, layer)?)?,
-        read_floats(&model.weights, get(Role::PleNormQuery, layer)?)?,
-        read_floats(&model.weights, get(Role::PleNormConv, layer)?)?,
-        read_floats(&model.weights, get(Role::PleConv, layer)?)?,
+        read_floats(&model.weights, get(Slot::Layer(Wanted::PleNormKey), layer)?)?,
+        read_floats(&model.weights, get(Slot::Layer(Wanted::PleNormQuery), layer)?)?,
+        read_floats(&model.weights, get(Slot::Layer(Wanted::PleNormConv), layer)?)?,
+        read_floats(&model.weights, get(Slot::Layer(Wanted::PleConv), layer)?)?,
     );
     let ple = PleFeed::new(shape, model.ngram()?, vectors, Box::new(projection));
     Ok(PackFeeds::with_embedding(Box::new(embedding), ple, None))

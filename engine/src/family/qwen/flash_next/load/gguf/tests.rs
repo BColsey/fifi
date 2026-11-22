@@ -1047,15 +1047,18 @@ fn the_record_store_reads_the_first_and_last_expert_of_the_real_layout() {
             expert: 511,
         }])
         .expect("read");
-    let gate_up = slices.gate.file_range.end - slices.gate.file_range.start
-        + slices.up.file_range.end
+    let gate = slices.gate.as_ref().expect("a gate stack");
+    let gate_up = gate.file_range.end - gate.file_range.start + slices.up.file_range.end
         - slices.up.file_range.start;
     assert_eq!(
         &record[0][gate_up as usize..gate_up as usize + 3],
         &[7, 8, 9]
     );
-    assert_eq!(store.record_bytes_at(47), index.record_bytes(47).unwrap());
-    assert_eq!(store.record_bytes(), index.max_record_bytes());
+    assert_eq!(
+        store.record_bytes_at(47).expect("layer 47"),
+        index.record_bytes(47).unwrap()
+    );
+    assert_eq!(store.record_bytes(), index.max_record_bytes().unwrap());
 }
 
 #[test]

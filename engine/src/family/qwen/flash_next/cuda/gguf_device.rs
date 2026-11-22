@@ -9,6 +9,7 @@ use super::{
     driver::{DriverShape, StateIo, TokenDevice, TokenDriver},
     feeds::{StartShape, StartSink},
     gguf_moe::GgufMoe,
+    gguf_stream::{ExpertStreams, StreamTotals, layer_stacks},
     pack_feeds::PackFeeds,
     state::StateSlot,
     step::FlashStep,
@@ -18,8 +19,9 @@ use crate::{
     EngError,
     family::{
         engine_owner::{EngineOwner, Handle},
+        expert_bank::layer_stream::{Home, StreamPlan},
         exl3_tensors::f32_le_bytes,
-        flash_next::load::gguf::{GgufModel, feeds::gguf_feeds, trunk::gguf_trunk},
+        qwen::flash_next::load::gguf::{GgufModel, feeds::gguf_feeds, trunk::gguf_trunk},
         project::cuda::{CudaProjector, CudaWeights},
     },
     kernels::cuda::{
@@ -52,12 +54,25 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
     chunk_limit: usize,
     positions: usize,
     threads: usize,
+    placement: StreamPlan,
 ) -> Result<TokenDriver<GgufDevice, PackFeeds>, EngError> {
     let model = Box::new(model);
     let ctx = projector.shared_context();
     drop(projector);
     let stream = Rc::new(ctx.stream()?);
-    let weights = Rc::new(gguf_trunk(&model, &ctx, true, chunk_limit)?);
+    let stacks = layer_stacks(&model)?;
+    let resident = |layer: usize| placement.home(layer) == Home::Card;
+    let weights = Rc::new(gguf_trunk(&model, &ctx, &resident, chunk_limit)?);
+    let expert_total: u64 = stacks
+        .iter()
+        .flat_map(|layer| layer.stacks.iter().map(|stack| stack.bytes))
+        .sum();
+    let resident_bytes = placement.resident_bytes();
+    let streams = if placement.streamed().is_empty() {
+        None
+    } else {
+        Some(ExpertStreams::new(&model, &stacks, placement, &ctx, &stream)?)
+    };
     let config = model.config();
     let layers = config.layers();
     let step = FlashStep::from_shape(
@@ -70,7 +85,12 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
         0..layers,
     )?
     .with_gdn_form(GdnForm::FLASH_NEXT_GGUF);
-    let moe = GgufMoe::new(&ctx, Handle::Shared(Rc::clone(&weights)), &step.moe_dims(1))?;
+    let moe = GgufMoe::new(
+        &ctx,
+        Handle::Shared(Rc::clone(&weights)),
+        &step.moe_dims(1),
+        streams,
+    )?;
     let feeds = gguf_feeds(&model, threads)?;
     let ple = config.model_shape()?.ple;
     let shape = DriverShape {
@@ -90,11 +110,20 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
         moe,
     };
     let owner = EngineOwner::new(run, model, weights, stream, ctx);
-    TokenDriver::new(GgufDevice { owner }, feeds, shape)
+    eprintln!(
+        "flash-next gguf: card bytes live after the build {:.2} GiB; resident experts {:.2} of {:.2} GiB ({:.1}% of the routed experts)",
+        crate::family::engine_owner::live_device_bytes() as f64 / (1u64 << 30) as f64,
+        resident_bytes as f64 / (1u64 << 30) as f64,
+        expert_total as f64 / (1u64 << 30) as f64,
+        100.0 * resident_bytes as f64 / expert_total.max(1) as f64,
+    );
+    TokenDriver::new(GgufDevice { owner, reported: StreamTotals::default() }, feeds, shape)
 }
 
 pub(in crate::family::qwen::flash_next) struct GgufDevice {
     owner: Owner,
+    /// The staging totals at the last receipt line.
+    reported: StreamTotals,
 }
 
 impl StartSink for GgufDevice {
@@ -176,6 +205,24 @@ impl TokenDevice for GgufDevice {
     }
 
     fn reset(&mut self) -> Result<(), EngError> {
+        if let Some(now) = self.owner.step().moe.stream_totals()
+            && now.stagings != self.reported.stagings
+        {
+            let (moved, needed) = (
+                now.moved - self.reported.moved,
+                now.needed - self.reported.needed,
+            );
+            eprintln!(
+                "flash-next gguf: expert stream since the last request: {} layer stagings, moved {:.1} MiB, needed {:.1} MiB ({:.0}% used), copy {:.2} s, host in staging {:.2} s",
+                now.stagings - self.reported.stagings,
+                moved as f64 / (1u64 << 20) as f64,
+                needed as f64 / (1u64 << 20) as f64,
+                100.0 * needed as f64 / moved.max(1) as f64,
+                now.copy_seconds - self.reported.copy_seconds,
+                now.host_seconds - self.reported.host_seconds,
+            );
+            self.reported = now;
+        }
         self.owner.step().step.reset()
     }
 }

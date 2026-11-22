@@ -217,6 +217,11 @@ impl GgufWeights {
         &self.paths
     }
 
+    /// The length of each shard file when it was opened, in shard order.
+    pub(crate) fn shard_lens(&self) -> &[u64] {
+        &self.file_lens
+    }
+
     /// Whether the checkpoint is a split set of more than one file.
     pub(crate) fn is_split(&self) -> bool {
         self.files.len() > 1

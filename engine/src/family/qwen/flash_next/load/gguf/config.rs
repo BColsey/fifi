@@ -64,7 +64,7 @@ pub(in crate::family::qwen::flash_next) struct NgramHash {
 /// The configuration read from the metadata.
 #[derive(Debug)]
 pub(in crate::family::qwen::flash_next) struct GgufConfig {
-    pub(super) dims: Dims,
+    pub(in crate::family::qwen::flash_next) dims: Dims,
     pub(in crate::family::qwen::flash_next) hash: NgramHash,
     /// Rows of the n-gram table: the largest row any head addresses.
     pub(in crate::family::qwen::flash_next) ngram_rows_needed: u64,
@@ -409,6 +409,11 @@ impl GgufConfig {
     /// Per layer, whether it is a QSA attention layer (the others are DeltaNet).
     pub(in crate::family::qwen::flash_next) fn kinds(&self) -> &[bool] {
         &self.dims.kinds
+    }
+
+    /// Routed experts of a layer.
+    pub(in crate::family::qwen::flash_next) fn experts(&self) -> usize {
+        self.dims.experts as usize
     }
 
     /// Routed experts picked per token and layer.

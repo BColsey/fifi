@@ -9,10 +9,10 @@
 
 use super::{
     GgufModel, host,
-    smallmodel::{Small, write_small},
+    smallmodel::{Small, write_small, write_small_with},
 };
 use crate::family::{
-    flash_next::cuda::{
+    qwen::flash_next::cuda::{
         driver::TokenDriver,
         gguf_device::{GgufDevice, gguf_driver},
         pack_feeds::PackFeeds,
@@ -21,13 +21,30 @@ use crate::family::{
     session::TokenStepper,
 };
 
+/// Every layer's experts on the card: the placement of a model that fits.
+fn all_on_card(model: &GgufModel) -> crate::family::expert_bank::layer_stream::StreamPlan {
+    let stacks = crate::family::qwen::flash_next::cuda::gguf_stream::layer_stacks(model)
+        .expect("stacks");
+    crate::family::qwen::flash_next::cuda::gguf_stream::stream_plan(
+        &stacks,
+        model.config().experts(),
+        crate::family::expert_bank::layer_stream::StreamBudget {
+            card_bytes: u64::MAX / 4,
+            host_bytes: 0,
+            staging_slots: 2,
+        },
+    )
+    .expect("plan")
+}
+
 /// The driver over the small model, owning its model, card handle and weights.
 fn driver_of(small: &Small, positions: usize) -> TokenDriver<GgufDevice, PackFeeds> {
     let model = GgufModel::open(&small.first)
         .expect("open")
         .expect("a qwen4exp model");
     let projector = CudaProjector::new().expect("the card");
-    gguf_driver(model, projector, 8 << 20, positions, 2).expect("the driver")
+    let placement = all_on_card(&model);
+    gguf_driver(model, projector, 8 << 20, positions, 2, placement).expect("the driver")
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -99,11 +116,12 @@ fn agreement(small: &Small, layers: usize, tokens: &[u32]) -> Agreement {
     };
     for (at, &token) in tokens.iter().enumerate() {
         let got = driver.logits(token).expect("device logits");
-        assert_eq!(got.len(), want.logits[at].len());
+        let host_row = &want.logits[at];
+        assert_eq!(got.len(), host_row.len());
         assert!(got.iter().all(|v| v.is_finite()), "position {at}");
         let diff = got
             .iter()
-            .zip(&want.logits[at])
+            .zip(host_row)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         let scale = host_row.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -121,7 +139,21 @@ fn agreement(small: &Small, layers: usize, tokens: &[u32]) -> Agreement {
             diff <= limit,
             "position {at}: difference {diff} over the bound {limit} (scale {scale})"
         );
-        assert_eq!(argmax(&got), argmax(&want.logits[at]), "position {at}");
+        out.worst = out.worst.max(diff);
+        out.worst_ratio = out.worst_ratio.max(diff / limit);
+        let top = argmax(host_row);
+        let second = host_row
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| *id != top)
+            .map(|(_, v)| *v)
+            .fold(f32::MIN, f32::max);
+        if host_row[top] - second > 2.0 * limit {
+            assert_eq!(argmax(&got), top, "position {at}");
+            out.matched += 1;
+        } else {
+            out.undecided += 1;
+        }
     }
     eprintln!(
         "{} positions, {layers} layers: worst difference {}, worst ratio to the bound {:.3}, top-1 matched {}, undecided {}, compared {}, flippable {}",
@@ -213,7 +245,7 @@ const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":nul
 #[ignore = "needs a GPU (about 2 GiB)"]
 fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forward() {
     use crate::{
-        family::{executor::GenerationState, flash_next::factory, sampler::Sampler},
+        family::{executor::GenerationState, qwen::flash_next::factory, sampler::Sampler},
         sched::{
             job::{Job, JobEvent},
             worker::EngineNote,
@@ -286,7 +318,7 @@ fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forw
 #[test]
 #[ignore = "needs a GPU (about 2 GiB)"]
 fn stopping_the_engine_gives_back_its_card_memory() {
-    use crate::{family::flash_next::factory, sched::worker::EngineNote};
+    use crate::{family::qwen::flash_next::factory, sched::worker::EngineNote};
     const SLACK: usize = 256 << 20;
     let small = write_small(7);
     let dir = small.dir.path();

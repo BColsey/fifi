@@ -17,13 +17,14 @@
 
 use super::{
     GgufModel,
-    tensors::{Convention, Mapped, Role, Site},
+    tensors::{Convention, Mapped, Slot},
 };
 use crate::{
     EngError,
     family::{
         exl3_pack::layer_name,
         exl3_tensors::f32_le_bytes,
+        recipe::{Global, Role as Wanted, Site, SiteTensor},
         project::cuda::{CudaWeight, CudaWeights},
     },
     kernels::cuda::{CudaContext, QuantTensor},
@@ -56,10 +57,34 @@ pub(in crate::family::qwen::flash_next) fn expert_key(layer: usize, part: &str) 
 
 fn site_prefix(site: Site, layer: Option<usize>) -> String {
     match (site, layer) {
-        (Site::Mixer, _) => MIXER.to_string(),
-        (Site::Attn, Some(layer)) => layer_name(layer, "attn_hyper_connection"),
-        (Site::Mlp, Some(layer)) => layer_name(layer, "mlp_hyper_connection"),
+        (Site::Head, _) => MIXER.to_string(),
+        (Site::Mixer, Some(layer)) => layer_name(layer, "attn_hyper_connection"),
+        (Site::Ffn, Some(layer)) => layer_name(layer, "mlp_hyper_connection"),
         _ => unreachable!("a layer site has a layer"),
+    }
+}
+
+/// The pack name of one tensor of a hyper-connection site and how it goes up: the norm gamma is
+/// stored `1 + w` and goes up as `w` in F16, the down, up and inject matrices as F16.
+fn hyper_plan(site: Site, part: SiteTensor, layer: Option<usize>) -> (String, Upload) {
+    let prefix = site_prefix(site, layer);
+    match part {
+        SiteTensor::Norm => (
+            format!("{prefix}.hc_norm.weight"),
+            Upload::Half { minus_one: true },
+        ),
+        SiteTensor::Down => (
+            format!("{prefix}.input_mix_weight_down.weight"),
+            Upload::Half { minus_one: false },
+        ),
+        SiteTensor::Up => (
+            format!("{prefix}.input_mix_weight_up.weight"),
+            Upload::Half { minus_one: false },
+        ),
+        SiteTensor::Inject => (
+            format!("{prefix}.block_inject_weight.weight"),
+            Upload::Half { minus_one: false },
+        ),
     }
 }
 
@@ -70,65 +95,60 @@ fn plan_of(entry: &Mapped) -> Option<(String, Upload)> {
     let at = |suffix: &str| layer_name(layer.unwrap_or(0), suffix);
     let native = |name: String| Some((name, Upload::Native));
     let float = |name: String| Some((name, Upload::Float { minus_one: false }));
-    match entry.role {
-        Role::Head => native("lm_head".to_string()),
-        Role::HyperNorm(site) => Some((
-            format!("{}.hc_norm.weight", site_prefix(site, layer)),
-            Upload::Half { minus_one: true },
-        )),
-        Role::HyperDown(site) => Some((
-            format!("{}.input_mix_weight_down.weight", site_prefix(site, layer)),
-            Upload::Half { minus_one: false },
-        )),
-        Role::HyperUp(site) => Some((
-            format!("{}.input_mix_weight_up.weight", site_prefix(site, layer)),
-            Upload::Half { minus_one: false },
-        )),
-        Role::HyperInject(site) => Some((
-            format!("{}.block_inject_weight.weight", site_prefix(site, layer)),
-            Upload::Half { minus_one: false },
-        )),
-        Role::DeltaQkv => native(at("linear_attn.in_proj_qkv")),
-        Role::DeltaZ => native(at("linear_attn.in_proj_z")),
-        Role::DeltaOut => native(at("linear_attn.out_proj")),
-        Role::DeltaBeta => float(at("linear_attn.in_proj_b.weight")),
-        Role::DeltaAlpha => float(at("linear_attn.in_proj_a.weight")),
-        Role::DeltaConv => float(at("linear_attn.conv1d.weight")),
-        Role::DeltaDecay => float(at("linear_attn.A_log")),
-        Role::DeltaDtBias => float(at("linear_attn.dt_bias")),
-        Role::DeltaNorm => float(at("linear_attn.norm.weight")),
-        Role::QsaQ => native(at("self_attn.q_proj")),
-        Role::QsaK => native(at("self_attn.k_proj")),
-        Role::QsaV => native(at("self_attn.v_proj")),
-        Role::QsaO => native(at("self_attn.o_proj")),
-        Role::QsaQNorm => float(at("self_attn.q_norm.weight")),
-        Role::QsaKNorm => float(at("self_attn.k_norm.weight")),
-        Role::QsaIndexQNorm => Some((
+    let role = match entry.role {
+        Slot::Global(Global::Head) => return native("lm_head".to_string()),
+        Slot::Global(Global::HeadSite(part)) => {
+            return Some(hyper_plan(Site::Head, part, None));
+        }
+        Slot::Global(_) => return None,
+        Slot::Layer(role) => role,
+    };
+    match role {
+        Wanted::Hyper(site, part) => Some(hyper_plan(site, part, layer)),
+        Wanted::DeltaQkv => native(at("linear_attn.in_proj_qkv")),
+        Wanted::DeltaGate => native(at("linear_attn.in_proj_z")),
+        Wanted::DeltaOut => native(at("linear_attn.out_proj")),
+        Wanted::DeltaBeta => float(at("linear_attn.in_proj_b.weight")),
+        Wanted::DeltaAlpha => float(at("linear_attn.in_proj_a.weight")),
+        Wanted::DeltaConv => float(at("linear_attn.conv1d.weight")),
+        Wanted::DeltaDecay => float(at("linear_attn.A_log")),
+        Wanted::DeltaDtBias => float(at("linear_attn.dt_bias")),
+        Wanted::DeltaNorm => float(at("linear_attn.norm.weight")),
+        Wanted::QProj => native(at("self_attn.q_proj")),
+        Wanted::KProj => native(at("self_attn.k_proj")),
+        Wanted::VProj => native(at("self_attn.v_proj")),
+        Wanted::OProj => native(at("self_attn.o_proj")),
+        Wanted::QNorm => float(at("self_attn.q_norm.weight")),
+        Wanted::KNorm => float(at("self_attn.k_norm.weight")),
+        Wanted::IndexQNorm => Some((
             at("self_attn.indexer.q_layernorm.weight"),
             Upload::Float { minus_one: true },
         )),
-        Role::QsaIndexKNorm => Some((
+        Wanted::IndexKNorm => Some((
             at("self_attn.indexer.k_layernorm.weight"),
             Upload::Float { minus_one: true },
         )),
-        Role::QsaIndexQ => Some((at("self_attn.indexer.index_qk_proj.q"), Upload::Raw)),
-        Role::QsaIndexK => Some((at("self_attn.indexer.index_qk_proj.k"), Upload::Raw)),
-        Role::Router => float(at("mlp.gate.weight")),
-        Role::SharedScalar => float(at("mlp.shared_expert_gate.weight")),
-        Role::SharedGate => native(at("mlp.shared_expert.gate_proj")),
-        Role::SharedUp => native(at("mlp.shared_expert.up_proj")),
-        Role::SharedDown => native(at("mlp.shared_expert.down_proj")),
-        Role::Embedding
-        | Role::NgramTable
-        | Role::PleKey
-        | Role::PleValue
-        | Role::PleNormKey
-        | Role::PleNormQuery
-        | Role::PleNormConv
-        | Role::PleConv
-        | Role::ExpertGate
-        | Role::ExpertUp
-        | Role::ExpertDown => None,
+        Wanted::IndexProj => Some((at("self_attn.indexer.index_qk_proj.q"), Upload::Raw)),
+        Wanted::IndexKey => Some((at("self_attn.indexer.index_qk_proj.k"), Upload::Raw)),
+        Wanted::Router => float(at("mlp.gate.weight")),
+        Wanted::SharedRouterGate => float(at("mlp.shared_expert_gate.weight")),
+        Wanted::SharedGate => native(at("mlp.shared_expert.gate_proj")),
+        Wanted::SharedUp => native(at("mlp.shared_expert.up_proj")),
+        Wanted::SharedDown => native(at("mlp.shared_expert.down_proj")),
+        Wanted::AttnNorm
+        | Wanted::FfnNorm
+        | Wanted::DenseGate
+        | Wanted::DenseUp
+        | Wanted::DenseDown
+        | Wanted::PleKey
+        | Wanted::PleValue
+        | Wanted::PleNormKey
+        | Wanted::PleNormQuery
+        | Wanted::PleNormConv
+        | Wanted::PleConv
+        | Wanted::ExpertGate
+        | Wanted::ExpertUp
+        | Wanted::ExpertDown => None,
     }
 }
 
@@ -170,12 +190,12 @@ fn f32_to_f16(value: f32) -> u16 {
     sign | (((exponent as u32) << 10) + rounded) as u16
 }
 
-/// Uploads the resident trunk of `model` on `ctx`, and with `resident_experts` the routed experts
-/// as native stacks under [`expert_key`]. `chunk_limit` is the host bytes one native read holds.
+/// Uploads the resident trunk of `model` on `ctx`, and the routed experts of the layers
+/// `resident_experts` names as native stacks under [`expert_key`]. `chunk_limit` is the host bytes one native read holds.
 pub(in crate::family::qwen::flash_next) fn gguf_trunk(
     model: &GgufModel,
     ctx: &CudaContext,
-    resident_experts: bool,
+    resident_experts: &dyn Fn(usize) -> bool,
     chunk_limit: usize,
 ) -> Result<CudaWeights, EngError> {
     let weights = &*model.weights;
@@ -183,17 +203,17 @@ pub(in crate::family::qwen::flash_next) fn gguf_trunk(
     let mut out: Vec<CudaWeight> = Vec::new();
     for entry in model.map().entries() {
         let expert_part = match entry.role {
-            Role::ExpertGate => Some("gate"),
-            Role::ExpertUp => Some("up"),
-            Role::ExpertDown => Some("down"),
+            Slot::Layer(Wanted::ExpertGate) => Some("gate"),
+            Slot::Layer(Wanted::ExpertUp) => Some("up"),
+            Slot::Layer(Wanted::ExpertDown) => Some("down"),
             _ => None,
         };
-        let planned = match (expert_part, resident_experts) {
-            (Some(part), true) => {
+        let planned = match expert_part {
+            Some(part) if resident_experts(entry.layer.unwrap_or(0)) => {
                 Some((expert_key(entry.layer.unwrap_or(0), part), Upload::Native))
             }
-            (Some(_), false) => None,
-            (None, _) => plan_of(entry),
+            Some(_) => None,
+            None => plan_of(entry),
         };
         let Some((name, how)) = planned else {
             continue;

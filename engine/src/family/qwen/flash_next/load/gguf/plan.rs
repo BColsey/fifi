@@ -16,7 +16,7 @@
 use super::{GgufModel, tensors::Place};
 use crate::family::{
     qwen::flash_next::host_plan::{HostFrame, HostMemory},
-    recipe::{Global, Role as Wanted},
+    recipe::Global,
 };
 use crate::{
     EngError,
@@ -81,7 +81,9 @@ impl GgufModel {
         let total = index
             .total_bytes()
             .map_err(|error| refuse(format!("{error:?}")))?;
-        let record_max = index.max_record_bytes();
+        let record_max = index
+            .max_record_bytes()
+            .map_err(|error| refuse(format!("{error:?}")))?;
         let count = layers as u64 * experts;
         let shape = TierShape {
             layers,

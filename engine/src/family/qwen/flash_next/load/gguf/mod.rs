@@ -34,7 +34,7 @@ pub(super) mod plan;
 mod smallmodel;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in super::super) mod start;
-pub(super) mod tensors;
+pub(in crate::family::qwen::flash_next) mod tensors;
 #[cfg(test)]
 mod testkit;
 mod weight_map;
@@ -67,7 +67,7 @@ const LIMITS: GgufLimits = GgufLimits {
 /// An opened Flash-Next GGUF: the checkpoint, its configuration and its tensor map.
 #[derive(Debug)]
 pub(in super::super) struct GgufModel {
-    pub(super) weights: std::sync::Arc<GgufWeights>,
+    pub(in crate::family::qwen::flash_next) weights: std::sync::Arc<GgufWeights>,
     pub(super) config: GgufConfig,
     pub(super) map: TensorMap,
 }
@@ -145,7 +145,7 @@ impl GgufModel {
         GgufExpertIndex::new(
             self.weights.header(),
             self.weights.shard_lens(),
-            &ExpertTensorNames::llama_cpp(),
+            &ExpertTensorNames::standard(),
             self.config.layers(),
             dims.experts as usize,
             (dims.hidden as usize, dims.moe_inter as usize),
@@ -157,10 +157,7 @@ impl GgufModel {
     /// The routed experts as an [`ExpertRecordStore`](crate::weights::expert_store): one
     /// positioned read per slice, records of each layer's own size.
     pub(in crate::family::qwen::flash_next) fn record_store(&self) -> Result<GgufRecordStore, EngError> {
-        Ok(GgufRecordStore::new(
-            std::sync::Arc::clone(&self.weights),
-            self.expert_index()?,
-        ))
+        GgufRecordStore::new(std::sync::Arc::clone(&self.weights), self.expert_index()?)
     }
 
     /// The tensor types of this file that no CUDA decode kernel reads yet.
