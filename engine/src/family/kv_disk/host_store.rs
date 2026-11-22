@@ -13,10 +13,7 @@ use super::{
 };
 use crate::{
     EngError,
-    family::{
-        host_admit::HostAdmission,
-        session::{PrefixStore, SaveKind},
-    },
+    family::session::{PrefixStore, SaveKind},
     sched::job::{PrefixSource, PrefixTier},
 };
 use std::{rc::Rc, time::Instant};
@@ -97,9 +94,9 @@ fn slab_bytes(layout: &SlabLayout) -> usize {
 /// Whether the host's available memory leaves room for one more entry of `entry_bytes` above the
 /// reserve. Unknown counts as short, so no entry is lost for lack of a look.
 pub(crate) fn host_is_short(label: &'static str, entry_bytes: u64) -> bool {
-    let available = HostAdmission::probe(label, label)
+    let available = crate::family::mem::HostFacts::read(label, label)
         .ok()
-        .map(|admission| admission.available_budget());
+        .map(|host| host.budget());
     host_memory_is_short(available, HOST_RESERVE, entry_bytes)
 }
 
@@ -278,9 +275,9 @@ impl HostStoreDisk {
             }
         };
         let total = slab_bytes(&shape);
-        let available = HostAdmission::probe(label, label)
+        let available = crate::family::mem::HostFacts::read(label, label)
             .ok()
-            .map(|admission| admission.available_budget());
+            .map(|host| host.budget());
         if available.is_some_and(|available| total as u64 > available) {
             tier.counters.missed += 1;
             eprintln!("{label}: kv disk restore skipped: the host budget cannot hold {total} B");
