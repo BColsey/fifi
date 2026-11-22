@@ -16,6 +16,9 @@ pub(crate) enum Provenance {
     /// The tree could not be verified (a namespace root, a hybrid layout, a missing controller):
     /// the budget is the bare `MemAvailable`. The text names what was refused.
     Bare(String),
+    /// A unified-memory machine: one pool the whole machine shares, no cgroup. The budget is the
+    /// physical memory and the floor is the unified-memory one ([`super::host_budget`]).
+    Unified,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +41,7 @@ impl HostFacts {
     /// container the probe cannot parse must keep serving on the figure it always served on, and
     /// a memory refusal where a smaller setting fits is a defect. Only an unreadable or
     /// inconsistent `/proc/meminfo` is an error.
+    #[cfg(any(test, target_os = "linux"))]
     #[allow(
         dead_code,
         reason = "the callers are Linux-only; the macOS test build exercises read_in"
@@ -52,6 +56,7 @@ impl HostFacts {
         )
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn read_in(
         label: &'static str,
         root_label: &'static str,
@@ -72,6 +77,7 @@ impl HostFacts {
 
     /// The bare figures of the given meminfo text, with one log line (per process) naming the
     /// refusal they replace.
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn bare(
         label: &'static str,
         root_label: &'static str,
@@ -89,6 +95,30 @@ impl HostFacts {
         Ok(facts)
     }
 
+    /// The host facts of a Mac: the unified memory the machine has, read by the one Mac reader
+    /// ([`super::physical_memory_bytes`]) and floored by the one Mac rule ([`super::host_budget`]).
+    /// There is no cgroup and no `MemAvailable`: the pool is the whole physical memory.
+    #[cfg(not(any(test, target_os = "linux")))]
+    pub(crate) fn read(label: &'static str, _root_label: &'static str) -> Result<Self, EngError> {
+        let physical = super::physical_memory_bytes().ok_or_else(|| {
+            EngError::MemoryPlan(format!(
+                "{label} could not read the physical memory (sysctl hw.memsize)."
+            ))
+        })?;
+        Ok(Self::from_unified(physical))
+    }
+
+    /// The facts of a unified-memory machine of `physical` bytes.
+    pub(crate) fn from_unified(physical: u64) -> Self {
+        Self {
+            mem_total: physical,
+            mem_available: physical,
+            cgroup_remaining: None,
+            provenance: Provenance::Unified,
+            process_rss: 0,
+        }
+    }
+
     /// One line for a start line or a report: the budget and whether its cgroup clamp was
     /// verified or the bare `MemAvailable` figure stands in for it.
     pub(crate) fn provenance_note(&self) -> String {
@@ -98,6 +128,9 @@ impl HostFacts {
                 "host budget {:.1} GiB, cgroup limit verified",
                 gib(self.budget())
             ),
+            Provenance::Unified => {
+                format!("host budget {:.1} GiB, unified memory", gib(self.budget()))
+            }
             Provenance::Bare(reason) => format!(
                 "host budget {:.1} GiB, cgroup limit unverified (bare MemAvailable): {reason}",
                 gib(self.budget())
@@ -107,6 +140,7 @@ impl HostFacts {
 
     /// `MemTotal` alone, from `/proc/meminfo`: what a plan that only needs the machine's size
     /// asks for (the unified-memory fractions), with no cgroup read.
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn physical_total() -> Option<u64> {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
         meminfo_bytes("the host", &text, "MemTotal:").ok()
@@ -120,6 +154,7 @@ impl HostFacts {
     /// The verified path: finds the process's cgroup tree, verifies it and reads every limit on
     /// the way to the root. Refuses when anything cannot be verified; [`HostFacts::read`] turns
     /// that refusal into the bare figures.
+    #[cfg(any(test, target_os = "linux"))]
     fn verified_in(
         label: &'static str,
         root_label: &'static str,
@@ -137,6 +172,7 @@ impl HostFacts {
 
     /// Private to `verified_in` except for the host tests of the memory plans, which build the
     /// synthetic cgroup-clamped snapshot a start reads through `read` (the same seam).
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn from_meminfo(
         label: &'static str,
         contents: &str,
@@ -176,7 +212,10 @@ impl HostFacts {
 
     /// The bytes the OS keeps out of every host plan on this machine ([`os_floor_of`]).
     pub(crate) fn os_floor(&self) -> u64 {
-        super::os_floor_of(self.mem_total)
+        match self.provenance {
+            Provenance::Unified => self.mem_total - super::host_budget(self.mem_total),
+            _ => super::os_floor_of(self.mem_total),
+        }
     }
 
     /// What a plan may spend on the process and its stores: `MemAvailable` above the OS floor,
@@ -277,6 +316,7 @@ impl HostFacts {
 }
 
 /// This process's resident set in bytes (`VmRSS` of `<proc>/self/status`), 0 when unreadable.
+#[cfg(any(test, target_os = "linux"))]
 fn resident_set_bytes(proc: &std::path::Path) -> u64 {
     std::fs::read_to_string(proc.join("self/status"))
         .ok()
@@ -289,6 +329,7 @@ fn resident_set_bytes(proc: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn meminfo_bytes(label: &'static str, contents: &str, name: &str) -> Result<u64, EngError> {
     let invalid = || {
         EngError::MemoryPlan(format!(
@@ -308,6 +349,7 @@ fn meminfo_bytes(label: &'static str, contents: &str, name: &str) -> Result<u64,
     Ok(bytes)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn cgroup_remaining_bytes(
     label: &'static str,
     maximum: &str,
@@ -332,10 +374,12 @@ fn cgroup_remaining_bytes(
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn root_error(root_label: &str, error: std::io::Error) -> EngError {
     EngError::MemoryPlan(format!("{root_label} cgroup root: {error}"))
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn read_admission_file(label: &'static str, path: &std::path::Path) -> Result<String, EngError> {
     std::fs::read_to_string(path).map_err(|error| {
         EngError::MemoryPlan(format!("{label} cannot read {}: {error}", path.display()))
@@ -343,6 +387,7 @@ fn read_admission_file(label: &'static str, path: &std::path::Path) -> Result<St
 }
 
 // Discovery must verify the global controller root and reject hidden ancestors first.
+#[cfg(any(test, target_os = "linux"))]
 fn cgroup_remaining_in(
     label: &'static str,
     root: &std::path::Path,
@@ -394,6 +439,7 @@ fn cgroup_remaining_in(
     Ok(minimum)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn verify_cgroup_root(
     label: &'static str,
     root: &std::path::Path,
@@ -452,6 +498,7 @@ fn verify_cgroup_root(
     Ok(())
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn cgroup_from_proc(
     label: &'static str,
     root: &std::path::Path,
@@ -1498,5 +1545,26 @@ mod tests {
         std::fs::remove_file(proc_dir.join("self/status")).unwrap();
         let read = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(read.process_rss, 0);
+    }
+
+    #[test]
+    fn a_unified_memory_machine_spends_the_unified_budget_and_keeps_the_unified_floor() {
+        const GIB: u64 = 1 << 30;
+        // The Mac rule is the one in `unified`: a sixth of the memory, at least 4 GiB, is the
+        // floor. A 16 GiB Mac keeps 4 GiB and spends 12; a 64 GiB Mac keeps its sixth.
+        for physical in [8 * GIB, 16 * GIB, 36 * GIB, 64 * GIB, 192 * GIB] {
+            let host = HostFacts::from_unified(physical);
+            assert_eq!(host.provenance(), &Provenance::Unified);
+            assert_eq!(host.total(), physical);
+            assert_eq!(host.spare(), crate::family::mem::host_budget(physical));
+            assert_eq!(host.os_floor() + host.spare(), physical);
+            assert_eq!(host.kept_back(), host.os_floor());
+        }
+        let sixteen = HostFacts::from_unified(16 * GIB);
+        assert_eq!(sixteen.os_floor(), 4 * GIB);
+        // There is no cgroup: the payload admission spends the whole spare, less nothing.
+        assert!(sixteen.admit(LABEL, 12 * GIB).is_ok());
+        assert!(sixteen.admit(LABEL, 12 * GIB + 1).is_err());
+        assert!(sixteen.provenance_note().contains("unified memory"));
     }
 }

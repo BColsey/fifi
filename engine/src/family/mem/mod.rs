@@ -13,9 +13,8 @@
 // The facts are read by the CUDA-build starts; the host build compiles them without a reader.
 #![allow(dead_code, reason = "the CUDA-build starts read the facts")]
 
-// The host reader parses `/proc`, so it exists where a Linux host does (and in the test build);
-// the numbers below are plain arithmetic and exist everywhere.
-#[cfg(any(test, target_os = "linux"))]
+// The host facts exist on every target: `/proc` and the cgroup tree on Linux, the unified memory
+// of `unified` on a Mac.
 mod host;
 mod unified;
 
@@ -27,13 +26,11 @@ mod unified;
 )]
 pub(crate) use unified::*;
 
-#[cfg(any(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "the name a caller matches a provenance on")]
 pub(crate) use host::{HostFacts, Provenance};
 
 use std::path::{Path, PathBuf};
 
-#[cfg(any(test, target_os = "linux"))]
 use crate::EngError;
 
 /// One gibibyte.
@@ -83,7 +80,6 @@ pub(crate) struct HostMemory {
 
 impl HostMemory {
     /// The memory of one start's host facts: the figures the guard admits against.
-    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn of(host: &HostFacts) -> Self {
         Self {
             total: host.total(),
@@ -147,7 +143,6 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
 }
 
 /// The facts of one start. Read once, then lent to every stage.
-#[cfg(any(test, target_os = "linux"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Facts {
     pub(crate) host: HostFacts,
@@ -155,7 +150,6 @@ pub(crate) struct Facts {
     pub(crate) disks: Vec<DiskFacts>,
 }
 
-#[cfg(any(test, target_os = "linux"))]
 impl Facts {
     /// The facts with the host read from the machine and no card or disk yet.
     pub(crate) fn read(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
