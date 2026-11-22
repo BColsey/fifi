@@ -330,10 +330,10 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         }
     ));
     for engine in &config.engines {
-        let is_q36_family = engine.family == crate::family::qwen36::factory::FAMILY
-            || engine.family == crate::family::qwen36::factory::DENSE_FAMILY;
+        let is_q36_family = engine.family == crate::family::qwen::qwen36::factory::FAMILY
+            || engine.family == crate::family::qwen::qwen36::factory::DENSE_FAMILY;
         let is_flint = engine.family == crate::family::flint::FAMILY;
-        let is_flash_mlx = engine.family == crate::family::flash_next::factory::FAMILY
+        let is_flash_mlx = engine.family == crate::family::qwen::flash_next::factory::FAMILY
             && super::probe::CompiledBackends::of_this_build().mlx;
         if is_flint || is_flash_mlx {
             let rows = if is_flint {
@@ -384,7 +384,7 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             }));
             continue;
         }
-        if engine.family == crate::family::nemotron35::factory::FAMILY {
+        if engine.family == crate::family::nemotron::nemotron35::factory::FAMILY {
             use super::effective::{EffectiveSetting, Origin};
             let (value, origin) = match engine
                 .nemotron
@@ -434,11 +434,11 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             }));
             continue;
         }
-        use crate::family::qwen36::factory::backend_of_build;
-        use crate::family::qwen36::settings::{Q36Env, Q36Settings};
+        use crate::family::qwen::qwen36::factory::backend_of_build;
+        use crate::family::qwen::qwen36::settings::{Q36Env, Q36Settings};
         let env = Q36Env::from_process(&engine.model_dir);
         let backend = backend_of_build();
-        let spec = if engine.family == crate::family::qwen36::factory::DENSE_FAMILY {
+        let spec = if engine.family == crate::family::qwen::qwen36::factory::DENSE_FAMILY {
             crate::family::spec::QWEN3_8_27B_DENSE
         } else {
             crate::family::spec::QWEN3_6_35B_A3B
@@ -466,7 +466,7 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
                 .check_prefix_reuse_cap(true)
                 .map_err(|error| super::describe_error(&error))?;
         }
-        let default_options = crate::family::qwen36::settings::Q36Options::default();
+        let default_options = crate::family::qwen::qwen36::settings::Q36Options::default();
         let rows = super::effective::q36_effective(
             engine.qwen36.as_ref().unwrap_or(&default_options),
             env.cache_limit.as_deref(),

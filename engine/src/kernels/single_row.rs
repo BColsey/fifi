@@ -13,7 +13,7 @@ pub(crate) enum SingleRow {
     Wide(u32),
 }
 
-/// The kernel the Qwen3.6 EXL3 start registers on its context (`family/qwen36/cuda/start.rs`), and
+/// The kernel the Qwen3.6 EXL3 start registers on its context (`family/qwen/qwen36/cuda/start.rs`), and
 /// that any harness which claims to measure or qualify the served step must register too. An
 /// explicit `FIFI_EXL3_SINGLE_GATHER` still wins over it.
 pub(crate) const SERVED_SINGLE_ROW: SingleRow = SingleRow::Wide(1);

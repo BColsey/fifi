@@ -21,7 +21,7 @@
 //! 3. a GPU expert kernel: [`GpuExpertStore`] uploads an expert part and reports free VRAM; the
 //!    family's decode step calls its own device kernel on resident keys.
 //!
-//! The CPU pool and mapping follow the patterns of `family::qwen36::tiered` (`cpu_pool`,
+//! The CPU pool and mapping follow the patterns of `family::qwen::qwen36::tiered` (`cpu_pool`,
 //! `mapped_file`, `host`), whose [`MappedFile`](crate::family::mapped_file) this
 //! reuses unchanged; extracting that module onto this interface is the next step.
 

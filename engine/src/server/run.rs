@@ -16,11 +16,11 @@ use super::router::router;
 use super::state::{AppState, EngineEntry};
 use super::wire::state_name;
 use crate::EngError;
-use crate::family::flash_next::factory;
 use crate::family::flint;
-use crate::family::gemma4;
-use crate::family::nemotron35::factory as nemotron_factory;
-use crate::family::qwen36::factory as q36_factory;
+use crate::family::gemma::gemma4;
+use crate::family::nemotron::nemotron35::factory as nemotron_factory;
+use crate::family::qwen::flash_next::factory;
+use crate::family::qwen::qwen36::factory as q36_factory;
 use crate::family::sampler::SamplingDefaults;
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
 use crate::storage_guard;
@@ -298,7 +298,7 @@ pub(crate) fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
 
 /// Starts every engine of the configuration. A failure names the engine. Every entry carries the
 /// `prefix_reuse` flag of the configuration file to the chat handler and to the Q36 engine
-/// start, whose session-cap rule reads it (`family::qwen36::settings::check_prefix_reuse_cap`),
+/// start, whose session-cap rule reads it (`family::qwen::qwen36::settings::check_prefix_reuse_cap`),
 /// and the sampling defaults that its `generation_config.json` sets together with the flag of
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
@@ -545,7 +545,7 @@ fn start_flash(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    use crate::family::flash_next::settings::{FlashEnv, FlashOptions};
+    use crate::family::qwen::flash_next::settings::{FlashEnv, FlashOptions};
 
     let env = FlashEnv::capture();
     let (started, settings) = factory::start_engine_resolved(
@@ -593,7 +593,7 @@ fn start_q36(
     // factory's own resolved settings, beside the same options and env it
     // read (an environment variable cannot change inside the process), so
     // the server cannot report a configuration it did not start with.
-    let default_options = crate::family::qwen36::settings::Q36Options::default();
+    let default_options = crate::family::qwen::qwen36::settings::Q36Options::default();
     let effective = crate::capability::effective::q36_effective(
         config.qwen36.as_ref().unwrap_or(&default_options),
         std::env::var("Q36_CACHE_LIMIT").ok().as_deref(),
@@ -978,10 +978,10 @@ mod tests {
         entry_prefix_reuse, outcome, serve, shutdown_failure, start_engines,
     };
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    use crate::family::flash_next::factory;
-    use crate::family::flash_next::settings::FlashOptions;
-    use crate::family::qwen36::factory as q36_factory;
-    use crate::family::qwen36::settings::Q36Options;
+    use crate::family::qwen::flash_next::factory;
+    use crate::family::qwen::flash_next::settings::FlashOptions;
+    use crate::family::qwen::qwen36::factory as q36_factory;
+    use crate::family::qwen::qwen36::settings::Q36Options;
     use crate::family::sampler::SamplingDefaults;
     use crate::sched::worker::PrefixCapability;
     use crate::sched::worker::{EngineNote, EngineState, ShutdownReport};
@@ -1654,7 +1654,7 @@ mod tests {
         // The development engine would not read the Q36 members, so this error proves the dispatch.
         // The entry sets its own cache limit, which wins over `Q36_CACHE_LIMIT`, so an inherited
         // value cannot change the error. The missing limit is tested with an injected environment
-        // in `family::qwen36::factory` and with a clean process environment in `server_q36_cli`.
+        // in `family::qwen::qwen36::factory` and with a clean process environment in `server_q36_cli`.
         // `context_limit` is a member that both Q36 arms read and refuse below its minimum of 2,
         // so one test serves every build.
         let options = Q36Options {
@@ -1797,9 +1797,9 @@ mod tests {
             metal,
             vec![
                 crate::family::flint::FAMILY,
-                crate::family::flash_next::factory::FAMILY,
-                crate::family::qwen36::factory::FAMILY,
-                crate::family::qwen36::factory::DENSE_FAMILY,
+                crate::family::qwen::flash_next::factory::FAMILY,
+                crate::family::qwen::qwen36::factory::FAMILY,
+                crate::family::qwen::qwen36::factory::DENSE_FAMILY,
             ]
         );
     }
@@ -2312,8 +2312,8 @@ mod tests {
     #[test]
     fn retained_rows_match_the_config_effective_surface_for_shipped_configs() {
         use crate::capability::effective::q36_effective;
-        use crate::family::qwen36::factory as q36_factory;
-        use crate::family::qwen36::settings::{Q36Env, Q36Settings};
+        use crate::family::qwen::qwen36::factory as q36_factory;
+        use crate::family::qwen::qwen36::settings::{Q36Env, Q36Settings};
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
         let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
@@ -2398,16 +2398,16 @@ mod residency_tests {
     #[test]
     fn only_the_process_lifetime_families_hold_memory_after_a_stop() {
         for family in [
-            crate::family::qwen36::factory::FAMILY,
-            crate::family::qwen36::factory::DENSE_FAMILY,
-            crate::family::flash_next::factory::FAMILY,
+            crate::family::qwen::qwen36::factory::FAMILY,
+            crate::family::qwen::qwen36::factory::DENSE_FAMILY,
+            crate::family::qwen::flash_next::factory::FAMILY,
         ] {
             assert!(holds_memory_until_restart(family), "{family}");
         }
         for family in [
             super::fake::FAMILY,
             crate::family::flint::FAMILY,
-            crate::family::gemma4::FAMILY,
+            crate::family::gemma::gemma4::FAMILY,
         ] {
             assert!(!holds_memory_until_restart(family), "{family}");
         }

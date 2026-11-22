@@ -2,12 +2,12 @@
 //!
 //! The file carries no key.
 
-use crate::family::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
-use crate::family::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
+use crate::family::gemma::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
+use crate::family::qwen::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::{
-    nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
-    qwen36::{
+    nemotron::nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
+    qwen::qwen36::{
         factory::{DENSE_FAMILY, FAMILY as Q36_FAMILY},
         settings::Q36Options,
     },
@@ -48,8 +48,8 @@ const FAKE_FAMILY: &str = super::fake::FAMILY;
 /// IQ2_S), Nemotron `nemotron_h_moe` (its entry needs an options block), Raon `raon1` (its CUDA
 /// serving is not on main) and Flint.
 pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
-    ("qwen35moe", crate::family::qwen36::factory::FAMILY),
-    ("gemma4", crate::family::gemma4::FAMILY),
+    ("qwen35moe", crate::family::qwen::qwen36::factory::FAMILY),
+    ("gemma4", crate::family::gemma::gemma4::FAMILY),
 ];
 
 /// The architectures of [`GGUF_ARCHITECTURE_FAMILIES`], for refusal text.
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn a_gemma4_entry_reads_a_session_count_or_auto() {
-        use crate::family::gemma4::Gemma4Options;
+        use crate::family::gemma::gemma4::Gemma4Options;
         let seqs = |options: &str| {
             let config = load(&gemma4_entry(options)).expect("valid");
             config.engines[0]
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn a_gemma4_prompt_share_reads_a_row_count_and_refuses_the_rest() {
-        use crate::family::gemma4::Gemma4Options;
+        use crate::family::gemma::gemma4::Gemma4Options;
         let config = load(&gemma4_entry(r#"{"max_seqs": 4, "prompt_rows": 32}"#)).expect("valid");
         let options = config.engines[0].gemma4.as_ref().expect("options");
         assert_eq!(Gemma4Options::prompt_rows(options), Some(32));

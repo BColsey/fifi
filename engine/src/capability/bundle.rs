@@ -399,8 +399,8 @@ fn engine_input(
                 engine.flash_next.as_ref().and_then(|options| {
                     options.kv_format.map(|kv| {
                         match kv {
-                            crate::family::flash_next::settings::KvFormatName::F16 => "f16",
-                            crate::family::flash_next::settings::KvFormatName::Int8 => "int8",
+                            crate::family::qwen::flash_next::settings::KvFormatName::F16 => "f16",
+                            crate::family::qwen::flash_next::settings::KvFormatName::Int8 => "int8",
                         }
                         .to_string()
                     })
@@ -414,7 +414,7 @@ fn engine_input(
     let preflight =
         preflight::preflight(&engine.model_dir, &engine.tokenizer_dir, &candidate, facts)
             .map_err(|error| super::describe_error(&error));
-    let env = crate::family::qwen36::settings::Q36Env::from_process(&engine.model_dir);
+    let env = crate::family::qwen::qwen36::settings::Q36Env::from_process(&engine.model_dir);
     let effective = effective_rows(engine, &env);
     EngineInput {
         id: engine.id.clone(),
@@ -429,16 +429,16 @@ fn engine_input(
 /// refusal. Consults the same family environment settings as the CLI.
 fn effective_rows(
     engine: &crate::server::config::EngineConfig,
-    env: &crate::family::qwen36::settings::Q36Env,
+    env: &crate::family::qwen::qwen36::settings::Q36Env,
 ) -> Result<Vec<Value>, String> {
-    use crate::family::qwen36::factory::{DENSE_FAMILY, FAMILY, backend_of_build};
-    use crate::family::qwen36::settings::Q36Settings;
+    use crate::family::qwen::qwen36::factory::{DENSE_FAMILY, FAMILY, backend_of_build};
+    use crate::family::qwen::qwen36::settings::Q36Settings;
     let rows = if engine.family == crate::family::flint::FAMILY {
         Some(super::effective::flint_effective_for_build(
             engine.flint.as_ref(),
             None,
         ))
-    } else if engine.family == crate::family::flash_next::factory::FAMILY
+    } else if engine.family == crate::family::qwen::flash_next::factory::FAMILY
         && super::probe::CompiledBackends::of_this_build().mlx
     {
         Some(super::effective::flash_mlx_config_effective(
@@ -477,7 +477,7 @@ fn effective_rows(
         spec,
     )
     .map_err(|error| super::describe_error(&error))?;
-    let default_options = crate::family::qwen36::settings::Q36Options::default();
+    let default_options = crate::family::qwen::qwen36::settings::Q36Options::default();
     Ok(super::effective::q36_effective(
         engine.qwen36.as_ref().unwrap_or(&default_options),
         env.cache_limit.as_deref(),
@@ -953,14 +953,14 @@ mod tests {
     /// (load.rs): the CUDA settings path only runs for a CUDA-decode entry,
     /// and without it there are no device rows to plan.
     fn flash_engine(
-        flash_next: crate::family::flash_next::settings::FlashOptions,
+        flash_next: crate::family::qwen::flash_next::settings::FlashOptions,
     ) -> (tempfile::TempDir, crate::server::config::EngineConfig) {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = crate::server::config::EngineConfig {
             id: "flash".to_string(),
             model_dir: dir.path().to_path_buf(),
             tokenizer_dir: dir.path().to_path_buf(),
-            family: crate::family::flash_next::factory::FAMILY.to_string(),
+            family: crate::family::qwen::flash_next::factory::FAMILY.to_string(),
             model: None,
             context_limit: None,
             fake: None,
@@ -991,11 +991,12 @@ mod tests {
 
     #[test]
     fn a_flash_entry_carries_its_configured_context_into_the_preflight() {
-        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
-            cuda_decode: Some(true),
-            context: Some(5002),
-            ..Default::default()
-        });
+        let (_dir, engine) =
+            flash_engine(crate::family::qwen::flash_next::settings::FlashOptions {
+                cuda_decode: Some(true),
+                context: Some(5002),
+                ..Default::default()
+            });
         assert_eq!(
             flash_load_plan_detail(&engine),
             "the load would refuse this pack: engine config: context must be a multiple of 4, found 5002"
@@ -1004,11 +1005,12 @@ mod tests {
 
     #[test]
     fn a_flash_entry_carries_its_configured_kv_format_into_the_preflight() {
-        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
-            cuda_decode: Some(true),
-            kv_format: Some(crate::family::flash_next::settings::KvFormatName::Int8),
-            ..Default::default()
-        });
+        let (_dir, engine) =
+            flash_engine(crate::family::qwen::flash_next::settings::FlashOptions {
+                cuda_decode: Some(true),
+                kv_format: Some(crate::family::qwen::flash_next::settings::KvFormatName::Int8),
+                ..Default::default()
+            });
         assert_eq!(
             flash_load_plan_detail(&engine),
             "the load would refuse this pack: engine config: kv_format int8 has no attention kernel yet; use f16"
@@ -1021,12 +1023,13 @@ mod tests {
         // on the context instead. The loader round-trips the KV name through
         // serde before the settings run (load.rs): a mangled name would fail
         // the parse with `kv_format: unknown variant`, not this text.
-        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
-            cuda_decode: Some(true),
-            kv_format: Some(crate::family::flash_next::settings::KvFormatName::F16),
-            context: Some(5002),
-            ..Default::default()
-        });
+        let (_dir, engine) =
+            flash_engine(crate::family::qwen::flash_next::settings::FlashOptions {
+                cuda_decode: Some(true),
+                kv_format: Some(crate::family::qwen::flash_next::settings::KvFormatName::F16),
+                context: Some(5002),
+                ..Default::default()
+            });
         assert_eq!(
             flash_load_plan_detail(&engine),
             "the load would refuse this pack: engine config: context must be a multiple of 4, found 5002"
@@ -1035,11 +1038,12 @@ mod tests {
 
     #[test]
     fn a_flash_entry_carries_its_configured_prefill_width_into_the_preflight() {
-        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
-            cuda_decode: Some(true),
-            prefill_rows: Some(9000),
-            ..Default::default()
-        });
+        let (_dir, engine) =
+            flash_engine(crate::family::qwen::flash_next::settings::FlashOptions {
+                cuda_decode: Some(true),
+                prefill_rows: Some(9000),
+                ..Default::default()
+            });
         assert_eq!(
             flash_load_plan_detail(&engine),
             "the load would refuse this pack: engine config: prefill_rows must be between 1 and 2048, found 9000"
@@ -1053,7 +1057,7 @@ mod tests {
         // device's memory could not be probed (the synthetic facts) — the
         // same no-rows answer as before this wiring.
         let (_dir, engine) =
-            flash_engine(crate::family::flash_next::settings::FlashOptions::default());
+            flash_engine(crate::family::qwen::flash_next::settings::FlashOptions::default());
         let input = super::engine_input(&engine, &synthetic_facts());
         let report = input.preflight.expect("a report");
         assert!(report.decisions.is_empty());
@@ -1076,7 +1080,7 @@ mod tests {
             context_limit: None,
             fake: None,
             flash_next: None,
-            qwen36: Some(crate::family::qwen36::settings::Q36Options::default()),
+            qwen36: Some(crate::family::qwen::qwen36::settings::Q36Options::default()),
             nemotron: None,
             gemma4: None,
             flint: None,
@@ -1086,9 +1090,9 @@ mod tests {
         };
         // Deterministic env injection (the parity-test value), never the
         // process environment: tests must not depend on Q36_CACHE_LIMIT.
-        let env = crate::family::qwen36::settings::Q36Env {
+        let env = crate::family::qwen::qwen36::settings::Q36Env {
             cache_limit: Some("8589934592".to_string()),
-            ..crate::family::qwen36::settings::Q36Env::default()
+            ..crate::family::qwen::qwen36::settings::Q36Env::default()
         };
         // Deliberately NOT asserting row count or keys: the resolver owns
         // the surface; the bundle only carries it with origins attached.

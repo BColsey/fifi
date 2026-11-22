@@ -22,7 +22,7 @@
 
 use serde::Serialize;
 
-use crate::family::qwen36::settings::{Backend, Q36Options, Q36Settings};
+use crate::family::qwen::qwen36::settings::{Backend, Q36Options, Q36Settings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,7 +80,9 @@ pub(crate) fn q36_effective(
     backend: Backend,
     settings: &Q36Settings,
 ) -> Vec<EffectiveSetting> {
-    use crate::family::qwen36::settings::{activation_name, kv_dtype_name, weight_format_name};
+    use crate::family::qwen::qwen36::settings::{
+        activation_name, kv_dtype_name, weight_format_name,
+    };
     let ignored = |key: &str| settings.ignored_mlx_keys.contains(&key);
     let on_arm = |key: &str, origin: Origin| {
         if ignored(key) {
@@ -272,7 +274,7 @@ fn mlx_switch(key: &'static str, name: &str) -> EffectiveSetting {
 /// The Qwen disk-experts override: automatic when unset, `on` for `1`, `off` for `0`, and a
 /// value that is neither is named as ignored.
 fn disk_experts_row() -> EffectiveSetting {
-    use crate::family::qwen36::settings::DiskExperts;
+    use crate::family::qwen::qwen36::settings::DiskExperts;
     let value = std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS");
     let (setting, ignored) = DiskExperts::of(value.as_deref());
     let label = match setting {
@@ -508,11 +510,11 @@ fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>, flint: bool) {
 }
 
 pub(crate) fn flash_mlx_effective(
-    options: &crate::family::flash_next::settings::FlashOptions,
-    env: &crate::family::flash_next::settings::FlashEnv,
-    settings: &crate::family::flash_next::settings::FlashSettings,
+    options: &crate::family::qwen::flash_next::settings::FlashOptions,
+    env: &crate::family::qwen::flash_next::settings::FlashEnv,
+    settings: &crate::family::qwen::flash_next::settings::FlashSettings,
 ) -> Vec<EffectiveSetting> {
-    use crate::family::flash_next::factory::CONTEXT_LIMIT;
+    use crate::family::qwen::flash_next::factory::CONTEXT_LIMIT;
     let cache_origin = if options.cache_limit_bytes.is_some() {
         Origin::ConfigFile
     } else {
@@ -549,9 +551,9 @@ pub(crate) fn flash_mlx_effective(
 pub(crate) fn flash_mlx_config_effective(
     model_dir: &std::path::Path,
     tokenizer_dir: &std::path::Path,
-    options: Option<&crate::family::flash_next::settings::FlashOptions>,
+    options: Option<&crate::family::qwen::flash_next::settings::FlashOptions>,
 ) -> Result<Vec<EffectiveSetting>, crate::EngError> {
-    use crate::family::flash_next::{
+    use crate::family::qwen::flash_next::{
         factory::check_mlx_settings,
         settings::{FlashEnv, FlashOptions, FlashSettings},
     };
@@ -833,7 +835,7 @@ pub(crate) fn flint_effective(
 #[cfg(test)]
 mod tests {
     use super::{Origin, q36_effective};
-    use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
     use std::path::Path;
 
     fn resolve(options: &Q36Options, backend: Backend) -> Q36Settings {
@@ -1012,7 +1014,7 @@ mod tests {
         for key in ["layer_major", "tall_hilo"] {
             assert!(rows.iter().all(|r| r.key != key), "{key} is a Flint row");
         }
-        let qwen = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/family/qwen36");
+        let qwen = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/family/qwen/qwen36");
         let mut stack = vec![qwen];
         let mut seen = 0;
         while let Some(dir) = stack.pop() {

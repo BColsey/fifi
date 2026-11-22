@@ -3111,7 +3111,7 @@ static int compile_moe_rows(
 
 // The compiled device-routed MoE decode block body. B>1 dispatches to the row-vectorized
 // helper after argument collection; B=1 replays the original op sequence of
-// `engine/src/family/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`,
+// `engine/src/family/qwen/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`,
 // calling the same inference_mlx_* shims that the uncompiled Rust path calls, in the same
 // order. A stable
 // ascending argsort of the negated probabilities keeps the lowest index first on ties, like the

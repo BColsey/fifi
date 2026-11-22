@@ -637,7 +637,7 @@ fn the_listing_offers_serve_only_for_a_complete_snapshot_of_a_known_family() {
     assert_eq!(complete["servable"], true);
     assert_eq!(
         complete["families"],
-        serde_json::json!([crate::family::qwen36::factory::FAMILY])
+        serde_json::json!([crate::family::qwen::qwen36::factory::FAMILY])
     );
     assert_eq!(partial["complete"], false);
     assert_eq!(partial["servable"], false);

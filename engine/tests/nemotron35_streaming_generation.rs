@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use inference_engine::family::nemotron35::runner;
+use inference_engine::family::nemotron::nemotron35::runner;
 
 const CHUNK: usize = 256;
 

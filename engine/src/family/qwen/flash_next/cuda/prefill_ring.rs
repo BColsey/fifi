@@ -1,0 +1,519 @@
+//! The prefill expert ring streams records from a frozen pinned store to a separate copy
+//! stream. The eager path queues nonresident experts ahead in layer-major order. The
+//! routed path queues selected nonresident experts. The lookahead variant also uses
+//! the preceding chunk's picks to start the next layer's copies before its router runs.
+//!
+//! Ordering discipline (the same shape as the bank's twice-reviewed copy tail): a ring slot's
+//! next H2D copy on the copy stream waits the `used` event the compute stream recorded after
+//! the slot's last read, and the compute stream waits the slot's `copied` event before its
+//! first read. The bank is frozen read-only for the whole chunk, so the host places the plan
+//! reads are stable.
+
+use crate::family::expert_bank::NO_PLACE;
+
+/// An expert the chunk needs that the bank does not hold: streamed into a ring slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StreamEntry {
+    pub(super) layer: u16,
+    pub(super) expert: u16,
+    /// The pinned-store place the record reads from, stable while the bank is frozen.
+    pub(super) place: u32,
+    /// The ring slot the record lands in (`index % ring`).
+    pub(super) slot: u16,
+}
+
+/// Every entry in stream order: layer-major, expert id ascending, skipping experts the bank
+/// already holds (they read from bank slots on the compute stream, no copy). Inclusive store
+/// keeps a place for every expert, Exclusive only for the non-banked ones, which is exactly
+/// what the ring needs either way.
+pub(super) fn plan_from_rows(
+    slot_rows: &[&[i32]],
+    place_rows: &[&[u32]],
+    experts: usize,
+    ring: usize,
+) -> Vec<StreamEntry> {
+    let mut entries = Vec::new();
+    for (layer, (slots, places)) in slot_rows.iter().zip(place_rows).enumerate() {
+        for expert in 0..experts {
+            let (slot, place) = (
+                slots.get(expert).copied().unwrap_or(-1),
+                places.get(expert).copied().unwrap_or(NO_PLACE),
+            );
+            if slot >= 0 || place == NO_PLACE {
+                continue;
+            }
+            entries.push(StreamEntry {
+                layer: layer as u16,
+                expert: expert as u16,
+                place,
+                slot: (entries.len() % ring.max(1)) as u16,
+            });
+        }
+    }
+    entries
+}
+
+/// Allows one selected-expert issue per layer in a chunk: a second call would start the next
+/// layer's prediction copies again over slots still marked as issued.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Default)]
+pub(super) struct SelectedOnce {
+    last: Option<usize>,
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+impl SelectedOnce {
+    pub(super) fn claim(&mut self, layer: usize) -> Result<(), crate::EngError> {
+        if self.last == Some(layer) {
+            return Err(crate::EngError::BadRequest(format!(
+                "the prefill ring issued the selected experts of layer {layer} twice in one chunk"
+            )));
+        }
+        self.last = Some(layer);
+        Ok(())
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) mod device {
+    use super::{NO_PLACE, SelectedOnce, StreamEntry, plan_from_rows};
+    use crate::{
+        EngError,
+        family::{expert_bank::BankGeometry, qwen::flash_next::cuda::bank::device::DeviceBank},
+        kernels::cuda::{CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream},
+    };
+
+    struct Lookahead {
+        /// Exact routed picks, replaced layer by layer as each chunk runs.
+        routes: Vec<Vec<bool>>,
+        /// Copies issued for the next layer in slots the current layer does not hold.
+        next: Vec<StreamEntry>,
+    }
+
+    /// The ring's device side: `ring` record slots laid out like one bank layer, plus one copy
+    /// stream whose H2D copies run behind the compute stream via per-slot events.
+    pub(in crate::family::qwen::flash_next) struct PrefillRing {
+        slots: DeviceBuffer,
+        copy: DeviceStream,
+        copied: Vec<DeviceEvent>,
+        used: Vec<DeviceEvent>,
+        live: Vec<bool>,
+        entries: Vec<StreamEntry>,
+        /// Boundary per layer: entries[layer_start[l]..layer_start[l + 1]] are layer l's.
+        layer_start: Vec<usize>,
+        /// The most streamed experts any one layer needs (a layer's pass reads them all at once).
+        per_layer: usize,
+        /// The first layer whose `free_layer` has not run yet (the consumed point).
+        freed: usize,
+        issued: usize,
+        /// When enabled, the current layer's issued entries. Only these slots have copy
+        /// obligations for the layer. The eager path tracks its horizon with `issued`.
+        selected: Option<Vec<StreamEntry>>,
+        selected_once: SelectedOnce,
+        lookahead: Option<Lookahead>,
+        record: usize,
+        ring: usize,
+        /// Whether a chunked prefill window is open.
+        active: bool,
+    }
+
+    impl PrefillRing {
+        /// Allocates `ring` record slots laid out like one bank layer and the copy stream's
+        /// events. The plan is empty until [`Self::replan`]; Strata measured 384 slots as the
+        /// optimum on a 24 GB card, ~1.2 GiB at flash-next's 3.23 MiB records.
+        pub(in crate::family::qwen::flash_next) fn build(
+            ctx: &CudaContext,
+            geometry: BankGeometry,
+            ring: usize,
+        ) -> Result<Self, EngError> {
+            if ring == 0 {
+                return Err(EngError::BadRequest(
+                    "the prefill ring needs at least one slot".into(),
+                ));
+            }
+            let layers = geometry.layers;
+            Ok(Self {
+                slots: ctx.allocate(ring * geometry.record_bytes)?,
+                copy: ctx.stream()?,
+                copied: (0..ring)
+                    .map(|_| ctx.event())
+                    .collect::<Result<Vec<_>, _>>()?,
+                used: (0..ring)
+                    .map(|_| ctx.event())
+                    .collect::<Result<Vec<_>, _>>()?,
+                live: vec![false; ring],
+                entries: Vec::new(),
+                layer_start: vec![0; layers + 1],
+                per_layer: 0,
+                freed: 0,
+                issued: 0,
+                selected: None,
+                selected_once: SelectedOnce::default(),
+                lookahead: None,
+                record: geometry.record_bytes,
+                ring,
+                active: false,
+            })
+        }
+
+        /// Re-plans the stream against the bank as it stands now (the decode steps between
+        /// prompts admit and evict, so the plan is per prompt): every non-resident expert,
+        /// layer-major. The slot buffer and events survive; a slot whose last copy is still in
+        /// flight keeps `live`, and the next issue waits its `used` event as usual.
+        pub(in crate::family::qwen::flash_next) fn replan(&mut self, bank: &DeviceBank) {
+            let geometry: BankGeometry = *bank.geometry();
+            let layers = geometry.layers;
+            let experts = geometry.experts;
+            let slot_rows: Vec<&[i32]> = (0..layers)
+                .map(|l| bank.slot_row(l))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_default();
+            let place_rows: Vec<Vec<u32>> = (0..layers)
+                .map(|l| {
+                    (0..experts)
+                        .map(|e| bank.place_of(l, e as u16).unwrap_or(NO_PLACE))
+                        .collect()
+                })
+                .collect();
+            let place_refs: Vec<&[u32]> = place_rows.iter().map(|v| v.as_slice()).collect();
+            let entries = plan_from_rows(&slot_rows, &place_refs, experts, self.ring);
+            let mut layer_start = vec![entries.len(); layers + 1];
+            for (i, entry) in entries.iter().enumerate() {
+                let l = usize::from(entry.layer);
+                if layer_start[l] == entries.len() {
+                    layer_start[l] = i;
+                }
+            }
+            self.per_layer = layer_start
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .max()
+                .unwrap_or(0);
+            self.entries = entries;
+            self.layer_start = layer_start;
+            self.begin_chunk();
+        }
+
+        /// The most streamed experts any one layer needs: the ring must hold at least this
+        /// many slots, because a layer's grouped pass reads all of them at once.
+        pub(in crate::family::qwen::flash_next) fn per_layer(&self) -> usize {
+            self.per_layer
+        }
+
+        /// Enqueues H2D copies until `ahead` entries past the consumed point (the driver calls
+        /// this between layers, typically with the whole next layer in flight). The horizon
+        /// never crosses a wrap onto a slot whose tenant is not freed yet: the copy would wait
+        /// an unrecorded `used` event and the bytes it overwrites could still be read.
+        pub(in crate::family::qwen::flash_next) fn issue_until(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            ahead: usize,
+        ) -> Result<(), EngError> {
+            let start = self.layer_start[self.freed];
+            let mut target = (start + ahead).min(self.entries.len());
+            let mut held = vec![false; self.ring];
+            for entry in &self.entries[start..self.issued] {
+                held[usize::from(entry.slot)] = true;
+            }
+            for (i, entry) in self.entries[self.issued..target].iter().enumerate() {
+                let slot = usize::from(entry.slot);
+                if held[slot] {
+                    target = self.issued + i;
+                    break;
+                }
+                held[slot] = true;
+            }
+            while self.issued < target {
+                let entry = self.entries[self.issued];
+                self.issue(ctx, bank, entry)?;
+                self.issued += 1;
+            }
+            Ok(())
+        }
+
+        fn issue(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            entry: StreamEntry,
+        ) -> Result<(), EngError> {
+            let slot = usize::from(entry.slot);
+            if self.live[slot] {
+                self.copy.wait(&self.used[slot])?;
+            }
+            bank.stream_place(
+                ctx,
+                &self.copy,
+                usize::from(entry.layer),
+                entry.place,
+                self.range(slot)?,
+            )?;
+            self.copy.record(&self.copied[slot])?;
+            self.live[slot] = true;
+            Ok(())
+        }
+
+        pub(in crate::family::qwen::flash_next) fn enable_selected(&mut self) {
+            self.selected = Some(Vec::with_capacity(self.per_layer));
+        }
+
+        pub(in crate::family::qwen::flash_next) fn enable_lookahead(
+            &mut self,
+            geometry: BankGeometry,
+        ) {
+            self.enable_selected();
+            self.lookahead = Some(Lookahead {
+                routes: vec![vec![false; geometry.experts]; geometry.layers],
+                next: Vec::with_capacity(self.per_layer),
+            });
+        }
+
+        /// Start a new request without routing history from an earlier context.
+        pub(in crate::family::qwen::flash_next) fn clear_history(&mut self) {
+            if let Some(lookahead) = &mut self.lookahead {
+                for layer in &mut lookahead.routes {
+                    layer.fill(false);
+                }
+            }
+        }
+
+        pub(in crate::family::qwen::flash_next) fn issue_first(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+        ) -> Result<(), EngError> {
+            self.issue_prediction(ctx, bank, 0)
+        }
+
+        /// Issues one layer's predictions from the previous chunk. Current DMA and
+        /// projection obligations keep their slots until `free_layer`.
+        fn issue_prediction(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            let Some(predicted) = self.lookahead.as_ref().and_then(|v| v.routes.get(layer)) else {
+                return Ok(());
+            };
+            let selected = self
+                .selected
+                .as_ref()
+                .expect("lookahead uses selected uploads");
+            let mut held = vec![false; self.ring];
+            for entry in selected {
+                held[usize::from(entry.slot)] = true;
+            }
+            let copies: Vec<_> = self
+                .layer_entries(layer)
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    predicted[usize::from(entry.expert)] && !held[usize::from(entry.slot)]
+                })
+                .collect();
+            for entry in copies {
+                self.issue(ctx, bank, entry)?;
+                if layer == self.freed {
+                    self.selected
+                        .as_mut()
+                        .expect("lookahead uses selected uploads")
+                        .push(entry);
+                } else {
+                    self.lookahead
+                        .as_mut()
+                        .expect("lookahead enabled")
+                        .next
+                        .push(entry);
+                }
+            }
+            Ok(())
+        }
+
+        pub(in crate::family::qwen::flash_next) fn is_selected(&self) -> bool {
+            self.selected.is_some()
+        }
+
+        /// Queues the selected entries of the current layer after route resolution. The
+        /// existing plan keeps slot assignments stable when the selected set is sparse.
+        pub(in crate::family::qwen::flash_next) fn issue_selected(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            layer: usize,
+            picks: &[usize],
+        ) -> Result<(), EngError> {
+            if layer != self.freed || layer >= bank.geometry().layers || !self.is_selected() {
+                return Err(EngError::BadRequest(
+                    "the prefill ring can issue selected experts only for its current layer".into(),
+                ));
+            }
+            self.selected_once.claim(layer)?;
+            let mut wanted = vec![false; bank.geometry().experts];
+            for &expert in picks {
+                *wanted.get_mut(expert).ok_or_else(|| {
+                    EngError::BadRequest("prefill ring: a selected expert is out of range".into())
+                })? = true;
+            }
+            // The current layer already holds any prefetched entries that survived
+            // the preceding layer's slot check. A requested resident stays in the bank.
+            let selected = self.selected.as_ref().expect("selected ring");
+            let mut issued = vec![false; wanted.len()];
+            for entry in selected {
+                issued[usize::from(entry.expert)] = true;
+            }
+            for i in self.layer_start[layer]..self.layer_start[layer + 1] {
+                let entry = self.entries[i];
+                let expert = usize::from(entry.expert);
+                if wanted[expert] && !issued[expert] {
+                    self.issue(ctx, bank, entry)?;
+                    self.selected.as_mut().expect("selected ring").push(entry);
+                }
+            }
+            if let Some(lookahead) = &mut self.lookahead {
+                lookahead.routes[layer] = wanted;
+                self.issue_prediction(ctx, bank, layer + 1)?;
+            }
+            Ok(())
+        }
+
+        /// Resets the per-chunk cursors for the next chunk of the same prompt: layers free in
+        /// order again from 0. The slot events and `live` survive, so a wrap onto a slot whose
+        /// copy is still in flight still waits its `used` event.
+        pub(in crate::family::qwen::flash_next) fn begin_chunk(&mut self) {
+            self.freed = 0;
+            self.issued = 0;
+            self.selected_once.reset();
+            if let Some(selected) = &mut self.selected {
+                selected.clear();
+            }
+            if let Some(lookahead) = &mut self.lookahead {
+                lookahead.next.clear();
+            }
+        }
+
+        /// Whether a prefill window is open (armed by the owning block's `begin_prefill`).
+        pub(in crate::family::qwen::flash_next) fn active(&self) -> bool {
+            self.active
+        }
+
+        pub(in crate::family::qwen::flash_next) fn set_active(&mut self, on: bool) {
+            self.active = on;
+        }
+
+        /// The stream the ring's H2D copies run on; the owner syncs it when the window closes.
+        pub(in crate::family::qwen::flash_next) fn copy_stream(&self) -> &DeviceStream {
+            &self.copy
+        }
+
+        /// Issues every entry through the end of `layer` (inclusive): the driver calls this at
+        /// the start of layer `l`'s MoE half with `layer = l + 1`, so the next layer's experts
+        /// stream during this layer's compute and the next attention.
+        pub(in crate::family::qwen::flash_next) fn issue_through(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            let target = self
+                .layer_start
+                .get(layer + 1)
+                .copied()
+                .unwrap_or(self.entries.len());
+            let start = self.layer_start[self.freed];
+            self.issue_until(ctx, bank, target.saturating_sub(start))
+        }
+
+        /// Makes `stream` wait every copy of `layer`'s entries, so the grouped launches that
+        /// follow read settled bytes.
+        pub(in crate::family::qwen::flash_next) fn wait_layer(
+            &self,
+            stream: &DeviceStream,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            if let Some(selected) = &self.selected {
+                if let Some(entry) = selected.last() {
+                    // The final copy event covers all earlier copies on this stream.
+                    stream.wait(&self.copied[usize::from(entry.slot)])?;
+                }
+            } else {
+                for entry in self.layer_entries(layer) {
+                    stream.wait(&self.copied[usize::from(entry.slot)])?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Records `used` on `stream` for every slot of `layer`, letting later copies overwrite
+        /// them once this layer's reads finish. Call after the layer's grouped launches are on
+        /// the compute stream. Layers must be freed in order; the freed point is what
+        /// [`Self::issue_until`] issues past.
+        pub(in crate::family::qwen::flash_next) fn free_layer(
+            &mut self,
+            stream: &DeviceStream,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            if layer != self.freed {
+                return Err(EngError::BadRequest(format!(
+                    "the prefill ring frees layers in order, layer {layer} after {}",
+                    self.freed
+                )));
+            }
+            let entries = self
+                .selected
+                .as_deref()
+                .unwrap_or_else(|| self.layer_entries(layer));
+            for entry in entries {
+                stream.record(&self.used[usize::from(entry.slot)])?;
+            }
+            if let Some(selected) = &mut self.selected {
+                selected.clear();
+                if let Some(lookahead) = &mut self.lookahead {
+                    std::mem::swap(selected, &mut lookahead.next);
+                }
+            }
+            self.freed += 1;
+            Ok(())
+        }
+
+        /// The ring slot an expert of a layer landed in, for the grouped pass's slot ids.
+        pub(in crate::family::qwen::flash_next) fn slot_of(
+            &self,
+            layer: usize,
+            expert: u16,
+        ) -> Option<u16> {
+            self.layer_entries(layer)
+                .iter()
+                .find(|e| e.expert == expert)
+                .map(|e| e.slot)
+        }
+
+        /// The ring buffer, laid out like one bank layer for the grouped launch.
+        pub(in crate::family::qwen::flash_next) fn slots(&self) -> &DeviceBuffer {
+            &self.slots
+        }
+
+        /// The ring's slot count (the `members` bound of a ring-sourced launch).
+        pub(in crate::family::qwen::flash_next) fn ring_slots(&self) -> usize {
+            self.ring
+        }
+
+        fn layer_entries(&self, layer: usize) -> &[StreamEntry] {
+            self.entries
+                .get(
+                    self.layer_start.get(layer).copied().unwrap_or(0)
+                        ..self.layer_start.get(layer + 1).copied().unwrap_or(0),
+                )
+                .unwrap_or(&[])
+        }
+
+        fn range(&self, slot: usize) -> Result<DeviceRange<'_>, EngError> {
+            self.slots.range(slot * self.record, self.record)
+        }
+    }
+}

@@ -16,7 +16,7 @@
 //! pair whole in every window and the fold stores `w` whole, so the host reads the table
 //! (`8 m + 8` bytes) after one synchronization with no preparation of the buffer. Router (mask 1),
 //! invalid-state (mask 4) and arithmetic (mask 16) bits live in `w` only; the host refuses a
-//! window with any non-zero pair bit or a non-zero `w` (`family::qwen36::krow::check_status`).
+//! window with any non-zero pair bit or a non-zero `w` (`family::qwen::qwen36::krow::check_status`).
 //!
 //! `verify_greedy` runs after `argmax_rows` and compares the pair tokens with the window ids on the
 //! device: the accepted run `a` (the leading rows `i < m - 1` whose token equals `ids[i + 1]`) and

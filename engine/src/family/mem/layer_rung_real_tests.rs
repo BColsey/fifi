@@ -5,7 +5,7 @@
 
 use super::HostMemory;
 use super::layer_rung::{Home, Placement, RungBudget, RungModel, place};
-use crate::family::qwen36::card_short::{CardFigures, CardVerdict, decide};
+use crate::family::qwen::qwen36::card_short::{CardFigures, CardVerdict, decide};
 use crate::weights::{GgufHeader, MetaValue};
 use std::{fs::File, io::BufReader, path::PathBuf};
 

@@ -1,6 +1,6 @@
 //! The block indexer of Qwen3.8 Flash-Next QSA attention on the device. The formulas and layouts
 //! are in `native/resident/qsa_index.h`; they follow the host indexer of
-//! `family::flash_next::qsa` (`indexer_queries`, `block_key`, `block_scores`).
+//! `family::qwen::flash_next::qsa` (`indexer_queries`, `block_key`, `block_scores`).
 //!
 //! QSA keeps, per layer, one pooled indexer key per completed block of `ratio` positions.
 //! [`CudaContext::qsa_index`] queues, for `m` tokens of a chunk, the normed and rotated indexer

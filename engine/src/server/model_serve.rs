@@ -28,11 +28,11 @@ use crate::server::config::{Config, EngineConfig, StartupError};
 /// loader's own checks staying the authority.
 pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
     (
-        crate::family::qwen36::factory::FAMILY,
+        crate::family::qwen::qwen36::factory::FAMILY,
         crate::family::QWEN3_6_35B_A3B.model_types,
     ),
     (
-        crate::family::qwen36::factory::DENSE_FAMILY,
+        crate::family::qwen::qwen36::factory::DENSE_FAMILY,
         crate::family::QWEN3_8_27B_DENSE.model_types,
     ),
 ];
@@ -135,7 +135,7 @@ const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>
 pub(crate) struct Discovered {
     pub(crate) family: String,
     pub(crate) weight_format: &'static str,
-    pub(crate) options: crate::family::qwen36::settings::Q36Options,
+    pub(crate) options: crate::family::qwen::qwen36::settings::Q36Options,
     pub(crate) tokenizer_dir: PathBuf,
 }
 
@@ -173,13 +173,13 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     }
     let weight_format = select_weight_format(has_gguf, has_safetensors);
 
-    let options = crate::family::qwen36::settings::Q36Options {
+    let options = crate::family::qwen::qwen36::settings::Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
         // they are.
         weight_format: (weight_format != MLX_WEIGHTS).then(|| weight_format.to_string()),
         context_limit: args.context_limit,
         kv_dtype: args.kv_dtype.clone(),
-        ..crate::family::qwen36::settings::Q36Options::default()
+        ..crate::family::qwen::qwen36::settings::Q36Options::default()
     };
     Ok(Discovered {
         family,
@@ -280,7 +280,7 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         _ => eprint!("{}", warned_checks(&report)),
     }
 
-    let backend = crate::family::qwen36::factory::backend_of_build();
+    let backend = crate::family::qwen::qwen36::factory::backend_of_build();
     eprintln!(
         "model: {} — family {}, {} weights, backend {}",
         args.model_dir.display(),
@@ -528,10 +528,10 @@ fn detectable_names() -> String {
         .join(", ")
 }
 
-fn backend_name(backend: crate::family::qwen36::settings::Backend) -> &'static str {
+fn backend_name(backend: crate::family::qwen::qwen36::settings::Backend) -> &'static str {
     match backend {
-        crate::family::qwen36::settings::Backend::Mlx => "mlx",
-        crate::family::qwen36::settings::Backend::Cuda => "cuda",
+        crate::family::qwen::qwen36::settings::Backend::Mlx => "mlx",
+        crate::family::qwen::qwen36::settings::Backend::Cuda => "cuda",
     }
 }
 
@@ -569,7 +569,7 @@ fn warned_checks(report: &preflight::PreflightReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ModelServeArgs, discover, parse_args};
-    use crate::family::qwen36::settings::Q36Options;
+    use crate::family::qwen::qwen36::settings::Q36Options;
     use crate::server::config::Config;
     use std::path::{Path, PathBuf};
 
@@ -958,7 +958,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&real, dir.path().join("model.gguf")).expect("symlink");
         let discovered = discover(&args_for(dir.path())).expect("discovers");
-        assert_eq!(discovered.family, crate::family::qwen36::factory::FAMILY);
+        assert_eq!(
+            discovered.family,
+            crate::family::qwen::qwen36::factory::FAMILY
+        );
         assert_eq!(discovered.weight_format, "gguf");
     }
 

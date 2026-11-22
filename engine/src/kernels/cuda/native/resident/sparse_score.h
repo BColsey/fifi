@@ -7,7 +7,7 @@
  * over the candidate range `[sink, kv_len - recent)`, `logit = scale * (B q_lane) . z(t)` with
  * `z(t)` the stored F16 sketch cell of `sketch[h][t]` and `B q_lane` the basis projection of
  * the lane's query row. Non-candidate cells are never written. The score matches the host
- * reference `family/qwen36/sparse_reference.rs::relevance_scores` up to f32 rounding.
+ * reference `family/qwen/qwen36/sparse_reference.rs::relevance_scores` up to f32 rounding.
  *
  * The kv length is read from the device: `kv_len = *pos + 1` (the decode entry scores the step
  * that appends at `*pos`). Poison rule (as attn_prep and kv8_append): if `*pos < 0` or

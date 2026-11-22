@@ -4,7 +4,7 @@
 //! score or selection, and raises status bits 4. The selection is checked against a host ranking
 //! at the 256K-token size (65536 blocks, budget 512) with ties at the threshold, and one score and
 //! selection call of 32768 tokens equals 32768 single-token calls bit for bit. The numerics
-//! against the host indexer are in `family::flash_next::qsa::cuda_tests`.
+//! against the host indexer are in `family::qwen::flash_next::qsa::cuda_tests`.
 
 use super::{QsaIndexCall, QsaIndexer, QsaPosition, QsaScoreCall, QsaSelectCall};
 use crate::EngError;

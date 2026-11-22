@@ -1,6 +1,6 @@
 use inference_engine::{
     EngError,
-    family::nemotron35::forward::mamba::{MambaConfig, mamba_block_forward},
+    family::nemotron::nemotron35::forward::mamba::{MambaConfig, mamba_block_forward},
     tensor::{Dtype, Tensor},
 };
 

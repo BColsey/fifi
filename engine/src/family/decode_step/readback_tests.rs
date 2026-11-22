@@ -97,7 +97,7 @@ fn vocabulary_mismatch_falls_back_before_running_a_token() {
 fn the_k_row_draw_source_is_the_one_row_rule() {
     use super::readback::device_sampling_supported;
     use crate::family::{
-        qwen36::krow::{DrawSource, draw_source},
+        qwen::qwen36::krow::{DrawSource, draw_source},
         sampler::SamplingParams,
     };
     let mut every = vec![SamplingParams::greedy()];

@@ -1,5 +1,5 @@
 use inference_engine::{
-    family::nemotron35::forward::attention_block_forward,
+    family::nemotron::nemotron35::forward::attention_block_forward,
     tensor::{Dtype, Tensor},
 };
 

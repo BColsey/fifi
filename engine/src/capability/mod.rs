@@ -8,7 +8,7 @@
 //! compatibility rule: where a load-time check exists, preflight calls the
 //! same function the loader calls, so the two cannot drift apart.
 //!
-//! Evidence classes, the rule of `family::qwen36::cuda::placement` applied
+//! Evidence classes, the rule of `family::qwen::qwen36::cuda::placement` applied
 //! here too: every reported number is labeled. `Measured` was read from the
 //! machine just now (free VRAM, available RAM, file sizes). `Property`
 //! comes from a device or checkpoint descriptor. `CompiledIn` is a fact

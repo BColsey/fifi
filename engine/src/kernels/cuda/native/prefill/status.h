@@ -2,7 +2,7 @@
  * attn_prefill.h, attn_prep_chunk.h and gdn_scan_seq.h include this file instead of defining
  * their own. INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION is mask 8 (0x8) of the prefill
  * status word — a prefill chunk fault, a bound violation in any of the kernels; the family
- * book reads the word with `status_error` (family/qwen36/cuda/book.rs), which maps mask 8 to
+ * book reads the word with `status_error` (family/qwen/qwen36/cuda/book.rs), which maps mask 8 to
  * Backend "prefill_chunk" with precedence 4 > 8 > 1 > 2. The Rust mirror is
  * `crate::kernels::cuda::native::prefill::PREFILL_STATUS_BOUND_VIOLATION`, also 0x8; the
  * device bound-violation tests pin the C value against it at run time. */

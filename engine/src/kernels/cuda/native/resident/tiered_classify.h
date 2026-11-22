@@ -3,7 +3,7 @@
  * the per-kernel header of the layout in kernels/cuda/resident/mod.rs; abi_resident.h stays closed).
  * Launch-only: nothing here allocates, copies or synchronizes; a fault in queued work surfaces at the
  * next synchronize. Include after abi.h in C++. Rust mirrors the struct in
- * native/resident/tiered_classify.rs. The host oracle is family/qwen36/tiered/classify.rs
+ * native/resident/tiered_classify.rs. The host oracle is family/qwen/qwen36/tiered/classify.rs
  * (`classify_reference`), which this kernel must equal bit for bit.
  *
  * One block of 256 threads. Thread 0 walks the router's picks in rank order (id, weight) and writes, per pick i:

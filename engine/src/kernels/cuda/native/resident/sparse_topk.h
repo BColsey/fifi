@@ -5,7 +5,7 @@
  * The entry turns the relevance scores of sparse_score into the selected index list of the
  * sparse KV path, per KV head: the `top_k` largest candidate scores in `[sink, kv_len -
  * recent)` ranked by value descending with ties broken by ascending index (the radix-select
- * rule of family/qwen36/sparse_reference.rs::deterministic_top_k), followed by the sink cells
+ * rule of family/qwen/qwen36/sparse_reference.rs::deterministic_top_k), followed by the sink cells
  * `[0, sink)` and the recent window `[kv_len - recent, kv_len)`, each ascending. The head's
  * written count lands in `counts[head]`: `min(top_k, candidates) + sink + recent` indices.
  *

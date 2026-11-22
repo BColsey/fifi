@@ -1,4 +1,4 @@
-use inference_engine::family::nemotron35::{
+use inference_engine::family::nemotron::nemotron35::{
     NemotronActivation, NemotronBlockKind, NemotronTextSpec,
 };
 
@@ -431,7 +431,9 @@ fn audio_metadata_is_recorded_but_rejected_from_execution() {
 
 #[test]
 fn attention_has_explicit_no_rotation_with_reference_provenance() {
-    use inference_engine::family::nemotron35::{NEMOTRON_ROTATION_PROVENANCE, NemotronRotation};
+    use inference_engine::family::nemotron::nemotron35::{
+        NEMOTRON_ROTATION_PROVENANCE, NemotronRotation,
+    };
     let config: serde_json::Value = serde_json::from_slice(CONFIG).unwrap();
     assert!(
         config["llm_config"]
@@ -454,7 +456,9 @@ fn attention_has_explicit_no_rotation_with_reference_provenance() {
 
 #[test]
 fn key_plan_maps_pinned_text_names_to_block_roles() {
-    use inference_engine::family::nemotron35::{NemotronKeyClass as K, NemotronTensorPart as P};
+    use inference_engine::family::nemotron::nemotron35::{
+        NemotronKeyClass as K, NemotronTensorPart as P,
+    };
     let spec = NemotronTextSpec::from_config(CONFIG).unwrap();
     for (name, block, class, expert, part) in [
         (

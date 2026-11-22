@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use inference_engine::{
     EngError,
-    family::nemotron35::{
+    family::nemotron::nemotron35::{
         exec::WeightSource,
         loader::{ExpertIndex, ExpertProjection, NemotronLoader},
         runner::LoaderWeightSource,

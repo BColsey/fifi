@@ -1,0 +1,4566 @@
+//! Settings of one Q36 engine entry in the `enginesrv` config.
+//!
+//! The entry carries `id`, `family`, `model_dir`, `tokenizer_dir`, and `model` (server config) plus
+//! the `qwen36` object, which `Q36Options` reads. A key that is absent takes its default or its
+//! environment fallback. This file only reads and checks values. It opens no file and starts no
+//! thread.
+//!
+//! The dense Qwen3.8 family uses these settings on MLX and has its own pinned tokenizer
+//! bundle. Its session cap is explicit and includes its attention and DeltaNet state.
+
+use super::host::HostShape;
+use super::host_load::rotary_dim;
+use super::host_plan::{self, HostFacts, NoteValue};
+use crate::family::kv_format::KvRowShape;
+use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
+use crate::family::session::StoreLimits;
+use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
+use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+use crate::family::speculate::driver::{RepeatDrafter, Speculator};
+use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+/// Rotary dimension of the pinned model (head_dim 256 times the partial-rotary factor 0.25);
+/// the GGUF carries no config.json, and the resident-step test fixtures name the same 64.
+/// The single pinned fact: `cuda/pinned.rs` and the EXL3 pack walk alias this constant so the
+/// loader's walk and the preflight estimate cannot drift apart.
+pub(crate) const ROTARY_DIM: u32 = 64;
+
+/// Vocabulary size of the pinned `tokenizer.json` with its added tokens.
+const TOKENIZER_VOCAB_SIZE: u32 = 248_077;
+/// Positions of the default context limit of the CUDA arm. The CUDA arm sizes its default F32 cache
+/// by the limit, so it keeps 32,768 until the 8-bit cache becomes its default form (it builds the
+/// 8-bit cache when `kv_dtype` is `q8`).
+pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
+/// Positions of the default context limit of the MLX arm: 262,144. The 8-bit cache holds them in
+/// 2.85 GB (10,880 bytes per position with BF16 scales). A qualification run measured the fit, the
+/// retrieval, and the tool-call format at this limit on the 36 GB Mac Studio. The default form is
+/// the 8-bit cache, so the limit belongs to that form: an explicit `kv_dtype` of `f32` needs an
+/// explicit `context_limit` and `session_cap_bytes` too.
+pub(crate) const MLX_DEFAULT_CONTEXT_LIMIT: u32 = 262_144;
+/// The default cache cap of the MLX arm: 4 GiB admits 262,144 positions of the 8-bit form
+/// (2,852,126,720 bytes with BF16 scales, 3,019,898,880 with F32 scales) plus the DeltaNet state
+/// (65,863,680 bytes). The F32 form at 32,768 positions (1,342,177,280 bytes) fits as well.
+pub(crate) const DEFAULT_SESSION_CAP: u64 = 4 << 30;
+/// The largest chunk that the prefill plan may pick when `prefill_budget_bytes` is set. One chunk
+/// takes about 0.9 s at 290 tok/s, so a cancellation waits that long at most. The plan result sets
+/// the worker piece (`ExecutorOps::prefill_piece`). Without a plan, or when the plan admits no
+/// chunk, the piece is `NO_BUDGET_PIECE`.
+pub(crate) const DEFAULT_PREFILL_CHUNK: u32 = 256;
+/// The default chunk of a BF16 engine: 256, the same as an F32 engine. An earlier fix had pinned it
+/// to 1 (no chunked prefill) while the chunk-size dependence of the BF16 prefill was open; the
+/// serving shapes (chunk 256 and the tails after a 256 head) measured inside the range of mlx-lm,
+/// and the pin cost about 14x on prompt speed. The constant stays separate so that a re-pin is a
+/// one-line change. An explicit `prefill_chunk` in the config always wins.
+pub(crate) const BF16_DEFAULT_PREFILL_CHUNK: u32 = 256;
+/// The fallback worker piece for an executor that plans no chunk: no budget, or a plan that admits
+/// none. The executor then runs one token per step.
+/// The worker checks the cancel flag only between pieces. At about 62 tok/s, a piece of 16 waits
+/// about 0.26 s, and a piece of 256 would wait about 4.1 s.
+pub(crate) const NO_BUDGET_PIECE: u32 = 16;
+/// The largest accepted prefill chunk. It matches the decoder's `MAX_CHUNK_ROWS`; 2048 is opt-in
+/// (the default stays `DEFAULT_PREFILL_CHUNK`). On the M4 Max it shortened a 49K prefill by 4%.
+pub(crate) const MAX_PREFILL_CHUNK: u32 = 2048;
+/// The CUDA arm cap of M_sess: the largest chunk the prefill ladder admits, independent of the MLX
+/// prefill_chunk ceiling above.
+pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;
+
+/// SHA-256 of the pinned Qwen3.6 files (`engine/testdata/mac-phase0a.json`).
+const TOKENIZER_JSON_SHA256: &str =
+    "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4";
+const TOKENIZER_CONFIG_SHA256: &str =
+    "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182";
+const CHAT_TEMPLATE_SHA256: &str =
+    "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
+const GENERATION_CONFIG_SHA256: &str =
+    "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
+
+/// The backend a build serves Q36 from: MLX on Apple Silicon, CUDA on Linux with `native-cuda`; a
+/// build with neither keeps the MLX reading, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Mlx,
+    Cuda,
+}
+
+/// The prefix-store limits of a `prefix_reuse` engine: two pinned roots and six LRU entries. An
+/// engine without the flag keeps the one-entry store.
+const PREFIX_STORE_LIMITS: StoreLimits = StoreLimits {
+    roots: 2,
+    entries: 6,
+};
+
+/// The prefix-store limits of an engine with the given process-wide `prefix_reuse` flag (the one
+/// mapping the MLX rules build on, `start::rules_of`): the worker plans intermediate save points
+/// only when the store holds at least two LRU entries, and the engine's ready note reports that
+/// same limit from the built executor. The DEFAULT for every spec stays six entries (an entry's
+/// real cost grows with its depth - a snapshot holds a zero-copy share of the attention buffers and
+/// owns a depth-sized copy after the next append, while its own charge is the DeltaNet state only -
+/// so a budget-derived default waits for the replay measurement); `entries_override` is the
+/// operator's exact opt-in count, honored for every spec that reaches the store.
+pub(crate) fn prefix_store_limits_of(
+    prefix_reuse: bool,
+    entries_override: Option<usize>,
+) -> StoreLimits {
+    if !prefix_reuse {
+        return StoreLimits::default();
+    }
+    StoreLimits {
+        roots: PREFIX_STORE_LIMITS.roots,
+        entries: entries_override.unwrap_or(PREFIX_STORE_LIMITS.entries),
+    }
+}
+
+/// The `qwen36` object of an engine entry. Every member is optional.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Q36Options {
+    /// Optional content pin for the selected CUDA GGUF file: exactly 64 hex digits.
+    pub(crate) gguf_sha256: Option<String>,
+    /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
+    pub(crate) cache_limit_bytes: Option<u64>,
+    /// The first position that the engine refuses, from 2. The default is 262,144 on the MLX arm
+    /// (the 8-bit cache) and 32,768 on the CUDA arm. The executor rejects a limit whose cache does
+    /// not fit `session_cap_bytes`.
+    pub(crate) context_limit: Option<u32>,
+    /// The bytes of session state that the engine admits. Q36 defaults to 4 GiB.
+    /// The dense family requires an explicit cap covering its configured context.
+    pub(crate) session_cap_bytes: Option<u64>,
+    /// The prompt tokens per `prefill` call, from 1 to 1024. The default is 256 for an F32 engine and
+    /// for a BF16 engine (`BF16_DEFAULT_PREFILL_CHUNK`). It is the largest
+    /// chunk that the planner may choose; the worker piece is the planned chunk, or 16
+    /// (`NO_BUDGET_PIECE`) when no chunk is planned: no budget, or a budget that admits none.
+    /// CUDA: ignored with one start line until the chunked CUDA prefill accepts it as the cap of
+    /// `M_sess`.
+    pub(crate) prefill_chunk: Option<u32>,
+    /// The engine memory budget in bytes for the admission of the chunked prefill, from 1. Absent
+    /// means off: every prompt token is one step. The executor picks the largest chunk of at most
+    /// `prefill_chunk` rows whose workspace fits the budget after the weights and the reserve.
+    pub(crate) prefill_budget_bytes: Option<u64>,
+    /// The bytes that the planner keeps free for the session state, the MLX cache, and the
+    /// pressure margin. Absent with `prefill_budget_bytes` it is derived (see `reserve_plan`) and refused
+    /// without it. A value of 0 is allowed and admits a larger chunk than the memory plan allows.
+    pub(crate) prefill_session_reserve_bytes: Option<u64>,
+    /// The dtype of the decode activations: `f32` or `bf16`. The default is `bf16`. It also picks
+    /// the scale storage: `bf16` keeps the stored BF16 scales and biases, `f32` keeps the scales
+    /// widened to F32, and the decoder constructor refuses any other pairing.
+    pub(crate) activation_dtype: Option<String>,
+    /// The form of the attention KV cache: `f32`, the pair of F32 capacity buffers, or `q8`, the
+    /// 8-bit affine codes with scales and biases of the activation dtype. The default is `q8` on
+    /// the MLX arm, where the 8-bit cache passed its quality gate, and `f32` on the CUDA arm until
+    /// it passes there; the CUDA arm builds the 8-bit cache (Int8G32) when the value is `q8`. `f32`
+    /// stays the control on the MLX arm.
+    pub(crate) kv_dtype: Option<String>,
+    /// Opt-in host-backed CUDA Q8 KV budget, including pinned staging and owned metadata.
+    pub(crate) kv_offload_host_bytes: Option<u64>,
+    /// Graph capture of the CUDA arm (default true on the CUDA arm for every weights format;
+    /// `"capture": false` rolls back to the eager step); the MLX arm ignores it.
+    pub(crate) capture: Option<bool>,
+    /// `mlx_compile` on the Q36 DeltaNet and device-routed MoE decode blocks: the engine traces
+    /// both blocks once after the weights load and runs every one-token decode step through the
+    /// compiled closures, which gains 9.6 to 13.0 percent of decode speed (measured at depths
+    /// 30,000 to 16) and moves F32 logits by at most 5e-5 (compile is deterministic run to run but
+    /// not bit-identical to the uncompiled path). The default is `false`; the shipped Mac config
+    /// sets `true`. The MLX arm reads it; the CUDA arm records it as ignored.
+    pub(crate) compile: Option<bool>,
+    /// MLX-only distinct compiled programs per adapter, positive and addressable. Default 8.
+    /// Raising this budget is opt-in and does not enable compilation.
+    pub(crate) compile_program_limit: Option<usize>,
+    /// Concurrent MLX sessions, from 1 to 8. The default is 1; larger windows require compile.
+    pub(crate) max_seqs: Option<usize>,
+    /// The exact LRU entry count of the prefix store of a `prefix_reuse` engine, as the operator's
+    /// OPT-IN override. The default for every spec stays the fixed six - an entry's real cost grows
+    /// with its depth (a snapshot holds a share of the attention buffers and owns a depth-sized
+    /// copy after the next append; its own charge is the DeltaNet state only), so a budget-derived
+    /// default waits for the replay measurement. Validated from 1 to 4096 at parse; ignored with a
+    /// start line when `prefix_reuse` is off, and by the CUDA arm (an MLX key).
+    pub(crate) prefix_store_entries: Option<usize>,
+    /// The tiered expert mode of the CUDA arm. Absent means off: the routed experts are all
+    /// resident on the device, as before. The MLX arm refuses the member.
+    pub(crate) tiered: Option<TieredOptions>,
+    /// The banked EXL3 expert mode of the CUDA arm: `slots` experts per layer stay on the device
+    /// and every expert's packed bytes stay in a pageable host store for miss copies. Absent means
+    /// off. An EXL3-only CUDA member. Measured on a 6 GB laptop GPU over PCIe Gen4 (2.08bpw):
+    /// 40.5-43.8 tok/s served decode. The ngram-drafted `draft_verify: krow` over the bank measured
+    /// net-negative in the same state (31.9/21.7 tok/s vs the 41.7/39.0 baseline, and 10.8/8.1 on
+    /// a Gen1 link) because every extra drafted expert read misses the bank and pays the PCIe
+    /// refill; revisit only with a real draft head, which reads resident experts it already
+    /// picked.
+    pub(crate) expert_bank: Option<ExpertBankOptions>,
+    /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
+    /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.
+    pub(crate) weight_format: Option<String>,
+    /// The CUDA devices this engine spans, as explicit ordinals in strictly ascending order.
+    /// Absent means `[0]`: the first device only, as before. A CUDA member; the MLX arm
+    /// refuses it. More than one device is refused with `weight_format` `exl3`, `tiered`,
+    /// `kv_offload_host_bytes`, and `capture` (the resolved flag: unset means the CUDA arm's
+    /// default, on), each by name.
+    pub(crate) cuda_devices: Option<Vec<u32>>,
+    /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. The
+    /// CUDA arm (`weight_format` `exl3`) and the MLX resident arm (`gguf`) take `ngram`.
+    pub(crate) draft_mode: Option<String>,
+    /// The most drafts of one verify window, from 1 to 16. The default is 2.
+    pub(crate) num_draft_tokens: Option<u32>,
+    /// Shorten each window from the calibrated chance that its drafts are accepted. Default false.
+    /// The calibration reads the MTP head's confidence, so `ngram` ignores it.
+    pub(crate) dynamic_draft_tokens: Option<bool>,
+    /// The running product of acceptance chances below which a draft is dropped, above 0 and
+    /// below 1. The default is 0.4. Used with `dynamic_draft_tokens`.
+    pub(crate) draft_confidence: Option<f64>,
+    /// The most rows of one verify window, the pending token included, from 2 to 64. The default
+    /// is 8. An enabled `draft_mode` refuses more than 8 (`QWEN36_MAX_WINDOW_ROWS`); 8 is a cap,
+    /// not a D1 qualification.
+    pub(crate) draft_max_rows: Option<u32>,
+    /// When the context repeats an earlier passage for this many tokens, draft that many tokens of
+    /// it in one window. 0 (the default) is off; otherwise from `ngram_match_min` to 256.
+    pub(crate) hybrid_draft_tokens: Option<u32>,
+    /// The shortest repeated tail that an n-gram draft needs, from 1 to 64. The default is 2.
+    pub(crate) ngram_match_min: Option<u32>,
+    /// The directory of the pack that holds the MTP head. Required by `draft_mode` `mtp`.
+    pub(crate) mtp_model_dir: Option<PathBuf>,
+    /// How a verify window is rolled back after a partial accept: `host` (the default: the whole
+    /// committed state is copied to the host before the window and written back, then the kept rows
+    /// are fed again) or `device` (per-row copies of the DeltaNet state in device memory, no host
+    /// copy, no replay). `device` needs an enabled `draft_mode`; its slots take up to 440 MiB at 8
+    /// rows, and start is refused when they cannot be allocated.
+    pub(crate) draft_rollback: Option<String>,
+    /// How a verify window runs its rows: `eager` (the default: the one-row step once per row) or
+    /// `krow` (one K-row window; a captured graph per window length on a resident engine, the
+    /// uncaptured body with host-mapped slot picks on a banked engine). `krow` needs
+    /// `draft_rollback` `device` and the EXL3 pack.
+    pub(crate) draft_verify: Option<String>,
+    /// The on-disk prefix cache: saved prefixes that survive a restart and an
+    /// eviction from pinned host memory. Absent means the default (see `kv_disk::KV_CACHE_DEFAULT_ON`).
+    pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheOptions>,
+}
+
+fn kv_cache_settings(
+    options: &Q36Options,
+    devices: &[usize],
+) -> Result<Option<crate::family::kv_disk::KvCacheSettings>, EngError> {
+    let Some(cache) = &options.kv_cache else {
+        return Ok(None);
+    };
+    if devices.len() > 1 {
+        return Err(bad(
+            "kv_cache is refused with more than one CUDA device: the card path keeps no disk tier"
+                .into(),
+        ));
+    }
+    cache.checked().map(Some).map_err(bad)
+}
+
+/// How a verify window runs its rows (`draft_verify`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum VerifyMode {
+    /// The eager window: one one-row step per row. The reference of the K-row path.
+    #[default]
+    Eager,
+    /// One K-row window (`family/qwen/qwen36/krow.rs`).
+    Krow,
+}
+
+/// The config text of `draft_verify`.
+pub(crate) fn verify_mode_name(mode: VerifyMode) -> &'static str {
+    match mode {
+        VerifyMode::Eager => "eager",
+        VerifyMode::Krow => "krow",
+    }
+}
+
+/// Parses `draft_verify` by exact match; absent is `eager`. `krow` needs the device rollback (its
+/// per-row states are written straight into the rollback slots) and the EXL3 pack (the only
+/// layout with a K-row plan). The window cap of 8 rows is `draft_max_rows`, already enforced for
+/// an enabled Qwen3.6 speculation.
+fn verify_of(
+    options: &Q36Options,
+    rollback: RollbackMode,
+    weights: WeightFormat,
+) -> Result<VerifyMode, EngError> {
+    let mode = match options.draft_verify.as_deref() {
+        None | Some("eager") => VerifyMode::Eager,
+        Some("krow") => VerifyMode::Krow,
+        Some(other) => {
+            return Err(bad(format!(
+                "draft_verify must be eager or krow, got {other:?}"
+            )));
+        }
+    };
+    if mode == VerifyMode::Krow {
+        if rollback != RollbackMode::Device {
+            return Err(bad(
+                "draft_verify krow needs draft_rollback device; set draft_rollback to device or \
+                 draft_verify to eager"
+                    .into(),
+            ));
+        }
+        if weights != WeightFormat::Exl3 {
+            return Err(bad("draft_verify krow needs weight_format exl3".into()));
+        }
+    }
+    Ok(mode)
+}
+
+/// How a verify window is rolled back (`draft_rollback`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RollbackMode {
+    /// Copy the committed state to the host, restore it, replay the kept rows.
+    #[default]
+    Host,
+    /// Device-resident per-row slots (`family/qwen/qwen36/rollback.rs`).
+    Device,
+}
+
+/// The config text of `draft_rollback`.
+pub(crate) fn rollback_mode_name(mode: RollbackMode) -> &'static str {
+    match mode {
+        RollbackMode::Host => "host",
+        RollbackMode::Device => "device",
+    }
+}
+
+/// Parses `draft_rollback` by exact match; absent is `host`. `device` needs an enabled speculative
+/// mode (the CUDA arm and an EXL3 pack are already required by that) and no host-paged KV, whose
+/// cache has no resident plane to truncate.
+fn rollback_of(
+    options: &Q36Options,
+    speculation: &SpecConfig,
+    kv_offload_host_bytes: Option<u64>,
+    backend: Backend,
+) -> Result<RollbackMode, EngError> {
+    let mode = match options.draft_rollback.as_deref() {
+        None | Some("host") => RollbackMode::Host,
+        Some("device") => RollbackMode::Device,
+        Some(other) => {
+            return Err(bad(format!(
+                "draft_rollback must be host or device, got {other:?}"
+            )));
+        }
+    };
+    if mode == RollbackMode::Device {
+        if backend != Backend::Cuda {
+            return Err(bad(
+                "draft_rollback device is CUDA-only: the MLX arm rolls back with a shared-handle \
+                 snapshot"
+                    .into(),
+            ));
+        }
+        if !speculation.enabled() {
+            return Err(bad("draft_rollback device needs draft_mode ngram".into()));
+        }
+        if kv_offload_host_bytes.is_some() {
+            return Err(bad(
+                "draft_rollback device is refused with kv_offload_host_bytes: the host-paged KV has no \
+                 resident plane to truncate"
+                    .into(),
+            ));
+        }
+    }
+    Ok(mode)
+}
+
+impl Q36Options {
+    /// The speculation members, as `SpecConfig::new` reads them.
+    fn spec_options(&self) -> SpecOptions {
+        SpecOptions {
+            draft_mode: self.draft_mode.clone(),
+            num_draft_tokens: self.num_draft_tokens,
+            dynamic_draft_tokens: self.dynamic_draft_tokens,
+            draft_confidence: self.draft_confidence,
+            draft_max_rows: self.draft_max_rows,
+            hybrid_draft_tokens: self.hybrid_draft_tokens,
+            ngram_match_min: self.ngram_match_min,
+            mtp_model_dir: self.mtp_model_dir.clone(),
+        }
+    }
+}
+
+/// The checkpoint format of one engine entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WeightFormat {
+    /// The pinned GGUF file inside `model_dir`.
+    #[default]
+    Gguf,
+    /// A stock EXL3 pack: the safetensors shards and `config.json` inside `model_dir`.
+    Exl3,
+}
+
+pub(crate) fn weight_format_name(format: WeightFormat) -> &'static str {
+    match format {
+        WeightFormat::Gguf => "gguf",
+        WeightFormat::Exl3 => "exl3",
+    }
+}
+
+/// Parses the `weight_format` member by exact match; absent is the GGUF default. Anything else,
+/// a different case or padding included, is refused by name.
+pub(crate) fn weight_format_of(text: Option<&str>) -> Result<WeightFormat, EngError> {
+    match text {
+        None | Some("gguf") => Ok(WeightFormat::Gguf),
+        Some("exl3") => Ok(WeightFormat::Exl3),
+        Some(other) => Err(bad(format!(
+            "weight_format must be gguf or exl3, got {other:?}"
+        ))),
+    }
+}
+
+/// Refuses the combinations of an EXL3 entry that have no implementation: the MLX arm has no
+/// EXL3 reader, and the tiered and host-paged KV modes read GGUF blocks. Graph capture is allowed:
+/// a captured EXL3 step reads the picked experts on the device.
+fn check_weight_format(
+    format: WeightFormat,
+    options: &Q36Options,
+    backend: Backend,
+) -> Result<(), EngError> {
+    if format != WeightFormat::Exl3 {
+        return Ok(());
+    }
+    if backend != Backend::Cuda {
+        return Err(bad("weight_format exl3 is CUDA-only".into()));
+    }
+    for (set, key) in [
+        (options.tiered.is_some(), "tiered"),
+        (
+            options.kv_offload_host_bytes.is_some(),
+            "kv_offload_host_bytes",
+        ),
+    ] {
+        if set {
+            return Err(bad(format!("weight_format exl3 does not support {key}")));
+        }
+    }
+    Ok(())
+}
+
+/// The most devices one `cuda_devices` list may name. The CUDA backend
+/// enforces the same bound against the visible devices at engine start.
+pub(crate) const MAX_CUDA_DEVICES: usize = 4;
+
+/// The checked `cuda_devices` list: `[0]` when the member is absent. The list
+/// is a shape contract only — that the ordinals are visible devices is the
+/// CUDA start's probe, which names both numbers. More than one device
+/// refuses the combinations the multi-device step does not run, each by name:
+/// the EXL3 pack (its shard slicing is unproven), tiered experts and
+/// host-paged KV (both read whole GGUF blocks on one device), and graph
+/// capture (the capture window owns one stream).
+fn cuda_devices_of(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<Vec<usize>, EngError> {
+    let Some(list) = &options.cuda_devices else {
+        return Ok(vec![0]);
+    };
+    if backend != Backend::Cuda {
+        return Err(bad("cuda_devices is CUDA-only".into()));
+    }
+    if list.is_empty() || list.len() > MAX_CUDA_DEVICES {
+        return Err(bad(format!(
+            "cuda_devices must name between 1 and {MAX_CUDA_DEVICES} devices, found {}",
+            list.len()
+        )));
+    }
+    if list.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(bad(format!(
+            "cuda_devices must be strictly ascending without duplicates, found {list:?}"
+        )));
+    }
+    if list.len() > 1 {
+        for (set, key) in [
+            (weights == WeightFormat::Exl3, "weight_format exl3"),
+            (options.tiered.is_some(), "tiered"),
+            (options.expert_bank.is_some(), "expert_bank"),
+            (
+                options.kv_offload_host_bytes.is_some(),
+                "kv_offload_host_bytes",
+            ),
+            (
+                options.capture.unwrap_or(backend == Backend::Cuda),
+                "capture",
+            ),
+        ] {
+            if set {
+                return Err(bad(format!(
+                    "cuda_devices with more than one device does not support {key}"
+                )));
+            }
+        }
+    }
+    Ok(list.iter().map(|&device| device as usize).collect())
+}
+
+/// The most rows a Qwen3.6 speculative verify window may have, the pending token included.
+///
+/// This is a CAP, not a qualification, and a precaution for a future K-row verify path. Today's
+/// eager window feeds every row through the one-row `run_token`, so it uses no multi-row
+/// projection kernel at any row count. The EXL3 projections switch from the rows kernel to the
+/// unsplit kernel at 9 or more rows (`exl3_linear`), and no test shows that path bitwise equal to
+/// a one-row step, so the limit keeps a K-row path from reaching it unexamined. Rows 2 to 8 are
+/// accepted by the config; whether they are D1-qualified is decided by the device tests of
+/// `speculate::d1_oracle`, which have not run on a device yet. The limit belongs to this family:
+/// the generic `SpecConfig` range (2 to 64), prefill and chunked feed are unchanged.
+pub(crate) const QWEN36_MAX_WINDOW_ROWS: usize = 8;
+
+/// Refuses an enabled speculative configuration whose windows could exceed
+/// [`QWEN36_MAX_WINDOW_ROWS`]. A disabled entry feeds no window and keeps its members unchecked
+/// beyond the generic range, so an existing config with `draft_mode` off still loads.
+pub(crate) fn check_window_rows(config: &SpecConfig) -> Result<(), EngError> {
+    if config.enabled() && config.max_rows > QWEN36_MAX_WINDOW_ROWS {
+        return Err(bad(format!(
+            "draft_max_rows {} exceeds {QWEN36_MAX_WINDOW_ROWS}: Qwen3.6 verify windows are capped at \
+             {QWEN36_MAX_WINDOW_ROWS} rows. The cap is reserved for the K-row verify path (the EXL3 \
+             projections leave the rows kernel at 9 rows); the current window feeds one row at a \
+             time and does not use it. The cap is not a qualification of {QWEN36_MAX_WINDOW_ROWS}-row \
+             windows",
+            config.max_rows
+        )));
+    }
+    Ok(())
+}
+
+/// The speculative step a config asks for. Free of any device so that the refusals are tested on
+/// the host. The settings parser refuses a window of more than 8 rows already; a step built from a
+/// hand-made config meets the same cap here, before the mode is looked at. The CUDA step's
+/// `set_speculation` is this function plus an assignment.
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn speculator_of(
+    config: &SpecConfig,
+) -> Result<Option<Speculator<RepeatDrafter>>, EngError> {
+    check_window_rows(config)?;
+    match config.mode {
+        DraftMode::Disabled => Ok(None),
+        DraftMode::Ngram => Ok(Some(Speculator::new(
+            RepeatDrafter::new(
+                (config.ngram_match_min, config.hybrid_tokens),
+                (config.window_drafts(), config.hybrid_drafts()),
+            ),
+            config.max_rows - 1,
+        ))),
+        DraftMode::Mtp => Err(EngError::BadRequest(
+            "draft_mode mtp has no draft step yet".to_owned(),
+        )),
+    }
+}
+
+/// The speculation members. An enabled mode needs an arm that has a verify window: the CUDA arm
+/// with an EXL3 pack or the MLX resident arm with GGUF blocks.
+fn speculation_of(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<SpecConfig, EngError> {
+    let config = SpecConfig::new(&options.spec_options())?;
+    if config.enabled()
+        && !matches!(
+            (backend, weights),
+            (Backend::Cuda, WeightFormat::Exl3) | (Backend::Mlx, WeightFormat::Gguf)
+        )
+    {
+        return Err(bad(
+            "draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the \
+             MLX arm with gguf"
+                .into(),
+        ));
+    }
+    // The MTP head has no draft step yet: accepting the mode would promise a speed the engine
+    // does not have. The change that adds the step replaces this refusal.
+    if config.mode == DraftMode::Mtp {
+        return Err(bad("draft_mode mtp has no draft step yet".into()));
+    }
+    check_window_rows(&config)?;
+    Ok(config)
+}
+
+/// The `tiered` member of the `qwen36` object. The CPU tier maps the model file read-only for the whole
+/// serve, so the operator's contract is that the model file must not change while it is served: no
+/// truncation (the next touch of a lost page faults with SIGBUS) and no in-place overwrite (the CPU tier
+/// would read the new bytes without any fault).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TieredOptions {
+    /// An exact count of resident experts or "auto" for the largest count that fits.
+    pub(crate) slots: Option<SlotRequest>,
+    /// CPU worker threads, from 1 to 8. The default is 6.
+    pub(crate) threads: Option<u32>,
+    /// The longest wait for one layer's CPU experts, in milliseconds, from 1 to 600,000. The
+    /// default is 10,000.
+    pub(crate) timeout_ms: Option<u32>,
+    /// Fill every layer's bank with its lowest-numbered experts before the first token. The
+    /// default is false: the banks start empty and policy P fills them.
+    pub(crate) preload: Option<bool>,
+    /// Bank swaps per token, in thousandths, from 0 to 8000. The default 250 buys one
+    /// promotion per four tokens model-wide — sized for the blocking fill path.
+    pub(crate) swaps_milli: Option<u32>,
+}
+
+/// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
+/// resident when the rest live in a host store. `slots` may name the exact count (8 to 256,
+/// from the 8 picks of one token) or stay absent for "the most that fit"; `mode` is `auto`
+/// (bank only when the resident load does not fit) or `on` (always bank), `auto` by default.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpertBankOptions {
+    pub(crate) slots: Option<u32>,
+    pub(crate) mode: Option<String>,
+    /// How many of the layer's hottest experts stay pinned in their slots instead of
+    /// competing under LRU; 0 (the default) is plain LRU.
+    pub(crate) sticky: Option<u32>,
+}
+
+pub(crate) use crate::family::slot_request::SlotRequest;
+
+/// Whether the banked load runs only when the resident load does not fit (`Auto`) or always
+/// (`On`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BankMode {
+    Auto,
+    On,
+}
+
+/// The checked `expert_bank` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertBankSettings {
+    pub(crate) slots: SlotRequest,
+    pub(crate) mode: BankMode,
+    pub(crate) sticky: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TieredSettings {
+    pub(crate) slots: SlotRequest,
+    pub(crate) threads: usize,
+    pub(crate) timeout_ms: u32,
+    pub(crate) preload: bool,
+    pub(crate) swaps_milli: u32,
+}
+
+/// The default CPU worker threads of the tiered member.
+const TIERED_DEFAULT_THREADS: u32 = 6;
+/// The default wait for one layer's CPU experts, in milliseconds.
+const TIERED_DEFAULT_TIMEOUT_MS: u32 = 10_000;
+
+impl TieredSettings {
+    /// The member a config that names `"tiered": {"slots": "auto"}` and nothing else
+    /// resolves to: the automatic lower rung of a start the card cannot carry.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        allow(dead_code, reason = "the CUDA start's card-short rung is the caller")
+    )]
+    pub(crate) const AUTO: Self = Self {
+        slots: SlotRequest::Fit,
+        threads: TIERED_DEFAULT_THREADS as usize,
+        timeout_ms: TIERED_DEFAULT_TIMEOUT_MS,
+        swaps_milli: 250,
+        preload: false,
+    };
+}
+
+/// The environment fallbacks, read by the caller so that this file stays pure.
+#[derive(Debug, Default)]
+pub(crate) struct Q36Env {
+    /// `Q36_CACHE_LIMIT`, a byte count.
+    pub(crate) cache_limit: Option<String>,
+    /// `Q36_KV_GEOMETRIC`, `1` arming the geometric KV capacity law (the raw value;
+    /// `resident::state::geometric_growth` remains the parse authority).
+    pub(crate) kv_geometric: Option<String>,
+    /// `Q36_SPEC_STEP_WINDOW`, `2` arming the checkpoint-window verify path (the raw
+    /// value; `resident::executor`'s one-shot readers remain the parse authority).
+    pub(crate) spec_step_window: Option<String>,
+    /// The host memory and the model's shard bytes, for the MLX values that no member and no
+    /// variable sets (`host_plan`). `None` keeps every such value required, as before.
+    pub(crate) host: Option<HostFacts>,
+    /// The routed expert bytes of the checkpoint, for a Mac start whose resident model does not
+    /// fit the host and streams its experts instead.
+    pub(crate) experts: Option<host_plan::ExpertFacts>,
+    /// `FIFI_Q36_MLX_DISK_EXPERTS`: automatic unless set to `0` or `1`.
+    pub(crate) disk_experts: DiskExperts,
+}
+
+impl Q36Env {
+    /// The environment of this process and the host it runs on: the three allowlisted variables
+    /// and, for the model under `model_dir`, the facts the host-derived defaults read. The one
+    /// constructor every start, preflight and effective-configuration view calls, so they resolve
+    /// the same settings.
+    pub(crate) fn from_process(model_dir: &Path) -> Self {
+        Self {
+            cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+            kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+            spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
+            host: HostFacts::probe(model_dir),
+            experts: host_plan::expert_facts(model_dir),
+            disk_experts: DiskExperts::of(std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").as_deref())
+                .0,
+        }
+    }
+}
+
+/// The checkpoint-window verify path (`Q36_SPEC_STEP_WINDOW=2`) commits at the NEXT
+/// driver cycle, and under the geometric KV law (`Q36_KV_GEOMETRIC=1`) the interleaved
+/// plain rows grow the shared caches before the commit fires, so the deferred commit's
+/// restore adopts the checkpoint's frozen capacities - an extent no reserve taken at the
+/// window can bound (measured on the Mac: a commit at live position 257 adopted 524,288
+/// bytes with 281,616 available). Engine open refuses the combination until the
+/// deferred commit is fixed; each variable alone still opens. The armed conditions
+/// mirror the one-shot readers in the resident modules (`Some("1")`, `Some("2")`).
+fn geometric_checkpoint_window(env: &Q36Env) -> Result<(), EngError> {
+    if env.kv_geometric.as_deref() == Some("1") && env.spec_step_window.as_deref() == Some("2") {
+        return Err(bad(
+            "Q36_KV_GEOMETRIC=1 with Q36_SPEC_STEP_WINDOW=2 is not supported: \
+             the checkpoint-window commit is not yet supported under the geometric law"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The dtype of the Q36 decode activations: the hidden state between blocks, the inputs of the
+/// quantized matmuls, and the converted layer norms. `bf16` is the serving default; `f32` is the
+/// qualification control. Scale storage follows the same setting, so the two are one lever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Activation {
+    F32,
+    Bf16,
+}
+
+pub(crate) fn activation_name(activation: Activation) -> &'static str {
+    match activation {
+        Activation::F32 => "f32",
+        Activation::Bf16 => "bf16",
+    }
+}
+
+impl Activation {
+    /// The resident dtype of this activation: the value that `Consts::act` holds and that the
+    /// kernels take as operands.
+    pub(crate) fn dtype(self) -> Dtype {
+        match self {
+            Activation::F32 => Dtype::F32,
+            Activation::Bf16 => Dtype::Bf16,
+        }
+    }
+
+    /// The activation whose resident dtype is `dtype`, the inverse of `dtype`: the resident state
+    /// reads the activation back from `Consts::act` when it charges the cache. Any other dtype is
+    /// `None`.
+    pub(crate) fn of_dtype(dtype: Dtype) -> Option<Self> {
+        match dtype {
+            Dtype::F32 => Some(Self::F32),
+            Dtype::Bf16 => Some(Self::Bf16),
+            _ => None,
+        }
+    }
+}
+
+/// The group size of the Q8 cache form, along the head dimension: 64 lanes share one scale and one
+/// bias. `head_dim` must be a multiple of this; the decoder constructor refuses a Q8 engine whose
+/// head dimension is not. The one definition: the byte charge below, and the quantize, the append,
+/// and the attention of the Q8 form, all read it.
+pub(crate) const Q8_GROUP: u32 = 64;
+
+/// The bits of the Q8 cache form: 8-bit affine codes, four per U32 word. The code width also sits
+/// in the shapes of the cache buffers (`attn.rs` divides the head dimension by 4) and in the byte
+/// charge of `kv_growth_per_position` (one byte per code), so a change of this constant needs those
+/// places and the portable check of `quantize_rows`.
+pub(crate) const Q8_BITS: u32 = 8;
+
+/// Parses the `Q36_KV_GEOMETRIC` value: absent or `0` is the quantum law (false), `1`
+/// is the geometric law (true), anything else is an error naming the value. Pure, so a
+/// host test pins every arm; `state::geometric_growth` applies it once per process.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn parse_kv_geometric(
+    value: Result<String, std::env::VarError>,
+) -> Result<bool, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(text) if text == "0" => Ok(false),
+        Ok(text) if text == "1" => Ok(true),
+        Ok(text) => Err(format!("Q36_KV_GEOMETRIC must be 0 or 1, got {text:?}")),
+        Err(error) => Err(format!("Q36_KV_GEOMETRIC is not valid text: {error}")),
+    }
+}
+
+/// The LOGICAL bytes that one more position adds to the cache of ONE attention layer, from the
+/// cache form and the activation dtype — the one byte authority: `attn::growth_bytes` (which
+/// `state::kv_growth_bytes` calls) and `cache_growth_per_position` reach it.
+///
+/// - `F32`: keys and values `[1, KVH, 1, D]` F32, `KVH * D * 2 * 4` bytes. The real model
+///   (KVH 2, D 256) adds 4,096 bytes per layer and position and 40,960 over its 10 attention
+///   layers.
+/// - `Q8`: per side (keys, values) codes `[1, KVH, 1, D/4]` U32 of `KVH * D` bytes, plus scales
+///   and biases `[1, KVH, 1, D/64]` of the ACTIVATION dtype, `2 * KVH * (D/64) * scale_bytes`
+///   bytes per side. The real model adds 1,088 bytes per layer and position at BF16 scales
+///   (10,880 over the 10 layers) and 1,152 at F32 scales (11,520).
+///
+/// A Q8 form whose `head_dim` is not a multiple of `Q8_GROUP` (64) is `BadRequest`. An overflow
+/// is `MemoryPlan`.
+pub(crate) fn kv_growth_per_position(
+    kv_heads: u32,
+    head_dim: u32,
+    kv: KvDtype,
+    act: Activation,
+) -> Result<u64, EngError> {
+    if kv == KvDtype::Q8 && !head_dim.is_multiple_of(Q8_GROUP) {
+        return Err(bad(format!(
+            "kv_dtype q8 needs a head_dim that is a multiple of {Q8_GROUP}, got {head_dim}"
+        )));
+    }
+    let bytes = kv
+        .format(act)
+        .layer_position_bytes(KvRowShape {
+            heads_kv: u64::from(kv_heads),
+            head_dim: u64::from(head_dim),
+        })
+        .map_err(|_| EngError::MemoryPlan("attention growth bytes overflow u64".into()))?;
+    Ok(bytes)
+}
+
+/// Parses the `activation_dtype` member: `f32` or `bf16`. Any other text is refused in the style of
+/// the numeric members.
+pub(crate) fn parse_activation(text: &str) -> Result<Activation, EngError> {
+    match text {
+        "f32" => Ok(Activation::F32),
+        "bf16" => Ok(Activation::Bf16),
+        other => Err(bad(format!(
+            "activation_dtype must be f32 or bf16, got {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn activation_of(text: Option<&str>) -> Result<Activation, EngError> {
+    match text {
+        None => Ok(Activation::Bf16),
+        Some(text) => parse_activation(text),
+    }
+}
+
+/// The scale-pairing rule: the stored scales and biases (counted by
+/// `ResidentWeights::scale_census`) must all have the dtype that matches `activation`, because the
+/// setting is one lever. A `bf16` engine over F32 scales promotes every `qmm` back to F32, and an
+/// `f32` engine over BF16 scales makes MLX cast the scales on every call (about 31.6 tok/s).
+/// Returns the refusal text of a mismatched pair.
+pub(crate) fn scale_pairing_error(
+    weights: u64,
+    f32_parts: u64,
+    bf16_parts: u64,
+    other_parts: u64,
+    activation: Activation,
+) -> Option<String> {
+    let (name, scale_dtype, wrong) = match activation {
+        Activation::F32 => ("f32", "F32", bf16_parts + other_parts),
+        Activation::Bf16 => ("bf16", "BF16", f32_parts + other_parts),
+    };
+    (wrong > 0).then(|| {
+        format!(
+            "activation_dtype {name} needs {scale_dtype} scales and biases; the census holds \
+             {weights} packed weights with {f32_parts} F32, {bf16_parts} BF16, and {other_parts} other parts"
+        )
+    })
+}
+
+/// The form of the attention KV cache of one engine: `F32` keeps the pair of F32 capacity buffers
+/// `[1, KVH, cap, D]` (4,096 bytes per layer and position on the real model, 40,960 over its 10
+/// attention layers); `Q8` keeps the 8-bit affine codes `[1, KVH, cap, D/4]` beside scales and
+/// biases `[1, KVH, cap, D/64]` of the ACTIVATION dtype (1,088 bytes per layer and position at BF16
+/// scales, 1,152 at F32 scales; 10,880 and 11,520 over the 10 attention layers). `F32` is the
+/// default and the control that the quality gate of the 8-bit form compares against; the shipped
+/// default flips to `Q8` only after that gate passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KvDtype {
+    /// The F32 capacity buffers, the control.
+    F32,
+    /// The BF16 capacity buffers: the F32 path's shapes at half storage (KVH 2 x D 256 over
+    /// the 10 full-attention layers = ~20 KiB per position vs 40 for F32), appended with a
+    /// cast and read natively behind the adapter's existing `allow_bf16` - the same KV form
+    /// mlx-lm's default arm runs. The decode-gap probe; fits every depth inside the KV budget
+    /// (5.0 GB at 262,144).
+    Bf16,
+    /// The 8-bit affine codes, scales, and biases (group 64, bits 8).
+    Q8,
+}
+
+pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
+    match kv {
+        KvDtype::F32 => "f32",
+        KvDtype::Bf16 => "bf16",
+        KvDtype::Q8 => "q8",
+    }
+}
+
+impl KvDtype {
+    /// The storage format in the shared byte arithmetic (`family::kv_format`): Q8 keeps its
+    /// group-64 affine codes with a scale AND a bias of the activation width each
+    /// (2 sides x 2 arrays x groups x scale bytes).
+    pub(crate) fn format(self, act: Activation) -> crate::family::kv_format::KvFormat {
+        match self {
+            Self::F32 => crate::family::kv_format::KvFormat::F32,
+            Self::Bf16 => crate::family::kv_format::KvFormat::Bf16,
+            Self::Q8 => crate::family::kv_format::KvFormat::Affine8 {
+                group: Q8_GROUP,
+                param_bytes: u32::try_from(act.dtype().byte_width()).expect(
+                    "an activation width of more than 4 GiB per element is not a real dtype",
+                ),
+            },
+        }
+    }
+}
+
+/// Parses the `kv_dtype` member: `f32`, `bf16`, or `q8`. Any other text is refused in the style
+/// of the numeric members.
+pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
+    match text {
+        "f32" => Ok(KvDtype::F32),
+        "bf16" => Ok(KvDtype::Bf16),
+        "q8" => Ok(KvDtype::Q8),
+        other => Err(bad(format!(
+            "kv_dtype must be f32, bf16, or q8, got {other:?}"
+        ))),
+    }
+}
+
+/// The cache form of `text`, the raw member value. `None` is the default of the arm: the 8-bit
+/// cache on the MLX arm, where it passed its quality gate, and the F32 cache on the CUDA arm until
+/// it passes there. An explicit `q8` is valid on both arms.
+pub(crate) fn kv_dtype_of(text: Option<&str>, backend: Backend) -> Result<KvDtype, EngError> {
+    match (text, backend) {
+        (Some(text), _) => parse_kv_dtype(text),
+        (None, Backend::Mlx) => Ok(KvDtype::Q8),
+        (None, Backend::Cuda) => Ok(KvDtype::F32),
+    }
+}
+
+/// Whether the chunked prefill may run with the activation dtype `act`: the chunk path is dtype
+/// aware — its blocks run the same boundary casts as the decode step and the chunk loop guards
+/// every dtype — so both activation dtypes plan a chunk and only the budget and the largest chunk
+/// can keep one out. This is the one authority for the rule: `Q36Executor::plan_prefill` asks it
+/// with `Consts::act`, and the start-up line of `start::plan_prefill` follows the plan and names no
+/// dtype rule.
+pub(crate) fn chunked_prefill_allowed(act: Dtype) -> bool {
+    matches!(act, Dtype::F32 | Dtype::Bf16)
+}
+
+/// The checked settings of one Q36 engine.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Q36Settings {
+    /// The selected descriptor, shared by admission and executor loading.
+    pub(crate) spec: FamilySpec,
+    /// The checkpoint directory with the safetensors shards and `config.json`.
+    pub(crate) artifact: PathBuf,
+    /// The directory with `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, and
+    /// `generation_config.json`.
+    pub(crate) tokenizer_dir: PathBuf,
+    /// The MLX allocator cache limit in bytes.
+    pub(crate) cache_limit: u64,
+    /// The first position that the engine refuses.
+    pub(crate) context_limit: u32,
+    /// The bytes of cache growth that the engine admits.
+    pub(crate) session_cap: u64,
+    /// The prompt tokens per `prefill` call. MLX: with a budget it is also the largest planned
+    /// chunk. CUDA: always 0 (the key is ignored with one start line until the chunked CUDA prefill
+    /// accepts it); the chunk cap the step holds is `DEFAULT_CUDA_PREFILL_CHUNK`, set through
+    /// `QwenResidentStep::set_m_sess_cap`.
+    pub(crate) prefill_chunk: u32,
+    /// The budget of the chunked prefill, or `None` when the chunked prefill is off.
+    pub(crate) prefill_budget: Option<u64>,
+    /// The bytes that the planner keeps free. It is used only when `prefill_budget` is set.
+    pub(crate) prefill_reserve: u64,
+    /// The dtype of the decode activations, which also picks the scale storage. The default is
+    /// `bf16`.
+    pub(crate) activation: Activation,
+    /// The form of the attention KV cache. The default is `f32`, the control.
+    pub(crate) kv: KvDtype,
+    /// A CUDA GGUF start whose config names no `kv_dtype`: the start picks the form from the free
+    /// card after the weights (see `admission_sketch::choose_cuda_fit`); `kv` is the fallback
+    /// when the card cannot be read.
+    pub(crate) kv_auto: bool,
+    /// A CUDA GGUF start whose config names no `context_limit`: the start picks the largest
+    /// context the free card carries; `context_limit` is the fallback when the card cannot be
+    /// read.
+    pub(crate) context_auto: bool,
+    /// Host-backed CUDA Q8 KV is disabled when this budget is absent.
+    pub(crate) kv_offload_host_bytes: Option<u64>,
+    /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
+    pub(crate) capture: bool,
+    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks.
+    /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
+    /// program per distinct compiled block, and the CUDA arm records the key as ignored.
+    pub(crate) compile: bool,
+    pub(crate) compile_program_limit: crate::kernels::ProgramLimit,
+    /// Maximum concurrent sessions. One preserves the original single-job worker.
+    pub(crate) max_seqs: usize,
+    /// Whether the config named `max_seqs`. The CUDA arm sizes its sessions from the cache pool
+    /// when it did not; a named count is a cap on that.
+    pub(crate) max_seqs_set: bool,
+    /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
+    /// six. Validated by the parse; `prefix_store_limits_of` applies it.
+    pub(crate) prefix_store_entries: Option<usize>,
+    /// The backend these settings were read for. The `prefix_reuse` cap rule applies to the MLX
+    /// arm only.
+    pub(crate) backend: Backend,
+    /// The process-wide `prefix_reuse` flag, set by the factory after `new`: with the flag on, this
+    /// engine's prefix store keeps two pinned roots and six LRU entries; with it off, the one-entry
+    /// store (zero roots, one entry). No config member reads it: the flag belongs to the server
+    /// configuration file, and `new` leaves it false.
+    pub(crate) prefix_reuse: bool,
+    /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
+    pub(crate) tiered: Option<TieredSettings>,
+    /// The banked EXL3 expert mode, or `None` for the resident engine.
+    pub(crate) expert_bank: Option<ExpertBankSettings>,
+    /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
+    pub(crate) weights: WeightFormat,
+    /// Checked lowercase content pin for CUDA GGUF; absent preserves legacy verification.
+    pub(crate) gguf_sha256: Option<String>,
+    /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
+    pub(crate) speculation: SpecConfig,
+    /// How a verify window is rolled back. `Host` unless `draft_rollback` says `device`.
+    pub(crate) draft_rollback: RollbackMode,
+    /// How a verify window runs its rows. `Eager` unless `draft_verify` says `krow`.
+    pub(crate) draft_verify: VerifyMode,
+    /// The CUDA device ordinals this engine spans, strictly ascending. `[0]` unless the
+    /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
+    pub(crate) cuda_devices: Vec<usize>,
+    /// The on-disk prefix cache, or `None` when the member is absent.
+    pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheSettings>,
+    /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
+    /// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
+    /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
+    /// it as the cap of `M_sess`.
+    pub(crate) ignored_mlx_keys: Vec<&'static str>,
+    /// The keys whose value came from the host facts (`host_plan`): `cache_limit_bytes`,
+    /// `prefill_budget_bytes`, `compile` and `context_limit` (the largest context that fits the
+    /// derived budget); not from a member, a variable or a fixed default. Empty when nothing was
+    /// derived.
+    pub(crate) derived: Vec<&'static str>,
+    /// The one startup line that names the host facts and the source of each value; present only
+    /// when at least one value was derived.
+    pub(crate) host_note: Option<String>,
+    /// Set when the resident model does not fit the host memory but its experts streamed from
+    /// disk do: the Mac start then streams them, under this many bytes of host budget.
+    pub(crate) mlx_staged_cap: Option<u64>,
+}
+
+fn bad(message: String) -> EngError {
+    EngError::BadRequest(format!("engine config: {message}"))
+}
+
+fn ranged<T: Copy + PartialOrd + std::fmt::Display>(
+    key: &str,
+    value: Option<T>,
+    default: T,
+    low: T,
+    high: T,
+) -> Result<T, EngError> {
+    let value = value.unwrap_or(default);
+    if value >= low && value <= high {
+        Ok(value)
+    } else {
+        Err(bad(format!(
+            "{key} must be between {low} and {high}, found {value}"
+        )))
+    }
+}
+
+/// The allocator cache limit and whether the host derived it: a member first, then
+/// `Q36_CACHE_LIMIT`, then the host rule. Without any of the three the start is refused.
+fn cache_limit(options: &Q36Options, env: &Q36Env) -> Result<(u64, CacheSource), EngError> {
+    let (limit, source) = match options.cache_limit_bytes {
+        Some(value) => (value, CacheSource::Member),
+        None => match env.cache_limit.as_deref().filter(|value| !value.is_empty()) {
+            Some(text) => (
+                text.parse::<u64>()
+                    .map_err(|_| bad("Q36_CACHE_LIMIT is not a byte count".into()))?,
+                CacheSource::Variable,
+            ),
+            None => match env.host {
+                Some(host) => (host.defaults().cache_limit_bytes, CacheSource::Host),
+                None => {
+                    return Err(bad(
+                        "cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set".into(),
+                    ));
+                }
+            },
+        },
+    };
+    if limit == 0 {
+        return Err(bad("the cache limit must be above 0".into()));
+    }
+    Ok((limit, source))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheSource {
+    Member,
+    Variable,
+    Host,
+}
+
+fn at_least_one(key: &str, value: Option<u64>) -> Result<Option<u64>, EngError> {
+    value
+        .map(|value| ranged(key, Some(value), 1, 1, u64::MAX))
+        .transpose()
+}
+
+/// The pressure margin of a derived prefill reserve: the same 1 GiB the
+/// shipped Mac Studio profile carries on top of its plan sum (the
+/// constants test pins that sum byte for byte).
+const DERIVED_RESERVE_MARGIN_BYTES: u64 = crate::family::mem::DEVICE.unified_pressure_margin;
+
+/// What becomes of the chunked-prefill reserve. A reserve without a
+/// budget is a mistake, because nothing would read it. A budget without
+/// a reserve derives one (below) instead of demanding arithmetic the
+/// planner's own authorities already know: the attention cache at the
+/// context limit, the fixed DeltaNet state, the allocator cache limit,
+/// and the pressure margin — the composition the shipped profile was
+/// hand-summed from. An explicit member always wins, byte for byte.
+/// With neither, the prefill runs one token at a time, nothing reads
+/// the reserve, and it stays 0.
+enum ReservePlan {
+    Explicit(u64),
+    Derive,
+    Off,
+}
+
+fn reserve_plan(options: &Q36Options, budget: Option<u64>) -> Result<ReservePlan, EngError> {
+    match (options.prefill_session_reserve_bytes, budget) {
+        (Some(_), None) => Err(bad(
+            "prefill_session_reserve_bytes needs prefill_budget_bytes".into(),
+        )),
+        (None, Some(_)) => Ok(ReservePlan::Derive),
+        (Some(reserve), Some(_)) => Ok(ReservePlan::Explicit(reserve)),
+        (None, None) => Ok(ReservePlan::Off),
+    }
+}
+
+/// The derived reserve. It is a plan sum, not a measurement: what the
+/// chunked prefill must keep free while it runs — one full session of
+/// cache growth, the recurrent state, the allocator's retained cache,
+/// and the margin. Checked throughout; an overflow refuses like the
+/// session-cap rules do.
+fn derived_reserve(
+    spec: &FamilySpec,
+    kv: KvDtype,
+    activation: Activation,
+    context_limit: u32,
+    cache_limit: u64,
+) -> Result<u64, EngError> {
+    let overflow = || bad("the derived prefill reserve overflows u64".into());
+    let fixed = delta_state_bytes(spec)?;
+    cache_growth_per_position(spec, kv, activation)?
+        .checked_mul(u64::from(context_limit))
+        .and_then(|cache| cache.checked_add(fixed))
+        .and_then(|sum| sum.checked_add(cache_limit))
+        .and_then(|sum| sum.checked_add(DERIVED_RESERVE_MARGIN_BYTES))
+        .ok_or_else(overflow)
+}
+
+/// The DeltaNet state bytes of one model: per DeltaNet layer the recurrent state
+/// `[value_heads, value_head_dim, key_head_dim]` and the convolution ring
+/// `[conv_dim, conv_kernel - 1]`, F32. It is derived from the family spec, never a literal:
+/// `QWEN3_6_35B_A3B` holds 65,863,680 bytes in its 30 DeltaNet layers.
+pub(crate) fn delta_state_bytes(spec: &FamilySpec) -> Result<u64, EngError> {
+    let Some(linear) = spec.linear else {
+        return Err(bad(
+            "the model has no linear-attention state to reserve".into()
+        ));
+    };
+    let rec = u64::from(linear.value_heads)
+        .checked_mul(u64::from(linear.value_head_dim))
+        .and_then(|elems| elems.checked_mul(u64::from(linear.key_head_dim)))
+        .and_then(|elems| elems.checked_mul(4))
+        .ok_or_else(|| bad("the DeltaNet state bytes overflow u64".into()))?;
+    let ring = u64::from(linear.conv_dim()?)
+        .checked_mul(u64::from(linear.conv_kernel - 1))
+        .and_then(|elems| elems.checked_mul(4))
+        .ok_or_else(|| bad("the DeltaNet state bytes overflow u64".into()))?;
+    let per_layer = rec
+        .checked_add(ring)
+        .ok_or_else(|| bad("the DeltaNet state bytes overflow u64".into()))?;
+    let layers = spec
+        .layers_attention
+        .iter()
+        .filter(|kind| **kind == AttentionKind::DeltaNet)
+        .count();
+    u64::try_from(layers)
+        .ok()
+        .and_then(|layers| per_layer.checked_mul(layers))
+        .ok_or_else(|| bad("the DeltaNet state bytes overflow u64".into()))
+}
+
+/// The cache bytes that one position adds over every full-attention layer, in the cache form `kv`:
+/// the F32 control is keys and values `[1, heads_kv, 1, head_dim]` F32, and the Q8 form is the
+/// 8-bit codes beside scales and biases of the activation dtype (`kv_growth_per_position`, the one
+/// authority). It is derived from the family spec, never a literal: `QWEN3_6_35B_A3B` adds 40,960
+/// bytes per position in its 10 attention layers in the F32 form, 10,880 at Q8 with BF16 scales,
+/// and 11,520 at Q8 with F32 scales.
+pub(crate) fn cache_growth_per_position(
+    spec: &FamilySpec,
+    kv: KvDtype,
+    act: Activation,
+) -> Result<u64, EngError> {
+    let per_layer = kv_growth_per_position(spec.heads_kv, spec.head_dim, kv, act)?;
+    let layers = spec
+        .layers_attention
+        .iter()
+        .filter(|kind| **kind == AttentionKind::Full)
+        .count();
+    u64::try_from(layers)
+        .ok()
+        .and_then(|layers| per_layer.checked_mul(layers))
+        .ok_or_else(|| bad("the cache growth per position overflows u64".into()))
+}
+
+/// The tiered member, checked: CUDA only, `slots` required, no capture (the tiered step waits for
+/// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
+/// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
+/// `chunk_ready` keeps a tiered session off the chunk path).
+/// The checked `expert_bank` entry, or `None` when the member is absent. The refusals mirror the
+/// qualified state of the arm: the banked decode is eager-only and reads an EXL3 pack (so
+/// `tiered` and `kv_offload_host_bytes` cannot co-occur — both refuse `exl3` themselves). An
+/// enabled draft rides the same banked body (`ngram` today; `mtp` refuses globally, having no
+/// draft step).
+fn expert_bank_settings(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<Option<ExpertBankSettings>, EngError> {
+    let Some(bank) = &options.expert_bank else {
+        return Ok(None);
+    };
+    if backend == Backend::Mlx {
+        return Err(bad(
+            "expert_bank is a CUDA member; the MLX arm refuses it".into()
+        ));
+    }
+    if weights != WeightFormat::Exl3 {
+        return Err(bad(
+            "expert_bank needs weight_format exl3: the host store reads an EXL3 pack".into(),
+        ));
+    }
+    if options.capture == Some(true) {
+        return Err(bad(
+            "expert_bank and capture exclude each other: the banked decode is eager only".into(),
+        ));
+    }
+    let slots = match bank.slots {
+        None => SlotRequest::Fit,
+        // From 8, the picks of one token: a smaller bank cannot hold one token's picks
+        // together, so the resolver would refuse every token after boot.
+        Some(count) => SlotRequest::Exactly(
+            usize::try_from(ranged("expert_bank.slots", Some(count), 8, 8, 256)?)
+                .map_err(|_| bad("expert_bank.slots exceeds usize".into()))?,
+        ),
+    };
+    let mode = match bank.mode.as_deref() {
+        None | Some("auto") => BankMode::Auto,
+        Some("on") => BankMode::On,
+        Some(other) => {
+            return Err(bad(format!(
+                "expert_bank.mode must be auto or on, got {other:?}"
+            )));
+        }
+    };
+    let sticky = usize::try_from(ranged("expert_bank.sticky", bank.sticky, 0, 0, 256)?)
+        .map_err(|_| bad("expert_bank.sticky exceeds usize".into()))?;
+    Ok(Some(ExpertBankSettings {
+        slots,
+        mode,
+        sticky,
+    }))
+}
+
+fn tiered_settings(
+    options: &Q36Options,
+    backend: Backend,
+) -> Result<Option<TieredSettings>, EngError> {
+    let Some(tiered) = options.tiered else {
+        return Ok(None);
+    };
+    if backend == Backend::Mlx {
+        return Err(bad("tiered is a CUDA member; the MLX arm refuses it".into()));
+    }
+    let slots = tiered
+        .slots
+        .ok_or_else(|| bad("tiered needs slots (8 to 256 or auto)".into()))?;
+    if let SlotRequest::Exactly(count) = slots
+        && !(8..=256).contains(&count)
+    {
+        return Err(bad(format!(
+            "tiered.slots must be 8 to 256 or auto, found {count}"
+        )));
+    }
+    let built = TieredSettings {
+        slots,
+        threads: usize::try_from(ranged(
+            "tiered.threads",
+            tiered.threads,
+            TIERED_DEFAULT_THREADS,
+            1,
+            8,
+        )?)
+        .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
+        timeout_ms: ranged(
+            "tiered.timeout_ms",
+            tiered.timeout_ms,
+            TIERED_DEFAULT_TIMEOUT_MS,
+            1,
+            600_000,
+        )?,
+        preload: tiered.preload.unwrap_or(false),
+        swaps_milli: ranged("tiered.swaps_milli", tiered.swaps_milli, 250, 0, 8_000)?,
+    };
+    // The member shapes are validated above so their errors keep precedence; the exclusion
+    // reads the resolved flag, so an unset capture (the CUDA arm's default, on) is refused
+    // here by name with its rollback.
+    if options.capture.unwrap_or(backend == Backend::Cuda) {
+        return Err(bad(
+            "tiered and capture exclude each other: the tiered step is eager only; set \"capture\": false".into(),
+        ));
+    }
+    Ok(Some(built))
+}
+
+/// Refuses one MLX chunked-prefill key on the CUDA arm, naming it: the arm prefills one token
+/// per step until CPF lands, so accepting the key would promise a speed it does not have.
+fn refuse_cuda_key(key: &str, value: Option<u64>) -> Result<(), EngError> {
+    if value.is_some() {
+        return Err(bad(format!(
+            "{key} is an MLX chunked-prefill key; the CUDA arm prefills one token per step until CPF"
+        )));
+    }
+    Ok(())
+}
+
+/// The MLX allocator, compile, and session keys the CUDA arm ignores (the KV cache is sized by
+/// `context_limit` alone, the prefill runs one token per step, and the CUDA arm does not build the
+/// MLX compile seam): the start logs one line each. `prefill_chunk` stays ignored until the chunked
+/// CUDA prefill accepts it as the cap of `M_sess`: until then the key would promise a speed the arm
+/// does not have.
+fn ignored_mlx_keys_of(options: &Q36Options) -> Vec<&'static str> {
+    [
+        (options.cache_limit_bytes.is_some(), "cache_limit_bytes"),
+        (options.session_cap_bytes.is_some(), "session_cap_bytes"),
+        (options.prefill_chunk.is_some(), "prefill_chunk"),
+        (options.compile.is_some(), "compile"),
+        (
+            options.prefix_store_entries.is_some(),
+            "prefix_store_entries",
+        ),
+    ]
+    .into_iter()
+    .filter(|&(set, _)| set)
+    .map(|(_, key)| key)
+    .collect()
+}
+
+fn kv_offload_of(options: &Q36Options, backend: Backend) -> Result<Option<u64>, EngError> {
+    let Some(bytes) = at_least_one("kv_offload_host_bytes", options.kv_offload_host_bytes)? else {
+        return Ok(None);
+    };
+    if backend != Backend::Cuda {
+        return Err(bad("kv_offload_host_bytes is CUDA-only".into()));
+    }
+    if kv_dtype_of(options.kv_dtype.as_deref(), backend)? != KvDtype::Q8 {
+        return Err(bad("kv_offload_host_bytes requires kv_dtype q8".into()));
+    }
+    if options.capture.unwrap_or(backend == Backend::Cuda) || options.tiered.is_some() {
+        return Err(bad(
+            "kv_offload_host_bytes requires capture=false and no tiered experts".into(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+impl Q36Settings {
+    /// Checks the entry and its `qwen36` object (absent means all members absent); the config
+    /// value wins over the environment. The backend fixes which keys are read: `Cuda` refuses
+    /// the chunked-prefill budget keys by name and makes the allocator and session keys
+    /// optional (ignored, recorded for the start lines); `Mlx` reads them all.
+    pub(crate) fn new(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        options: Option<&Q36Options>,
+        env: &Q36Env,
+        backend: Backend,
+    ) -> Result<Self, EngError> {
+        Self::new_for_family(
+            model_dir,
+            tokenizer_dir,
+            options,
+            env,
+            backend,
+            QWEN3_6_35B_A3B,
+        )
+    }
+
+    pub(crate) fn new_for_family(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        options: Option<&Q36Options>,
+        env: &Q36Env,
+        backend: Backend,
+        spec: FamilySpec,
+    ) -> Result<Self, EngError> {
+        if spec.feed_forward.is_some() && backend == Backend::Cuda {
+            return Err(bad(format!(
+                "{} requires the native-mlx backend on Apple Silicon; the CUDA Q36 loader does not support the dense family",
+                spec.name
+            )));
+        }
+        geometric_checkpoint_window(env)?;
+        let default = Q36Options::default();
+        let options = options.unwrap_or(&default);
+        let weights = weight_format_of(options.weight_format.as_deref())?;
+        check_weight_format(weights, options, backend)?;
+        let gguf_sha256 = options
+            .gguf_sha256
+            .as_deref()
+            .map(|digest| {
+                if backend != Backend::Cuda || weights != WeightFormat::Gguf {
+                    return Err(bad("gguf_sha256 requires CUDA GGUF weights".into()));
+                }
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(bad("gguf_sha256 must contain exactly 64 hex digits".into()));
+                }
+                Ok(digest.to_ascii_lowercase())
+            })
+            .transpose()?;
+        let cuda_devices = cuda_devices_of(options, backend, weights)?;
+        let speculation = speculation_of(options, backend, weights)?;
+        let kv_offload_host_bytes = kv_offload_of(options, backend)?;
+        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes, backend)?;
+        let draft_verify = verify_of(options, draft_rollback, weights)?;
+        let mut budget_from_host = None;
+        let mut cache_source = None;
+        let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
+        {
+            Backend::Mlx => {
+                let explicit_budget =
+                    at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                budget_from_host = match (explicit_budget, env.host) {
+                    (None, Some(host)) => Some(host.defaults().prefill_budget_bytes),
+                    _ => None,
+                };
+                let budget = explicit_budget.or(budget_from_host);
+                let reserve = reserve_plan(options, budget)?;
+                let activation = activation_of(options.activation_dtype.as_deref())?;
+                let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Mlx)?;
+                let (limit, source) = cache_limit(options, env)?;
+                cache_source = Some(source);
+                (budget, reserve, activation, kv, limit, Vec::new())
+            }
+            Backend::Cuda => {
+                refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                refuse_cuda_key(
+                    "prefill_session_reserve_bytes",
+                    options.prefill_session_reserve_bytes,
+                )?;
+                let activation = activation_of(options.activation_dtype.as_deref())?;
+                // Unlike the MLX arm, the CUDA arm does NOT refuse `q8` here — the CUDA start
+                // maps the parsed form onto the step's `KvMode` (F32 to the fp16 control cache,
+                // Q8 to Int8G32) and refuses the Tiled layout there.
+                let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Cuda)?;
+                (
+                    None,
+                    ReservePlan::Explicit(0),
+                    activation,
+                    kv,
+                    0,
+                    ignored_mlx_keys_of(options),
+                )
+            }
+        };
+        // The MLX error order of the base: budget, reserve, activation_dtype, kv_dtype,
+        // cache_limit, context_limit, session_cap, prefill_chunk. `cache_limit` is computed in the
+        // match above, BEFORE `context_limit` and the second match, so a config with both faults
+        // names the cache-limit fault first; the CUDA arm refuses its keys in the first match,
+        // reads no cache limit, and takes only `context_limit` below.
+        let mut context_limit = ranged(
+            "context_limit",
+            options.context_limit,
+            spec.feed_forward.map_or(
+                match backend {
+                    Backend::Mlx => MLX_DEFAULT_CONTEXT_LIMIT,
+                    Backend::Cuda => DEFAULT_CONTEXT_LIMIT,
+                },
+                |dense| dense.context_limit,
+            ),
+            2,
+            spec.feed_forward
+                .map_or(u32::MAX, |dense| dense.context_limit),
+        )?;
+        // A start that names no context and cannot hold the model plus the reserve at the default
+        // takes the largest context that fits the derived budget. The reserve is linear in the
+        // context (`derived_reserve`), so the fixed part is its value at zero positions.
+        // The host facts of a MoE start that streams its routed experts, when it may (the variable
+        // is not `0`) and the headers say how many expert bytes there are.
+        let staged_host = (backend == Backend::Mlx
+            && spec.feed_forward.is_none()
+            && env.disk_experts != DiskExperts::Off)
+            .then(|| {
+                env.host
+                    .zip(env.experts)
+                    .map(|(host, experts)| host.staged(experts))
+            })
+            .flatten();
+        let mut context_from_host = false;
+        if options.context_limit.is_none()
+            && matches!(reserve, ReservePlan::Derive)
+            && let (Some(budget), Some(host)) = (budget_from_host, env.host)
+        {
+            let default_reserve =
+                derived_reserve(&spec, kv, activation, context_limit, cache_limit)?;
+            if host_plan::shortfall_text(host, budget, default_reserve, context_limit).is_some() {
+                let per_position = cache_growth_per_position(&spec, kv, activation)?;
+                let fixed = derived_reserve(&spec, kv, activation, 0, cache_limit)?;
+                let chosen =
+                    host_plan::largest_context(host, budget, per_position, fixed).or_else(|| {
+                        // No context fits the resident model: size it for a start that streams
+                        // the routed experts from disk, which is what the start will do.
+                        staged_host.and_then(|staged| {
+                            host_plan::largest_context(staged, budget, per_position, fixed)
+                        })
+                    });
+                if let Some(chosen) = chosen {
+                    context_limit = chosen.min(context_limit);
+                    context_from_host = true;
+                }
+            }
+        }
+        // The dense spec's session floor: one full session of cache
+        // growth plus the fixed state. An absent cap derives exactly
+        // this (the MoE default would not admit the dense session);
+        // an explicit cap below it is refused with the requirement, as
+        // before. With prefix_reuse the live-plus-entry rule in
+        // `check_prefix_reuse_cap` still applies on top.
+        let dense_required = if spec.feed_forward.is_some() {
+            let cache = cache_growth_per_position(&spec, kv, activation)?
+                .checked_mul(u64::from(context_limit))
+                .ok_or_else(|| bad("the session cache bytes overflow u64".into()))?;
+            let fixed = delta_state_bytes(&spec)?;
+            let required = cache
+                .checked_add(fixed)
+                .ok_or_else(|| bad("the session cap requirement overflows u64".into()))?;
+            if options.session_cap_bytes.is_some_and(|cap| cap < required) {
+                return Err(bad(format!(
+                    "{} needs session_cap_bytes of at least {required} bytes for context limit {context_limit}: {cache} attention cache bytes plus {fixed} DeltaNet bytes; set or raise session_cap_bytes",
+                    spec.name
+                )));
+            }
+            Some(required)
+        } else {
+            None
+        };
+        let prefill_reserve = match reserve {
+            ReservePlan::Explicit(reserve) => reserve,
+            ReservePlan::Off => 0,
+            ReservePlan::Derive => {
+                derived_reserve(&spec, kv, activation, context_limit, cache_limit)?
+            }
+        };
+        let mut mlx_staged_cap = None;
+        if let (Some(budget), Some(host)) = (budget_from_host, env.host)
+            && let Some(text) =
+                host_plan::shortfall_text(host, budget, prefill_reserve, context_limit)
+        {
+            // A resident model that does not fit is not a refusal when its experts streamed from
+            // disk do fit: the start streams them under the host budget.
+            match staged_host {
+                Some(staged)
+                    if host_plan::shortfall_text(
+                        staged,
+                        budget,
+                        prefill_reserve,
+                        context_limit,
+                    )
+                    .is_none() =>
+                {
+                    mlx_staged_cap = Some(budget);
+                }
+                _ => return Err(bad(text)),
+            }
+        }
+        let (session_cap, prefill_chunk) = match backend {
+            Backend::Mlx => (
+                ranged(
+                    "session_cap_bytes",
+                    options.session_cap_bytes,
+                    dense_required.unwrap_or(DEFAULT_SESSION_CAP),
+                    1,
+                    u64::MAX,
+                )?,
+                ranged(
+                    "prefill_chunk",
+                    options.prefill_chunk,
+                    if activation == Activation::Bf16 {
+                        BF16_DEFAULT_PREFILL_CHUNK
+                    } else {
+                        DEFAULT_PREFILL_CHUNK
+                    },
+                    1,
+                    MAX_PREFILL_CHUNK,
+                )?,
+            ),
+            // Inert: the CUDA arm reads none of them (the KV is sized by `context_limit`, the
+            // worker piece is `NO_BUDGET_PIECE`, `prefill_chunk` is ignored with its start line
+            // until the chunked CUDA prefill accepts it).
+            Backend::Cuda => (0, 0),
+        };
+        let tiered = tiered_settings(options, backend)?;
+        let expert_bank = expert_bank_settings(options, backend, weights)?;
+        let kv_cache = kv_cache_settings(options, &cuda_devices)?;
+        // The card-driven choices apply to the single-device GGUF start that names neither
+        // tiered experts nor host-paged KV; every member the config names is taken as given.
+        let card_chosen = backend == Backend::Cuda
+            && weights == WeightFormat::Gguf
+            && cuda_devices == [0]
+            && tiered.is_none()
+            && kv_offload_host_bytes.is_none();
+        let kv_auto = card_chosen && options.kv_dtype.is_none();
+        let context_auto = card_chosen && options.context_limit.is_none();
+        let compile_program_limit = match options.compile_program_limit {
+            Some(_) if backend != Backend::Mlx => {
+                return Err(bad("compile_program_limit requires the MLX backend".into()));
+            }
+            Some(value) => crate::kernels::ProgramLimit::new(value)?,
+            None => crate::kernels::ProgramLimit::default(),
+        };
+        let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
+        // The shipped Mac profile turns the compiled decode blocks on. A host-derived start does
+        // the same for the MoE family, except under speculation, whose windows the compiled
+        // blocks were not measured with.
+        let compile_from_host = backend == Backend::Mlx
+            && options.compile.is_none()
+            && env.host.is_some()
+            && spec.feed_forward.is_none()
+            && !speculation.enabled();
+        let compile = match backend {
+            Backend::Mlx => options.compile.unwrap_or(compile_from_host),
+            Backend::Cuda => false,
+        };
+        // The override validates at boot through `ranged` (the same message shape as every
+        // other member) so a typo cannot reach the store; the range keeps a fat finger from
+        // asking for a million live slots.
+        let prefix_store_entries = match options.prefix_store_entries {
+            None => None,
+            Some(value) => Some(ranged("prefix_store_entries", Some(value), value, 1, 4096)?),
+        };
+        if max_seqs > 1 && backend == Backend::Cuda {
+            if spec.feed_forward.is_some() {
+                return Err(bad(
+                    "max_seqs above 1 requires MoE device routing; the dense family runs one sequence at a time"
+                        .into(),
+                ));
+            }
+            if speculation.enabled() {
+                return Err(bad(
+                    "max_seqs above 1 does not run with speculative decoding".into(),
+                ));
+            }
+        }
+        if max_seqs > 1 && backend == Backend::Mlx {
+            if spec.feed_forward.is_some() {
+                return Err(bad(
+                    "max_seqs above 1 requires MoE device routing; the dense family runs one sequence at a time"
+                        .into(),
+                ));
+            }
+            if !compile {
+                return Err(bad("max_seqs above 1 requires compile=true".into()));
+            }
+            if prefill_budget.is_none() || prefill_chunk < MIN_PREFILL_CHUNK_ROWS {
+                return Err(bad(format!(
+                    "max_seqs above 1 requires prefill_budget_bytes and prefill_chunk at least {MIN_PREFILL_CHUNK_ROWS}"
+                )));
+            }
+            if prefill_budget.is_some_and(|budget| prefill_reserve.max(session_cap) >= budget) {
+                return Err(bad(
+                    "max_seqs above 1 requires prefill_budget_bytes above both prefill_session_reserve_bytes and session_cap_bytes"
+                        .into(),
+                ));
+            }
+        }
+        let mut derived = Vec::new();
+        if cache_source == Some(CacheSource::Host) {
+            derived.push("cache_limit_bytes");
+        }
+        if budget_from_host.is_some() {
+            derived.push("prefill_budget_bytes");
+        }
+        if compile_from_host {
+            derived.push("compile");
+        }
+        if context_from_host {
+            derived.push("context_limit");
+        }
+        let host_note = env.host.filter(|_| !derived.is_empty()).map(|host| {
+            let source = |key: &'static str, member: bool, rule: String| {
+                if derived.contains(&key) {
+                    rule
+                } else if member {
+                    "set".to_string()
+                } else {
+                    "default".to_string()
+                }
+            };
+            let cache_origin = match cache_source {
+                Some(CacheSource::Member) => "set",
+                Some(CacheSource::Variable) => "Q36_CACHE_LIMIT",
+                _ => "derived: memory / 9, 1 to 8 GiB",
+            };
+            let values = [
+                NoteValue {
+                    key: "cache_limit_bytes",
+                    value: cache_limit.to_string(),
+                    source: cache_origin.to_string(),
+                },
+                NoteValue {
+                    key: "prefill_budget_bytes",
+                    value: prefill_budget.map_or_else(|| "off".into(), |b| b.to_string()),
+                    source: source(
+                        "prefill_budget_bytes",
+                        options.prefill_budget_bytes.is_some(),
+                        "derived: memory minus the OS floor".into(),
+                    ),
+                },
+                NoteValue {
+                    key: "prefill_session_reserve_bytes",
+                    value: prefill_reserve.to_string(),
+                    source: if options.prefill_session_reserve_bytes.is_some() {
+                        "set".to_string()
+                    } else if prefill_budget.is_some() {
+                        "derived: cache at the context limit + DeltaNet state + cache limit + 1 GiB margin"
+                            .to_string()
+                    } else {
+                        "default".to_string()
+                    },
+                },
+                NoteValue {
+                    key: "context_limit",
+                    value: context_limit.to_string(),
+                    source: source(
+                        "context_limit",
+                        options.context_limit.is_some(),
+                        "derived: largest that fits the budget".into(),
+                    ),
+                },
+                NoteValue {
+                    key: "session_cap_bytes",
+                    value: session_cap.to_string(),
+                    source: source(
+                        "session_cap_bytes",
+                        options.session_cap_bytes.is_some(),
+                        String::new(),
+                    ),
+                },
+                NoteValue {
+                    key: "compile",
+                    value: compile.to_string(),
+                    source: source(
+                        "compile",
+                        options.compile.is_some(),
+                        "derived: on for the MoE family".into(),
+                    ),
+                },
+            ];
+            host_plan::startup_line(host, &values)
+        });
+        Ok(Self {
+            spec,
+            artifact: model_dir.to_path_buf(),
+            tokenizer_dir: tokenizer_dir.to_path_buf(),
+            cache_limit,
+            context_limit,
+            session_cap,
+            prefill_chunk,
+            prefill_budget,
+            prefill_reserve,
+            activation,
+            kv,
+            kv_auto,
+            context_auto,
+            kv_offload_host_bytes,
+            // The CUDA arm captures by default (EXL3 reads the picks on the device; a GGUF step
+            // saves its launch overhead — measured 5.3 percent of wall in the W3 bench, at a
+            // one-time first-request capture warmup); `"capture": false` rolls back to eager.
+            // A banked load stays eager: the slot resolver works on the host between the
+            // readback and the launches, which a graph cannot do (an explicit `"capture": true`
+            // was refused above).
+            capture: options.capture.unwrap_or(backend == Backend::Cuda) && expert_bank.is_none(),
+            // The CUDA arm has no MLX compile seam: the key stays false there and
+            // `ignored_mlx_keys_of` records it for the start line instead.
+            compile,
+            compile_program_limit,
+            max_seqs,
+            max_seqs_set: options.max_seqs.is_some(),
+            prefix_store_entries,
+            backend,
+            prefix_reuse: false,
+            tiered,
+            expert_bank,
+            weights,
+            gguf_sha256,
+            speculation,
+            draft_rollback,
+            draft_verify,
+            cuda_devices,
+            kv_cache,
+            ignored_mlx_keys,
+            derived,
+            host_note,
+            mlx_staged_cap,
+        })
+    }
+
+    /// The `prefix_reuse` cap rule.
+    /// With the process-wide `prefix_reuse` flag on, one saved entry and the live session share
+    /// this engine's `SessionBudget`: the entry charges its attention caches plus the fixed
+    /// DeltaNet state, and the live session can hold the same caches again up to the context
+    /// limit. The cap must therefore cover `2 * growth_per_position * context_limit +
+    /// fixed_bytes` (2,750,218,240 bytes at the default context limit of 32,768 in the default
+    /// F32 cache form; the growth follows `kv_dtype`, so a Q8 engine with BF16 scales needs
+    /// 2 * 10,880 * 32,768 + 65,863,680), or a later job fails with `MemoryPlan` although the
+    /// same job succeeds with `prefix_reuse` off. Engine start refuses a smaller cap and answers
+    /// with the cap, the requirement, the context limit, and the hint `raise session_cap_bytes`.
+    /// With the flag off the rule does not apply. It does not apply to the CUDA arm either: that
+    /// arm ignores `session_cap_bytes` (the value is 0), and its entry lives in host RAM bounded by
+    /// `context_limit`. Roots and periodic entries do not raise this requirement: they are best
+    /// effort inside the cap, a denied save skips only that save, and the requirement keeps
+    /// covering exactly the live session plus the one tip entry at the context limit.
+    pub(crate) fn check_prefix_reuse_cap(&self, prefix_reuse: bool) -> Result<(), EngError> {
+        if prefix_reuse && self.kv_offload_host_bytes.is_some() {
+            return Err(bad(
+                "kv_offload_host_bytes does not support prefix_reuse; set prefix_reuse=false"
+                    .into(),
+            ));
+        }
+        if !prefix_reuse || self.backend == Backend::Cuda {
+            return Ok(());
+        }
+        let (growth, fixed, required) = self.prefix_reuse_requirement()?;
+        if self.session_cap < required {
+            let (cap, limit) = (self.session_cap, self.context_limit);
+            let message = format!(
+                "prefix_reuse needs session_cap_bytes of at least {required} bytes for context limit {limit}: 2 * {growth} cache bytes per position plus {fixed} DeltaNet bytes; the cap is {cap} bytes; raise session_cap_bytes"
+            );
+            return Err(bad(message));
+        }
+        Ok(())
+    }
+
+    /// The cache bytes per position, the fixed DeltaNet bytes, and the session cap that the live
+    /// session plus one saved entry need at the context limit.
+    fn prefix_reuse_requirement(&self) -> Result<(u64, u64, u64), EngError> {
+        let growth = cache_growth_per_position(&self.spec, self.kv, self.activation)?;
+        let fixed = delta_state_bytes(&self.spec)?;
+        let required = growth
+            .checked_mul(2)
+            .and_then(|twice| twice.checked_mul(u64::from(self.context_limit)))
+            .and_then(|cache| cache.checked_add(fixed))
+            .ok_or_else(|| bad("the prefix_reuse cap requirement overflows u64".into()))?;
+        Ok((growth, fixed, required))
+    }
+
+    /// The bytes one saved prefix entry holds at the context limit: its attention caches plus
+    /// the fixed DeltaNet state. The live session's own cache is already in the prefill reserve.
+    pub(crate) fn prefix_entry_bytes(&self) -> Result<u64, EngError> {
+        let (_, fixed, required) = self.prefix_reuse_requirement()?;
+        Ok((required - fixed) / 2 + fixed)
+    }
+
+    /// The session cap that makes the `prefix_reuse` rule hold, for an MLX start whose cap the
+    /// configuration does not set.
+    pub(crate) fn raise_session_cap_for_prefix_reuse(&mut self) -> Result<(), EngError> {
+        let (_, _, required) = self.prefix_reuse_requirement()?;
+        self.session_cap = self.session_cap.max(required);
+        Ok(())
+    }
+}
+
+/// The executor's checked shape, before any shard opens or any weight is imported.
+pub(super) fn shape_of(config: &[u8], spec: &FamilySpec) -> Result<HostShape, EngError> {
+    spec.check_config(config)?;
+    HostShape::from_spec(spec, rotary_dim(config, spec.head_dim)?)
+}
+
+fn digest(text: &str) -> Result<[u8; 32], EngError> {
+    let invalid = || EngError::Checkpoint(format!("tokenizer pin {text} is not 64 hex digits"));
+    let mut out = [0u8; 32];
+    if text.len() != 64 {
+        return Err(invalid());
+    }
+    for (slot, pair) in out.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+        *slot = std::str::from_utf8(pair.as_slice())
+            .ok()
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+            .ok_or_else(invalid)?;
+    }
+    Ok(out)
+}
+
+/// The pin of the tokenizer files of the pinned checkpoint. `TokenizerBundle::load` logs a warning
+/// for any other `tokenizer.json`, `tokenizer_config.json`, template, or `generation_config.json`
+/// and serves the files it finds.
+pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
+    Ok(TokenizerPin {
+        tokenizer_json: digest(TOKENIZER_JSON_SHA256)?,
+        tokenizer_config_json: digest(TOKENIZER_CONFIG_SHA256)?,
+        chat_template_jinja: digest(CHAT_TEMPLATE_SHA256)?,
+        generation_config_json: digest(GENERATION_CONFIG_SHA256)?,
+        vocab_size: TOKENIZER_VOCAB_SIZE,
+    })
+}
+
+/// The MLX family selects its own bundle. Dense uses the official tokenizer JSON and the
+/// mlx-community conversion's config and template; its release template uses an unsupported
+/// Jinja statement. CUDA supports only Qwen3.6 and calls `tokenizer_pin` directly.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn tokenizer_pin_for_spec(spec: &FamilySpec) -> Result<TokenizerPin, EngError> {
+    if spec.feed_forward.is_none() {
+        return tokenizer_pin();
+    }
+    Ok(TokenizerPin {
+        tokenizer_json: digest("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3")?,
+        tokenizer_config_json: digest(
+            "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+        )?,
+        chat_template_jinja: digest(
+            "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        )?,
+        generation_config_json: digest(GENERATION_CONFIG_SHA256)?,
+        vocab_size: TOKENIZER_VOCAB_SIZE,
+    })
+}
+
+#[cfg(test)]
+mod kv_bytes_golden_tests;
+
+/// The FIFI_Q36_MLX_DISK_EXPERTS override of where the routed experts live on the Mac.
+/// Automatic (unset) streams them from disk when the resident model does not fit; `1` says the
+/// same explicitly; `0` keeps them resident and refuses a start that does not fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DiskExperts {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl DiskExperts {
+    /// The setting of a variable value, and why a value that is neither `0` nor `1` is ignored.
+    pub(crate) fn of(value: Option<&std::ffi::OsStr>) -> (Self, Option<String>) {
+        match value {
+            None => (Self::Auto, None),
+            Some(value) if value == "1" => (Self::On, None),
+            Some(value) if value == "0" => (Self::Off, None),
+            Some(value) => (
+                Self::Auto,
+                Some(format!("{:?} is not 0 or 1", value.to_string_lossy())),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BF16_DEFAULT_PREFILL_CHUNK, Backend, BankMode, DEFAULT_CONTEXT_LIMIT,
+        DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE,
+        Q36Env, Q36Options, Q36Settings, SlotRequest, TieredSettings, activation_name,
+        activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
+        digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        tokenizer_pin_for_spec,
+    };
+    use super::{
+        QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
+        rollback_mode_name, rollback_of, verify_mode_name, verify_of,
+    };
+    use crate::EngError;
+    use crate::family::session::StoreLimits;
+    use crate::family::spec::{QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE};
+    use crate::family::speculate::config::{SpecConfig, SpecOptions};
+    use crate::tensor::Dtype;
+    use std::path::{Path, PathBuf};
+
+    /// S4: every arm of the `Q36_KV_GEOMETRIC` parse - absent, `0`, `1`, junk, and the
+    /// not-valid-text error - pinned on the host, because the caller lives in the
+    /// Mac-gated resident module.
+    #[test]
+    fn the_kv_geometric_parse_covers_every_arm() {
+        use super::parse_kv_geometric;
+        use std::env::VarError;
+        assert_eq!(parse_kv_geometric(Err(VarError::NotPresent)), Ok(false));
+        assert_eq!(parse_kv_geometric(Ok("0".into())), Ok(false));
+        assert_eq!(parse_kv_geometric(Ok("1".into())), Ok(true));
+        assert_eq!(
+            parse_kv_geometric(Ok("2".into())),
+            Err("Q36_KV_GEOMETRIC must be 0 or 1, got \"2\"".to_string())
+        );
+        assert_eq!(
+            parse_kv_geometric(Err(VarError::NotUnicode(std::ffi::OsString::new()))),
+            Err(
+                "Q36_KV_GEOMETRIC is not valid text: environment variable was not valid unicode: \"\""
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn compile_program_budget_defaults_validates_and_refuses_cuda() {
+        let options = |value| Q36Options {
+            compile_program_limit: value,
+            cache_limit_bytes: Some(1024),
+            ..Default::default()
+        };
+        for (value, expected) in [(None, 8), (Some(12), 12), (Some(1), 1)] {
+            let settings =
+                settings_for(Some(&options(value)), &Q36Env::default(), Backend::Mlx).unwrap();
+            assert_eq!(settings.compile_program_limit.get(), expected);
+            assert!(!settings.compile, "budget does not enable compilation");
+        }
+        for value in [0, usize::MAX] {
+            let error = settings_for(
+                Some(&options(Some(value))),
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+            .unwrap_err();
+            assert!(format!("{error:?}").contains("compile_program_limit"));
+        }
+        for value in [8, 12] {
+            let error = settings_for(
+                Some(&options(Some(value))),
+                &Q36Env::default(),
+                Backend::Cuda,
+            )
+            .unwrap_err();
+            assert!(format!("{error:?}").contains("compile_program_limit requires the MLX"));
+        }
+        for json in [
+            r#"{"compile_program_limit":-1}"#,
+            r#"{"compile_program_limit":18446744073709551616}"#,
+        ] {
+            assert!(serde_json::from_str::<Q36Options>(json).is_err());
+        }
+    }
+
+    fn cuda_offload(body: &str) -> Result<Q36Settings, EngError> {
+        let options: Q36Options = serde_json::from_str(body).unwrap();
+        settings_for(Some(&options), &Q36Env::default(), Backend::Cuda)
+    }
+
+    #[test]
+    fn kv_cache_member_is_checked_and_single_device_only() {
+        assert_eq!(cuda_offload("{}").unwrap().kv_cache, None);
+        let named =
+            cuda_offload(r#"{"kv_cache":{"dir":"/c","quota_bytes":2147483648,"enabled":true}}"#)
+                .unwrap();
+        assert_eq!(
+            named.kv_cache,
+            Some(crate::family::kv_disk::KvCacheSettings {
+                enabled: Some(true),
+                dir: Some(PathBuf::from("/c")),
+                quota_bytes: Some(2_147_483_648),
+            })
+        );
+        assert_eq!(
+            cuda_offload(r#"{"kv_cache":{}}"#).unwrap().kv_cache,
+            Some(crate::family::kv_disk::KvCacheSettings::default())
+        );
+        for (body, needle) in [
+            (r#"{"kv_cache":{"dir":"relative/path"}}"#, "absolute"),
+            (r#"{"kv_cache":{"quota_bytes":1000}}"#, "1 GiB"),
+            (
+                r#"{"cuda_devices":[0,1],"capture":false,"kv_cache":{"dir":"/c"}}"#,
+                "more than one CUDA device",
+            ),
+        ] {
+            let text = error_text(cuda_offload(body));
+            assert!(text.contains(needle), "{body}: {text}");
+        }
+        let options: Q36Options =
+            serde_json::from_str(r#"{"cache_limit_bytes":1024,"kv_cache":{"dir":"/c"}}"#).unwrap();
+        let mlx = settings_for(Some(&options), &Q36Env::default(), Backend::Mlx).unwrap();
+        assert_eq!(
+            mlx.kv_cache.and_then(|cache| cache.dir),
+            Some(PathBuf::from("/c")),
+            "the MLX arm reads the member"
+        );
+        assert!(serde_json::from_str::<Q36Options>(r#"{"kv_cache":{"path":"/c"}}"#).is_err());
+    }
+
+    #[test]
+    fn gguf_content_pin_is_optional_checked_and_cuda_only() {
+        assert!(cuda_offload("{}").unwrap().gguf_sha256.is_none());
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let object = serde_json::json!({"gguf_sha256": digest.to_uppercase()}).to_string();
+        let pinned = cuda_offload(&object).unwrap();
+        assert_eq!(pinned.gguf_sha256.as_deref(), Some(digest));
+        assert_eq!(pinned.cache_limit, 0);
+        for invalid in [
+            "".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+        ] {
+            let object = serde_json::json!({"gguf_sha256": invalid}).to_string();
+            let error = message(cuda_offload(&object));
+            assert!(
+                error.contains("gguf_sha256") && error.contains("64 hex"),
+                "{error}"
+            );
+        }
+        let options = Q36Options {
+            gguf_sha256: Some(digest.to_string()),
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        };
+        let error = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Mlx,
+        ));
+        assert!(
+            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
+            "{error}"
+        );
+        let object =
+            serde_json::json!({"gguf_sha256": digest, "weight_format": "exl3"}).to_string();
+        let error = message(cuda_offload(&object));
+        assert!(
+            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cuda_devices_default_to_the_first_device_and_parse_a_list() {
+        let resident = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(resident.cuda_devices, vec![0]);
+        let pair = cuda_offload(r#"{"cuda_devices":[0,1],"capture":false}"#).unwrap();
+        assert_eq!(pair.cuda_devices, vec![0, 1]);
+        let second = cuda_offload(r#"{"cuda_devices":[1]}"#).unwrap();
+        assert_eq!(second.cuda_devices, vec![1]);
+    }
+
+    #[test]
+    fn expert_bank_refuses_wrong_arms_and_floors_slots_by_key() {
+        // Every refusal names the key an operator can fix; the multi-device arm refuses the
+        // member by name the same way it refuses tiered.
+        for (body, needle) in [
+            (r#"{"expert_bank":{}}"#, "weight_format exl3"),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{},"capture":true}"#,
+                "capture",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"mtp","mtp_model_dir":"/h"}"#,
+                "no draft step",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"slots":4}}"#,
+                "expert_bank.slots",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"slots":257}}"#,
+                "expert_bank.slots",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"mode":"bogus"}}"#,
+                "expert_bank.mode",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"sticky":257}}"#,
+                "expert_bank.sticky",
+            ),
+            (r#"{"cuda_devices":[0,1],"expert_bank":{}}"#, "expert_bank"),
+        ] {
+            let text = message(cuda_offload(body));
+            assert!(text.contains(needle), "{body}: {text}");
+        }
+        // The member is CUDA-only; on the MLX arm the refusal fires before the pack check
+        // (the cache limit the MLX settings also need comes from the env).
+        let options: Q36Options = serde_json::from_str(r#"{"expert_bank":{}}"#).unwrap();
+        let mlx = Q36Env {
+            cache_limit: Some("1024".to_string()),
+            ..Q36Env::default()
+        };
+        assert!(
+            message(settings_for(Some(&options), &mlx, Backend::Mlx))
+                .contains("the MLX arm refuses it")
+        );
+    }
+
+    #[test]
+    fn expert_bank_accepts_the_fit_request_and_explicit_slots_from_the_floor() {
+        // An ngram draft rides the banked window (the refusal above holds mtp out).
+        let draft =
+            cuda_offload(r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"ngram"}"#)
+                .unwrap();
+        assert!(matches!(
+            draft.speculation.mode,
+            crate::family::speculate::config::DraftMode::Ngram
+        ));
+        let fit = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{}}"#).unwrap();
+        assert_eq!(
+            fit.expert_bank
+                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
+            Some((SlotRequest::Fit, BankMode::Auto, 0))
+        );
+        let on = cuda_offload(
+            r#"{"weight_format":"exl3","expert_bank":{"slots":8,"mode":"on","sticky":64}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            on.expert_bank
+                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
+            Some((SlotRequest::Exactly(8), BankMode::On, 64))
+        );
+        let top = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":256}}"#).unwrap();
+        assert_eq!(
+            top.expert_bank.map(|bank| bank.slots),
+            Some(SlotRequest::Exactly(256))
+        );
+    }
+
+    #[test]
+    fn cuda_devices_refuse_bad_shapes_and_combinations_by_name() {
+        for (body, needle) in [
+            (r#"{"cuda_devices":[]}"#, "cuda_devices"),
+            (r#"{"cuda_devices":[0,0]}"#, "strictly ascending"),
+            (r#"{"cuda_devices":[2,1]}"#, "strictly ascending"),
+            (r#"{"cuda_devices":[0,1,2,3,4]}"#, "cuda_devices"),
+            (
+                r#"{"cuda_devices":[0,1],"weight_format":"exl3"}"#,
+                "weight_format exl3",
+            ),
+            (r#"{"cuda_devices":[0,1]}"#, "capture"),
+            (r#"{"cuda_devices":[0,1],"capture":true}"#, "capture"),
+            (r#"{"cuda_devices":[0,1],"tiered":{"slots":8}}"#, "tiered"),
+            (
+                r#"{"cuda_devices":[0,1],"kv_dtype":"q8","kv_offload_host_bytes":1}"#,
+                "kv_offload_host_bytes",
+            ),
+        ] {
+            assert!(message(cuda_offload(body)).contains(needle), "{body}");
+        }
+        // One named device keeps every combination the single-device engine runs.
+        assert!(cuda_offload(r#"{"cuda_devices":[0],"capture":true}"#).is_ok());
+        // The member is CUDA-only even as a single-device list.
+        let options: Q36Options = serde_json::from_str(r#"{"cuda_devices":[0]}"#).unwrap();
+        assert!(
+            message(settings_for(
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Mlx
+            ))
+            .contains("cuda_devices is CUDA-only")
+        );
+    }
+
+    #[test]
+    fn host_kv_offload_is_opt_in_and_does_not_enable_prefix_reuse() {
+        let resident = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(resident.kv_offload_host_bytes, None);
+        let paged =
+            cuda_offload(r#"{"kv_dtype":"q8","kv_offload_host_bytes":8388608,"capture":false}"#)
+                .unwrap();
+        assert_eq!(paged.kv_offload_host_bytes, Some(8_388_608));
+        assert!(!paged.prefix_reuse);
+        assert!(paged.check_prefix_reuse_cap(false).is_ok());
+        assert!(error_text(paged.check_prefix_reuse_cap(true)).contains("prefix_reuse"));
+        assert!(
+            cuda_offload(
+                r#"{"kv_dtype":"q8","kv_offload_host_bytes":18446744073709551615,"capture":false}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn host_kv_offload_refuses_unsupported_modes_by_key() {
+        for body in [
+            r#"{"kv_offload_host_bytes":1}"#,
+            r#"{"kv_dtype":"f32","kv_offload_host_bytes":1}"#,
+            r#"{"kv_dtype":"q8","kv_offload_host_bytes":0}"#,
+            r#"{"kv_dtype":"q8","kv_offload_host_bytes":1,"capture":true}"#,
+            r#"{"kv_dtype":"q8","kv_offload_host_bytes":8388608}"#,
+            r#"{"kv_dtype":"q8","kv_offload_host_bytes":1,"tiered":{"slots":8}}"#,
+        ] {
+            assert!(message(cuda_offload(body)).contains("kv_offload_host_bytes"));
+        }
+        let options: Q36Options =
+            serde_json::from_str(r#"{"kv_dtype":"q8","kv_offload_host_bytes":8388608}"#).unwrap();
+        let refused = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Mlx,
+        ));
+        assert!(refused.contains("kv_offload_host_bytes") && refused.contains("CUDA"));
+    }
+
+    #[test]
+    fn host_kv_budget_uses_strict_unsigned_json_and_rejects_typos() {
+        for body in [
+            r#"{"kv_offload_host_bytes":-1}"#,
+            r#"{"kv_offload_host_bytes":1.5}"#,
+            r#"{"kv_offload_host_bytes":"8388608"}"#,
+            r#"{"kv_offload_host_bytes":true}"#,
+            r#"{"kv_offload_host_bytes":18446744073709551616}"#,
+            r#"{"kv_offload_host_byte":8388608}"#,
+        ] {
+            assert!(serde_json::from_str::<Q36Options>(body).is_err());
+        }
+    }
+
+    fn with_limit() -> Q36Options {
+        Q36Options {
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        }
+    }
+
+    fn dense_settings(options: &Q36Options) -> Result<Q36Settings, EngError> {
+        Q36Settings::new_for_family(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(options),
+            &Q36Env::default(),
+            Backend::Mlx,
+            crate::family::QWEN3_8_27B_DENSE,
+        )
+    }
+
+    #[test]
+    fn dense_derives_the_cap_covering_its_cache_and_delta_state() {
+        let options = with_limit();
+        // Absent: the cap derives byte for byte from the requirement the
+        // refusal used to name, instead of demanding the arithmetic.
+        let derived = dense_settings(&options).unwrap();
+        assert_eq!(derived.session_cap, 9_283_698_688);
+        // Explicit but too small: still refused, with the requirement.
+        let text = message(dense_settings(&Q36Options {
+            session_cap_bytes: Some(9_283_698_687),
+            ..options.clone()
+        }));
+        assert!(text.contains("at least 9283698688 bytes"), "{text}");
+        assert!(text.contains("9126805504 attention cache bytes"), "{text}");
+        assert!(text.contains("156893184 DeltaNet bytes"), "{text}");
+        let settings = dense_settings(&Q36Options {
+            session_cap_bytes: Some(9_283_698_688),
+            ..options
+        })
+        .unwrap();
+        assert_eq!(settings.context_limit, 262_144);
+        assert_eq!(settings.session_cap, 9_283_698_688);
+        assert!(settings.check_prefix_reuse_cap(false).is_ok());
+        let prefix_error = error_text(settings.check_prefix_reuse_cap(true));
+        assert!(prefix_error.contains("at least 18410504192 bytes"));
+        assert!(
+            dense_settings(&Q36Options {
+                session_cap_bytes: Some(18_410_504_192),
+                ..with_limit()
+            })
+            .unwrap()
+            .check_prefix_reuse_cap(true)
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn dense_cap_tracks_context_cache_form_and_activation() {
+        for (kv, activation, required) in [
+            ("q8", "bf16", 156_962_816),
+            ("q8", "f32", 156_966_912),
+            ("f32", "bf16", 157_155_328),
+        ] {
+            let options = Q36Options {
+                context_limit: Some(2),
+                kv_dtype: Some(kv.into()),
+                activation_dtype: Some(activation.into()),
+                session_cap_bytes: Some(required),
+                ..with_limit()
+            };
+            assert!(dense_settings(&options).is_ok(), "{kv}/{activation}");
+            assert!(
+                dense_settings(&Q36Options {
+                    session_cap_bytes: Some(required - 1),
+                    ..options
+                })
+                .is_err(),
+                "{kv}/{activation}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_is_refused_on_cuda_before_any_file_or_device_access() {
+        let text = message(Q36Settings::new_for_family(
+            Path::new("/nonexistent"),
+            Path::new("/nonexistent"),
+            None,
+            &Q36Env::default(),
+            Backend::Cuda,
+            crate::family::QWEN3_8_27B_DENSE,
+        ));
+        assert!(text.contains("qwen3_8_27b_dense requires the native-mlx backend"));
+    }
+
+    #[test]
+    fn dense_refuses_max_seqs_above_one_even_with_valid_mlx_settings() {
+        let options = Q36Options {
+            max_seqs: Some(2),
+            session_cap_bytes: Some(9_283_698_688),
+            ..with_limit()
+        };
+        let text = message(dense_settings(&options));
+        assert!(
+            text.contains("max_seqs above 1 requires MoE device routing"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn dense_context_cannot_exceed_the_descriptor_limit() {
+        let text = message(dense_settings(&Q36Options {
+            context_limit: Some(262_145),
+            session_cap_bytes: Some(u64::MAX),
+            ..with_limit()
+        }));
+        assert!(
+            text.contains("context_limit must be between 2 and 262144"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_executor_shape_helper_uses_the_selected_dense_dimensions() {
+        // Checkpoint facts from the existing dense config tests, not from the descriptor.
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {"mode": "affine", "bits": 6, "group_size": 64},
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 5120, "intermediate_size": 17408,
+                "num_hidden_layers": 64, "num_attention_heads": 24,
+                "num_key_value_heads": 4, "head_dim": 256, "vocab_size": 248320,
+                "max_position_embeddings": 262144, "full_attention_interval": 4,
+                "attn_output_gate": true, "tie_word_embeddings": false,
+                "attention_bias": false, "hidden_act": "silu", "rms_norm_eps": 1e-6,
+                "linear_num_key_heads": 16, "linear_key_head_dim": 128,
+                "linear_num_value_heads": 48, "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "rope_parameters": {
+                    "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+                    "mrope_interleaved": true, "mrope_section": [11, 11, 10]
+                },
+                "layer_types": (0..64).map(|i| if i % 4 == 3 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }).collect::<Vec<_>>()
+            }
+        })
+        .to_string();
+        let shape = super::shape_of(config.as_bytes(), &crate::family::QWEN3_8_27B_DENSE)
+            .expect("dense executor shape");
+        assert_eq!(shape.hidden, 5120);
+        assert_eq!(shape.kinds.len(), 64);
+        for (index, kind) in shape.kinds.iter().enumerate() {
+            assert_eq!(
+                *kind,
+                if index % 4 == 3 {
+                    crate::family::AttentionKind::Full
+                } else {
+                    crate::family::AttentionKind::DeltaNet
+                }
+            );
+        }
+        assert_eq!(shape.attn.heads_q, 24);
+        assert_eq!(shape.attn.heads_kv, 4);
+        assert_eq!(shape.attn.head_dim, 256);
+        assert_eq!(shape.attn.rotary_dim, 64);
+        assert_eq!(shape.delta.value_heads, 48);
+        assert_eq!(shape.dense_inter, Some(17_408));
+        assert!(super::shape_of(config.as_bytes(), &QWEN3_6_35B_A3B).is_err());
+        let q36 = super::shape_of(
+            include_bytes!("../../../../tests/fixtures/qwen3_6_35b_a3b_config.json"),
+            &QWEN3_6_35B_A3B,
+        )
+        .expect("unchanged Q36 executor shape");
+        assert_eq!(q36.hidden, 2048);
+        assert_eq!(q36.kinds.len(), 40);
+        assert_eq!(q36.attn.heads_q, 16);
+        assert_eq!(q36.attn.heads_kv, 2);
+        assert_eq!(q36.delta.value_heads, 32);
+        assert_eq!(q36.dense_inter, None);
+    }
+
+    fn settings_for(
+        options: Option<&Q36Options>,
+        env: &Q36Env,
+        backend: Backend,
+    ) -> Result<Q36Settings, EngError> {
+        Q36Settings::new(Path::new("/m"), Path::new("/t"), options, env, backend)
+    }
+
+    fn settings(options: Option<&Q36Options>, env: &Q36Env) -> Result<Q36Settings, EngError> {
+        settings_for(options, env, Backend::Mlx)
+    }
+
+    fn message(result: Result<Q36Settings, EngError>) -> String {
+        match result {
+            Err(EngError::BadRequest(text)) => text,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn error_text<T: std::fmt::Debug>(result: Result<T, EngError>) -> String {
+        match result {
+            Err(EngError::BadRequest(text)) => text,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn exl3_options(extra: impl FnOnce(&mut Q36Options)) -> Q36Options {
+        let mut options = Q36Options {
+            weight_format: Some("exl3".into()),
+            ..Q36Options::default()
+        };
+        extra(&mut options);
+        options
+    }
+
+    #[test]
+    fn the_weight_format_defaults_to_gguf_and_accepts_exactly_two_spellings() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            settings_for(None, &Q36Env::default(), Backend::Cuda)
+                .unwrap()
+                .weights,
+            super::WeightFormat::Gguf
+        );
+        for (text, want) in [
+            ("gguf", super::WeightFormat::Gguf),
+            ("exl3", super::WeightFormat::Exl3),
+        ] {
+            let got = cuda(Q36Options {
+                weight_format: Some(text.into()),
+                ..Q36Options::default()
+            })
+            .unwrap();
+            assert_eq!(got.weights, want);
+            assert_eq!(super::weight_format_name(want), text);
+        }
+        for bad in ["", "EXL3", "Gguf", " exl3", "exl3 ", "exl2", "safetensors"] {
+            let text = message(cuda(Q36Options {
+                weight_format: Some(bad.into()),
+                ..Q36Options::default()
+            }));
+            assert_eq!(
+                text,
+                format!("engine config: weight_format must be gguf or exl3, got {bad:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn speculation_is_off_unless_the_mode_says_otherwise() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let off = cuda(exl3_options(|_| ())).unwrap();
+        assert!(!off.speculation.enabled());
+        assert_eq!(off.speculation, SpecConfig::default());
+        // The members are checked even while a mode other than disabled is refused.
+        let members = cuda(exl3_options(|o| {
+            o.num_draft_tokens = Some(3);
+            o.ngram_match_min = Some(4);
+        }))
+        .unwrap();
+        assert!(!members.speculation.enabled());
+        assert_eq!(members.speculation.num_draft_tokens, 3);
+        assert_eq!(members.speculation.ngram_match_min, 4);
+    }
+
+    #[test]
+    fn ngram_drafting_is_accepted_and_mtp_waits_for_its_draft_step() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let on = cuda(exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.num_draft_tokens = Some(3);
+            o.ngram_match_min = Some(4);
+        }))
+        .unwrap();
+        assert!(on.speculation.enabled());
+        assert_eq!(on.speculation.num_draft_tokens, 3);
+        assert_eq!(on.speculation.ngram_match_min, 4);
+        let text = message(cuda(exl3_options(|o| {
+            o.draft_mode = Some("mtp".into());
+            o.mtp_model_dir = Some(PathBuf::from("/h"));
+        })));
+        assert_eq!(text, "engine config: draft_mode mtp has no draft step yet");
+    }
+
+    #[test]
+    fn the_mlx_arm_takes_ngram_but_not_the_device_rollback_or_mtp() {
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
+        let on = mlx(Q36Options {
+            draft_mode: Some("ngram".into()),
+            num_draft_tokens: Some(3),
+            cache_limit_bytes: Some(8 << 30),
+            ..Q36Options::default()
+        })
+        .unwrap();
+        assert!(on.speculation.enabled());
+        assert_eq!(on.speculation.num_draft_tokens, 3);
+        assert_eq!(on.draft_rollback, super::RollbackMode::Host);
+        assert_eq!(
+            message(mlx(Q36Options {
+                draft_mode: Some("ngram".into()),
+                draft_rollback: Some("device".into()),
+                ..Q36Options::default()
+            })),
+            "engine config: draft_rollback device is CUDA-only: the MLX arm rolls back with a \
+             shared-handle snapshot"
+        );
+        assert_eq!(
+            message(mlx(Q36Options {
+                draft_mode: Some("mtp".into()),
+                mtp_model_dir: Some(PathBuf::from("/h")),
+                ..Q36Options::default()
+            })),
+            "engine config: draft_mode mtp has no draft step yet"
+        );
+    }
+
+    #[test]
+    fn a_speculative_window_of_more_than_eight_rows_is_refused_by_name() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        for rows in [9, 16, 64] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_max_rows = Some(rows);
+            })));
+            assert!(
+                text.starts_with(&format!(
+                    "engine config: draft_max_rows {rows} exceeds 8: Qwen3.6 verify windows are capped at 8 rows"
+                )),
+                "{text}"
+            );
+            assert!(text.contains("not a qualification"), "{text}");
+        }
+    }
+
+    #[test]
+    fn eight_rows_are_accepted_as_a_cap_not_as_a_qualification() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        for rows in 2..=8 {
+            let on = cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_max_rows = Some(rows);
+            }))
+            .unwrap();
+            assert!(on.speculation.enabled());
+            assert_eq!(on.speculation.max_rows, rows as usize);
+            assert!(on.speculation.window_drafts() < QWEN36_MAX_WINDOW_ROWS);
+        }
+        assert_eq!(QWEN36_MAX_WINDOW_ROWS, 8);
+        let default_on = cuda(exl3_options(|o| o.draft_mode = Some("ngram".into()))).unwrap();
+        assert_eq!(
+            default_on.speculation.max_rows, QWEN36_MAX_WINDOW_ROWS,
+            "the default row cap is the Qwen3.6 cap: speculation on by default needs no override"
+        );
+    }
+
+    #[test]
+    fn draft_rollback_is_host_unless_the_member_says_device() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            cuda(exl3_options(|_| {})).unwrap().draft_rollback,
+            RollbackMode::Host
+        );
+        assert_eq!(
+            cuda(exl3_options(|o| o.draft_rollback = Some("host".into())))
+                .unwrap()
+                .draft_rollback,
+            RollbackMode::Host
+        );
+        let device = cuda(exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.draft_rollback = Some("device".into());
+        }))
+        .unwrap();
+        assert_eq!(device.draft_rollback, RollbackMode::Device);
+        assert_eq!(rollback_mode_name(device.draft_rollback), "device");
+        assert_eq!(rollback_mode_name(RollbackMode::default()), "host");
+    }
+
+    #[test]
+    fn draft_rollback_device_is_refused_without_speculation_and_with_an_unknown_value() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let text = message(cuda(exl3_options(|o| {
+            o.draft_rollback = Some("device".into())
+        })));
+        assert!(
+            text.contains("draft_rollback device needs draft_mode ngram"),
+            "{text}"
+        );
+        for bad_value in ["Device", "gpu", "", "1"] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_rollback = Some(bad_value.into());
+            })));
+            assert!(
+                text.contains("draft_rollback must be host or device"),
+                "{bad_value:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_rollback_device_is_refused_with_the_host_paged_kv() {
+        let speculation = SpecConfig::new(&SpecOptions {
+            draft_mode: Some("ngram".into()),
+            ..SpecOptions::default()
+        })
+        .unwrap();
+        let options = Q36Options {
+            draft_rollback: Some("device".into()),
+            ..Q36Options::default()
+        };
+        let text = format!(
+            "{:?}",
+            rollback_of(&options, &speculation, Some(1 << 30), Backend::Cuda).unwrap_err()
+        );
+        assert!(text.contains("kv_offload_host_bytes"), "{text}");
+        assert_eq!(
+            rollback_of(&options, &speculation, None, Backend::Cuda).unwrap(),
+            RollbackMode::Device
+        );
+    }
+
+    #[test]
+    fn draft_verify_is_eager_unless_the_member_says_krow() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            cuda(exl3_options(|_| {})).unwrap().draft_verify,
+            VerifyMode::Eager
+        );
+        assert_eq!(
+            cuda(exl3_options(|o| o.draft_verify = Some("eager".into())))
+                .unwrap()
+                .draft_verify,
+            VerifyMode::Eager
+        );
+        let krow = cuda(exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.draft_rollback = Some("device".into());
+            o.draft_verify = Some("krow".into());
+        }))
+        .unwrap();
+        assert_eq!(krow.draft_verify, VerifyMode::Krow);
+        assert_eq!(krow.draft_rollback, RollbackMode::Device);
+        assert_eq!(verify_mode_name(krow.draft_verify), "krow");
+        assert_eq!(verify_mode_name(VerifyMode::default()), "eager");
+    }
+
+    #[test]
+    fn draft_verify_krow_is_refused_without_the_device_rollback_and_with_an_unknown_value() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        // The default rollback is host; an explicit host is refused the same way.
+        for rollback in [None, Some("host")] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_rollback = rollback.map(Into::into);
+                o.draft_verify = Some("krow".into());
+            })));
+            assert!(
+                text.contains("draft_verify krow needs draft_rollback device"),
+                "{rollback:?}: {text}"
+            );
+        }
+        for bad_value in ["Krow", "k-row", "", "1", "device"] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_rollback = Some("device".into());
+                o.draft_verify = Some(bad_value.into());
+            })));
+            assert!(
+                text.contains("draft_verify must be eager or krow"),
+                "{bad_value:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_verify_krow_is_refused_without_the_exl3_pack() {
+        let options = Q36Options {
+            draft_verify: Some("krow".into()),
+            ..Q36Options::default()
+        };
+        let text = format!(
+            "{:?}",
+            verify_of(&options, RollbackMode::Device, WeightFormat::Gguf).unwrap_err()
+        );
+        assert!(text.contains("weight_format exl3"), "{text}");
+        assert_eq!(
+            verify_of(&options, RollbackMode::Device, WeightFormat::Exl3).unwrap(),
+            VerifyMode::Krow
+        );
+    }
+
+    #[test]
+    fn the_cap_is_confined_to_enabled_qwen36_speculation() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        // A disabled entry feeds no window: the generic 2..=64 range still applies and loads.
+        let off = cuda(exl3_options(|o| o.draft_max_rows = Some(64))).unwrap();
+        assert!(!off.speculation.enabled());
+        assert_eq!(off.speculation.max_rows, 64);
+        // The generic speculation range is not narrowed for other users of `SpecConfig`.
+        let wide = SpecConfig::new(&SpecOptions {
+            draft_mode: Some("ngram".into()),
+            draft_max_rows: Some(64),
+            ..SpecOptions::default()
+        })
+        .unwrap();
+        assert_eq!(wide.max_rows, 64);
+        // The step-side check is the same function, so a hand-made config meets the same cap.
+        assert!(check_window_rows(&wide).is_err());
+        assert!(check_window_rows(&SpecConfig::default()).is_ok());
+        let mut nine = wide.clone();
+        nine.max_rows = 9;
+        assert!(check_window_rows(&nine).is_err());
+        nine.max_rows = 8;
+        assert!(check_window_rows(&nine).is_ok());
+    }
+
+    #[test]
+    fn ngram_drafting_never_meets_a_host_paged_kv_cache() {
+        // A window exports the whole session state, which the host-paged cache cannot do. EXL3
+        // weights, the only weights a window runs on, already refuse that cache by name.
+        let options = exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.kv_dtype = Some("q8".into());
+            o.kv_offload_host_bytes = Some(1 << 30);
+        });
+        let text = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Cuda,
+        ));
+        assert_eq!(
+            text,
+            "engine config: weight_format exl3 does not support kv_offload_host_bytes"
+        );
+    }
+
+    #[test]
+    fn an_enabled_draft_mode_is_refused_where_no_window_runs() {
+        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the MLX arm with gguf";
+        let gguf = Q36Options {
+            draft_mode: Some("ngram".into()),
+            ..Q36Options::default()
+        };
+        let cuda_gguf = settings_for(Some(&gguf), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(message(cuda_gguf), want);
+        let exl3 = exl3_options(|o| o.draft_mode = Some("ngram".into()));
+        let mlx = settings_for(Some(&exl3), &Q36Env::default(), Backend::Mlx);
+        assert_eq!(
+            message(mlx),
+            "engine config: weight_format exl3 is CUDA-only"
+        );
+    }
+
+    #[test]
+    fn a_bad_speculation_member_is_named() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let text = message(cuda(exl3_options(|o| o.draft_mode = Some("model".into()))));
+        assert!(
+            text.contains("draft_mode must be disabled, ngram or mtp"),
+            "{text}"
+        );
+        let text = message(cuda(exl3_options(|o| o.num_draft_tokens = Some(0))));
+        assert!(text.contains("num_draft_tokens"), "{text}");
+        let text = message(cuda(exl3_options(|o| o.draft_mode = Some("mtp".into()))));
+        assert!(text.contains("mtp_model_dir"), "{text}");
+    }
+
+    #[test]
+    fn an_exl3_entry_is_refused_where_nothing_reads_it() {
+        let mlx = settings_for(
+            Some(&exl3_options(|_| ())),
+            &Q36Env::default(),
+            Backend::Mlx,
+        );
+        assert_eq!(
+            message(mlx),
+            "engine config: weight_format exl3 is CUDA-only"
+        );
+        let tiered = exl3_options(|o| {
+            o.tiered = Some(super::TieredOptions {
+                slots: Some(SlotRequest::Exactly(8)),
+                ..super::TieredOptions::default()
+            })
+        });
+        let paged = exl3_options(|o| {
+            o.kv_dtype = Some("q8".into());
+            o.kv_offload_host_bytes = Some(1 << 30);
+        });
+        for (options, key) in [(tiered, "tiered"), (paged, "kv_offload_host_bytes")] {
+            let text = message(settings_for(
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Cuda,
+            ));
+            assert_eq!(
+                text,
+                format!("engine config: weight_format exl3 does not support {key}")
+            );
+        }
+        let plain = settings_for(
+            Some(&exl3_options(|_| ())),
+            &Q36Env::default(),
+            Backend::Cuda,
+        );
+        assert_eq!(plain.unwrap().weights, super::WeightFormat::Exl3);
+        // Graph capture is accepted for an EXL3 entry: the step reads the picks on the device.
+        let captured = settings_for(
+            Some(&exl3_options(|o| o.capture = Some(true))),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .unwrap();
+        assert_eq!(captured.weights, super::WeightFormat::Exl3);
+        assert!(captured.capture);
+    }
+
+    #[test]
+    fn a_cuda_entry_captures_by_default_and_can_roll_back() {
+        let capture = |options: &Q36Options, backend| {
+            settings_for(Some(options), &Q36Env::default(), backend)
+                .unwrap()
+                .capture
+        };
+        // Unset: every CUDA entry captures (EXL3 and GGUF alike); an explicit false rolls back.
+        assert!(capture(&exl3_options(|_| ()), Backend::Cuda));
+        assert!(!capture(
+            &exl3_options(|o| o.capture = Some(false)),
+            Backend::Cuda
+        ));
+        assert!(capture(
+            &exl3_options(|o| o.capture = Some(true)),
+            Backend::Cuda
+        ));
+        let gguf = Q36Options::default();
+        assert!(capture(&gguf, Backend::Cuda));
+        assert!(!capture(
+            &Q36Options {
+                capture: Some(false),
+                ..Q36Options::default()
+            },
+            Backend::Cuda
+        ));
+    }
+
+    /// The rule derives its byte counts from the family spec and the cache form, never from a
+    /// literal.
+    #[test]
+    fn the_prefix_reuse_bytes_are_derived_from_the_family_spec() {
+        // 30 DeltaNet layers of a `[32, 128, 128]` state and an `[8192, 3]` ring, F32.
+        assert_eq!(
+            delta_state_bytes(&QWEN3_6_35B_A3B).unwrap(),
+            65_863_680,
+            "DeltaNet state bytes"
+        );
+        // 10 attention layers: the F32 control keeps `[1, 2, 1, 256]` keys and values, and the
+        // Q8 form charges 1,088 per layer and position at BF16 scales, 1,152 at F32 scales.
+        assert_eq!(
+            cache_growth_per_position(
+                &QWEN3_6_35B_A3B,
+                super::KvDtype::F32,
+                super::Activation::F32
+            )
+            .unwrap(),
+            40_960,
+            "cache bytes per position, F32 control"
+        );
+        assert_eq!(
+            cache_growth_per_position(
+                &QWEN3_6_35B_A3B,
+                super::KvDtype::Q8,
+                super::Activation::Bf16
+            )
+            .unwrap(),
+            10_880,
+            "cache bytes per position, Q8 with BF16 scales"
+        );
+        assert_eq!(
+            cache_growth_per_position(&QWEN3_6_35B_A3B, super::KvDtype::Q8, super::Activation::F32)
+                .unwrap(),
+            11_520,
+            "cache bytes per position, Q8 with F32 scales"
+        );
+    }
+
+    /// The rule accepts exactly `2 * growth_per_position * context_limit + fixed_bytes` and
+    /// refuses one byte below it.
+    #[test]
+    fn the_prefix_reuse_cap_rule_accepts_the_required_cap_and_refuses_one_byte_less() {
+        let required = 2 * 40_960 * u64::from(DEFAULT_CONTEXT_LIMIT) + 65_863_680;
+        assert_eq!(required, 2_750_218_240, "the required cap");
+        let enough = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(required),
+            ..f32_form_at_the_cuda_limit()
+        };
+        let passed = settings(Some(&enough), &Q36Env::default())
+            .unwrap()
+            .check_prefix_reuse_cap(true);
+        assert_eq!(passed, Ok(()), "the required cap passes");
+        let one_less = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(required - 1),
+            ..f32_form_at_the_cuda_limit()
+        };
+        let refused = settings(Some(&one_less), &Q36Env::default())
+            .unwrap()
+            .check_prefix_reuse_cap(true);
+        assert!(
+            refused.is_err(),
+            "one byte below the requirement: {refused:?}"
+        );
+    }
+
+    /// The refusal names the cap, the requirement, the context limit, and the hint.
+    #[test]
+    fn the_prefix_reuse_cap_error_names_the_cap_the_requirement_the_limit_and_the_hint() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(2_750_218_239),
+            ..f32_form_at_the_cuda_limit()
+        };
+        let refused = settings(Some(&options), &Q36Env::default())
+            .unwrap()
+            .check_prefix_reuse_cap(true);
+        assert_eq!(
+            error_text(refused),
+            "engine config: prefix_reuse needs session_cap_bytes of at least 2750218240 bytes for \
+             context limit 32768: 2 * 40960 cache bytes per position plus 65863680 DeltaNet bytes; \
+             the cap is 2750218239 bytes; raise session_cap_bytes"
+        );
+    }
+
+    /// The F32 control at 32,768 positions: the form and the limit that the first prefix-reuse
+    /// numbers (2,750,218,240 bytes) were derived for, stated because neither is the MLX default.
+    fn f32_form_at_the_cuda_limit() -> Q36Options {
+        Q36Options {
+            kv_dtype: Some("f32".to_string()),
+            context_limit: Some(DEFAULT_CONTEXT_LIMIT),
+            ..Q36Options::default()
+        }
+    }
+
+    /// The default MLX engine holds the 8-bit cache at 262,144 positions, so the prefix-reuse rule
+    /// asks for `2 * 10,880 * 262,144 + 65,863,680` = 5,770,117,120 bytes: more than the default
+    /// cap of 4 GiB, which covers one live session (2,917,990,400 bytes) but not the entry beside
+    /// it. The rule accepts the requirement and refuses one byte less, and the refusal names the
+    /// cap, the requirement, the limit, and the hint.
+    #[test]
+    fn the_default_engine_needs_a_larger_cap_for_prefix_reuse_and_the_error_says_so() {
+        let required = 2 * 10_880 * u64::from(MLX_DEFAULT_CONTEXT_LIMIT) + 65_863_680;
+        assert_eq!(
+            required, 5_770_117_120,
+            "the required cap of the default form"
+        );
+        assert!(
+            DEFAULT_SESSION_CAP < required,
+            "the default cap is below it"
+        );
+        assert!(
+            DEFAULT_SESSION_CAP >= 10_880 * u64::from(MLX_DEFAULT_CONTEXT_LIMIT) + 65_863_680,
+            "the default cap covers one live session of the default form"
+        );
+        let at_default_cap = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
+        assert_eq!(
+            error_text(at_default_cap.check_prefix_reuse_cap(true)),
+            "engine config: prefix_reuse needs session_cap_bytes of at least 5770117120 bytes for \
+             context limit 262144: 2 * 10880 cache bytes per position plus 65863680 DeltaNet \
+             bytes; the cap is 4294967296 bytes; raise session_cap_bytes"
+        );
+        let enough = Q36Options {
+            session_cap_bytes: Some(required),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings(Some(&enough), &Q36Env::default())
+                .unwrap()
+                .check_prefix_reuse_cap(true),
+            Ok(()),
+            "the requirement passes"
+        );
+        let one_less = Q36Options {
+            session_cap_bytes: Some(required - 1),
+            ..with_limit()
+        };
+        assert!(
+            settings(Some(&one_less), &Q36Env::default())
+                .unwrap()
+                .check_prefix_reuse_cap(true)
+                .is_err(),
+            "one byte below the requirement is refused"
+        );
+    }
+
+    /// The CUDA arm has no session cap (it is 0 and ignored), so the rule must not refuse it: a
+    /// CUDA start with the flag on passes at the default limit of 32,768 and at 40,960, the limit
+    /// that the 33,650-token pi transcript of the 3090 gate needs. A cap of 1 byte on the MLX arm
+    /// is refused, which shows that the backend alone decides.
+    #[test]
+    fn the_prefix_reuse_cap_rule_does_not_apply_to_the_cuda_arm() {
+        for limit in [DEFAULT_CONTEXT_LIMIT, 40_960] {
+            let options = Q36Options {
+                context_limit: Some(limit),
+                ..Q36Options::default()
+            };
+            let cuda = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda).unwrap();
+            assert_eq!(cuda.session_cap, 0, "the CUDA arm has no session cap");
+            assert_eq!(
+                cuda.check_prefix_reuse_cap(true),
+                Ok(()),
+                "CUDA, context limit {limit}"
+            );
+        }
+        let mlx_options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(1),
+            ..Q36Options::default()
+        };
+        let mlx = settings(Some(&mlx_options), &Q36Env::default()).unwrap();
+        assert!(
+            mlx.check_prefix_reuse_cap(true).is_err(),
+            "the MLX arm still refuses a cap of 1 byte"
+        );
+    }
+
+    /// Without the flag the rule does not apply, whatever the cap is.
+    #[test]
+    fn the_prefix_reuse_cap_rule_is_off_when_the_flag_is_off() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(1),
+            ..Q36Options::default()
+        };
+        let passed = settings(Some(&options), &Q36Env::default())
+            .unwrap()
+            .check_prefix_reuse_cap(false);
+        assert_eq!(passed, Ok(()), "the flag is off");
+    }
+
+    #[test]
+    fn an_object_with_a_cache_limit_takes_the_defaults() {
+        let got = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
+        assert_eq!(
+            got,
+            Q36Settings {
+                spec: QWEN3_6_35B_A3B,
+                artifact: PathBuf::from("/m"),
+                tokenizer_dir: PathBuf::from("/t"),
+                cache_limit: 1024,
+                cuda_devices: vec![0],
+                kv_cache: None,
+                context_limit: 262_144,
+                session_cap: 4 << 30,
+                prefill_chunk: 256,
+                prefill_budget: None,
+                prefill_reserve: 0,
+                activation: super::Activation::Bf16,
+                kv: super::KvDtype::Q8,
+                kv_auto: false,
+                context_auto: false,
+                kv_offload_host_bytes: None,
+                capture: false,
+                compile: false,
+                compile_program_limit: Default::default(),
+                max_seqs: 1,
+                max_seqs_set: false,
+                prefix_store_entries: None,
+                backend: Backend::Mlx,
+                prefix_reuse: false,
+                tiered: None,
+                expert_bank: None,
+                weights: super::WeightFormat::Gguf,
+                gguf_sha256: None,
+                speculation: SpecConfig::default(),
+                draft_rollback: RollbackMode::Host,
+                draft_verify: VerifyMode::Eager,
+                ignored_mlx_keys: Vec::new(),
+                derived: Vec::new(),
+                host_note: None,
+                mlx_staged_cap: None,
+            }
+        );
+        assert_eq!(MLX_DEFAULT_CONTEXT_LIMIT, 262_144);
+        assert_eq!(
+            DEFAULT_CONTEXT_LIMIT, 32_768,
+            "the CUDA arm keeps its limit"
+        );
+        assert_eq!(DEFAULT_SESSION_CAP, 4_294_967_296);
+        assert_eq!(DEFAULT_PREFILL_CHUNK, 256);
+        assert_eq!(BF16_DEFAULT_PREFILL_CHUNK, 256);
+        assert_eq!(NO_BUDGET_PIECE, 16);
+        // The reserve of `config/qwen36-mac-studio-36gb.json` is a plan sum (see its README): the
+        // 8-bit cache at 262,144 positions, the DeltaNet state, the cache limit of the file, and
+        // the pressure margin.
+        assert_eq!(262_144u64 * 10_880, 2_852_126_720);
+        assert_eq!(
+            2_852_126_720u64 + 65_863_680 + 4_294_967_296 + (1 << 30),
+            8_286_699_520
+        );
+    }
+
+    /// The `prefix_reuse` member of the settings: `new` leaves it false on both backends, because
+    /// no config member or environment key carries the flag; the factory sets it after `new` from
+    /// the process-wide flag of the configuration file.
+    #[test]
+    fn the_settings_default_prefix_reuse_to_false() {
+        for backend in [Backend::Mlx, Backend::Cuda] {
+            let options = match backend {
+                Backend::Mlx => with_limit(),
+                Backend::Cuda => Q36Options::default(),
+            };
+            let got = settings_for(Some(&options), &Q36Env::default(), backend)
+                .map(|got| got.prefix_reuse)
+                .unwrap_or_else(|_| panic!("{backend:?} settings must build"));
+            assert!(!got, "{backend:?}: the factory sets the flag after `new`");
+        }
+    }
+
+    /// BF16 serving policy: without a `prefill_chunk` the default chunk is 256 for a BF16 engine
+    /// and for an F32 engine; an explicit `prefill_chunk` wins for both. The shipped config leaves
+    /// the member absent.
+    #[test]
+    fn the_default_chunk_depends_on_the_activation_and_an_explicit_chunk_wins() {
+        let bf16 = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
+        assert_eq!(
+            bf16.activation,
+            super::Activation::Bf16,
+            "the default activation"
+        );
+        assert_eq!(bf16.prefill_chunk, 256, "BF16 default: the chunk of F32");
+        let f32 = Q36Options {
+            activation_dtype: Some("f32".to_string()),
+            ..with_limit()
+        };
+        let got = settings(Some(&f32), &Q36Env::default()).unwrap();
+        assert_eq!(got.prefill_chunk, 256, "F32 default");
+        for activation in ["bf16", "f32"] {
+            let options = Q36Options {
+                activation_dtype: Some(activation.to_string()),
+                prefill_chunk: Some(64),
+                ..with_limit()
+            };
+            let got = settings(Some(&options), &Q36Env::default()).unwrap();
+            assert_eq!(
+                got.prefill_chunk, 64,
+                "an explicit chunk wins for {activation}"
+            );
+        }
+        let maximum = Q36Options {
+            prefill_chunk: Some(1024),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings(Some(&maximum), &Q36Env::default())
+                .unwrap()
+                .prefill_chunk,
+            1024,
+            "the maximum accepted chunk"
+        );
+    }
+
+    #[test]
+    fn every_member_of_the_object_overrides_its_default() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(5),
+            context_limit: Some(65_536),
+            session_cap_bytes: Some(3_000_000_000),
+            prefill_chunk: Some(64),
+            prefill_budget_bytes: Some(30_000_000_000),
+            prefill_session_reserve_bytes: Some(7),
+            prefix_store_entries: Some(9),
+            activation_dtype: Some("f32".to_string()),
+            kv_dtype: Some("q8".to_string()),
+            kv_offload_host_bytes: None,
+            capture: Some(true),
+            compile: Some(true),
+            max_seqs: Some(4),
+            tiered: None,
+            weight_format: None,
+            ..Q36Options::default()
+        };
+        let got = settings(Some(&options), &Q36Env::default()).unwrap();
+        assert_eq!(got.cache_limit, 5);
+        assert_eq!(got.context_limit, 65_536);
+        assert_eq!(got.session_cap, 3_000_000_000);
+        assert_eq!(got.prefill_chunk, 64);
+        assert_eq!(got.prefill_budget, Some(30_000_000_000));
+        assert_eq!(got.prefill_reserve, 7);
+        assert_eq!(got.activation, super::Activation::F32);
+        assert_eq!(got.kv, super::KvDtype::Q8, "the kv_dtype member overrides");
+        assert!(got.capture, "every member of the object overrides");
+        assert!(got.compile, "compile: every member of the object overrides");
+        assert_eq!(got.max_seqs, 4);
+        assert_eq!(got.prefix_store_entries, Some(9));
+        assert_eq!(got.artifact, PathBuf::from("/m"));
+        assert_eq!(got.tokenizer_dir, PathBuf::from("/t"));
+    }
+
+    /// The compile key: the default is false (the shipped Mac file sets true, pinned by
+    /// `the_shipped_mac_studio_config_passes_every_check_before_the_backend`), the MLX arm reads
+    /// the member, and the CUDA arm keeps false and records the key for its start line.
+    #[test]
+    fn the_compile_key_defaults_to_false_the_mlx_arm_reads_it_and_the_cuda_arm_ignores_it() {
+        let off = settings_for(Some(&with_limit()), &Q36Env::default(), Backend::Mlx).unwrap();
+        assert!(!off.compile, "compile is off without the member");
+        let on = Q36Options {
+            compile: Some(true),
+            ..with_limit()
+        };
+        assert!(
+            settings_for(Some(&on), &Q36Env::default(), Backend::Mlx)
+                .unwrap()
+                .compile,
+            "the MLX arm reads the member"
+        );
+        // A CUDA entry with only the compile key: no other MLX key is set, so the ignored list
+        // names the compile key alone.
+        let cuda_only: Q36Options = serde_json::from_str("{\"compile\": true}").unwrap();
+        let got = settings_for(Some(&cuda_only), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert!(!got.compile, "the CUDA arm keeps the compile seam off");
+        assert_eq!(
+            got.ignored_mlx_keys,
+            vec!["compile"],
+            "the CUDA arm records the key for its start line"
+        );
+        let unknown = serde_json::from_str::<Q36Options>("{\"compile\": 1}");
+        assert!(unknown.is_err(), "the member is a boolean, not a count");
+    }
+
+    #[test]
+    fn concurrent_sessions_are_opt_in_and_require_compiled_mlx() {
+        let env = Q36Env::default();
+        let mut options = with_limit();
+        for backend in [Backend::Mlx, Backend::Cuda] {
+            assert_eq!(
+                settings_for(Some(&options), &env, backend)
+                    .unwrap()
+                    .max_seqs,
+                1
+            );
+        }
+        options.max_seqs = Some(4);
+        assert!(message(settings(Some(&options), &env)).contains("compile=true"));
+        options.compile = Some(true);
+        let cuda = settings_for(Some(&options), &env, Backend::Cuda).unwrap();
+        assert_eq!((cuda.max_seqs, cuda.max_seqs_set), (4, true));
+        let unset = settings_for(Some(&with_limit()), &env, Backend::Cuda).unwrap();
+        assert_eq!((unset.max_seqs, unset.max_seqs_set), (1, false));
+        assert!(message(settings(Some(&options), &env)).contains("prefill_budget_bytes"));
+        options.prefill_budget_bytes = Some(8 << 30);
+        options.prefill_session_reserve_bytes = Some(0);
+        assert_eq!(settings(Some(&options), &env).unwrap().max_seqs, 4);
+        options.prefill_chunk = Some(1);
+        assert!(message(settings(Some(&options), &env)).contains("prefill_chunk"));
+        options.prefill_chunk = Some(2);
+        for value in [0, 9] {
+            options.max_seqs = Some(value);
+            assert!(message(settings(Some(&options), &env)).contains("max_seqs"));
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(2.5),
+            serde_json::json!("4"),
+        ] {
+            assert!(
+                serde_json::from_value::<Q36Options>(serde_json::json!({"max_seqs": value}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_sessions_refuse_unplannable_chunk_bounds_before_io() {
+        let env = Q36Env::default();
+        for chunk in [1, 2, 3, 4] {
+            let mut options = Q36Options {
+                compile: Some(true),
+                max_seqs: Some(4),
+                prefill_chunk: Some(chunk),
+                prefill_budget_bytes: Some(8 << 30),
+                prefill_session_reserve_bytes: Some(0),
+                ..with_limit()
+            };
+            let result = settings(Some(&options), &env);
+            if chunk < 4 {
+                assert!(message(result).contains("prefill_chunk"), "chunk {chunk}");
+            } else {
+                assert!(result.is_ok(), "chunk {chunk}");
+            }
+            options.max_seqs = Some(1);
+            assert!(settings(Some(&options), &env).is_ok(), "solo chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn concurrent_sessions_refuse_exhausted_prefill_reserves_before_io() {
+        let env = Q36Env::default();
+        for (cap, reserve, budget, admitted) in [
+            (8, 0, 9, true),
+            (8, 0, 8, false),
+            (8, 0, 7, false),
+            (1, 8, 9, true),
+            (1, 8, 8, false),
+            (1, 8, 7, false),
+            (u64::MAX, 0, u64::MAX, false),
+            (1, u64::MAX, u64::MAX, false),
+        ] {
+            let mut options = Q36Options {
+                compile: Some(true),
+                max_seqs: Some(4),
+                prefill_chunk: Some(4),
+                session_cap_bytes: Some(cap),
+                prefill_budget_bytes: Some(budget),
+                prefill_session_reserve_bytes: Some(reserve),
+                ..with_limit()
+            };
+            let result = settings(Some(&options), &env);
+            if admitted {
+                assert!(
+                    result.is_ok(),
+                    "cap {cap}, reserve {reserve}, budget {budget}"
+                );
+            } else {
+                assert!(message(result).contains("prefill_budget_bytes"));
+            }
+            options.max_seqs = Some(1);
+            assert!(settings(Some(&options), &env).is_ok(), "solo reserve floor");
+        }
+    }
+
+    #[test]
+    fn the_environment_fills_the_cache_limit_and_the_object_wins() {
+        let env = Q36Env {
+            cache_limit: Some("77".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(settings(None, &env).unwrap().cache_limit, 77);
+        assert_eq!(
+            settings(Some(&with_limit()), &env).unwrap().cache_limit,
+            1024,
+            "the object wins"
+        );
+    }
+
+    #[test]
+    fn the_geometric_checkpoint_window_combination_is_refused_at_open() {
+        let both = Q36Env {
+            kv_geometric: Some("1".to_string()),
+            spec_step_window: Some("2".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &both)),
+            "engine config: Q36_KV_GEOMETRIC=1 with Q36_SPEC_STEP_WINDOW=2 is not supported: \
+             the checkpoint-window commit is not yet supported under the geometric law"
+        );
+    }
+
+    #[test]
+    fn each_window_or_geometric_variable_alone_still_opens() {
+        // Each alone must reach the LATER per-arm validation (here: the MLX cache-limit
+        // refusal), proving the combination guard refused nothing by itself.
+        let geometric_alone = Q36Env {
+            kv_geometric: Some("1".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &geometric_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let window_alone = Q36Env {
+            spec_step_window: Some("2".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &window_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let window_step_alone = Q36Env {
+            spec_step_window: Some("1".to_string()),
+            kv_geometric: Some("1".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &window_step_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set",
+            "the =1 step window is not the checkpoint window and stays allowed"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_bad_cache_limit_names_the_key_and_the_variable() {
+        assert_eq!(
+            message(settings(None, &Q36Env::default())),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let empty = Q36Env {
+            cache_limit: Some(String::new()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &empty)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let env = Q36Env {
+            cache_limit: Some("many".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &env)),
+            "engine config: Q36_CACHE_LIMIT is not a byte count"
+        );
+    }
+
+    #[test]
+    fn a_cache_limit_of_zero_is_refused() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(0),
+            ..Q36Options::default()
+        };
+        assert_eq!(
+            message(settings(Some(&options), &Q36Env::default())),
+            "engine config: the cache limit must be above 0"
+        );
+    }
+
+    #[test]
+    fn the_numeric_members_are_range_checked_and_name_the_key() {
+        let cases = [
+            (
+                Q36Options {
+                    context_limit: Some(1),
+                    ..with_limit()
+                },
+                "context_limit must be between 2 and 4294967295, found 1",
+            ),
+            (
+                Q36Options {
+                    prefill_chunk: Some(0),
+                    ..with_limit()
+                },
+                "prefill_chunk must be between 1 and 2048, found 0",
+            ),
+            (
+                Q36Options {
+                    prefill_chunk: Some(2049),
+                    ..with_limit()
+                },
+                "prefill_chunk must be between 1 and 2048, found 2049",
+            ),
+            (
+                Q36Options {
+                    session_cap_bytes: Some(0),
+                    ..with_limit()
+                },
+                "session_cap_bytes must be between 1 and 18446744073709551615, found 0",
+            ),
+        ];
+        for (options, want) in cases {
+            let got = message(settings(Some(&options), &Q36Env::default()));
+            assert_eq!(got, format!("engine config: {want}"));
+        }
+    }
+
+    #[test]
+    fn the_mlx_first_error_order_is_budget_reserve_cache_context_session_chunk() {
+        // The base order: budget, reserve, cache_limit, context_limit, session_cap, prefill_chunk.
+        // `cache_limit` is computed before `context_limit`, so a config with BOTH faults names the
+        // cache-limit fault first — a missing limit (no key, no env) or a zero one against
+        // `context_limit: 1` — and `{context_limit: 1, prefill_chunk: 0}` names `context_limit`
+        // before the chunk.
+        let both = Q36Options {
+            context_limit: Some(1),
+            prefill_chunk: Some(0),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings(Some(&both), &Q36Env::default())),
+            "engine config: context_limit must be between 2 and 4294967295, found 1"
+        );
+        let all = Q36Options {
+            context_limit: Some(1),
+            session_cap_bytes: Some(0),
+            prefill_chunk: Some(0),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings(Some(&all), &Q36Env::default())),
+            "engine config: context_limit must be between 2 and 4294967295, found 1"
+        );
+        // The two pairs with a FAULTING cache limit pin the flip the cases above cannot
+        // see (`with_limit()` never faults the cache limit): the cache-limit fault wins.
+        let no_limit = Q36Options {
+            context_limit: Some(1),
+            ..Q36Options::default()
+        };
+        assert_eq!(
+            message(settings(Some(&no_limit), &Q36Env::default())),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let zero_limit = Q36Options {
+            cache_limit_bytes: Some(0),
+            context_limit: Some(1),
+            ..Q36Options::default()
+        };
+        assert_eq!(
+            message(settings(Some(&zero_limit), &Q36Env::default())),
+            "engine config: the cache limit must be above 0"
+        );
+    }
+
+    #[test]
+    fn the_object_reads_from_json_and_rejects_an_unknown_member() {
+        let text = r#"{"cache_limit_bytes": 7, "context_limit": 4096, "session_cap_bytes": 9, "prefill_chunk": 3}"#;
+        let options: Q36Options = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            options,
+            Q36Options {
+                cache_limit_bytes: Some(7),
+                context_limit: Some(4096),
+                session_cap_bytes: Some(9),
+                prefill_chunk: Some(3),
+                ..Q36Options::default()
+            }
+        );
+        let error = serde_json::from_str::<Q36Options>(r#"{"manifest": "/m"}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `manifest`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_prefill_budget_must_be_positive_and_a_reserve_needs_a_budget() {
+        let zero = Q36Options {
+            prefill_budget_bytes: Some(0),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings(Some(&zero), &Q36Env::default())),
+            "engine config: prefill_budget_bytes must be between 1 and 18446744073709551615, found 0"
+        );
+        let alone = Q36Options {
+            prefill_session_reserve_bytes: Some(5),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings(Some(&alone), &Q36Env::default())),
+            "engine config: prefill_session_reserve_bytes needs prefill_budget_bytes"
+        );
+        let unreserved = Q36Options {
+            prefill_budget_bytes: Some(5),
+            ..with_limit()
+        };
+        // A budget without a reserve derives one (and, like an explicit
+        // reserve above the budget, is accepted: the planner then plans
+        // no chunk, exactly as an explicit pair would).
+        let derived = settings(Some(&unreserved), &Q36Env::default()).unwrap();
+        assert_eq!(derived.prefill_budget, Some(5));
+        assert!(derived.prefill_reserve > 5, "derived, not zero");
+        let both = Q36Options {
+            prefill_budget_bytes: Some(1),
+            prefill_session_reserve_bytes: Some(0),
+            ..with_limit()
+        };
+        let got = settings(Some(&both), &Q36Env::default()).unwrap();
+        assert_eq!((got.prefill_budget, got.prefill_reserve), (Some(1), 0));
+    }
+
+    #[test]
+    fn the_derived_reserve_reproduces_the_shipped_mac_profile() {
+        // `config/qwen36-mac-studio-36gb.json` with the reserve member
+        // removed must resolve to the file's hand-summed reserve.
+        let options = Q36Options {
+            cache_limit_bytes: Some(4_294_967_296),
+            context_limit: Some(262_144),
+            session_cap_bytes: Some(4_294_967_296),
+            prefill_budget_bytes: Some(32_212_254_720),
+            kv_dtype: Some("q8".into()),
+            activation_dtype: Some("bf16".into()),
+            ..Q36Options::default()
+        };
+        let derived = settings(Some(&options), &Q36Env::default()).unwrap();
+        assert_eq!(derived.prefill_reserve, 8_286_699_520);
+        // And with the member present, resolution is byte-identical.
+        let explicit = settings(
+            Some(&Q36Options {
+                prefill_session_reserve_bytes: Some(8_286_699_520),
+                ..options
+            }),
+            &Q36Env::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                explicit.prefill_budget,
+                explicit.prefill_reserve,
+                explicit.session_cap,
+                explicit.context_limit
+            ),
+            (
+                derived.prefill_budget,
+                derived.prefill_reserve,
+                derived.session_cap,
+                derived.context_limit
+            )
+        );
+    }
+
+    #[test]
+    fn the_shipped_config_files_resolve_unchanged() {
+        // Byte-for-byte parity for the configurations the repository
+        // ships: explicit files must not move when derivations exist.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+        let mac: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("qwen36-mac-studio-36gb.json")).unwrap(),
+        )
+        .unwrap();
+        let options: Q36Options =
+            serde_json::from_value(mac["engines"][0]["qwen36"].clone()).unwrap();
+        let got = settings(Some(&options), &Q36Env::default()).unwrap();
+        assert_eq!(got.cache_limit, 4_294_967_296);
+        assert_eq!(got.context_limit, 262_144);
+        assert_eq!(got.session_cap, 4_294_967_296);
+        assert_eq!(got.prefill_budget, Some(32_212_254_720));
+        assert_eq!(got.prefill_reserve, 8_286_699_520);
+
+        let cuda: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("qwen36-cuda-3090-kv8-prefix-262k.json")).unwrap(),
+        )
+        .unwrap();
+        let options: Q36Options =
+            serde_json::from_value(cuda["engines"][0]["qwen36"].clone()).unwrap();
+        let got = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.context_limit, 262_144);
+        assert_eq!(
+            (got.prefill_budget, got.prefill_reserve, got.session_cap),
+            (None, 0, 0)
+        );
+        assert_eq!(kv_dtype_name(got.kv), "q8");
+    }
+
+    #[test]
+    fn the_prefill_reserve_member_wins_over_the_derivation() {
+        let off = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
+        assert_eq!((off.prefill_budget, off.prefill_reserve), (None, 0));
+        let options = Q36Options {
+            cache_limit_bytes: Some(24),
+            session_cap_bytes: Some(1000),
+            prefill_budget_bytes: Some(5000),
+            prefill_session_reserve_bytes: Some(77),
+            ..Q36Options::default()
+        };
+        let got = settings(Some(&options), &Q36Env::default()).unwrap();
+        assert_eq!(got.prefill_reserve, 77, "not the cap plus the cache limit");
+        let max = Q36Options {
+            prefill_session_reserve_bytes: Some(u64::MAX),
+            ..options
+        };
+        let got = settings(Some(&max), &Q36Env::default()).unwrap();
+        assert_eq!(got.prefill_reserve, u64::MAX);
+    }
+
+    #[test]
+    fn the_prefill_members_read_from_json() {
+        let text =
+            r#"{"prefill_budget_bytes": 32212254720, "prefill_session_reserve_bytes": 6776750080}"#;
+        let options: Q36Options = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            options,
+            Q36Options {
+                prefill_budget_bytes: Some(32_212_254_720),
+                prefill_session_reserve_bytes: Some(6_776_750_080),
+                ..Q36Options::default()
+            }
+        );
+    }
+
+    #[test]
+    fn activation_dtype_parses_f32_and_bf16_and_the_default_is_bf16() {
+        let bf16 = Q36Options {
+            activation_dtype: Some("bf16".to_string()),
+            ..with_limit()
+        };
+        let f32 = Q36Options {
+            activation_dtype: Some("f32".to_string()),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings(Some(&bf16), &Q36Env::default())
+                .unwrap()
+                .activation,
+            super::Activation::Bf16
+        );
+        assert_eq!(
+            settings(Some(&f32), &Q36Env::default()).unwrap().activation,
+            super::Activation::F32
+        );
+        assert_eq!(
+            settings(Some(&with_limit()), &Q36Env::default())
+                .unwrap()
+                .activation,
+            super::Activation::Bf16,
+            "bf16 is the serving default"
+        );
+        assert_eq!(activation_of(None).unwrap(), super::Activation::Bf16);
+        assert_eq!(activation_name(super::Activation::Bf16), "bf16");
+        assert_eq!(activation_name(super::Activation::F32), "f32");
+    }
+
+    /// Hand-derived: the per-layer, per-position charge of both cache forms. The real model is KVH
+    /// 2, D 256 — codes `2 * 256 * 2 = 1,024` bytes, scales and biases
+    /// `2 sides * 2 arrays * 2 * 4 groups * scale_bytes`, so 64 bytes at BF16 scales (2) and 128 at
+    /// F32 scales (4): 1,088 and 1,152 per layer and position, 10,880 and 11,520 over the 10
+    /// attention layers. The F32 form stays the control at 4,096 and 40,960, and a head dimension
+    /// below the group (TINY_GQA's 32) refuses the Q8 form.
+    #[test]
+    fn the_growth_bytes_derive_both_cache_forms_by_hand() {
+        use super::{Activation, KvDtype, kv_growth_per_position};
+        // The F32 control: the tiny GQA layer (2 heads of 32) and the real layer (2 of 256).
+        assert_eq!(
+            kv_growth_per_position(2, 32, KvDtype::F32, Activation::F32).unwrap(),
+            512
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 256, KvDtype::F32, Activation::F32).unwrap(),
+            4_096
+        );
+        // The Q8 form, both activation dtypes: the tiny KV8 fixture (2 heads of 64) and the
+        // real layer (2 of 256). The fixture: codes 2 * 64 * 2 = 256 bytes, plus scales and
+        // biases 2 sides * 2 arrays * 2 * 1 group * scale_bytes — 32 at F32, 16 at BF16.
+        assert_eq!(
+            kv_growth_per_position(2, 64, KvDtype::Q8, Activation::F32).unwrap(),
+            288
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 64, KvDtype::Q8, Activation::Bf16).unwrap(),
+            272
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 256, KvDtype::Q8, Activation::Bf16).unwrap(),
+            1_088
+        );
+        assert_eq!(
+            kv_growth_per_position(2, 256, KvDtype::Q8, Activation::F32).unwrap(),
+            1_152
+        );
+        // Over the 10 attention layers of the real model, both forms.
+        assert_eq!(
+            10 * kv_growth_per_position(2, 256, KvDtype::F32, Activation::F32).unwrap(),
+            40_960
+        );
+        assert_eq!(
+            10 * kv_growth_per_position(2, 256, KvDtype::Q8, Activation::Bf16).unwrap(),
+            10_880
+        );
+        assert_eq!(
+            10 * kv_growth_per_position(2, 256, KvDtype::Q8, Activation::F32).unwrap(),
+            11_520
+        );
+        // The 8-bit cache sizing: 2.85 GB at 262,144 positions instead of 10.7 GB.
+        assert_eq!(10_880u64 * 262_144, 2_852_126_720);
+        assert_eq!(40_960u64 * 262_144, 10_737_418_240);
+        // A head dimension below the group refuses the Q8 form (TINY_GQA's 32), naming the
+        // setting.
+        let refused = kv_growth_per_position(2, 32, KvDtype::Q8, Activation::F32);
+        assert!(
+            matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("kv_dtype q8") && m.contains("multiple of 64")),
+            "the head-dimension rule: {refused:?}"
+        );
+        // An overflow of either form is MemoryPlan: the F32 form at the extremes, the Q8 form
+        // with a head dimension of 2^31 lanes (a multiple of 64 whose codes alone overflow).
+        assert!(kv_growth_per_position(u32::MAX, u32::MAX, KvDtype::F32, Activation::F32).is_err());
+        assert!(kv_growth_per_position(u32::MAX, 1 << 31, KvDtype::Q8, Activation::Bf16).is_err());
+    }
+
+    /// The `kv_dtype` pairs with `activation_dtype` freely: the Q8 scales follow the activation
+    /// dtype, so all four combinations are legal settings.
+    #[test]
+    fn every_kv_dtype_pairs_with_every_activation_dtype() {
+        for kv in [super::KvDtype::F32, super::KvDtype::Q8] {
+            for (text, act) in [
+                ("f32", super::Activation::F32),
+                ("bf16", super::Activation::Bf16),
+            ] {
+                let options = Q36Options {
+                    activation_dtype: Some(text.to_string()),
+                    kv_dtype: Some(kv_dtype_name(kv).to_string()),
+                    ..with_limit()
+                };
+                let got = settings(Some(&options), &Q36Env::default()).unwrap();
+                assert_eq!(
+                    (got.activation, got.kv),
+                    (act, kv),
+                    "the pair {text}/{kv:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_activation_dtype_is_refused_with_the_member_style() {
+        for text in ["f16", "BF16", ""] {
+            let options = Q36Options {
+                activation_dtype: Some(text.to_string()),
+                ..with_limit()
+            };
+            assert_eq!(
+                message(settings(Some(&options), &Q36Env::default())),
+                format!("engine config: activation_dtype must be f32 or bf16, got {text:?}"),
+                "the text {text:?}"
+            );
+        }
+        let json = r#"{"activation_dtype": "bf16"}"#;
+        let options: Q36Options = serde_json::from_str(json).unwrap();
+        assert_eq!(options.activation_dtype.as_deref(), Some("bf16"));
+    }
+
+    /// `kv_dtype` parses `f32` and `q8`, reads from JSON, and refuses any other text in the style
+    /// of its neighbors. The default is `q8` on the MLX arm (where the 8-bit cache passed its
+    /// quality gate; the F32 control stays one member away) and `f32` on the CUDA arm (the default
+    /// flips to q8 only after the 8-bit cache passes the gate there).
+    #[test]
+    fn kv_dtype_parses_f32_and_q8_and_the_default_is_q8_on_mlx_and_f32_on_cuda() {
+        for (text, want) in [("f32", super::KvDtype::F32), ("q8", super::KvDtype::Q8)] {
+            let options = Q36Options {
+                kv_dtype: Some(text.to_string()),
+                ..with_limit()
+            };
+            assert_eq!(
+                settings(Some(&options), &Q36Env::default()).unwrap().kv,
+                want,
+                "the text {text}"
+            );
+        }
+        assert_eq!(
+            settings(Some(&with_limit()), &Q36Env::default())
+                .unwrap()
+                .kv,
+            super::KvDtype::Q8,
+            "the MLX default is the 8-bit cache"
+        );
+        assert_eq!(kv_dtype_of(None, Backend::Mlx).unwrap(), super::KvDtype::Q8);
+        assert_eq!(
+            kv_dtype_of(None, Backend::Cuda).unwrap(),
+            super::KvDtype::F32,
+            "the CUDA default is the F32 cache"
+        );
+        assert_eq!(
+            kv_dtype_of(Some("f32"), Backend::Mlx).unwrap(),
+            super::KvDtype::F32,
+            "an explicit f32 selects the control on the MLX arm"
+        );
+        assert_eq!(
+            kv_dtype_of(Some("q8"), Backend::Cuda).unwrap(),
+            super::KvDtype::Q8,
+            "parsing does not decide availability; the CUDA start maps q8 onto Int8G32"
+        );
+        assert_eq!(kv_dtype_name(super::KvDtype::F32), "f32");
+        assert_eq!(kv_dtype_name(super::KvDtype::Q8), "q8");
+        assert_eq!(parse_kv_dtype("f32").unwrap(), super::KvDtype::F32);
+        let json = r#"{"kv_dtype": "q8"}"#;
+        let options: Q36Options = serde_json::from_str(json).unwrap();
+        assert_eq!(options.kv_dtype.as_deref(), Some("q8"));
+    }
+
+    #[test]
+    fn a_bad_kv_dtype_is_refused_with_the_member_style() {
+        for text in ["f16", "Q8", "int8", ""] {
+            let options = Q36Options {
+                kv_dtype: Some(text.to_string()),
+                ..with_limit()
+            };
+            assert_eq!(
+                message(settings(Some(&options), &Q36Env::default())),
+                format!("engine config: kv_dtype must be f32, bf16, or q8, got {text:?}"),
+                "the text {text:?}"
+            );
+        }
+    }
+
+    /// The CUDA arm refuses an unknown `kv_dtype` text at its own arm too.
+    #[test]
+    fn the_cuda_arm_refuses_an_unknown_kv_dtype_text_at_its_own_member() {
+        let options = Q36Options {
+            kv_dtype: Some("int8".to_string()),
+            ..with_limit()
+        };
+        assert_eq!(
+            message(settings_for(
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Cuda
+            )),
+            "engine config: kv_dtype must be f32, bf16, or q8, got \"int8\"",
+        );
+    }
+
+    #[test]
+    fn the_scale_pairing_rule_accepts_only_the_matching_pair() {
+        // The real model: 431 packed weights, each with a scale and a bias tensor, 862 parts.
+        assert_eq!(862, 2 * 431, "every packed weight holds two parts");
+        for (f32_parts, bf16_parts, activation) in [
+            (862u64, 0u64, super::Activation::F32),
+            (0, 862, super::Activation::Bf16),
+            (43, 0, super::Activation::F32),
+            (0, 43, super::Activation::Bf16),
+        ] {
+            assert_eq!(
+                scale_pairing_error(431, f32_parts, bf16_parts, 0, activation),
+                None,
+                "the matching pair passes"
+            );
+        }
+        let bf16_over_f32 = scale_pairing_error(431, 862, 0, 0, super::Activation::Bf16).unwrap();
+        assert!(
+            bf16_over_f32.contains("activation_dtype bf16 needs BF16 scales and biases"),
+            "{bf16_over_f32}"
+        );
+        let f32_over_bf16 = scale_pairing_error(431, 0, 862, 0, super::Activation::F32).unwrap();
+        assert!(
+            f32_over_bf16.contains("activation_dtype f32 needs F32 scales and biases"),
+            "{f32_over_bf16}"
+        );
+        for activation in [super::Activation::F32, super::Activation::Bf16] {
+            assert!(
+                scale_pairing_error(431, 861, 1, 0, activation).is_some(),
+                "one stray part refuses the pair"
+            );
+            assert!(
+                scale_pairing_error(431, 862, 0, 1, activation).is_some(),
+                "one other-dtype part refuses the pair"
+            );
+        }
+    }
+
+    /// The chunk rule: the chunk path is dtype aware, so both activation dtypes plan a chunk.
+    /// `Q36Executor::plan_prefill` asks the rule with `Consts::act`, which the setting maps through
+    /// `Activation::dtype`, and the start-up line of `start::plan_prefill` follows the plan and
+    /// names no dtype rule.
+    #[test]
+    fn the_chunk_rule_plans_a_chunk_for_both_activation_dtypes() {
+        assert!(
+            chunked_prefill_allowed(Dtype::F32),
+            "the F32 control keeps the chunked prefill"
+        );
+        assert!(
+            chunked_prefill_allowed(Dtype::Bf16),
+            "the chunk path is dtype aware"
+        );
+        assert!(
+            !chunked_prefill_allowed(Dtype::F16),
+            "a dtype the decoder cannot hold plans no chunk: the rule
+            stays a rule, not a constant true"
+        );
+        assert_eq!(
+            super::Activation::F32.dtype(),
+            Dtype::F32,
+            "the F32 control maps to the F32 the rule asks for"
+        );
+        assert_eq!(
+            super::Activation::Bf16.dtype(),
+            Dtype::Bf16,
+            "the BF16 setting maps to the BF16 the rule accepts"
+        );
+    }
+
+    #[test]
+    fn the_pin_holds_the_digest_of_each_tokenizer_file() {
+        let pin = tokenizer_pin().unwrap();
+        assert_eq!(pin.vocab_size, 248_077);
+        assert_eq!(pin.tokenizer_json[..4], [0x87, 0xa7, 0x83, 0x0d]);
+        assert_eq!(pin.tokenizer_json[28..], [0x3d, 0xb7, 0x2d, 0xe4]);
+        assert_eq!(pin.tokenizer_config_json[..4], [0xe9, 0x8f, 0x19, 0x01]);
+        assert_eq!(pin.chat_template_jinja[..4], [0xe8, 0x4f, 0x32, 0xa2]);
+        assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
+    }
+
+    #[test]
+    fn tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate() {
+        let moe = tokenizer_pin_for_spec(&QWEN3_6_35B_A3B).unwrap();
+        let cuda = tokenizer_pin().unwrap();
+        let dense = tokenizer_pin_for_spec(&QWEN3_8_27B_DENSE).unwrap();
+        assert_eq!(moe.tokenizer_json, cuda.tokenizer_json);
+        assert_eq!(moe.tokenizer_config_json, cuda.tokenizer_config_json);
+        assert_eq!(moe.chat_template_jinja, cuda.chat_template_jinja);
+        assert_eq!(moe.generation_config_json, cuda.generation_config_json);
+        assert_eq!(
+            dense.tokenizer_json,
+            digest("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3").unwrap()
+        );
+        assert_eq!(
+            dense.tokenizer_config_json,
+            digest("b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27").unwrap()
+        );
+        assert_eq!(
+            dense.chat_template_jinja,
+            digest("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041").unwrap()
+        );
+        assert_ne!(dense.tokenizer_json, moe.tokenizer_json);
+        assert_ne!(dense.tokenizer_config_json, moe.tokenizer_config_json);
+        assert_ne!(dense.chat_template_jinja, moe.chat_template_jinja);
+        assert_eq!(dense.generation_config_json, moe.generation_config_json);
+        assert_eq!(dense.vocab_size, moe.vocab_size);
+    }
+
+    #[test]
+    fn a_digest_that_is_not_64_hex_digits_is_refused() {
+        assert!(digest(&"a".repeat(64)).is_ok());
+        for text in ["", &"a".repeat(63), &"a".repeat(65), &"g".repeat(64)] {
+            assert!(
+                matches!(digest(text), Err(EngError::Checkpoint(_))),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cuda_arm_parses_the_8_bit_form_and_the_start_maps_it() {
+        // The CUDA arm does not refuse `q8` at the settings — the start maps the parsed form onto
+        // the step's `KvMode` (F32 to the fp16 control cache, Q8 to Int8G32) and refuses the Tiled
+        // layout there.
+        let q8: Q36Options = serde_json::from_str("{\"kv_dtype\": \"q8\"}").unwrap();
+        assert_eq!(
+            settings_for(Some(&q8), &Q36Env::default(), Backend::Cuda)
+                .expect("the CUDA arm parses the 8-bit form")
+                .kv,
+            super::KvDtype::Q8
+        );
+        let f32_form: Q36Options = serde_json::from_str("{\"kv_dtype\": \"f32\"}").unwrap();
+        let got = settings_for(Some(&f32_form), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.kv, super::KvDtype::F32);
+        // The MLX arm takes the same member.
+        let mlx = Q36Options {
+            kv_dtype: Some("q8".to_string()),
+            ..with_limit()
+        };
+        assert_eq!(
+            settings_for(Some(&mlx), &Q36Env::default(), Backend::Mlx)
+                .unwrap()
+                .kv,
+            super::KvDtype::Q8
+        );
+    }
+
+    /// The default flip of the MLX arm does not reach the CUDA arm: its fallback is the F32
+    /// cache and 32,768 positions, which the start replaces with the card's choice when the
+    /// config names neither.
+    #[test]
+    fn the_cuda_arm_falls_back_to_the_f32_form_and_32768_positions() {
+        let got = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.kv, super::KvDtype::F32);
+        assert_eq!(got.context_limit, 32_768);
+    }
+
+    /// The card chooses what the config leaves open, for the single-device GGUF start that
+    /// fixes neither tiered experts nor host-paged KV; a member the config names is taken as
+    /// given, and the MLX arm never reads the card.
+    #[test]
+    fn the_card_chooses_only_what_a_cuda_gguf_config_leaves_open() {
+        let flags = |text: &str, backend| {
+            let options: Q36Options = serde_json::from_str(text).unwrap();
+            let got = settings_for(Some(&options), &Q36Env::default(), backend).unwrap();
+            (got.kv_auto, got.context_auto)
+        };
+        assert_eq!(flags("{}", Backend::Cuda), (true, true));
+        assert_eq!(
+            flags(r#"{"context_limit":65536}"#, Backend::Cuda),
+            (true, false)
+        );
+        assert_eq!(flags(r#"{"kv_dtype":"q8"}"#, Backend::Cuda), (false, true));
+        assert_eq!(
+            flags(r#"{"kv_dtype":"q8","context_limit":65536}"#, Backend::Cuda),
+            (false, false)
+        );
+        assert_eq!(
+            flags(
+                r#"{"tiered":{"slots":"auto"},"capture":false}"#,
+                Backend::Cuda
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            flags(r#"{"cuda_devices":[0,1],"capture":false}"#, Backend::Cuda),
+            (false, false)
+        );
+        assert_eq!(
+            flags(r#"{"cache_limit_bytes":1024}"#, Backend::Mlx),
+            (false, false)
+        );
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn a_cuda_entry_needs_no_cache_limit_and_refuses_the_prefill_budget_by_name() {
+        // A CUDA entry is configurable with an empty object: no cache limit, no environment.
+        let got = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            (got.context_limit, got.cache_limit, got.capture),
+            (DEFAULT_CONTEXT_LIMIT, 0, true)
+        );
+        // Default options set no MLX key, so NOTHING is recorded for the start lines (the empty
+        // case pins the filter of `ignored_mlx_keys_of`).
+        assert!(
+            got.ignored_mlx_keys.is_empty(),
+            "default cuda options record no ignored key: {:?}",
+            got.ignored_mlx_keys
+        );
+        assert_eq!(
+            got.prefill_budget, None,
+            "the CUDA arm plans no budget: the worker piece is NO_BUDGET_PIECE"
+        );
+        for key in ["prefill_budget_bytes", "prefill_session_reserve_bytes"] {
+            let text: String = format!("{{\"{key}\": 5}}");
+            let options: Q36Options = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                message(settings_for(
+                    Some(&options),
+                    &Q36Env::default(),
+                    Backend::Cuda
+                )),
+                format!(
+                    "engine config: {key} is an MLX chunked-prefill key; the CUDA arm \
+                     prefills one token per step until CPF"
+                )
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn the_cuda_arm_ignores_prefill_chunk_until_cpf_7a_wires_it() {
+        use super::DEFAULT_CUDA_PREFILL_CHUNK;
+        // The CUDA arm keeps ignoring the key, with its start line, until the chunked CUDA prefill
+        // accepts it as the cap of `M_sess`. Any value is taken — 0 included, the CLI twin's case —
+        // and the field stays the inert 0; the step's cap is `DEFAULT_CUDA_PREFILL_CHUNK` until the
+        // config is wired.
+        let value = Q36Options {
+            prefill_chunk: Some(0),
+            ..Q36Options::default()
+        };
+        let got = settings_for(Some(&value), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            got.ignored_mlx_keys,
+            ["prefill_chunk"],
+            "the chunk key is ignored with its start line"
+        );
+        assert_eq!(got.prefill_chunk, 0, "the CUDA field stays inert");
+        assert_eq!(
+            got.prefill_budget, None,
+            "the CUDA arm plans no budget: the worker piece is NO_BUDGET_PIECE"
+        );
+        assert_eq!(
+            DEFAULT_CUDA_PREFILL_CHUNK, 2048,
+            "the step's cap stays the no-cap default"
+        );
+    }
+
+    fn tiered(body: &str) -> Q36Options {
+        serde_json::from_str(&format!("{{{body}}}")).expect("a valid qwen36 object")
+    }
+
+    #[test]
+    fn the_tiered_member_is_off_by_default_and_takes_its_defaults_when_given() {
+        let off = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(off.tiered, None, "tiered is never on without the member");
+        let minimal = tiered(r#""capture":false, "tiered": {"slots": 40}"#);
+        let got = settings_for(Some(&minimal), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            got.tiered,
+            Some(TieredSettings {
+                swaps_milli: 250,
+                slots: SlotRequest::Exactly(40),
+                threads: 6,
+                timeout_ms: 10_000,
+                preload: false
+            })
+        );
+        let full = tiered(
+            r#""capture":false, "tiered": {"slots": 61, "threads": 4, "timeout_ms": 5000, "preload": true}"#,
+        );
+        let got = settings_for(Some(&full), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(
+            got.tiered,
+            Some(TieredSettings {
+                swaps_milli: 250,
+                slots: SlotRequest::Exactly(61),
+                threads: 4,
+                timeout_ms: 5000,
+                preload: true
+            })
+        );
+    }
+
+    #[test]
+    fn auto_tiered_slots_are_explicit_and_preserve_the_cuda_mode_checks() {
+        let options = tiered(r#""capture":false,"tiered":{"slots":"auto"}"#);
+        let got = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.tiered.unwrap().slots, SlotRequest::Fit);
+        for value in [r#""AUTO""#, r#""16""#, "true", "16.5", "-1"] {
+            assert!(
+                serde_json::from_str::<Q36Options>(&format!(r#"{{"tiered":{{"slots":{value}}}}}"#))
+                    .is_err(),
+                "{value}"
+            );
+        }
+        assert!(settings_for(Some(&options), &Q36Env::default(), Backend::Mlx).is_err());
+        let capture = tiered(r#""capture":true,"tiered":{"slots":"auto"}"#);
+        assert!(settings_for(Some(&capture), &Q36Env::default(), Backend::Cuda).is_err());
+    }
+
+    #[test]
+    fn the_tiered_member_is_checked_by_name() {
+        let refused = |body: &str, backend: Backend, needle: &str| {
+            let options = tiered(body);
+            let text = message(settings_for(Some(&options), &Q36Env::default(), backend));
+            assert!(text.contains(needle), "{body}: {text}");
+        };
+        let cuda = Backend::Cuda;
+        refused(r#""tiered": {}"#, cuda, "tiered needs slots");
+        refused(r#""tiered": {"slots": 7}"#, cuda, "tiered.slots");
+        refused(r#""tiered": {"slots": 257}"#, cuda, "tiered.slots");
+        refused(
+            r#""tiered": {"slots": 40, "threads": 0}"#,
+            cuda,
+            "tiered.threads",
+        );
+        refused(
+            r#""tiered": {"slots": 40, "threads": 9}"#,
+            cuda,
+            "tiered.threads",
+        );
+        refused(
+            r#""tiered": {"slots": 40, "timeout_ms": 0}"#,
+            cuda,
+            "tiered.timeout_ms",
+        );
+        refused(
+            r#""tiered": {"slots": 40, "timeout_ms": 600001}"#,
+            cuda,
+            "tiered.timeout_ms",
+        );
+        refused(
+            r#""cache_limit_bytes": 1024, "tiered": {"slots": 40}"#,
+            Backend::Mlx,
+            "tiered is a CUDA member",
+        );
+        refused(
+            r#""capture": true, "tiered": {"slots": 40}"#,
+            cuda,
+            "exclude each other",
+        );
+        refused(r#""tiered": {"slots": 40}"#, cuda, "exclude each other");
+        let unknown = serde_json::from_str::<Q36Options>(r#"{"tiered": {"slots": 40, "bank": 1}}"#);
+        assert!(
+            unknown.is_err(),
+            "an unknown tiered member is refused by the parser"
+        );
+    }
+
+    /// The default LRU entry count of a `prefix_reuse` store stays the fixed six for EVERY spec (an
+    /// entry's real cost grows with its depth - a snapshot owns a depth-sized copy of the attention
+    /// buffers after the next append while its own charge is the DeltaNet state only - so no
+    /// budget-derived default ships before the replay measurement); the operator's exact override
+    /// is honored for every spec that reaches the store.
+    #[test]
+    fn the_prefix_store_entry_count_stays_six_unless_overridden() {
+        let limits = |flag: bool, set: Option<usize>| super::prefix_store_limits_of(flag, set);
+        assert_eq!(
+            limits(true, None),
+            StoreLimits {
+                roots: 2,
+                entries: 6
+            },
+            "the default stays six for every spec"
+        );
+        assert_eq!(
+            limits(true, Some(32)),
+            StoreLimits {
+                roots: 2,
+                entries: 32
+            },
+            "the exact override wins when set"
+        );
+        assert_eq!(
+            limits(true, Some(6)),
+            StoreLimits {
+                roots: 2,
+                entries: 6
+            },
+            "setting 6 equals the default"
+        );
+        assert_eq!(
+            limits(false, Some(32)),
+            StoreLimits::default(),
+            "the flag off keeps the one-entry store, override and all"
+        );
+    }
+
+    /// The override validates at boot: 0 and 4097 are refused by name, 6 is accepted, and
+    /// the absent member stays `None` for the default cap.
+    #[test]
+    fn prefix_store_entries_validates_at_parse() {
+        let refused = |value: usize| {
+            error_text(settings_for(
+                Some(&Q36Options {
+                    cache_limit_bytes: Some(1024),
+                    prefix_store_entries: Some(value),
+                    ..Q36Options::default()
+                }),
+                &Q36Env::default(),
+                Backend::Mlx,
+            ))
+        };
+        assert!(
+            refused(0).contains("prefix_store_entries"),
+            "zero: {}",
+            refused(0)
+        );
+        assert!(
+            refused(4097).contains("prefix_store_entries"),
+            "above the range: {}",
+            refused(4097)
+        );
+        let six = settings(
+            Some(&Q36Options {
+                cache_limit_bytes: Some(1024),
+                prefix_store_entries: Some(6),
+                ..Q36Options::default()
+            }),
+            &Q36Env::default(),
+        )
+        .unwrap();
+        assert_eq!(six.prefix_store_entries, Some(6), "the accepted override");
+        let absent = settings(
+            Some(&Q36Options {
+                cache_limit_bytes: Some(1024),
+                ..Q36Options::default()
+            }),
+            &Q36Env::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            absent.prefix_store_entries, None,
+            "absent stays the default cap"
+        );
+    }
+}
+
+/// The step-side half of the cap: `speculator_of` is what the CUDA step's `set_speculation` calls,
+/// and it needs no device, so its refusals run in the host test gate.
+#[cfg(test)]
+mod speculation_arming {
+    use super::speculator_of;
+    use crate::family::speculate::config::{SpecConfig, SpecOptions};
+
+    fn config(mode: &str, rows: u32) -> SpecConfig {
+        SpecConfig::new(&SpecOptions {
+            draft_mode: Some(mode.to_owned()),
+            draft_max_rows: Some(rows),
+            ..SpecOptions::default()
+        })
+        .expect("a generic-range config")
+    }
+
+    #[test]
+    fn a_window_of_more_than_eight_rows_is_refused_before_the_mode_is_read() {
+        for rows in [9, 16, 64] {
+            let error = speculator_of(&config("ngram", rows))
+                .err()
+                .expect("refused");
+            let text = format!("{error:?}");
+            assert!(
+                text.contains(&format!("draft_max_rows {rows} exceeds 8")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_to_eight_rows_arm_the_ngram_step_and_a_disabled_config_arms_nothing() {
+        for rows in 2..=8 {
+            assert!(
+                speculator_of(&config("ngram", rows))
+                    .expect("armed")
+                    .is_some()
+            );
+        }
+        assert!(
+            speculator_of(&SpecConfig::default())
+                .expect("off")
+                .is_none()
+        );
+        let disabled = SpecConfig {
+            max_rows: 64,
+            ..SpecConfig::default()
+        };
+        assert!(
+            speculator_of(&disabled)
+                .expect("a disabled entry feeds no window")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_disk_experts_variable_is_auto_on_off_or_ignored() {
+        use super::DiskExperts;
+        use std::ffi::OsStr;
+        assert_eq!(DiskExperts::of(None), (DiskExperts::Auto, None));
+        assert_eq!(
+            DiskExperts::of(Some(OsStr::new("1"))),
+            (DiskExperts::On, None)
+        );
+        assert_eq!(
+            DiskExperts::of(Some(OsStr::new("0"))),
+            (DiskExperts::Off, None)
+        );
+        let (setting, reason) = DiskExperts::of(Some(OsStr::new("true")));
+        assert_eq!(setting, DiskExperts::Auto);
+        assert_eq!(reason.as_deref(), Some("\"true\" is not 0 or 1"));
+    }
+}

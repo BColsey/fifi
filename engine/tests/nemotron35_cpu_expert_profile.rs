@@ -1,6 +1,6 @@
 //! Opt-in benchmark of the production mapped NVFP4 expert pool.
 
-use inference_engine::family::nemotron35::runner::{CpuLayerTiming, time_cpu_experts};
+use inference_engine::family::nemotron::nemotron35::runner::{CpuLayerTiming, time_cpu_experts};
 use std::{env, path::PathBuf, process::Command};
 
 #[test]

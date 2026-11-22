@@ -2,7 +2,7 @@
 
 use std::{path::Path, time::Instant};
 
-use inference_engine::{EngError, family::nemotron35::runner, tokenizer::nemotron};
+use inference_engine::{EngError, family::nemotron::nemotron35::runner, tokenizer::nemotron};
 
 const PROMPT: &str = "The quick brown fox";
 

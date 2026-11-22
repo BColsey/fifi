@@ -3,7 +3,7 @@
 //! its own); a chosen block that is not a completed block gives its token a NaN output and status
 //! bits 4, a position word outside the cache (or a chunk running past it) gives every token a NaN
 //! output and status bits 4; and cache rows past a token's position (NaN here) are never read for
-//! it. The numerics against the host attention are in `family::flash_next::qsa::cuda_attn_tests`.
+//! it. The numerics against the host attention are in `family::qwen::flash_next::qsa::cuda_attn_tests`.
 
 use super::{QsaAttnCall, QsaAttnShape};
 use crate::EngError;

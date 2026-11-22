@@ -2,7 +2,7 @@
 //! the copy plan of a pass, the counters, and (in [`policy`]) the slot policies themselves.
 //! Ungated on purpose — plain host gates compile and run the seam's tests without the card
 //! feature (knowledge: `native-cuda-gated-tests-invisible-to-featureless-lib-gates`). The
-//! first family's bank (`family/flash_next/cuda/bank.rs`) keeps the device owner, the
+//! first family's bank (`family/qwen/flash_next/cuda/bank.rs`) keeps the device owner, the
 //! pinned-store budget and its construction of the seam's [`ReplaceOnMissLru`]; this module
 //! is what a second family's bank can share without adopting that family's pass protocol:
 //! the state types are policy-agnostic, the trait is the four-method contract whose rules
@@ -92,7 +92,7 @@ impl BankGeometry {
     }
 
     // The bank the tier plan settled is the first family's construction: `from_plan` lives in
-    // `family/flash_next/cuda/bank.rs` (an inherent impl of this struct) so the seam does not
+    // `family/qwen/flash_next/cuda/bank.rs` (an inherent impl of this struct) so the seam does not
     // depend on that family's moe modules.
 
     /// Byte offset of `slot` (or of a host place) in a layer's buffer.

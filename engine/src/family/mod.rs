@@ -32,11 +32,6 @@ pub(in crate::family) mod exl3_merge_plan;
 mod exl3_merge_plan_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod exl3_pack;
-#[allow(
-    dead_code,
-    reason = "the factory wires the MLX and the opt-in CUDA executors (`cuda_decode`); the allow covers the pieces still reached only by tests until the family is qualified"
-)]
-pub(crate) mod flash_next;
 
 pub(crate) mod device_budget;
 #[allow(
@@ -55,7 +50,7 @@ pub(in crate::family) mod exl3_tensors;
 )]
 pub(crate) mod expert_bank;
 pub mod flint;
-pub mod gemma4;
+pub mod gemma;
 pub mod gguf_model;
 pub(crate) mod gguf_select;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -78,6 +73,9 @@ pub mod keys;
 pub(crate) mod kv_disk;
 pub(crate) mod kv_format;
 pub(crate) mod kv_ring;
+pub mod nemotron;
+pub mod qwen;
+pub mod raon;
 #[allow(
     dead_code,
     reason = "the interface of the shared resident step: a family reaches it through its recipe as each family moves onto the step"
@@ -114,7 +112,6 @@ mod mlx_stream_stats;
 pub mod layer_weights;
 pub mod mapped_file;
 pub(in crate::family) mod math;
-pub mod nemotron35;
 #[allow(
     dead_code,
     reason = "no engine path calls the store yet; only its tests do"
@@ -132,12 +129,6 @@ pub(crate) mod prefill;
 )]
 pub(crate) mod project;
 pub mod quantization;
-#[allow(
-    dead_code,
-    reason = "the Q36 host reference serves later work; until it lands, only tests and the Mac reference run call it"
-)]
-pub mod qwen36;
-pub mod raon1;
 pub mod recurrent;
 pub mod route;
 #[allow(

@@ -236,11 +236,11 @@ fn evaluate(
     let family_name = family.as_deref();
     // A GGUF directory with no tokenizer files starts from the vocabulary in the weights.
     gguf_tokenizer_check(inspection, &mut checks);
-    if family_name == Some(crate::family::qwen36::factory::FAMILY) {
+    if family_name == Some(crate::family::qwen::qwen36::factory::FAMILY) {
         // `None` when this binary has no GPU backend at all;
         // `backend_of_build`'s fallback arm must not masquerade as one.
         let backend =
-            (!facts.backends.none()).then(crate::family::qwen36::factory::backend_of_build);
+            (!facts.backends.none()).then(crate::family::qwen::qwen36::factory::backend_of_build);
         return q36_preflight(
             model_dir,
             tokenizer_dir,
@@ -251,7 +251,7 @@ fn evaluate(
             checks,
         );
     }
-    if family_name == Some(crate::family::flash_next::factory::FAMILY) {
+    if family_name == Some(crate::family::qwen::flash_next::factory::FAMILY) {
         return rows_or_shallow(
             model_dir,
             tokenizer_dir,
@@ -260,7 +260,7 @@ fn evaluate(
             candidate,
             facts,
             checks,
-            crate::family::flash_next::preflight_rows_entry(),
+            crate::family::qwen::flash_next::preflight_rows_entry(),
         );
     }
     if family_name == Some(crate::family::flint::FAMILY) {
@@ -555,10 +555,10 @@ fn identify_family(
             CheckStatus::Pass,
             format!(
                 "config.json model_type matches {}",
-                crate::family::qwen36::factory::FAMILY
+                crate::family::qwen::qwen36::factory::FAMILY
             ),
         ));
-        return Some(crate::family::qwen36::factory::FAMILY.to_string());
+        return Some(crate::family::qwen::qwen36::factory::FAMILY.to_string());
     }
     let by_architecture = inspection.gguf_files.iter().find_map(|fact| {
         crate::server::config::GGUF_ARCHITECTURE_FAMILIES
@@ -674,12 +674,12 @@ fn q36_preflight(
     inspection: &ModelInspection,
     candidate: &Candidate,
     facts: &HardwareFacts,
-    backend: Option<crate::family::qwen36::settings::Backend>,
+    backend: Option<crate::family::qwen::qwen36::settings::Backend>,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
 
-    let family = Some(crate::family::qwen36::factory::FAMILY.to_string());
+    let family = Some(crate::family::qwen::qwen36::factory::FAMILY.to_string());
     let finish = |checks: Vec<Check>,
                   estimate: Option<Estimate>,
                   decisions: Vec<PlanDecision>,
@@ -747,8 +747,8 @@ fn q36_preflight(
                 format!(
                     "context {}, kv_dtype {}, activation {} resolve under the {} rules",
                     settings.context_limit,
-                    crate::family::qwen36::settings::kv_dtype_name(settings.kv),
-                    crate::family::qwen36::settings::activation_name(settings.activation),
+                    crate::family::qwen::qwen36::settings::kv_dtype_name(settings.kv),
+                    crate::family::qwen::qwen36::settings::activation_name(settings.activation),
                     match backend {
                         Backend::Cuda => "CUDA",
                         Backend::Mlx => "MLX",
@@ -772,7 +772,7 @@ fn q36_preflight(
 
     // The tokenizer verdict is the loader's: bundle load under the
     // family's pin refuses any file that differs from the tested release.
-    match crate::family::qwen36::settings::tokenizer_pin()
+    match crate::family::qwen::qwen36::settings::tokenizer_pin()
         .and_then(|pin| crate::tokenizer::TokenizerBundle::load(tokenizer_dir, &pin))
     {
         Ok(_) => checks.push(Check::new(
@@ -795,13 +795,13 @@ fn q36_preflight(
     // measured (doc/explanation/status.md), so it stays experimental
     // until that gate passes.
     let qualification = match settings.weights {
-        crate::family::qwen36::settings::WeightFormat::Exl3 => Qualification::Experimental,
-        crate::family::qwen36::settings::WeightFormat::Gguf => Qualification::Qualified,
+        crate::family::qwen::qwen36::settings::WeightFormat::Exl3 => Qualification::Experimental,
+        crate::family::qwen::qwen36::settings::WeightFormat::Gguf => Qualification::Qualified,
     };
 
     // Format vs. directory shape: the resolved weight format must have
     // its files here. Exact checkpoint identity stays the loader's check.
-    use crate::family::qwen36::settings::WeightFormat;
+    use crate::family::qwen::qwen36::settings::WeightFormat;
     match settings.weights {
         WeightFormat::Gguf if backend == Backend::Cuda => {
             checks.push(pinned_gguf_check(model_dir, inspection));
@@ -837,7 +837,7 @@ fn q36_preflight(
             CheckStatus::Pass,
             format!(
                 "{} checkpoint files are present; exact file identity is verified by the loader",
-                crate::family::qwen36::settings::weight_format_name(settings.weights)
+                crate::family::qwen::qwen36::settings::weight_format_name(settings.weights)
             ),
         )),
     }
@@ -866,7 +866,7 @@ fn q36_preflight(
     // check above (the MLX arm has no EXL3).
     #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
     let (weight_bytes, exl3_plan) = if settings.weights == WeightFormat::Exl3 {
-        match crate::family::qwen36::exl3_plan(model_dir) {
+        match crate::family::qwen::qwen36::exl3_plan(model_dir) {
             Ok(plan) => (plan.device_bytes, Some(plan)),
             Err(error) => {
                 checks.push(Check::new(
@@ -948,7 +948,7 @@ fn q36_preflight(
     // call of one implementation, never a second copy of the math.
     #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
     let decisions = match exl3_plan.as_ref() {
-        Some(_) => match crate::family::qwen36::preflight::preflight_rows(&RowsRequest {
+        Some(_) => match crate::family::qwen::qwen36::preflight::preflight_rows(&RowsRequest {
             model_dir,
             tokenizer_dir,
             context: candidate.context_limit,
@@ -1546,7 +1546,7 @@ fn largest_resident_context(
 /// that inject the backend.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn pinned_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> Check {
-    use crate::family::qwen36::cuda::start::ALLOW_UNPINNED_VAR;
+    use crate::family::qwen::qwen36::cuda::start::ALLOW_UNPINNED_VAR;
     gguf_admission_check(model_dir, std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())
 }
 
@@ -1555,7 +1555,7 @@ fn pinned_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> Check {
 /// checkpoint) test without touching process-global state.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn gguf_admission_check(model_dir: &Path, raw: Option<&str>) -> Check {
-    use crate::family::qwen36::cuda::start::{
+    use crate::family::qwen::qwen36::cuda::start::{
         ALLOW_UNPINNED_VAR, GGUF_NAME, allow_unpinned_wanted, check_gguf_identity, select_gguf,
     };
     let allow_unpinned = match allow_unpinned_wanted(raw) {
@@ -1631,7 +1631,7 @@ fn pinned_gguf_check(_model_dir: &Path, inspection: &ModelInspection) -> Check {
 /// the pinned name (same gate as `pinned_gguf_check`).
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn pinned_gguf_bytes(inspection: &ModelInspection) -> Option<u64> {
-    use crate::family::qwen36::cuda::start::GGUF_NAME;
+    use crate::family::qwen::qwen36::cuda::start::GGUF_NAME;
     inspection
         .gguf_files
         .iter()
@@ -1722,14 +1722,14 @@ fn q36_verdict(
 
 fn estimate_q36(
     spec: &crate::family::spec::FamilySpec,
-    settings: &crate::family::qwen36::settings::Q36Settings,
+    settings: &crate::family::qwen::qwen36::settings::Q36Settings,
     weight_bytes: u64,
-    backend: crate::family::qwen36::settings::Backend,
+    backend: crate::family::qwen::qwen36::settings::Backend,
     facts: &HardwareFacts,
 ) -> Result<Estimate, crate::EngError> {
     use crate::family::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
-    use crate::family::qwen36::admission_sketch as sketch;
-    use crate::family::qwen36::settings::Backend;
+    use crate::family::qwen::qwen36::admission_sketch as sketch;
+    use crate::family::qwen::qwen36::settings::Backend;
 
     // The one CUDA demand model: the same builder the family's preflight
     // rows call, so the estimate and the rows cannot drift apart.
@@ -2100,7 +2100,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tok = tempfile::tempdir().unwrap();
         let candidate = Candidate {
-            family: Some(crate::family::flash_next::factory::FAMILY.to_string()),
+            family: Some(crate::family::qwen::flash_next::factory::FAMILY.to_string()),
             ..Candidate::default()
         };
         let mut facts = cuda_facts(24 << 30);
@@ -2192,7 +2192,7 @@ mod tests {
             dir.path(),
             tok.path(),
             &inspection,
-            Some(crate::family::flash_next::factory::FAMILY.to_string()),
+            Some(crate::family::qwen::flash_next::factory::FAMILY.to_string()),
             &Candidate::default(),
             &cuda_facts(24 << 30),
             Vec::new(),
@@ -2240,7 +2240,7 @@ mod tests {
             .expect("report");
         assert_eq!(
             report.family.as_deref(),
-            Some(crate::family::qwen36::factory::FAMILY)
+            Some(crate::family::qwen::qwen36::factory::FAMILY)
         );
         let check = check_named(&report, "tokenizer files");
         assert_eq!(check.status, super::CheckStatus::Pass, "{}", check.detail);
@@ -2283,8 +2283,8 @@ mod tests {
     fn the_rows_proposal_equals_the_estimates_value_on_a_synthetic_fixture() {
         use crate::family::exl3_pack::PackPlan;
         use crate::family::plan_rows::RowsFit;
-        use crate::family::qwen36::preflight::rows_from_walk;
-        use crate::family::qwen36::settings::{
+        use crate::family::qwen::qwen36::preflight::rows_from_walk;
+        use crate::family::qwen::qwen36::settings::{
             Backend as Q36Backend, Q36Env, Q36Options, Q36Settings,
         };
         use std::collections::BTreeMap;
@@ -2357,7 +2357,7 @@ mod tests {
     #[ignore = "reads a real pack in FIFI_EXL3_CHECKPOINT"]
     fn the_rows_proposal_equals_the_estimates_value_on_one_fixture() {
         use crate::family::plan_rows::RowsRequest;
-        use crate::family::qwen36::settings::{
+        use crate::family::qwen::qwen36::settings::{
             Backend as Q36Backend, Q36Env, Q36Options, Q36Settings,
         };
 
@@ -2377,7 +2377,7 @@ mod tests {
             Q36Backend::Cuda,
         )
         .expect("the pack's settings resolve");
-        let plan = crate::family::qwen36::exl3_plan(&dir).expect("the pack walks");
+        let plan = crate::family::qwen::qwen36::exl3_plan(&dir).expect("the pack walks");
         let estimate = super::estimate_q36(
             &settings.spec,
             &settings,
@@ -2386,15 +2386,16 @@ mod tests {
             &facts,
         )
         .expect("the estimate");
-        let (rows, _note, _fit) = crate::family::qwen36::preflight::preflight_rows(&RowsRequest {
-            model_dir: &dir,
-            tokenizer_dir: &dir,
-            context: Some(262_144),
-            kv_dtype: None,
-            prefill_rows: None,
-            facts: &facts,
-        })
-        .expect("the rows");
+        let (rows, _note, _fit) =
+            crate::family::qwen::qwen36::preflight::preflight_rows(&RowsRequest {
+                model_dir: &dir,
+                tokenizer_dir: &dir,
+                context: Some(262_144),
+                kv_dtype: None,
+                prefill_rows: None,
+                facts: &facts,
+            })
+            .expect("the rows");
         let context = rows
             .iter()
             .find(|decision| decision.name == "context")
@@ -2425,7 +2426,7 @@ mod tests {
 
     #[test]
     fn a_wrong_tokenizer_fails_the_pin_check() {
-        use crate::family::qwen36::settings::Backend;
+        use crate::family::qwen::qwen36::settings::Backend;
         let dir = tempfile::tempdir().unwrap().keep();
         std::fs::write(dir.join("weights.safetensors"), vec![0u8; 8]).unwrap();
         for name in crate::capability::inspect::TOKENIZER_FILES {
@@ -2453,7 +2454,7 @@ mod tests {
     /// `.gguf` file there, and a directory without any weight file still fails the start.
     #[test]
     fn an_mlx_pack_passes_the_weight_format_check_without_a_gguf_file() {
-        use crate::family::qwen36::settings::Backend;
+        use crate::family::qwen::qwen36::settings::Backend;
         let candidate = super::Candidate {
             context_limit: Some(4096),
             ..super::Candidate::default()
@@ -2493,7 +2494,7 @@ mod tests {
 
     #[test]
     fn a_refused_setting_fails_before_any_estimate() {
-        use crate::family::qwen36::settings::Backend;
+        use crate::family::qwen::qwen36::settings::Backend;
         let dir = tempfile::tempdir().unwrap().keep();
         let inspection = crate::capability::inspect::inspect(&dir, &dir).unwrap();
         let candidate = super::Candidate {
@@ -2714,7 +2715,7 @@ mod tests {
 
     #[test]
     fn q36_estimate_uses_the_admission_authorities() {
-        use crate::family::qwen36::settings::{Backend, Q36Env, Q36Settings};
+        use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Settings};
         use std::path::Path;
 
         // Resolved exactly as the factory resolves a bare entry on CUDA.
@@ -2755,7 +2756,7 @@ mod tests {
 
     #[test]
     fn the_estimate_matches_the_gpu_qualification_receipts() {
-        use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+        use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
         use std::path::Path;
 
         // The 2026-11-03 qualification host: a display-attached RTX 3090,

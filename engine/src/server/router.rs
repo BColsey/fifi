@@ -953,7 +953,7 @@ mod tests {
     fn derive_q36(
         args: &crate::server::model_serve::ModelServeArgs,
     ) -> Result<crate::server::config::Config, crate::server::StartupError> {
-        derive_family(args, crate::family::qwen36::factory::FAMILY)
+        derive_family(args, crate::family::qwen::qwen36::factory::FAMILY)
     }
 
     #[tokio::test]
@@ -961,7 +961,7 @@ mod tests {
         let (state, _engine) = one_engine_state();
         let held = testkit::engine(Vec::new());
         let mut entry = testkit::entry("held", "model-b", &held, 1_024);
-        entry.family = crate::family::qwen36::factory::FAMILY.to_string();
+        entry.family = crate::family::qwen::qwen36::factory::FAMILY.to_string();
         state.add_engine(entry, held);
         let freed = testkit::engine(Vec::new());
         state.add_engine(testkit::entry("freed", "model-c", &freed, 1_024), freed);
@@ -1013,7 +1013,7 @@ mod tests {
         );
         let held = testkit::engine(Vec::new());
         let mut entry = testkit::entry("first", "model-b", &held, 1_024);
-        entry.family = crate::family::qwen36::factory::FAMILY.to_string();
+        entry.family = crate::family::qwen::qwen36::factory::FAMILY.to_string();
         state.add_engine(entry, held);
         let app = router(Arc::clone(&state));
 

@@ -7,7 +7,7 @@
  * per token is f32 [heads][dim] queries followed by one [dim] raw key, at column col_off of a
  * row of ld floats. With rms0(x, w) = x * (1 + w) / sqrt(mean(x^2) + eps) and rope the
  * rotate-half rotation of the first rotary_dim values (pairs (i, i + rotary_dim / 2), angle
- * pos / theta^((2 i) / rotary_dim) in f32, as family/flash_next/math.rs):
+ * pos / theta^((2 i) / rotary_dim) in f32, as family/qwen/flash_next/math.rs):
  *
  * index, for the m tokens at positions p0 .. p0 + m - 1:
  *   queries[t][h] = rope(rms0(row_t.query[h], q_norm), p0 + t)

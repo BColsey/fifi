@@ -347,9 +347,12 @@ fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
     assert_eq!(merge.matches("exl3_grouped_indexed_wide(").count(), 1);
     for (file, source) in [
         ("exl3/moe.rs", include_str!("exl3/moe.rs")),
-        ("step.rs", include_str!("qwen36/cuda/step.rs")),
-        ("mixer.rs", include_str!("qwen36/cuda/mixer.rs")),
-        ("mixer_ops.rs", include_str!("qwen36/cuda/mixer_ops.rs")),
+        ("step.rs", include_str!("qwen/qwen36/cuda/step.rs")),
+        ("mixer.rs", include_str!("qwen/qwen36/cuda/mixer.rs")),
+        (
+            "mixer_ops.rs",
+            include_str!("qwen/qwen36/cuda/mixer_ops.rs"),
+        ),
         ("exl3/prefill_moe.rs", include_str!("exl3/prefill_moe.rs")),
     ] {
         assert!(!source.contains("exl3_grouped_indexed_wide"), "{file}");
@@ -379,7 +382,7 @@ fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
 /// reads the switch at the start, before the stream, for the EXL3 layout only.
 #[test]
 fn the_step_reaches_the_merged_block_only_through_the_switch() {
-    let step = include_str!("qwen36/cuda/step.rs");
+    let step = include_str!("qwen/qwen36/cuda/step.rs");
     let squeezed = squeeze(step);
     // Only an EXL3 load builds it, from the resolved intent, through `choose` (default falls back,
     // explicit refuses); every other layout gets `None`.
@@ -808,14 +811,14 @@ fn the_load_acts_on_the_resolution_and_logs_the_fallback_reason() {
 fn only_the_qwen36_exl3_load_can_reach_the_merged_block() {
     for (file, source) in [
         ("flint", include_str!("flint/cuda_executor.rs")),
-        ("flash_next step", include_str!("flash_next/step.rs")),
+        ("flash_next step", include_str!("qwen/flash_next/step.rs")),
         (
             "flash_next moe",
-            include_str!("flash_next/moe/exl3_cuda_tests.rs"),
+            include_str!("qwen/flash_next/moe/exl3_cuda_tests.rs"),
         ),
         (
             "qwen36 moe.rs (GGUF block)",
-            include_str!("qwen36/cuda/moe.rs"),
+            include_str!("qwen/qwen36/cuda/moe.rs"),
         ),
     ] {
         for word in [
@@ -832,7 +835,7 @@ fn only_the_qwen36_exl3_load_can_reach_the_merged_block() {
 /// The start resolves the switch before the projector exists and before any weight is opened.
 #[test]
 fn the_start_resolves_the_switch_before_any_weight_work() {
-    let start = include_str!("qwen36/cuda/start.rs");
+    let start = include_str!("qwen/qwen36/cuda/start.rs");
     let body = &start[start.find("pub(crate) fn start(").expect("start")..];
     let switch = body.find("resolve_switch(").expect("the switch check");
     // The tiered check runs inside the mode resolution that start calls.
@@ -860,7 +863,7 @@ fn the_start_resolves_the_switch_before_any_weight_work() {
 /// The test hook of the step refuses a non-EXL3 layout instead of silently building nothing.
 #[test]
 fn the_step_hook_refuses_a_layout_that_is_not_exl3() {
-    let step = include_str!("qwen36/cuda/step.rs");
+    let step = include_str!("qwen/qwen36/cuda/step.rs");
     let hook = squeeze(section(step, "pub(crate) fn set_shared_in_routed("));
     assert!(
         hook.contains("ifon&&self.layout!=WeightLayout::Exl3{returnErr("),

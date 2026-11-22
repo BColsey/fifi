@@ -1,6 +1,6 @@
 //! The sparse attention of Qwen3.8 Flash-Next QSA on the device. The formula and layouts are in
 //! `native/resident/qsa_attn.h`; they follow the host `attend_selected` of
-//! `family::flash_next::qsa`.
+//! `family::qwen::flash_next::qsa`.
 //!
 //! [`CudaContext::qsa_attn`] queues, for each of `m` consecutive tokens (one in decode, a chunk in
 //! prefill), the gated attention of every query head over the positions its selection names: the

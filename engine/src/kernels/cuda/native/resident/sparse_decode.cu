@@ -2,7 +2,7 @@
  * The contract is in resident/sparse_decode.h; the numerics deliberately mirror
  * attn_q8_part_k of attn_decode_q8.cu line for line (same dequant, same fmaf chains, same
  * reduce8 order, same 64-tile online softmax) so that subset-exactness against the
- * independent reference of family/qwen36/sparse_reference.rs is a property of the SELECTION,
+ * independent reference of family/qwen/qwen36/sparse_reference.rs is a property of the SELECTION,
  * not of a second attention arithmetic. Single block per KV head (grid n_kv_head); no
  * splits, no part buffer, no combine - the baseline kernel of phase 4c.
  */

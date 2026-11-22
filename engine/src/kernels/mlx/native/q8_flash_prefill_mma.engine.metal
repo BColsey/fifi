@@ -2,7 +2,7 @@
 // KERNEL BODY ONLY (MLX fast metal_kernel generates the signature from the input / output names and the
 // template arguments; the grid is in THREADS).  Spike r45-mma, validated on Apple M4 Max with MLX 0.32.2 and 0.32.3.
 //
-// Cache layout it reads (engine/src/family/qwen36/resident/attn.rs, Q8Tensor; Q8_GROUP = 64, Q8_BITS = 8):
+// Cache layout it reads (engine/src/family/qwen/qwen36/resident/attn.rs, Q8Tensor; Q8_GROUP = 64, Q8_BITS = 8):
 //   kc, vc            [1, KVH, cap, D / 4]    uint32, 4 unsigned 8-bit codes per word, first value in the LOW byte
 //   ks_row, kb_row,
 //   vs_row, vb_row    [1, KVH, cap, D / GSZ]  affine scale / bias per group of GSZ values (activation dtype, read as float);

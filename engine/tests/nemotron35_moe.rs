@@ -1,5 +1,5 @@
 use inference_engine::{
-    family::nemotron35::forward::moe::{
+    family::nemotron::nemotron35::forward::moe::{
         ExpertWeights, MlpWeights, MoeConfig, RoutedExpert, apply_routed_experts, expert_forward,
         moe_block_forward, route,
     },

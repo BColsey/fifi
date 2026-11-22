@@ -89,6 +89,6 @@ The writer is the same as for the family fixtures above. No engine code generate
   `source_bf16.bin` holds the same 80 rows from the official BF16 checkpoint `Qwen/Qwen3.8-Flash-Next` (commit `de4b8e4d43b917e7706784d8bb445c9af86a3540`); it is the truth the decoded rows are measured against.
   `decoded_f32.bin` holds the rows decoded by a NumPy script written from the format description, independent of the Rust decoder.
   `manifest.json` records the revisions, the file metadata, the hashing tensors (byte-identical in the EXL3, MLX oQ4e, and official checkpoints), the selected rows and heads, the SHA-256 of the 65,536-entry mul1 table, and the measured error against the BF16 rows (relative L2 at most 3.50%, cosine at least 0.99938; with the bias of the wrong head, mean relative L2 19.9%).
-  Used by `engine/src/weights/exl3/ngram_tests.rs` and the PLE row-plan test in `engine/src/family/flash_next/ple.rs`.
+  Used by `engine/src/weights/exl3/ngram_tests.rs` and the PLE row-plan test in `engine/src/family/qwen/flash_next/ple.rs`.
 - `layer-parity-portable.json`: one `mm` cell and one `qmm` probe with MLX reference outputs (`mx.matmul`, `mx.quantized_matmul`) and zero tolerances, copied unchanged from a larger layer-parity fixture that is not in this repository. Used by `engine/tests/layer_parity.rs`.
 - `resident-rows.json`: four row-broadcast and weighted-row-sum cells with bit-exact MLX GPU outputs, the MLX version, and the generator hash. `engine/tests/native_rows.rs` reads it when `ROWS_FIXTURES` names its path, and checks its SHA-256 first.

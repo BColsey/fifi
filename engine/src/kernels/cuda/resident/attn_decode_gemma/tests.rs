@@ -1,6 +1,6 @@
 //! Comparisons against references frozen before the candidate implementation.
 use super::*;
-use crate::family::gemma4::resident::bolt::{ATTN_SPLIT_MAX, ATTN_SPLIT_MIN_KEYS};
+use crate::family::gemma::gemma4::resident::bolt::{ATTN_SPLIT_MAX, ATTN_SPLIT_MIN_KEYS};
 use crate::kernels::cuda::{CudaContext, testkit};
 
 #[test]

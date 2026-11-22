@@ -11,7 +11,7 @@ use super::{ALTERNATIVES, CONTEXT, FAKE_TOKENIZER_JSON, PROMPT, VOCAB, rows, see
 use crate::{
     EngError,
     family::{
-        qwen36::rollback::{RollbackBook, RollbackPlan, StateFacts},
+        qwen::qwen36::rollback::{RollbackBook, RollbackPlan, StateFacts},
         sampler::Sampler,
         session::{DecodeSession, Limits, TokenStepper},
         speculate::{

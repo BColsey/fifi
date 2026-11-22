@@ -976,7 +976,7 @@ fn attn_prep_inside_a_capture_equals_eager() {
 // test `the_native_launch_entries_refuse_bad_arguments_before_any_device_call`.
 //
 // Every test below runs in an isolation split (the pattern of
-// `family/qwen36/cuda/native_mixer_device_tests.rs`): a device phase consumes the fixture, works
+// `family/qwen/qwen36/cuda/native_mixer_device_tests.rs`): a device phase consumes the fixture, works
 // only through `?` - no assert, expect or unwrap while a CUDA owner is alive - hands back plain
 // host bytes, and drops every owner at its return; only then do the assertions run.
 

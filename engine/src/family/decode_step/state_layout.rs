@@ -43,7 +43,7 @@
 //!
 //! # Prefill and verify windows
 //!
-//! Prefill has its own arena, sized by `family/qwen36/cuda/prefill_plan.rs`, with no overlay on the
+//! Prefill has its own arena, sized by `family/qwen/qwen36/cuda/prefill_plan.rs`, with no overlay on the
 //! decode arena. It writes the KV rows `[p0, p0 + M)` and the DeltaNet state of slot 0 IN PLACE,
 //! through the offsets of this file, so nothing here changes when it lands. The handoff to decode
 //! is: the committed token count `ResidentState::tokens()` equals the `pos` of the first decode

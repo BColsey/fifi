@@ -112,11 +112,11 @@ fn every_measurement_test_refuses_the_switches_first() {
     for (name, source) in [
         (
             "krow_alpha_device_tests.rs",
-            include_str!("../qwen36/cuda/krow_alpha_device_tests.rs"),
+            include_str!("../qwen/qwen36/cuda/krow_alpha_device_tests.rs"),
         ),
         (
             "krow_step_device_tests.rs",
-            include_str!("../qwen36/cuda/krow_step_device_tests.rs"),
+            include_str!("../qwen/qwen36/cuda/krow_step_device_tests.rs"),
         ),
     ] {
         let mut tests = 0;
@@ -133,7 +133,7 @@ fn every_measurement_test_refuses_the_switches_first() {
         }
         assert!(tests >= 1, "{name}");
     }
-    let alpha = include_str!("../qwen36/cuda/krow_alpha_device_tests.rs");
+    let alpha = include_str!("../qwen/qwen36/cuda/krow_alpha_device_tests.rs");
     // The receipt mode is wired into the alpha test: the env switch is read and the pass is called.
     assert!(alpha.contains("FIFI_KROW_RECEIPT\").as_deref() == Ok(\"1\")"));
     assert!(alpha.contains("receipt_pass(&env, &ops, loaded.kernel);"));

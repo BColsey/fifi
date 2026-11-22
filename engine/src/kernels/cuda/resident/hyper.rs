@@ -1,7 +1,7 @@
 //! The hyper-connection (four-branch gated residual) read and apply of Qwen3.8 Flash-Next on the
 //! device. The formulas and layouts are in `native/resident/hyper.h`; they follow the gated
 //! residual of the Qwen3.8-Next architecture report (arXiv 2608.30320, Eq. 30-34) and the host
-//! code of `family::flash_next::hyper`.
+//! code of `family::qwen::flash_next::hyper`.
 //!
 //! [`CudaContext::hyper_read`] queues four kernels on a [`DeviceStream`] and returns: the
 //! per-branch RMS norm with `(1 + w)` weights, the low-rank down projection with SiLU and the

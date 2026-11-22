@@ -39,7 +39,7 @@ impl CompiledBackends {
 /// CUDA facts. Memory figures are for device 0, the default serving
 /// device. A Qwen3.6 engine can also span the devices its
 /// `cuda_devices` setting names; that placement has its own planner
-/// and receipt at load (`family::qwen36::cuda::placement`), and this
+/// and receipt at load (`family::qwen::qwen36::cuda::placement`), and this
 /// probe does not reproduce it — multi-device figures are per-device
 /// budgets, not one sum.
 #[derive(Clone, Debug, PartialEq, Serialize)]

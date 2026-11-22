@@ -1016,22 +1016,22 @@ mod tests {
             ("expert_cpu.rs", include_str!("expert_cpu.rs"), 0),
             (
                 "tiered/mod.rs",
-                include_str!("../family/qwen36/tiered/mod.rs"),
+                include_str!("../family/qwen/qwen36/tiered/mod.rs"),
                 0,
             ),
             (
                 "tiered/locator.rs",
-                include_str!("../family/qwen36/tiered/locator.rs"),
+                include_str!("../family/qwen/qwen36/tiered/locator.rs"),
                 0,
             ),
             (
                 "tiered/policy.rs",
-                include_str!("../family/qwen36/tiered/policy.rs"),
+                include_str!("../family/qwen/qwen36/tiered/policy.rs"),
                 0,
             ),
             (
                 "tiered/cpu_pool.rs",
-                include_str!("../family/qwen36/tiered/cpu_pool.rs"),
+                include_str!("../family/qwen/qwen36/tiered/cpu_pool.rs"),
                 0,
             ),
             (
@@ -1041,17 +1041,17 @@ mod tests {
             ),
             (
                 "tiered/report.rs",
-                include_str!("../family/qwen36/tiered/report.rs"),
+                include_str!("../family/qwen/qwen36/tiered/report.rs"),
                 0,
             ),
             (
                 "tiered/guess.rs",
-                include_str!("../family/qwen36/tiered/guess.rs"),
+                include_str!("../family/qwen/qwen36/tiered/guess.rs"),
                 0,
             ),
             (
                 "tiered/residency.rs",
-                include_str!("../family/qwen36/tiered/residency.rs"),
+                include_str!("../family/qwen/qwen36/tiered/residency.rs"),
                 0,
             ),
         ];

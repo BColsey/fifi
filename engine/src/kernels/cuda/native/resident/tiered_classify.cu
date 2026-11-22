@@ -1,6 +1,6 @@
 /*
  * The tiered classification of one layer. Semantics: see tiered_classify.h; the host oracle is
- * family/qwen36/tiered/classify.rs. Original CUDA C.
+ * family/qwen/qwen36/tiered/classify.rs. Original CUDA C.
  *
  * One block, 256 threads. Thread 0 does the classification (top_k <= 12 picks, a handful of integer compares, in pick
  * order, so the result cannot depend on scheduling) into registers and shared memory; the block then copies the normed

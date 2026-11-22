@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use inference_engine::{
     EngError,
-    family::nemotron35::{
+    family::nemotron::nemotron35::{
         NemotronBlockKind, NemotronGeometry, NemotronMambaGeometry, NemotronMoeGeometry,
         NemotronTextSpec,
         exec::{
