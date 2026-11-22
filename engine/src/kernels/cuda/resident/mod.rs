@@ -108,6 +108,7 @@ pub(crate) mod paged_position;
 pub(crate) mod qsa_attn;
 pub(crate) mod qsa_index;
 pub(crate) mod quantize_q8_1;
+pub(crate) mod relative_attention;
 pub(crate) mod rope_gemma;
 pub(crate) mod router;
 pub(crate) mod router_rows;

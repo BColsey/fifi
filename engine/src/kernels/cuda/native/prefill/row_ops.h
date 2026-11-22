@@ -70,6 +70,48 @@ typedef struct inference_cuda_row_rank_sum_args {
     size_t rank;    /* 1..32; ONE F32 sum, no intermediate BF16 rounding */
 } inference_cuda_row_rank_sum_args;
 
+/* Gate and up are concatenated per routed row. */
+typedef struct inference_cuda_row_clipped_expert_args {
+    const float *x;
+    size_t x_bytes;
+    const float *scales;
+    size_t scales_bytes;
+    float *out;
+    size_t out_bytes;
+    unsigned *flag;
+    size_t flag_bytes;
+    size_t rows;
+    size_t middle;
+    float gate_cap;
+    float up_cap;
+} inference_cuda_row_clipped_expert_args;
+
+/* The inverse IDs and weights are indexed by original token and route rank.
+ * The down scales and rows are indexed by the expert-grouped slot.
+ */
+typedef struct inference_cuda_row_indexed_rank_sum_args {
+    const float *x;
+    size_t x_bytes;
+    const int32_t *inverse_ids;
+    size_t inverse_ids_bytes;
+    const float *scales;
+    size_t scales_bytes;
+    const float *weights;
+    size_t weights_bytes;
+    float *out;
+    size_t out_bytes;
+    unsigned *flag;
+    size_t flag_bytes;
+    size_t rows;
+    size_t columns;
+    size_t rank;
+} inference_cuda_row_indexed_rank_sum_args;
+
+int inference_cuda_row_clipped_expert_launch(const inference_cuda_row_clipped_expert_args *args,
+                                             void *stream, int *out_stage);
+int inference_cuda_row_indexed_rank_sum_launch(const inference_cuda_row_indexed_rank_sum_args *args,
+                                               void *stream, int *out_stage);
+
 int inference_cuda_row_sigmoid_launch(const inference_cuda_row_unary_args *args,
                                       void *stream, int *out_stage);
 int inference_cuda_row_mul_launch(const inference_cuda_row_mul_args *args,
@@ -97,5 +139,11 @@ ROW_OPS_ASSERT(sizeof(inference_cuda_row_gather_args) == 88 &&
                offsetof(inference_cuda_row_gather_args, source_rows) == 80, "row gather layout");
 ROW_OPS_ASSERT(sizeof(inference_cuda_row_rank_sum_args) == 72 &&
                offsetof(inference_cuda_row_rank_sum_args, rank) == 64, "row rank sum layout");
+ROW_OPS_ASSERT(sizeof(inference_cuda_row_clipped_expert_args) == 88 &&
+               offsetof(inference_cuda_row_clipped_expert_args, gate_cap) == 80,
+               "clipped expert activation layout");
+ROW_OPS_ASSERT(sizeof(inference_cuda_row_indexed_rank_sum_args) == 120 &&
+               offsetof(inference_cuda_row_indexed_rank_sum_args, rank) == 112,
+               "indexed rank sum layout");
 #undef ROW_OPS_ASSERT
 #endif

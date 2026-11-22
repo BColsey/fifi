@@ -132,8 +132,13 @@ impl CpuForward {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn enable_cuda(&mut self, host_reserve: u64) -> Result<(), EngError> {
+        let attention = super::cuda_projection::gguf::attention::Config {
+            context: self.context,
+            relative_dims: self.math.d_rel,
+            relative_extent: self.math.rel_extent,
+        };
         self.weights
-            .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve)
+            .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve, attention)
     }
 
     pub(super) fn vocab_size(&self) -> u32 {
@@ -160,6 +165,8 @@ impl CpuForward {
     }
 
     pub(super) fn restore(&mut self, saved: &PrefixState) {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.invalidate_device_attention();
         self.state.clone_from(&saved.visits);
         self.position = saved.position;
         self.failed = false;
@@ -170,6 +177,8 @@ impl CpuForward {
     }
 
     pub(super) fn reset(&mut self) {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.invalidate_device_attention();
         for slot in &mut self.state {
             *slot = VisitState::default();
         }
@@ -294,7 +303,7 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
-        let input = self.mlp_input(visit, &layer, state, stream, bank)?;
+        let input = self.mlp_input(visit, &layer, state, stream, bank, None)?;
         let mlp = self.moe(physical, &format!("{layer}.mlp"), &input)?;
         self.finish_layer(&layer, state, stream, mlp)
     }
@@ -306,6 +315,7 @@ impl CpuForward {
         state: &mut VisitState,
         stream: &mut Stream,
         bank: Option<&MessageBank>,
+        projected: Option<super::cpu_attention::AttentionProjection>,
     ) -> Result<Vec<f32>, EngError> {
         let physical = visit.weight_layer;
         let query = self.weights.vec(
@@ -316,8 +326,14 @@ impl CpuForward {
         if let Weights::Gguf(weights) = &self.weights {
             weights.predict_experts(physical, || stream.mix(0, &query));
         }
-        let inputs = self.attention_inputs(visit, layer, stream, bank)?;
-        let attn = self.attention(layer, visit.attention, &inputs, state)?;
+        let projected = match projected {
+            Some(projected) => projected,
+            None => {
+                let inputs = self.attention_inputs(visit, layer, stream, bank)?;
+                self.project_attention(layer, visit.attention, &inputs)?
+            }
+        };
+        let attn = self.attention(layer, visit, state, projected)?;
         if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
             stream
                 .blocks
@@ -443,14 +459,23 @@ impl CpuForward {
 
     fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {
         let experts = self.spec.n_routed_experts as usize;
-        let scores = self
+        let logits = self
             .weights
-            .project(&format!("{prefix}.gate.weight"), input, experts)?
-            .into_iter()
-            .map(sigmoid)
-            .collect::<Vec<_>>();
+            .project(&format!("{prefix}.gate.weight"), input, experts)?;
         let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
-        let selected = route(&scores, &bias, self.spec.num_experts_per_tok as usize)?;
+        self.moe_route_from_logits(layer, logits, &bias)
+    }
+
+    fn moe_route_from_logits(
+        &self,
+        layer: usize,
+        mut scores: Vec<f32>,
+        bias: &[f32],
+    ) -> Result<MoeRoute, EngError> {
+        for score in &mut scores {
+            *score = sigmoid(*score);
+        }
+        let selected = route(&scores, bias, self.spec.num_experts_per_tok as usize)?;
         let total = selected
             .iter()
             .map(|&id| scores[id])

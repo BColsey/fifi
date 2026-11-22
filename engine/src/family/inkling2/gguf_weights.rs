@@ -21,7 +21,9 @@ use super::{
     cpu_weights::Projection,
     cuda_projection::{
         DenseUpload, expert_layer_order, expert_mib_budget, expert_residency_budget,
-        gguf::{ExpertLayer, ExpertStack, ExpertView, GgufCuda, GgufDenseUpload, can_repack},
+        gguf::{
+            ExpertLayer, ExpertStack, ExpertView, GgufCuda, GgufDenseUpload, attention, can_repack,
+        },
     },
 };
 
@@ -542,6 +544,7 @@ impl GgufTextWeights {
         spec: &TextSpec,
         eps: f32,
         host_reserve: u64,
+        attention: attention::Config,
     ) -> Result<(), EngError> {
         let packed = std::env::var("FIFI_INKLING_CUDA_PACKED_GGUF").as_deref() == Ok("1");
         let group_projections =
@@ -601,6 +604,17 @@ impl GgufTextWeights {
         let stream = packed
             || tiered
             || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
+        let resident_attention =
+            if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref() == Ok("1") {
+                if packed {
+                    attention::Plan::new(self, spec, attention)?
+                } else {
+                    eprintln!("Inkling CUDA relative attention requires packed GGUF weights");
+                    None
+                }
+            } else {
+                None
+            };
         let mut cuda = GgufCuda::load(
             uploads,
             spec,
@@ -613,6 +627,7 @@ impl GgufTextWeights {
                 stream,
                 budget,
                 cache_reserve,
+                resident_attention,
             },
         )?;
         if reuse {
@@ -626,6 +641,16 @@ impl GgufTextWeights {
             ram::RamExperts::plan(self, &cuda, spec, eps, ram_limit.unwrap_or(0), host_reserve)?;
         self.cuda = Some(cuda);
         Ok(())
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn resident_attention(
+        &self,
+    ) -> Option<(
+        &crate::kernels::cuda::CudaContext,
+        &attention::ResidentAttention,
+    )> {
+        self.cuda.as_ref()?.resident_attention()
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -761,6 +786,17 @@ impl GgufTextWeights {
         requests: [Option<Projection<'_>>; N],
     ) -> Option<Result<[Vec<f32>; N], EngError>> {
         self.cuda.as_ref()?.attention_projections(inputs, requests)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn attention_projections_rows<const N: usize>(
+        &self,
+        inputs: &[[&[f32]; 3]],
+        requests: [Option<Projection<'_>>; N],
+    ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
+        self.cuda.as_ref().map_or(Ok(None), |cuda| {
+            cuda.attention_projections_rows(inputs, requests)
+        })
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

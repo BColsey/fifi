@@ -87,6 +87,7 @@ pub(in crate::kernels::cuda) mod qsa_attn;
 pub(in crate::kernels::cuda) mod qsa_index;
 pub(in crate::kernels::cuda) mod qsa_select;
 pub(in crate::kernels::cuda) mod quantize_q8_1;
+pub(in crate::kernels::cuda) mod relative_attention;
 pub(in crate::kernels::cuda) mod rope_gemma;
 pub(in crate::kernels::cuda) mod router;
 pub(in crate::kernels::cuda) mod router_rows;

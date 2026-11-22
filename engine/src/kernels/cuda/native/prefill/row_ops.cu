@@ -3,11 +3,13 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cmath>
 #include <initializer_list>
 #include <stdint.h>
 
 #include "../abi.h"
 #include "../device.h"
+#include "../expert_math.cuh"
 
 namespace {
 constexpr unsigned kThreads = 256;
@@ -136,6 +138,67 @@ __global__ void rank_sum_k(inference_cuda_row_rank_sum_args a, size_t count) {
     store_value(sum, finite, a.out + i, a.flag);
 }
 
+bool valid_clipped_expert(const inference_cuda_row_clipped_expert_args *a) {
+    size_t in_bytes, out_bytes;
+    return a && a->middle <= (size_t(1) << 21) &&
+        std::isfinite(a->gate_cap) && a->gate_cap > 0.0f &&
+        std::isfinite(a->up_cap) && a->up_cap > 0.0f &&
+        float_bytes(a->rows, 2 * a->middle, &in_bytes) &&
+        float_bytes(a->rows, a->middle, &out_bytes) &&
+        valid_regions({{a->x, a->x_bytes, in_bytes, false},
+                       {a->scales, a->scales_bytes, a->rows * 4, false},
+                       {a->out, a->out_bytes, out_bytes, true},
+                       {a->flag, a->flag_bytes, 4, true}});
+}
+
+bool valid_indexed_rank_sum(const inference_cuda_row_indexed_rank_sum_args *a) {
+    size_t source, target;
+    if (!a || a->rank < 1 || a->rank > 32 ||
+        !float_bytes(a->rows, a->columns, &target) ||
+        !float_bytes(a->rows * a->rank, a->columns, &source)) return false;
+    const size_t metadata = a->rows * a->rank * 4;
+    return valid_regions({{a->x, a->x_bytes, source, false},
+                          {a->inverse_ids, a->inverse_ids_bytes, metadata, false},
+                          {a->scales, a->scales_bytes, metadata, false},
+                          {a->weights, a->weights_bytes, metadata, false},
+                          {a->out, a->out_bytes, target, true},
+                          {a->flag, a->flag_bytes, 4, true}});
+}
+
+__global__ void clipped_expert_k(inference_cuda_row_clipped_expert_args a, size_t count) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const size_t row = i / a.middle;
+    const size_t col = i % a.middle;
+    const float scale = a.scales[row];
+    const float gate = a.x[2 * row * a.middle + col] * scale;
+    const float up = a.x[(2 * row + 1) * a.middle + col] * scale;
+    const float value = clipped_expert_activation(gate, up, a.gate_cap, a.up_cap);
+    store_value(value, isfinite(gate) && isfinite(up), a.out + i, a.flag);
+}
+
+__global__ void indexed_rank_sum_k(inference_cuda_row_indexed_rank_sum_args a, size_t count) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const size_t route = (i / a.columns) * a.rank;
+    const size_t col = i % a.columns;
+    const size_t slots = a.rows * a.rank;
+    float sum = 0.0f;
+    bool finite = true;
+    for (size_t rank = route; rank < route + a.rank; ++rank) {
+        const int32_t slot = a.inverse_ids[rank];
+        if (slot < 0 || size_t(slot) >= slots) {
+            a.out[i] = 0.0f;
+            atomicOr(a.flag, unsigned(INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION));
+            return;
+        }
+        const float scaled = __fmul_rn(a.x[size_t(slot) * a.columns + col], a.scales[slot]);
+        finite = finite && isfinite(scaled);
+        sum = __fadd_rn(sum, __fmul_rn(a.weights[rank], scaled));
+    }
+    store_value(sum, finite, a.out + i, a.flag);
+}
+
 unsigned blocks(size_t count) { return unsigned((count + kThreads - 1) / kThreads); }
 
 int launch_status(int *out_stage) {
@@ -192,6 +255,32 @@ extern "C" int inference_cuda_row_rank_sum_launch(const inference_cuda_row_rank_
         if (!stream || !valid_rank_sum(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         const size_t count = a->rows * a->columns;
         rank_sum_k<<<blocks(count), kThreads, 0, (cudaStream_t)stream>>>(*a, count);
+        return launch_status(out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_row_clipped_expert_launch(
+    const inference_cuda_row_clipped_expert_args *a, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!stream || !valid_clipped_expert(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const size_t count = a->rows * a->middle;
+        clipped_expert_k<<<blocks(count), kThreads, 0, (cudaStream_t)stream>>>(*a, count);
+        return launch_status(out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_row_indexed_rank_sum_launch(
+    const inference_cuda_row_indexed_rank_sum_args *a, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!stream || !valid_indexed_rank_sum(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const size_t count = a->rows * a->columns;
+        indexed_rank_sum_k<<<blocks(count), kThreads, 0, (cudaStream_t)stream>>>(*a, count);
         return launch_status(out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;

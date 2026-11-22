@@ -1,3 +1,4 @@
+#include "../expert_math.cuh"
 // Dense matvec for floating-point or packed GGUF weights (see resident/dense_gemv.h).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -281,12 +282,7 @@ __global__ void activate_moe(inference_cuda_gguf_moe_args a, float *middle) {
     const float scale = a.picks[blockIdx.y].gate_scale;
     const float gate = a.scratch[2 * offset + col] * scale;
     const float up = a.scratch[2 * offset + a.middle + col] * scale;
-    const float g = a.gate_cap * tanhf(gate / a.gate_cap);
-    const float u = a.up_cap * tanhf(up / a.up_cap);
-    // Report an overflow from the gate projection even if the soft cap would hide it.
-    middle[offset + col] = isfinite(gate) && isfinite(up)
-                               ? g * (1.0f / (1.0f + expf(-gate))) * u
-                               : __int_as_float(0x7fc00000);
+    middle[offset + col] = clipped_expert_activation(gate, up, a.gate_cap, a.up_cap);
 }
 
 __global__ void sum_moe(inference_cuda_gguf_moe_args a, const float *down) {

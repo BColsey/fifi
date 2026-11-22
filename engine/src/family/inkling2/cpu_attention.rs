@@ -2,10 +2,15 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use super::Attention;
 use super::cpu_forward::{CpuForward, dot, rms_norm, sigmoid};
 use super::cpu_weights::Projection;
+use super::{Attention, LayerVisit};
 use crate::EngError;
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use super::{cpu_weights::Weights, cuda_projection::gguf::attention};
+
+pub(super) type AttentionProjection = [Vec<f32>; 8];
 
 #[derive(Clone, Default)]
 struct CausalConv(VecDeque<Vec<f32>>);
@@ -52,6 +57,8 @@ pub(super) struct VisitState {
     // KV rows are immutable after append, so prefix snapshots share their storage.
     keys: VecDeque<Arc<Vec<f32>>>,
     values: VecDeque<Arc<Vec<f32>>>,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    position: usize,
     k_conv: CausalConv,
     v_conv: CausalConv,
     attn_conv: CausalConv,
@@ -78,14 +85,13 @@ impl CpuForward {
     pub(super) fn attention(
         &self,
         layer: &str,
-        attention: Attention,
-        inputs: &[Vec<f32>; 3],
+        visit: LayerVisit,
         state: &mut VisitState,
+        projected: AttentionProjection,
     ) -> Result<Vec<f32>, EngError> {
-        let heads = self.heads(attention);
+        let heads = self.heads(visit.attention);
         let attn = format!("{layer}.attn");
-        let [mut q, k, v, mut relative, sinks, gates, k_taps, v_taps] =
-            self.attention_projections(&attn, heads, attention, inputs)?;
+        let [mut q, k, v, mut relative, sinks, gates, k_taps, v_taps] = projected;
         self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
         clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
 
@@ -102,23 +108,54 @@ impl CpuForward {
             self.math.d_rel,
             self.math.rel_l2_clip_threshold,
         );
-        let table = self.weights.vec(
-            &format!("{attn}.rel_logits_proj.proj"),
-            self.math.d_rel * self.math.rel_extent,
-        )?;
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        let device_output = if let Weights::Gguf(weights) = &self.weights
+            && let Some((context, attention)) = weights.resident_attention()
+        {
+            Some(attention.step(
+                context,
+                visit.state_slot,
+                attention::Row {
+                    query: &q,
+                    key: &k,
+                    value: &v,
+                    relative: &relative,
+                    sinks: &sinks,
+                    gates: &gates,
+                },
+                attention::History {
+                    position: state.position,
+                    keys: &state.keys,
+                    values: &state.values,
+                },
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+        let device_output = None;
         state.push(
             k,
             v,
-            match attention {
+            match visit.attention {
                 Attention::Local => self.spec.sliding_window_size as usize,
                 Attention::Global => self.context,
             },
         );
 
-        let mut out = self.attend(state, heads, &q, &relative, &table, &sinks);
-        for (out, gate) in out.iter_mut().zip(gates) {
-            *out *= sigmoid(gate);
-        }
+        let out = if let Some(out) = device_output {
+            out
+        } else {
+            let table = self.weights.vec(
+                &format!("{attn}.rel_logits_proj.proj"),
+                self.math.d_rel * self.math.rel_extent,
+            )?;
+            let mut out = self.attend(state, heads, &q, &relative, &table, &sinks);
+            for (out, gate) in out.iter_mut().zip(gates) {
+                *out *= sigmoid(gate);
+            }
+            out
+        };
         let raw = self
             .weights
             .project(&format!("{attn}.wo_ud.weight"), &out, self.hidden())?;
@@ -129,13 +166,59 @@ impl CpuForward {
         )
     }
 
-    fn attention_projections(
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn invalidate_device_attention(&self) {
+        if let Weights::Gguf(weights) = &self.weights
+            && let Some((_, attention)) = weights.resident_attention()
+        {
+            attention.invalidate();
+        }
+    }
+
+    pub(super) fn project_attention(
+        &self,
+        layer: &str,
+        attention: Attention,
+        inputs: &[Vec<f32>; 3],
+    ) -> Result<AttentionProjection, EngError> {
+        self.attention_requests(
+            &format!("{layer}.attn"),
+            self.heads(attention),
+            attention,
+            |calls| {
+                self.weights
+                    .attention_projections(inputs.each_ref().map(Vec::as_slice), calls)
+            },
+        )
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn prefill_attention_projections(
+        &self,
+        weights: &super::gguf_weights::GgufTextWeights,
+        layer: &str,
+        attention: Attention,
+        inputs: &[[Vec<f32>; 3]],
+    ) -> Result<Option<Vec<AttentionProjection>>, EngError> {
+        let refs: Vec<_> = inputs
+            .iter()
+            .map(|input| input.each_ref().map(Vec::as_slice))
+            .collect();
+        self.attention_requests(
+            &format!("{layer}.attn"),
+            self.heads(attention),
+            attention,
+            |calls| weights.attention_projections_rows(&refs, calls),
+        )
+    }
+
+    fn attention_requests<R>(
         &self,
         attn: &str,
         heads: Heads,
         attention: Attention,
-        inputs: &[Vec<f32>; 3],
-    ) -> Result<[Vec<f32>; 8], EngError> {
+        run: impl FnOnce([Option<Projection<'_>>; 8]) -> R,
+    ) -> R {
         let dynamic = attention == Attention::Global;
         let taps = self.math.sconv_kernel_size * heads.kv;
         let requests = [
@@ -157,8 +240,7 @@ impl CpuForward {
                 rows,
             })
         });
-        self.weights
-            .attention_projections(inputs.each_ref().map(Vec::as_slice), calls)
+        run(calls)
     }
 
     fn heads(&self, attention: Attention) -> Heads {
@@ -294,6 +376,10 @@ impl VisitState {
         self.values.push_front(Arc::new(value));
         self.keys.truncate(length);
         self.values.truncate(length);
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        {
+            self.position += 1;
+        }
     }
 }
 

@@ -12,13 +12,15 @@ use crate::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes},
             matvec_q::{MatvecCall, QuantType, ROWS_MULTIPLE},
             quantize_q8_1::{QuantizeCall, q8_1_bytes},
-            router::{RouterLogitsCall, RouterShape},
+            router::{MAX_ROWS as ROUTER_MAX_ROWS, RouterLogitsCall, RouterShape},
         },
     },
     weights::GgufType,
 };
 
 use super::{Resident, bad};
+
+mod attention_prefill;
 
 #[repr(usize)]
 enum Slot {
@@ -65,6 +67,12 @@ pub(super) struct ResidentProjection<'a> {
     pub(super) weight: &'a Resident,
     pub(super) dtype: DenseDtype,
     pub(super) input: usize,
+}
+
+pub(super) struct ProjectionBatch<'a> {
+    pub(super) weight: DeviceRange<'a>,
+    pub(super) activations: usize,
+    pub(super) scale: f32,
 }
 
 pub(super) struct DenseStep {
@@ -133,7 +141,7 @@ impl DenseStep {
         let stream = stream.unwrap_or(&self.stream);
         let output = self.range(Slot::Output, 0, rows)?;
         let q8 = self.q8_scratch(dtype, weight, [rows, cols]);
-        let mut values = self.run(context, stream, x, output, |input| {
+        let values = self.run(context, stream, x, output, |input| {
             if let Some(x_q8) = q8 {
                 context.quantize_q8_1(
                     stream,
@@ -168,13 +176,120 @@ impl DenseStep {
                 },
             )
         })?;
-        if scale != 1.0 {
-            for value in &mut values {
-                *value *= scale;
-                if !value.is_finite() {
-                    return Err(bad("GGUF expert scale overflowed"));
-                }
+        scale_projection(values, scale)
+    }
+
+    pub(super) fn fits_gguf_rows(
+        &self,
+        dtype: DenseDtype,
+        [rows, cols]: [usize; 2],
+        count: usize,
+    ) -> Result<bool, EngError> {
+        // Preserve the original single-row Q8_1 activation path when requested.
+        Ok(count >= 2 && count <= self.gguf_rows_capacity(dtype, [rows, cols])?)
+    }
+
+    pub(super) fn gguf_rows_capacity(
+        &self,
+        dtype: DenseDtype,
+        [rows, cols]: [usize; 2],
+    ) -> Result<usize, EngError> {
+        if rows == 0 || cols == 0 || self.uses_q8_activations(dtype) {
+            return Ok(0);
+        }
+        let need = dense_gemv_bytes(DenseGemvShape::packed(1, rows, cols), dtype)?;
+        let bytes = need
+            .x
+            .checked_add(need.y)
+            .ok_or_else(|| bad("GGUF expert batch size overflows"))?;
+        let arena = self.arena.tensor(Slot::Output as usize)?.bytes();
+        Ok((arena / bytes).min(DenseGemvShape::MAX_ACTIVATION_ROWS))
+    }
+
+    pub(super) fn project_gguf_rows(
+        &self,
+        context: &CudaContext,
+        stream: Option<&DeviceStream>,
+        (dtype, weight, [rows, cols], scale): (DenseDtype, DeviceRange<'_>, [usize; 2], f32),
+        inputs: &[&[f32]],
+    ) -> Result<Vec<f32>, EngError> {
+        if inputs.iter().any(|row| row.len() != cols) {
+            return Err(bad("streamed expert projection input width differs"));
+        }
+        if !self.fits_gguf_rows(dtype, [rows, cols], inputs.len())? {
+            return Err(bad(
+                "streamed expert batch exceeds the CUDA projection arena",
+            ));
+        }
+        if scale == 0.0 {
+            return Ok(vec![0.0; inputs.len() * rows]);
+        }
+
+        // During expert computation, both batched matrices fit in the idle logits slot.
+        let input_elements = inputs.len() * cols;
+        let input = self.range(Slot::Output, 0, input_elements)?;
+        let output = self.range(Slot::Output, input_elements, inputs.len() * rows)?;
+        let stream = stream.unwrap_or(&self.stream);
+        let values = self.run_rows(context, stream, inputs, [input, output], || {
+            context.dense_gemv(
+                stream,
+                DenseGemvCall {
+                    shape: DenseGemvShape::packed(inputs.len(), rows, cols),
+                    dtype,
+                    w: weight,
+                    x: input,
+                    y: output,
+                },
+            )
+        })?;
+        scale_projection(values, scale)
+    }
+
+    /// Group resident projections of the same geometry into one upload and readback.
+    pub(super) fn project_gguf_batches(
+        &self,
+        context: &CudaContext,
+        (dtype, [rows, cols]): (DenseDtype, [usize; 2]),
+        batches: &[ProjectionBatch<'_>],
+        inputs: &[&[f32]],
+    ) -> Result<Vec<f32>, EngError> {
+        let count = inputs.len();
+        if count == 0
+            || count > self.gguf_rows_capacity(dtype, [rows, cols])?
+            || inputs.iter().any(|row| row.len() != cols)
+        {
+            return Err(bad("bad resident GGUF projection tile"));
+        }
+        let output_start = count * cols;
+        let input = self.range(Slot::Output, 0, output_start)?;
+        let output = self.range(Slot::Output, output_start, count * rows)?;
+        let mut calls = Vec::with_capacity(batches.len());
+        let mut at = 0;
+        for batch in batches {
+            let n = batch.activations;
+            if n == 0 || n > count - at {
+                return Err(bad("resident GGUF projection groups exceed the tile"));
             }
+            calls.push(DenseGemvCall {
+                shape: DenseGemvShape::packed(n, rows, cols),
+                dtype,
+                w: batch.weight,
+                x: self.range(Slot::Output, at * cols, n * cols)?,
+                y: self.range(Slot::Output, output_start + at * rows, n * rows)?,
+            });
+            at += n;
+        }
+        if at != count {
+            return Err(bad("resident GGUF projection groups do not cover the tile"));
+        }
+        let mut values = self.run_rows(context, &self.stream, inputs, [input, output], || {
+            context.dense_gemv_group(&self.stream, &calls)
+        })?;
+        let mut at = 0;
+        for batch in batches {
+            let end = at + batch.activations * rows;
+            scale_values(&mut values[at..end], batch.scale)?;
+            at = end;
         }
         Ok(values)
     }
@@ -245,24 +360,66 @@ impl DenseStep {
         weight: &Resident,
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
-        let [rows, cols] = weight.shape;
-        let output = self.range(Slot::Output, 0, rows)?;
+        let output = self.range(Slot::Output, 0, weight.shape[0])?;
         self.run(context, &self.stream, x, output, |input| {
-            context.router_logits_rows(
-                &self.stream,
-                RouterLogitsCall {
-                    shape: RouterShape {
-                        m: 1,
-                        hidden: cols,
-                        n_expert: rows,
-                        top_k: 1,
-                    },
-                    x: input,
-                    w: weight.codes.range(0, weight.codes.bytes())?,
-                    logits: output,
-                },
-            )
+            self.launch_router(context, weight, 1, [input, output])
         })
+    }
+
+    pub(super) fn project_router_rows(
+        &self,
+        context: &CudaContext,
+        weight: &Resident,
+        inputs: &[&[f32]],
+    ) -> Result<Vec<f32>, EngError> {
+        let [rows, cols] = weight.shape;
+        if inputs.iter().any(|input| input.len() != cols) {
+            return Err(bad("CUDA router input width differs"));
+        }
+        let slot = self.arena.tensor(Slot::Output as usize)?;
+        // The logits slot is idle while routing. Its capacity bounds both
+        // matrices and the existing pinned transfer buffer.
+        let capacity = (slot.bytes() / float_bytes(rows + cols)?).clamp(1, ROUTER_MAX_ROWS);
+        let mut logits = Vec::with_capacity(inputs.len() * rows);
+        for tile in inputs.chunks(capacity) {
+            if let [only] = tile {
+                logits.extend(self.project_router(context, weight, only)?);
+                continue;
+            }
+            let input_elements = tile.len() * cols;
+            let input = self.range(Slot::Output, 0, input_elements)?;
+            let output = self.range(Slot::Output, input_elements, tile.len() * rows)?;
+            logits.extend(
+                self.run_rows(context, &self.stream, tile, [input, output], || {
+                    self.launch_router(context, weight, tile.len(), [input, output])
+                })?,
+            );
+        }
+        Ok(logits)
+    }
+
+    fn launch_router(
+        &self,
+        context: &CudaContext,
+        weight: &Resident,
+        count: usize,
+        [input, output]: [DeviceRange<'_>; 2],
+    ) -> Result<(), EngError> {
+        let [rows, cols] = weight.shape;
+        context.router_logits_rows(
+            &self.stream,
+            RouterLogitsCall {
+                shape: RouterShape {
+                    m: count,
+                    hidden: cols,
+                    n_expert: rows,
+                    top_k: 1,
+                },
+                x: input,
+                w: weight.codes.range(0, weight.codes.bytes())?,
+                logits: output,
+            },
+        )
     }
 
     pub(super) fn controller(
@@ -397,6 +554,23 @@ impl DenseStep {
         }
         slot.buffer().range(slot.offset() + skip, bytes)
     }
+}
+
+fn scale_projection(mut values: Vec<f32>, scale: f32) -> Result<Vec<f32>, EngError> {
+    scale_values(&mut values, scale)?;
+    Ok(values)
+}
+
+fn scale_values(values: &mut [f32], scale: f32) -> Result<(), EngError> {
+    if scale != 1.0 {
+        for value in values {
+            *value *= scale;
+            if !value.is_finite() {
+                return Err(bad("GGUF expert scale overflowed"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn float_bytes(len: usize) -> Result<usize, EngError> {

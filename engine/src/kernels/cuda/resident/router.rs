@@ -51,7 +51,7 @@ use crate::kernels::cuda::native::resident::router::{
 
 pub(crate) const ROUTER_STATUS_BIT: i32 = 1;
 
-const MAX_ROWS: usize = 4096;
+pub(crate) const MAX_ROWS: usize = 4096;
 const MAX_HIDDEN: usize = 65536;
 const MAX_EXPERTS: usize = 512;
 const MAX_TOP_K: usize = 32;

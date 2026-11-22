@@ -138,10 +138,11 @@ impl Weights {
         spec: &TextSpec,
         eps: f32,
         host_reserve: u64,
+        attention: super::cuda_projection::gguf::attention::Config,
     ) -> Result<(), EngError> {
         match self {
             Self::Native(w) => w.enable_cuda(spec),
-            Self::Gguf(w) => w.enable_cuda(spec, eps, host_reserve),
+            Self::Gguf(w) => w.enable_cuda(spec, eps, host_reserve, attention),
         }
     }
 

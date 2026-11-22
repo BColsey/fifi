@@ -88,7 +88,24 @@ impl GgufTextWeights {
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
         self.cuda
             .as_ref()
-            .is_some_and(|cuda| cuda.has_stream_banks())
+            .is_some_and(|cuda| cuda.supports_grouped_prefill())
+    }
+
+    pub(in crate::family::inkling2) fn batch_prefill_router(&self, layer: u32, name: &str) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(|cuda| cuda.batch_prefill_router(layer, name))
+    }
+
+    pub(in crate::family::inkling2) fn prefill_router_logits(
+        &self,
+        name: &str,
+        inputs: &[&[f32]],
+    ) -> Result<Vec<f32>, EngError> {
+        self.cuda
+            .as_ref()
+            .ok_or_else(|| bad("prefill router requires a CUDA backend"))?
+            .prefill_router_logits(name, inputs)
     }
 
     pub(in crate::family::inkling2) fn observe_experts(&self, layer: usize, selected: &[usize]) {
@@ -104,13 +121,42 @@ impl GgufTextWeights {
         routes: &[PrefillRoute<'_>],
         activate: impl Fn(f32, f32) -> f32,
     ) -> Result<Option<ExpertRows>, EngError> {
-        let Some(cuda) = self.cuda.as_ref().filter(|cuda| cuda.streams_layer(layer)) else {
+        let Some(cuda) = self.cuda.as_ref() else {
+            return Ok(None);
+        };
+        let resident = cuda.prefills_resident_layer(layer);
+        if !resident && !cuda.streams_layer(layer) {
+            return Ok(None);
+        }
+        let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
+            return Ok(None);
+        };
+        if resident {
+            cuda.prefill_resident_experts(&mut source, layer, routes, dtypes, activate)
+        } else {
+            cuda.prefill_experts(&mut source, layer, routes, dtypes, activate)
+        }
+    }
+
+    pub(in crate::family::inkling2) fn prefill_device_experts(
+        &self,
+        names: [&str; 2],
+        layer: u32,
+        routes: &[PrefillRoute<'_>],
+        caps: [f32; 2],
+        route_weight: impl Fn(usize, usize) -> f32,
+    ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
+        let Some(cuda) = self
+            .cuda
+            .as_ref()
+            .filter(|cuda| cuda.prefills_device_layer(layer))
+        else {
             return Ok(None);
         };
         let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
             return Ok(None);
         };
-        cuda.prefill_experts(&mut source, layer, routes, dtypes, activate)
+        cuda.prefill_device_experts(&mut source, layer, routes, dtypes, caps, route_weight)
     }
 
     pub(in crate::family::inkling2) fn prefill_bank_report(
@@ -200,5 +246,75 @@ impl GgufTextWeights {
             activate,
             combine,
         )
+    }
+}
+
+#[test]
+#[ignore = "requires a leased CUDA device and the resident Inkling GGUF"]
+fn resident_prefill_scatter_matches_single_rows_across_tiles() {
+    use crate::family::inkling2::{
+        cpu_forward::{CpuForward, sigmoid},
+        cpu_weights::Weights,
+    };
+    use std::{env, path::Path};
+
+    let checkpoint = env::var_os("FIFI_INKLING_MODEL_DIR").expect("set the Inkling GGUF");
+    let mut model = CpuForward::open(Path::new(&checkpoint), 128).unwrap();
+    model.enable_cuda(0).unwrap();
+    let Weights::Gguf(weights) = &model.weights else {
+        panic!("resident prefill fixture requires GGUF weights");
+    };
+    let names = [
+        "model.llm.layers.0.mlp.experts.w13_weight",
+        "model.llm.layers.0.mlp.experts.w2_weight",
+    ];
+    let hidden = model.spec.hidden_size as usize;
+    let inputs = (0..96)
+        .map(|row| {
+            (0..hidden)
+                .map(|col| ((row * 17 + col * 13) % 61) as f32 / 31.0 - 1.0)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let picks = [[0, 16], [17, 16], [16, 0], [17, 0]];
+    let routes = inputs
+        .iter()
+        .enumerate()
+        .map(|(row, input)| PrefillRoute {
+            ids: &picks[row % picks.len()],
+            input,
+        })
+        .collect::<Vec<_>>();
+    let activate = |gate: f32, up: f32| gate * sigmoid(gate) * up;
+
+    let batch = weights
+        .prefill_experts(names, 0, &routes, activate)
+        .unwrap()
+        .expect("enable resident packed prefill");
+    assert_eq!(batch.len(), routes.len());
+    for (row, (route, contributions)) in routes.iter().zip(batch).enumerate() {
+        assert_eq!(contributions.len(), route.ids.len());
+        for (&expert, actual) in route.ids.iter().zip(contributions) {
+            let id = ExpertId {
+                layer: 0,
+                expert: expert as u32,
+            };
+            let gates = weights.expert(names[0], id, route.input).unwrap();
+            let mid = gates
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[gate, up]| activate(gate, up))
+                .collect::<Vec<_>>();
+            let expected = weights.expert(names[1], id, &mid).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(&a, b)| a.to_bits() == b.to_bits()),
+                "resident tile differed at row {row}, expert {expert}"
+            );
+        }
     }
 }

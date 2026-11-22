@@ -264,9 +264,26 @@ impl GgufCuda {
             .map(|route| vec![Vec::new(); route.ids.len()])
             .collect();
         let transfers = self.visit_experts(source, &ids, cache, |id, matrices| {
-            for &(row, rank) in &groups[&id] {
-                rows[row][rank] =
-                    self.project_pair(&matrices, dtypes, routes[row].input, &activate)?;
+            let [gate, down] = &matrices.parts;
+            let tile = self
+                .step
+                .gguf_rows_capacity(dtypes[0], gate.shape)?
+                .min(self.step.gguf_rows_capacity(dtypes[1], down.shape)?)
+                .max(1);
+            for lanes in groups[&id].chunks(tile) {
+                if lanes.len() == 1 {
+                    let (row, rank) = lanes[0];
+                    rows[row][rank] =
+                        self.project_pair(&matrices, dtypes, routes[row].input, &activate)?;
+                } else {
+                    let batch =
+                        self.project_prefill_rows(&matrices, dtypes, lanes, routes, &activate)?;
+                    for (&(row, rank), output) in
+                        lanes.iter().zip(batch.chunks_exact(down.shape[0]))
+                    {
+                        rows[row][rank] = output.to_vec();
+                    }
+                }
             }
             Ok(())
         })?;
@@ -357,6 +374,38 @@ impl GgufCuda {
         Ok(transfers)
     }
 
+    fn project_prefill_rows(
+        &self,
+        matrices: &ExpertMatrices<'_>,
+        dtypes: [DenseDtype; 2],
+        lanes: &[(usize, usize)],
+        routes: &[PrefillRoute<'_>],
+        activate: &impl Fn(f32, f32) -> f32,
+    ) -> Result<Vec<f32>, EngError> {
+        let [gate, down] = &matrices.parts;
+        let middle = down.shape[1];
+        if gate.shape[0] != 2 * middle {
+            return Err(bad(
+                "streamed expert batch has incompatible gate and down widths",
+            ));
+        }
+
+        let project = |part: usize, input: &[&[f32]]| {
+            let view = &matrices.parts[part];
+            self.step.project_gguf_rows(
+                &self.context,
+                matrices.stream,
+                (dtypes[part], view.data, view.shape, view.scale),
+                input,
+            )
+        };
+        let inputs: Vec<_> = lanes.iter().map(|&(row, _)| routes[row].input).collect();
+        let gates = project(0, &inputs)?;
+        let mid = activate_rows(&gates, middle, activate);
+        let activations = mid.chunks_exact(middle).collect::<Vec<_>>();
+        project(1, &activations)
+    }
+
     fn project_pair(
         &self,
         weights: &ExpertMatrices<'_>,
@@ -409,9 +458,22 @@ fn note_bucket(histogram: &mut Vec<u64>, count: usize) {
     histogram[bucket] += 1;
 }
 
+pub(super) fn activate_rows(
+    gates: &[f32],
+    middle: usize,
+    activate: &impl Fn(f32, f32) -> f32,
+) -> Vec<f32> {
+    let mut result = Vec::with_capacity(gates.len() / 2);
+    for combined in gates.chunks_exact(2 * middle) {
+        let (gate, up) = combined.split_at(middle);
+        result.extend(gate.iter().zip(up).map(|(&g, &u)| activate(g, u)));
+    }
+    result
+}
+
 pub(in crate::family::inkling2) type ExpertRows = Vec<Vec<Vec<f32>>>;
 
-fn group_routes(
+pub(super) fn group_routes(
     layer: u32,
     routes: &[PrefillRoute<'_>],
 ) -> BTreeMap<ExpertId, Vec<(usize, usize)>> {

@@ -139,6 +139,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/qsa_select.cu",
     "src/kernels/cuda/native/resident/pack_rows.cu",
     "src/kernels/cuda/native/resident/dense_gemv.cu",
+    "src/kernels/cuda/native/resident/relative_attention.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -204,6 +205,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/prefill/mmq_nvfp4.h",
     "src/kernels/cuda/native/prefill/mmq_quant.h",
     "src/kernels/cuda/native/prefill/row_ops.h",
+    "src/kernels/cuda/native/expert_math.cuh",
     "src/kernels/cuda/native/prefill/scatter_cols.h",
     "src/kernels/cuda/native/prefill/status.h",
     "src/kernels/cuda/native/prefill/swiglu_rows.h",
@@ -290,6 +292,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/hyper.h",
     "src/kernels/cuda/native/resident/qsa_attn.h",
     "src/kernels/cuda/native/resident/qsa_index.h",
+    "src/kernels/cuda/native/resident/relative_attention.h",
     "src/kernels/cuda/native/resident/qsa_select.h",
 ];
 

@@ -51,6 +51,68 @@ impl CpuForward {
         matches!(&self.weights, Weights::Gguf(weights) if weights.supports_grouped_prefill())
     }
 
+    pub(in crate::family::inkling2) fn prefill_workspace_bytes_per_row(
+        &self,
+    ) -> Result<u64, EngError> {
+        let hidden = u128::from(self.spec.hidden_size);
+        let middle = u128::from(self.spec.intermediate_size);
+        let experts = u128::from(self.spec.n_routed_experts);
+        let top_k = u128::from(self.spec.num_experts_per_tok);
+        let blocks = self
+            .visits
+            .iter()
+            .filter(|visit| {
+                visit
+                    .weight_layer
+                    .is_multiple_of(self.spec.n_layers_per_attn_res_block)
+            })
+            .count() as u128;
+
+        // Current stream, prelude, prior pass bank, and a transient stream clone.
+        let stream_values = 4 * (blocks + 1) * hidden;
+        // Routed contributions, MLP input, accumulated output, and staging
+        // copies of the input, output, and gate/up and down intermediates.
+        let mut projection_values = (top_k + 6) * hidden + 6 * middle;
+        let mut projection_metadata = 0;
+        if prefill_projection_batch_enabled() {
+            let query = u128::from(
+                self.spec
+                    .num_attention_heads
+                    .max(self.spec.swa_num_attention_heads),
+            );
+            let kv = u128::from(
+                self.spec
+                    .num_key_value_heads
+                    .max(self.spec.swa_num_key_value_heads),
+            );
+            let width = u128::from(self.spec.head_dim.max(self.spec.swa_head_dim));
+            projection_values += 3 * hidden
+                + 2 * (query + kv) * width
+                + query * (self.math.d_rel as u128 + 1)
+                + 2 * kv * self.math.sconv_kernel_size as u128;
+            projection_metadata = (size_of::<[Vec<f32>; 3]>()
+                + size_of::<super::super::cpu_attention::AttentionProjection>()
+                + size_of::<[&[f32]; 3]>()) as u128;
+        }
+        // Batched router logits coexist with the selected rows' scores.
+        let numeric_bytes =
+            (stream_values + projection_values + 2 * experts) * size_of::<f32>() as u128;
+        // Include row handles and reserve room for geometrically grown lane lists.
+        let row_metadata = (size_of::<PromptRow>()
+            + size_of::<MlpRow>()
+            + size_of::<PrefillRoute<'_>>()
+            + size_of::<Vec<f32>>()) as u128;
+        let stream_metadata = 8 * blocks * size_of::<Vec<f32>>() as u128;
+        let lanes = size_of::<(usize, usize)>();
+        let resident_slots = size_of::<(crate::expert_tier::ExpertId, (usize, usize))>();
+        let route_metadata = top_k
+            * (2 * (lanes + resident_slots) + size_of::<usize>() + size_of::<Vec<f32>>()) as u128;
+        u64::try_from(
+            numeric_bytes + row_metadata + stream_metadata + route_metadata + projection_metadata,
+        )
+        .map_err(|_| EngError::MemoryPlan("Inkling prefill workspace size overflows".into()))
+    }
+
     pub(in crate::family::inkling2) fn prefill_grouped(
         &mut self,
         tokens: &[u32],
@@ -63,7 +125,7 @@ impl CpuForward {
                 "a previous Inkling forward invalidated the sequence state",
             ));
         }
-        if !(2..=crate::family::inkling2::MAX_PREFILL_ROWS).contains(&tokens.len())
+        if tokens.len() < 2
             || tokens.len() > self.context.saturating_sub(self.position)
             || tokens
                 .iter()
@@ -114,20 +176,81 @@ impl CpuForward {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let prefix = format!("{layer}.mlp");
-        let mlp = rows
-            .iter_mut()
-            .map(|row| {
-                let input =
-                    self.mlp_input(visit, &layer, state, &mut row.stream, row.bank.as_ref())?;
-                let route = self.moe_route(physical, &prefix, &input)?;
-                Ok(MlpRow { route, input })
-            })
-            .collect::<Result<Vec<_>, EngError>>()?;
+        let mut projected = self
+            .prompt_attention_inputs(visit, &layer, rows, weights)?
+            .into_iter()
+            .flatten();
+        let inputs = rows.iter_mut().map(|row| {
+            self.mlp_input(
+                visit,
+                &layer,
+                state,
+                &mut row.stream,
+                row.bank.as_ref(),
+                projected.next(),
+            )
+        });
+        let router = format!("{prefix}.gate.weight");
+        let mlp = if weights.batch_prefill_router(physical as u32, &router) {
+            self.prompt_routes(
+                weights,
+                physical,
+                &prefix,
+                inputs.collect::<Result<_, _>>()?,
+            )?
+        } else {
+            inputs
+                .map(|input| {
+                    let input = input?;
+                    let route = self.moe_route(physical, &prefix, &input)?;
+                    Ok(MlpRow { route, input })
+                })
+                .collect::<Result<_, EngError>>()?
+        };
         let outputs = self.prompt_experts(weights, physical, &prefix, &mlp)?;
         for (row, output) in rows.iter_mut().zip(outputs) {
             self.finish_layer(&layer, state, &mut row.stream, output)?;
         }
         Ok(())
+    }
+
+    fn prompt_routes(
+        &self,
+        weights: &GgufTextWeights,
+        layer: usize,
+        prefix: &str,
+        inputs: Vec<Vec<f32>>,
+    ) -> Result<Vec<MlpRow>, EngError> {
+        let input_rows: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
+        let logits =
+            weights.prefill_router_logits(&format!("{prefix}.gate.weight"), &input_rows)?;
+        let experts = self.spec.n_routed_experts as usize;
+        let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
+        inputs
+            .into_iter()
+            .zip(logits.chunks_exact(experts))
+            .map(|(input, scores)| {
+                let route = self.moe_route_from_logits(layer, scores.to_vec(), &bias)?;
+                Ok(MlpRow { route, input })
+            })
+            .collect()
+    }
+
+    fn prompt_attention_inputs(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        rows: &[PromptRow],
+        weights: &GgufTextWeights,
+    ) -> Result<Option<Vec<super::super::cpu_attention::AttentionProjection>>, EngError> {
+        if !prefill_projection_batch_enabled() {
+            return Ok(None);
+        }
+        let inputs = rows
+            .iter()
+            .map(|row| self.attention_inputs(visit, layer, &row.stream, row.bank.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.prefill_attention_projections(weights, layer, visit.attention, &inputs)
     }
 
     fn prompt_experts(
@@ -148,12 +271,19 @@ impl CpuForward {
             format!("{prefix}.experts.w13_weight"),
             format!("{prefix}.experts.w2_weight"),
         ];
-        let batch = weights.prefill_experts(
-            names.each_ref().map(String::as_str),
+        let names = names.each_ref().map(String::as_str);
+        if let Some(output) = weights.prefill_device_experts(
+            names,
             layer as u32,
             &routes,
-            |gate, up| self.math.expert_activation(gate, up),
-        )?;
+            [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
+            |row, id| mlp[row].route.weight(id, self.math.route_scale),
+        )? {
+            return Ok(output);
+        }
+        let batch = weights.prefill_experts(names, layer as u32, &routes, |gate, up| {
+            self.math.expert_activation(gate, up)
+        })?;
         let Some(batch) = batch else {
             return mlp
                 .iter()
@@ -176,6 +306,13 @@ impl CpuForward {
             })
             .collect())
     }
+}
+
+fn prefill_projection_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS").as_deref() == Ok("1")
+    })
 }
 
 #[test]

@@ -30,6 +30,8 @@ pub(crate) struct DenseGemvShape {
 }
 
 impl DenseGemvShape {
+    pub(crate) const MAX_ACTIVATION_ROWS: usize = GEMV_MAX_M;
+
     /// One compact activation row and compact results: the stride equals the width.
     pub(crate) fn packed(m: usize, rows: usize, cols: usize) -> Self {
         Self {

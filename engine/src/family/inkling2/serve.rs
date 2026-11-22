@@ -36,7 +36,7 @@ pub(crate) fn start_engine(
     let engine = spawn_engine_noted(1, ready_note, move |stages| {
         stages.begin("weights");
         let forward = CpuForward::open(&model_dir, settings.context as usize)?;
-        let host_reserve = settings.host_reserve(&forward)?;
+        let (planned_rows, host_reserve) = settings.host_prefill_plan(&forward, requested_rows)?;
         let prefix = PrefixStore::with_limits(settings.prefix_limits());
         forward.validate_tokenizer(vocab_size, &eos)?;
         let forward = match backend {
@@ -47,10 +47,21 @@ pub(crate) fn start_engine(
             }
         };
         let prefill_rows = if supports_grouped_prefill(&forward) {
-            requested_rows
+            planned_rows
         } else {
             1
         };
+        if requested_rows > 1 {
+            eprintln!(
+                "Inkling CUDA prefill rows {}",
+                serde_json::json!({
+                    "requested": requested_rows,
+                    "admitted": prefill_rows,
+                    "context": settings.context,
+                    "host_reserve_bytes": host_reserve,
+                })
+            );
+        }
         Ok((
             TextExecutor {
                 forward,
@@ -88,8 +99,8 @@ fn prefill_rows(backend: TextBackend) -> Result<usize, EngError> {
     value
         .to_str()
         .and_then(|text| text.parse::<usize>().ok())
-        .filter(|rows| (1..=super::MAX_PREFILL_ROWS).contains(rows))
-        .ok_or_else(|| super::bad(format!("{NAME} must be in 1..={}", super::MAX_PREFILL_ROWS)))
+        .filter(|&rows| rows != 0)
+        .ok_or_else(|| super::bad(format!("{NAME} must be a positive row count")))
 }
 
 fn supports_grouped_prefill(forward: &CpuForward) -> bool {
@@ -154,18 +165,72 @@ impl TextSettings {
         }
     }
 
-    fn host_reserve(&self, forward: &CpuForward) -> Result<u64, EngError> {
+    fn host_prefill_plan(
+        &self,
+        forward: &CpuForward,
+        requested_rows: usize,
+    ) -> Result<(usize, u64), EngError> {
         let limits = self.prefix_limits();
         // Count every saved state at full size irrespective of shared KV rows.
-        let reserve = forward.host_state_bytes()? * (1 + limits.roots + limits.entries) as u64;
+        let state_bytes = forward
+            .host_state_bytes()?
+            .checked_mul((1 + limits.roots + limits.entries) as u64)
+            .ok_or_else(|| EngError::MemoryPlan("Inkling host state size overflows".into()))?;
         #[cfg(target_os = "linux")]
-        if self.context > DEFAULT_TEXT_CONTEXT || self.prefix_reuse {
+        {
             const LABEL: &str = "Inkling text state";
-            crate::family::mem::HostFacts::read(LABEL, "Inkling")?
-                .admit_payload(reserve, LABEL)?;
+            let state_needs_admission = self.context > DEFAULT_TEXT_CONTEXT || self.prefix_reuse;
+            if state_needs_admission || requested_rows > 1 {
+                let admission =
+                    match crate::family::mem::HostFacts::read(LABEL, "Inkling") {
+                        Ok(admission) => admission,
+                        Err(error) if !state_needs_admission => {
+                            eprintln!("Inkling grouped prefill unavailable: {error:?}");
+                            return Ok((1, state_bytes));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if state_needs_admission {
+                    admission.admit_payload(state_bytes, LABEL)?;
+                }
+                #[cfg(feature = "native-cuda")]
+                if requested_rows > 1 {
+                    return Ok(fit_prefill(
+                        requested_rows,
+                        forward.context,
+                        state_bytes,
+                        forward.prefill_workspace_bytes_per_row()?,
+                        admission.payload_spare(),
+                    ));
+                }
+            }
         }
-        Ok(reserve)
+        let _ = requested_rows;
+        Ok((1, state_bytes))
     }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn fit_prefill(
+    requested: usize,
+    context: usize,
+    state_bytes: u64,
+    bytes_per_row: u64,
+    capacity: u64,
+) -> (usize, u64) {
+    let fit = capacity
+        .saturating_sub(state_bytes)
+        .checked_div(bytes_per_row)
+        .unwrap_or(0);
+    let rows = requested
+        .min(context)
+        .min(usize::try_from(fit).unwrap_or(usize::MAX));
+    if rows < 2 {
+        return (1, state_bytes);
+    }
+    // The product is bounded by the capacity above. Include it in the
+    // reserve seen by the expert RAM warmer.
+    (rows, state_bytes + rows as u64 * bytes_per_row)
 }
 
 struct TextExecutor {
@@ -251,5 +316,23 @@ impl ExecutorOps for TextExecutor {
             self.forward.restore(state);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_prefill;
+
+    #[test]
+    fn grouped_prefill_fits_requested_width_and_context() {
+        assert_eq!(fit_prefill(512, 768, 100, 20, 20_000), (512, 10_340));
+        assert_eq!(fit_prefill(usize::MAX, 128, 100, 20, 20_000), (128, 2_660));
+    }
+
+    #[test]
+    fn grouped_prefill_reserves_workspace_and_falls_back_under_pressure() {
+        assert_eq!(fit_prefill(512, 768, 200, 80, 2_999), (34, 2_920));
+        assert_eq!(fit_prefill(512, 768, 200, 80, 359), (1, 200));
+        assert_eq!(fit_prefill(512, 768, 200, 80, 199), (1, 200));
     }
 }
