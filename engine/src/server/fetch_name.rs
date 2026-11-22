@@ -97,25 +97,42 @@ pub(crate) fn quant_label(path: &str) -> Option<String> {
     from_name(stem).or_else(|| dir.and_then(from_name))
 }
 
-/// The quantizations a listing holds: every GGUF set, projector files left out, each with its
-/// label. Two sets with one label (two directories) keep the larger.
+/// The quantizations a listing holds: every complete GGUF set, projector files and empty files
+/// left out, each with its label. A split set counts only when every shard of it is listed; two
+/// sets with one label (two directories) keep the larger.
 pub(crate) fn quants(files: &[HubFile]) -> Vec<Quant> {
-    let mut sets: BTreeMap<(String, String), Vec<HubFile>> = BTreeMap::new();
+    // (directory, stem, shard count; 0 for a single file)
+    let mut sets: BTreeMap<(String, String, u32), Vec<(u32, HubFile)>> = BTreeMap::new();
     for file in files {
         let lower = file.path.to_ascii_lowercase();
-        if !lower.ends_with(".gguf") || lower.contains("mmproj") {
+        if !lower.ends_with(".gguf") || lower.contains("mmproj") || file.size == 0 {
             continue;
         }
         let (dir, name) = file.path.rsplit_once('/').unwrap_or(("", &file.path));
-        let stem = crate::weights::ShardName::parse(name)
-            .map_or_else(|| name.to_string(), |shard| shard.stem);
-        sets.entry((dir.to_string(), stem))
+        let (stem, count, number) = match crate::weights::ShardName::parse(name) {
+            Some(shard) => (shard.stem, shard.count, shard.number),
+            None => (name.to_string(), 0, 1),
+        };
+        sets.entry((dir.to_string(), stem, count))
             .or_default()
-            .push(file.clone());
+            .push((number, file.clone()));
     }
     let mut found: BTreeMap<String, Quant> = BTreeMap::new();
-    for ((_, _), mut set) in sets {
-        set.sort_by(|a, b| a.path.cmp(&b.path));
+    for ((_, _, count), mut set) in sets {
+        set.sort_by_key(|(number, _)| *number);
+        let whole = if count == 0 {
+            set.len() == 1
+        } else {
+            set.len() == count as usize
+                && set
+                    .iter()
+                    .zip(1..)
+                    .all(|((number, _), want)| *number == want)
+        };
+        if !whole {
+            continue;
+        }
+        let set: Vec<HubFile> = set.into_iter().map(|(_, file)| file).collect();
         let Some(label) = quant_label(&set[0].path) else {
             continue;
         };
@@ -135,38 +152,6 @@ pub(crate) fn quants(files: &[HubFile]) -> Vec<Quant> {
     found.into_values().collect()
 }
 
-/// The first file of the quantization named `label` in a cached snapshot, when every file of that
-/// quantization is whole in it.
-pub(crate) fn cached_quant(snapshot: &Path, label: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<HubFile>) {
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, base, out);
-            } else if let (Ok(meta), Ok(relative)) =
-                (std::fs::metadata(&path), path.strip_prefix(base))
-            {
-                out.push(HubFile {
-                    path: relative.to_string_lossy().into_owned(),
-                    size: meta.len(),
-                    sha256: None,
-                });
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(snapshot, snapshot, &mut files);
-    let found = quants(&files)
-        .into_iter()
-        .find(|quant| quant.label.eq_ignore_ascii_case(label))?;
-    let count =
-        crate::weights::shard_name_of(Path::new(&found.first().path)).map(|shard| shard.count);
-    if count.is_some_and(|count| count as usize != found.files.len()) {
-        return None;
-    }
-    Some(snapshot.join(&found.first().path))
-}
-
 /// How a quantization sits on this host, from the planner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fit {
@@ -176,12 +161,12 @@ pub(crate) enum Fit {
     NotResident,
 }
 
-/// The quantization to fetch and why. With a label asked for, that one or an error naming what
+/// The quantization to serve and why. With a label asked for, that one or an error naming what
 /// the repo holds; without, the planner's choice.
 pub(crate) fn choose(
     quants: &[Quant],
     wanted: Option<&str>,
-    mut fits: impl FnMut(&Quant) -> Fit,
+    mut fits: impl FnMut(&Quant) -> Result<Fit, String>,
 ) -> Result<(Quant, String), String> {
     if let Some(label) = wanted {
         return quants
@@ -198,7 +183,7 @@ pub(crate) fn choose(
     let mut by_size: Vec<&Quant> = quants.iter().collect();
     by_size.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
     for quant in &by_size {
-        if fits(quant) == Fit::Resident {
+        if fits(quant)? == Fit::Resident {
             return Ok((
                 (*quant).clone(),
                 format!(
@@ -228,17 +213,145 @@ fn mib(bytes: u64) -> u64 {
     bytes >> 20
 }
 
-/// What the fetch asks of the rest of the server: the planner's fit for a quantization (given a
-/// stub file that has the real header and the quantization's size), and the family check that
-/// refuses a repo the engine does not serve before any weight is downloaded.
+/// What the choice asks of the rest of the server: the family check that refuses a model the
+/// engine does not serve, and the planner's fit for a quantization. Both read a stub file that
+/// has the real header and the quantization's size.
 pub(crate) struct Planner<'a> {
     pub(crate) accepts: &'a dyn Fn(&Path) -> Result<(), StartupError>,
-    pub(crate) fit: &'a mut dyn FnMut(&Path) -> Fit,
+    pub(crate) fit: &'a mut dyn FnMut(&Path) -> Result<Fit, StartupError>,
+}
+
+/// The one quantization rule, for a cached snapshot and a listing alike: the family check on the
+/// real header, then `choose` with the planner's fit read from stubs of each size.
+fn pick(
+    repo: &str,
+    cache: &Path,
+    held: &[Quant],
+    wanted: Option<&str>,
+    header: &[u8],
+    planner: Planner<'_>,
+) -> Result<(Quant, String), StartupError> {
+    let refuse = |message: String| StartupError(format!("serve --model {repo}: {message}"));
+    let stubs = Stubs::new(cache, header)?;
+    let size_of = |bytes: u64| bytes.max(header.len() as u64);
+    let smallest = held
+        .iter()
+        .min_by_key(|quant| quant.bytes)
+        .ok_or_else(|| refuse("the repo holds no GGUF file".to_string()))?;
+    (planner.accepts)(&stubs.path(size_of(smallest.bytes), "check")?)
+        .map_err(|error| refuse(error.0))?;
+    let fit = planner.fit;
+    let mut failure = None;
+    let chosen = choose(held, wanted, |quant| {
+        stubs
+            .path(size_of(quant.bytes), &quant.label)
+            .and_then(|stub| fit(&stub))
+            .map_err(|error| {
+                failure = Some(error.0.clone());
+                error.0
+            })
+    });
+    chosen.map_err(|message| refuse(failure.unwrap_or(message)))
+}
+
+fn announce(origin: &str, repo: &str, held: &[Quant], picked: &Quant, why: &str) -> String {
+    format!(
+        "{origin}: {repo}:{} ({} MiB, {}): {why}; name another with {repo}:<QUANT> (the repo holds {})",
+        picked.label,
+        mib(picked.bytes),
+        picked
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        labels(held)
+    )
+}
+
+/// The GGUF files of a cached snapshot, with the sizes of the blobs they link to.
+fn cached_files(snapshot: &Path) -> Vec<HubFile> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<HubFile>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else if let (Ok(meta), Ok(relative)) =
+                (std::fs::metadata(&path), path.strip_prefix(base))
+            {
+                out.push(HubFile {
+                    path: relative.to_string_lossy().into_owned(),
+                    size: meta.len(),
+                    sha256: None,
+                });
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(snapshot, snapshot, &mut files);
+    files
+}
+
+/// The path to serve for `wanted`: a quantization of the cached snapshot when the cache holds a
+/// complete one that fits the request, else one fetched into the hub cache first. The first shard
+/// of a split set, inside the snapshot.
+pub(crate) fn resolve(
+    hub: &Arc<HfHub>,
+    wanted: &Wanted,
+    planner: Planner<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<PathBuf, StartupError> {
+    let repo = wanted.repo.as_str();
+    if let Some(snapshot) = hub.main_snapshot(repo) {
+        let held = quants(&cached_files(&snapshot));
+        let usable = !held.is_empty()
+            && wanted.quant.as_deref().is_none_or(|label| {
+                held.iter()
+                    .any(|quant| quant.label.eq_ignore_ascii_case(label))
+            });
+        if usable {
+            let smallest = held
+                .iter()
+                .min_by_key(|quant| quant.bytes)
+                .expect("a non-empty set");
+            let first = snapshot.join(&smallest.first().path);
+            let header = read_local_header(&first, smallest.first().size)
+                .map_err(|error| StartupError(format!("serve --model {repo}: {error}")))?;
+            let (picked, why) = pick(
+                repo,
+                hub.cache_dir(),
+                &held,
+                wanted.quant.as_deref(),
+                &header,
+                planner,
+            )?;
+            say(&announce("cache", repo, &held, &picked, &why));
+            return Ok(snapshot.join(&picked.first().path));
+        }
+    }
+    fetch(hub, wanted, planner, say)
+}
+
+fn read_local_header(path: &Path, size: u64) -> Result<Vec<u8>, String> {
+    let name = path.display().to_string();
+    super::hf::read_gguf_header(&name, size, &mut |length| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(
+                std::fs::File::open(path)
+                    .map_err(|error| format!("cannot read {name}: {error}"))?,
+                length,
+            ),
+            &mut bytes,
+        )
+        .map_err(|error| format!("cannot read {name}: {error}"))?;
+        Ok(bytes)
+    })
 }
 
 /// Makes the files of one quantization of `wanted.repo` exist in the hub cache and returns the
 /// path to serve: the first shard, inside the snapshot.
-pub(crate) fn fetch(
+fn fetch(
     hub: &Arc<HfHub>,
     wanted: &Wanted,
     planner: Planner<'_>,
@@ -250,14 +363,14 @@ pub(crate) fn fetch(
     let held = quants(&tree.files);
     if held.is_empty() {
         return Err(refuse(
-            "the repo holds no GGUF file; name a repo of GGUF files".to_string(),
+            "the repo holds no complete GGUF file; name a repo of GGUF files".to_string(),
         ));
     }
     // Nothing is read from the repo's files while even the smallest quantization cannot fit.
     let smallest = held
         .iter()
         .min_by_key(|quant| quant.bytes)
-        .expect("a listing with a quantization");
+        .expect("a non-empty set");
     if let Some(free) = hub.free_bytes()
         && smallest.bytes > free
     {
@@ -269,44 +382,19 @@ pub(crate) fn fetch(
             hub.cache_dir().display()
         )));
     }
-    // The real header of the smallest quantization stands for all of them: the planner and the
-    // family check read it from stub files of each size, and no weight is downloaded yet.
+    // The real header of the smallest quantization stands for all of them.
     let header = hub
         .gguf_header_bytes(&wanted.repo, &tree.commit, smallest.first())
         .map_err(&refuse)?;
-    let stubs = Stubs::new(hub.cache_dir(), &header)?;
-    (planner.accepts)(&stubs.path(smallest.bytes.max(header.len() as u64), "check")?)
-        .map_err(|error| StartupError(format!("serve --model {}: {}", wanted.repo, error.0)))?;
-    let fit = planner.fit;
-    let mut stub_error = None;
-    let (picked, why) = choose(&held, wanted.quant.as_deref(), |quant| {
-        match stubs.path(quant.bytes.max(header.len() as u64), &quant.label) {
-            Ok(stub) => fit(&stub),
-            Err(error) => {
-                stub_error = Some(error);
-                Fit::NotResident
-            }
-        }
-    })
-    .map_err(&refuse)?;
-    if let Some(error) = stub_error {
-        return Err(error);
-    }
-    drop(stubs);
-    say(&format!(
-        "fetch: {}:{} ({} MiB, {}): {why}; name another with {}:<QUANT> (the repo holds {})",
-        wanted.repo,
-        picked.label,
-        mib(picked.bytes),
-        picked
-            .files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        wanted.repo,
-        labels(&held)
-    ));
+    let (picked, why) = pick(
+        &wanted.repo,
+        hub.cache_dir(),
+        &held,
+        wanted.quant.as_deref(),
+        &header,
+        planner,
+    )?;
+    say(&announce("fetch", &wanted.repo, &held, &picked, &why));
     let chosen: Vec<String> = picked.files.iter().map(|file| file.path.clone()).collect();
     let snapshot = hub
         .download_and_wait(
@@ -463,11 +551,11 @@ mod tests {
         ]);
         let resident_up_to = |limit: u64| {
             move |quant: &Quant| {
-                if quant.bytes <= limit {
+                Ok(if quant.bytes <= limit {
                     Fit::Resident
                 } else {
                     Fit::NotResident
-                }
+                })
             }
         };
         let (picked, why) = choose(&held, None, resident_up_to(650)).expect("choice");
@@ -481,5 +569,21 @@ mod tests {
         assert_eq!(picked.label, "Q8_0");
         let error = choose(&held, Some("Q2_K"), resident_up_to(0)).unwrap_err();
         assert!(error.contains("Q4_K_M, Q6_K, Q8_0"), "{error}");
+    }
+
+    #[test]
+    fn a_listing_offers_only_complete_non_empty_sets() {
+        let held = quants(&[
+            file("a-Q4_K_M.gguf", 0),
+            file("b-Q6_K-00001-of-00003.gguf", 10),
+            file("b-Q6_K-00003-of-00003.gguf", 10),
+            file("c-Q8_0-00001-of-00002.gguf", 10),
+            file("c-Q8_0-00002-of-00002.gguf", 10),
+            // The same stem with another shard count is another set.
+            file("c-Q8_0-00001-of-00003.gguf", 10),
+        ]);
+        let labels: Vec<&str> = held.iter().map(|quant| quant.label.as_str()).collect();
+        assert_eq!(labels, ["Q8_0"]);
+        assert_eq!(held[0].files.len(), 2);
     }
 }

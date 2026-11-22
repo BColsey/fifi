@@ -794,10 +794,10 @@ fn gguf_file(length: usize, fill: u8) -> Vec<u8> {
 fn fetch_with(
     hub: &Arc<HfHub>,
     quant: Option<&str>,
-    fit: &mut dyn FnMut(&Path) -> super::fetch_name::Fit,
+    fit: &mut dyn FnMut(&Path) -> Result<super::fetch_name::Fit, super::config::StartupError>,
     accepts: &dyn Fn(&Path) -> Result<(), super::config::StartupError>,
 ) -> Result<PathBuf, super::config::StartupError> {
-    super::fetch_name::fetch(
+    super::fetch_name::resolve(
         hub,
         &super::fetch_name::Wanted {
             repo: "org/m".to_string(),
@@ -823,7 +823,7 @@ fn a_name_fetches_only_the_files_of_the_quantization_asked_for() {
     let path = fetch_with(
         &hub,
         Some("q8_0"),
-        &mut |_| super::fetch_name::Fit::Resident,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
         &|_| Ok(()),
     )
     .expect("fetched");
@@ -860,9 +860,9 @@ fn without_a_label_the_planner_chooses_and_a_planner_stub_has_the_real_header_an
             assert_eq!(&std::fs::read(stub).expect("stub")[..4], b"GGUF");
             seen.push(length);
             if length <= 300 {
-                super::fetch_name::Fit::Resident
+                Ok(super::fetch_name::Fit::Resident)
             } else {
-                super::fetch_name::Fit::NotResident
+                Ok(super::fetch_name::Fit::NotResident)
             }
         },
         &|_| Ok(()),
@@ -887,7 +887,7 @@ fn a_repo_the_engine_does_not_serve_is_refused_before_any_weight_is_downloaded()
     let error = fetch_with(
         &hub,
         None,
-        &mut |_| super::fetch_name::Fit::Resident,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
         &|_| {
             Err(super::config::StartupError(
                 "no family serves the GGUF architecture mamba9".into(),
@@ -910,7 +910,7 @@ fn a_disk_too_small_for_the_smallest_quantization_refuses_before_any_file_is_rea
     let error = fetch_with(
         &hub,
         None,
-        &mut |_| super::fetch_name::Fit::Resident,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
         &|_| Ok(()),
     )
     .expect_err("refused");
@@ -933,17 +933,17 @@ fn a_repo_with_no_gguf_and_a_label_it_lacks_are_refused_naming_what_it_holds() {
     let error = fetch_with(
         &hub,
         None,
-        &mut |_| super::fetch_name::Fit::Resident,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
         &|_| Ok(()),
     )
     .expect_err("no gguf");
-    assert!(error.0.contains("holds no GGUF"), "{}", error.0);
+    assert!(error.0.contains("holds no complete GGUF"), "{}", error.0);
     let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
     let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
     let error = fetch_with(
         &hub,
         Some("Q2_K"),
-        &mut |_| super::fetch_name::Fit::Resident,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
         &|_| Ok(()),
     )
     .expect_err("no such quantization");
@@ -981,5 +981,152 @@ fn an_interrupted_download_resumes_from_its_partial_instead_of_starting_over() {
         !blobs
             .join(format!("{}.incomplete", sha256_hex(&content)))
             .exists()
+    );
+}
+
+fn all_resident() -> impl FnMut(&Path) -> Result<super::fetch_name::Fit, super::config::StartupError>
+{
+    |_| Ok(super::fetch_name::Fit::Resident)
+}
+
+#[test]
+fn a_second_resolve_serves_the_cached_file_with_no_request() {
+    let q4 = gguf_file(300, 4);
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &q4)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let first = fetch_with(&hub, None, &mut all_resident(), &|_| Ok(())).expect("fetched");
+    let after_first = mock.requests.lock().expect("log").len();
+    // A hub nobody answers for: the cache alone must serve.
+    let dead = hub_with_endpoint("http://127.0.0.1:9", dir.path());
+    let again = fetch_with(&dead, None, &mut all_resident(), &|_| Ok(())).expect("cached");
+    assert_eq!(first, again);
+    let named =
+        fetch_with(&dead, Some("q4_k_m"), &mut all_resident(), &|_| Ok(())).expect("cached");
+    assert_eq!(first, named);
+    assert_eq!(mock.requests.lock().expect("log").len(), after_first);
+}
+
+fn hub_with_endpoint(endpoint: &str, dir: &Path) -> Arc<HfHub> {
+    Arc::new(HfHub::with_limits(
+        endpoint.to_string(),
+        dir.to_path_buf(),
+        None,
+        64,
+        Duration::from_secs(2),
+        Box::new(free_disk_bytes),
+    ))
+}
+
+#[test]
+fn a_set_in_a_subdirectory_is_chosen_whole_and_a_set_missing_a_shard_is_never_offered() {
+    let mock = MockHub::start(vec![
+        file(
+            "UD-Q4_K_XL/model-UD-Q4_K_XL-00001-of-00002.gguf",
+            &gguf_file(200, 1),
+        ),
+        file(
+            "UD-Q4_K_XL/model-UD-Q4_K_XL-00002-of-00002.gguf",
+            &gguf_file(150, 2),
+        ),
+        // The larger set lacks its second shard: it is not a quantization of this repo.
+        file("Q8_0/model-Q8_0-00001-of-00002.gguf", &gguf_file(900, 3)),
+        file("model-Q2_K.gguf", &[]),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let path = fetch_with(&hub, None, &mut all_resident(), &|_| Ok(())).expect("fetched");
+    assert_eq!(
+        path,
+        snapshot(dir.path(), "org/m").join("UD-Q4_K_XL/model-UD-Q4_K_XL-00001-of-00002.gguf")
+    );
+    assert!(
+        path.with_file_name("model-UD-Q4_K_XL-00002-of-00002.gguf")
+            .is_file()
+    );
+    let error = fetch_with(&hub, Some("Q8_0"), &mut all_resident(), &|_| Ok(()))
+        .expect_err("Q8_0 is incomplete in the listing");
+    assert!(error.0.contains("UD-Q4_K_XL"), "{}", error.0);
+    // Cached, the same set is found again with no label, through the same rule.
+    let dead = hub_with_endpoint("http://127.0.0.1:9", dir.path());
+    assert_eq!(
+        fetch_with(&dead, None, &mut all_resident(), &|_| Ok(())).expect("cached"),
+        path
+    );
+}
+
+#[test]
+fn a_planner_that_cannot_run_is_an_error_not_a_smaller_quantization() {
+    let mock = MockHub::start(vec![
+        file("model-Q4_K_M.gguf", &gguf_file(300, 4)),
+        file("model-Q8_0.gguf", &gguf_file(600, 8)),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| {
+            Err(super::config::StartupError(
+                "the plan could not be made".into(),
+            ))
+        },
+        &|_| Ok(()),
+    )
+    .expect_err("planner error");
+    assert!(
+        error.0.contains("the plan could not be made"),
+        "{}",
+        error.0
+    );
+    assert!(!repo_cache_dir(dir.path(), "org/m").join("blobs").exists());
+}
+
+#[test]
+fn two_processes_fetching_one_blob_write_it_once() {
+    let content = payload(4000, 5);
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &content)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Two hub bridges over one cache stand for two processes: each holds its own lock handle.
+    let run = |hub: Arc<HfHub>| {
+        std::thread::spawn(move || hub.download_and_wait("org/m", "main", &|_| true, &mut |_| {}))
+    };
+    let first = run(hub_with(
+        &mock,
+        dir.path(),
+        32,
+        Duration::from_secs(5),
+        None,
+    ));
+    let second = run(hub_with(
+        &mock,
+        dir.path(),
+        32,
+        Duration::from_secs(5),
+        None,
+    ));
+    let (first, second) = (
+        first.join().expect("thread"),
+        second.join().expect("thread"),
+    );
+    for done in [first, second] {
+        let done = done.expect("downloaded");
+        assert_eq!(
+            std::fs::read(done.join("model-Q4_K_M.gguf")).expect("file"),
+            content
+        );
+    }
+    let fetched: u64 = mock
+        .resolve_requests()
+        .iter()
+        .filter_map(|line| line.split("range=").nth(1)?.split_once('-'))
+        .map(|(start, end)| {
+            end.parse::<u64>().expect("end") + 1 - start.parse::<u64>().expect("start")
+        })
+        .sum();
+    assert_eq!(
+        fetched,
+        content.len() as u64,
+        "the bytes crossed the wire once"
     );
 }

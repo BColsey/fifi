@@ -411,10 +411,35 @@ const CHUNK_RETRIES: usize = 2;
 /// file and fetches it again.
 const FILE_ATTEMPTS: usize = 3;
 
+/// The most bytes read of one hub API answer: a repo listing with thousands of files is a few
+/// MiB; a larger answer is not one.
+const API_BODY_LIMIT: u64 = 16 << 20;
+
 /// The first read of a GGUF header: most headers (metadata and tensor table) are inside it; a
 /// longer one is read again with four times the length, up to the cap.
 const HEADER_PROBE_BYTES: u64 = 8 << 20;
 const HEADER_CAP_BYTES: u64 = 256 << 20;
+
+/// The bytes at the start of a `size`-byte GGUF file that hold its complete header, from
+/// `read(length)`, which returns the first `length` bytes: a read of growing length until the
+/// header parses.
+pub(crate) fn read_gguf_header(
+    name: &str,
+    size: u64,
+    read: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let mut length = HEADER_PROBE_BYTES.min(size);
+    loop {
+        let bytes = read(length)?;
+        if crate::weights::GgufHeader::from_bytes(&bytes, size, HEADER_CAP_BYTES).is_ok() {
+            return Ok(bytes);
+        }
+        if length >= size || length >= HEADER_CAP_BYTES {
+            return Err(format!("{name} has no readable GGUF header"));
+        }
+        length = (length * 4).min(size).min(HEADER_CAP_BYTES);
+    }
+}
 
 /// The directory the hub stores inside a repo that no client wants:
 /// xet bookkeeping, not model data.
@@ -424,6 +449,12 @@ const SKIPPED_PREFIX: &str = ".cache/";
 /// filled: the snapshot is not servable until the job removes it.
 fn incomplete_marker(repo_dir: &Path, commit: &str) -> PathBuf {
     repo_dir.join(format!(".fifi-incomplete-{commit}"))
+}
+
+/// A name no other job of any process shares: job ids count from the process's start time, so
+/// two processes started in one millisecond would repeat them.
+fn job_tag(job: &Job) -> String {
+    format!("{}-{}", std::process::id(), job.id)
 }
 
 fn unix_millis() -> u64 {
@@ -512,12 +543,17 @@ impl HfHub {
             env!("CARGO_PKG_VERSION"),
             " (hub bridge)"
         );
+        // An https hub never redirects a read to plain http; a configured http endpoint (a
+        // mirror on loopback) is the user's own choice.
+        let https_only = !endpoint.starts_with("http://");
         let api: ureq::Agent = ureq::Agent::config_builder()
+            .https_only(https_only)
             .timeout_global(Some(API_TIMEOUT))
             .user_agent(user_agent)
             .build()
             .into();
         let downloader: ureq::Agent = ureq::Agent::config_builder()
+            .https_only(https_only)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(chunk_timeout))
             .user_agent(user_agent)
@@ -583,9 +619,17 @@ impl HfHub {
         match request.call() {
             Ok(mut response) => {
                 let mut text = String::new();
-                let _ = response.body_mut().as_reader().read_to_string(&mut text);
-                serde_json::from_str(&text)
-                    .map_err(|error| format!("hub answer is not JSON: {error}"))
+                let _ = response
+                    .body_mut()
+                    .as_reader()
+                    .take(API_BODY_LIMIT)
+                    .read_to_string(&mut text);
+                serde_json::from_str(&text).map_err(|error| {
+                    format!(
+                        "hub answer is not JSON (or longer than {} MiB): {error}",
+                        API_BODY_LIMIT >> 20
+                    )
+                })
             }
             Err(ureq::Error::StatusCode(code)) => Err(format!("hub returned {code}")),
             Err(error) => Err(format!("hub unreachable: {error}")),
@@ -919,24 +963,16 @@ impl HfHub {
             commit,
             urlencode_path(&file.path)
         );
-        let mut length = HEADER_PROBE_BYTES.min(file.size);
-        loop {
-            let bytes = chunk_request(
+        read_gguf_header(&file.path, file.size, &mut |length| {
+            chunk_request(
                 &self.downloader,
                 self.token.as_deref(),
                 &url,
                 0,
                 length,
                 length == file.size,
-            )?;
-            if crate::weights::GgufHeader::from_bytes(&bytes, file.size, HEADER_CAP_BYTES).is_ok() {
-                return Ok(bytes);
-            }
-            if length >= file.size || length >= HEADER_CAP_BYTES {
-                return Err(format!("{} has no readable GGUF header", file.path));
-            }
-            length = (length * 4).min(file.size).min(HEADER_CAP_BYTES);
-        }
+            )
+        })
     }
 
     /// Runs one selected download to its end on the calling thread, handing the live state to
@@ -1045,7 +1081,7 @@ impl HfHub {
             let refs = repo_dir.join("refs");
             std::fs::create_dir_all(&refs)
                 .map_err(|error| format!("cannot create {}: {error}", refs.display()))?;
-            let tmp = refs.join(format!(".job{}.tmp", job.id));
+            let tmp = refs.join(format!(".job{}.tmp", job_tag(job)));
             std::fs::write(&tmp, &job.commit)
                 .and_then(|_| std::fs::rename(&tmp, refs.join(&job.revision)))
                 .map_err(|error| format!("cannot record the ref: {error}"))?;
@@ -1086,11 +1122,17 @@ impl HfHub {
         if link.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&link);
         }
+        // One writer per blob: another process or job fetching the same hash waits here, then
+        // finds the blob placed and takes it.
+        let _lock = match file.sha256.as_deref() {
+            Some(sha) => Some(lock_blob(job, blobs_dir, sha)?),
+            None => None,
+        };
         let blob = match file.sha256.as_deref() {
             Some(sha) if blob_has_size(&blobs_dir.join(sha), file.size) => sha.to_string(),
             _ => self.fetch_verified(job, file, blobs_dir, bytes_before)?,
         };
-        place_link(&link, &file.path, &blob, job.id)
+        place_link(&link, &file.path, &blob, &job_tag(job))
     }
 
     /// Fetches one file into `blobs/` and returns its blob name, the
@@ -1109,7 +1151,7 @@ impl HfHub {
         let resumable = file.sha256.is_some();
         let part = match &file.sha256 {
             Some(sha) => blobs_dir.join(format!("{sha}.incomplete")),
-            None => blobs_dir.join(format!(".{}.part", job.id)),
+            None => blobs_dir.join(format!(".{}.part", job_tag(job))),
         };
         let mut last = String::new();
         for _ in 0..FILE_ATTEMPTS {
@@ -1360,6 +1402,33 @@ fn link_resolves_to(link: &Path, size: u64) -> bool {
     std::fs::metadata(link).is_ok_and(|meta| meta.is_file() && meta.len() == size)
 }
 
+/// An exclusive advisory lock on `.locks/<sha>.lock` beside `blobs/`, held until the returned file drops. The wait
+/// polls, so a cancelled job leaves it.
+fn lock_blob(job: &Job, blobs_dir: &Path, sha: &str) -> Result<std::fs::File, String> {
+    let dir = blobs_dir.parent().unwrap_or(blobs_dir).join(".locks");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join(format!("{sha}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    loop {
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(file),
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                if job.cancel.load(Ordering::SeqCst) {
+                    return Err(CANCELLED.to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("cannot lock {}: {error}", path.display())),
+        }
+    }
+}
+
 fn blob_has_size(blob: &Path, size: u64) -> bool {
     std::fs::metadata(blob).is_ok_and(|meta| meta.is_file() && meta.len() == size)
 }
@@ -1379,7 +1448,7 @@ fn file_present(snapshot_dir: &Path, blobs_dir: &Path, file: &HubFile) -> bool {
 /// temporary name beside it and renamed over the final name, so a
 /// reader sees the old state or the new one and two writers of the same
 /// file cannot leave a half state.
-fn place_link(link: &Path, path: &str, blob: &str, job_id: u64) -> Result<(), String> {
+fn place_link(link: &Path, path: &str, blob: &str, job_id: &str) -> Result<(), String> {
     let parent = link
         .parent()
         .ok_or_else(|| format!("{} has no directory", link.display()))?;

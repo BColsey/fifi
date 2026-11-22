@@ -244,35 +244,20 @@ fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupErr
     Ok(args.clone())
 }
 
-/// A hub repo name that is not a path: the cached snapshot when it holds what was asked for, else
-/// the files of one quantization fetched into the hub cache first.
+/// A hub repo name that is not a path: one quantization of its cached snapshot, or of the hub
+/// when the cache holds none that fits, chosen by the planner.
 fn resolve_hub_name(
     args: &ModelServeArgs,
     wanted: &super::fetch_name::Wanted,
 ) -> Result<ModelServeArgs, StartupError> {
     let mut resolved = args.clone();
     let hub = std::sync::Arc::new(super::hf::HfHub::from_env());
-    if let Some(snapshot) = hub.main_snapshot(&wanted.repo) {
-        let found = match &wanted.quant {
-            None => Some(snapshot),
-            Some(label) => super::fetch_name::cached_quant(&snapshot, label),
-        };
-        if let Some(path) = found {
-            eprintln!(
-                "model: {} resolved to the hub cache at {}",
-                args.model_dir.display(),
-                path.display()
-            );
-            resolved.model_dir = path;
-            return Ok(resolved);
-        }
-    }
-    // The planner reads the machine once, and only when no quantization was named.
+    // The planner reads the machine once, and only when a choice needs it.
     let facts = std::cell::OnceCell::new();
     let measured = || facts.get_or_init(crate::capability::probe::probe);
     let accepts = |stub: &Path| discover(&args_for_path(stub)).map(|_| ());
     let mut fit = |stub: &Path| planned_fit(stub, measured());
-    resolved.model_dir = super::fetch_name::fetch(
+    resolved.model_dir = super::fetch_name::resolve(
         &hub,
         wanted,
         super::fetch_name::Planner {
@@ -292,33 +277,16 @@ fn args_for_path(path: &Path) -> ModelServeArgs {
 }
 
 /// Whether the shared planner plans the stub's weights fully resident on this host's card at the
-/// default context: the preflight estimate's own fit. A family with no estimate yet is sized by
-/// its file against the free memory the estimate would have used.
-fn planned_fit(stub: &Path, facts: &HardwareFacts) -> super::fetch_name::Fit {
+/// default context: the preflight estimate's own fit. A plan with no estimate is not resident; a
+/// preflight that cannot run is an error.
+fn planned_fit(stub: &Path, facts: &HardwareFacts) -> Result<super::fetch_name::Fit, StartupError> {
     use super::fetch_name::Fit;
-    let Ok(report) = preflight::preflight(stub, stub, &preflight::Candidate::default(), facts)
-    else {
-        return Fit::NotResident;
-    };
-    match report.estimate {
+    let report = preflight::preflight(stub, stub, &preflight::Candidate::default(), facts)
+        .map_err(|error| StartupError(describe_error(&error)))?;
+    Ok(match report.estimate {
         Some(estimate) if estimate.fit == preflight::ResourceFit::Fits => Fit::Resident,
-        Some(_) => Fit::NotResident,
-        None => {
-            let free = facts
-                .cuda
-                .first_device_free_bytes
-                .as_ref()
-                .or(facts.host.mem_available_bytes.as_ref())
-                .copied()
-                .unwrap_or(0);
-            let bytes = std::fs::metadata(stub).map_or(u64::MAX, |meta| meta.len());
-            if bytes.saturating_mul(10) <= free.saturating_mul(8) {
-                Fit::Resident
-            } else {
-                Fit::NotResident
-            }
-        }
-    }
+        _ => Fit::NotResident,
+    })
 }
 
 /// Discover the model, run the non-probing preflight, and build the
