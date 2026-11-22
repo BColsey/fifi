@@ -23,7 +23,11 @@
 //! in place into the slot's pinned bounce buffer on `begin` (the host is busy for the read, which
 //! the report counts in `read_seconds`) and then copied the same way.
 
-use std::{fs::File, os::unix::fs::FileExt, rc::Rc, sync::Arc, time::Instant};
+use std::{fs::File, os::unix::fs::FileExt, sync::Arc, time::Instant};
+
+use super::extent_read::{ExtentPlan, read_extent, span_of};
+use super::host_tier::SECTOR;
+use crate::family::engine_owner::Handle;
 
 use super::layer_stream::{ExpertTransport, TransferReport, UploadSet};
 use crate::{
@@ -42,8 +46,14 @@ fn transport_error(detail: String) -> EngError {
 pub(crate) enum StackHome {
     /// In the pinned buffer `buf` of the transport's store, from `offset`.
     Pinned { buf: usize, offset: usize },
-    /// In a model file, from `offset`.
-    File { file: Arc<File>, offset: u64 },
+    /// In a model file, from `offset`. A whole-layer copy reads the extent through `direct` (a
+    /// handle opened for direct reads, several threads at once) when there is one; a subset
+    /// copy reads each record through `file`.
+    File {
+        file: Arc<File>,
+        direct: Option<Arc<File>>,
+        offset: u64,
+    },
 }
 
 /// The quantization and shape of a stack, when the staged copy is read as a [`NativeWeight`].
@@ -112,34 +122,39 @@ struct StallPair {
 }
 
 /// The transport over one card.
-pub(crate) struct CardTransport {
-    ctx: Rc<CudaContext>,
-    compute: Rc<DeviceStream>,
+pub(crate) struct CardTransport<'a> {
+    ctx: Handle<'a, CudaContext>,
+    compute: Handle<'a, DeviceStream>,
     copy: DeviceStream,
     experts: usize,
     layers: Vec<Vec<StackSpan>>,
     /// `stage_of[layer][stack]` indexes every slot's `stages`.
     stage_of: Vec<Vec<usize>>,
+    /// Where each stack of each layer sits in a slot's bounce buffer (file sources).
+    bounce_at: Vec<Vec<usize>>,
     store: Vec<PinnedBuf>,
     slots: Vec<Slot>,
+    extent: ExtentPlan,
     read_seconds: f64,
+    read_bytes: u64,
     stalls: Vec<StallPair>,
     spare_stalls: Vec<(TimingEvent, TimingEvent)>,
 }
 
-impl CardTransport {
+impl<'a> CardTransport<'a> {
     /// Allocates `slots` staging slots on the card (and a bounce buffer per slot when any layer
     /// is read from a file). `layers[l]` lists the stacks of layer `l`; every layer has the same
     /// number of stacks and `experts` equal records per stack. `store` holds the pinned buffers
     /// the [`StackHome::Pinned`] spans index.
     pub(crate) fn new(
-        ctx: Rc<CudaContext>,
-        compute: Rc<DeviceStream>,
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        compute: impl Into<Handle<'a, DeviceStream>>,
         experts: usize,
         layers: Vec<Vec<StackSpan>>,
         store: Vec<PinnedBuf>,
         slots: usize,
     ) -> Result<Self, EngError> {
+        let (ctx, compute) = (ctx.into(), compute.into());
         let stacks = layers.first().map_or(0, Vec::len);
         if stacks == 0 || slots == 0 || experts == 0 {
             return Err(transport_error("no stacks, slots or experts".into()));
@@ -190,11 +205,33 @@ impl CardTransport {
             .iter()
             .flatten()
             .any(|span| matches!(span.home, StackHome::File { .. }));
-        let bounce_bytes: usize = layers
-            .iter()
-            .map(|spans| spans.iter().map(|span| span.bytes).sum::<usize>())
-            .max()
-            .unwrap_or(0);
+        // The bounce layout of the file sources. A stack read through a direct handle needs its
+        // aligned span at a sector-aligned address, so the stack's own bytes start `offset mod
+        // sector` bytes into a sector; the others are packed.
+        let mut bounce_at: Vec<Vec<usize>> = Vec::with_capacity(layers.len());
+        let mut bounce_bytes = 0usize;
+        for spans in &layers {
+            let mut at_row = Vec::with_capacity(stacks);
+            let mut cursor = 0usize;
+            for span in spans {
+                let at = match &span.home {
+                    StackHome::File {
+                        direct: Some(_),
+                        offset,
+                        ..
+                    } => {
+                        let (_, delta) = span_of(*offset, span.bytes);
+                        cursor.next_multiple_of(SECTOR as usize) + delta
+                    }
+                    _ => cursor,
+                };
+                at_row.push(at);
+                cursor = at + span.bytes;
+            }
+            bounce_bytes =
+                bounce_bytes.max(cursor.next_multiple_of(SECTOR as usize) + SECTOR as usize);
+            bounce_at.push(at_row);
+        }
         let copy = ctx.stream()?;
         let mut staged = Vec::with_capacity(slots);
         for _ in 0..slots {
@@ -233,9 +270,12 @@ impl CardTransport {
             experts,
             layers,
             stage_of,
+            bounce_at,
             store,
             slots: staged,
+            extent: ExtentPlan::DEFAULT,
             read_seconds: 0.0,
+            read_bytes: 0,
             stalls: Vec::new(),
             spare_stalls: Vec::new(),
         })
@@ -294,6 +334,18 @@ impl CardTransport {
         self.read_seconds
     }
 
+    /// Replaces the plan of the direct extent reads (see
+    /// [`probe_plan`](super::extent_read::probe_plan)).
+    pub(crate) fn set_extent_plan(&mut self, plan: ExtentPlan) {
+        self.extent = plan;
+    }
+
+    /// Bytes the drive was asked for in direct extent reads, and the host seconds all file reads
+    /// took, over the transport's life: the rate of the file source.
+    pub(crate) fn read_totals(&self) -> (u64, f64) {
+        (self.read_bytes, self.read_seconds)
+    }
+
     /// Reads `span` from its file into `bounce` at `at`; returns the host seconds it took.
     fn read_into(
         bounce: &mut PinnedBuf,
@@ -316,7 +368,7 @@ impl CardTransport {
     }
 }
 
-impl ExpertTransport for CardTransport {
+impl ExpertTransport for CardTransport<'_> {
     type Ticket = CardTicket;
 
     fn begin(
@@ -341,42 +393,63 @@ impl ExpertTransport for CardTransport {
         // File sources are read into the slot's bounce buffer first, every stack before the
         // first copy: the buffer cannot be written while a copy of it is outstanding.
         let mut read_seconds = 0f64;
-        let mut bounce_at = 0usize;
-        for span in spans {
-            if let StackHome::File { file, offset } = &span.home {
-                let bounce = state.bounce.as_mut().ok_or_else(|| {
-                    transport_error("a file source needs the bounce buffer".into())
-                })?;
-                match set {
-                    UploadSet::Whole => {
-                        read_seconds +=
-                            Self::read_into(bounce, bounce_at, file, *offset, span.bytes)?;
-                    }
-                    UploadSet::Subset(experts) => {
-                        let record = span.bytes / self.experts;
-                        for &expert in experts {
-                            let rel = expert as usize * record;
-                            read_seconds += Self::read_into(
-                                bounce,
-                                bounce_at + rel,
-                                file,
-                                *offset + rel as u64,
-                                record,
-                            )?;
-                        }
+        let mut read_bytes = 0u64;
+        let bounce_row = &self.bounce_at[layer];
+        for (index, span) in spans.iter().enumerate() {
+            let StackHome::File {
+                file,
+                direct,
+                offset,
+            } = &span.home
+            else {
+                continue;
+            };
+            let at = bounce_row[index];
+            let bounce = state
+                .bounce
+                .as_mut()
+                .ok_or_else(|| transport_error("a file source needs the bounce buffer".into()))?;
+            match (set, direct) {
+                (UploadSet::Whole, Some(direct)) => {
+                    let (span_len, delta) = span_of(*offset, span.bytes);
+                    let base = at - delta;
+                    let plan = self.extent;
+                    let mut stats = None;
+                    bounce.fill(base + span_len, |host| {
+                        stats = Some(read_extent(
+                            direct,
+                            *offset,
+                            span.bytes,
+                            &mut host[base..base + span_len],
+                            plan,
+                        )?);
+                        Ok(())
+                    })?;
+                    if let Some(stats) = stats {
+                        read_seconds += stats.seconds;
+                        read_bytes += stats.bytes;
                     }
                 }
-                bounce_at += span.bytes;
+                (UploadSet::Whole, None) => {
+                    read_seconds += Self::read_into(bounce, at, file, *offset, span.bytes)?;
+                }
+                (UploadSet::Subset(experts), _) => {
+                    let record = span.bytes / self.experts;
+                    for &expert in experts {
+                        let rel = expert as usize * record;
+                        read_seconds +=
+                            Self::read_into(bounce, at + rel, file, *offset + rel as u64, record)?;
+                    }
+                }
             }
         }
         let mut bytes = 0u64;
-        let mut bounce_at = 0usize;
         for (index, span) in spans.iter().enumerate() {
             let dst = state.stages[stage_of[index]].buffer();
             // Where this stack's bytes sit in host memory: a pinned buffer and offset.
             let (from_file, base) = match &span.home {
                 StackHome::Pinned { buf, offset } => (false, (*buf, *offset)),
-                StackHome::File { .. } => (true, (usize::MAX, bounce_at)),
+                StackHome::File { .. } => (true, (usize::MAX, bounce_row[index])),
             };
             let record = span.bytes / self.experts;
             let mut copy_range = |rel: usize, len: usize| -> Result<(), EngError> {
@@ -405,15 +478,13 @@ impl ExpertTransport for CardTransport {
                     }
                 }
             }
-            if from_file {
-                bounce_at += span.bytes;
-            }
         }
         // The end mark is recorded before the copied event: a host wait on the event then
         // proves the end mark complete, and the elapsed time can be read.
         self.copy.record_timing(&state.end)?;
         self.copy.record(&state.copied)?;
         self.read_seconds += read_seconds;
+        self.read_bytes += read_bytes;
         Ok(CardTicket {
             layer,
             slot,

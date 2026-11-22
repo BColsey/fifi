@@ -11,6 +11,7 @@ use super::layer_stream::{
 use super::layer_stream_card::{CardTicket, CardTransport, StackHome, StackSpan};
 use crate::{
     EngError,
+    family::engine_owner::Handle,
     family::project::cuda::CudaProjector,
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf, device_present},
 };
@@ -36,15 +37,15 @@ fn stack_bytes(layer: usize, stack: usize) -> Vec<u8> {
     out
 }
 
-struct Checking {
-    inner: CardTransport,
+struct Checking<'a> {
+    inner: CardTransport<'a>,
     stream: Rc<DeviceStream>,
     sent: Vec<(usize, usize, UploadSet)>,
     checked: Rc<RefCell<usize>>,
     wanted: Vec<u32>,
 }
 
-impl ExpertTransport for Checking {
+impl ExpertTransport for Checking<'_> {
     type Ticket = CardTicket;
 
     fn begin(
@@ -67,7 +68,7 @@ impl ExpertTransport for Checking {
     }
 }
 
-impl Checking {
+impl Checking<'_> {
     /// Every expert the layer's pieces picked must read back byte-exact from its slot.
     fn verify(&self, layer: usize, slot: usize) {
         for stack in 0..STACKS {
@@ -93,8 +94,8 @@ impl Checking {
     }
 }
 
-struct Verify<'a> {
-    transport: &'a RefCell<Option<Checking>>,
+struct Verify<'a, 'c> {
+    transport: &'a RefCell<Option<Checking<'c>>>,
     layers: usize,
     picks: Vec<u32>,
     predicted: Option<Vec<u32>>,
@@ -102,9 +103,9 @@ struct Verify<'a> {
 
 /// The driver owns the transport, so the test routes it through a cell: `LayerMajor` gets a thin
 /// handle and the recipe reads the staged bytes through the same cell.
-struct Handle<'a>(&'a RefCell<Option<Checking>>);
+struct Shared<'a, 'c>(&'a RefCell<Option<Checking<'c>>>);
 
-impl ExpertTransport for Handle<'_> {
+impl ExpertTransport for Shared<'_, '_> {
     type Ticket = CardTicket;
 
     fn begin(&mut self, l: usize, s: &UploadSet, slot: usize) -> Result<Self::Ticket, EngError> {
@@ -128,7 +129,7 @@ impl ExpertTransport for Handle<'_> {
     }
 }
 
-impl LayerRecipe for Verify<'_> {
+impl LayerRecipe for Verify<'_, '_> {
     fn layers(&self) -> usize {
         self.layers
     }
@@ -169,13 +170,19 @@ fn layer_shapes(layers: usize) -> Vec<LayerExperts> {
         .collect()
 }
 
-fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u32>>) -> usize {
+fn run(
+    layers: usize,
+    from_file: bool,
+    direct: bool,
+    rule: UploadRule,
+    predicted: Option<Vec<u32>>,
+) -> usize {
     assert!(
         device_present("expert layer transport"),
         "a GPU is required"
     );
     let projector = CudaProjector::new().expect("projector");
-    let ctx = projector.shared_context();
+    let ctx = projector.context();
     let compute = Rc::new(ctx.stream().expect("stream"));
     let mut spans: Vec<Vec<StackSpan>> = Vec::new();
     let mut store: Vec<PinnedBuf> = Vec::new();
@@ -220,12 +227,24 @@ fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u
             continue;
         }
         let file = Arc::new(std::fs::File::open(&path).expect("reopen"));
+        let direct_handle = if direct {
+            match super::host_tier::open_direct(&path) {
+                Ok(handle) => Some(Arc::new(handle)),
+                Err(error) => {
+                    eprintln!("direct source skipped: {error}");
+                    return layers * 2 * STACKS * 3;
+                }
+            }
+        } else {
+            None
+        };
         spans[layer] = row
             .iter()
             .map(|&(len, offset, _)| StackSpan {
                 bytes: len,
                 home: StackHome::File {
                     file: Arc::clone(&file),
+                    direct: direct_handle.clone(),
                     offset,
                 },
                 shape: None,
@@ -248,8 +267,8 @@ fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u
     .expect("plan");
     assert_eq!(plan.streamed().len(), layers);
     let inner = CardTransport::new(
-        Rc::clone(&ctx),
-        Rc::clone(&compute),
+        ctx,
+        Handle::Shared(Rc::clone(&compute)),
         EXPERTS,
         spans,
         store,
@@ -271,7 +290,7 @@ fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u
         picks,
         predicted,
     };
-    let mut driver = LayerMajor::new(&plan, &shapes, rule, Handle(&cell)).expect("driver");
+    let mut driver = LayerMajor::new(&plan, &shapes, rule, Shared(&cell)).expect("driver");
     let report = driver.run(&mut recipe).expect("run");
     eprintln!("{report}");
     let sent = cell.borrow().as_ref().expect("transport").sent.clone();
@@ -293,7 +312,7 @@ fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u
 #[ignore = "needs a GPU (under 1 GiB)"]
 fn pinned_layers_land_byte_exact_in_layer_order() {
     let rule = UploadRule::pinned_defaults(2);
-    let checked = run(7, false, rule, None);
+    let checked = run(7, false, false, rule, None);
     // 7 layers x 2 pieces x 3 stacks x 3 experts.
     assert_eq!(checked, 7 * 2 * STACKS * 3);
 }
@@ -307,7 +326,7 @@ fn a_predicted_subset_is_topped_up_and_lands_byte_exact() {
         bandwidth: 1e9,
         per_copy_s: 0.0,
     };
-    let checked = run(5, false, rule, Some(vec![2, 5]));
+    let checked = run(5, false, false, rule, Some(vec![2, 5]));
     assert_eq!(checked, 5 * 2 * STACKS * 3);
 }
 
@@ -316,7 +335,16 @@ fn a_predicted_subset_is_topped_up_and_lands_byte_exact() {
 #[ignore = "needs a GPU (under 1 GiB)"]
 fn file_layers_land_byte_exact() {
     let rule = UploadRule::pinned_defaults(2);
-    let checked = run(5, true, rule, None);
+    let checked = run(5, true, false, rule, None);
+    assert_eq!(checked, 5 * 2 * STACKS * 3);
+}
+
+/// The same layers read through a direct handle, several threads per stack.
+#[test]
+#[ignore = "needs a GPU (under 1 GiB)"]
+fn direct_file_layers_land_byte_exact() {
+    let rule = UploadRule::pinned_defaults(2);
+    let checked = run(5, true, true, rule, None);
     assert_eq!(checked, 5 * 2 * STACKS * 3);
 }
 
@@ -377,7 +405,7 @@ fn pinned_stream_rate_and_overlap() {
     let experts = 512usize;
     let stack = 917_504usize * experts;
     let projector = CudaProjector::new().expect("projector");
-    let ctx = projector.shared_context();
+    let ctx = projector.context();
     let compute = Rc::new(ctx.stream().expect("stream"));
     let mut store = Vec::new();
     let mut spans = Vec::new();
@@ -419,8 +447,8 @@ fn pinned_stream_rate_and_overlap() {
     let src = ctx.allocate(256 << 20).expect("src");
     let dst = ctx.allocate(256 << 20).expect("dst");
     let mut transport = CardTransport::new(
-        Rc::clone(&ctx),
-        Rc::clone(&compute),
+        ctx,
+        Handle::Shared(Rc::clone(&compute)),
         experts,
         spans,
         store,
@@ -429,7 +457,7 @@ fn pinned_stream_rate_and_overlap() {
     .expect("transport");
     for copies in [0usize, 60, 240] {
         let mut burn = Burn {
-            ctx: &ctx,
+            ctx,
             stream: &compute,
             src: &src,
             dst: &dst,
@@ -491,7 +519,7 @@ fn a_staged_stack_reads_bit_identical_to_a_resident_one() {
     };
     assert!(device_present("staged native weight"), "a GPU is required");
     let projector = CudaProjector::new().expect("projector");
-    let ctx = projector.shared_context();
+    let ctx = projector.context();
     let compute = Rc::new(ctx.stream().expect("stream"));
     let k = 256usize;
     let experts = 8usize;
@@ -521,8 +549,8 @@ fn a_staged_stack_reads_bit_identical_to_a_resident_one() {
         bytes_of.push((bytes, n_rows));
     }
     let mut transport = CardTransport::new(
-        Rc::clone(&ctx),
-        Rc::clone(&compute),
+        ctx,
+        Handle::Shared(Rc::clone(&compute)),
         experts,
         spans,
         store,

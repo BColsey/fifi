@@ -375,20 +375,6 @@ impl UploadRule {
     }
 }
 
-/// The rows of one prefill piece: as many as the card's free bytes allow after the experts,
-/// the staging slots and the decode state, in whole multiples of `granule`, between `granule`
-/// and `cap`. A wider piece copies each streamed layer once for more rows, so the bytes moved
-/// per token fall in proportion; the piece stops growing where the per-row activation bytes
-/// (`bytes_per_row`: the stream, the mixer and expert scratch of one row) fill the free bytes.
-pub(crate) fn piece_rows(free_bytes: u64, bytes_per_row: u64, granule: usize, cap: usize) -> usize {
-    let granule = granule.max(1);
-    if bytes_per_row == 0 {
-        return cap.max(granule);
-    }
-    let fit = usize::try_from(free_bytes / bytes_per_row).unwrap_or(usize::MAX);
-    (fit.min(cap) / granule * granule).max(granule)
-}
-
 /// What a finished transfer reports.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TransferReport {
@@ -911,14 +897,6 @@ mod tests {
         let streamed = plan.streamed().len() as f64;
         let chunk_major = 16.0 * streamed * layers[0].bytes() as f64 / 4096.0;
         assert!((run(vec![4096]) * 16.0 - chunk_major).abs() < 1e-6);
-    }
-
-    #[test]
-    fn the_piece_rows_follow_the_free_bytes() {
-        assert_eq!(piece_rows(1 << 30, 500_000, 256, 8192), 2048);
-        assert_eq!(piece_rows(100 << 30, 500_000, 256, 8192), 8192);
-        assert_eq!(piece_rows(1 << 20, 500_000, 256, 8192), 256);
-        assert_eq!(piece_rows(1 << 30, 0, 256, 4096), 4096);
     }
 
     #[test]
