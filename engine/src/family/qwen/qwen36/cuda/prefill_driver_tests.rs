@@ -622,12 +622,12 @@ fn drive_chunks_slices_rows_at_their_positions() {
         for &count in &[0usize, 1, 2, 129, 300] {
             let tokens: Vec<u32> = (0..count as u32).map(|at| at + 7).collect();
             let mut log: Vec<(PrefillStep, Vec<u32>)> = Vec::new();
-            let ran = drive_chunks(start, &tokens, (128, None, false), |step, rows| {
+            let ran = drive_chunks(start, &tokens, (128, 0), |step, rows| {
                 log.push((step, rows.to_vec()));
                 Ok(())
             })
             .expect("a ladder chunk size plans every count");
-            let expected = pieces_of(start, count, 128, None).expect("the same plan");
+            let expected = pieces_of(start, count, 128, 0).expect("the same plan");
             assert_eq!(
                 ran, expected,
                 "the plan that ran is returned: start {start}, {count} rows"
@@ -658,65 +658,46 @@ fn drive_chunks_slices_rows_at_their_positions() {
     }
 }
 
-/// The shared chunk loop's plans of a resident session, against lists fixed from the plan the
-/// driver used before the shared loop (arena, depth tier, start, rows).
+/// The shared chunk loop's plans against lists fixed from an integer port of the piece model
+/// (arena, multiprocessors, start, rows): the rows of a piece are the arena's, cut by the model
+/// at the depth the piece ends at.
 #[test]
-fn the_shared_loop_plans_a_resident_session_like_the_plan_it_replaced() {
+fn the_shared_loop_plans_pieces_from_the_arena_and_the_model() {
     fn chunk(p0: usize, rows: usize) -> PrefillStep {
         PrefillStep::Chunk { p0, rows }
     }
-    let cases: Vec<(usize, Option<usize>, usize, usize, Vec<PrefillStep>)> = vec![
+    let cases: Vec<(usize, usize, usize, usize, Vec<PrefillStep>)> = vec![
         (
             4096,
-            None,
+            0,
             0,
             9000,
-            vec![
-                chunk(0, 2048),
-                chunk(2048, 2048),
-                chunk(4096, 1024),
-                chunk(5120, 1024),
-                chunk(6144, 1024),
-                chunk(7168, 1024),
-                chunk(8192, 808),
-            ],
+            vec![chunk(0, 4096), chunk(4096, 4096), chunk(8192, 808)],
         ),
         (
             2048,
-            None,
+            0,
             2900,
             5000,
-            vec![
-                chunk(2900, 2048),
-                chunk(4948, 1024),
-                chunk(5972, 1024),
-                chunk(6996, 904),
-            ],
+            vec![chunk(2900, 2048), chunk(4948, 2048), chunk(6996, 904)],
         ),
         (
             1024,
-            None,
+            0,
             70_000,
             3000,
-            vec![
-                chunk(70_000, 512),
-                chunk(70_512, 512),
-                chunk(71_024, 512),
-                chunk(71_536, 512),
-                chunk(72_048, 512),
-                chunk(72_560, 440),
-            ],
+            vec![chunk(70_000, 1024), chunk(71_024, 1024), chunk(72_048, 952)],
         ),
         (
             512,
-            Some(82),
+            82,
             155_136,
             1024,
             vec![chunk(155_136, 512), chunk(155_648, 256), chunk(155_904, 256)],
         ),
         (
             512,
-            Some(30),
+            30,
             155_648,
             700,
             vec![
@@ -730,14 +711,14 @@ fn the_shared_loop_plans_a_resident_session_like_the_plan_it_replaced() {
         ),
         (
             2048,
-            Some(82),
+            82,
             0,
             5000,
             vec![chunk(0, 2048), chunk(2048, 2048), chunk(4096, 904)],
         ),
         (
             4096,
-            Some(82),
+            82,
             73_000,
             2000,
             vec![
@@ -749,47 +730,33 @@ fn the_shared_loop_plans_a_resident_session_like_the_plan_it_replaced() {
         ),
         (
             128,
-            None,
+            0,
             5,
             400,
             vec![chunk(5, 128), chunk(133, 128), chunk(261, 128), chunk(389, 16)],
         ),
         (
             16,
-            None,
+            0,
             7,
             35,
             vec![chunk(7, 16), chunk(23, 16), chunk(39, 3)],
         ),
         (
             256,
-            Some(82),
+            82,
             200_000,
             600,
             vec![chunk(200_000, 256), chunk(200_256, 256), chunk(200_512, 88)],
         ),
     ];
-    for (m_sess, fixed, p0, rows, want) in cases {
+    for (m_sess, sm, p0, rows, want) in cases {
         let tokens = vec![0u32; rows];
-        let got = drive_chunks(p0, &tokens, (m_sess, fixed, false), |_, _| Ok(()))
+        let got = drive_chunks(p0, &tokens, (m_sess, sm), |_, _| Ok(()))
             .expect("a ladder size plans");
-        assert_eq!(got, want, "arena {m_sess}, depth tier {fixed:?}, {p0}+{rows}");
+        assert_eq!(got, want, "arena {m_sess}, {sm} SMs, {p0}+{rows}");
     }
-    assert!(drive_chunks(0, &[0u32; 4], (300, None, false), |_, _| Ok(())).is_err());
-}
-
-/// A streamed session takes the arena's rows at every depth the piece model allows, so a prompt
-/// crosses each streamed layer in fewer pieces than the depth table would give.
-#[test]
-fn a_streamed_session_plans_wider_pieces_than_a_resident_one() {
-    let tokens = vec![0u32; 16_384];
-    let count = |streamed| {
-        drive_chunks(8_192, &tokens, (4096, None, streamed), |_, _| Ok(()))
-            .unwrap()
-            .len()
-    };
-    assert_eq!(count(true), 4);
-    assert!(count(false) > count(true));
+    assert!(drive_chunks(0, &[0u32; 4], (300, 0), |_, _| Ok(())).is_err());
 }
 
 #[test]
@@ -797,7 +764,7 @@ fn fixed_drive_limits_depth_without_shrinking_the_session_arena() {
     let tokens: Vec<u32> = (0..1024).collect();
     let mut seen = Vec::new();
     let mut copied = Vec::new();
-    drive_chunks(155_136, &tokens, (512, Some(82), false), |step, rows| {
+    drive_chunks(155_136, &tokens, (512, 82), |step, rows| {
         seen.push(step);
         copied.extend_from_slice(rows);
         Ok(())
@@ -2099,7 +2066,7 @@ fn tiered_4096_pieces_preserve_tokens_and_follow_the_piece_model() {
                 .min(start + total - at);
             assert!(size > 0 && size <= 4096);
             let chunk = &tokens[at - start..at - start + size];
-            drive_chunks(at, chunk, (4096, None, true), |step, rows| {
+            drive_chunks(at, chunk, (4096, 0), |step, rows| {
                 let (p0, count) = match step {
                     PrefillStep::Feed { p0 } => (p0, 1),
                     PrefillStep::Chunk { p0, rows } => (p0, rows),

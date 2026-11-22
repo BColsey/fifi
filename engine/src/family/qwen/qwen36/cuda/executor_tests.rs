@@ -470,12 +470,12 @@ fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
         let mut grouped = Vec::new();
         while at < end {
             let rows = piece_of(&arena, at, 82).unwrap().min(end - at);
-            grouped.extend(pieces_of(at, rows, 1024, None).unwrap());
+            grouped.extend(pieces_of(at, rows, 1024, 82).unwrap());
             at += rows;
         }
         assert_eq!(
             grouped,
-            pieces_of(p0, 4097, 1024, None).unwrap(),
+            pieces_of(p0, 4097, 1024, 82).unwrap(),
             "depth {p0}"
         );
     }

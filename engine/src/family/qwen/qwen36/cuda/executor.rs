@@ -32,7 +32,6 @@
 //! addresses, not positions, and the next token rewrites the `pos`/`kv_len` words from the
 //! imported `tokens` count.
 
-use super::prefill_plan::DEPTH_ANCHORS;
 use super::prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes, stored_prefix_report};
 use super::step::{ChunkVerdict, QwenResidentStep};
 use crate::family::kv_disk::DiskOwner;
@@ -40,7 +39,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
-        prefill::piece_rows::piece_rows,
+        prefill::piece_rows::{MEASURED_ANCHORS, piece_rows},
         sampler::Sampler,
         session::{
             DecodeSession, Limits, PrefixIdentity, SaveKind, StoreLimits, TokenStepper,
@@ -78,7 +77,7 @@ pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
 /// depth the piece ends at (the same rule the chunk loop plans its pieces by).
 pub(super) fn piece_of(verdict: &ChunkVerdict, p0: usize, sm_count: usize) -> Option<usize> {
     match verdict {
-        ChunkVerdict::Ready { m_sess } => Some(piece_rows(DEPTH_ANCHORS, sm_count, p0, *m_sess)),
+        ChunkVerdict::Ready { m_sess } => Some(piece_rows(MEASURED_ANCHORS, sm_count, p0, *m_sess)),
         _ => None,
     }
 }

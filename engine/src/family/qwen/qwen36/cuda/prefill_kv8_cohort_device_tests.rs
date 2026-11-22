@@ -455,7 +455,7 @@ fn cohort_deep_tail(
         let rows = case.rows.min(DEEP_COUNT - offset);
         let rows = if case.fixed {
             crate::family::prefill::piece_rows::piece_rows(
-                super::super::prefill_plan::DEPTH_ANCHORS,
+                crate::family::prefill::piece_rows::MEASURED_ANCHORS,
                 82,
                 p0,
                 rows,

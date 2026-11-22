@@ -7,12 +7,12 @@ use super::{
     dims::KvMode,
     prefill_plan::{
         Admission, ChunkCost, ChunkSlot as S, EXL3_SLOTS, EXL3_TILE_ROWS, Extra, M_LADDER,
-        DEPTH_ANCHORS, PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_tensors,
-        exl3_chunk_cost, exl3_chunk_costs, exl3_chunk_tensors, kv_bytes, m_pos, state_bytes,
+        PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_tensors,
+        exl3_chunk_cost, exl3_chunk_costs, exl3_chunk_tensors, kv_bytes, state_bytes,
     },
     prefill_driver::pieces_of,
 };
-use crate::family::prefill::piece_rows::piece_rows;
+use crate::family::prefill::piece_rows::{MEASURED_ANCHORS, piece_rows};
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
@@ -42,7 +42,7 @@ fn feed(p0: usize) -> PrefillStep {
 }
 
 fn chunk_list(p0: usize, n_rows: usize, m_sess: usize) -> Result<Vec<PrefillStep>, EngError> {
-    pieces_of(p0, n_rows, m_sess, None)
+    pieces_of(p0, n_rows, m_sess, 0)
 }
 
 fn steps(p0: usize, n_rows: usize, m_sess: usize) -> Vec<PrefillStep> {
@@ -75,10 +75,10 @@ fn fixed_depth_tier_preserves_early_chunks_and_the_legacy_plan() {
         (196_608, 16, 16),
         (usize::MAX, 512, 128),
     ] {
-        assert_eq!(piece_rows(DEPTH_ANCHORS, NSM, p0, rows), want);
+        assert_eq!(piece_rows(MEASURED_ANCHORS, NSM, p0, rows), want);
     }
     assert_eq!(
-        pieces_of(155_136, 1024, 512, Some(82)).unwrap(),
+        pieces_of(155_136, 1024, 512, 82).unwrap(),
         vec![
             chunk(155_136, 512),
             chunk(155_648, 256),
@@ -86,25 +86,11 @@ fn fixed_depth_tier_preserves_early_chunks_and_the_legacy_plan() {
         ]
     );
     assert_eq!(
-        pieces_of(155_648, 257, 512, Some(82)).unwrap(),
+        pieces_of(155_648, 257, 512, 82).unwrap(),
         vec![chunk(155_648, 256), feed(155_904)]
     );
-    assert!(pieces_of(usize::MAX, 1, 512, Some(82)).is_err());
-    assert!(pieces_of(0, 1, 0, Some(82)).is_err());
-}
-
-#[test]
-fn m_pos_steps_down_at_3k_and_64k_positions() {
-    let rows = [(0, 2048), (3071, 2048), (3072, 1024), (32767, 1024)];
-    for (p0, want) in rows.into_iter().chain([
-        (32768, 1024),
-        (65535, 1024),
-        (65536, 512),
-        (131_072, 512),
-        (usize::MAX, 512),
-    ]) {
-        assert_eq!(m_pos(p0), want, "p0 {p0}");
-    }
+    assert!(pieces_of(usize::MAX, 1, 512, 82).is_err());
+    assert!(pieces_of(0, 1, 0, 82).is_err());
 }
 
 #[test]
@@ -134,17 +120,18 @@ fn a_one_row_tail_goes_to_feed_and_longer_tails_are_chunks() {
 }
 
 #[test]
-fn prompt_chunk_counts_follow_the_64k_tier() {
-    // The 64K tier leaves the 16K plan unchanged and reduces the 128K plan to 190 chunks.
+fn prompt_chunk_counts_follow_the_piece_model() {
+    // The piece model keeps 2,048-row pieces through the 16K plan and plans the 128K prompt in
+    // 169 chunks.
     assert_eq!(steps(0, 1023, 2048), vec![chunk(0, 1023)]);
     assert_eq!(steps(0, 2047, 2048), vec![chunk(0, 2047)]);
     let sixteen_k = steps(0, 16_383, 2048);
-    assert_eq!(sixteen_k.len(), 14);
+    assert_eq!(sixteen_k.len(), 8);
     assert_eq!(
         &sixteen_k[..3],
-        [chunk(0, 2048), chunk(2048, 2048), chunk(4096, 1024)]
+        [chunk(0, 2048), chunk(2048, 2048), chunk(4096, 2048)]
     );
-    assert_eq!(sixteen_k.last(), Some(&chunk(15_360, 1023)));
+    assert_eq!(sixteen_k.last(), Some(&chunk(14_336, 2047)));
     let big = steps(0, 131_071, 2048);
     let sizes = |rows: usize| {
         big.iter()
@@ -153,23 +140,20 @@ fn prompt_chunk_counts_follow_the_64k_tier() {
     };
     assert_eq!(
         (big.len(), sizes(2048), sizes(1024), sizes(512), sizes(511)),
-        (190, 2, 60, 127, 1)
+        (169, 16, 39, 113, 1)
     );
 }
 
 #[test]
-fn m_pos_follows_the_position_of_each_chunk_start() {
+fn the_piece_model_follows_the_position_of_each_chunk_start() {
     // A prefix import starts the run deep: the first chunk already takes the deep size.
     let deep = steps(65_536, 1500, 2048);
-    assert_eq!(
-        deep,
-        vec![chunk(65_536, 512), chunk(66_048, 512), chunk(66_560, 476)]
-    );
+    assert_eq!(deep, vec![chunk(65_536, 1024), chunk(66_560, 476)]);
     assert_eq!(
         steps(65_535, 1500, 2048),
         vec![chunk(65_535, 1024), chunk(66_559, 476)]
     );
-    // A chunk that starts just below 3K takes 2,048 rows and ends past the threshold.
+    // A chunk that starts just below 3K takes 2,048 rows and ends past 3K.
     assert_eq!(
         steps(3000, 3000, 2048),
         vec![chunk(3000, 2048), chunk(5048, 952)]
@@ -219,7 +203,7 @@ fn every_list_covers_the_run_in_order_with_only_a_last_feed() {
                     match *step {
                         PrefillStep::Chunk { p0: start, rows } => {
                             assert_eq!(start, at, "{context}");
-                            assert!((2..=m_pos(at).min(m_sess)).contains(&rows), "{context}");
+                            assert!((2..=m_sess).contains(&rows), "{context}");
                             at += rows;
                         }
                         PrefillStep::Feed { p0: start } => {

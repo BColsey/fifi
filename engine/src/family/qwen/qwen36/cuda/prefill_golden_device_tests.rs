@@ -557,7 +557,7 @@ fn capture(
         })
         .collect();
     let expected: Vec<(usize, usize, &'static str)> =
-        pieces_of(0, FED_ROWS, wanted, None)
+        pieces_of(0, FED_ROWS, wanted, 0)
             .expect("chunk list")
             .iter()
             .map(|step| match step {

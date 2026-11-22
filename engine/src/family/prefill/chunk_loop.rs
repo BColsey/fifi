@@ -2,9 +2,8 @@
 //! that prefills in chunks and for the resident and the tiered arm alike.
 //!
 //! WHAT. [`plan_pieces`] turns the rows of a feed into the list of [`PrefillStep`]s. A piece has
-//! the most rows the memory plan admits (`max_rows`, the family's arena), cut by the family's own
-//! depth table when it still has one, then by the piece-time model ([`piece_rows`]) when the
-//! device is depth-bound. A one-row piece is a feed step. [`drive_prompt`] walks the list through
+//! the most rows the memory plan admits (`max_rows`, the family's arena), cut by the piece-time
+//! model ([`piece_rows`]) at the depth it ends at. A one-row piece is a feed step. [`drive_prompt`] walks the list through
 //! [`drive_steps`]. [`drive_chunk`] is what a chunk runs: open the window, stage the inputs, clear
 //! the status word, queue the layers, read the status, commit; the family supplies the surface
 //! ([`ChunkFamily`]) and three hooks for the parts only it has (the head of a last row, a report).
@@ -12,7 +11,7 @@
 //! WHY one loop. The resident and the tiered arm of Qwen3.6 and the chunked prefill of Flash-Next
 //! each carried a list builder and the same six calls in their own order. A streamed model wants
 //! the widest pieces the arena holds (each piece copies every streamed layer once), a resident
-//! one the pieces its depth table gives; that is a difference in `table`, not a second loop.
+//! one the same; the arena is the one input that differs.
 
 use super::{
     piece_rows::{Anchor, piece_rows},
@@ -20,16 +19,13 @@ use super::{
 };
 use crate::EngError;
 
-/// What bounds the pieces of a prompt.
-pub(crate) struct PiecePlan<'a> {
+/// What bounds the pieces of a prompt: the arena's rows and the piece-time model.
+pub(crate) struct PiecePlan {
     /// The most rows of one piece: the arena the memory plan admitted.
     pub(crate) max_rows: usize,
-    /// A family's own rows by depth where it keeps a table (`None`: the arena alone). The
-    /// argument is the position the piece starts at.
-    pub(crate) table: Option<&'a dyn Fn(usize) -> usize>,
-    /// The piece-time model: its two anchors and the device's multiprocessor count (0 for the
-    /// card the anchors were measured on). `None` leaves a piece at the bound above.
-    pub(crate) model: Option<((Anchor, Anchor), usize)>,
+    /// The model's two anchors and the device's multiprocessor count (0 for the card the
+    /// anchors were measured on).
+    pub(crate) model: ((Anchor, Anchor), usize),
 }
 
 /// The pieces that feed `rows` rows from position `start`. A piece never has zero rows and a
@@ -37,7 +33,7 @@ pub(crate) struct PiecePlan<'a> {
 pub(crate) fn plan_pieces(
     start: usize,
     rows: usize,
-    plan: &PiecePlan<'_>,
+    plan: &PiecePlan,
 ) -> Result<Vec<PrefillStep>, EngError> {
     if plan.max_rows == 0 {
         return Err(EngError::BadRequest(
@@ -50,13 +46,8 @@ pub(crate) fn plan_pieces(
     let mut steps = Vec::new();
     let mut at = start;
     while at < end {
-        let mut take = plan.max_rows.min(end - at);
-        if let Some(table) = plan.table {
-            take = take.min(table(at).max(1));
-        }
-        if let Some((anchors, sm_count)) = plan.model {
-            take = piece_rows(anchors, sm_count, at, take);
-        }
+        let (anchors, sm_count) = plan.model;
+        let take = piece_rows(anchors, sm_count, at, plan.max_rows.min(end - at));
         steps.push(match take {
             1 => PrefillStep::Feed { p0: at },
             _ => PrefillStep::Chunk { p0: at, rows: take },
@@ -71,7 +62,7 @@ pub(crate) fn plan_pieces(
 pub(crate) fn drive_prompt(
     start: usize,
     tokens: &[u32],
-    plan: &PiecePlan<'_>,
+    plan: &PiecePlan,
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
     let steps = plan_pieces(start, tokens.len(), plan)?;
@@ -130,14 +121,12 @@ pub(crate) fn drive_chunk<F: super::chunk_family::ChunkFamily>(
 mod tests {
     use super::*;
 
-    const NEAR: Anchor = Anchor::at(73_728, 1024);
-    const FAR: Anchor = Anchor::at(155_648, 512);
+    use crate::family::prefill::piece_rows::MEASURED_ANCHORS;
 
-    fn plan(max_rows: usize) -> PiecePlan<'static> {
+    fn plan(max_rows: usize) -> PiecePlan {
         PiecePlan {
             max_rows,
-            table: None,
-            model: None,
+            model: (MEASURED_ANCHORS, 0),
         }
     }
 
@@ -184,36 +173,8 @@ mod tests {
     }
 
     #[test]
-    fn the_family_table_cuts_a_piece_by_the_depth_it_starts_at() {
-        let table = |at: usize| if at < 1000 { 256 } else { 64 };
-        let plan = PiecePlan {
-            max_rows: 1024,
-            table: Some(&table),
-            model: None,
-        };
-        let steps = plan_pieces(0, 1500, &plan).unwrap();
-        covers(&steps, 0, 1500);
-        assert_eq!(steps[0], PrefillStep::Chunk { p0: 0, rows: 256 });
-        let rows_of = |step: &PrefillStep| match step {
-            PrefillStep::Chunk { rows, .. } => *rows,
-            PrefillStep::Feed { .. } => 1,
-        };
-        assert!(
-            steps
-                .iter()
-                .filter(|s| matches!(s, PrefillStep::Chunk { p0, .. } if *p0 >= 1000))
-                .all(|s| rows_of(s) <= 64)
-        );
-    }
-
-    #[test]
     fn the_piece_model_narrows_deep_pieces_and_leaves_shallow_ones_at_the_arena() {
-        let model = Some(((NEAR, FAR), 0));
-        let plan = PiecePlan {
-            max_rows: 4096,
-            table: None,
-            model,
-        };
+        let plan = plan(4096);
         let shallow = plan_pieces(0, 8192, &plan).unwrap();
         assert_eq!(shallow[0], PrefillStep::Chunk { p0: 0, rows: 4096 });
         let deep = plan_pieces(155_648, 4096, &plan).unwrap();
@@ -231,7 +192,8 @@ mod tests {
         let narrow = plan_pieces(0, 32_768, &plan(256)).unwrap().len();
         let wide = plan_pieces(0, 32_768, &plan(4096)).unwrap().len();
         assert_eq!(narrow, 128);
-        assert_eq!(wide, 8);
+        // The model narrows a 4,096-row arena to 2,048 rows from about 10K of depth.
+        assert_eq!(wide, 13);
     }
 
     #[test]

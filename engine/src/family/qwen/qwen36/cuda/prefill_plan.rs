@@ -44,9 +44,6 @@ use crate::{
 pub(crate) const M_LADDER: [usize; 5] = [2048, 1024, 512, 256, 128];
 /// Only offered by the default-off tiered experiment; the normal ladder stays unchanged.
 pub(super) const LARGE_M_LADDER: [usize; 6] = [4096, 2048, 1024, 512, 256, 128];
-/// Keep 1,024-row chunks through the warm 32K–64K range; partials remain capped at 64 MiB.
-const TIER_1024_FROM: usize = 3 * 1024;
-const TIER_512_FROM: usize = 64 * 1024;
 /// A chunk size is admitted only if at least this many device bytes stay spare.
 /// Canonical value in the shared `admission_sketch`, shared with the preflight estimate.
 pub(crate) const SPARE_MIN: usize = crate::family::admission_sketch::PREFILL_SPARE_MIN_BYTES;
@@ -76,22 +73,9 @@ fn word_bytes(parts: &[usize]) -> Result<usize, EngError> {
         .ok_or_else(overflow)
 }
 
-/// `M_pos(p0)`: 2,048 rows for `p0 < 3,072`, 1,024 for `3,072 <= p0 < 65,536`, else 512.
-/// `p0` is the position of the chunk's first row.
-pub(crate) fn m_pos(p0: usize) -> usize {
-    if p0 < TIER_1024_FROM {
-        2048
-    } else if p0 < TIER_512_FROM {
-        1024
-    } else {
-        512
-    }
-}
-
 // The admission types moved to the shared prefill core (`family::prefill`); these re-exports
 // keep the old paths alive for the driver, the step and the plan tests.
 pub(crate) use crate::family::prefill::admission::{Admission, ChunkCost, Extra};
-use crate::family::prefill::piece_rows::Anchor;
 use crate::family::project::exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_max_jobs};
 
 impl Admission {
@@ -102,13 +86,6 @@ impl Admission {
         Self::new(device_budget, PART_CHARGE, SPARE_MIN, &M_LADDER)
     }
 }
-
-/// The measured anchors of the piece-time model: on the 82-SM RTX 3090 a piece of 1,024 rows
-/// reaches 0.45 s at 73,728 positions of depth, and a piece of 512 rows at 155,648 (two runs keep
-/// 512-row pieces below 0.454 s through 152K). The rows at every depth and on every device
-/// follow from them (`piece_rows`).
-pub(super) const DEPTH_ANCHORS: (Anchor, Anchor) =
-    (Anchor::at(73_728, 1024), Anchor::at(155_648, 512));
 
 /// KV bytes of a session of `window` positions: the pool's exact bytes per position, without
 /// `KvPool`'s per-plane `STATE_ALIGN` rounding (at most 255 B a plane, 40 planes at `Int8G32` —

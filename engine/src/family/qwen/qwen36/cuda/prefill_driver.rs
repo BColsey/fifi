@@ -15,14 +15,15 @@
 use super::{
     dims::{KvMode, StepDims},
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot, DEPTH_ANCHORS, Extra, LARGE_M_LADDER, M_LADDER,
-        PART_CHARGE, SPARE_MIN, chunk_tensors, exl3_chunk_tensors, m_pos,
+        Admission, ChunkCost, ChunkSlot, Extra, LARGE_M_LADDER, M_LADDER, PART_CHARGE, SPARE_MIN,
+        chunk_tensors, exl3_chunk_tensors,
     },
 };
 use crate::family::exl3::launch::Launch;
 use crate::family::prefill::{
     arena::PrefillStep,
     chunk_loop::{PiecePlan, drive_prompt},
+    piece_rows::MEASURED_ANCHORS,
 };
 use crate::{
     EngError,
@@ -691,10 +692,6 @@ impl PrefillArena {
             .transpose()
     }
 
-    pub(super) fn segmented(&self) -> bool {
-        self.kv8_staging.as_ref().is_some_and(|(_, _, mode)| *mode)
-    }
-
     pub(super) fn part_bytes(&self) -> usize {
         self.part.bytes()
     }
@@ -723,34 +720,23 @@ impl PrefillArena {
 // `check_chunk_start` moved to the shared prefill core (`family::prefill::arena`); the old
 // path lives as the re-export at the top of this file.
 
-/// The Qwen3.6 pieces of a prompt: the session arena `m_sess` bounds a piece, its depth table
-/// ([`m_pos`]) cuts a resident session's pieces, a streamed session (its experts cross the link
-/// once per piece) takes the arena's rows, and a depth-bound arena (`fixed_depth`, the card's
-/// multiprocessors) is cut by the piece-time model.
-pub(super) fn piece_plan(
-    m_sess: usize,
-    fixed_depth: Option<usize>,
-    streamed: bool,
-) -> PiecePlan<'static> {
+/// The Qwen3.6 pieces of a prompt: the session arena `m_sess` bounds a piece and the piece-time
+/// model cuts it by the depth it ends at on a device of `sm_count` multiprocessors.
+pub(super) fn piece_plan(m_sess: usize, sm_count: usize) -> PiecePlan {
     PiecePlan {
         max_rows: m_sess,
-        table: if streamed { None } else { Some(&m_pos) },
-        model: fixed_depth.map(|sm_count| (DEPTH_ANCHORS, sm_count)),
+        model: (MEASURED_ANCHORS, sm_count),
     }
 }
 
 /// The plan of a prompt's pieces, refused for an arena off the ladder.
-fn checked_plan(
-    m_sess: usize,
-    fixed_depth: Option<usize>,
-    streamed: bool,
-) -> Result<PiecePlan<'static>, EngError> {
+fn checked_plan(m_sess: usize, sm_count: usize) -> Result<PiecePlan, EngError> {
     if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
         return Err(EngError::BadRequest(format!(
             "prefill plan: chunk size {m_sess} is not one of {LARGE_M_LADDER:?} or 16"
         )));
     }
-    Ok(piece_plan(m_sess, fixed_depth, streamed))
+    Ok(piece_plan(m_sess, sm_count))
 }
 
 /// Drives the prompt rows of one feed_rows call through the shared chunk loop: each step gets its
@@ -760,15 +746,10 @@ fn checked_plan(
 pub(super) fn drive_chunks(
     start: usize,
     tokens: &[u32],
-    (m_sess, fixed_depth, streamed): (usize, Option<usize>, bool),
+    (m_sess, sm_count): (usize, usize),
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
-    drive_prompt(
-        start,
-        tokens,
-        &checked_plan(m_sess, fixed_depth, streamed)?,
-        run,
-    )
+    drive_prompt(start, tokens, &checked_plan(m_sess, sm_count)?, run)
 }
 
 /// The pieces of `n_rows` rows from `p0` for an arena of `m_sess` rows, for the plan tests.
@@ -777,13 +758,9 @@ pub(super) fn pieces_of(
     p0: usize,
     n_rows: usize,
     m_sess: usize,
-    fixed_depth: Option<usize>,
+    sm_count: usize,
 ) -> Result<Vec<PrefillStep>, EngError> {
-    crate::family::prefill::chunk_loop::plan_pieces(
-        p0,
-        n_rows,
-        &checked_plan(m_sess, fixed_depth, false)?,
-    )
+    crate::family::prefill::chunk_loop::plan_pieces(p0, n_rows, &checked_plan(m_sess, sm_count)?)
 }
 
 /// Preserves the per-token vocabulary refusal before checking the signed kernel index.

@@ -15,7 +15,7 @@ fn chunked(
     range: std::ops::Range<usize>,
 ) -> Result<Vec<Row>, EngError> {
     let mut rows = Vec::new();
-    for piece in pieces_of(range.start, range.len(), ROWS, None)? {
+    for piece in pieces_of(range.start, range.len(), ROWS, 0)? {
         let PrefillStep::Chunk { p0, rows: count } = piece else {
             return Err(bad("KV8 cohort unexpectedly planned a one-row feed"));
         };
@@ -207,7 +207,7 @@ fn kv8_restore_partitions_preserve_all_scored_positions() {
     for cut in [1024, 1280, 1536] {
         let mut selected = Vec::new();
         for range in [0..cut, cut..CONTEXT] {
-            for piece in pieces_of(range.start, range.len(), ROWS, None).unwrap() {
+            for piece in pieces_of(range.start, range.len(), ROWS, 0).unwrap() {
                 let PrefillStep::Chunk { p0, rows } = piece else {
                     panic!("one-row piece")
                 };

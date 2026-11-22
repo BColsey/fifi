@@ -1518,7 +1518,6 @@ impl<'a> QwenResidentStep<'a> {
         use crate::family::session::TokenStepper;
 
         let start = self.tokens();
-        let fixed_depth = self.fixed_prefill_depth();
         self.prefill_report.note_chunked_epoch_start(start);
         let run = |step, rows: &[u32]| match step {
             PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
@@ -1535,16 +1534,7 @@ impl<'a> QwenResidentStep<'a> {
                 Ok(())
             }
         };
-        // A tiered session streams its experts, so each piece crosses every layer once and the
-        // widest pieces the arena holds win; a resident session keeps its depth table.
-        let streamed = self.tiered_mode;
-        drive_chunks(start, tokens, (m_sess, fixed_depth, streamed), run).map(|_| ())
-    }
-
-    /// The multiprocessors of the device, when the prefill pieces are depth-bound.
-    pub(super) fn fixed_prefill_depth(&self) -> Option<usize> {
-        let segmented = self.prefill.as_ref().is_some_and(PrefillArena::segmented);
-        segmented.then(|| self.prefill_sm_count())
+        drive_chunks(start, tokens, (m_sess, self.prefill_sm_count()), run).map(|_| ())
     }
 
     /// The multiprocessors the prefill arena was admitted on, 0 before there is one.

@@ -15,6 +15,13 @@ pub(crate) const ANCHOR_SM_COUNT: usize = 82;
 /// The fewest rows of a piece the rule returns.
 const MIN_PIECE_ROWS: usize = 128;
 
+/// The anchors measured on the 82-SM RTX 3090 with Qwen3.6's attention: a piece of 1,024 rows
+/// reaches 0.45 s at 73,728 positions of depth, and a piece of 512 rows at 155,648 (two runs keep
+/// 512-row pieces below 0.454 s through 152K). The rows at every depth and on every device
+/// follow from them.
+pub(crate) const MEASURED_ANCHORS: (Anchor, Anchor) =
+    (Anchor::at(73_728, 1024), Anchor::at(155_648, 512));
+
 /// One measured point: a piece of `rows` rows ending at `depth` positions takes the target time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Anchor {

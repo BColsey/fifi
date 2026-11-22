@@ -46,7 +46,7 @@ const SIZES: [usize; 6] = [16, 128, 256, 512, 1024, 2048];
 const FEED_TAIL_CAPS: [usize; 3] = [16, 128, 256];
 
 /// The caps whose partition ends in the 257-row partial chunk.
-const PARTIAL_TAIL_CAPS: [usize; 3] = [512, 1024, 2048];
+const PARTIAL_TAIL_CAPS: [usize; 2] = [512, 1024];
 
 fn digest(text: &str) -> String {
     let mut hasher = Sha256::new();
@@ -248,7 +248,7 @@ fn the_plan_tables_hold_their_golden_digests() {
     // is fed; the token after them goes through decode.
     let mut partition_text = String::new();
     for &cap in &SIZES {
-        let steps = pieces_of(0, FED_ROWS, cap, None).expect("chunk list");
+        let steps = pieces_of(0, FED_ROWS, cap, 0).expect("chunk list");
         for step in &steps {
             match step {
                 PrefillStep::Chunk { p0, rows } => {
@@ -277,17 +277,23 @@ fn the_plan_tables_hold_their_golden_digests() {
             );
         }
     }
-    // At cap 2048 the depth tier, not the cap, cuts the chunks from position 4,096 on.
-    let deep = pieces_of(0, FED_ROWS, 2048, None).expect("chunk list");
-    assert!(
-        deep.iter().any(|step| matches!(
-            step,
+    // At cap 2048 the arena cuts the pieces at every depth of the golden prompt: two whole
+    // pieces and the 1,281-row remainder (the piece model allows 2,048 rows through 10K).
+    let wide = pieces_of(0, FED_ROWS, 2048, 0).expect("chunk list");
+    assert_eq!(
+        wide,
+        vec![
+            PrefillStep::Chunk { p0: 0, rows: 2048 },
+            PrefillStep::Chunk {
+                p0: 2048,
+                rows: 2048
+            },
             PrefillStep::Chunk {
                 p0: 4096,
-                rows: 1024
-            }
-        )),
-        "cap=2048: the chunk at 4,096 must be cut to 1,024 rows by the depth tier"
+                rows: 1281
+            },
+        ],
+        "cap=2048: the golden prompt in whole 2,048-row pieces"
     );
     let sha = section(&mut body, "partition", &partition_text);
     sections.insert("partition".into(), sha.into());

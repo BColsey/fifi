@@ -7,6 +7,7 @@ use crate::{
         prefill::{
             chunk_family::ChunkFamily,
             chunk_loop::{ChunkOrder, PiecePlan, StatusClear, drive_chunk, drive_prompt},
+            piece_rows::MEASURED_ANCHORS,
             steps::check_chunk_start,
         },
         project::exl3_jobs_plan::exl3_rows_ceiling,
@@ -156,8 +157,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let start = self.pos;
         let plan = PiecePlan {
             max_rows: cap,
-            table: None,
-            model: None,
+            model: (MEASURED_ANCHORS, 0),
         };
         let mut first = true;
         drive_prompt(start, tokens, &plan, |_, rows| {
