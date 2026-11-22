@@ -904,12 +904,38 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
         let mut block = vec![0x00, 0x2c]; // F16 scale 1/16
         block.extend([1; 32]);
         file.write_all_at(&block, tensor.abs_offset()).unwrap();
+        // Populate different Q6_K token-embedding blocks to check branch replication.
+        let mapped = model
+            .map()
+            .get(crate::family::recipe::Global::Embedding, None)
+            .unwrap();
+        assert_eq!(mapped.ty, crate::weights::GgufType::Q6K);
+        let tensor = model.weights.header().tensor(&mapped.name).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&model.weights.paths()[tensor.shard()])
+            .unwrap();
+        let row_bytes = mapped.dims[0] / mapped.ty.block_elems() * mapped.ty.block_bytes();
+        for (token, low) in [(1u64, 0x11), (2, 0x22)] {
+            let mut block = vec![low; 128];
+            block.extend([0xaa; 64]);
+            block.extend([1; 16]);
+            block.extend([0x00, 0x2c]);
+            file.write_all_at(&block, tensor.abs_offset() + token * row_bytes)
+                .unwrap();
+        }
     }
     let mut projector = super::projector::HostProjector::new(&model.weights, &rows, 2);
     let mut state = super::super::super::ple::PleState::new(&shape.ple);
     let tokens = [1, 2];
     let starts = chunk.begin_chunk(&tokens, false).unwrap();
     assert_eq!(starts.len(), 2);
+    for (start, value) in starts.iter().zip([0.0625f32, 0.125]) {
+        for branch in start.stream.chunks_exact(shape.hyper.hidden()) {
+            assert!(branch[..256].iter().all(|&x| x == value));
+            assert!(branch[256..].iter().all(|&x| x == 0.0));
+        }
+    }
     assert!(
         starts
             .iter()
