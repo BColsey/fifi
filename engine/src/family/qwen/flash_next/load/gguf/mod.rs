@@ -30,6 +30,7 @@ mod device_tests;
 mod host;
 pub(super) mod ngram;
 pub(super) mod plan;
+pub(in crate::family::qwen::flash_next) mod placement;
 #[cfg(test)]
 mod smallmodel;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

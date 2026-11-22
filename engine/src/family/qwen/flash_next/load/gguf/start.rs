@@ -23,7 +23,6 @@ use crate::{
             cuda::{
                 executor::{CudaRules, FlashCudaExecutor},
                 gguf_device::gguf_driver,
-                gguf_stream::{layer_stacks, stream_plan},
                 start::ple_threads,
             },
             host_plan::{HOST_LABELS, HostMemory},

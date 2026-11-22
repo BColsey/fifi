@@ -15,25 +15,16 @@
 
 use std::{rc::Rc, sync::Arc, time::Instant};
 
-use super::super::load::gguf::{
-    GgufModel,
-    tensors::{Mapped, Slot},
-};
+use super::super::load::gguf::{GgufModel, placement::LayerStacks};
 use crate::{
     EngError,
-    family::{
-        expert_bank::{
-            layer_stream::{
-                ExpertTransport, Home, LayerExperts, StreamBudget, StreamPlan, UploadSet,
-            },
-            layer_stream_card::{CardTransport, StackHome, StackShape, StackSpan},
-        },
-        recipe::Role as Wanted,
+    family::expert_bank::{
+        layer_stream::{ExpertTransport, Home, StreamPlan, UploadSet},
+        layer_stream_card::{CardTransport, StackHome, StackShape, StackSpan},
     },
     kernels::cuda::{
         CudaContext, DeviceStream, NativeWeight, PinnedBuf, resident::matvec_q::QuantType,
     },
-    weights::GgufType,
 };
 
 fn refuse(detail: impl AsRef<str>) -> EngError {
@@ -45,93 +36,6 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 
 /// Host bytes one pinned fill reads at a time.
 const FILL_CHUNK: usize = 64 << 20;
-
-/// The three stacks of one layer's routed experts, in the order the block reads them.
-pub(in crate::family::qwen::flash_next) struct LayerStacks {
-    /// Tensor name, stored type, `(k, rows of the whole stack)` and bytes of gate, up and down.
-    pub(in crate::family::qwen::flash_next) stacks: [StackFacts; 3],
-}
-
-#[derive(Clone)]
-pub(in crate::family::qwen::flash_next) struct StackFacts {
-    pub(in crate::family::qwen::flash_next) name: String,
-    pub(in crate::family::qwen::flash_next) ty: GgufType,
-    pub(in crate::family::qwen::flash_next) k: usize,
-    pub(in crate::family::qwen::flash_next) rows: usize,
-    pub(in crate::family::qwen::flash_next) bytes: u64,
-    pub(in crate::family::qwen::flash_next) shard: usize,
-}
-
-/// The stacks of every layer, read from the tensor map: per stack its own type and size.
-pub(in crate::family::qwen::flash_next) fn layer_stacks(
-    model: &GgufModel,
-) -> Result<Vec<LayerStacks>, EngError> {
-    let layers = model.config().layers();
-    let mut found: Vec<[Option<StackFacts>; 3]> = vec![[None, None, None]; layers];
-    for entry in model.map().entries() {
-        let (Some(layer), Some(part)) = (entry.layer, expert_part(entry)) else {
-            continue;
-        };
-        let (k, rows) = match entry.dims.as_slice() {
-            [k, rows, stack] => (*k as usize, *rows as usize * *stack as usize),
-            other => {
-                return Err(refuse(format!("{} has dimensions {other:?}", entry.name)));
-            }
-        };
-        found
-            .get_mut(layer)
-            .ok_or_else(|| refuse(format!("{} names layer {layer}", entry.name)))?[part] =
-            Some(StackFacts {
-                name: entry.name.clone(),
-                ty: entry.ty,
-                k,
-                rows,
-                bytes: entry.bytes,
-                shard: entry.shard,
-            });
-    }
-    found
-        .into_iter()
-        .enumerate()
-        .map(|(layer, parts)| {
-            let [Some(gate), Some(up), Some(down)] = parts else {
-                return Err(refuse(format!("layer {layer} lacks an expert stack")));
-            };
-            Ok(LayerStacks {
-                stacks: [gate, up, down],
-            })
-        })
-        .collect()
-}
-
-/// 0, 1, 2 for the gate, up and down stack entries.
-fn expert_part(entry: &Mapped) -> Option<usize> {
-    match entry.role {
-        Slot::Layer(Wanted::ExpertGate) => Some(0),
-        Slot::Layer(Wanted::ExpertUp) => Some(1),
-        Slot::Layer(Wanted::ExpertDown) => Some(2),
-        _ => None,
-    }
-}
-
-/// The plan: where every layer's experts live, from the card and host bytes the memory plan
-/// left for the routed experts.
-pub(in crate::family::qwen::flash_next) fn stream_plan(
-    stacks: &[LayerStacks],
-    experts: usize,
-    budget: StreamBudget,
-) -> Result<StreamPlan, EngError> {
-    let layers = stacks
-        .iter()
-        .map(|layer| {
-            LayerExperts::new(
-                experts,
-                layer.stacks.iter().map(|stack| stack.bytes).collect(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    StreamPlan::choose(&layers, budget)
-}
 
 /// What the staging moved and used, over the transport's life.
 #[derive(Debug, Default, Clone, Copy)]

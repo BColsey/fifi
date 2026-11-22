@@ -9,7 +9,7 @@ use super::{
     driver::{DriverShape, StateIo, TokenDevice, TokenDriver},
     feeds::{StartShape, StartSink},
     gguf_moe::GgufMoe,
-    gguf_stream::{ExpertStreams, StreamTotals, layer_stacks},
+    gguf_stream::{ExpertStreams, StreamTotals},
     pack_feeds::PackFeeds,
     state::StateSlot,
     step::FlashStep,
@@ -21,7 +21,9 @@ use crate::{
         engine_owner::{EngineOwner, Handle},
         expert_bank::layer_stream::{Home, StreamPlan},
         exl3_tensors::f32_le_bytes,
-        qwen::flash_next::load::gguf::{GgufModel, feeds::gguf_feeds, trunk::gguf_trunk},
+        qwen::flash_next::load::gguf::{
+            GgufModel, feeds::gguf_feeds, placement::layer_stacks, trunk::gguf_trunk,
+        },
         project::cuda::{CudaProjector, CudaWeights},
     },
     kernels::cuda::{

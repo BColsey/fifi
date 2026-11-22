@@ -23,9 +23,9 @@ use crate::family::{
 
 /// Every layer's experts on the card: the placement of a model that fits.
 fn all_on_card(model: &GgufModel) -> crate::family::expert_bank::layer_stream::StreamPlan {
-    let stacks = crate::family::qwen::flash_next::cuda::gguf_stream::layer_stacks(model)
+    let stacks = super::placement::layer_stacks(model)
         .expect("stacks");
-    crate::family::qwen::flash_next::cuda::gguf_stream::stream_plan(
+    super::placement::stream_plan(
         &stacks,
         model.config().experts(),
         crate::family::expert_bank::layer_stream::StreamBudget {
@@ -406,5 +406,72 @@ fn which_layer_first_differs_when_the_indexer_drops_positions() {
             line.push_str(&format!(" L{layer} {:.4}", diff / scale.max(1e-6)));
         }
         eprintln!("{line}");
+    }
+}
+
+/// The real file's first two layers on the card against the host forward from the file's own
+/// dequantized weights, token by token: the residual stream after each layer stays within the
+/// activation-rounding bound. The experts are placed by a budget of `FIFI_FLASH_CARD_GIB`
+/// (default 3), so the first layers stream; the host decodes each picked expert from the file.
+/// Needs FIFI_FLASH_GGUF and the card.
+#[test]
+#[ignore = "needs a GPU and the real file"]
+fn real_file_first_layers_follow_the_host_with_streamed_experts() {
+    let Ok(path) = std::env::var("FIFI_FLASH_GGUF") else {
+        eprintln!("skipped: FIFI_FLASH_GGUF is unset");
+        return;
+    };
+    let open = || {
+        GgufModel::open(std::path::Path::new(&path))
+            .expect("open the real model")
+            .expect("a qwen4exp model at FIFI_FLASH_GGUF")
+    };
+    let model: &'static GgufModel = Box::leak(Box::new(open()));
+    let gib: u64 = std::env::var("FIFI_FLASH_CARD_GIB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let stacks =
+        super::placement::layer_stacks(model).expect("stacks");
+    let placement = super::placement::stream_plan(
+        &stacks,
+        model.config().experts(),
+        crate::family::expert_bank::layer_stream::StreamBudget {
+            card_bytes: gib << 30,
+            host_bytes: 0,
+            staging_slots: 2,
+        },
+    )
+    .expect("plan");
+    eprintln!("placement: {placement}");
+    let projector = CudaProjector::new().expect("the card");
+    let tokens = [760u32, 6511, 314];
+    let mut driver = gguf_driver(open(), projector, 64 << 20, tokens.len() + 8, 2, placement)
+        .expect("the driver");
+    let layers = 2;
+    let reference = host::HostModel::load(model, layers).expect("host layers");
+    let want = host::run(model, &reference, &tokens, 2).expect("host forward");
+    crate::family::qwen::flash_next::cuda::gguf_device::layer_trace::start();
+    for (at, &token) in tokens.iter().enumerate() {
+        driver.logits(token).expect("device logits");
+        let streams = crate::family::qwen::flash_next::cuda::gguf_device::layer_trace::take();
+        for layer in 0..layers {
+            let got = &streams[layer];
+            let host_stream = &want.layer_out[at][layer];
+            let scale = host_stream.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = got
+                .iter()
+                .zip(host_stream)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let limit = bound(layer + 1, scale);
+            eprintln!(
+                "token {at} layer {layer}: max difference {diff:.5} against the bound {limit:.5} (scale {scale:.3})"
+            );
+            assert!(
+                got.iter().all(|v| v.is_finite()) && diff <= limit,
+                "token {at} layer {layer}: difference {diff} over the bound {limit}"
+            );
+        }
     }
 }
