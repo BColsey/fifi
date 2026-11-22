@@ -24,7 +24,7 @@ use crate::{
     kernels::MlxKernels,
     tensor::{Backing, Dtype, ExecutionTensor, Tensor},
     weights::{
-        GgufType, IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, dequantize_into,
+        GgufType, IQ1S_GRID_U16, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, dequantize_into,
         inkling_codebook_words,
     },
 };
@@ -621,7 +621,7 @@ fn codebook(format: GgufType) -> Result<Option<Tensor>, EngError> {
         return Ok(None);
     };
     let bytes = match format {
-        GgufType::Iq1S => IQ1S_GRID
+        GgufType::Iq1S => IQ1S_GRID_U16
             .iter()
             .flat_map(|&word| u32::from(word).to_le_bytes())
             .collect(),

@@ -268,23 +268,6 @@ pub(crate) fn dot_q6_k(weights: &[u8], input: &[f32]) -> f32 {
     result
 }
 
-fn iq1_s(b: &[u8], y: &mut [f32]) {
-    let d = rd_f16(b, 0);
-    for (group, output) in y.as_chunks_mut::<32>().0.iter_mut().enumerate() {
-        let high = rd_u16(b, 34 + 2 * group);
-        let scale = d * f32::from(2 * ((high >> 12) & 7) + 1);
-        let delta = if high & 0x8000 == 0 { 0.125 } else { -0.125 };
-        for (index, weights) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-            let low = usize::from(b[2 + group * 4 + index]);
-            let grid = IQ1S_GRID[low | (usize::from((high >> (3 * index)) & 7) << 8)];
-            for (j, weight) in weights.iter_mut().enumerate() {
-                let q = f32::from((grid >> (2 * j)) & 3) - 1.0;
-                *weight = scale * (q + delta);
-            }
-        }
-    }
-}
-
 fn iq2_xxs(b: &[u8], y: &mut [f32]) {
     let d = rd_f16(b, 0);
     for ib in 0..8 {

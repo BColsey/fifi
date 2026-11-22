@@ -214,8 +214,8 @@ fn empty_input_gives_empty_output() {
 #[test]
 fn unsupported_type_is_an_error() {
     let mut dst = vec![0f32; 32];
-<<<<<<< HEAD
     // Only types plan() still refuses belong here (Q4_1 and Q5_1 have no decoder).
+    // The Inkling port's Iq1S and Q2_K changes are subsumed by main's IQ series.
     for ty in [GgufType::Q41, GgufType::Q51] {
         let src = vec![0u8; ty.block_bytes() as usize];
         assert!(matches!(
@@ -223,18 +223,6 @@ fn unsupported_type_is_an_error() {
             Err(EngError::Checkpoint(_))
         ));
     }
-=======
-    // Q4_0 left this list when the dequant plan wired it (scalar decode
-    // and the CUDA projector); only types plan() still refuses belong here.
-    // Iq1S left when the Inkling port wired its scalar decoder. Q2_K is
-    // the one plan() still refuses.
-    let ty = GgufType::Q2K;
-    let src = vec![0u8; ty.block_bytes() as usize];
-    assert!(matches!(
-        dequantize_into(ty, &src, &mut dst),
-        Err(EngError::Checkpoint(_))
-    ));
->>>>>>> 40552527d (test(gguf): Iq1S left the unsupported list when the Inkling port wired it)
 }
 
 #[test]
