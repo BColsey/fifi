@@ -341,6 +341,37 @@ fn mapped_checkpoint_projections_match_host_dots() {
     );
 }
 
+// Range hashes recorded from the pinned revision, not independent whole-shard hashes.
+fn verify_pinned_expert_sample(name: &str, bytes: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let expected = match name {
+        "blk.0.ffn_gate_exps.weight" => {
+            "37e0e5454cce1f22a7ef56e2e6eaa48eb7d036e790e39a7b8db52de738080b2e"
+        }
+        "blk.0.ffn_up_exps.weight" => {
+            "cd93f9529b635f30a0741d883938fe910c34f5bb6030186d8a957d78b4eda73d"
+        }
+        "blk.0.ffn_down_exps.weight" => {
+            "ac3b3689a319b6651372c430cab53f1d328a5b928263ec5248da2c097075e3d2"
+        }
+        _ => return false,
+    };
+    format!("{:x}", Sha256::digest(bytes)) == expected
+}
+
+#[test]
+fn pinned_expert_sample_rejects_missing_and_unknown_data() {
+    assert!(!verify_pinned_expert_sample(
+        "blk.0.ffn_gate_exps.weight",
+        &[]
+    ));
+    assert!(!verify_pinned_expert_sample(
+        "blk.0.ffn_gate_exps.weight",
+        &[0; 2460]
+    ));
+    assert!(!verify_pinned_expert_sample("unknown", &[1]));
+}
+
 #[test]
 #[ignore = "needs pinned expert row samples and an admitted CUDA device"]
 fn mapped_expert_rows_match_indexed_cuda_matvec() {
@@ -354,7 +385,11 @@ fn mapped_expert_rows_match_indexed_cuda_matvec() {
             .map(|n| if n % 5 < 2 { -1.0 } else { 1.0 })
             .collect();
         let bytes = mapped_blocks(&model, tensor, expert, 1..4).unwrap();
-        assert!(bytes.iter().any(|&v| v != 0));
+        assert!(
+            verify_pinned_expert_sample(&tensor.name, &bytes),
+            "pinned sample hash mismatch: {}",
+            tensor.name
+        );
         let weights = dequantize(tensor.ty, &bytes).unwrap();
         let stride = bytes.len() / 3;
         let mut padded = bytes.clone();
