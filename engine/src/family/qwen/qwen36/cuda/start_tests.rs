@@ -581,12 +581,20 @@ fn start_without_the_tiered_key_builds_no_bank() {
     );
     assert!(plan.preload, "the member asks for the preload");
     assert!(
-        !tiered_plan_of(&cuda_settings(
+        tiered_plan_of(&cuda_settings(
             r#"{"capture":false, "tiered": {"slots": 40}}"#
         ))
         .unwrap()
         .preload,
-        "the banks start empty unless asked"
+        "the banks start full unless told otherwise"
+    );
+    assert!(
+        !tiered_plan_of(&cuda_settings(
+            r#"{"capture":false, "tiered": {"slots": 40, "preload": false}}"#
+        ))
+        .unwrap()
+        .preload,
+        "preload false starts the banks empty"
     );
     assert!(plan.check().is_ok());
     assert!(check_tiered_start(&tiered).is_ok());

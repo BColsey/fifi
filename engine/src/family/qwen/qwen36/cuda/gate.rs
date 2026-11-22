@@ -448,11 +448,11 @@ mod tests {
                 5000
             )
         );
-        assert!(!plan.preload, "the banks start empty unless asked");
-        let preloaded: GateSettings = with_member(r#"{"slots": 256, "preload": true}"#)
+        assert!(plan.preload, "the banks start full unless told otherwise");
+        let empty: GateSettings = with_member(r#"{"slots": 256, "preload": false}"#)
             .parse()
             .unwrap();
-        assert!(preloaded.tiered.expect("the member sets the plan").preload);
+        assert!(!empty.tiered.expect("the member sets the plan").preload);
     }
 
     #[test]

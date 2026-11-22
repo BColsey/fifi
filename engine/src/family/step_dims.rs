@@ -127,7 +127,7 @@ impl TieredPlan {
     pub(crate) const DEFAULT_TIMEOUT_MS: u32 = crate::family::tier_budget::TIERED_STALL_WINDOW_MS;
 
     /// The defaults of the measurements: the caller chooses the slots and the thread count (6 in
-    /// the measurements); stall window 60 s, 0.25 swaps per token, decay 0.999, no preload.
+    /// the measurements); stall window 60 s, 0.25 swaps per token, decay 0.999, banks filled before the first token.
     pub(crate) fn new(slots_per_layer: usize, threads: usize) -> Self {
         Self::from_slots(SlotRequest::Exactly(slots_per_layer), threads)
     }
@@ -139,7 +139,7 @@ impl TieredPlan {
             timeout_ms: Self::DEFAULT_TIMEOUT_MS,
             swaps_milli: 250,
             decay_milli: 999,
-            preload: false,
+            preload: true,
         }
     }
 

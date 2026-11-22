@@ -624,8 +624,9 @@ pub(crate) struct TieredOptions {
     /// The longest wait for one layer's CPU experts, in milliseconds, from 1 to 600,000. The
     /// default is 10,000.
     pub(crate) timeout_ms: Option<u32>,
-    /// Fill every layer's bank with its lowest-numbered experts before the first token. The
-    /// default is false: the banks start empty and policy P fills them.
+    /// Fill every layer's bank with its lowest-numbered experts before the first token, so the
+    /// start reports ready with every funded slot occupied. The default is true; false starts
+    /// the banks empty and lets policy P fill them from the first requests.
     pub(crate) preload: Option<bool>,
     /// Bank swaps per token, in thousandths, from 0 to 8000. The default 250 buys one
     /// promotion per four tokens model-wide — sized for the blocking fill path.
@@ -690,7 +691,7 @@ impl TieredSettings {
         threads: TIERED_DEFAULT_THREADS as usize,
         timeout_ms: TIERED_DEFAULT_TIMEOUT_MS,
         swaps_milli: 250,
-        preload: false,
+        preload: true,
     };
 }
 
@@ -1347,7 +1348,7 @@ fn tiered_settings(
             1,
             600_000,
         )?,
-        preload: tiered.preload.unwrap_or(false),
+        preload: tiered.preload.unwrap_or(true),
         swaps_milli: ranged("tiered.swaps_milli", tiered.swaps_milli, 250, 0, 8_000)?,
     };
     // The member shapes are validated above so their errors keep precedence; the exclusion
@@ -4383,7 +4384,7 @@ mod tests {
                 slots: SlotRequest::Exactly(40),
                 threads: 6,
                 timeout_ms: crate::family::tier_budget::TIERED_STALL_WINDOW_MS,
-                preload: false
+                preload: true
             })
         );
         let full = tiered(
