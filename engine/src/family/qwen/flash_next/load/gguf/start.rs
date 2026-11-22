@@ -12,7 +12,11 @@ use std::{path::Path, sync::Arc};
 
 use sha2::{Digest, Sha256};
 
-use super::{GgufModel, plan::Card};
+use super::{
+    GgufModel,
+    placement::{layer_stacks, stream_plan},
+    plan::Card,
+};
 use crate::{
     EngError,
     family::{
