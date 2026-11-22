@@ -255,7 +255,8 @@ impl ResidentAttention {
         work.encoded.resize(out_at, 0);
         work.transfer.write(0, &work.encoded)?;
         let device = &work.device;
-        let call = |i: usize, [out, kc, vc, status, q, k, v, rel, table, sinks, gates, pos]| {
+        let call = |i: usize, bytes: [usize; 12]| {
+            let [out, kc, vc, status, q, k, v, rel, table, sinks, gates, pos] = bytes;
             let [q_at, k_at, v_at, rel_at, sinks_at, gates_at, pos_at, _] = offsets[i];
             let (sink_in, gate_in) = if let Some(side) = side {
                 let sink_bytes = visit.shape.query_heads * size_of::<f32>();
