@@ -175,6 +175,7 @@ pub(crate) enum Fit {
 pub(crate) fn choose(
     quants: &[Quant],
     wanted: Option<&str>,
+    max_bytes: Option<u64>,
     mut fits: impl FnMut(&Quant) -> Result<Fit, String>,
 ) -> Result<(Quant, String), String> {
     if let Some(label) = wanted {
@@ -189,25 +190,44 @@ pub(crate) fn choose(
                 )
             });
     }
-    let mut by_size: Vec<&Quant> = quants.iter().collect();
-    by_size.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
-    for quant in &by_size {
-        if fits(quant)? == Fit::Resident {
-            return Ok((
-                (*quant).clone(),
-                format!(
-                    "the largest of {} that the planner fits fully resident on this card at the default context",
-                    quants.len()
-                ),
-            ));
+    // Only quantizations that fit the free disk are candidates.
+    let mut ascending: Vec<&Quant> = quants
+        .iter()
+        .filter(|quant| max_bytes.is_none_or(|limit| quant.bytes <= limit))
+        .collect();
+    ascending.sort_by(|a, b| a.bytes.cmp(&b.bytes).then_with(|| a.label.cmp(&b.label)));
+    let Some(smallest) = ascending.first() else {
+        return Err(format!(
+            "no quantization fits the free disk; the repo holds {}",
+            labels(quants)
+        ));
+    };
+    // A smaller file of the same model never plans worse, so the quantizations that fit
+    // resident are a prefix of the sorted list: a binary search finds its end in a few plans
+    // instead of one per quantization.
+    let (mut low, mut high) = (0, ascending.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if fits(ascending[middle])? == Fit::Resident {
+            low = middle + 1;
+        } else {
+            high = middle;
         }
     }
-    let smallest = by_size.last().ok_or("the repo holds no GGUF file")?;
+    if low > 0 {
+        return Ok((
+            ascending[low - 1].clone(),
+            format!(
+                "the largest of {} that the planner fits fully resident on this card at the default context",
+                ascending.len()
+            ),
+        ));
+    }
     Ok((
         (*smallest).clone(),
         format!(
             "none of the {} fits fully resident at the default context, so the smallest, which serves on the lower rung",
-            quants.len()
+            ascending.len()
         ),
     ))
 }
@@ -237,6 +257,7 @@ fn pick(
     cache: &Path,
     held: &[Quant],
     wanted: Option<&str>,
+    max_bytes: Option<u64>,
     header: &[u8],
     planner: Planner<'_>,
 ) -> Result<(Quant, String), StartupError> {
@@ -251,7 +272,7 @@ fn pick(
         .map_err(|error| refuse(error.0))?;
     let fit = planner.fit;
     let mut failure = None;
-    let chosen = choose(held, wanted, |quant| {
+    let chosen = choose(held, wanted, max_bytes, |quant| {
         stubs
             .path(size_of(quant.bytes), &quant.label)
             .and_then(|stub| fit(&stub))
@@ -331,6 +352,7 @@ pub(crate) fn resolve(
                 hub.cache_dir(),
                 &held,
                 wanted.quant.as_deref(),
+                None,
                 &header,
                 planner,
             )?;
@@ -400,6 +422,7 @@ fn fetch(
         hub.cache_dir(),
         &held,
         wanted.quant.as_deref(),
+        hub.free_bytes(),
         &header,
         planner,
     )?;
@@ -430,6 +453,34 @@ fn fetch(
     Ok(snapshot.join(&picked.first().path))
 }
 
+/// Removes the planning stubs of processes that are gone: a `.fifi-plan-<pid>` directory whose
+/// process no longer runs (where `/proc` says so; elsewhere, one untouched for ten minutes).
+fn sweep_stale_plans(cache: &Path) {
+    let own = std::process::id().to_string();
+    for entry in std::fs::read_dir(cache).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(".fifi-plan-") else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        let gone = if Path::new("/proc/self").exists() {
+            !Path::new("/proc").join(pid).exists()
+        } else {
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(600))
+        };
+        if gone {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Stub weight files under the hub cache: each holds the real GGUF header and has the length of
 /// the quantization it stands for (a sparse file, no bytes written past the header).
 struct Stubs {
@@ -439,6 +490,7 @@ struct Stubs {
 
 impl Stubs {
     fn new(cache: &Path, header: &[u8]) -> Result<Self, StartupError> {
+        sweep_stale_plans(cache);
         let dir = cache.join(format!(".fifi-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .map_err(|error| StartupError(format!("cannot plan in {}: {error}", dir.display())))?;
@@ -569,16 +621,16 @@ mod tests {
                 })
             }
         };
-        let (picked, why) = choose(&held, None, resident_up_to(650)).expect("choice");
+        let (picked, why) = choose(&held, None, None, resident_up_to(650)).expect("choice");
         assert_eq!(picked.label, "Q6_K");
         assert!(why.contains("largest of 3"), "{why}");
-        let (picked, why) = choose(&held, None, resident_up_to(100)).expect("choice");
+        let (picked, why) = choose(&held, None, None, resident_up_to(100)).expect("choice");
         assert_eq!(picked.label, "Q4_K_M");
         assert!(why.contains("lower rung"), "{why}");
         // A label asked for wins over the planner, whatever its case.
-        let (picked, _) = choose(&held, Some("q8_0"), resident_up_to(100)).expect("choice");
+        let (picked, _) = choose(&held, Some("q8_0"), None, resident_up_to(100)).expect("choice");
         assert_eq!(picked.label, "Q8_0");
-        let error = choose(&held, Some("Q2_K"), resident_up_to(0)).unwrap_err();
+        let error = choose(&held, Some("Q2_K"), None, resident_up_to(0)).unwrap_err();
         assert!(error.contains("Q4_K_M, Q6_K, Q8_0"), "{error}");
     }
 
@@ -596,5 +648,54 @@ mod tests {
         let labels: Vec<&str> = held.iter().map(|quant| quant.label.as_str()).collect();
         assert_eq!(labels, ["Q8_0"]);
         assert_eq!(held[0].files.len(), 2);
+    }
+
+    #[test]
+    fn the_planner_is_asked_about_few_quantizations_and_never_about_one_the_disk_cannot_hold() {
+        let sizes = [300_u64, 400, 500, 600, 700, 800, 900, 1000];
+        let files: Vec<HubFile> = sizes
+            .iter()
+            .map(|size| file(&format!("m-Q{}_K.gguf", size / 100), *size))
+            .collect();
+        let held = quants(&files);
+        let mut asked = Vec::new();
+        let (picked, _) = choose(&held, None, None, |quant| {
+            asked.push(quant.bytes);
+            Ok(if quant.bytes <= 650 {
+                Fit::Resident
+            } else {
+                Fit::NotResident
+            })
+        })
+        .expect("choice");
+        assert_eq!(picked.bytes, 600);
+        assert!(asked.len() <= 4, "{asked:?}");
+        // With room for 550 bytes only, the larger ones are not asked about at all.
+        let mut asked = Vec::new();
+        let (picked, _) = choose(&held, None, Some(550), |quant| {
+            asked.push(quant.bytes);
+            Ok(Fit::Resident)
+        })
+        .expect("choice");
+        assert_eq!(picked.bytes, 500);
+        assert!(asked.iter().all(|bytes| *bytes <= 550), "{asked:?}");
+        let error = choose(&held, None, Some(100), |_| Ok(Fit::Resident)).unwrap_err();
+        assert!(error.contains("fits the free disk"), "{error}");
+    }
+
+    #[test]
+    fn stubs_of_a_process_that_is_gone_are_swept_and_a_live_one_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead = dir.path().join(".fifi-plan-4194999");
+        let live = dir
+            .path()
+            .join(format!(".fifi-plan-{}", std::process::id()));
+        let other = dir.path().join("models--a--b");
+        for path in [&dead, &live, &other] {
+            std::fs::create_dir_all(path.join("x")).expect("dirs");
+        }
+        let _stubs = Stubs::new(dir.path(), b"GGUF").expect("stubs");
+        assert!(!dead.exists());
+        assert!(live.exists() && other.exists());
     }
 }
