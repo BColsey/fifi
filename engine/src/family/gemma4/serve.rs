@@ -219,6 +219,15 @@ mod device {
                     message: "the sampler vocabulary is not the head width".to_owned(),
                 });
             }
+            if sampler.capture_armed() {
+                let logits = self.logits(token)?;
+                return crate::family::decode_step::draw::host_draw(
+                    Self::OPERATION,
+                    &logits,
+                    sampler,
+                    sampler_vocab,
+                );
+            }
             let drawn = self
                 .model
                 .decode_draw(self.seq, token, *self.pos, sampler)?;
@@ -526,16 +535,20 @@ mod device {
             Ok(())
         }
 
-        /// A Bolt window draws on the device; the logits rows stay on the card.
+        /// The logits rows of a window with a request that records its draw: only the host walk
+        /// has the candidates.
         fn step_rows(
             &mut self,
-            _sessions: &mut [&mut BoltSession],
-            _tokens: &[u32],
+            sessions: &mut [&mut BoltSession],
+            tokens: &[u32],
         ) -> Result<Vec<Vec<f32>>, EngError> {
-            Err(EngError::Backend {
-                operation: Self::OPERATION,
-                message: "a Bolt window draws its tokens on the device".to_owned(),
-            })
+            let seqs: Vec<&BoltSeq> = sessions.iter().map(|session| &session.seq).collect();
+            let positions: Vec<usize> = sessions.iter().map(|session| session.pos).collect();
+            let rows = self.model.decode_rows(&seqs, tokens, &positions)?;
+            for session in sessions.iter_mut() {
+                session.pos += 1;
+            }
+            Ok(rows)
         }
 
         fn draws_on_device(&self) -> bool {

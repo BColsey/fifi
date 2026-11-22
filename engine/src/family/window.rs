@@ -215,7 +215,11 @@ fn step_window<F: WindowRows>(
         .iter()
         .map(|&slot| fed_of(family, &mut *sessions[slot]))
         .collect();
-    let drawn_on_device = family.draws_on_device();
+    // A request that records its draw needs the host walk, so its window takes the logits rows.
+    let drawn_on_device = family.draws_on_device()
+        && !admitted
+            .iter()
+            .any(|&slot| generations[slot].sampler.capture_armed());
     let mut drawn: Result<Vec<u32>> = Ok(Vec::new());
     let stepped = {
         let mut rows: Vec<&mut F::Session> = sessions

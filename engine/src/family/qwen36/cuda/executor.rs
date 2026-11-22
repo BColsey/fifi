@@ -143,16 +143,12 @@ impl TokenStepper for QwenResidentStep<'_> {
             return Ok(id);
         }
         let logits = self.logits(token)?;
-        let visible = logits
-            .get(..sampler_vocab)
-            .ok_or_else(|| EngError::Backend {
-                operation: Self::OPERATION,
-                message: format!(
-                    "logits have {} values but the sampler vocabulary is {sampler_vocab}",
-                    logits.len()
-                ),
-            })?;
-        sampler.sample(visible)
+        crate::family::decode_step::draw::host_draw(
+            Self::OPERATION,
+            &logits,
+            sampler,
+            sampler_vocab,
+        )
     }
 
     fn fed(&self) -> usize {

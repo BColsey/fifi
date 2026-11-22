@@ -2801,7 +2801,9 @@ impl<'a> QwenResidentStep<'a> {
         if !self.shortlist_on {
             return Ok(None);
         }
-        if !device_sampling_supported(sampler.params(), self.sync_each, vocab_matches) {
+        // A zero `top_p` keeps the top token alone, as on the host.
+        let kept = crate::family::decode_step::draw::kept_params(sampler.params(), sampler_vocab);
+        if !device_sampling_supported(kept, self.sync_each, vocab_matches) {
             if sampler.open_draw_on_device()
                 && device_open_supported(sampler.params(), self.sync_each, vocab_matches)
             {
@@ -2816,11 +2818,14 @@ impl<'a> QwenResidentStep<'a> {
             sampler.record_device_greedy(selected);
             return Ok(Some(selected));
         }
-        let params = sampler.params();
+        if sampler.capture_armed() {
+            // Only the host walk records the candidates of a draw.
+            return Ok(None);
+        }
         self.draw = Some(ShortlistDraw {
-            temperature: params.temperature() as f32,
-            top_k: params.top_k() as usize,
-            top_p: params.top_p() as f32,
+            temperature: kept.temperature() as f32,
+            top_k: kept.top_k() as usize,
+            top_p: kept.top_p() as f32,
             seed: sampler.seed(),
             position: self.state.tokens() as u64,
         });

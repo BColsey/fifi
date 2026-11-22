@@ -1121,7 +1121,8 @@ impl Bolt {
         sampler: &crate::family::sampler::Sampler,
     ) -> Result<u32, EngError> {
         self.decode(seq, token, pos)?;
-        let route = crate::family::decode_step::draw::route(sampler, pos as u64, Self::DRAW_WIDTH);
+        let route =
+            crate::family::decode_step::draw::route(sampler, pos as u64, Self::DRAW_WIDTH, VOCAB);
         Ok(self
             .draw
             .draw(&self.ctx, &self.stream, &self.logits_capped.buf, &[route])?[0])
@@ -1146,7 +1147,12 @@ impl Bolt {
             .iter()
             .zip(samplers)
             .map(|(&pos, sampler)| {
-                crate::family::decode_step::draw::route(sampler, pos as u64, Self::DRAW_WIDTH)
+                crate::family::decode_step::draw::route(
+                    sampler,
+                    pos as u64,
+                    Self::DRAW_WIDTH,
+                    VOCAB,
+                )
             })
             .collect();
         let window = self.window.as_ref().expect("checked above");

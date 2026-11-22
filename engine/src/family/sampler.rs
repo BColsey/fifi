@@ -719,6 +719,16 @@ impl Sampler {
         )
     }
 
+    /// Whether the request armed a capture of its sampling decisions. Only the host walk records
+    /// the candidates, so an armed sampler draws on the host.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        expect(dead_code, reason = "used by the CUDA device samplers")
+    )]
+    pub(crate) fn capture_armed(&self) -> bool {
+        self.capture.is_some()
+    }
+
     /// Whether a CUDA step may answer this sampler's draw from the device shortlist and the
     /// softmax mass of the row ([`Sampler::sample_open_shortlist`]): an open-vocabulary draw
     /// (`top_k` 0) at a positive temperature, with no capture armed (an armed sampler records the

@@ -112,6 +112,8 @@ struct Rows {
     reserve_error: bool,
     /// The family draws the next token of every row itself, as a device sampler would.
     device_draw: bool,
+    /// Calls of `step_rows_drawn`.
+    drawn_calls: usize,
 }
 
 impl Rows {
@@ -130,6 +132,7 @@ impl Rows {
             growth_error_on: None,
             reserve_error: false,
             device_draw: false,
+            drawn_calls: 0,
         }
     }
 }
@@ -232,6 +235,7 @@ impl WindowRows for Rows {
         samplers: &[&crate::family::sampler::Sampler],
     ) -> Result<Vec<u32>> {
         assert_eq!(samplers.len(), sessions.len(), "one sampler per row");
+        self.drawn_calls += 1;
         self.step_calls += 1;
         self.stepped_rows.push(sessions.len());
         for session in sessions.iter_mut() {
@@ -345,6 +349,38 @@ fn a_family_that_draws_on_the_device_runs_the_same_windows() {
     family.device_draw = true;
     let drawn = windowed_with(family, &prompts, 12);
     assert_eq!(drawn, windowed(&prompts, 12));
+}
+
+#[test]
+fn a_window_with_a_recording_request_takes_the_logits_rows() {
+    let mut family = Rows::new(8);
+    family.device_draw = true;
+    let mut a = session(&mut family, &[1, 2, 3]);
+    let mut b = session(&mut family, &[4]);
+    let mut first = sampled_generation(4, 7);
+    let mut second = sampled_generation(4, 8);
+    let _capture = second.sampler.arm_capture(8);
+    let batches = decode_window(
+        &mut family,
+        &mut [&mut a, &mut b],
+        &mut [&mut first, &mut second],
+    )
+    .expect("window");
+    assert_eq!(batches.len(), 2);
+    assert_eq!(family.drawn_calls, 0, "the host walk records the draw");
+    assert_eq!(family.step_calls, 1);
+    let mut unarmed = Rows::new(8);
+    unarmed.device_draw = true;
+    let mut c = session(&mut unarmed, &[1, 2, 3]);
+    let mut d = session(&mut unarmed, &[4]);
+    let (mut third, mut fourth) = (sampled_generation(4, 7), sampled_generation(4, 8));
+    decode_window(
+        &mut unarmed,
+        &mut [&mut c, &mut d],
+        &mut [&mut third, &mut fourth],
+    )
+    .expect("window");
+    assert_eq!(unarmed.drawn_calls, 1);
 }
 
 #[test]
