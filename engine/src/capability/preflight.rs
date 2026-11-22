@@ -2280,6 +2280,48 @@ mod tests {
     }
 
     #[test]
+    fn check_reads_the_tokenizer_file_that_serve_builds_from() {
+        use crate::tokenizer::gguf::{tests::tiny_gguf, vocabulary_gguf};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("a-qwen.gguf");
+        let second = dir.path().join("b-model.gguf");
+        for file in [&first, &second] {
+            std::fs::write(file, tiny_gguf("qwen35moe", "gpt2", "raon")).expect("write");
+        }
+        // Serve builds the tokenizer from `vocabulary_gguf` of its tokenizer source: the named file
+        // itself, or the first valid file of the directory.
+        for (model, expected) in [
+            (&second, &second),
+            (&first, &first),
+            (&dir.path().to_path_buf(), &first),
+        ] {
+            assert_eq!(
+                vocabulary_gguf(model).expect("scan").as_deref(),
+                Some(expected.as_path())
+            );
+            crate::tokenizer::bundle::TokenizerBundle::load_observed(model)
+                .expect("serve builds the tokenizer from the same source");
+            let report =
+                super::preflight(model, model, &Candidate::default(), &cuda_facts(22 << 30))
+                    .expect("report");
+            let tokenizer = check_named(&report, "tokenizer files");
+            assert_eq!(tokenizer.status, CheckStatus::Pass, "{}", tokenizer.detail);
+            let named = expected.file_name().unwrap().to_string_lossy();
+            assert!(
+                tokenizer.detail.contains(named.as_ref()),
+                "{}",
+                tokenizer.detail
+            );
+            let other = if expected == &first {
+                "b-model.gguf"
+            } else {
+                "a-qwen.gguf"
+            };
+            assert!(!tokenizer.detail.contains(other), "{}", tokenizer.detail);
+        }
+    }
+
+    #[test]
     fn gemma4_preflight_requires_cuda_and_bolt_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(

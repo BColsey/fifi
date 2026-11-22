@@ -1019,7 +1019,8 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_gguf_discovers_its_own_family_and_defaults_side_files_to_the_parent() {
+    fn an_explicit_gguf_discovers_its_own_family_and_reads_side_files_only_from_a_named_directory()
+    {
         let dir = directory_of_architecture("qwen35moe");
         let file = dir.path().join("model.gguf");
         std::fs::write(
@@ -1027,14 +1028,23 @@ mod tests {
             crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon"),
         )
         .expect("write another architecture");
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").expect("write tokenizer");
         let args = args_for(&file);
         let discovered = discover(&args).expect("discover explicit checkpoint");
         assert_eq!(
             discovered.family,
             crate::family::qwen::qwen36::factory::FAMILY
         );
-        assert_eq!(discovered.tokenizer_dir, dir.path());
-        let config = super::config_from(&discovered, &args);
+        assert_eq!(
+            discovered.tokenizer_dir, file,
+            "the header supplies the vocabulary"
+        );
+        let named = ModelServeArgs {
+            tokenizer_dir: Some(dir.path().to_path_buf()),
+            ..args_for(&file)
+        };
+        let discovered = discover(&named).expect("discover with a named directory");
+        let config = super::config_from(&discovered, &named);
         assert_eq!(config.engines[0].model_dir, file);
         assert_eq!(config.engines[0].tokenizer_dir, dir.path());
     }

@@ -15,8 +15,9 @@ enginesrv config effective <path> [--json]
   validates that file.
 - `check` — a model directory or one `.gguf` file: compatibility verdict,
   the checks behind it, and a memory estimate where supported. An explicit
-  file excludes other weight files in the directory and defaults tokenizer
-  side files to its parent. For Qwen3.6 CUDA, the weight check names the
+  file excludes other weight files in the directory and takes its tokenizer
+  and geometry from its own header; a directory is read for side files only
+  when `--tokenizer-dir` names it. For Qwen3.6 CUDA, the weight check names the
   selected GGUF and the estimate uses its byte count. Exit 0 when servable.
 - `config effective` — the resolved configuration with the origin of every
   value (config file, environment, family default, or compiled default).
