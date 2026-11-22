@@ -1004,20 +1004,31 @@ fn two_real_expert_slots_match_host() {
     }
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    let bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[256, 257]).unwrap();
+    // Initial zero-valued synthetic holes are not dispatched; only the two verified experts are.
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1, 256]).unwrap();
     let experts = model.config().dims.experts as usize;
-    let geometry = BankGeometry::new(1, experts, 1, 2, layout.bytes).unwrap();
+    let geometry = BankGeometry::new(1, experts, 2, 3, layout.bytes).unwrap();
     let mut mapping = vec![-1; experts];
-    mapping[256] = 0;
-    mapping[257] = 1;
+    mapping[0] = 0;
+    mapping[1] = 1;
+    mapping[256] = 2;
     let policy =
         ReplaceOnMissLru::from_fill(geometry, &[&mapping], &[vec![0; experts]], None).unwrap();
-    let state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
+    let mut state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
+    let copies = bank
+        .step_disk(&stream, &model, &mut state, 0, &[257, 256])
+        .unwrap();
+    assert_eq!(
+        (copies.hits, copies.ops.len(), copies.ops[0].incoming),
+        (1, 1, 257)
+    );
+    let slots = [state.slot_row(0)[257], state.slot_row(0)[256]];
+    assert!(slots.iter().all(|&slot| slot >= 0) && slots[0] != slots[1]);
     let ids = ctx.allocate(8).unwrap();
     ids.write_at(
         &stream,
         0,
-        &[1i32.to_ne_bytes(), 0i32.to_ne_bytes()].concat(),
+        &[slots[0].to_ne_bytes(), slots[1].to_ne_bytes()].concat(),
     )
     .unwrap();
     for part in &layout.parts {
