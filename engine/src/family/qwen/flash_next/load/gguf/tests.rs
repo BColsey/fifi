@@ -340,6 +340,53 @@ fn the_refusal_names_each_type_without_a_kernel_and_the_types_that_have_one() {
 }
 
 #[test]
+fn expert_reader_selects_layer_role_and_expert_without_touching_other_rows() {
+    let (written, model) = open(&Spec {
+        shards: 4,
+        ..Spec::default()
+    });
+    let entry = model.map().get(Wanted::ExpertGate, Some(0)).unwrap();
+    let [k, rows, experts] = entry.dims[..] else {
+        panic!("expected expert stack")
+    };
+    assert!(experts > 1 && rows > 2);
+    let stride = (k / entry.ty.block_elems() * entry.ty.block_bytes()) as usize;
+    let payload = vec![0xa7; 2 * stride];
+    written.patch(&entry.name, (rows + 1) * stride as u64, &payload);
+    let mut output = vec![0; 2 * stride];
+    model
+        .read_expert_rows(0, Wanted::ExpertGate, 1, 1..3, &mut output)
+        .unwrap();
+    assert_eq!(output, payload);
+    model
+        .read_expert_rows(0, Wanted::ExpertGate, 0, 1..3, &mut output)
+        .unwrap();
+    assert_eq!(output, vec![0; 2 * stride]);
+    output.fill(0x55);
+    assert!(
+        model
+            .read_expert_rows(0, Wanted::ExpertGate, experts, 1..3, &mut output)
+            .is_err()
+    );
+    assert!(
+        model
+            .read_expert_rows(0, Wanted::ExpertGate, 1, 1..2, &mut output)
+            .is_err()
+    );
+    assert!(
+        model
+            .read_expert_rows(0, Wanted::QProj, 1, 1..3, &mut output)
+            .is_err()
+    );
+    assert!(
+        model
+            .read_expert_rows(usize::MAX, Wanted::ExpertGate, 1, 1..3, &mut output)
+            .is_err()
+    );
+    assert_eq!(output, vec![0x55; 2 * stride]);
+}
+
+#[test]
 fn expert_row_spans_check_bounds_alignment_and_overflow() {
     let (_written, model) = open(&Spec::default());
     let mut stack = model

@@ -130,6 +130,33 @@ impl GgufModel {
         GgufNgramRows::open(&self.weights, table, self.config.hash.clone())
     }
 
+    /// Read checked stored rows for one expert into a caller-sized buffer. This does not
+    /// convert formats or upload to the CUDA expert bank.
+    pub(in super::super) fn read_expert_rows(
+        &self,
+        layer: usize,
+        role: crate::family::recipe::Role,
+        expert: u64,
+        rows: std::ops::Range<u64>,
+        out: &mut [u8],
+    ) -> Result<(), EngError> {
+        use crate::family::recipe::Role;
+        if !matches!(role, Role::ExpertGate | Role::ExpertUp | Role::ExpertDown) {
+            return Err(EngError::BadRequest("not a routed expert role".into()));
+        }
+        let entry = self.map.get(role, Some(layer)).ok_or_else(|| {
+            EngError::BadRequest(format!("missing expert role {role:?} at layer {layer}"))
+        })?;
+        let (offset, bytes) = entry.row_span(Some(expert), rows)?;
+        if out.len() != bytes {
+            return Err(EngError::BadRequest(format!(
+                "expert read needs {bytes} bytes, got {}",
+                out.len()
+            )));
+        }
+        self.weights.read_range(&entry.name, offset, out)
+    }
+
     /// The tensor types of this file that no CUDA decode kernel reads yet.
     pub(in super::super) fn kernel_gaps(&self) -> Vec<KernelGap> {
         self.map.kernel_gaps(has_decode_kernel)
