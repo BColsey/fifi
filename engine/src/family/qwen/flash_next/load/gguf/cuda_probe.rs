@@ -3,7 +3,10 @@
 
 use std::{cell::Cell, ops::Range};
 
-use super::{GgufModel, tensors::Mapped};
+use super::{
+    GgufModel,
+    tensors::{Mapped, Slot},
+};
 use crate::{
     EngError,
     kernels::cuda::{
@@ -103,9 +106,18 @@ fn mapped_blocks(
     expert: Option<u64>,
     rows: Range<u64>,
 ) -> Result<Vec<u8>, EngError> {
-    let (begin, bytes) = tensor.row_span(expert, rows)?;
+    let (begin, bytes) = tensor.row_span(expert, rows.clone())?;
     let mut blocks = vec![0; bytes];
-    model.weights.read_range(&tensor.name, begin, &mut blocks)?;
+    if let Some(expert) = expert {
+        let (Slot::Layer(role), Some(layer)) = (tensor.role, tensor.layer) else {
+            return Err(EngError::BadRequest(
+                "expert tensor lacks layer role".into(),
+            ));
+        };
+        model.read_expert_rows(layer, role, expert, rows, &mut blocks)?;
+    } else {
+        model.weights.read_range(&tensor.name, begin, &mut blocks)?;
+    }
     Ok(blocks)
 }
 
@@ -201,6 +213,7 @@ fn mapped_checkpoint_projections_match_host_dots() {
     let ctx = CudaContext::new().expect("CUDA device");
     let stream = ctx.stream().expect("stream");
     let mut checked = 0;
+    let mut expert_checked = 0;
     for (t, expert) in projection_samples(&model) {
         let x: Vec<_> = (0..t.dims[0])
             .map(|n| if n % 5 < 2 { -1.0 } else { 1.0 })
@@ -224,9 +237,16 @@ fn mapped_checkpoint_projections_match_host_dots() {
             );
         }
         checked += 1;
+        expert_checked += usize::from(expert.is_some());
     }
     assert!(checked > 0, "no native mapped projections were checked");
-    eprintln!("Flash-Next layer 0: checked {checked} mapped projections");
+    assert!(
+        expert_checked > 0,
+        "no expert reader projections were checked"
+    );
+    eprintln!(
+        "Flash-Next layer 0: checked {checked} mapped projections, {expert_checked} expert stacks"
+    );
 }
 
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
