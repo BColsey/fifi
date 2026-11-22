@@ -187,6 +187,47 @@ pub(in super::super::super) struct ExpertProjection<'a> {
     pub(in super::super::super) slots: usize,
 }
 
+/// Caller-owned activation, index and output ranges for an expert projection.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in super::super::super) struct ExpertProjectionInputs<'a> {
+    pub(in super::super::super) ids: crate::kernels::cuda::DeviceRange<'a>,
+    pub(in super::super::super) x_q8: crate::kernels::cuda::DeviceRange<'a>,
+    pub(in super::super::super) x_per_slot: bool,
+    pub(in super::super::super) output: crate::kernels::cuda::DeviceRange<'a>,
+    pub(in super::super::super) output_stride: usize,
+    pub(in super::super::super) used: usize,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl<'a> ExpertProjection<'a> {
+    /// Queue the native indexed matvec; normal stream and input-lifetime rules apply.
+    pub(in super::super::super) fn launch(
+        self,
+        ctx: &crate::kernels::cuda::CudaContext,
+        stream: &crate::kernels::cuda::DeviceStream,
+        inputs: ExpertProjectionInputs<'a>,
+    ) -> Result<(), EngError> {
+        use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
+        ctx.matvec_expert(
+            stream,
+            ExpertMatvecCall {
+                ty: self.ty,
+                w_stack: self.weights,
+                ids: inputs.ids,
+                x_q8: inputs.x_q8,
+                x_per_slot: inputs.x_per_slot,
+                y: inputs.output,
+                y_slot_stride: inputs.output_stride,
+                k: self.k,
+                rows: self.rows,
+                n_expert: self.slots,
+                n_used: inputs.used,
+                glu_gate: None,
+            },
+        )
+    }
+}
+
 /// Staged device owner. Every slot must be initialized before exposing any stack,
 /// since indexed kernels may access any slot. Cross-stream ordering is the caller's duty.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

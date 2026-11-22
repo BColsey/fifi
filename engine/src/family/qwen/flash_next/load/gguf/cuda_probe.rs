@@ -701,8 +701,8 @@ fn mapped_expert_rows_match_indexed_cuda_matvec() {
 #[test]
 #[ignore = "needs verified full expert samples and an admitted CUDA device"]
 fn full_expert_device_stacks_match_host() {
-    use super::expert_layout::ExpertDeviceStacks;
-    use crate::{kernels::cuda::resident::matvec_expert::ExpertMatvecCall, weights::dequantize};
+    use super::expert_layout::{ExpertDeviceStacks, ExpertProjectionInputs};
+    use crate::weights::dequantize;
     full_expert_fixture_integrity();
     let path = std::env::var_os("FIFI_FLASH_EXPERT_FIXTURE").unwrap();
     let model = GgufModel::open(std::path::Path::new(&path))
@@ -837,24 +837,20 @@ fn full_expert_device_stacks_match_host() {
         )
         .unwrap();
         let y = ctx.allocate(rows * 4).unwrap();
-        ctx.matvec_expert(
-            &stream,
-            ExpertMatvecCall {
-                ty: projection.ty,
-                w_stack: projection.weights,
-                ids: ids.range(0, 4).unwrap(),
-                x_q8: q.range(0, qbytes).unwrap(),
-                x_per_slot: false,
-                y: y.range(0, rows * 4).unwrap(),
-                y_slot_stride: rows,
-                k,
-                rows,
-                n_expert: projection.slots,
-                n_used: 1,
-                glu_gate: None,
-            },
-        )
-        .unwrap();
+        projection
+            .launch(
+                &ctx,
+                &stream,
+                ExpertProjectionInputs {
+                    ids: ids.range(0, 4).unwrap(),
+                    x_q8: q.range(0, qbytes).unwrap(),
+                    x_per_slot: false,
+                    output: y.range(0, rows * 4).unwrap(),
+                    output_stride: rows,
+                    used: 1,
+                },
+            )
+            .unwrap();
         let mut out = vec![0; rows * 4];
         y.read_at(&stream, 0, &mut out).unwrap();
         let blocks = mapped_blocks(&model, tensor, expert, 0..rows as u64).unwrap();
