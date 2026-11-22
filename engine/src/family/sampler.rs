@@ -3685,8 +3685,8 @@ mod open_draw_tests {
     /// rows are left to the full row more often and never answered wrongly.
     #[test]
     fn a_certified_open_draw_is_the_host_token_for_the_same_unit() {
-        let (mut sharp_checked, mut sharp_certified) = (0_u64, 0_u64);
-        let (mut flat_checked, mut flat_certified) = (0_u64, 0_u64);
+        let (mut sharp_checked, mut sharp_agreed) = (0_u64, 0_u64);
+        let (mut flat_checked, mut flat_agreed) = (0_u64, 0_u64);
         for (seed, sharpness) in [(1, 12.0), (2, 9.0), (3, 7.0), (4, 5.0)] {
             let row = model_row(seed, sharpness);
             let ranked: Vec<(u32, f32)> = ranked_row(&row).into_iter().take(20).collect();
@@ -3701,9 +3701,9 @@ mod open_draw_tests {
                             let host = pick_row(settings, &row, || unit, None).expect("host").0;
                             let sharp = sharpness >= 9.0 && temperature <= 0.7;
                             let (checked, certified) = if sharp {
-                                (&mut sharp_checked, &mut sharp_certified)
+                                (&mut sharp_checked, &mut sharp_agreed)
                             } else {
-                                (&mut flat_checked, &mut flat_certified)
+                                (&mut flat_checked, &mut flat_agreed)
                             };
                             *checked += 1;
                             if let Some(token) = open_pick(settings, &ranked, total * scale, unit) {
@@ -3719,12 +3719,12 @@ mod open_draw_tests {
             }
         }
         assert!(
-            sharp_certified * 100 > sharp_checked * 80,
-            "{sharp_certified} of {sharp_checked} sharp draws certified"
+            sharp_agreed * 100 > sharp_checked * 80,
+            "{sharp_agreed} of {sharp_checked} sharp draws certified"
         );
         assert!(
-            flat_certified > 0,
-            "{flat_certified} of {flat_checked} flat draws certified"
+            flat_agreed > 0,
+            "{flat_agreed} of {flat_checked} flat draws certified"
         );
     }
 
