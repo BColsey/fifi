@@ -39,6 +39,7 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/attn_decode_q8.h"
+#include "resident/multi_row.h"
 #include "resident/attn_split_reduce.cuh"
 
 namespace {
@@ -63,7 +64,33 @@ struct Args {
     int window, ring;        // 0: all positions / linear cells; else last `window` / cell p % ring
     float scale;
     const float *sinks = nullptr;  // private launch args only; the external ABI is unchanged
+    // The many-rows entry: row t of the launch is one token of its own sequence (m rows, one token each);
+    // rows[t] holds that sequence's planes and its step block. Null for every other launch.
+    const inference_cuda_kv_row *rows = nullptr;
 };
+
+// The planes and the visible-key word of one grid row: the launch's own for a single sequence
+// (token t sees kv_len + t keys), the row table's for the many-rows entry (row t sees the kv_len
+// word of its own step block, 8 bytes in, and nothing else).
+struct RowView {
+    const signed char *k_codes;
+    const unsigned short *k_scales;
+    const signed char *v_codes;
+    const unsigned short *v_scales;
+    int kv_len;
+};
+
+template <bool kMany>
+__device__ inline RowView row_of(const Args &a, int t) {
+    if constexpr (kMany) {
+        const inference_cuda_kv_row &r = a.rows[t];
+        return {(const signed char *)r.k_codes, (const unsigned short *)r.k_scales,
+                (const signed char *)r.v_codes, (const unsigned short *)r.v_scales,
+                *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET)};
+    } else {
+        return {a.k_codes, a.k_scales, a.v_codes, a.v_scales, *a.kv_len};
+    }
+}
 
 // Key range plan from the number of keys alone, as attn_decode.cu: n_split splits of `chunk`
 // keys (a multiple of the tile) cover n_keys; split s owns [s * chunk, min(n_keys, (s+1)*chunk)).
@@ -78,8 +105,10 @@ __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int 
 }
 
 // kv_len must leave room for the m tokens in a linear cache; a ring takes any positive length.
+template <bool kMany>
 __device__ inline bool kv_ok(const Args &a, int kv_len) {
-    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= a.cells - (a.m - 1));
+    // A many-rows launch appends one token per row, so a linear cache needs no headroom.
+    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= a.cells - (kMany ? 0 : a.m - 1));
 }
 
 // Visible keys of token t: the last min(n_keys, window) positions. first = position of key 0.
@@ -130,7 +159,7 @@ __device__ inline float reduce8(const float (&a)[8], int lane, int &head) {
     return d;
 }
 
-template <int D>
+template <int D, bool kMany = false>
 __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
     constexpr int G = kGroup, NCH = D / 128;  // chunks of 4 dims per lane: 2 (D 256) or 1 (D 128)
     static_assert(D == 128 || D == 256, "head_dim 128 or 256");
@@ -139,11 +168,12 @@ __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
     __shared__ float s_corr[G];
     const int s = blockIdx.x, kvh = blockIdx.y, t = blockIdx.z;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int kv_len = *a.kv_len;
-    if (!kv_ok(a, kv_len)) {
+    const RowView rw = row_of<kMany>(a, t);
+    const int kv_len = rw.kv_len;
+    if (!kv_ok<kMany>(a, kv_len)) {
         return;
     }
-    const int n_keys = kv_len + t;
+    const int n_keys = kMany ? kv_len : kv_len + t;
     int first, count;
     visible(a, n_keys, first, count);
     int chunk, n_active;
@@ -184,9 +214,9 @@ __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
         signed char vc[kTile];
         unsigned short vs[kTile];
         if (own) {
-            const signed char *vcol = a.v_codes + (size_t)kvh * code_stride + tid;
+            const signed char *vcol = rw.v_codes + (size_t)kvh * code_stride + tid;
             const unsigned short *vrow =
-                a.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
+                rw.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
 #pragma unroll 8
             for (int j = 0; j < kTile; ++j) {
                 vc[j] = j < nvalid ? vcol[(size_t)cache_cell(a, first, base + j) * D]
@@ -202,9 +232,9 @@ __global__ void __launch_bounds__(256) attn_q8_part_k(Args a) {
             const int j = warp + 8 * i;
             if (j < nvalid) {
                 const signed char *kc =
-                    a.k_codes + (size_t)kvh * code_stride +
+                    rw.k_codes + (size_t)kvh * code_stride +
                     (size_t)cache_cell(a, first, base + j) * D;
-                const unsigned short *ks = a.k_scales + (size_t)kvh * scale_stride +
+                const unsigned short *ks = rw.k_scales + (size_t)kvh * scale_stride +
                                            (size_t)cache_cell(a, first, base + j) * groups;
                 float kf[8];
 #pragma unroll
@@ -307,7 +337,7 @@ __device__ int g_kernel_ran = 0;
 #endif
 
 // Separate variant preserves legacy register allocation and flag-off performance.
-template <int D>
+template <int D, bool kMany = false>
 __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
     constexpr int G = kGroup, NCH = D / 128;  // chunks of 4 dims per lane: 2 (D 256) or 1 (D 128)
     static_assert(D == 256, "register V is qualified for head_dim 256");
@@ -319,11 +349,12 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
 #ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
     if (s == 0 && kvh == 0 && t == 0 && tid == 0) { g_kernel_ran = 1; }
 #endif
-    const int kv_len = *a.kv_len;
-    if (!kv_ok(a, kv_len)) {
+    const RowView rw = row_of<kMany>(a, t);
+    const int kv_len = rw.kv_len;
+    if (!kv_ok<kMany>(a, kv_len)) {
         return;
     }
-    const int n_keys = kv_len + t;
+    const int n_keys = kMany ? kv_len : kv_len + t;
     int first, count;
     visible(a, n_keys, first, count);
     int chunk, n_active;
@@ -365,9 +396,9 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
             const int j = warp + 8 * i;
             if (j < nvalid) {
                 const signed char *kc =
-                    a.k_codes + (size_t)kvh * code_stride +
+                    rw.k_codes + (size_t)kvh * code_stride +
                     (size_t)cache_cell(a, first, base + j) * D;
-                const unsigned short *ks = a.k_scales + (size_t)kvh * scale_stride +
+                const unsigned short *ks = rw.k_scales + (size_t)kvh * scale_stride +
                                            (size_t)cache_cell(a, first, base + j) * groups;
                 float kf[8];
 #pragma unroll
@@ -430,9 +461,9 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
         for (int g = 0; g < G; ++g) {
             acc[g] *= s_corr[g];
         }
-        const signed char *vcol = a.v_codes + (size_t)kvh * code_stride + tid;
+        const signed char *vcol = rw.v_codes + (size_t)kvh * code_stride + tid;
         const unsigned short *vrow =
-            a.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
+            rw.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
         // Eight constant-index values fit registers without changing the ascending-key FMA chain.
 #pragma unroll 1
         for (int first_j = 0; first_j < kTile; first_j += 8) {
@@ -484,7 +515,7 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_part_k(Args a) {
 // with compute. The multiply/fmaf order per head is unchanged, so it is bitwise-equal to
 // the legacy kernel; INFERENCE_CUDA_KV8_ATTN_V_PREFETCH=1 (exactly "1", read once)
 // selects it. The legacy kernel above is untouched.
-template <int D>
+template <int D, bool kMany = false>
 __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) {
     constexpr int G = kGroup, NCH = D / 128;  // chunks of 4 dims per lane: 2 (D 256) or 1 (D 128)
     static_assert(D == 256, "register V is qualified for head_dim 256");
@@ -496,11 +527,12 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
 #ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
     if (s == 0 && kvh == 0 && t == 0 && tid == 0) { g_kernel_ran = 2; }
 #endif
-    const int kv_len = *a.kv_len;
-    if (!kv_ok(a, kv_len)) {
+    const RowView rw = row_of<kMany>(a, t);
+    const int kv_len = rw.kv_len;
+    if (!kv_ok<kMany>(a, kv_len)) {
         return;
     }
-    const int n_keys = kv_len + t;
+    const int n_keys = kMany ? kv_len : kv_len + t;
     int first, count;
     visible(a, n_keys, first, count);
     int chunk, n_active;
@@ -556,9 +588,9 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
             if (j < nvalid) {
                 const int row = cache_cell(a, first, base + j);
                 const signed char *kc =
-                    a.k_codes + (size_t)kvh * code_stride + (size_t)row * D;
+                    rw.k_codes + (size_t)kvh * code_stride + (size_t)row * D;
                 const unsigned short *ks =
-                    a.k_scales + (size_t)kvh * scale_stride + (size_t)row * groups;
+                    rw.k_scales + (size_t)kvh * scale_stride + (size_t)row * groups;
 #pragma unroll
                 for (int c = 0; c < NCH; ++c) {
                     kc_next[c] = *reinterpret_cast<const int *>(kc + 128 * c + 4 * lane);
@@ -576,9 +608,9 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
                 if (more) {
                     const int row = cache_cell(a, first, base + j + 8);
                     const signed char *kc =
-                        a.k_codes + (size_t)kvh * code_stride + (size_t)row * D;
+                        rw.k_codes + (size_t)kvh * code_stride + (size_t)row * D;
                     const unsigned short *ks =
-                        a.k_scales + (size_t)kvh * scale_stride + (size_t)row * groups;
+                        rw.k_scales + (size_t)kvh * scale_stride + (size_t)row * groups;
 #pragma unroll
                     for (int c = 0; c < NCH; ++c) {
                         kc_hold[c] = *reinterpret_cast<const int *>(kc + 128 * c + 4 * lane);
@@ -657,9 +689,9 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
         for (int g = 0; g < G; ++g) {
             acc[g] *= s_corr[g];
         }
-        const signed char *vcol = a.v_codes + (size_t)kvh * code_stride + tid;
+        const signed char *vcol = rw.v_codes + (size_t)kvh * code_stride + tid;
         const unsigned short *vrow =
-            a.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
+            rw.v_scales + (size_t)kvh * scale_stride + (tid / kQuant);
         // Eight constant-index values fit registers without changing the ascending-key FMA chain.
 #pragma unroll 1
         for (int first_j = 0; first_j < kTile; first_j += 8) {
@@ -704,19 +736,20 @@ __global__ void __launch_bounds__(256, 2) attn_q8_register_v_prefetch_k(Args a) 
     }
 }
 
-template <int D>
+template <int D, bool kMany = false>
 __global__ void __launch_bounds__(D) attn_q8_combine_k(Args a) {
     constexpr int G = kGroup;
     __shared__ float s_w[kMaxSplits], s_l[kMaxSplits], s_red[D / 32];
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const int kvh = h / G, g = h % G;
     float *o = a.out + ((size_t)t * a.n_head + h) * D + d;
-    const int kv_len = *a.kv_len;
-    if (!kv_ok(a, kv_len)) {
+    const RowView rw = row_of<kMany>(a, t);
+    const int kv_len = rw.kv_len;
+    if (!kv_ok<kMany>(a, kv_len)) {
         *o = __int_as_float(0x7fc00000);  // NaN: the caller's non-finite check ends the job
         return;
     }
-    const int n_keys = kv_len + t;
+    const int n_keys = kMany ? kv_len : kv_len + t;
     int first, count;
     visible(a, n_keys, first, count);
     int chunk, n_active;
@@ -844,7 +877,7 @@ bool arm_receipt() {
 }
 #endif
 
-template <int D>
+template <int D, bool kMany = false>
 Failure enqueue(const Args &a, cudaStream_t s) {
     Failure failure;
     if constexpr (D == 256) {
@@ -861,31 +894,31 @@ Failure enqueue(const Args &a, cudaStream_t s) {
                     return failure;
                 }
 #endif
-                attn_q8_register_v_prefetch_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+                attn_q8_register_v_prefetch_k<D, kMany><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
 #ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
                 g_dispatched.store(2, std::memory_order_relaxed);
 #endif
                 failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
                 if (failure.ok()) {
-                    attn_q8_combine_k<D><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
+                    attn_q8_combine_k<D, kMany><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
                     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
                 }
                 return failure;
             }
             // The statement below is main's launch, verbatim (same indentation).
-            attn_q8_register_v_part_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+            attn_q8_register_v_part_k<D, kMany><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
 #ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
             g_dispatched.store(1, std::memory_order_relaxed);
 #endif
         } else {
-            attn_q8_part_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+            attn_q8_part_k<D, kMany><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
         }
     } else {
-        attn_q8_part_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+        attn_q8_part_k<D, kMany><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
     }
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (failure.ok()) {
-        attn_q8_combine_k<D><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
+        attn_q8_combine_k<D, kMany><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     }
     return failure;
@@ -939,6 +972,64 @@ static int launch_decode(const inference_cuda_attn_decode_q8_args *in,
 extern "C" int inference_cuda_attn_decode_q8_launch(const inference_cuda_attn_decode_q8_args *in,
     void *stream, int *out_stage) {
     return launch_decode(in, nullptr, stream, out_stage);
+}
+
+// The many-rows entry: n rows, each the single token of a sequence of its own (multi_row.h). The
+// part scratch is laid out as for m = n tokens, row t in the slot token t has in a single launch.
+extern "C" int inference_cuda_attn_decode_q8_multi_launch(
+    const inference_cuda_attn_decode_q8_multi_args *in, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (in == NULL || stream == NULL || in->q == NULL || in->rows == NULL || in->part == NULL ||
+            in->out == NULL || in->n < 1 || in->n > INFERENCE_CUDA_MULTI_ROW_MAX) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        // The shared rules of the single entry, on a stand-in whose kv_len word is any non-null
+        // address and whose planes are placeholders of the right alignment.
+        inference_cuda_attn_decode_q8_args shape = {};
+        shape.q = in->q;
+        shape.proj = in->proj;
+        shape.k_codes = shape.k_scales = shape.v_codes = shape.v_scales = shape.kv_len = in->rows;
+        shape.part = in->part;
+        shape.out = in->out;
+        shape.ld = in->ld;
+        shape.m = 1;  // one token per row: no look-ahead headroom, as the grid's row count is not a token count
+        shape.n_head = in->n_head;
+        shape.n_kv_head = in->n_kv_head;
+        shape.head_dim = in->head_dim;
+        shape.cells = in->cells;
+        shape.max_splits = in->max_splits;
+        shape.min_keys = in->min_keys;
+        shape.window = in->window;
+        shape.ring = in->ring;
+        shape.scale = in->scale;
+        if (!valid(&shape) || !aligned_to(in->rows, 8)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Args a = {};
+        a.q = (const float *)in->q;
+        a.proj = (const float *)in->proj;
+        a.part = (float *)in->part;
+        a.out = (float *)in->out;
+        a.ld = in->ld;
+        a.m = in->n;
+        a.n_head = in->n_head;
+        a.n_kv_head = in->n_kv_head;
+        a.cells = in->cells;
+        a.max_splits = in->max_splits;
+        a.min_keys = in->min_keys;
+        a.window = in->window;
+        a.ring = in->ring;
+        a.scale = in->scale;
+        a.rows = in->rows;
+        const cudaStream_t s = (cudaStream_t)stream;
+        const Failure failure =
+            in->head_dim == 128 ? enqueue<128, true>(a, s) : enqueue<256, true>(a, s);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
 }
 #ifdef INFERENCE_CUDA_ARMS_QUALIFICATION
 // Test/harness-only arm control, on THIS thread only (see t_force_prefetch).

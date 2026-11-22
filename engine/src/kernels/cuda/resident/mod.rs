@@ -104,6 +104,7 @@ mod matvec_gguf;
 pub(crate) mod matvec_native;
 pub(crate) mod matvec_q;
 pub(crate) mod moe_combine;
+pub(crate) mod multi_row;
 pub(crate) mod pack_rows;
 pub(crate) mod paged_position;
 pub(crate) mod qsa_attn;

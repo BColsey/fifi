@@ -171,7 +171,7 @@ fn to_int(name: &str, value: usize) -> Result<c_int, EngError> {
 }
 
 /// Rule (1), head counts, token count and `eps`.
-fn check_counts(shape: &DeltaShape, eps: f32) -> Result<(), EngError> {
+pub(super) fn check_counts(shape: &DeltaShape, eps: f32) -> Result<(), EngError> {
     if !(1..=GDN_DELTA_MAX_M).contains(&shape.m) {
         return Err(rule("tokens", &format!("m is {}, not 1 to 32768", shape.m)));
     }
@@ -203,7 +203,7 @@ fn check_counts(shape: &DeltaShape, eps: f32) -> Result<(), EngError> {
 }
 
 /// Rule (1), the row lengths.
-fn check_rows(shape: &DeltaShape) -> Result<(), EngError> {
+pub(super) fn check_rows(shape: &DeltaShape) -> Result<(), EngError> {
     let conv_cols = product(&[
         sum(shape.n_k_heads, sum(shape.n_k_heads, shape.n_v_heads)?)?,
         GDN_HEAD_DIM,

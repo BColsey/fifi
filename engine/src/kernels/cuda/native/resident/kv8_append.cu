@@ -21,6 +21,7 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/kv8_append.h"
+#include "resident/multi_row.h"
 
 namespace {
 
@@ -49,6 +50,7 @@ struct Args {
     int *status;
     int m, n_kv_head, head_dim, cells;
     int code_scale;
+    const inference_cuda_kv_row *rows;  // the many-rows entry: row t appends to rows[t]'s planes; else null
 };
 
 // NaN-propagating max: `fmaxf` returns the other operand when one is NaN, so a group holding a
@@ -90,6 +92,10 @@ __device__ inline int quant_code(float x, float s) {
     return max(-127, min(127, __float2int_rn(__fdiv_rn(x, s))));
 }
 
+// kMany: row t is the single token of its own sequence, so the position word, the status word and
+// the four planes come from rows[t] and the token's cell is the position itself (m is the row
+// count). kMany = false is the kernel of the single sequence, unchanged.
+template <bool kMany = false>
 __global__ void kv8_append_k(Args a) {
     const int kvh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     // Poison rule, as in attn_prep: the position of token 0 is read from the device (decode) or
@@ -97,14 +103,28 @@ __global__ void kv8_append_k(Args a) {
     // access. The answer is block uniform (while no other stream writes the word), so the early
     // return happens before any barrier. A refused launch writes no code, no scale, and ORs
     // mask 4 into status (one thread, integer atomic). A valid launch touches neither.
-    const long long base = a.pos_dev ? (long long)*a.pos_dev : (long long)a.pos0;
-    if (base < 0 || base + a.m > a.cells) {
-        if (a.status && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
-            atomicOr(a.status, kStatusInvalidStepState);
+    signed char *k_codes = a.k_codes, *v_codes = a.v_codes;
+    unsigned short *k_scales = a.k_scales, *v_scales = a.v_scales;
+    int *status = a.status;
+    long long base;
+    if constexpr (kMany) {
+        const inference_cuda_kv_row &row = a.rows[t];
+        k_codes = (signed char *)row.k_codes;
+        k_scales = (unsigned short *)row.k_scales;
+        v_codes = (signed char *)row.v_codes;
+        v_scales = (unsigned short *)row.v_scales;
+        status = (int *)((char *)row.step + INFERENCE_CUDA_STEP_STATUS_OFFSET);
+        base = *(const int *)((const char *)row.step + INFERENCE_CUDA_STEP_POS_OFFSET);
+    } else {
+        base = a.pos_dev ? (long long)*a.pos_dev : (long long)a.pos0;
+    }
+    if (base < 0 || base + (kMany ? 1 : a.m) > a.cells) {
+        if (status && blockIdx.x == 0 && threadIdx.x == 0 && (kMany || blockIdx.y == 0))
+            atomicOr(status, kStatusInvalidStepState);
         return;
     }
     const int groups = a.head_dim / kGroup;
-    const size_t cell = (size_t)(base + t);
+    const size_t cell = (size_t)(kMany ? base : base + t);
     const size_t in_at = ((size_t)t * a.n_kv_head + kvh) * a.head_dim + d;
     const size_t code_at = (size_t)kvh * a.cells * a.head_dim + cell * a.head_dim + d;
     const size_t scale_at = (size_t)kvh * a.cells * groups + cell * groups + d / kGroup;
@@ -118,11 +138,11 @@ __global__ void kv8_append_k(Args a) {
     const float kden = a.code_scale == kStoredHalf ? h2f(ks) : kd;
     const float vden = a.code_scale == kStoredHalf ? h2f(vs) : vd;
     // Stored-half zero forces zero codes even when the unrounded f32 scale is nonzero.
-    a.k_codes[code_at] = (signed char)(ks == 0 ? 0 : quant_code(kx, kden));
-    a.v_codes[code_at] = (signed char)(vs == 0 ? 0 : quant_code(vx, vden));
+    k_codes[code_at] = (signed char)(ks == 0 ? 0 : quant_code(kx, kden));
+    v_codes[code_at] = (signed char)(vs == 0 ? 0 : quant_code(vx, vden));
     if ((d & (kGroup - 1)) == 0) {
-        a.k_scales[scale_at] = ks;
-        a.v_scales[scale_at] = vs;
+        k_scales[scale_at] = ks;
+        v_scales[scale_at] = vs;
     }
 }
 
@@ -194,7 +214,14 @@ Args make_args(const void *k, const void *v, void *k_codes, void *k_scales, void
 
 Failure launch(const Args &a, cudaStream_t s) {
     Failure failure;
-    kv8_append_k<<<dim3(a.n_kv_head, a.m), a.head_dim, 0, s>>>(a);
+    kv8_append_k<><<<dim3(a.n_kv_head, a.m), a.head_dim, 0, s>>>(a);
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    return failure;
+}
+
+Failure launch_many(const Args &a, cudaStream_t s) {
+    Failure failure;
+    kv8_append_k<true><<<dim3(a.n_kv_head, a.m), a.head_dim, 0, s>>>(a);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     return failure;
 }
@@ -225,6 +252,28 @@ extern "C" int inference_cuda_kv8_append_launch(const inference_cuda_kv8_append_
         a.pos_dev = (const int *)in->pos;
         a.status = (int *)in->status;
         const Failure failure = launch(a, (cudaStream_t)stream);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_kv8_append_multi_launch(const inference_cuda_kv8_append_multi_args *in,
+                                                      void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (in == NULL || stream == NULL || in->rows == NULL || !aligned_to(in->rows, 8) ||
+            in->k == NULL || in->v == NULL || !aligned_to(in->k, 4) || !aligned_to(in->v, 4) ||
+            in->n < 1 || in->n > INFERENCE_CUDA_MULTI_ROW_MAX ||
+            !valid_geometry(1, in->n_kv_head, in->head_dim, in->cells) ||
+            !valid_code_scale(in->code_scale)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Args a = make_args(in->k, in->v, NULL, NULL, NULL, NULL, in->n, in->n_kv_head,
+                           in->head_dim, in->cells, in->code_scale);
+        a.rows = in->rows;
+        const Failure failure = launch_many(a, (cudaStream_t)stream);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
