@@ -6,11 +6,10 @@ use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideCall};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
-use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
+use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
 use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::Kv8Data;
-use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
@@ -154,15 +153,14 @@ impl Gemma {
         let h1 = &sc.h[1];
         let h2 = &sc.h[2];
         let h3 = &sc.h[3];
-        ctx.embed_q8(
+        ctx.embed_native(
             stream,
-            EmbedQ8Call {
-                out: h0.buf.range(0, h0.bytes())?,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
+            EmbedNativeCall {
+                weight: &self.embed,
                 ids: sc.ids.range(0, m * 4)?,
+                x: h0.buf.range(0, h0.bytes())?,
+                status: sc.status.range(0, 4)?,
                 m,
-                n_rows: self.embed.rows,
-                k: self.embed.k,
             },
         )?;
         ctx.row_scale(
@@ -201,17 +199,12 @@ impl Gemma {
                 q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             },
         )?;
-        ctx.matvec_q(
+        ctx.matvec_native(
             stream,
-            MatvecCall {
-                ty: QuantType::Q80,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: self.logits.buf.range(0, self.logits.bytes())?,
-                k: HIDDEN,
-                rows: self.embed.rows,
-                ncols: 1,
-            },
+            &self.embed,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            self.logits.buf.range(0, self.logits.bytes())?,
+            1,
         )?;
         ctx.softcap(
             stream,

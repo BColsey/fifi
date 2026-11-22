@@ -36,7 +36,6 @@ fn decodes_one_token_against_the_pinned_checkpoint() {
 #[test]
 #[ignore = "requires the pinned Humanizer file, a device and GEMMA4_BANDWIDTH_PROBE"]
 fn measures_matvec_bandwidth() {
-    use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         return;
     };
@@ -45,8 +44,8 @@ fn measures_matvec_bandwidth() {
     };
     let reps: usize = reps.parse().expect("probe count");
     let model: Gemma = super::load(std::path::Path::new(&path)).expect("load");
-    // The embedding is the one matrix that stays in the checkpoint's native Q8_0 layout,
-    // so it is what the vendored matvec probe can measure.
+    // The embedding is a native weight of the file's own type, so it is what the vendored
+    // matvec probe can measure.
     let embed = &model.embed;
     let out = &model.logits;
     let q8 = &model.scratch.q8_hidden;
@@ -54,23 +53,18 @@ fn measures_matvec_bandwidth() {
     for _ in 0..reps {
         model
             .ctx
-            .matvec_q(
+            .matvec_native(
                 &model.stream,
-                MatvecCall {
-                    ty: QuantType::Q80,
-                    w: embed.buf.range(0, embed.bytes()).expect("embed"),
-                    x_q8: q8.range(0, q8.bytes()).expect("q8"),
-                    y: out.buf.range(0, out.bytes()).expect("out"),
-                    k: embed.k,
-                    rows: embed.rows,
-                    ncols: 1,
-                },
+                embed,
+                q8.range(0, q8.bytes()).expect("q8"),
+                out.buf.range(0, out.bytes()).expect("out"),
+                1,
             )
             .expect("matvec");
     }
     model.stream.synchronize().expect("sync");
     let seconds = started.elapsed().as_secs_f64();
-    let bytes = reps * embed.bytes();
+    let bytes = reps * embed.buffer().bytes();
     eprintln!(
         "bandwidth reps={reps} seconds={seconds:.3} gb_per_s={:.1}",
         bytes as f64 / seconds / 1e9

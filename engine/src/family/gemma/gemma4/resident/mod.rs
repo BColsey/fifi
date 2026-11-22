@@ -35,10 +35,13 @@ mod window_tests;
 
 use crate::EngError;
 use crate::family::kv_ring::KvRing;
+use crate::family::project::cuda::matrix::{
+    upload_matrix as matrix, upload_matrix_bytes as matrix_from_bytes,
+};
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, NativeWeight};
 use crate::weights::{GgufType, GgufWeights};
 
 pub(crate) const LAYERS: usize = 48;
@@ -51,19 +54,6 @@ pub(crate) const HEADS: usize = 16;
 pub(crate) const CELLS: usize = 8192;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 pub(crate) const FFN: usize = 15360;
-
-/// One Q8_0 matrix resident on the device, raw checkpoint blocks.
-pub(crate) struct Matrix {
-    pub(crate) buf: DeviceBuffer,
-    pub(crate) rows: usize,
-    pub(crate) k: usize,
-}
-
-impl Matrix {
-    fn bytes(&self) -> usize {
-        self.rows * (self.k / 32) * 34
-    }
-}
 
 /// One Q8_0 matrix resident on the device in the split layout gemma_matvec reads: one
 /// int8 quant plane per row, then one half scale per 32-value block.
@@ -149,13 +139,15 @@ pub(crate) struct Scratch {
     pub(crate) ids: DeviceBuffer,
     pub(crate) pos: DeviceBuffer,
     pub(crate) kv_len: DeviceBuffer,
+    /// The gather's status word: a bad token id sets a bit here.
+    pub(crate) status: DeviceBuffer,
 }
 
 pub(crate) struct Gemma {
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<Layer>,
-    pub(crate) embed: Matrix,
+    pub(crate) embed: NativeWeight,
     pub(crate) out_norm: Vector,
     pub(crate) rope_freqs: Option<Vector>,
     pub(crate) scratch: Scratch,
@@ -307,6 +299,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
         ids: zero(&ctx, 4)?,
         pos: zero(&ctx, 4)?,
         kv_len: zero(&ctx, 4)?,
+        status: zero(&ctx, 4)?,
     };
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
@@ -338,34 +331,6 @@ fn vector_filled(ctx: &CudaContext, len: usize, value: f32) -> Result<Vector, En
     Ok(Vector {
         buf: ctx.upload(&bytes)?,
         len,
-    })
-}
-
-fn matrix(
-    weights: &GgufWeights,
-    ctx: &CudaContext,
-    name: &str,
-    k: usize,
-    rows: usize,
-) -> Result<Matrix, EngError> {
-    let (ty, bytes) = weights.read_tensor(name)?;
-    if ty != GgufType::Q80 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} is {}, expected Q8_0",
-            ty.name()
-        )));
-    }
-    if bytes.len() != rows * (k / 32) * 34 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} holds {} bytes, expected {}",
-            bytes.len(),
-            rows * (k / 32) * 34
-        )));
-    }
-    Ok(Matrix {
-        buf: ctx.upload(&bytes)?,
-        rows,
-        k,
     })
 }
 

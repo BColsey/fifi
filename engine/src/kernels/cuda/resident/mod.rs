@@ -86,7 +86,6 @@ pub(crate) mod attn_prep;
 pub(crate) mod dense_gemv;
 pub(crate) mod embed;
 pub(crate) mod embed_bf16;
-pub(crate) mod embed_q8;
 pub(crate) mod exl3;
 pub(crate) mod expert_activation;
 pub(crate) mod gdn_conv;

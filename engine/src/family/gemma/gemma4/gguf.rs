@@ -132,7 +132,9 @@ fn read_window(header: &crate::weights::GgufHeader, most: u64) -> Result<usize, 
     Ok(window as usize)
 }
 
-/// One expected tensor: storage type and dimensions in file order.
+/// One expected tensor: storage type and dimensions in file order. An expected Q8_0 stands for
+/// a matrix: the file may store it in any type a native kernel reads, which is how the Q8_0
+/// original and its K-quant and IQ requants share one inventory.
 pub(super) struct Expected {
     pub(super) name: String,
     pub(super) ty: GgufType,
@@ -229,11 +231,20 @@ fn check_inventory(
             }
             continue;
         };
-        if tensor.ggml_type() != **ty {
+        let stored = tensor.ggml_type();
+        let matrix = **ty == GgufType::Q80;
+        if matrix && !stored.has_native_kernel() {
+            return Err(reject(format!(
+                "tensor {} has type {}, expected a matrix type with a native kernel",
+                tensor.name(),
+                stored.name()
+            )));
+        }
+        if !matrix && stored != **ty {
             return Err(reject(format!(
                 "tensor {} has type {}, expected {}",
                 tensor.name(),
-                tensor.ggml_type().name(),
+                stored.name(),
                 ty.name()
             )));
         }
@@ -552,26 +563,40 @@ pub(crate) fn open_bolt_weights(path: &Path) -> Result<(GgufWeights, BoltSpellin
     Ok((weights, spelling))
 }
 
-/// Extracts one layer's PLE rows from the canonical merged
-/// per_layer_token_embd payload. The reference layout is token-major: each
-/// of the `vocab` rows carries every layer's PLE block contiguous, so a
-/// layer's slice is `width` Q8 bytes at a per-row `stride` offset.
+/// Extracts one layer's PLE rows from the canonical merged per_layer_token_embd payload of type
+/// `ty`. The reference layout is token-major: each of the `vocab` rows carries every layer's PLE
+/// block contiguous, so a layer's slice is `ple` values' blocks at a per-row `stride` offset.
 #[cfg(any(test, feature = "native-cuda"))]
 pub(crate) fn ple_rows_from_merged(
     merged: &[u8],
+    ty: GgufType,
     layer: usize,
     ple: usize,
     layers: usize,
     vocab: usize,
-) -> Vec<u8> {
-    let stride = (ple * layers / 32) * 34;
-    let width = (ple / 32) * 34;
+) -> Result<Vec<u8>, EngError> {
+    let (elems, bytes) = (ty.block_elems() as usize, ty.block_bytes() as usize);
+    if !ple.is_multiple_of(elems) {
+        return Err(reject(format!(
+            "the per-layer table of {} has rows of {ple} values, not whole blocks",
+            ty.name()
+        )));
+    }
+    let width = ple / elems * bytes;
+    let stride = width * layers;
+    if merged.len() != stride * vocab || layer >= layers {
+        return Err(reject(format!(
+            "the merged per-layer table holds {} bytes, expected {} for layer {layer} of {layers}",
+            merged.len(),
+            stride * vocab
+        )));
+    }
     let mut out = Vec::with_capacity(vocab * width);
     for token in 0..vocab {
         let at = token * stride + layer * width;
         out.extend_from_slice(&merged[at..at + width]);
     }
-    out
+    Ok(out)
 }
 
 /// Resolves which tensor spelling the file carries. A file with both

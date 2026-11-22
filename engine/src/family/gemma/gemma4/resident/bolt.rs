@@ -37,14 +37,13 @@ use super::bolt_graph::{
 };
 use super::step::layer_buffers;
 use super::{
-    Kv, Matrix, PackedMatrix, Vector, epsilon, matrix, packed_matrix, scalar, vector,
+    Kv, PackedMatrix, Vector, epsilon, matrix, matrix_from_bytes, packed_matrix, scalar, vector,
     vector_filled, zero,
 };
 use crate::EngError;
 use crate::family::card_fit::CellFigures;
 use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
-use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{
     WideAttention, WideCall, WideGeometry, WideLoad,
@@ -53,11 +52,10 @@ use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
-use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
+use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
 use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
-use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
@@ -66,7 +64,7 @@ use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::shortlist;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
-use crate::weights::GgufType;
+use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Geometry is read from the family descriptor, the single source of truth;
@@ -236,7 +234,7 @@ pub(crate) struct BoltLayer {
     ple_gate: PackedMatrix,
     ple_proj: PackedMatrix,
     post_ple_norm: Vector,
-    table: Matrix,
+    table: NativeWeight,
     scale: f32,
     global: bool,
     head: usize,
@@ -419,7 +417,7 @@ pub(crate) struct Bolt {
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<BoltLayer>,
-    pub(crate) embed: Matrix,
+    pub(crate) embed: NativeWeight,
     pub(crate) ple_model: PackedMatrix,
     pub(crate) ple_model_norm: Vector,
     pub(crate) out_norm: Vector,
@@ -576,13 +574,7 @@ pub(crate) fn load_choosing(
                 )
             })?;
             let (ty, bytes) = weights.read_tensor(name)?;
-            if ty != GgufType::Q80 {
-                return Err(EngError::Checkpoint(format!(
-                    "gguf model: tensor {name} is {}, expected Q8_0",
-                    ty.name()
-                )));
-            }
-            Some(bytes)
+            Some((bytes, ty))
         }
     };
     for layer in 0..LAYERS {
@@ -696,23 +688,22 @@ pub(crate) fn load_choosing(
             table: match spelling.ple_table(layer) {
                 Some(name) => matrix(&weights, &ctx, &name, PLE, VOCAB)?,
                 None => {
-                    let bytes = ple_rows_from_merged(
-                        merged.as_deref().ok_or_else(|| {
-                            EngError::Checkpoint(
-                                "gguf model: the merged table was hoisted for the canonical spelling"
-                                    .to_string(),
-                            )
-                        })?,
-                        layer,
+                    let (merged, merged_ty) = merged.as_ref().ok_or_else(|| {
+                        EngError::Checkpoint(
+                            "gguf model: the merged table was hoisted for the canonical spelling"
+                                .to_string(),
+                        )
+                    })?;
+                    let bytes =
+                        ple_rows_from_merged(merged, *merged_ty, layer, PLE, LAYERS, VOCAB)?;
+                    matrix_from_bytes(
+                        &ctx,
+                        "per_layer_token_embd.weight",
+                        *merged_ty,
                         PLE,
-                        LAYERS,
                         VOCAB,
-                    );
-                    Matrix {
-                        buf: ctx.upload(&bytes)?,
-                        rows: VOCAB,
-                        k: PLE,
-                    }
+                        &bytes,
+                    )?
                 }
             },
             scale: scalar(&weights, &format!("{base}layer_output_scale.weight"))?,
@@ -1428,15 +1419,14 @@ impl Bolt {
         let h1 = &sc.h[1];
         let h2 = &sc.h[2];
         let h3 = &sc.h[3];
-        ctx.embed_q8(
+        ctx.embed_native(
             stream,
-            EmbedQ8Call {
-                out: h0.buf.range(0, h0.bytes())?,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
+            EmbedNativeCall {
+                weight: &self.embed,
                 ids: sc.ids.range(0, m * 4)?,
+                x: h0.buf.range(0, h0.bytes())?,
+                status: sc.status.range(0, 4)?,
                 m,
-                n_rows: self.embed.rows,
-                k: self.embed.k,
             },
         )?;
         ctx.row_scale(
@@ -1500,17 +1490,12 @@ impl Bolt {
                 rows: 1,
             },
         )?;
-        ctx.matvec_q(
+        ctx.matvec_native(
             stream,
-            MatvecCall {
-                ty: QuantType::Q80,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: self.logits.buf.range(0, self.logits.bytes())?,
-                k: HIDDEN,
-                rows: self.embed.rows,
-                ncols: 1,
-            },
+            &self.embed,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            self.logits.buf.range(0, self.logits.bytes())?,
+            1,
         )?;
         ctx.softcap(
             stream,
@@ -1573,20 +1558,15 @@ impl Bolt {
         let row_bytes = q8_1_bytes(HIDDEN, 1).expect("hidden q8 row size");
         for first in (0..m).step_by(HEAD_COLUMNS) {
             let columns = HEAD_COLUMNS.min(m - first);
-            ctx.matvec_q(
+            ctx.matvec_native(
                 stream,
-                MatvecCall {
-                    ty: QuantType::Q80,
-                    w: self.embed.buf.range(0, self.embed.bytes())?,
-                    x_q8: sc.q8_hidden.range(first * row_bytes, columns * row_bytes)?,
-                    y: window
-                        .logits
-                        .buf
-                        .range(first * VOCAB * 4, columns * VOCAB * 4)?,
-                    k: HIDDEN,
-                    rows: self.embed.rows,
-                    ncols: columns,
-                },
+                &self.embed,
+                sc.q8_hidden.range(first * row_bytes, columns * row_bytes)?,
+                window
+                    .logits
+                    .buf
+                    .range(first * VOCAB * 4, columns * VOCAB * 4)?,
+                columns,
             )?;
         }
         ctx.softcap(
@@ -2084,15 +2064,14 @@ impl Bolt {
                 },
             )?;
         }
-        ctx.embed_q8(
+        ctx.embed_native(
             stream,
-            EmbedQ8Call {
-                out: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
-                w: layer.table.buf.range(0, layer.table.bytes())?,
+            EmbedNativeCall {
+                weight: &layer.table,
                 ids: sc.ids.range(0, m * 4)?,
+                x: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                status: sc.status.range(0, 4)?,
                 m,
-                n_rows: layer.table.rows,
-                k: layer.table.k,
             },
         )?;
         self.trace(pos, &format!("L{index}_plep"), &sc.ple_nrm, m * PLE * 4);
@@ -2602,18 +2581,27 @@ mod tests {
         word_bytes.extend_from_slice(&0i32.to_le_bytes());
         word_bytes.extend_from_slice(&1i32.to_le_bytes());
         let words = ctx.upload(&word_bytes).expect("words");
+        let status = ctx.upload(&zero(4)).expect("status");
+        let q8_matrix = |rows: usize, k: usize| {
+            super::matrix_from_bytes(
+                &ctx,
+                "zeros",
+                crate::weights::GgufType::Q80,
+                k,
+                rows,
+                &zero(rows * (k / 32) * 34),
+            )
+            .expect("matrix")
+        };
         // Embedding gather and the hidden-path ops at full Bolt widths.
-        ctx.embed_q8(
+        ctx.embed_native(
             &stream,
-            EmbedQ8Call {
-                out: f32s(2560).range(0, 2560 * 4).unwrap(),
-                w: i8s(1024 * (2560 / 32) * 34)
-                    .range(0, 1024 * (2560 / 32) * 34)
-                    .unwrap(),
+            EmbedNativeCall {
+                weight: &q8_matrix(1024, 2560),
                 ids: words.range(0, 4).unwrap(),
+                x: f32s(2560).range(0, 2560 * 4).unwrap(),
+                status: status.range(0, 4).unwrap(),
                 m: 1,
-                n_rows: 1024,
-                k: 2560,
             },
         )
         .expect("embed 2560");
@@ -2724,17 +2712,14 @@ mod tests {
         )
         .expect("ple slice norm");
         // The PLE table gather and the gated mixing at 256.
-        ctx.embed_q8(
+        ctx.embed_native(
             &stream,
-            EmbedQ8Call {
-                out: f32s(256).range(0, 256 * 4).unwrap(),
-                w: i8s(1024 * (256 / 32) * 34)
-                    .range(0, 1024 * (256 / 32) * 34)
-                    .unwrap(),
+            EmbedNativeCall {
+                weight: &q8_matrix(1024, 256),
                 ids: words.range(0, 4).unwrap(),
+                x: f32s(256).range(0, 256 * 4).unwrap(),
+                status: status.range(0, 4).unwrap(),
                 m: 1,
-                n_rows: 1024,
-                k: 256,
             },
         )
         .expect("ple table gather");

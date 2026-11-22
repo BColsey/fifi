@@ -59,7 +59,6 @@ pub(in crate::kernels::cuda) mod attn_prep;
 pub(in crate::kernels::cuda) mod dense_gemv;
 pub(in crate::kernels::cuda) mod embed;
 pub(in crate::kernels::cuda) mod embed_bf16;
-pub(in crate::kernels::cuda) mod embed_q8;
 pub(in crate::kernels::cuda) mod exl3;
 pub(in crate::kernels::cuda) mod expert_activation;
 pub(in crate::kernels::cuda) mod gdn_conv;

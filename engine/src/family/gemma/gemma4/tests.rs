@@ -689,7 +689,7 @@ fn rejects_missing_unexpected_and_mistyped_tensors() {
     ));
     expect_rejection(
         open(&build_gguf(&kvs, &tensors)),
-        "tensor blk.0.attn_q.weight has type F32, expected Q8_0",
+        "tensor blk.0.attn_q.weight has type F32, expected a matrix type with a native kernel",
     );
 
     let mut tensors = globals();
@@ -1112,6 +1112,28 @@ fn bolt_both_spellings_share_one_kv_map() {
     }
 }
 
+/// A K-quant table slices by its own block layout: a layer of 256 values is one 144-byte Q4_K
+/// block, so token `t` of layer `l` sits at `t * 144 * layers + l * 144`.
+#[test]
+fn a_k_quant_merged_table_slices_by_its_own_blocks() {
+    use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
+    use crate::weights::GgufType;
+
+    let (layers, vocab) = (3usize, 5usize);
+    let merged: Vec<u8> = (0..vocab * layers * 144).map(|i| (i % 251) as u8).collect();
+    for layer in 0..layers {
+        let got =
+            ple_rows_from_merged(&merged, GgufType::Q4K, layer, 256, layers, vocab).expect("slice");
+        assert_eq!(got.len(), vocab * 144);
+        for token in 0..vocab {
+            let at = token * layers * 144 + layer * 144;
+            assert_eq!(&got[token * 144..(token + 1) * 144], &merged[at..at + 144]);
+        }
+    }
+    assert!(ple_rows_from_merged(&merged, GgufType::Q4K, 3, 256, layers, vocab).is_err());
+    assert!(ple_rows_from_merged(&merged, GgufType::Q4K, 0, 100, layers, vocab).is_err());
+}
+
 #[test]
 fn the_merged_table_and_per_layer_tables_carry_the_same_weights() {
     use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
@@ -1175,7 +1197,8 @@ fn the_merged_table_and_per_layer_tables_carry_the_same_weights() {
         .read_tensor("per_layer_token_embd.weight")
         .expect("merged table reads");
     for layer in [0, 5, 24, 41] {
-        let from_merged = ple_rows_from_merged(&merged.1, layer, ple, layers, vocab);
+        let from_merged = ple_rows_from_merged(&merged.1, GgufType::Q80, layer, ple, layers, vocab)
+            .expect("the layer slice");
         let (_, from_legacy) = legacy
             .read_tensor(&format!("blk.{layer}.per_layer_embd.weight"))
             .expect("legacy table reads");

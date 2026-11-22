@@ -1209,6 +1209,7 @@ pub(crate) mod exl3;
 pub(crate) use exl3::{Exl3JobsIo, Exl3MatrixView};
 pub(crate) mod exl3_jobs;
 mod load_policy;
+pub(crate) mod matrix;
 #[cfg(test)]
 mod model_tests;
 mod plain_float;
