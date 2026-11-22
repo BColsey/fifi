@@ -664,3 +664,98 @@ fn a_file_that_says_the_expert_weights_are_not_normalised_is_refused_by_key() {
         "{error}"
     );
 }
+
+/// The rate of the real file's expert extents: one buffered `pread` of a stack against the
+/// direct parallel reads of every candidate plan, on a layer far from the ones other runs read
+/// (`FIFI_FLASH_EXTENT_LAYER`, default 40), and the bytes of the best plan against the buffered
+/// bytes. A direct read bypasses the page cache, so its rates are cold-cache rates by
+/// construction; the buffered rate is for the pages as found.
+#[test]
+fn real_file_extents_read_in_parallel_with_direct_io() {
+    use crate::family::expert_bank::{
+        extent_read::{ExtentPlan, read_extent, span_of},
+        host_tier::{SECTOR, open_direct},
+    };
+    use std::os::unix::fs::FileExt;
+    let Some(model) = real_model() else {
+        eprintln!("skipped: FIFI_FLASH_GGUF is unset");
+        return;
+    };
+    let layer: usize = std::env::var("FIFI_FLASH_EXTENT_LAYER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    let experts = model.config().dims.experts as usize;
+    let lens: Vec<u64> = model
+        .weights
+        .paths()
+        .iter()
+        .map(|path| std::fs::metadata(path).expect("shard").len())
+        .collect();
+    let dims = &model.config().dims;
+    let index = crate::weights::GgufExpertIndex::new(
+        model.weights.header(),
+        &lens,
+        &crate::weights::ExpertTensorNames::standard(),
+        model.config().layers(),
+        experts,
+        (dims.hidden as usize, dims.moe_inter as usize),
+        None,
+    )
+    .expect("index");
+    let slices = index.slices(layer, 0).expect("slices");
+    let part = slices.parts().next().expect("a stack");
+    let bytes = ((part.file_range.end - part.file_range.start) as usize) * experts;
+    let offset = part.file_range.start;
+    let path = &model.weights.paths()[part.shard];
+    let buffered = std::fs::File::open(path).expect("open");
+    let direct = open_direct(path).expect("a drive that takes O_DIRECT");
+    eprintln!(
+        "layer {layer}: one stack of {} MiB at offset {offset} of {}",
+        bytes >> 20,
+        path.display()
+    );
+    let mut want = vec![0u8; bytes];
+    let started = std::time::Instant::now();
+    let mut done = 0usize;
+    while done < bytes {
+        let n = buffered
+            .read_at(&mut want[done..], offset + done as u64)
+            .expect("pread");
+        assert!(n > 0, "end of file");
+        done += n;
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    eprintln!(
+        "buffered pread, one thread: {:.2} GB/s ({seconds:.2} s)",
+        bytes as f64 / seconds / 1e9
+    );
+    let (span, delta) = span_of(offset, bytes);
+    let mut backing = vec![0u8; span + SECTOR as usize];
+    let shift = (SECTOR as usize - backing.as_ptr() as usize % SECTOR as usize) % SECTOR as usize;
+    let mut best: Option<(f64, ExtentPlan)> = None;
+    for plan in ExtentPlan::CANDIDATES {
+        let dst = &mut backing[shift..shift + span];
+        let stats = read_extent(&direct, offset, bytes, dst, plan).expect("direct read");
+        eprintln!(
+            "direct {} threads x {} KiB: {:.2} GB/s ({:.2} s)",
+            plan.threads,
+            plan.chunk >> 10,
+            stats.gbps(),
+            stats.seconds
+        );
+        if best.is_none_or(|(rate, _)| stats.gbps() > rate) {
+            best = Some((stats.gbps(), plan));
+        }
+        assert!(
+            backing[shift + delta..shift + delta + bytes] == want[..],
+            "{plan:?} read other bytes than the buffered read"
+        );
+    }
+    let (rate, plan) = best.expect("a plan");
+    eprintln!(
+        "best: {} threads x {} KiB at {rate:.2} GB/s",
+        plan.threads,
+        plan.chunk >> 10
+    );
+}

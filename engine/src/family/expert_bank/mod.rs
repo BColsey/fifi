@@ -9,6 +9,7 @@
 //! are stated there.
 
 pub(crate) mod bank_tier;
+pub(crate) mod extent_read;
 pub(crate) mod host_tier;
 pub(crate) mod layer_stream;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
