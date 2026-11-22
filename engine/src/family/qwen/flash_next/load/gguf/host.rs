@@ -779,6 +779,22 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "reports kernel gaps from a header-only pinned fixture"]
+    fn pinned_header_kernel_gap_report() {
+        let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let gaps = model.kernel_gaps();
+        eprintln!("{}", model.summary());
+        if gaps.is_empty() {
+            eprintln!("no mapped matrix kernel gaps; executor still lacks GGUF loading");
+        } else {
+            eprintln!("{:?}", model.kernel_refusal(&gaps));
+        }
+    }
+
+    #[test]
     #[ignore = "emits tensor byte ranges from a header-only fixture"]
     fn delta_tensor_sample_plan() {
         let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
