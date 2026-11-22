@@ -6,10 +6,25 @@ use super::{
 };
 use crate::{
     EngError,
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream},
 };
 
 const SIDE: [usize; 2] = [4, 5];
+
+fn finish_borrowed<T>(
+    stream: &DeviceStream,
+    work: impl FnOnce() -> Result<T, EngError>,
+) -> Result<T, EngError> {
+    match work() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // A launch can fail after earlier kernels were queued against borrowed staging.
+            // A failed fence is more important than the original error: reuse is unsafe.
+            stream.synchronize()?;
+            Err(error)
+        }
+    }
+}
 
 pub(in crate::family::inkling2) struct PrefillProjection<'a> {
     pub(in crate::family::inkling2::cuda_projection) context: &'a CudaContext,
@@ -202,9 +217,11 @@ impl DenseStep {
                 encoded.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
             }
             buffer.write_at(&self.stream, input.offset(), &encoded)?;
-            context.dense_gemv_group(&self.stream, &calls)?;
             let mut bytes = vec![[0; 4]; output.bytes() / 4];
-            buffer.read_at(&self.stream, output.offset(), bytes.as_flattened_mut())?;
+            finish_borrowed(&self.stream, || {
+                context.dense_gemv_group(&self.stream, &calls)?;
+                buffer.read_at(&self.stream, output.offset(), bytes.as_flattened_mut())
+            })?;
             let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
             if !values.iter().all(|v| v.is_finite()) {
                 return Err(bad("CUDA projection produced a nonfinite output"));
@@ -228,6 +245,34 @@ mod tests {
         kernels::cuda::{device_present, resident::dense_gemv::DenseDtype},
         weights::GgufType,
     };
+
+    #[test]
+    fn borrowed_stage_fences_work_on_error_before_cold_reuse() {
+        if !device_present("Inkling borrowed staging fence") {
+            return;
+        }
+        let context = CudaContext::new().unwrap();
+        let stream = context.stream().unwrap();
+        let event = context.event().unwrap();
+        let stage = context.allocate(4096).unwrap();
+        let failed: Result<(), EngError> = finish_borrowed(&stream, || {
+            stage.write_at_enqueue(&stream, 0, &[7; 4096])?;
+            stream.record(&event)?;
+            Err(bad("injected after accepted work"))
+        });
+        assert!(
+            matches!(failed, Err(EngError::Checkpoint(ref s)) if s.contains("injected after accepted work"))
+        );
+        assert!(
+            event.query().unwrap(),
+            "failure returned before accepted work completed"
+        );
+        let cold = context.stream().unwrap();
+        stage.write_at(&cold, 0, &[9; 4096]).unwrap();
+        let mut output = vec![0; 4096];
+        stage.read_at(&cold, 0, &mut output).unwrap();
+        assert!(output.iter().all(|&b| b == 9));
+    }
 
     #[test]
     fn attention_projection_tiles_match_scalar_groups() {
@@ -320,6 +365,17 @@ mod tests {
             .unwrap();
         assert!(side.is_none());
         assert_eq!(layout.host_rows(&values).collect::<Vec<_>>(), scalar);
+        // The cold expert path overwrites the stage with new weights after attention.
+        let cold: Vec<_> = (0..7 * 32)
+            .flat_map(|i| (((i % 17) as f32 - 8.0) * 0.25).to_ne_bytes())
+            .collect();
+        context.upload_at(&scratch, 0, &cold).unwrap();
+        let cold_resident = make(cold, 7);
+        assert_eq!(
+            step.project_buffer(&context, &scratch, [7, 32], input[0][0])
+                .unwrap(),
+            step.project(&context, &cold_resident, input[0][0]).unwrap()
+        );
         assert!(
             step.project_group_rows(&context, &input[..1], weights)
                 .unwrap()
