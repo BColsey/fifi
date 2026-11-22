@@ -675,9 +675,8 @@ pub(crate) struct TieredSettings {
 
 /// The default CPU worker threads of the tiered member.
 const TIERED_DEFAULT_THREADS: u32 = 6;
-/// The default stall window of one layer's CPU experts, in milliseconds: the wait fails only when
-/// no expert job has answered for this long, so a slow disk that keeps answering never trips it.
-const TIERED_DEFAULT_TIMEOUT_MS: u32 = 60_000;
+/// The default stall window of one layer's CPU experts, in milliseconds: the plan's one default.
+const TIERED_DEFAULT_TIMEOUT_MS: u32 = crate::family::tier_budget::TIERED_STALL_WINDOW_MS;
 
 impl TieredSettings {
     /// The member a config that names `"tiered": {"slots": "auto"}` and nothing else
@@ -4383,7 +4382,7 @@ mod tests {
                 swaps_milli: 250,
                 slots: SlotRequest::Exactly(40),
                 threads: 6,
-                timeout_ms: 60_000,
+                timeout_ms: crate::family::tier_budget::TIERED_STALL_WINDOW_MS,
                 preload: false
             })
         );

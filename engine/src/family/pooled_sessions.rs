@@ -368,7 +368,9 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
     /// The pool must hold a first lease, and the device must hold the planes with room to spare.
     fn can_admit_session(&self) -> bool {
         if self.single {
-            return self.orphaned();
+            // The one session's planes are free when nobody holds them (a failed admission
+            // cleared them) or the holder was dropped.
+            return self.resident.is_none() || self.orphaned();
         }
         // A dropped session's cells come back at the next admission.
         if self.pool.free() < INITIAL_CELLS && !self.orphaned() {
@@ -1256,6 +1258,36 @@ mod tests {
             .expect("and serve a request");
         assert_eq!(sessions.step.context_cells(), POOL);
         assert_eq!(sessions.pool.free(), 0);
+    }
+
+    /// A failed `new_session` after the dropped session was reclaimed leaves the step with no
+    /// resident session: the next request must still be admitted.
+    #[test]
+    fn a_failed_new_session_does_not_lock_the_one_session_step() {
+        let (mut sessions, first) = refusing(8, Sizing::WholePool).expect("one session");
+        drop(first);
+        // The reclaim in `new_session` frees the planes; a pool that cannot lease fails the call.
+        sessions.reclaim();
+        assert!(sessions.resident.is_none());
+        let hold = sessions
+            .pool
+            .lease_for(sessions.ceiling, sessions.ceiling)
+            .expect("the pool is whole");
+        assert!(matches!(
+            sessions.new_session(),
+            Err(EngError::MemoryPlan(_))
+        ));
+        assert!(
+            sessions.can_admit_session(),
+            "no resident session means the step is free"
+        );
+        drop(hold);
+        let mut second = sessions
+            .new_session()
+            .expect("the second request is admitted");
+        sessions
+            .reset_for_request(&mut second, 100, None, false)
+            .expect("and served");
     }
 
     /// A start that named more than one session asked for what the step cannot do: it is refused.

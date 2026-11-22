@@ -941,7 +941,17 @@ impl PendingSides {
                     first_err = first_err.or(Some(PoolError::WorkerLost));
                     got += 1;
                 }
-                Err(_) => {
+                Err(RecvTimeoutError::Timeout) => {
+                    // A job that answered meanwhile renewed the window; a spent one is a stall,
+                    // named as one, not a lost worker.
+                    if stall.left().is_zero() {
+                        return Err(PoolError::Timeout {
+                            waited_ms: stall.quiet_ms(),
+                            pending: count - got,
+                        });
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
                     first_err = first_err.or(Some(PoolError::WorkerLost));
                     break;
                 }
@@ -2131,6 +2141,52 @@ mod tests {
             matches!(err, PoolError::Timeout { pending: 3, .. }),
             "{err:?}"
         );
+    }
+
+    /// The split gate/up join: its answers arrive slowly, and a stalled one fails as a stall.
+    #[test]
+    fn a_slow_split_side_run_is_served_and_a_stalled_one_fails_as_a_timeout() {
+        use super::{PendingSides, SideOutcome};
+        let sides = |stall: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for index in 0..6 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if stall && index == 3 {
+                        std::thread::sleep(Duration::from_millis(2500));
+                    }
+                    if tx
+                        .send(SideOutcome::Done(index, vec![index as f32]))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            PendingSides { rx, count: 6 }
+        };
+        let halves = sides(false)
+            .finish(Duration::from_millis(600))
+            .expect("a slow run that keeps answering");
+        assert_eq!(halves.len(), 6);
+        assert_eq!(halves[5], vec![5.0]);
+        let err = sides(true).finish(Duration::from_millis(400)).unwrap_err();
+        assert!(
+            matches!(err, PoolError::Timeout { pending: 3, .. }),
+            "a hung worker on the split path is a stall, not a lost worker: {err:?}"
+        );
+    }
+
+    /// A worker that dropped its sender without answering is a lost worker, whatever the window.
+    #[test]
+    fn a_split_side_run_whose_senders_are_gone_is_a_lost_worker() {
+        use super::PendingSides;
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let err = PendingSides { rx, count: 2 }
+            .finish(Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(err, PoolError::WorkerLost);
     }
 
     #[test]

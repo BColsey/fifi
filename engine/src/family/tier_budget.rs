@@ -15,6 +15,11 @@
 //! wrapped, never a panic), and the split is deterministic: no I/O, no clocks,
 //! no randomness, no threads. The tiered load uses its VRAM plan.
 
+/// The default stall window of the tiered host pool, in milliseconds: the wait for one layer's
+/// CPU experts fails only when no expert job has answered for this long, so a slow disk that
+/// keeps answering never trips it. The one default every start path and the plan read.
+pub const TIERED_STALL_WINDOW_MS: u32 = 60_000;
+
 /// What the card has and what is already spoken for (the caller measures these
 /// at load; none of them is guessed here). All fields are bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

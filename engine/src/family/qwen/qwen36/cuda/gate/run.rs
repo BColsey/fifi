@@ -1152,7 +1152,10 @@ mod tests {
         let on = identities_of(&tiered, 100, 90, 40);
         assert_eq!(on["tiered"]["slots"], 40);
         assert_eq!(on["tiered"]["threads"], 4);
-        assert_eq!(on["tiered"]["timeout_ms"], 10_000);
+        assert_eq!(
+            on["tiered"]["timeout_ms"],
+            crate::family::step_dims::TieredPlan::DEFAULT_TIMEOUT_MS
+        );
         assert_eq!(on["tiered"]["preload"], true);
         assert_eq!(
             session_options(&tiered, WeightLayout::Native)
