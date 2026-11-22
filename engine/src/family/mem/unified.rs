@@ -211,18 +211,30 @@ pub(crate) fn physical_memory_bytes() -> Option<u64> {
 }
 
 /// The bytes of this Mac that the OS can hand out without paging: the free, inactive and
-/// purgeable pages of `vm_stat`, read now. `None` when the tool or its output cannot be read.
+/// speculative pages of `vm_stat`, read now. `None` when the tool or its output cannot be read.
 #[cfg(target_os = "macos")]
 pub(crate) fn available_memory_bytes() -> Option<u64> {
-    let out = std::process::Command::new("/usr/bin/vm_stat")
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    // A save, a spill check and a landing each ask, often within one request: one read serves them.
+    static LAST: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, value)) = *last
+        && at.elapsed() < Duration::from_secs(1)
+    {
+        return value;
+    }
+    let value = std::process::Command::new("/usr/bin/vm_stat")
         .output()
         .ok()
-        .filter(|out| out.status.success())?;
-    parse_vm_stat(&String::from_utf8_lossy(&out.stdout))
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_vm_stat(&String::from_utf8_lossy(&out.stdout)));
+    *last = Some((Instant::now(), value));
+    value
 }
 
 /// The available bytes in the text of `vm_stat`: its page size times the free, inactive and
-/// purgeable page counts.
+/// speculative page counts.
 #[cfg(any(test, target_os = "macos"))]
 fn parse_vm_stat(text: &str) -> Option<u64> {
     let page_size: u64 = text
@@ -244,7 +256,7 @@ fn parse_vm_stat(text: &str) -> Option<u64> {
     };
     let available = pages("Pages free")?
         .checked_add(pages("Pages inactive")?)?
-        .checked_add(pages("Pages purgeable")?)?;
+        .checked_add(pages("Pages speculative")?)?;
     available.checked_mul(page_size)
 }
 
@@ -605,10 +617,10 @@ Pages purgeable:                                1244.\n\
 \"Translation faults\":                    27980608462.\n";
 
     #[test]
-    fn the_available_bytes_are_the_free_inactive_and_purgeable_pages() {
+    fn the_available_bytes_are_the_free_inactive_and_speculative_pages() {
         assert_eq!(
             parse_vm_stat(SAMPLE),
-            Some((1_920_791 + 106_344 + 1_244) * 16_384)
+            Some((1_920_791 + 106_344 + 7_385) * 16_384)
         );
     }
 

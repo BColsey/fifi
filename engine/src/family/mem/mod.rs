@@ -33,7 +33,7 @@ pub(crate) use unified::*;
 pub(crate) use device::DEVICE;
 
 /// The host memory a stored prefix may still take, read now: the bytes the OS can hand out
-/// without paging on a Mac (free, inactive and purgeable pages), the host budget elsewhere.
+/// without paging on a Mac (free, inactive and speculative pages), the host budget elsewhere.
 /// `None` when the host cannot be read.
 pub(crate) fn tier_available_bytes(label: &'static str) -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -45,6 +45,14 @@ pub(crate) fn tier_available_bytes(label: &'static str) -> Option<u64> {
     {
         HostFacts::read(label, label).ok().map(|host| host.budget())
     }
+}
+
+/// The bytes this process holds resident now (its resident set, which counts pinned buffers),
+/// or zero when they cannot be read.
+pub(crate) fn process_resident_bytes() -> u64 {
+    HostFacts::read("kv disk", "kv disk")
+        .map(|host| host.process_resident())
+        .unwrap_or(0)
 }
 
 #[allow(unused_imports, reason = "the name a caller matches a provenance on")]

@@ -677,7 +677,7 @@ mod device {
             let disk = tier_plan.as_ref().and_then(|(resolved, origin)| {
                 HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
             });
-            let serve = BoltServe {
+            let mut serve = BoltServe {
                 model,
                 eos: eos.clone(),
                 prefix: PrefixStore::with_limits(ONE_TIP),
@@ -690,6 +690,7 @@ mod device {
                 disk,
                 prefix_tier: PrefixTier::default(),
             };
+            serve.log_host_budget();
             if plan.seqs > 1 {
                 eprintln!(
                     "gemma4 bolt: {} prompt rows per tick while sessions share the model ({})",

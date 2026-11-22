@@ -6081,6 +6081,7 @@ mod tests {
         let resolved = Resolved {
             dir: dir.path().join("cache"),
             quota_bytes: 1 << 30,
+            host_bytes: None,
         };
         executor.disk = HostStoreDisk::open("q36 mlx", &resolved, "test", &load, 1);
         assert!(executor.disk.is_some(), "the tier opens");

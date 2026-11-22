@@ -237,6 +237,11 @@ impl HostFacts {
         self.budget() - self.spare()
     }
 
+    /// The resident set of this process when the facts were read; zero when it could not be.
+    pub(crate) fn process_resident(&self) -> u64 {
+        self.process_rss
+    }
+
     /// What this process still adds to its own footprint beyond the payload an admission names:
     /// heap growth, the CUDA context's host side, staging and allocator slack. Taken from the
     /// resident set now (the process is about to roughly double what it holds while it loads)

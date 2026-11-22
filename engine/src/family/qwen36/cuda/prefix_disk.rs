@@ -69,6 +69,10 @@ impl HostFamily for QwenFamily<'_> {
     type Path = (CudaPrefillPath, PrefixIdentity);
     type Landing = PinnedLanding;
 
+    fn host_available(&self) -> Option<u64> {
+        crate::family::mem::tier_available_bytes(TIER_LABEL)
+    }
+
     /// A pinned entry offers its slot; a pageable one stays in memory only.
     fn view(&self, saved: &CudaSavedPrefix) -> Option<SnapshotView> {
         let CudaSavedPrefix::Pinned { state, .. } = saved else {
@@ -233,6 +237,7 @@ impl QwenResidentStep<'_> {
             &self.load_identity(),
             retained,
         );
+        self.log_host_budget();
     }
 
     pub(crate) fn disk_tier_enabled(&self) -> bool {

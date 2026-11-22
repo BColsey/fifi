@@ -11,7 +11,7 @@ use crate::{
     family::{
         kv_disk::{
             DiskOwner, DiskParts, FamilyContract, HostStoreDisk, LoadIdentity, SlotBytes,
-            SnapshotView, VecFamily, plan_tier,
+            SnapshotView, VecFamily, bounded_by_cap, default_host_budget, plan_tier,
         },
         qwen36::{
             resident::{
@@ -113,7 +113,19 @@ impl VecFamily for MlxFamily<'_> {
             return system;
         };
         let active = self.kernels.borrow().memory_stats().ok()?.active;
-        system.map(|bytes| bytes.min(cap.saturating_sub(active)))
+        bounded_by_cap(system, cap, active)
+    }
+
+    fn budget_bytes(&self) -> Option<u64> {
+        self.room.or_else(|| default_host_budget(self.resident()))
+    }
+
+    /// The engine's memory is device arrays, which the resident set does not count.
+    fn resident(&self) -> u64 {
+        self.kernels
+            .borrow()
+            .memory_stats()
+            .map_or(0, |stats| stats.active)
     }
 
     fn room_for(&self, positions: usize) -> Result<()> {
@@ -227,6 +239,7 @@ impl Q36Executor {
             &load,
             limits.roots + limits.entries,
         );
+        self.log_host_budget();
         Ok(())
     }
 }

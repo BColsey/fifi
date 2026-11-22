@@ -291,6 +291,7 @@ fn the_start_line_names_the_directory_the_privacy_and_the_wait() {
     let resolved = Resolved {
         dir: "/var/cache/fifi/kv".into(),
         quota_bytes: 64 << 30,
+        host_bytes: None,
     };
     let report = OpenReport::default();
     let line = start_line("test engine", &resolved, "default", &report, 4);

@@ -514,7 +514,8 @@ fn the_default_directory_and_quota_follow_the_host() {
         resolve(&exact, None, None, |_| None, |_| 0).unwrap(),
         Resolved {
             dir: "/d".into(),
-            quota_bytes: 3 * gib
+            quota_bytes: 3 * gib,
+            host_bytes: None
         }
     );
 }
@@ -594,6 +595,7 @@ fn env(dir: Option<&str>, quota: Option<&str>, switch: Option<&str>) -> KvEnv {
     KvEnv {
         dir: dir.map(str::to_owned),
         quota: quota.map(str::to_owned),
+        host_bytes: None,
         switch: switch.map(str::to_owned),
         xdg_cache_home: None,
         home: Some("/home/u".to_owned()),
@@ -1142,5 +1144,25 @@ fn direct_flag() -> i32 {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         0
+    }
+}
+
+#[test]
+fn the_host_byte_bound_is_a_byte_count_or_the_start_is_refused() {
+    let free = |_: &Path| Some(100 * (1u64 << 30));
+    let with = |host: &str| {
+        let mut env = env(Some("/c"), None, Some("1"));
+        env.host_bytes = Some(host.to_owned());
+        plan(None, &env, true, free)
+    };
+    match with(" 50000000 ").unwrap() {
+        Plan::On { resolved, .. } => assert_eq!(resolved.host_bytes, Some(50_000_000)),
+        other => panic!("{other:?}"),
+    }
+    let error = with("lots").unwrap_err();
+    assert!(error.contains("FIFI_KV_CACHE_HOST_BYTES"), "{error}");
+    match plan(None, &env(Some("/c"), None, Some("1")), true, free).unwrap() {
+        Plan::On { resolved, .. } => assert_eq!(resolved.host_bytes, None),
+        other => panic!("{other:?}"),
     }
 }

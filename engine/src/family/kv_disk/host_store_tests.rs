@@ -21,7 +21,17 @@ impl Fake {
     }
 }
 
+thread_local! {
+    /// How many times a spill asked the family to ready a snapshot for a write.
+    static PREPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl HostFamily for Fake {
+    fn prepare(&self, _snapshot: &Snap) -> Result<Option<Rc<dyn SlotBytes>>, EngError> {
+        PREPARES.with(|count| count.set(count.get() + 1));
+        Ok(None)
+    }
+
     type Snapshot = Snap;
     type Path = u8;
     type Landing = Vec<u8>;
@@ -60,7 +70,7 @@ impl HostFamily for Fake {
         _positions: usize,
         layout: &SlabLayout,
     ) -> Result<Vec<u8>, EngError> {
-        vec_landing("fake", layout)
+        vec_landing("fake", layout, None)
     }
     fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<(), EngError> {
         place_in_vec(landing, slab, part)
@@ -120,6 +130,7 @@ fn open(dir: &std::path::Path, retained: usize) -> HostStoreDisk {
     let resolved = Resolved {
         dir: dir.join("cache"),
         quota_bytes: 1 << 30,
+        host_bytes: None,
     };
     HostStoreDisk::open("fake", &resolved, "test", &load(), retained).expect("the tier opens")
 }
@@ -178,6 +189,42 @@ fn a_short_host_spills_the_oldest_entries_past_the_watermark() {
         disk.tier.cache.has_exact(&first),
         "the least recently used one"
     );
+}
+
+#[test]
+fn entries_over_the_byte_bound_go_to_disk_oldest_first() {
+    // Sizes oldest first: the bound keeps what fits of the newest, and writes the rest.
+    assert_eq!(over_budget_picks(&[10, 10, 10], 30), Vec::<usize>::new());
+    assert_eq!(over_budget_picks(&[10, 10, 10], 25), vec![0]);
+    assert_eq!(over_budget_picks(&[10, 10, 10], 10), vec![0, 1]);
+    assert_eq!(over_budget_picks(&[10, 10, 10], 0), vec![0, 1, 2]);
+    assert_eq!(over_budget_picks(&[], 0), Vec::<usize>::new());
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut disk = open(dir.path(), 8);
+    let mut store = store(8);
+    let first = put(&mut store, 1_500, 1, SaveKind::Periodic);
+    let second = put(&mut store, 1_600, 2, SaveKind::Periodic);
+    let third = put(&mut store, 1_700, 3, SaveKind::Periodic);
+    // No bound, and a host with room: the count watermark is far off, nothing is written.
+    disk.spill_over_budget(&Fake, &store);
+    assert!(!disk.pending());
+    // A bound that holds the newest two: the oldest goes.
+    disk.host_bytes = Some((Fake::bytes_of(1_600) + Fake::bytes_of(1_700)) as u64);
+    disk.spill_over_budget(&Fake, &store);
+    pump_until_idle(&mut disk);
+    assert!(disk.tier.cache.has_exact(&first));
+    assert!(!disk.tier.cache.has_exact(&second));
+    assert!(!disk.tier.cache.has_exact(&third));
+    // A bound below the only entry: it is written.
+    let dir = tempfile::tempdir().unwrap();
+    let mut disk = open(dir.path(), 8);
+    let mut alone = self::store(8);
+    let only = put(&mut alone, 1_700, 3, SaveKind::Periodic);
+    disk.host_bytes = Some(10);
+    disk.spill_over_budget(&Fake, &alone);
+    pump_until_idle(&mut disk);
+    assert!(disk.tier.cache.has_exact(&only));
 }
 
 #[test]
@@ -277,4 +324,42 @@ fn a_short_snapshot_or_a_key_of_the_wrong_length_is_not_offered() {
     let held = held_of(&Fake, &key(1_501, 1), SaveKind::Tip, &long, Reason::Stop).unwrap();
     assert_eq!((held.positions, held.capture), (1_500, Capture::Tip));
     assert_eq!(held.bytes, Fake::bytes_of(1_500) as u64);
+}
+
+#[test]
+fn the_budget_bounds_what_the_system_has_free() {
+    assert_eq!(bounded_by_cap(Some(10), 100, 70), Some(10));
+    assert_eq!(bounded_by_cap(Some(50), 100, 70), Some(30));
+    assert_eq!(bounded_by_cap(Some(50), 100, 100), Some(0));
+    assert_eq!(
+        bounded_by_cap(Some(50), 100, 130),
+        Some(0),
+        "an engine over its cap leaves nothing"
+    );
+    assert_eq!(bounded_by_cap(None, 100, 70), None);
+}
+
+#[test]
+fn an_entry_already_on_disk_is_not_prepared_again_by_the_next_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut disk = open(dir.path(), 8);
+    let mut held = store(8);
+    let only = put(&mut held, 1_700, 3, SaveKind::Periodic);
+    disk.host_bytes = Some(10);
+    PREPARES.with(|count| count.set(0));
+    disk.spill_over_budget(&Fake, &held);
+    assert_eq!(
+        PREPARES.with(|count| count.get()),
+        1,
+        "the first save prepares it"
+    );
+    // While it is queued, a second save asks again and prepares nothing.
+    disk.spill_over_budget(&Fake, &held);
+    assert_eq!(PREPARES.with(|count| count.get()), 1, "queued");
+    pump_until_idle(&mut disk);
+    assert!(disk.tier.cache.has_exact(&only));
+    // Once it is on disk, every later save leaves it alone.
+    disk.spill_over_budget(&Fake, &held);
+    disk.spill_over_budget(&Fake, &held);
+    assert_eq!(PREPARES.with(|count| count.get()), 1, "on disk");
 }

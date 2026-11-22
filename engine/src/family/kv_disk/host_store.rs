@@ -54,6 +54,18 @@ pub(crate) trait HostFamily {
     fn host_available(&self) -> Option<u64> {
         crate::family::mem::tier_available_bytes("kv disk")
     }
+    /// The bytes of snapshots the host store may hold before the tier writes the oldest to disk,
+    /// when the family's planner funds one; `None` leaves the count watermark and the host's
+    /// free memory to decide.
+    fn host_budget(&self) -> Option<u64> {
+        default_host_budget(self.resident_bytes())
+    }
+    /// The host bytes the engine already holds resident (what the default budget leaves out):
+    /// the process's resident set, which holds pinned buffers too; a family whose memory lives
+    /// outside it (the Mac's device arrays) reads its own figure.
+    fn resident_bytes(&self) -> u64 {
+        crate::family::mem::process_resident_bytes()
+    }
     /// The layout of an entry of `positions`, or why this load cannot hold one that long.
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError>;
     /// Makes room for a snapshot of `positions` laid out as `layout`: a free slot, or host memory.
@@ -92,11 +104,15 @@ pub(crate) fn object_per_part(part_bytes: &[usize]) -> SlabLayout {
     }
 }
 
-/// A landing in a vector of host memory, for a family whose snapshot is one: the budget is
-/// checked against the host's available memory and the allocation is fallible.
-pub(crate) fn vec_landing(label: &str, layout: &SlabLayout) -> Result<Vec<u8>, EngError> {
+/// A landing in a vector of host memory, for a family whose snapshot is one: the layout is
+/// checked against the `available` host memory the family reads (the bound its own budget puts on
+/// it included) and the allocation is fallible. Unknown availability counts as room.
+pub(crate) fn vec_landing(
+    label: &str,
+    layout: &SlabLayout,
+    available: Option<u64>,
+) -> Result<Vec<u8>, EngError> {
     let total = slab_bytes(layout);
-    let available = crate::family::mem::tier_available_bytes("a kv disk restore");
     if available.is_some_and(|available| total as u64 > available) {
         return Err(EngError::MemoryPlan(format!(
             "{label}: the host budget cannot hold {total} B"
@@ -207,6 +223,9 @@ pub(crate) fn plan_tier(
 pub(crate) struct HostStoreDisk {
     pub(crate) tier: DiskTier,
     label: &'static str,
+    /// An operator's bound on the bytes of snapshots the host store holds, which replaces the
+    /// family's own (`FIFI_KV_CACHE_HOST_BYTES`).
+    pub(crate) host_bytes: Option<u64>,
 }
 
 impl HostStoreDisk {
@@ -222,9 +241,17 @@ impl HostStoreDisk {
         match KvDisk::open(&resolved.dir, resolved.quota_bytes, load) {
             Ok((cache, report)) => {
                 eprintln!("{}", start_line(label, resolved, origin, &report, retained));
+                let host_bytes = resolved.host_bytes;
+                if let Some(bytes) = host_bytes {
+                    eprintln!(
+                        "{label}: kv disk host budget {bytes} B ({}): older entries go to disk past it",
+                        super::HOST_BYTES_ENV
+                    );
+                }
                 Some(Self {
                     tier: DiskTier::new(label, cache, retained),
                     label,
+                    host_bytes,
                 })
             }
             Err(error) => {
@@ -284,8 +311,35 @@ impl HostStoreDisk {
         }
     }
 
-    /// After a save: [`Self::spill_over_watermark`] with the host's memory read now.
+    /// After a save: queues the oldest entries the host store holds beyond the bytes it may hold
+    /// (the operator's bound, or the family's budget) - every entry when the newest alone is
+    /// over it. Nothing happens without a bound.
+    pub(crate) fn spill_over_budget<F: HostFamily>(&mut self, family: &F, store: &Store<F>) {
+        let Some(budget) = self.host_bytes.or_else(|| family.host_budget()) else {
+            return;
+        };
+        let entries: Vec<_> = store.entries_lru().collect();
+        let sizes: Vec<u64> = entries
+            .iter()
+            .map(|&(_, _, snapshot)| family.view(snapshot).map_or(0, |view| view.bytes))
+            .collect();
+        for at in over_budget_picks(&sizes, budget) {
+            let (key, kind, snapshot) = entries[at];
+            // An entry already queued, being copied or on disk is not read back from the device
+            // again (`held_of` prepares the slot, which can be a device read).
+            if self.tier.has(key) {
+                continue;
+            }
+            if let Some(held) = held_of(family, key, kind, snapshot, Reason::Watermark) {
+                self.tier.enqueue(held);
+            }
+        }
+    }
+
+    /// After a save: the entries over the byte bound go to disk, and when the host's memory is
+    /// short the entries the next saves would push out do too.
     pub(crate) fn spill_after_save<F: HostFamily>(&mut self, family: &F, store: &Store<F>) {
+        self.spill_over_budget(family, store);
         let short = host_memory_is_short(
             family.host_available(),
             crate::family::mem::HOST_HEADROOM_BYTES,
@@ -450,6 +504,40 @@ impl HostStoreDisk {
     }
 }
 
+/// The host memory a stored entry may take: what the system has free, bounded by what a device
+/// budget `cap` has left beside the `active` bytes the engine holds (nothing when the engine
+/// holds more than the cap).
+pub(crate) fn bounded_by_cap(system: Option<u64>, cap: u64, active: u64) -> Option<u64> {
+    system.map(|bytes| bytes.min(cap.saturating_sub(active)))
+}
+
+/// The bytes of snapshots a host store may hold when no planner funds a figure: the machine's
+/// memory less the OS floor the plans keep, less the `resident` bytes the engine already holds.
+/// `None` when the machine's memory is unknown.
+pub(crate) fn default_host_budget(resident: u64) -> Option<u64> {
+    let total = crate::family::mem::physical_memory_bytes()?;
+    bounded_by_cap(
+        Some(total),
+        total.saturating_sub(crate::family::mem::os_floor_of(total)),
+        resident,
+    )
+}
+
+/// Which of the entries (oldest first, `sizes` bytes each) to write so the rest fit in `budget`
+/// bytes: the oldest ones, until what is left fits; all of them when none fits.
+pub(crate) fn over_budget_picks(sizes: &[u64], budget: u64) -> Vec<usize> {
+    let mut left: u64 = sizes.iter().sum();
+    let mut picks = Vec::new();
+    for (at, &size) in sizes.iter().enumerate() {
+        if left <= budget {
+            break;
+        }
+        picks.push(at);
+        left -= size;
+    }
+    picks
+}
+
 /// The tier facts of the restore that just covered `covered` tokens.
 pub(crate) fn restore_tier(
     disk: Option<&mut HostStoreDisk>,
@@ -487,6 +575,14 @@ pub(crate) trait VecFamily {
     fn available_bytes(&self) -> Option<u64> {
         crate::family::mem::tier_available_bytes(Self::LABEL)
     }
+    /// The bytes of snapshots the host store may hold, as [`HostFamily::host_budget`].
+    fn budget_bytes(&self) -> Option<u64> {
+        default_host_budget(self.resident())
+    }
+    /// The host bytes the engine already holds resident, as [`HostFamily::resident_bytes`].
+    fn resident(&self) -> u64 {
+        crate::family::mem::process_resident_bytes()
+    }
     /// Whether the host has room to hold an entry of `positions` beyond what is stored; a family
     /// that keeps a budget of its own for stored prefixes checks it here.
     fn room_for(&self, _positions: usize) -> Result<(), EngError> {
@@ -518,6 +614,14 @@ impl<T: VecFamily> HostFamily for T {
         self.available_bytes()
     }
 
+    fn host_budget(&self) -> Option<u64> {
+        self.budget_bytes()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.resident()
+    }
+
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError> {
         let longest = self.longest_entry();
         if positions > longest {
@@ -535,7 +639,7 @@ impl<T: VecFamily> HostFamily for T {
         layout: &SlabLayout,
     ) -> Result<Vec<u8>, EngError> {
         self.room_for(positions)?;
-        vec_landing(T::LABEL, layout)
+        vec_landing(T::LABEL, layout, self.available_bytes())
     }
 
     fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<(), EngError> {
@@ -608,6 +712,26 @@ pub(crate) trait DiskOwner {
             parts
                 .disk
                 .promote(&mut parts.family, parts.store, &path, prompt);
+        }
+    }
+
+    /// One start line with the bytes of snapshots the host store may hold before the oldest go to
+    /// disk: the operator's bound, else the family's planner room or the machine's memory less
+    /// the OS floor and what the engine holds.
+    fn log_host_budget(&mut self) {
+        if let Some(parts) = self.disk_parts(None)
+            && parts.disk.host_bytes.is_none()
+        {
+            match parts.family.host_budget() {
+                Some(bytes) => eprintln!(
+                    "{}: kv disk host budget {bytes} B at start (the planner's room, else the machine's memory less the OS floor and what the engine holds): older entries go to disk past it",
+                    parts.disk.label
+                ),
+                None => eprintln!(
+                    "{}: kv disk host budget unknown: only the count watermark and free memory decide",
+                    parts.disk.label
+                ),
+            }
         }
     }
 

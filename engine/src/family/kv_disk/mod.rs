@@ -36,6 +36,8 @@ pub(crate) use host_store::{
     DiskOwner, DiskParts, HostFamily, HostStoreDisk, SnapshotView, VecFamily, plan_tier,
 };
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use host_store::{bounded_by_cap, default_host_budget};
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use rows::{cut_rows, pad_rows};
 pub(crate) use slab::{ObjectRole, Put, Run, SlabLayout};
 pub(crate) use tier::{
@@ -1482,6 +1484,9 @@ pub(crate) struct Wanted {
 pub(crate) struct Resolved {
     pub(crate) dir: PathBuf,
     pub(crate) quota_bytes: u64,
+    /// The operator's bound on the bytes of snapshots the host store holds (`FIFI_KV_CACHE_HOST_BYTES`);
+    /// without it the family's planner, or the machine's memory, sets the bound.
+    pub(crate) host_bytes: Option<u64>,
 }
 
 /// The default directory under the user's cache directory.
@@ -1575,7 +1580,11 @@ pub(crate) fn resolve(
             })?
         }
     };
-    Ok(Resolved { dir, quota_bytes })
+    Ok(Resolved {
+        dir,
+        quota_bytes,
+        host_bytes: None,
+    })
 }
 
 /// The number of entries a pinned store of `retained` slots may hold before the disk tier
@@ -1677,12 +1686,14 @@ pub(crate) fn hurry_flag() -> &'static AtomicBool {
 pub(crate) const DIR_ENV: &str = "FIFI_KV_CACHE_DIR";
 pub(crate) const QUOTA_ENV: &str = "FIFI_KV_CACHE_QUOTA_BYTES";
 pub(crate) const SWITCH_ENV: &str = "FIFI_KV_CACHE";
+pub(crate) const HOST_BYTES_ENV: &str = "FIFI_KV_CACHE_HOST_BYTES";
 
 /// The raw values of the environment overrides.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct KvEnv {
     pub(crate) dir: Option<String>,
     pub(crate) quota: Option<String>,
+    pub(crate) host_bytes: Option<String>,
     pub(crate) switch: Option<String>,
     pub(crate) xdg_cache_home: Option<String>,
     pub(crate) home: Option<String>,
@@ -1706,6 +1717,7 @@ impl KvEnv {
         Self {
             dir: named(DIR_ENV, "Q36_KV_CACHE_DIR"),
             quota: named(QUOTA_ENV, "Q36_KV_CACHE_QUOTA_BYTES"),
+            host_bytes: get(HOST_BYTES_ENV),
             switch: named(SWITCH_ENV, "Q36_KV_CACHE"),
             xdg_cache_home: get("XDG_CACHE_HOME"),
             home: get("HOME"),
@@ -1781,6 +1793,17 @@ pub(crate) fn plan(
             }
         },
     };
+    let env_host_bytes = match env.host_bytes.as_deref() {
+        None => None,
+        Some(text) => match text.trim().parse::<u64>() {
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                return Err(format!(
+                    "{HOST_BYTES_ENV} must be a byte count, got {text:?}"
+                ));
+            }
+        },
+    };
     let config_enabled = config.and_then(|c| c.enabled);
     let config_dir = config.and_then(|c| c.dir.clone());
     let (wanted, origin) = if switch == Some(false) {
@@ -1820,7 +1843,13 @@ pub(crate) fn plan(
         free,
         held_bytes,
     ) {
-        Ok(resolved) => Ok(Plan::On { resolved, origin }),
+        Ok(resolved) => Ok(Plan::On {
+            resolved: Resolved {
+                host_bytes: env_host_bytes,
+                ..resolved
+            },
+            origin,
+        }),
         Err(reason) => Ok(Plan::Off(reason)),
     }
 }
