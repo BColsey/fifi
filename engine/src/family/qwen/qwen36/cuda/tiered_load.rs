@@ -341,13 +341,7 @@ pub(super) fn attach_tiered_parts(
         SlotRequest::Fit => geometry.top_k,
         SlotRequest::Exactly(count) => count,
     };
-    let cold_cap = cold_cap_for(
-        free,
-        geometry,
-        (layers, distinct.len()),
-        planned,
-        reserve,
-    );
+    let cold_cap = cold_cap_for(free, geometry, (layers, distinct.len()), planned, reserve);
     // Charge the staging the plan is about to allocate, so the reserve the banks leave
     // behind still covers the loader's headroom after the staging exists.
     let mut cold_bytes = 0u64;
