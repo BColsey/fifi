@@ -782,6 +782,24 @@ fn context_admission_charges_ring_budget_at_the_exact_boundary() {
 }
 
 #[test]
+fn gguf_ple_weights_load_without_transformer_trunk() {
+    let (_written, model) = open(&Spec::default());
+    let ple = super::ple_weights::GgufPleWeights::load(&model).expect("PLE weights");
+    let view = ple.view();
+    let shape = model.config().model_shape().unwrap();
+    let dims = shape.ple.dims();
+    let width = dims.hidden as usize * dims.branches as usize;
+    assert_eq!(view.shards.len(), 1);
+    assert_eq!(view.shard_rows.len(), 1);
+    assert!(view.shard_rows[0] > 0);
+    assert_eq!(view.norm_key.len(), width);
+    assert_eq!(view.norm_query.len(), width);
+    assert_eq!(view.norm_conv.len(), width);
+    assert_eq!(view.conv.len(), width * dims.conv_kernel as usize);
+    assert_eq!(view.weight_scale, 1.0);
+}
+
+#[test]
 fn the_plan_on_a_24_gib_card_and_a_62_gib_host_does_not_refuse() {
     let (_written, model) = open(&Spec::default());
     let sizes = model.sizes().expect("sizes");

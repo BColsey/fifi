@@ -21,8 +21,9 @@ use std::collections::BTreeMap;
 
 use super::{
     GgufModel,
+    ple_weights::{GgufPleWeights, read_floats},
     projector::{HostProjector, HostWeight, Remap, refuse, untile},
-    tensors::{Convention, Mapped, Slot},
+    tensors::{Mapped, Slot},
 };
 use crate::{
     EngError,
@@ -31,13 +32,11 @@ use crate::{
             deltanet::DeltaWeights,
             hyper::HyperWeights,
             moe::MoeWeights,
-            ple::PleWeights,
             qsa::QsaWeights,
             step::{AttnWeights, FlashLayerWeights, ModelShape, ModelWeights},
         },
         recipe::{Global, Role as Wanted, Site, SiteTensor},
     },
-    weights::{GgufWeights, dequantize},
 };
 
 struct HHyper {
@@ -113,30 +112,10 @@ struct HLayer {
 /// The weights of the first layers of a Flash-Next GGUF in the form the host step reads.
 pub(super) struct HostModel {
     pub(super) shape: ModelShape,
-    embed: HostWeight,
     lm_head: HostWeight,
     mixer: HHyper,
     layers: Vec<HLayer>,
-    ple_table: HostWeight,
-    ple_rows: [u64; 1],
-    ple_key: HostWeight,
-    ple_value: HostWeight,
-    ple_norms: [Vec<f32>; 3],
-    ple_conv: Vec<f32>,
-    multipliers: Vec<i64>,
-    vocab: Vec<i64>,
-    offsets: Vec<i64>,
-}
-
-fn read_floats(weights: &GgufWeights, entry: &Mapped) -> Result<Vec<f32>, EngError> {
-    let (ty, bytes) = weights.read_tensor(&entry.name)?;
-    let mut values = dequantize(ty, &bytes)?;
-    if entry.convention == Convention::GammaOnePlusW {
-        for value in &mut values {
-            *value -= 1.0;
-        }
-    }
-    Ok(values)
+    ple: GgufPleWeights,
 }
 
 const DELTA_ROLES: [Wanted; 9] = [
@@ -282,28 +261,12 @@ impl HostModel {
                 },
             });
         }
-        let ple = Some(dims.ple_layer);
-        let table = get(Global::NgramTable.into(), None)?;
-        let hash = &config.hash;
         Ok(Self {
             shape: config.model_shape()?,
-            embed: plain(Global::Embedding.into(), None)?,
             lm_head: plain(Global::Head.into(), None)?,
             mixer: hyper(Site::Head, None)?,
             layers: out_layers,
-            ple_table: HostWeight::new(&[table], Remap::None),
-            ple_rows: [table.dims[1]],
-            ple_key: plain(Wanted::PleKey.into(), ple)?,
-            ple_value: plain(Wanted::PleValue.into(), ple)?,
-            ple_norms: [
-                floats(Wanted::PleNormKey.into(), ple)?,
-                floats(Wanted::PleNormQuery.into(), ple)?,
-                floats(Wanted::PleNormConv.into(), ple)?,
-            ],
-            ple_conv: floats(Wanted::PleConv.into(), ple)?,
-            multipliers: hash.multipliers.clone(),
-            vocab: hash.vocab.clone(),
-            offsets: hash.offsets.clone(),
+            ple: GgufPleWeights::load(model)?,
         })
     }
 
@@ -317,7 +280,7 @@ impl HostModel {
             }
         }
         ModelWeights {
-            embed: &self.embed,
+            embed: &self.ple.embed,
             layers: self
                 .layers
                 .iter()
@@ -350,20 +313,7 @@ impl HostModel {
                     },
                 })
                 .collect(),
-            ple: PleWeights {
-                multipliers: &self.multipliers,
-                vocab: &self.vocab,
-                offsets: &self.offsets,
-                shards: std::slice::from_ref(&self.ple_table),
-                shard_rows: &self.ple_rows,
-                weight_scale: 1.0,
-                key: &self.ple_key,
-                value: &self.ple_value,
-                norm_key: &self.ple_norms[0],
-                norm_query: &self.ple_norms[1],
-                norm_conv: &self.ple_norms[2],
-                conv: &self.ple_conv,
-            },
+            ple: self.ple.view(),
             mixer: hyper(&self.mixer),
             lm_head: &self.lm_head,
         }
