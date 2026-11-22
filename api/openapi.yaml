@@ -56,7 +56,8 @@ components:
         header, gets 401 even when the bearer token is valid.
   responses:
     Unauthorized:
-      description: The bearer token is missing or wrong. The code is unauthorized.
+      description: >-
+        The bearer token is missing or wrong. The code is unauthorized.
       content:
         application/json:
           schema:
@@ -179,7 +180,8 @@ components:
       properties:
         id:
           type: string
-          description: Model name. Send this value as the model field of a request.
+          description: >-
+            Model name. Send this value as the model field of a request.
         object:
           type: string
           const: model
@@ -287,9 +289,12 @@ components:
               type: integer
               minimum: 1
             mem_total_bytes:
-              description: Total RAM in bytes, or an unavailable object with the reason.
+              description: >-
+                Total RAM in bytes, or an unavailable object with the reason.
             mem_available_bytes:
-              description: Available RAM in bytes at answer time, or an unavailable object with the reason.
+              description: >-
+                Available RAM in bytes at answer time, or an unavailable object
+                with the reason.
         engines:
           type: array
           items:
@@ -319,8 +324,15 @@ components:
                 $ref: "#/components/schemas/MlxExecution"
     MlxExecution:
       type: object
-      description: Startup plan reported by the loaded MLX worker. Absent during loading or if the worker did not publish a plan.
-      required: [backend, configured_prefill_rows, prefill_rows, worker_piece_rows, decisions]
+      description: >-
+        Startup plan reported by the loaded MLX worker. Absent during loading or
+        if the worker did not publish a plan.
+      required:
+        - backend
+        - configured_prefill_rows
+        - prefill_rows
+        - worker_piece_rows
+        - decisions
       properties:
         backend:
           const: mlx
@@ -330,11 +342,15 @@ components:
         prefill_rows:
           type: integer
           minimum: 1
-          description: Admitted prefill row ceiling. A value of one selects one-token steps.
+          description: >-
+            Admitted prefill row ceiling. A value of one selects one-token
+            steps.
         worker_piece_rows:
           type: integer
           minimum: 1
-          description: Maximum prompt rows passed to the executor at once. A piece can contain multiple one-token steps.
+          description: >-
+            Maximum prompt rows passed to the executor at once. A piece can
+            contain multiple one-token steps.
         decisions:
           type: array
           items:
@@ -381,7 +397,10 @@ components:
             minimum: 0
         workspace:
           type: object
-          description: Staging charges and allowances within the remaining budget. These can include a one-token decode stage priced against the device budget.
+          description: >-
+            Staging charges and allowances within the remaining budget. These
+            can include a one-token decode stage priced against the device
+            budget.
           additionalProperties:
             type: integer
             minimum: 0
@@ -634,7 +653,8 @@ components:
         index:
           type: integer
           minimum: 0
-          description: Position of the call in the message. The first call has index 0.
+          description: >-
+            Position of the call in the message. The first call has index 0.
         id:
           type: string
         type:
@@ -727,7 +747,8 @@ components:
       properties:
         prompt_tokens:
           type: integer
-          description: All prompt tokens, including the ones that a cached prefix served.
+          description: >-
+            All prompt tokens, including the ones that a cached prefix served.
         completion_tokens:
           type: integer
         total_tokens:
@@ -805,7 +826,8 @@ components:
           description: Name of the model that served the request.
         engine:
           type: string
-          description: Server extension. The id of the engine that served the request.
+          description: >-
+            Server extension. The id of the engine that served the request.
         choices:
           type: array
           items:
@@ -818,7 +840,9 @@ components:
         role:
           type: string
           const: assistant
-          description: The first chunk of a stream carries role assistant. Later chunks omit it.
+          description: >-
+            The first chunk of a stream carries role assistant. Later chunks
+            omit it.
         content:
           type: string
           description: Answer text. It never contains the text of a think block.
@@ -847,7 +871,9 @@ components:
         finish_reason:
           type: string
           enum: [stop, length, tool_calls]
-          description: Present on the final chunk only. The values are those of Choice.finish_reason.
+          description: >-
+            Present on the final chunk only. The values are those of
+            Choice.finish_reason.
     ChatCompletionChunk:
       type: object
       required: [id, object, created, model, engine, choices]
@@ -865,7 +891,8 @@ components:
           description: Name of the model that served the request.
         engine:
           type: string
-          description: Server extension. The id of the engine that served the request.
+          description: >-
+            Server extension. The id of the engine that served the request.
         choices:
           type: array
           items:
@@ -959,7 +986,8 @@ components:
               type: string
             signature:
               type: string
-              description: Always empty. The server does not sign thinking blocks.
+              description: >-
+                Always empty. The server does not sign thinking blocks.
         - type: object
           required: [type, id, name, input]
           properties:
@@ -2007,7 +2035,8 @@ paths:
         cancels the job. In both cases the stream closes without [DONE] and
         without an error event. No request timeout applies.
       requestBody:
-        description: The body may be at most 16 MiB. A larger body gets 400 bad_request.
+        description: >-
+          The body may be at most 16 MiB. A larger body gets 400 bad_request.
         required: true
         content:
           application/json:
@@ -2125,7 +2154,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
         "404":
-          description: No engine serves the model. error.type is not_found_error.
+          description: >-
+            No engine serves the model. error.type is not_found_error.
           content:
             application/json:
               schema:
@@ -2197,7 +2227,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
         "404":
-          description: No engine serves the model. error.type is not_found_error.
+          description: >-
+            No engine serves the model. error.type is not_found_error.
           content:
             application/json:
               schema:

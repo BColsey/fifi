@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "c40e760e5b54cde70e8bf361f1566093d478f23f392de8f220480867687c0930",
+ "x-source-sha256": "e82ebb553b99d7cf27e40c5db08bbf3743e16c8cf5f771a51f3b3042bbc968d2",
  "components": {
   "securitySchemes": {
    "apiKey": {
