@@ -254,6 +254,7 @@ pub(crate) fn choose_cuda_fit(
     spec: &crate::family::spec::FamilySpec,
     free: u64,
     weights: u64,
+    arena: u64,
     int8_usable: bool,
     kv: Option<crate::family::qwen::qwen36::settings::KvDtype>,
     context: Option<u32>,
@@ -299,6 +300,8 @@ pub(crate) fn choose_cuda_fit(
             free,
             weights,
             band: ADMISSION_UNCERTAINTY_BAND_BYTES,
+            // The sketch's flat floor already carries an arena allowance; only the rest is new.
+            arena: arena.saturating_sub(RUNTIME_OVERHEAD_FLOOR_BYTES),
         },
         &named,
         ContextLimits {
@@ -505,6 +508,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             None,
@@ -527,6 +531,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             None,
@@ -545,6 +550,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             None,
@@ -571,6 +577,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             Some(KvDtype::F32),
             None,
@@ -584,6 +591,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             Some(65_536),
@@ -597,6 +605,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             Some(180_224),
@@ -616,6 +625,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             Some(262_144),
@@ -639,6 +649,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             Some(262_144),
@@ -662,6 +673,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             true,
             None,
             None,
@@ -674,6 +686,7 @@ mod tests {
                 &QWEN3_6_35B_A3B,
                 WEIGHTS - 1,
                 WEIGHTS,
+                0,
                 true,
                 None,
                 None,
@@ -691,7 +704,7 @@ mod tests {
         // that gives int8 its arena is off) gets the longest fp16 context the card holds.
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
         let none = &|_, _| Some(0);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, false, None, None, none)
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, 0, false, None, None, none)
             .unwrap()
             .expect("fits");
         assert_eq!((fit.form, fit.context), (KvDtype::F32, 100_352));
@@ -701,6 +714,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             false,
             None,
             Some(262_144),
@@ -714,6 +728,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            0,
             false,
             Some(KvDtype::Q8),
             None,

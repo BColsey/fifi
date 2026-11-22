@@ -1432,6 +1432,21 @@ fn int8_cache_usable(plan: &StartupPlan) -> bool {
     )
 }
 
+/// The device bytes of the smallest prefill chunk the ladder admits: its arena and the attention
+/// work buffer. A start needs them beside the weights and the cache whatever its context, so the
+/// card choice funds them first.
+fn smallest_prefill_bytes(projector: &CudaProjector) -> Result<u64, EngError> {
+    let dims = StepDims::new(
+        &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?,
+        &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
+    )?;
+    let nsm = projector.context().mmq_device_facts()?.nsm;
+    let smallest = super::prefill_plan::chunk_costs(&dims, nsm)?.pop();
+    Ok(smallest.map_or(0, |cost| {
+        (cost.arena + super::prefill_plan::PART_CHARGE) as u64
+    }))
+}
+
 /// The cache form and context of a start that left them to the card, asked before any weight is
 /// uploaded. The free bytes are the ones the load's admission compares and the weight bytes are
 /// its native tensors, so the choice charges what the load will. A start whose config fixes both
@@ -1457,6 +1472,7 @@ fn card_fit(
         &settings.spec,
         free,
         weights,
+        smallest_prefill_bytes(projector)?,
         int8_cache_usable(plan),
         (!settings.kv_auto).then_some(settings.kv),
         (!settings.context_auto).then_some(settings.context_limit),
@@ -1513,6 +1529,7 @@ fn replan_smaller(
         &settings.spec,
         free,
         weights,
+        smallest_prefill_bytes(projector)?,
         true,
         Some(settings.kv),
         Some(settings.context_limit.saturating_sub(REPLAN_STEP)),

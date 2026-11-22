@@ -879,4 +879,106 @@ mod card_tests {
             }
         }
     }
+
+    /// The default start of every local Qwen3.6-architecture GGUF on a free 3090: the context the
+    /// card fit picks with and without funding the prefill arena of the smallest chunk first.
+    /// Reads headers only.
+    #[test]
+    #[ignore = "reads the real GGUF headers under $HOME/models and $HOME/.ollama"]
+    fn the_default_fit_funds_the_prefill_arena_of_every_local_qwen36_gguf() {
+        use crate::family::qwen36::admission_sketch::{choose_cuda_fit, cuda_kv_per_position};
+        use crate::family::qwen36::settings::KvDtype;
+        use crate::weights::{GgufHeader, MetaValue};
+        use std::{fs::File, io::BufReader, io::Read, path::PathBuf};
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let arena = chunk_costs(&dims, 82)
+            .expect("costs")
+            .pop()
+            .map_or(0, |cost| (cost.arena + PART_CHARGE) as u64);
+        eprintln!(
+            "smallest chunk arena and part at 82 SMs: {} MiB",
+            arena >> 20
+        );
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in [
+            home.join("models/qwen3.6"),
+            home.join("models/qwen3.6/iq"),
+            home.join("models/qwen3.6/requant"),
+            home.join(".ollama/models/blobs"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && entry.metadata().unwrap().len() > (1 << 30) {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let floor = |kv: KvDtype, context: u32| {
+            let cache = u64::from(context) * cuda_kv_per_position(&QWEN3_6_35B_A3B, kv).ok()?;
+            Some(
+                cache
+                    + if kv == KvDtype::Q8 {
+                        256 << 20
+                    } else {
+                        1 << 30
+                    },
+            )
+        };
+        for free in [23_416u64 << 20, 24_000 << 20] {
+            eprintln!("--- {} MiB free", free >> 20);
+            for path in &files {
+                let mut magic = [0u8; 4];
+                File::open(path).unwrap().read_exact(&mut magic).unwrap();
+                if &magic != b"GGUF" {
+                    continue;
+                }
+                let file = File::open(path).unwrap();
+                let Ok(header) = GgufHeader::parse(
+                    &mut BufReader::new(&file),
+                    file.metadata().unwrap().len(),
+                    512 << 20,
+                ) else {
+                    continue;
+                };
+                if !matches!(header.meta("general.architecture"),
+                    Some(MetaValue::String(arch)) if arch == "qwen35moe")
+                {
+                    continue;
+                }
+                let weights: u64 = header.tensors().iter().map(|t| t.byte_len()).sum();
+                let fit = |arena| {
+                    choose_cuda_fit(
+                        &QWEN3_6_35B_A3B,
+                        free,
+                        weights,
+                        arena,
+                        true,
+                        None,
+                        None,
+                        &floor,
+                    )
+                    .unwrap()
+                };
+                let (before, after) = (fit(0), fit(arena));
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                eprintln!(
+                    "{name:60.60} weights {:.2} GiB | without {before:?} | with {after:?}",
+                    weights as f64 / (1u64 << 30) as f64
+                );
+                // Funding the arena never lengthens the context.
+                assert!(after.map_or(0, |f| f.context) <= before.map_or(0, |f| f.context));
+            }
+        }
+    }
 }

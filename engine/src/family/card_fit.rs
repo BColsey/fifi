@@ -41,6 +41,10 @@ pub(crate) struct CardBytes {
     /// Slack that must remain after every charge: the measurement gap between the probe and the
     /// serving process.
     pub(crate) band: u64,
+    /// The device bytes a prefill needs beside the weights and the cache whatever the context: the
+    /// arena (and the attention work buffer) of the smallest chunk the family admits. A context
+    /// whose cache leaves less than this is no context: the start would have no prefill.
+    pub(crate) arena: u64,
 }
 
 /// The context limits of one start.
@@ -61,7 +65,10 @@ pub(crate) struct CardFit<K> {
 
 fn fits(card: CardBytes, charge: &dyn Fn(u32) -> Option<u64>, context: u32) -> bool {
     charge(context).is_some_and(|charge| {
-        i128::from(card.free) - i128::from(card.weights) - i128::from(charge)
+        i128::from(card.free)
+            - i128::from(card.weights)
+            - i128::from(charge)
+            - i128::from(card.arena)
             >= i128::from(card.band)
     })
 }
@@ -186,7 +193,6 @@ impl CellFigures {
         let charge = |cells: u32| {
             u64::from(cells)
                 .checked_mul(self.per_position)?
-                .checked_add(self.scratch)?
                 .checked_add(self.headroom)?
                 .checked_add(unlisted)?
                 .checked_add(self.seq_fixed.checked_mul(extra)?)
@@ -199,10 +205,12 @@ impl CellFigures {
             form: (),
             charge: &charge,
         };
+        // The scratch every session shares is the prefill working set: the one arena charge.
         let card = CardBytes {
             free,
             weights,
             band: 0,
+            arena: self.scratch,
         };
         plan_card_fit(card, &[form], limits).map(|fit| fit.context as usize)
     }
@@ -302,7 +310,31 @@ mod tests {
             free: 1000 * MIB + 128 * MIB + free_steps * MIB,
             weights: 1000 * MIB,
             band: 128 * MIB,
+            arena: 0,
         }
+    }
+
+    #[test]
+    fn the_arena_is_funded_before_the_context_is_sized() {
+        let bare = card(100);
+        let with = CardBytes {
+            arena: 40 * MIB,
+            ..bare
+        };
+        let ceiling = 262_144;
+        let at = |card| longest_context(card, &wide, ceiling).expect("a context");
+        // The arena takes its bytes from the cache: 40 MiB is 20,480 positions of `wide`.
+        assert_eq!(at(bare) - at(with), 20_480);
+        // A card that holds the cache and not the arena has no context at all.
+        let tight = CardBytes {
+            arena: 100_000 * MIB,
+            ..bare
+        };
+        assert_eq!(longest_context(tight, &wide, ceiling), None);
+        // The form rule sees the arena too: a thin form can reach what the wide one cannot.
+        let forms = forms();
+        let fit = plan_card_fit(with, &forms, LIMITS).expect("a fit");
+        assert!(fit.context >= at(with));
     }
 
     const LIMITS: ContextLimits = ContextLimits {
