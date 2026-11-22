@@ -1431,6 +1431,58 @@ fn two_real_expert_slots_match_host() {
         }
     }
     eprintln!("checked {n_ff} SwiGLU values for two real experts");
+    let qa_bytes = q8_1_bytes(n_ff, 2).unwrap();
+    let qa = ctx.allocate(qa_bytes).unwrap();
+    ctx.quantize_q8_1(
+        &stream,
+        QuantizeCall {
+            x: act.range(0, 2 * n_ff * 4).unwrap(),
+            y: qa.range(0, qa_bytes).unwrap(),
+            k: n_ff,
+            ncols: 2,
+        },
+    )
+    .unwrap();
+    let down = bank.projection(&state, Role::ExpertDown).unwrap();
+    assert_eq!(down.k, n_ff);
+    let hidden = down.rows;
+    let y_down = ctx.allocate(2 * hidden * 4).unwrap();
+    down.launch(
+        &ctx,
+        &stream,
+        ExpertProjectionInputs {
+            ids: ids.range(0, 8).unwrap(),
+            x_q8: qa.range(0, qa_bytes).unwrap(),
+            x_per_slot: true,
+            output: y_down.range(0, 2 * hidden * 4).unwrap(),
+            output_stride: hidden,
+            used: 2,
+        },
+    )
+    .unwrap();
+    let mut down_bytes = vec![0; 2 * hidden * 4];
+    y_down.read_at(&stream, 0, &mut down_bytes).unwrap();
+    let tensor = model.map().get(Role::ExpertDown, Some(0)).unwrap();
+    for (rank, expert) in [257u64, 256].into_iter().enumerate() {
+        let input: Vec<f32> = act_bytes[rank * n_ff * 4..(rank + 1) * n_ff * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        let max_abs = input.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
+        let blocks = mapped_blocks(&model, tensor, Some(expert), 0..hidden as u64).unwrap();
+        let weights = dequantize(tensor.ty, &blocks).unwrap();
+        for (index, row) in weights.chunks_exact(n_ff).enumerate() {
+            let off = (rank * hidden + index) * 4;
+            let got = f32::from_ne_bytes(down_bytes[off..off + 4].try_into().unwrap());
+            let want: f32 = row.iter().zip(&input).map(|(w, x)| w * x).sum();
+            let tolerance = 0.01 * max_abs * row.iter().map(|v| v.abs()).sum::<f32>() + 1e-5;
+            assert!(
+                (got - want).abs() <= tolerance,
+                "down after SwiGLU rank {rank} row {index}"
+            );
+        }
+    }
+    eprintln!("checked {hidden} down rows for two per-expert SwiGLU activations");
 }
 
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
