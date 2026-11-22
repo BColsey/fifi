@@ -138,12 +138,7 @@ impl CudaContext {
                 "the attention needs an i32 cell capacity and a window within it".to_owned(),
             ));
         }
-        if !crate::kernels::cuda::native::resident::attn_decode_gemma::ring_admitted(
-            call.ring,
-            call.window,
-            call.m,
-            call.cells,
-        ) {
+        if !crate::family::kv_ring::ring_admits(call.ring, call.window, call.m, call.cells) {
             return Err(EngError::BadRequest(format!(
                 "the attention ring {} needs a window and window + m - 1 <= ring <= cells, \
                  got window {}, m {}, cells {}",

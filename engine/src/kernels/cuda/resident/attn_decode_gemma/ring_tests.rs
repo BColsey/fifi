@@ -45,7 +45,10 @@ struct Planes {
     k_scales: DeviceBuffer,
     v_codes: DeviceBuffer,
     v_scales: DeviceBuffer,
+    /// The plane's cells per kv head: the stride of one head.
     cells: usize,
+    /// The ring argument the kernels read this plane with: 0 for a linear plane.
+    ring: usize,
 }
 
 impl Planes {
@@ -59,7 +62,16 @@ impl Planes {
             v_codes: zero(codes),
             v_scales: zero(scales),
             cells,
+            ring: 0,
         }
+    }
+
+    /// A plane read as a ring of `ring` cells, `extra` cells longer than the ring: the stride of
+    /// a head is the plane's cells, the cell of a position is `position % ring`.
+    fn sliding(ctx: &CudaContext, g: &Geometry, ring: usize, extra: usize) -> Self {
+        let mut planes = Self::new(ctx, g, ring + extra);
+        planes.ring = ring;
+        planes
     }
 
     fn shape(&self, g: &Geometry, rows: usize, ring: usize) -> Kv8Shape {
@@ -70,6 +82,7 @@ impl Planes {
             cells: self.cells,
             code_scale: Kv8CodeScale::UnroundedF32,
             ring,
+            window: if ring > 0 { g.window } else { 0 },
         }
     }
 
@@ -136,7 +149,7 @@ impl Rig {
             self.ctx
                 .kv8_chunk(
                     &self.stream,
-                    ring.shape(g, n, ring.cells),
+                    ring.shape(g, n, ring.ring),
                     ring.data(
                         k.range(first * row_bytes, n * row_bytes).unwrap(),
                         v.range(first * row_bytes, n * row_bytes).unwrap(),
@@ -163,7 +176,7 @@ impl Rig {
         let v = testkit::upload_f32(&self.ctx, host_v);
         let word = testkit::upload_bytes(&self.ctx, &(pos as i32).to_le_bytes());
         let status = testkit::upload_bytes(&self.ctx, &0u32.to_le_bytes());
-        for (planes, ring_cells) in [(linear, 0), (ring, ring.cells)] {
+        for (planes, ring_cells) in [(linear, 0), (ring, ring.ring)] {
             self.ctx
                 .kv8_append(
                     &self.stream,
@@ -246,13 +259,19 @@ impl Rig {
 
 /// Builds a linear plane and a ring from the same `positions` rows, then compares the two.
 fn ring_matches_linear(g: &Geometry, positions: usize) {
+    ring_matches_linear_with(g, positions, 0);
+}
+
+/// The same with the ring's planes `extra` cells longer than the ring, so a head's stride is the
+/// plane's cells and not the ring: a kernel that mixed the two would read the wrong cells.
+fn ring_matches_linear_with(g: &Geometry, positions: usize, extra: usize) {
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
     let rig = Rig { ctx, stream };
     let decode_steps = 20usize;
     let linear = Planes::new(&rig.ctx, g, positions + decode_steps + ROWS);
     let ring_cells = g.window + ROWS - 1;
-    let ring = Planes::new(&rig.ctx, g, ring_cells);
+    let ring = Planes::sliding(&rig.ctx, g, ring_cells, extra);
     let mut rng = testkit::Rng::new(0x5eed_0000 + positions as u64 + g.window as u64);
     let row = g.n_kv_head * g.head_dim;
     for pos0 in (0..positions).step_by(CHUNK) {
@@ -337,6 +356,18 @@ fn the_ring_is_bit_identical_to_the_linear_plane_at_4k() {
 }
 
 #[test]
+fn a_ring_in_a_longer_plane_is_bit_identical_to_the_linear_plane() {
+    if !testkit::device_present("attn_decode_gemma ring in a longer plane") {
+        return;
+    }
+    for g in &GEOMETRIES {
+        // The plane has 37 cells more than the ring; cells and ring differ, as they do for a
+        // layer whose plane was sized for a larger step than the ring it is read as.
+        ring_matches_linear_with(g, 4_096, 37);
+    }
+}
+
+#[test]
 fn the_ring_is_bit_identical_to_the_linear_plane_at_32k() {
     if !testkit::device_present("attn_decode_gemma ring 32K") {
         return;
@@ -360,7 +391,7 @@ fn read_planes(rig: &Rig, planes: &Planes) -> [Vec<u8>; 4] {
 /// chunks straddle the ring's end) and decode appends, cell `c` of every head of every ring plane
 /// holds the bytes of the newest position `p` with `p % ring == c` of the linear plane, and a
 /// cell no position reached is still zero.
-fn append_fills_ring_cells(g: &Geometry, positions: usize, chunk: usize) {
+fn append_fills_ring_cells(g: &Geometry, positions: usize, chunk: usize, extra: usize) {
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
     let rig = Rig { ctx, stream };
@@ -368,7 +399,8 @@ fn append_fills_ring_cells(g: &Geometry, positions: usize, chunk: usize) {
     let total = positions + decode_steps;
     let linear = Planes::new(&rig.ctx, g, total);
     let ring_cells = g.window + ROWS - 1;
-    let ring = Planes::new(&rig.ctx, g, ring_cells);
+    let ring = Planes::sliding(&rig.ctx, g, ring_cells, extra);
+    let stride = ring.cells;
     let mut rng = testkit::Rng::new(0xa99e_0000 + positions as u64 + chunk as u64);
     let row = g.n_kv_head * g.head_dim;
     let mut pos0 = 0;
@@ -397,7 +429,7 @@ fn append_fills_ring_cells(g: &Geometry, positions: usize, chunk: usize) {
             for cell in 0..ring_cells {
                 // The newest position that landed in this cell.
                 let newest = (0..total).rev().find(|p| p % ring_cells == cell);
-                let got = &ring_bytes[plane][(head * ring_cells + cell) * unit..][..unit];
+                let got = &ring_bytes[plane][(head * stride + cell) * unit..][..unit];
                 match newest {
                     Some(p) => assert_eq!(
                         got,
@@ -431,14 +463,37 @@ fn the_append_kernels_write_cell_position_mod_ring_across_the_wrap() {
             (3 * g.window + 5, 13),
             (4 * g.window, ROWS),
         ] {
-            append_fills_ring_cells(g, positions, chunk);
+            append_fills_ring_cells(g, positions, chunk, 0);
+            append_fills_ring_cells(g, positions, chunk, 23);
         }
     }
 }
 
+/// One `kv8_chunk` of `rows` rows into a ring of `ring_cells` over `g`'s window; `Ok` when the
+/// launch accepted it.
+fn append_rows_into_ring(rig: &Rig, g: &Geometry, ring_cells: usize, rows: usize) -> bool {
+    let ring = Planes::sliding(&rig.ctx, g, ring_cells, 0);
+    let row_bytes = g.n_kv_head * g.head_dim * 4;
+    let (k, v) = (
+        testkit::upload_f32(&rig.ctx, &vec![0.5; rows * g.n_kv_head * g.head_dim]),
+        testkit::upload_f32(&rig.ctx, &vec![0.5; rows * g.n_kv_head * g.head_dim]),
+    );
+    rig.ctx
+        .kv8_chunk(
+            &rig.stream,
+            ring.shape(g, rows, ring_cells),
+            ring.data(
+                k.range(0, rows * row_bytes).unwrap(),
+                v.range(0, rows * row_bytes).unwrap(),
+            ),
+            0,
+        )
+        .is_ok()
+}
+
 #[test]
-fn an_append_wider_than_the_ring_margin_is_refused_by_the_launch() {
-    if !testkit::device_present("kv8_append ring margin") {
+fn an_append_of_more_rows_than_the_ring_has_cells_is_refused_by_the_launch() {
+    if !testkit::device_present("kv8_append ring cells") {
         return;
     }
     let g = &GEOMETRIES[0];
@@ -446,32 +501,31 @@ fn an_append_wider_than_the_ring_margin_is_refused_by_the_launch() {
     let stream = ctx.stream().expect("stream");
     let rig = Rig { ctx, stream };
     let ring_cells = g.window + 3 - 1;
-    let ring = Planes::new(&rig.ctx, g, ring_cells);
-    let row_bytes = g.n_kv_head * g.head_dim * 4;
-    let rows = ring_cells + 1;
-    let (k, v) = (
-        testkit::upload_f32(&rig.ctx, &vec![0.5; rows * g.n_kv_head * g.head_dim]),
-        testkit::upload_f32(&rig.ctx, &vec![0.5; rows * g.n_kv_head * g.head_dim]),
-    );
-    // More rows than the ring has cells would write one cell twice in one launch.
-    let refused = rig.ctx.kv8_chunk(
-        &rig.stream,
-        ring.shape(g, rows, ring_cells),
-        ring.data(
-            k.range(0, rows * row_bytes).unwrap(),
-            v.range(0, rows * row_bytes).unwrap(),
-        ),
-        0,
-    );
-    assert!(
-        refused.is_err(),
-        "rows beyond the ring's cells are a refusal"
-    );
+    // More rows than cells would write one cell twice in one launch.
+    assert!(!append_rows_into_ring(&rig, g, ring_cells, ring_cells + 1));
+}
+
+#[test]
+fn an_append_past_the_rings_margin_is_refused_before_it_writes() {
+    if !testkit::device_present("kv8_append ring margin") {
+        return;
+    }
+    let g = &GEOMETRIES[0];
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rig = Rig { ctx, stream };
+    // A ring of `window + 2` cells takes three rows at once (window + 3 - 1 = ring). Three rows fit
+    // and four do not, though four are fewer than the ring has cells: the fourth row would
+    // overwrite a cell the first row's window still reads.
+    let ring_cells = g.window + 3 - 1;
+    assert!(append_rows_into_ring(&rig, g, ring_cells, 3));
+    assert!(!append_rows_into_ring(&rig, g, ring_cells, 4));
+    assert!(!append_rows_into_ring(&rig, g, ring_cells, ring_cells));
 }
 
 #[test]
 fn the_ring_rule_is_window_plus_rows_minus_one_up_to_the_cells() {
-    use crate::kernels::cuda::native::resident::attn_decode_gemma::ring_admitted;
+    use crate::family::kv_ring::ring_admits as ring_admitted;
     assert!(ring_admitted(0, 0, 16, 100));
     assert!(ring_admitted(0, 512, 16, 100));
     assert!(ring_admitted(527, 512, 16, 527));

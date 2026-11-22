@@ -793,8 +793,7 @@ impl CudaContext {
             && call.window <= cells
             && call.scale.is_finite()
             && call.scale.abs() < 1e30;
-        let ring_ok =
-            call.ring == 0 || (call.window >= 1 && call.ring >= call.window && call.ring <= cells);
+        let ring_ok = crate::family::kv_ring::ring_admits(call.ring, call.window, 1, cells);
         if !(shape_ok && ring_ok) {
             return Err(rule(
                 "shape",
@@ -812,6 +811,7 @@ impl CudaContext {
             cells,
             code_scale: Kv8CodeScale::StoredHalf,
             ring: 0,
+            window: 0,
         };
         check_planes(call.rows, &plane, false)?;
         let out = Claim::of("out", &call.out, q_bytes);

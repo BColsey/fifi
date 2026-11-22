@@ -1358,7 +1358,11 @@ mod device {
                     .iter()
                     .enumerate()
                     .fold((0u32, logits[0]), |(best, value), (index, &other)| {
-                        if other > value { (index as u32, other) } else { (best, value) }
+                        if other > value {
+                            (index as u32, other)
+                        } else {
+                            (best, value)
+                        }
                     })
                     .0;
                 chain.push(token);
@@ -1386,20 +1390,35 @@ mod device {
 
                 serve.reset(&mut hot).expect("reset");
                 let covered = serve.restore_prefix(&mut hot, &convo).expect("restore");
-                assert!(turn == 0 || covered > 0, "turn {turn} restores the saved prefix");
-                serve.prefill(&mut hot, &convo[covered..]).expect("tail prefill");
+                assert!(
+                    turn == 0 || covered > 0,
+                    "turn {turn} restores the saved prefix"
+                );
+                serve
+                    .prefill(&mut hot, &convo[covered..])
+                    .expect("tail prefill");
                 assert_eq!(hot.pos, cold.pos, "turn {turn}");
                 assert!(
-                    serve.save_prefix(&hot, &convo, SaveKind::Tip).expect("save"),
+                    serve
+                        .save_prefix(&hot, &convo, SaveKind::Tip)
+                        .expect("save"),
                     "turn {turn} saves its prompt"
                 );
                 let hot_chain = draw_chain(&mut serve, &hot, 24);
-                assert_eq!(hot_chain, cold_chain, "turn {turn} at {} tokens", convo.len());
+                assert_eq!(
+                    hot_chain,
+                    cold_chain,
+                    "turn {turn} at {} tokens",
+                    convo.len()
+                );
                 equal += 1;
                 convo.extend(&cold_chain);
             }
             assert_eq!(equal, 6);
-            assert!(convo.len() > 1_200, "the conversation passed the window twice");
+            assert!(
+                convo.len() > 1_200,
+                "the conversation passed the window twice"
+            );
         }
 
         /// A different prompt saves over the tip, and the old key no longer restores: the store

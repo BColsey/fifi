@@ -67,6 +67,10 @@ pub(crate) struct Kv8Shape {
     /// 0: cell = position. R > 0: position p goes to cell p % R (`rows <= R <= cells`), the cache
     /// of a sliding layer; `pos` is then bounded by the position range, not by `cells`.
     pub(crate) ring: usize,
+    /// The positions a query reaches in a ring's layer, 0 when unknown (a linear plane, or a
+    /// caller that checks the margin itself). With a window the launch refuses an append wider
+    /// than the ring's margin (`window + rows - 1 <= ring`), the rule attention reads by.
+    pub(crate) window: usize,
 }
 
 impl Kv8Shape {
@@ -85,6 +89,7 @@ impl Kv8Shape {
             cells,
             code_scale,
             ring: 0,
+            window: 0,
         }
     }
 
@@ -106,6 +111,11 @@ impl Kv8Shape {
             cells: geometry.cells(context),
             code_scale,
             ring: geometry.kernel_ring(context),
+            window: if geometry.kernel_ring(context) > 0 {
+                geometry.window()
+            } else {
+                0
+            },
         }
     }
 
@@ -203,12 +213,22 @@ fn check_shape(tag: &str, shape: &Kv8Shape, max_rows: usize) -> Result<Kv8Ints, 
             ),
         ));
     }
-    if shape.ring != 0 && !(shape.rows..=shape.cells).contains(&shape.ring) {
+    // A ring holds every row of one launch in its own cell; with the layer's window it also keeps
+    // the whole window readable beside the rows (`window + rows - 1 <= ring <= cells`).
+    let ring_ok = shape.ring == 0
+        || if shape.window > 0 {
+            crate::family::kv_ring::ring_admits(shape.ring, shape.window, shape.rows, shape.cells)
+        } else {
+            (shape.rows..=shape.cells).contains(&shape.ring)
+        };
+    if !ring_ok {
         return Err(rule(
             tag,
             &format!(
-                "ring is {}, not 0 or {rows} to cells {}",
+                "ring is {} with window {} and {rows} rows, not 0 or {} to cells {}",
                 shape.ring,
+                shape.window,
+                shape.window.max(1) + shape.rows - 1,
                 shape.cells,
                 rows = shape.rows
             ),

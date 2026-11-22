@@ -3281,7 +3281,11 @@ mod tests {
     fn a_ring_session_gives_the_logits_of_the_linear_control_bit_for_bit() {
         use crate::family::cell_pool::CELL_GRANULE;
         let mut model = load_q8();
-        assert_ne!(model.local_ring, KvRing::LINEAR, "the ring is what a start builds");
+        assert_ne!(
+            model.local_ring,
+            KvRing::LINEAR,
+            "the ring is what a start builds"
+        );
         let cells = 2 * CELL_GRANULE;
         let ring = model.new_seq_cells(cells).expect("ring session");
         model.set_linear_local_layers(true);
@@ -3295,19 +3299,43 @@ mod tests {
                 .map(|kv| kv.shape.cells)
                 .collect::<Vec<_>>()
         };
-        assert!(ring_cells(&ring).iter().any(|&c| c < cells), "{:?}", ring_cells(&ring));
+        assert!(
+            ring_cells(&ring).iter().any(|&c| c < cells),
+            "{:?}",
+            ring_cells(&ring)
+        );
         assert!(ring_cells(&linear).iter().all(|&c| c == cells));
-        let widths = [1usize, 8.min(model.rows), 3, 5.min(model.rows), 2, 7.min(model.rows), 1, model.rows];
+        let widths = [
+            1usize,
+            8.min(model.rows),
+            3,
+            5.min(model.rows),
+            2,
+            7.min(model.rows),
+            1,
+            model.rows,
+        ];
         let mut pos = 0usize;
         let mut turn = 0usize;
         while pos < 1_700 {
             let width = widths[turn % widths.len()].min(1_700 - pos);
-            let tokens: Vec<u32> = (0..width).map(|i| 2 + ((pos + i) as u32 * 37) % 9_000).collect();
-            model.prefill_batch(&ring, &tokens, pos, true).expect("ring chunk");
+            let tokens: Vec<u32> = (0..width)
+                .map(|i| 2 + ((pos + i) as u32 * 37) % 9_000)
+                .collect();
+            model
+                .prefill_batch(&ring, &tokens, pos, true)
+                .expect("ring chunk");
             let a = logit_bits(&model);
-            model.prefill_batch(&linear, &tokens, pos, true).expect("linear chunk");
+            model
+                .prefill_batch(&linear, &tokens, pos, true)
+                .expect("linear chunk");
             let b = logit_bits(&model);
-            assert_eq!(a, b, "the logits differ after the chunk ending at {}", pos + width);
+            assert_eq!(
+                a,
+                b,
+                "the logits differ after the chunk ending at {}",
+                pos + width
+            );
             pos += width;
             turn += 1;
         }
@@ -3315,8 +3343,14 @@ mod tests {
             let token = 3 + (step as u32 * 11) % 5_000;
             model.decode(&ring, token, pos + step).expect("ring step");
             let a = logit_bits(&model);
-            model.decode(&linear, token, pos + step).expect("linear step");
-            assert_eq!(a, logit_bits(&model), "the logits differ at decode step {step}");
+            model
+                .decode(&linear, token, pos + step)
+                .expect("linear step");
+            assert_eq!(
+                a,
+                logit_bits(&model),
+                "the logits differ at decode step {step}"
+            );
         }
     }
 
@@ -3337,7 +3371,9 @@ mod tests {
         // Feed the source one token at a time, saving at the counts that straddle the window.
         let mut snapshots = Vec::new();
         for pos in 0..total {
-            model.prefill_batch(&source, &tokens[pos..=pos], pos, false).expect("feed");
+            model
+                .prefill_batch(&source, &tokens[pos..=pos], pos, false)
+                .expect("feed");
             let fed = pos + 1;
             if [100, 511, 512, 513, 519, 520, 1_030, 1_600].contains(&fed) {
                 snapshots.push((fed, model.snapshot_seq(&source, fed).expect("snapshot")));
@@ -3345,28 +3381,46 @@ mod tests {
         }
         for (fed, snapshot) in &snapshots {
             let layers = model.snapshot_layer_bytes(*fed);
-            assert_eq!(layers.iter().sum::<usize>(), snapshot.bytes(), "size at {fed}");
+            assert_eq!(
+                layers.iter().sum::<usize>(),
+                snapshot.bytes(),
+                "size at {fed}"
+            );
             // Past the window the entry stops growing with the prefix on the sliding layers.
             model.restore_seq(&target, snapshot).expect("restore");
             // The source continues from its own cells only for the count it is at; rebuild it.
             let probe = model.new_seq_cells(cells).expect("probe");
             for pos in 0..*fed {
-                model.prefill_batch(&probe, &tokens[pos..=pos], pos, false).expect("refeed");
+                model
+                    .prefill_batch(&probe, &tokens[pos..=pos], pos, false)
+                    .expect("refeed");
             }
             for step in 0..6usize {
                 let token = 5 + step as u32;
                 model.decode(&probe, token, fed + step).expect("probe step");
                 let a = logit_bits(&model);
-                model.decode(&target, token, fed + step).expect("restored step");
+                model
+                    .decode(&target, token, fed + step)
+                    .expect("restored step");
                 assert_eq!(a, logit_bits(&model), "fed {fed} step {step}");
             }
         }
         // The window caps the sliding layers: a long entry is not larger than a window-long one by
         // more than the full-attention layers' cells.
-        let (short, long) = (model.snapshot_layer_bytes(600), model.snapshot_layer_bytes(1_600));
+        let (short, long) = (
+            model.snapshot_layer_bytes(600),
+            model.snapshot_layer_bytes(1_600),
+        );
         let sliding = |layers: &[usize]| layers[0];
-        assert_eq!(sliding(&short), sliding(&long), "a sliding layer stores its window only");
-        assert!(long[5] > short[5], "a full-attention layer stores every position");
+        assert_eq!(
+            sliding(&short),
+            sliding(&long),
+            "a sliding layer stores its window only"
+        );
+        assert!(
+            long[5] > short[5],
+            "a full-attention layer stores every position"
+        );
     }
 
     /// A chunk wider than the ring's margin is refused at the append, never written over the
@@ -3377,7 +3431,10 @@ mod tests {
         let model = load_q8();
         let seq = model.new_seq().expect("session");
         let margin = model.local_ring.widest_append();
-        assert_eq!(margin, model.rows, "the ring is sized for the widest chunk a step takes");
+        assert_eq!(
+            margin, model.rows,
+            "the ring is sized for the widest chunk a step takes"
+        );
         assert!(!model.local_ring.admits(margin + 1));
         assert!(model.local_ring.admits(margin));
         drop(seq);

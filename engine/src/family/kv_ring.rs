@@ -87,7 +87,6 @@ impl KvRing {
     }
 
     /// The positions a query reaches; 0 for a linear layer.
-    #[cfg(test)]
     pub(crate) fn window(self) -> usize {
         self.window
     }
@@ -226,7 +225,9 @@ mod tests {
         // Sums that overflow are a refusal, not a wrap.
         assert_eq!(ring_cells(usize::MAX, 2), None);
         assert!(!ring_admits(usize::MAX, usize::MAX, usize::MAX, usize::MAX));
-        // 2^31 + 8 does not fit an int: the long-long form of the kernel check must refuse it too.
+        // A window past an int still sizes in usize; the kernel's long long check admits it only
+        // while the ring and the cells are as large.
+        assert_eq!(ring_cells((1 << 31) + 8, 1), Some((1 << 31) + 8));
         assert!(!ring_admits(1 << 20, (1 << 31) + 8, 1, 1 << 20));
     }
 
