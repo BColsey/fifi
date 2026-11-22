@@ -1501,6 +1501,24 @@ fn the_bolt_configuration_takes_its_own_context_and_ids_but_only_the_built_windo
 }
 
 #[test]
+fn the_check_validates_the_files_the_load_may_choose_among() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bolt_gguf(
+        &bolt_base_kvs(&[]),
+        &bolt_tensors(),
+        &dir.path().join("bolt.gguf"),
+    );
+    std::fs::write(dir.path().join("a-larger.gguf"), vec![0u8; 1 << 20])
+        .expect("write a junk file");
+    let files = super::serve::bolt_files(dir.path()).expect("the valid file is enough");
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].path, dir.path().join("bolt.gguf"));
+    assert!(super::serve::check_checkpoint(&dir.path().join("a-larger.gguf")).is_err());
+    std::fs::remove_file(dir.path().join("bolt.gguf")).expect("remove the valid file");
+    assert!(super::serve::bolt_files(dir.path()).is_err());
+}
+
+#[test]
 fn a_lone_bolt_gguf_passes_the_dispatch_gate_with_no_side_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bolt_gguf(

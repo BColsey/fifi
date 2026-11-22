@@ -45,10 +45,32 @@ pub(crate) fn check_checkpoint(model_path: &Path) -> Result<(), EngError> {
     })
 }
 
-/// The header and tensor inventory check of the selected weights file.
-pub(crate) fn bolt_geometry(model_path: &Path) -> Result<(), EngError> {
+/// The weights files of a model path that the load's own opener (`open_bolt_weights`, called by
+/// `load_choosing`) accepts, largest first: the only files the load may choose among. When none
+/// is accepted, the error is the largest file's.
+pub(crate) fn bolt_files(
+    model_path: &Path,
+) -> Result<Vec<crate::family::gguf_select::GgufFile>, EngError> {
     let (_, files) = crate::family::gguf_select::candidates(model_path)?;
-    super::open_bolt_q8(&files[0].path)
+    let mut first_error = None;
+    let mut valid = Vec::with_capacity(files.len());
+    for file in files {
+        match super::open_bolt_weights(&file.path) {
+            Ok(_) => valid.push(file),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match (valid.is_empty(), first_error) {
+        (true, Some(error)) => Err(error),
+        _ => Ok(valid),
+    }
+}
+
+/// The header and tensor inventory check of every file the load may choose.
+pub(crate) fn bolt_geometry(model_path: &Path) -> Result<(), EngError> {
+    bolt_files(model_path).map(|_| ())
 }
 
 #[cfg(feature = "native-cuda")]
@@ -660,7 +682,7 @@ mod device {
         prefix_reuse: bool,
     ) -> Result<StartedEngine, EngError> {
         let tier_plan = kv_cache::plan_tier(kv_cache.as_ref(), "gemma4", TIER_LABEL)?;
-        let (_, files) = crate::family::gguf_select::candidates(model_path)?;
+        let files = super::bolt_files(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
         let text_identity = *bundle.identity();
         let eos = bundle.eos_token_ids().to_vec();
