@@ -514,6 +514,51 @@ fn expert_stack_copy_preserves_parts_slots_and_rejects_bad_input() {
 }
 
 #[test]
+fn split_shard_experts_load_into_selected_part_major_slots() {
+    use super::expert_layout::{ExpertLayout, ExpertStacks};
+    let (written, model) = open(&Spec {
+        shards: 4,
+        ..Spec::default()
+    });
+    for layer in [0, 3] {
+        let layout = ExpertLayout::for_layer(&model, layer).unwrap();
+        let stacks = ExpertStacks::new(&layout, 3).unwrap();
+        let mut bank = vec![0; stacks.bytes];
+        let mut record = vec![0; layout.bytes];
+        for (expert, slot) in [(1u64, 2usize), (2, 0)] {
+            for (part_index, part) in layout.parts.iter().enumerate() {
+                let tensor = model.map().get(part.role, Some(layer)).unwrap();
+                let value = (expert as u8) * 16 + part_index as u8 + 1;
+                written.patch(
+                    &tensor.name,
+                    expert * part.bytes.len() as u64,
+                    &vec![value; part.bytes.len()],
+                );
+            }
+            layout.read(&model, layer, expert, &mut record).unwrap();
+            stacks
+                .copy_record(&layout, slot, &record, &mut bank)
+                .unwrap();
+        }
+        for (expert, slot) in [(1u8, 2usize), (2, 0)] {
+            for part_index in 0..3 {
+                let expected = expert * 16 + part_index as u8 + 1;
+                assert!(
+                    bank[stacks.slot(part_index, slot).unwrap()]
+                        .iter()
+                        .all(|&v| v == expected)
+                );
+                assert!(
+                    bank[stacks.slot(part_index, 1).unwrap()]
+                        .iter()
+                        .all(|&v| v == 0)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn packed_expert_read_preserves_role_boundaries_and_rejects_bad_requests() {
     use super::expert_layout::ExpertLayout;
     let (written, model) = open(&Spec {
