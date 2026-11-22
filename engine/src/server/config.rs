@@ -2,10 +2,10 @@
 //!
 //! The file carries no key.
 
-use crate::family::qwen::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
 use crate::family::gemma::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
 use crate::family::inkling2_mini::FAMILY as INKLING_FAMILY;
+use crate::family::qwen::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::{
     nemotron::nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
     qwen::qwen36::{
