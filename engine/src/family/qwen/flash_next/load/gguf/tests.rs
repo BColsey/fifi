@@ -340,6 +340,41 @@ fn the_refusal_names_each_type_without_a_kernel_and_the_types_that_have_one() {
 }
 
 #[test]
+fn expert_row_spans_check_bounds_alignment_and_overflow() {
+    let (_written, model) = open(&Spec::default());
+    let mut stack = model
+        .map()
+        .entries()
+        .iter()
+        .find(|t| t.place == Place::Experts)
+        .unwrap()
+        .clone();
+    let [k, rows, experts] = stack.dims[..] else {
+        panic!("expert stack must have three dimensions")
+    };
+    let stride = k / stack.ty.block_elems() * stack.ty.block_bytes();
+    assert_eq!(
+        stack.row_span(Some(0), 0..rows).unwrap(),
+        (0, (rows * stride) as usize)
+    );
+    assert_eq!(
+        stack.row_span(Some(experts - 1), rows - 1..rows).unwrap().0,
+        (experts * rows - 1) * stride
+    );
+    assert!(stack.row_span(None, 0..1).is_err());
+    assert!(stack.row_span(Some(experts), 0..1).is_err());
+    assert!(stack.row_span(Some(0), 0..0).is_err());
+    assert!(stack.row_span(Some(0), rows..rows + 1).is_err());
+    stack.bytes = 0;
+    assert!(stack.row_span(Some(0), 0..1).is_err());
+    stack.bytes = u64::MAX;
+    stack.dims = vec![k, u64::MAX, 3];
+    assert!(stack.row_span(Some(2), 0..1).is_err());
+    stack.dims = vec![k + 1, rows, experts];
+    assert!(stack.row_span(Some(0), 0..1).is_err());
+}
+
+#[test]
 fn a_native_matrix_is_not_a_gap_anywhere_and_q4_1_is_one() {
     use super::tensors::has_decode_kernel;
     assert!(has_decode_kernel(Place::Device, GgufType::Q3K));

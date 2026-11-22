@@ -116,6 +116,43 @@ pub(in super::super::super) struct Mapped {
 }
 
 impl Mapped {
+    /// Tensor-relative stored bytes for contiguous output rows of a matrix or expert.
+    /// This plans file reads only; it does not upload or execute the resulting blocks.
+    pub(in super::super::super) fn row_span(
+        &self,
+        expert: Option<u64>,
+        rows: std::ops::Range<u64>,
+    ) -> Result<(u64, usize), EngError> {
+        let invalid = || EngError::BadRequest(format!("invalid row slice for {}", self.name));
+        let (k, outputs, expert) = match (self.dims.as_slice(), expert) {
+            ([k, outputs], None) => (*k, *outputs, 0),
+            ([k, outputs, experts], Some(expert)) if expert < *experts => (*k, *outputs, expert),
+            _ => return Err(invalid()),
+        };
+        let block = self.ty.block_elems();
+        if k == 0 || !k.is_multiple_of(block) || rows.start >= rows.end || rows.end > outputs {
+            return Err(invalid());
+        }
+        let stride = (k / block)
+            .checked_mul(self.ty.block_bytes())
+            .ok_or_else(invalid)?;
+        let begin = expert
+            .checked_mul(outputs)
+            .and_then(|n| n.checked_add(rows.start))
+            .and_then(|n| n.checked_mul(stride))
+            .ok_or_else(invalid)?;
+        let bytes = (rows.end - rows.start)
+            .checked_mul(stride)
+            .filter(|bytes| {
+                begin
+                    .checked_add(*bytes)
+                    .is_some_and(|end| end <= self.bytes)
+            })
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(invalid)?;
+        Ok((begin, bytes))
+    }
+
     /// Bytes this tensor takes on the card in its device form (zero off the card).
     pub(in super::super::super) fn device_bytes(&self) -> u64 {
         let elements: u64 = self.dims.iter().product();

@@ -103,45 +103,10 @@ fn mapped_blocks(
     expert: Option<u64>,
     rows: Range<u64>,
 ) -> Result<Vec<u8>, EngError> {
-    let (begin, bytes) = mapped_span(tensor, expert, rows)?;
+    let (begin, bytes) = tensor.row_span(expert, rows)?;
     let mut blocks = vec![0; bytes];
     model.weights.read_range(&tensor.name, begin, &mut blocks)?;
     Ok(blocks)
-}
-
-fn mapped_span(
-    tensor: &Mapped,
-    expert: Option<u64>,
-    rows: Range<u64>,
-) -> Result<(u64, usize), EngError> {
-    let invalid = || EngError::BadRequest(format!("invalid row slice for {}", tensor.name));
-    let (k, outputs, expert) = match (tensor.dims.as_slice(), expert) {
-        ([k, outputs], None) => (*k, *outputs, 0),
-        ([k, outputs, experts], Some(expert)) if expert < *experts => (*k, *outputs, expert),
-        _ => return Err(invalid()),
-    };
-    let block = tensor.ty.block_elems();
-    if k == 0 || !k.is_multiple_of(block) || rows.start >= rows.end || rows.end > outputs {
-        return Err(invalid());
-    }
-    let stride = (k / block)
-        .checked_mul(tensor.ty.block_bytes())
-        .ok_or_else(invalid)?;
-    let begin = expert
-        .checked_mul(outputs)
-        .and_then(|base| base.checked_add(rows.start))
-        .and_then(|first| first.checked_mul(stride))
-        .ok_or_else(invalid)?;
-    let bytes = (rows.end - rows.start)
-        .checked_mul(stride)
-        .filter(|bytes| {
-            begin
-                .checked_add(*bytes)
-                .is_some_and(|end| end <= tensor.bytes)
-        })
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or_else(invalid)?;
-    Ok((begin, bytes))
 }
 
 #[test]
@@ -213,7 +178,7 @@ fn write_mapped_projection_sample_plan() {
     let model = projection_model();
     let samples: Vec<_> = projection_samples(&model)
         .map(|(tensor, expert)| {
-            let (begin, bytes) = mapped_span(tensor, expert, 1..4).unwrap();
+            let (begin, bytes) = tensor.row_span(expert, 1..4).unwrap();
             let stored = model.weights.header().tensor(&tensor.name).unwrap();
             serde_json::json!({
                 "name": tensor.name,
