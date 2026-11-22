@@ -110,6 +110,8 @@ struct Rows {
     growth_error_on: Option<u32>,
     /// Makes `reserve_growth` fail with a refusal that is not a memory denial.
     reserve_error: bool,
+    /// The family draws the next token of every row itself, as a device sampler would.
+    device_draw: bool,
 }
 
 impl Rows {
@@ -127,6 +129,7 @@ impl Rows {
             narrow_row: None,
             growth_error_on: None,
             reserve_error: false,
+            device_draw: false,
         }
     }
 }
@@ -218,6 +221,25 @@ impl WindowRows for Rows {
         Ok(Permit(Rc::clone(&self.used), bytes))
     }
 
+    fn draws_on_device(&self) -> bool {
+        self.device_draw
+    }
+
+    fn step_rows_drawn(
+        &mut self,
+        sessions: &mut [&mut RowSession],
+        tokens: &[u32],
+        samplers: &[&crate::family::sampler::Sampler],
+    ) -> Result<Vec<u32>> {
+        assert_eq!(samplers.len(), sessions.len(), "one sampler per row");
+        self.step_calls += 1;
+        self.stepped_rows.push(sessions.len());
+        for session in sessions.iter_mut() {
+            session.fed += 1;
+        }
+        Ok(tokens.iter().map(|&token| next_of(token)).collect())
+    }
+
     fn step_rows(
         &mut self,
         sessions: &mut [&mut RowSession],
@@ -270,7 +292,10 @@ fn solo(prompt: &[u32], limit: u32) -> Vec<u32> {
 /// Runs the prompts together, one window per step over the rows that are still live, and
 /// returns each row's tokens.
 fn windowed(prompts: &[&[u32]], limit: u32) -> Vec<Vec<u32>> {
-    let mut family = Rows::new(8);
+    windowed_with(Rows::new(8), prompts, limit)
+}
+
+fn windowed_with(mut family: Rows, prompts: &[&[u32]], limit: u32) -> Vec<Vec<u32>> {
     let mut sessions: Vec<RowSession> = prompts.iter().map(|p| session(&mut family, p)).collect();
     let mut generations: Vec<GenerationState> = prompts.iter().map(|_| generation(limit)).collect();
     let mut tokens = vec![Vec::new(); prompts.len()];
@@ -311,6 +336,15 @@ fn every_row_of_a_window_equals_its_solo_run() {
         assert_eq!(tokens, &solo(prompt, 12), "prompt {prompt:?}");
         assert!(!tokens.is_empty());
     }
+}
+
+#[test]
+fn a_family_that_draws_on_the_device_runs_the_same_windows() {
+    let prompts: [&[u32]; 3] = [&[1, 2, 3], &[4], &[7, 9, 11, 2]];
+    let mut family = Rows::new(8);
+    family.device_draw = true;
+    let drawn = windowed_with(family, &prompts, 12);
+    assert_eq!(drawn, windowed(&prompts, 12));
 }
 
 #[test]

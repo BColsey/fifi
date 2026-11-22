@@ -63,6 +63,7 @@ use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
 use crate::kernels::cuda::resident::row_add::RowAddCall;
 use crate::kernels::cuda::resident::row_scale::RowScaleCall;
+use crate::kernels::cuda::resident::shortlist;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
 use crate::weights::GgufType;
@@ -444,6 +445,7 @@ pub(crate) struct Bolt {
     pub(crate) graph_mode: DecodeGraphMode,
     /// The logits rows of a window, present once `reserve_window` ran.
     window: Option<WindowBuffers>,
+    draw: crate::family::decode_step::draw::DrawBuffers,
     /// What names the checkpoint to an entry kept outside this process: its header digest, a
     /// sample of every tensor and its length and modification time.
     pub(crate) weights_identity: String,
@@ -798,6 +800,12 @@ pub(crate) fn load_choosing(
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
     let wide_prefill = wide_load.build(&ctx, wide_geometry(cells))?;
+    let draw = crate::family::decode_step::draw::DrawBuffers::new(
+        &ctx,
+        Bolt::PREFILL_BATCH,
+        VOCAB,
+        Bolt::DRAW_WIDTH,
+    )?;
     Ok(Bolt {
         cells,
         attn_splits,
@@ -817,6 +825,7 @@ pub(crate) fn load_choosing(
         graph: None,
         graph_seq: 0,
         window: None,
+        draw,
         weights_identity,
         wide_prefill,
     })
@@ -1036,6 +1045,33 @@ impl Bolt {
         tokens: &[u32],
         positions: &[usize],
     ) -> Result<Vec<Vec<f32>>, EngError> {
+        self.step_window(seqs, tokens, positions)?;
+        let m = seqs.len();
+        let window = self.window.as_ref().expect("checked above");
+        let mut bytes = vec![0u8; m * VOCAB * 4];
+        window.capped.buf.read_at(&self.stream, 0, &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<{ VOCAB * 4 }>()
+            .0
+            .iter()
+            .map(|row| {
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// Steps one token of each sequence together, as [`Self::decode_rows`], and leaves the capped
+    /// logits rows on the device.
+    fn step_window(
+        &mut self,
+        seqs: &[&BoltSeq],
+        tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<(), EngError> {
         let m = seqs.len();
         if m != tokens.len() || m != positions.len() {
             return Err(EngError::BadRequest(
@@ -1069,21 +1105,53 @@ impl Bolt {
         }
         self.decode_body(&Rows::Window { seqs }, true, m)?;
         self.graph_mode.note_eager();
-        let window = self.window.as_ref().expect("checked above");
-        let mut bytes = vec![0u8; m * VOCAB * 4];
-        window.capped.buf.read_at(&self.stream, 0, &mut bytes)?;
-        Ok(bytes
-            .as_chunks::<{ VOCAB * 4 }>()
-            .0
+        Ok(())
+    }
+
+    /// The candidates a draw ranks per row: Bolt's default `top_k` fits whole.
+    pub(crate) const DRAW_WIDTH: usize = shortlist::WIDE_K;
+
+    /// Steps one token and draws the next on the device: the capped logits are ranked and drawn
+    /// where they are, and one word leaves the card instead of the row.
+    pub(crate) fn decode_draw(
+        &mut self,
+        seq: &BoltSeq,
+        token: u32,
+        pos: usize,
+        sampler: &crate::family::sampler::Sampler,
+    ) -> Result<u32, EngError> {
+        self.decode(seq, token, pos)?;
+        let route = crate::family::decode_step::draw::route(sampler, pos as u64, Self::DRAW_WIDTH);
+        Ok(self
+            .draw
+            .draw(&self.ctx, &self.stream, &self.logits_capped.buf, &[route])?[0])
+    }
+
+    /// Steps one token of each sequence together, as [`Self::decode_rows`], and draws the next token
+    /// of each on the device, each from its own sampler at its own position.
+    pub(crate) fn decode_rows_draw(
+        &mut self,
+        seqs: &[&BoltSeq],
+        tokens: &[u32],
+        positions: &[usize],
+        samplers: &[&crate::family::sampler::Sampler],
+    ) -> Result<Vec<u32>, EngError> {
+        if samplers.len() != seqs.len() {
+            return Err(EngError::BadRequest(
+                "a Bolt window needs one sampler per sequence".to_owned(),
+            ));
+        }
+        self.step_window(seqs, tokens, positions)?;
+        let routes: Vec<_> = positions
             .iter()
-            .map(|row| {
-                row.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b))
-                    .collect()
+            .zip(samplers)
+            .map(|(&pos, sampler)| {
+                crate::family::decode_step::draw::route(sampler, pos as u64, Self::DRAW_WIDTH)
             })
-            .collect())
+            .collect();
+        let window = self.window.as_ref().expect("checked above");
+        self.draw
+            .draw(&self.ctx, &self.stream, &window.capped.buf, &routes)
     }
 
     /// Arms or disarms the decode graph for this model (the environment

@@ -54,6 +54,7 @@ impl SamplingScratch {
             ctx.shortlist(
                 stream,
                 ShortlistCall {
+                    k: shortlist::K,
                     logits: head.range(0, vocab * 4)?,
                     scratch: self.shortlist.range(0, self.shortlist.bytes())?,
                     n: vocab,

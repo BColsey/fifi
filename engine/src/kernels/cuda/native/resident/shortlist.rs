@@ -18,6 +18,50 @@ pub(in crate::kernels::cuda) const MASS_PARTS: usize = 8;
 pub(in crate::kernels::cuda) const MASS_SCRATCH_BYTES: usize = 3056;
 /// Most rows of one K-row launch.
 pub(in crate::kernels::cuda) const MAX_ROWS: usize = 16;
+/// The wide width a start can ask for (Bolt's top_k 64 default); [`K`] is the narrow one.
+pub(in crate::kernels::cuda) const WIDE_K: usize = 64;
+/// The tiles every width ranks over.
+const TILES: usize = 16;
+
+/// The byte layout of a single-row launch at one ranked width: `TILES` partial records, the final
+/// record, then the eight f64 mass partials. Width 20 is the layout of the constants above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shape {
+    pub(crate) k: usize,
+    /// Bytes of one record: `k` (logit, id) pairs, the non-finite word and three pad words.
+    pub(crate) part_bytes: usize,
+    pub(crate) result_offset: usize,
+    pub(crate) scratch_bytes: usize,
+    pub(crate) mass_offset: usize,
+    pub(crate) mass_scratch_bytes: usize,
+}
+
+impl Shape {
+    /// The layout at `k`, or `None` for a width the kernels do not instantiate.
+    pub(in crate::kernels::cuda) const fn of(k: usize) -> Option<Self> {
+        if k != K && k != WIDE_K {
+            return None;
+        }
+        let part_bytes = k * 8 + 16;
+        Some(Self {
+            k,
+            part_bytes,
+            result_offset: TILES * part_bytes,
+            scratch_bytes: (TILES + 1) * part_bytes,
+            mass_offset: (TILES + 1) * part_bytes,
+            mass_scratch_bytes: (TILES + 1) * part_bytes + MASS_PARTS * 8,
+        })
+    }
+}
+const _: () = {
+    let narrow = match Shape::of(K) {
+        Some(shape) => shape,
+        None => panic!("the narrow width has a layout"),
+    };
+    assert!(narrow.part_bytes == RESULT_BYTES && narrow.result_offset == RESULT_OFFSET);
+    assert!(narrow.scratch_bytes == SCRATCH_BYTES && narrow.mass_offset == MASS_OFFSET);
+    assert!(narrow.mass_scratch_bytes == MASS_SCRATCH_BYTES);
+};
 /// Bytes of the partials of one row (16 tiles of one record each): the offset of the final record
 /// of the single-row launch.
 pub(in crate::kernels::cuda) const PARTS_BYTES: usize = RESULT_OFFSET;
@@ -27,8 +71,10 @@ struct Args {
     logits: *const c_void,
     scratch: *mut c_void,
     n: c_int,
+    k: c_int,
 }
-const _: () = assert!(size_of::<Args>() == 24 && offset_of!(Args, n) == 16);
+const _: () =
+    assert!(size_of::<Args>() == 24 && offset_of!(Args, n) == 16 && offset_of!(Args, k) == 20);
 /// Mirror of `inference_cuda_shortlist_mass_args`.
 #[repr(C)]
 struct MassArgs {
@@ -36,11 +82,14 @@ struct MassArgs {
     scratch: *mut c_void,
     n: c_int,
     inv_temperature: f32,
+    k: c_int,
+    reserved: c_int,
 }
 const _: () = assert!(
-    size_of::<MassArgs>() == 24
+    size_of::<MassArgs>() == 32
         && offset_of!(MassArgs, n) == 16
         && offset_of!(MassArgs, inv_temperature) == 20
+        && offset_of!(MassArgs, k) == 24
 );
 const _: () = assert!(MASS_OFFSET + MASS_PARTS * 8 == MASS_SCRATCH_BYTES);
 const _: () = assert!(SCRATCH_BYTES <= MASS_OFFSET);
@@ -56,9 +105,11 @@ struct RowsArgs {
     scratch_stride: i64,
     n: c_int,
     m: c_int,
+    k: c_int,
+    reserved: c_int,
 }
 const _: () = assert!(
-    size_of::<RowsArgs>() == 48
+    size_of::<RowsArgs>() == 56
         && offset_of!(RowsArgs, logits) == 0
         && offset_of!(RowsArgs, scratch) == 8
         && offset_of!(RowsArgs, out) == 16
@@ -66,6 +117,7 @@ const _: () = assert!(
         && offset_of!(RowsArgs, scratch_stride) == 32
         && offset_of!(RowsArgs, n) == 40
         && offset_of!(RowsArgs, m) == 44
+        && offset_of!(RowsArgs, k) == 48
 );
 unsafe extern "C" {
     #[link_name = "inference_cuda_shortlist_launch"]
@@ -79,18 +131,20 @@ pub(in crate::kernels::cuda) struct ShortlistRaw<'a> {
     pub(in crate::kernels::cuda) logits: RawRange<'a>,
     pub(in crate::kernels::cuda) scratch: RawRange<'a>,
     pub(in crate::kernels::cuda) n: usize,
+    pub(in crate::kernels::cuda) k: usize,
 }
 pub(in crate::kernels::cuda) fn launch(
     stream: &RawStream,
     io: ShortlistRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let bytes = io.n.checked_mul(4).ok_or_else(invalid_argument)?;
+    let shape = Shape::of(io.k).ok_or_else(invalid_argument)?;
     if !(1..=MAX_LOGITS).contains(&io.n)
         || io.logits.bytes < bytes
         || !io.logits.offset.is_multiple_of(4)
-        || io.scratch.bytes < SCRATCH_BYTES
+        || io.scratch.bytes < shape.scratch_bytes
         || !io.scratch.offset.is_multiple_of(16)
-        || !Span::of(&io.logits, bytes).apart(&Span::of(&io.scratch, SCRATCH_BYTES))
+        || !Span::of(&io.logits, bytes).apart(&Span::of(&io.scratch, shape.scratch_bytes))
     {
         return Err(invalid_argument());
     }
@@ -98,6 +152,7 @@ pub(in crate::kernels::cuda) fn launch(
         logits: io.logits.address().cast_const(),
         scratch: io.scratch.address(),
         n: io.n as c_int,
+        k: io.k as c_int,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: live ranges above hold the checked extents,alignments and disjoint spans.
@@ -116,6 +171,7 @@ pub(in crate::kernels::cuda) struct ShortlistRowsRaw<'a> {
     pub(in crate::kernels::cuda) m: usize,
     pub(in crate::kernels::cuda) ld: usize,
     pub(in crate::kernels::cuda) scratch_stride: usize,
+    pub(in crate::kernels::cuda) k: usize,
 }
 
 /// Queues the two kernels of the K-row shortlist.
@@ -131,8 +187,9 @@ pub(in crate::kernels::cuda) fn launch_rows(
     let scratch_bytes =
         io.m.checked_mul(io.scratch_stride)
             .ok_or_else(invalid_argument)?;
+    let shape = Shape::of(io.k).ok_or_else(invalid_argument)?;
     let out_bytes =
-        io.m.checked_mul(RESULT_BYTES)
+        io.m.checked_mul(shape.part_bytes)
             .ok_or_else(invalid_argument)?;
     let logits = Span::of(&io.logits, logits_bytes);
     let scratch = Span::of(&io.scratch, scratch_bytes);
@@ -140,7 +197,7 @@ pub(in crate::kernels::cuda) fn launch_rows(
     if !((1..=MAX_ROWS).contains(&io.m)
         && (1..=MAX_LOGITS).contains(&io.n)
         && io.ld >= io.n
-        && io.scratch_stride >= PARTS_BYTES
+        && io.scratch_stride >= shape.result_offset
         && io.scratch_stride.is_multiple_of(16)
         && io.logits.bytes >= logits_bytes
         && io.logits.offset.is_multiple_of(4)
@@ -162,6 +219,8 @@ pub(in crate::kernels::cuda) fn launch_rows(
         scratch_stride: i64::try_from(io.scratch_stride).map_err(|_| invalid_argument())?,
         n: io.n as c_int,
         m: io.m as c_int,
+        k: io.k as c_int,
+        reserved: 0,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: the checks above proved `m` and `n` in range, `logits` large enough for the last row,
@@ -180,6 +239,7 @@ pub(in crate::kernels::cuda) struct MassRaw<'a> {
     pub(in crate::kernels::cuda) scratch: RawRange<'a>,
     pub(in crate::kernels::cuda) n: usize,
     pub(in crate::kernels::cuda) inv_temperature: f32,
+    pub(in crate::kernels::cuda) k: usize,
 }
 
 /// Queues the softmax mass kernel after a shortlist launch on the same scratch and stream.
@@ -188,14 +248,15 @@ pub(in crate::kernels::cuda) fn launch_mass(
     io: MassRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let bytes = io.n.checked_mul(4).ok_or_else(invalid_argument)?;
+    let shape = Shape::of(io.k).ok_or_else(invalid_argument)?;
     if !(1..=MAX_LOGITS).contains(&io.n)
         || !io.inv_temperature.is_finite()
         || io.inv_temperature <= 0.0
         || io.logits.bytes < bytes
         || !io.logits.offset.is_multiple_of(4)
-        || io.scratch.bytes < MASS_SCRATCH_BYTES
+        || io.scratch.bytes < shape.mass_scratch_bytes
         || !io.scratch.offset.is_multiple_of(16)
-        || !Span::of(&io.logits, bytes).apart(&Span::of(&io.scratch, MASS_SCRATCH_BYTES))
+        || !Span::of(&io.logits, bytes).apart(&Span::of(&io.scratch, shape.mass_scratch_bytes))
     {
         return Err(invalid_argument());
     }
@@ -204,6 +265,8 @@ pub(in crate::kernels::cuda) fn launch_mass(
         scratch: io.scratch.address(),
         n: io.n as c_int,
         inv_temperature: io.inv_temperature,
+        k: io.k as c_int,
+        reserved: 0,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: the checks above proved the logits extent, the scratch extent (the record the kernel

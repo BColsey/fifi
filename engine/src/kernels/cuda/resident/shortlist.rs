@@ -16,8 +16,23 @@ pub(crate) const MASS_OFFSET: usize = raw::MASS_OFFSET;
 pub(crate) const MASS_PARTS: usize = raw::MASS_PARTS;
 /// Scratch bytes a mass launch needs.
 pub(crate) const MASS_SCRATCH_BYTES: usize = raw::MASS_SCRATCH_BYTES;
-/// Bytes of the partials of one row of a K-row launch (the final record is not part of them).
+/// Bytes of the partials of one row of the narrow K-row launch (the final record is not part of
+/// them).
+#[cfg(test)]
 pub(crate) const PARTS_BYTES: usize = raw::PARTS_BYTES;
+/// The wide width (Bolt's `top_k` 64); [`K`] is the narrow one.
+pub(crate) const WIDE_K: usize = raw::WIDE_K;
+/// The byte layout of a launch at one ranked width.
+pub(crate) type Shape = raw::Shape;
+
+/// The layout at width `k`, or a refusal for a width the kernels do not instantiate.
+pub(crate) fn shape(k: usize) -> Result<Shape, EngError> {
+    Shape::of(k).ok_or_else(|| {
+        EngError::BadRequest(format!(
+            "the device shortlist ranks {K} or {WIDE_K} candidates, not {k}"
+        ))
+    })
+}
 /// The arguments of one K-row launch: the `m` rows of `logits` (`ld` floats apart) each get the record
 /// a single-row launch would give them, stored at `out + r * RESULT_BYTES`.
 pub(crate) struct ShortlistRowsCall<'a> {
@@ -31,10 +46,12 @@ pub(crate) struct ShortlistRowsCall<'a> {
     pub(crate) logits: DeviceRange<'a>,
     /// Scratch of `m * scratch_stride` bytes, 16-byte aligned; needs no initialization.
     pub(crate) scratch: DeviceRange<'a>,
-    /// Bytes between the partials of two rows: a multiple of 16, at least [`PARTS_BYTES`].
+    /// Bytes between the partials of two rows: a multiple of 16, at least the partials of a row at this width.
     pub(crate) scratch_stride: usize,
-    /// `m * RESULT_BYTES` bytes, 16-byte aligned: record `r` is row `r`'s.
+    /// `m * shape(k).part_bytes` bytes, 16-byte aligned: record `r` is row `r`'s.
     pub(crate) out: DeviceRange<'a>,
+    /// The ranked width of every record.
+    pub(crate) k: usize,
 }
 
 /// The arguments of the softmax-mass launch that follows a single-row shortlist on the same
@@ -46,12 +63,16 @@ pub(crate) struct ShortlistMassCall<'a> {
     pub(crate) n: usize,
     /// One over the sampling temperature: finite and positive.
     pub(crate) inv_temperature: f32,
+    /// The width of the record the shortlist launch wrote.
+    pub(crate) k: usize,
 }
 
 pub(crate) struct ShortlistCall<'a> {
     pub(crate) logits: DeviceRange<'a>,
     pub(crate) scratch: DeviceRange<'a>,
     pub(crate) n: usize,
+    /// The ranked width: [`K`] or [`WIDE_K`].
+    pub(crate) k: usize,
 }
 impl CudaContext {
     /// The caller orders the finite-input certificate/result read after this stream work.
@@ -73,9 +94,10 @@ impl CudaContext {
             .checked_mul(4)
             .ok_or_else(|| EngError::BadRequest("device shortlist size overflows".to_owned()))?;
         require_fit("shortlist logits", &call.logits, bytes, 4)?;
-        require_fit("shortlist scratch", &call.scratch, SCRATCH_BYTES, 16)?;
+        let layout = shape(call.k)?;
+        require_fit("shortlist scratch", &call.scratch, layout.scratch_bytes, 16)?;
         require_apart(
-            &Claim::of("shortlist scratch", &call.scratch, SCRATCH_BYTES),
+            &Claim::of("shortlist scratch", &call.scratch, layout.scratch_bytes),
             &Claim::of("shortlist logits", &call.logits, bytes),
         )?;
         self.launch_on(stream, move |s| {
@@ -85,6 +107,7 @@ impl CudaContext {
                     logits,
                     scratch,
                     n: call.n,
+                    k: call.k,
                 },
             )
         })
@@ -117,14 +140,19 @@ impl CudaContext {
             EngError::BadRequest("device shortlist mass size overflows".to_owned())
         })?;
         require_fit("shortlist mass logits", &call.logits, bytes, 4)?;
+        let layout = shape(call.k)?;
         require_fit(
             "shortlist mass scratch",
             &call.scratch,
-            MASS_SCRATCH_BYTES,
+            layout.mass_scratch_bytes,
             16,
         )?;
         require_apart(
-            &Claim::of("shortlist mass scratch", &call.scratch, MASS_SCRATCH_BYTES),
+            &Claim::of(
+                "shortlist mass scratch",
+                &call.scratch,
+                layout.mass_scratch_bytes,
+            ),
             &Claim::of("shortlist mass logits", &call.logits, bytes),
         )?;
         self.launch_on(stream, move |s| {
@@ -135,6 +163,7 @@ impl CudaContext {
                     scratch,
                     n: call.n,
                     inv_temperature: call.inv_temperature,
+                    k: call.k,
                 },
             )
         })
@@ -162,7 +191,8 @@ impl CudaContext {
                     .to_owned(),
             ));
         }
-        if call.scratch_stride < PARTS_BYTES || !call.scratch_stride.is_multiple_of(16) {
+        let layout = shape(call.k)?;
+        if call.scratch_stride < layout.result_offset || !call.scratch_stride.is_multiple_of(16) {
             return Err(EngError::BadRequest(
                 "device shortlist rows: the scratch stride must be a multiple of 16 of at least the \
                  partials of a row"
@@ -179,7 +209,7 @@ impl CudaContext {
             .m
             .checked_mul(call.scratch_stride)
             .ok_or_else(overflow)?;
-        let out_bytes = call.m * RESULT_BYTES;
+        let out_bytes = call.m * layout.part_bytes;
         let logits = self.raw_range(&call.logits)?;
         let scratch = self.raw_range(&call.scratch)?;
         let out = self.raw_range(&call.out)?;
@@ -198,7 +228,7 @@ impl CudaContext {
         }
         #[cfg(test)]
         self.note_row_kernel(crate::kernels::row_launches::RowKernel::ShortlistRows);
-        let (m, n, ld, scratch_stride) = (call.m, call.n, call.ld, call.scratch_stride);
+        let (m, n, ld, scratch_stride, k) = (call.m, call.n, call.ld, call.scratch_stride, call.k);
         self.launch_on(stream, move |s| {
             raw::launch_rows(
                 s,
@@ -210,6 +240,7 @@ impl CudaContext {
                     m,
                     ld,
                     scratch_stride,
+                    k,
                 },
             )
         })

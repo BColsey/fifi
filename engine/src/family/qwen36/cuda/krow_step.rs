@@ -98,7 +98,9 @@ use crate::{
             pack_rows::{PackRowsCall, PackSegment},
             router::RouterShape,
             router_rows::RouterLogitsStridedCall,
-            shortlist::{RESULT_BYTES as SHORTLIST_RECORD_BYTES, ShortlistRowsCall},
+            shortlist::{
+                K as SHORTLIST_K, RESULT_BYTES as SHORTLIST_RECORD_BYTES, ShortlistRowsCall,
+            },
             step_params::{ARGMAX_PART_BYTES, RESULT_PAIR_BYTES, StepParams},
         },
     },
@@ -630,6 +632,7 @@ impl<'a> QwenResidentStep<'a> {
     fn shortlist_call(&self, k: usize) -> Result<ShortlistRowsCall<'_>, EngError> {
         let runtime = self.krow_runtime()?;
         Ok(ShortlistRowsCall {
+            k: SHORTLIST_K,
             m: k,
             n: self.widths.verdict,
             ld: self.res.dims.shape.vocab,

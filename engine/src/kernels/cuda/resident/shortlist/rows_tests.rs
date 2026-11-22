@@ -30,6 +30,7 @@ impl Rig {
             .shortlist(
                 &self.stream,
                 ShortlistCall {
+                    k: K,
                     logits: input.range(0, row.len() * 4).unwrap(),
                     scratch: scratch.range(0, 3072).unwrap(),
                     n: row.len(),
@@ -56,6 +57,7 @@ impl Rig {
             .shortlist_rows(
                 &self.stream,
                 ShortlistRowsCall {
+                    k: K,
                     m,
                     n,
                     ld,
@@ -292,6 +294,7 @@ fn k_row_shortlist_refuses_bad_shapes_before_any_launch() {
     let scratch = testkit::upload_filled(&rig.ctx, STALE, 4 * 3072);
     let out = testkit::upload_filled(&rig.ctx, STALE, 4 * RESULT_BYTES);
     let call = |m: usize, n: usize, ld: usize, stride: usize| ShortlistRowsCall {
+        k: K,
         m,
         n,
         ld,
@@ -317,6 +320,7 @@ fn k_row_shortlist_refuses_bad_shapes_before_any_launch() {
     // A scratch that starts inside the logits overlaps them: one buffer holds both.
     let shared = testkit::upload_f32(&rig.ctx, &vec![1.0f32; 2 * 3072]);
     let overlap = ShortlistRowsCall {
+        k: K,
         m,
         n: 32,
         ld: 32,

@@ -26,6 +26,7 @@
 
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
+use crate::family::sampler::Sampler;
 use crate::family::session::{
     DecodePreparation, DecodeSession, Limits, TokenStepper, sample_logits,
 };
@@ -70,6 +71,25 @@ pub(crate) trait WindowRows: ExecutorOps {
         sessions: &mut [&mut Self::Session],
         tokens: &[u32],
     ) -> Result<Vec<Vec<f32>>>;
+
+    /// Whether this family draws the next token of every row on its own device from the row's
+    /// sampler, so that the logits never leave the card. Such a family runs
+    /// [`Self::step_rows_drawn`] and its `step_rows` is not called.
+    fn draws_on_device(&self) -> bool {
+        false
+    }
+
+    /// Steps every session once, as [`Self::step_rows`], and returns the token each row's sampler
+    /// draws next, in order, one sampler per row. Called with two or more rows, only by a family
+    /// whose [`Self::draws_on_device`] is true.
+    fn step_rows_drawn(
+        &mut self,
+        _sessions: &mut [&mut Self::Session],
+        _tokens: &[u32],
+        _samplers: &[&Sampler],
+    ) -> Result<Vec<u32>> {
+        Err(window_error("this family draws on the host"))
+    }
 }
 
 fn window_error(message: &str) -> EngError {
@@ -195,13 +215,24 @@ fn step_window<F: WindowRows>(
         .iter()
         .map(|&slot| fed_of(family, &mut *sessions[slot]))
         .collect();
+    let drawn_on_device = family.draws_on_device();
+    let mut drawn: Result<Vec<u32>> = Ok(Vec::new());
     let stepped = {
         let mut rows: Vec<&mut F::Session> = sessions
             .iter_mut()
             .enumerate()
             .filter_map(|(slot, session)| admitted.contains(&slot).then_some(&mut **session))
             .collect();
-        family.step_rows(&mut rows, &tokens)
+        if drawn_on_device {
+            let samplers: Vec<&Sampler> = admitted
+                .iter()
+                .map(|&slot| &generations[slot].sampler)
+                .collect();
+            drawn = family.step_rows_drawn(&mut rows, &tokens, &samplers);
+            Ok(Vec::new())
+        } else {
+            family.step_rows(&mut rows, &tokens)
+        }
     };
     // Record every consumed input before any result check or sampler can fail.
     for (&slot, &before) in admitted.iter().zip(&fed_before) {
@@ -210,10 +241,26 @@ fn step_window<F: WindowRows>(
         core.record_feed(before, after);
     }
     let stepped = stepped?;
+    let vocab = family.split(&mut *sessions[admitted[0]]).2.sampler_vocab;
+    if drawn_on_device {
+        let tokens = drawn?;
+        if tokens.len() != admitted.len() {
+            return Err(window_error("the step returned the wrong row count"));
+        }
+        for (&slot, &token) in admitted.iter().zip(&tokens) {
+            results[slot] = Some(publish_drawn(
+                family,
+                &mut *sessions[slot],
+                &mut *generations[slot],
+                token,
+                vocab,
+            ));
+        }
+        return Ok(());
+    }
     if stepped.len() != admitted.len() {
         return Err(window_error("the step returned the wrong row count"));
     }
-    let vocab = family.split(&mut *sessions[admitted[0]]).2.sampler_vocab;
     for (&slot, logits) in admitted.iter().zip(&stepped) {
         results[slot] = Some(publish_row(
             family,
@@ -224,6 +271,24 @@ fn step_window<F: WindowRows>(
         ));
     }
     Ok(())
+}
+
+/// Publishes the token the device drew for one row with the policy of a solo token.
+fn publish_drawn<F: WindowRows>(
+    family: &mut F,
+    session: &mut F::Session,
+    generation: &mut GenerationState,
+    token: u32,
+    vocab: usize,
+) -> Result<DecodeBatch> {
+    if usize::try_from(token).map_or(true, |token| token >= vocab) {
+        return Err(window_error(
+            "a row returned a token outside the sampler vocabulary",
+        ));
+    }
+    generation.sampler.record_device_draw(token);
+    let (core, mut step, limits) = family.split(session);
+    core.finish_decode_token(&mut step, generation, &limits, token)
 }
 
 /// Samples one row from its logits and publishes the token with the policy of a solo token.

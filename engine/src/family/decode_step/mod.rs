@@ -28,6 +28,7 @@ pub(crate) enum ChunkVerdict {
     NoArena,
 }
 
+pub(crate) mod draw;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[allow(
     dead_code,

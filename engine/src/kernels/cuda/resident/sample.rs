@@ -10,11 +10,6 @@
 //! 0 or up to n; top_p is in (0, 1]; min_p is in [0, 1); the logits and the scratch
 //! row hold n floats at 4-byte alignment and do not overlap; the three outputs hold
 //! four bytes each and overlap neither the logits nor the scratch row.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged until the worker calls the sampler")
-)]
-
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,

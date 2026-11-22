@@ -2705,6 +2705,7 @@ impl<'a> QwenResidentStep<'a> {
             self.context.shortlist(
                 &self.stream,
                 ShortlistCall {
+                    k: shortlist::K,
                     logits: self.view(Slot::Logits)?,
                     scratch: self.view(Slot::ArgmaxPart)?,
                     n: self.widths.verdict,
@@ -2715,6 +2716,7 @@ impl<'a> QwenResidentStep<'a> {
             self.context.shortlist_mass(
                 &self.stream,
                 ShortlistMassCall {
+                    k: shortlist::K,
                     logits: self.view(Slot::Logits)?,
                     scratch: self.view(Slot::ArgmaxPart)?,
                     n: self.widths.verdict,

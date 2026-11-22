@@ -488,3 +488,99 @@ fn a_shortlist_draw_keeps_the_status_bits_it_does_not_own() {
     );
     assert_eq!(u32::from_le_bytes([kept[0], kept[1], kept[2], kept[3]]), 8);
 }
+
+#[test]
+fn the_wide_shortlist_ranks_like_the_host_and_its_draws_follow_the_host_sampler() {
+    use crate::family::sampler::{Sampler, SamplingParams};
+    use crate::kernels::cuda::resident::shortlist::{ShortlistRowsCall, WIDE_K, shape};
+    if !testkit::device_present("wide shortlist draw") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let n = 1000;
+    let row = model_like_row(n);
+    let layout = shape(WIDE_K).expect("wide layout");
+    let logits = testkit::upload_f32(&ctx, &row);
+    let scratch = testkit::upload_filled(&ctx, 0, layout.result_offset);
+    let records = testkit::upload_filled(&ctx, 0, layout.part_bytes);
+    ctx.shortlist_rows(
+        &stream,
+        ShortlistRowsCall {
+            k: WIDE_K,
+            m: 1,
+            n,
+            ld: n,
+            logits: logits.range(0, n * 4).expect("logits"),
+            scratch: scratch.range(0, layout.result_offset).expect("scratch"),
+            scratch_stride: layout.result_offset,
+            out: records.range(0, layout.part_bytes).expect("records"),
+        },
+    )
+    .expect("wide shortlist");
+    stream.synchronize().expect("drain");
+    let bytes = testkit::read_bytes(&ctx, &records, layout.part_bytes);
+    // The record is the host's stable ranking: larger logit first, then lower id.
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by(|&a, &b| {
+        row[b as usize]
+            .total_cmp(&row[a as usize])
+            .then_with(|| a.cmp(&b))
+    });
+    for (rank, &id) in order[..WIDE_K].iter().enumerate() {
+        let at = rank * 8;
+        let device_logit = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let device_id = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+        assert_eq!(
+            (device_id, device_logit.to_bits()),
+            (id, row[id as usize].to_bits()),
+            "rank {rank}"
+        );
+    }
+    assert_eq!(&bytes[WIDE_K * 8..WIDE_K * 8 + 4], &[0; 4], "finite row");
+    let draws = 6000u64;
+    for (temperature, top_p, top_k) in [(1.0f64, 0.95f64, 64u32), (0.8, 1.0, 40)] {
+        let token = testkit::upload_filled(&ctx, 0, 4);
+        let logprob = testkit::upload_filled(&ctx, 0, 4);
+        let status = testkit::upload_filled(&ctx, 0, 4);
+        let mut device = vec![0u32; n];
+        for position in 0..draws {
+            ctx.sample_shortlist(
+                &stream,
+                SampleShortlistCall {
+                    token: token.range(0, 4).expect("token"),
+                    logprob: logprob.range(0, 4).expect("logprob"),
+                    status: status.range(0, 4).expect("status"),
+                    entries: records.range(0, WIDE_K * 8).expect("entries"),
+                    flag: records.range(WIDE_K * 8, 4).expect("flag"),
+                    count: WIDE_K,
+                    draw: ShortlistDraw {
+                        temperature: temperature as f32,
+                        top_k: top_k as usize,
+                        top_p: top_p as f32,
+                        seed: 0xb017,
+                        position,
+                    },
+                },
+            )
+            .expect("wide draw");
+            stream.synchronize().expect("drain");
+            let id = testkit::read_bytes(&ctx, &token, 4);
+            device[u32::from_le_bytes([id[0], id[1], id[2], id[3]]) as usize] += 1;
+        }
+        let mut host = vec![0u32; n];
+        let mut sampler = Sampler::new(
+            SamplingParams::new(temperature, top_p, top_k).expect("params"),
+            0xfeed,
+        );
+        for _ in 0..draws {
+            host[sampler.sample(&row).expect("host draw") as usize] += 1;
+        }
+        let (statistic, df) = two_sample_chi_square(&device, &host);
+        let bound = df as f64 + 5.0 * (2.0 * df as f64).sqrt();
+        assert!(
+            statistic < bound,
+            "T {temperature} top_p {top_p} top_k {top_k}: chi-square {statistic:.1} over {df} cells, bound {bound:.1}"
+        );
+    }
+}

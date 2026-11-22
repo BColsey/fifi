@@ -468,10 +468,6 @@ pub(crate) struct Sampler {
     /// request's generation state, so the latch reads as the margin at the request's first
     /// decode position.
     first_top2_margin: Option<f32>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler")
-    )]
     seed: u64,
     rng: SplitMix64,
 }
@@ -516,10 +512,6 @@ impl Sampler {
     }
 
     /// The seed that the generator started from. The generator state is not exposed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler")
-    )]
     pub(crate) fn seed(&self) -> u64 {
         self.seed
     }

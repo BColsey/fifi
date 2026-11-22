@@ -206,6 +206,27 @@ mod device {
             self.model.capped_logits()
         }
 
+        /// The next token is drawn on the device from the capped logits: one word leaves the card.
+        fn next_token(
+            &mut self,
+            token: u32,
+            sampler: &mut crate::family::sampler::Sampler,
+            sampler_vocab: usize,
+        ) -> Result<u32, EngError> {
+            if sampler_vocab != VOCAB {
+                return Err(EngError::Backend {
+                    operation: Self::OPERATION,
+                    message: "the sampler vocabulary is not the head width".to_owned(),
+                });
+            }
+            let drawn = self
+                .model
+                .decode_draw(self.seq, token, *self.pos, sampler)?;
+            *self.pos += 1;
+            sampler.record_device_draw(drawn);
+            Ok(drawn)
+        }
+
         fn fed(&self) -> usize {
             *self.pos
         }
@@ -505,19 +526,39 @@ mod device {
             Ok(())
         }
 
-        /// One token of every session through one step.
+        /// A Bolt window draws on the device; the logits rows stay on the card.
         fn step_rows(
+            &mut self,
+            _sessions: &mut [&mut BoltSession],
+            _tokens: &[u32],
+        ) -> Result<Vec<Vec<f32>>, EngError> {
+            Err(EngError::Backend {
+                operation: Self::OPERATION,
+                message: "a Bolt window draws its tokens on the device".to_owned(),
+            })
+        }
+
+        fn draws_on_device(&self) -> bool {
+            true
+        }
+
+        /// One token of every session through one step, and the next token of each drawn from
+        /// its own sampler.
+        fn step_rows_drawn(
             &mut self,
             sessions: &mut [&mut BoltSession],
             tokens: &[u32],
-        ) -> Result<Vec<Vec<f32>>, EngError> {
+            samplers: &[&crate::family::sampler::Sampler],
+        ) -> Result<Vec<u32>, EngError> {
             let seqs: Vec<&BoltSeq> = sessions.iter().map(|session| &session.seq).collect();
             let positions: Vec<usize> = sessions.iter().map(|session| session.pos).collect();
-            let rows = self.model.decode_rows(&seqs, tokens, &positions)?;
+            let drawn = self
+                .model
+                .decode_rows_draw(&seqs, tokens, &positions, samplers)?;
             for session in sessions.iter_mut() {
                 session.pos += 1;
             }
-            Ok(rows)
+            Ok(drawn)
         }
     }
 

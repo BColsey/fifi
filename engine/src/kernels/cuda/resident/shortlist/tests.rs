@@ -25,6 +25,7 @@ fn device_rows() -> Result<Vec<RowEvidence>, EngError> {
         ctx.shortlist(
             &stream,
             ShortlistCall {
+                k: K,
                 logits: input.range(0, n * 4)?,
                 scratch: scratch.range(0, 3072)?,
                 n,
@@ -107,6 +108,7 @@ fn device_range_checks() -> Result<(u32, Vec<bool>), EngError> {
     let scratch = ctx.upload(&[0u8; 3072])?;
     let call = || -> Result<ShortlistCall<'_>, EngError> {
         Ok(ShortlistCall {
+            k: K,
             logits: input.range(0, 257 * 4)?,
             scratch: scratch.range(0, 3072)?,
             n: 257,
@@ -158,6 +160,7 @@ fn device_mass(row: &[f32], temperature: f64) -> Result<(f64, f64), EngError> {
     ctx.shortlist(
         &stream,
         ShortlistCall {
+            k: K,
             logits: input.range(0, n * 4)?,
             scratch: scratch.range(0, 3072)?,
             n,
@@ -166,6 +169,7 @@ fn device_mass(row: &[f32], temperature: f64) -> Result<(f64, f64), EngError> {
     ctx.shortlist_mass(
         &stream,
         ShortlistMassCall {
+            k: K,
             logits: input.range(0, n * 4)?,
             scratch: scratch.range(0, 3072)?,
             n,
@@ -231,6 +235,7 @@ fn the_mass_launch_refuses_a_bad_temperature_or_a_short_scratch() {
     let input = ctx.upload(&raw).expect("upload");
     let scratch = ctx.upload(&[0u8; 3072]).expect("upload");
     let call = |inv_temperature: f32, scratch_bytes: usize, n: usize| ShortlistMassCall {
+        k: K,
         logits: input.range(0, 257 * 4).expect("range"),
         scratch: scratch.range(0, scratch_bytes).expect("range"),
         n,

@@ -29,6 +29,7 @@ typedef struct inference_cuda_shortlist_args {
     const void *logits;
     void *scratch;
     int n;
+    int k; /* ranked width of the record: 20 or 64 */
 } inference_cuda_shortlist_args;
 /* Launch-only stable top-20: larger logit first, then lower id; original f32 bits retained.
  * logits: 4-byte-aligned f32[n], n in1..2^30. scratch:16-byte-aligned2992bytes,disjoint.
@@ -42,6 +43,8 @@ typedef struct inference_cuda_shortlist_mass_args {
     void *scratch;
     int n;
     float inv_temperature;
+    int k; /* the width of the record the shortlist launch wrote: 20 or 64 */
+    int reserved;
 } inference_cuda_shortlist_mass_args;
 /* The softmax mass of the row a single-row shortlist launch just ranked, on the same scratch: the
  * sum over all n values of expf((logit - top) * inv_temperature), where top is the first entry of
@@ -63,6 +66,8 @@ typedef struct inference_cuda_shortlist_rows_args {
     long long scratch_stride;
     int n;
     int m;
+    int k; /* ranked width of every record: 20 or 64 */
+    int reserved;
 } inference_cuda_shortlist_rows_args;
 /* The K-row form of the shortlist above: row r (0 <= r < m) of the m logits rows, each of n f32 values
  * and row r starting r * ld floats after the first, gets the record the single-row launch gives it
@@ -79,18 +84,20 @@ int inference_cuda_shortlist_rows_launch(const inference_cuda_shortlist_rows_arg
 static_assert(sizeof(inference_cuda_shortlist_candidate)==8,"candidate layout");
 static_assert(sizeof(inference_cuda_shortlist_result)==176 &&
               offsetof(inference_cuda_shortlist_result,non_finite)==160,"result layout");
-static_assert(sizeof(inference_cuda_shortlist_mass_args)==24 &&
+static_assert(sizeof(inference_cuda_shortlist_mass_args)==32 &&
               offsetof(inference_cuda_shortlist_mass_args,n)==16 &&
               offsetof(inference_cuda_shortlist_mass_args,inv_temperature)==20,"mass argument layout");
 static_assert(sizeof(inference_cuda_shortlist_args)==24 &&
-              offsetof(inference_cuda_shortlist_args,n)==16,"argument layout");
-static_assert(sizeof(inference_cuda_shortlist_rows_args)==48 &&
+              offsetof(inference_cuda_shortlist_args,n)==16 &&
+              offsetof(inference_cuda_shortlist_args,k)==20,"argument layout");
+static_assert(sizeof(inference_cuda_shortlist_rows_args)==56 &&
               offsetof(inference_cuda_shortlist_rows_args,logits)==0 &&
               offsetof(inference_cuda_shortlist_rows_args,scratch)==8 &&
               offsetof(inference_cuda_shortlist_rows_args,out)==16 &&
               offsetof(inference_cuda_shortlist_rows_args,ld)==24 &&
               offsetof(inference_cuda_shortlist_rows_args,scratch_stride)==32 &&
               offsetof(inference_cuda_shortlist_rows_args,n)==40 &&
-              offsetof(inference_cuda_shortlist_rows_args,m)==44,"rows argument layout");
+              offsetof(inference_cuda_shortlist_rows_args,m)==44 &&
+              offsetof(inference_cuda_shortlist_rows_args,k)==48,"rows argument layout");
 #endif
 #endif

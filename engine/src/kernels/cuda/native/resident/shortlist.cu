@@ -1,18 +1,34 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
+#include <type_traits>
 #include "abi.h"
 #include "device.h"
 #include "resident/shortlist.h"
 
 namespace {
 using Candidate = inference_cuda_shortlist_candidate;
-using Part = inference_cuda_shortlist_result;
+/* A ranked record of K candidates: the C struct `inference_cuda_shortlist_result` for K = 20. */
+template <int K>
+struct PartK {
+    Candidate entries[K];
+    uint32_t non_finite;
+    uint32_t pad[3];
+};
+/* The widths a start can ask for: the card families rank 20 (Qwen3.6 and its kin) or 64 (Bolt). */
+constexpr int kWidthA = 20;
+constexpr int kWidthB = 64;
+/* Byte layout of the scratch of a single-row launch of width k: kTiles partial records, then the
+ * final record, then the eight f64 mass partials. */
+constexpr size_t part_bytes(int k) { return size_t(k) * 8 + 16; }
+constexpr size_t result_offset(int k) { return INFERENCE_CUDA_SHORTLIST_TILES * part_bytes(k); }
+constexpr size_t scratch_bytes(int k) { return (INFERENCE_CUDA_SHORTLIST_TILES + 1) * part_bytes(k); }
+constexpr size_t mass_offset(int k) { return scratch_bytes(k); }
+constexpr size_t mass_scratch_bytes(int k) { return mass_offset(k) + 8 * INFERENCE_CUDA_SHORTLIST_MASS_PARTS; }
+bool width_ok(int k) { return k == kWidthA || k == kWidthB; }
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
 constexpr int kTiles = INFERENCE_CUDA_SHORTLIST_TILES;
-constexpr int kK = INFERENCE_CUDA_SHORTLIST_K;
-constexpr size_t kScratch = INFERENCE_CUDA_SHORTLIST_SCRATCH_BYTES;
 
 __device__ Candidate empty_candidate() { return {-INFINITY, UINT32_MAX}; }
 
@@ -43,7 +59,8 @@ __device__ Candidate block_best(Candidate best, Candidate *warps, Candidate *cho
     return *chosen;
 }
 
-__global__ void shortlist_parts_k(const float *logits, int n, Part *parts) {
+template <int K>
+__global__ void shortlist_parts_k(const float *logits, int n, PartK<K> *parts) {
     __shared__ Candidate warps[kWarps], chosen;
     __shared__ unsigned warp_bad[kWarps];
     const size_t first = size_t(n) * blockIdx.x / kTiles;
@@ -52,7 +69,7 @@ __global__ void shortlist_parts_k(const float *logits, int n, Part *parts) {
     Candidate cutoff{INFINITY, 0};
     bool bad = false;
 #pragma unroll 1
-    for (int rank = 0; rank < kK; ++rank) {
+    for (int rank = 0; rank < K; ++rank) {
         Candidate best = empty_candidate();
         for (size_t index = first + threadIdx.x; index < end; index += kThreads) {
             const Candidate value{logits[index], unsigned(index)};
@@ -78,14 +95,15 @@ __global__ void shortlist_parts_k(const float *logits, int n, Part *parts) {
     }
 }
 
-__global__ void shortlist_final_k(Part *parts) {
+template <int K>
+__global__ void shortlist_final_k(PartK<K> *parts) {
     __shared__ Candidate warps[kWarps], chosen;
     Candidate cutoff{INFINITY, 0};
 #pragma unroll 1
-    for (int rank = 0; rank < kK; ++rank) {
+    for (int rank = 0; rank < K; ++rank) {
         Candidate best = empty_candidate();
-        for (int index = threadIdx.x; index < kTiles * kK; index += kThreads) {
-            const Candidate value = parts[index / kK].entries[index % kK];
+        for (int index = threadIdx.x; index < kTiles * K; index += kThreads) {
+            const Candidate value = parts[index / K].entries[index % K];
             if (value.id != UINT32_MAX && better(cutoff, value) && better(value, best)) best = value;
         }
         cutoff = block_best(best, warps, &chosen);
@@ -105,21 +123,22 @@ __global__ void shortlist_final_k(Part *parts) {
  * are those of the two kernels above with the row taken from the block index; the selection is made
  * of comparisons only, so the record of a row is a function of that row alone. Differences, on
  * purpose: the partials of row r live at scratch + r * scratch_stride, and the final record goes to
- * out + r * sizeof(Part) instead of the last part of the scratch, so the m records are contiguous
+ * out + r * part_bytes(k) instead of the last part of the scratch, so the m records are contiguous
  * for one device-to-host read. */
+template <int K>
 __global__ void shortlist_parts_rows_k(const float *logits, long long ld, int n, char *scratch,
                                        long long stride) {
     __shared__ Candidate warps[kWarps], chosen;
     __shared__ unsigned warp_bad[kWarps];
     const float *row_logits = logits + (size_t)blockIdx.y * (size_t)ld;
-    Part *parts = reinterpret_cast<Part *>(scratch + (size_t)blockIdx.y * (size_t)stride);
+    PartK<K> *parts = reinterpret_cast<PartK<K> *>(scratch + (size_t)blockIdx.y * (size_t)stride);
     const size_t first = size_t(n) * blockIdx.x / kTiles;
     const size_t end = size_t(n) * (blockIdx.x + 1) / kTiles;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     Candidate cutoff{INFINITY, 0};
     bool bad = false;
 #pragma unroll 1
-    for (int rank = 0; rank < kK; ++rank) {
+    for (int rank = 0; rank < K; ++rank) {
         Candidate best = empty_candidate();
         for (size_t index = first + threadIdx.x; index < end; index += kThreads) {
             const Candidate value{row_logits[index], unsigned(index)};
@@ -145,16 +164,17 @@ __global__ void shortlist_parts_rows_k(const float *logits, long long ld, int n,
     }
 }
 
-__global__ void shortlist_final_rows_k(const char *scratch, long long stride, Part *out) {
+template <int K>
+__global__ void shortlist_final_rows_k(const char *scratch, long long stride, PartK<K> *out) {
     __shared__ Candidate warps[kWarps], chosen;
-    const Part *parts = reinterpret_cast<const Part *>(scratch + (size_t)blockIdx.x * (size_t)stride);
-    Part *result = out + blockIdx.x;
+    const PartK<K> *parts = reinterpret_cast<const PartK<K> *>(scratch + (size_t)blockIdx.x * (size_t)stride);
+    PartK<K> *result = out + blockIdx.x;
     Candidate cutoff{INFINITY, 0};
 #pragma unroll 1
-    for (int rank = 0; rank < kK; ++rank) {
+    for (int rank = 0; rank < K; ++rank) {
         Candidate best = empty_candidate();
-        for (int index = threadIdx.x; index < kTiles * kK; index += kThreads) {
-            const Candidate value = parts[index / kK].entries[index % kK];
+        for (int index = threadIdx.x; index < kTiles * K; index += kThreads) {
+            const Candidate value = parts[index / K].entries[index % K];
             if (value.id != UINT32_MAX && better(cutoff, value) && better(value, best)) best = value;
         }
         cutoff = block_best(best, warps, &chosen);
@@ -170,16 +190,14 @@ __global__ void shortlist_final_rows_k(const char *scratch, long long stride, Pa
 }
 
 constexpr int kMassBlocks = INFERENCE_CUDA_SHORTLIST_MASS_PARTS;
-constexpr size_t kMassOffset = INFERENCE_CUDA_SHORTLIST_MASS_OFFSET;
-constexpr size_t kMassScratch = INFERENCE_CUDA_SHORTLIST_MASS_SCRATCH_BYTES;
 
 /* One block's share of the softmax mass: thread t adds the terms index = block * kThreads + t,
  * stepping by kMassBlocks * kThreads, in f32; the f32 sums are then added in f64, warp by warp and
  * block by block in a fixed order, so a launch is deterministic. */
-__global__ void shortlist_mass_k(const float *logits, int n, char *scratch, float inv_temperature) {
+__global__ void shortlist_mass_k(const float *logits, int n, char *scratch, float inv_temperature,
+                                 size_t record_at, size_t partials_at) {
     __shared__ double warps[kWarps];
-    const Part *record = reinterpret_cast<const Part *>(scratch + INFERENCE_CUDA_SHORTLIST_RESULT_OFFSET);
-    const float top = record->entries[0].logit;
+    const float top = reinterpret_cast<const Candidate *>(scratch + record_at)->logit;
     float acc = 0.0f;
     const size_t stride = size_t(kMassBlocks) * kThreads;
 #pragma unroll 4
@@ -196,40 +214,40 @@ __global__ void shortlist_mass_k(const float *logits, int n, char *scratch, floa
         double block = 0.0;
 #pragma unroll
         for (int i = 0; i < kWarps; ++i) block += warps[i];
-        reinterpret_cast<double *>(scratch + kMassOffset)[blockIdx.x] = block;
+        reinterpret_cast<double *>(scratch + partials_at)[blockIdx.x] = block;
     }
 }
 
 bool valid_mass(const inference_cuda_shortlist_mass_args *a, void *stream) {
-    if (!a || !stream || !a->logits || !a->scratch || a->n < 1 || a->n > (1 << 30) ||
+    if (!a || !stream || !width_ok(a->k) || !a->logits || !a->scratch || a->n < 1 || a->n > (1 << 30) ||
         !isfinite(a->inv_temperature) || !(a->inv_temperature > 0.0f)) {
         return false;
     }
     const uintptr_t x = uintptr_t(a->logits), s = uintptr_t(a->scratch);
     if (x % 4 || s % 16) return false;
     const size_t bytes = size_t(a->n) * 4;
-    return s <= x ? kMassScratch <= x - s : bytes <= s - x;
+    return s <= x ? mass_scratch_bytes(a->k) <= x - s : bytes <= s - x;
 }
 
 bool valid(const inference_cuda_shortlist_args *a, void *stream) {
-    if (!a || !stream || !a->logits || !a->scratch || a->n < 1 || a->n > (1 << 30)) return false;
+    if (!a || !stream || !width_ok(a->k) || !a->logits || !a->scratch || a->n < 1 || a->n > (1 << 30)) return false;
     const uintptr_t x = uintptr_t(a->logits), s = uintptr_t(a->scratch);
     if (x % 4 || s % 16) return false;
     const size_t bytes = size_t(a->n) * 4;
-    return s <= x ? kScratch <= x - s : bytes <= s - x;
+    return s <= x ? scratch_bytes(a->k) <= x - s : bytes <= s - x;
 }
 
 bool valid_rows(const inference_cuda_shortlist_rows_args *a, void *stream) {
-    if (!a || !stream || !a->logits || !a->scratch || !a->out || a->n < 1 || a->n > (1 << 30) ||
+    if (!a || !stream || !width_ok(a->k) || !a->logits || !a->scratch || !a->out || a->n < 1 || a->n > (1 << 30) ||
         a->m < 1 || a->m > INFERENCE_CUDA_SHORTLIST_MAX_ROWS || a->ld < a->n || a->ld > (1LL << 40) ||
-        a->scratch_stride < (long long)(kTiles * sizeof(Part)) || a->scratch_stride % 16) {
+        a->scratch_stride < (long long)(kTiles * part_bytes(a->k)) || a->scratch_stride % 16) {
         return false;
     }
     const uintptr_t x = uintptr_t(a->logits), s = uintptr_t(a->scratch), o = uintptr_t(a->out);
     if (x % 4 || s % 16 || o % 16) return false;
     const uintptr_t x_end = x + (uintptr_t(a->m - 1) * uintptr_t(a->ld) + uintptr_t(a->n)) * 4;
     const uintptr_t s_end = s + uintptr_t(a->m) * uintptr_t(a->scratch_stride);
-    const uintptr_t o_end = o + uintptr_t(a->m) * sizeof(Part);
+    const uintptr_t o_end = o + uintptr_t(a->m) * part_bytes(a->k);
     const bool x_s = x_end <= s || s_end <= x;
     const bool x_o = x_end <= o || o_end <= x;
     const bool s_o = s_end <= o || o_end <= s;
@@ -243,13 +261,25 @@ extern "C" int inference_cuda_shortlist_launch(const inference_cuda_shortlist_ar
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!valid(a, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        auto parts = static_cast<Part *>(a->scratch);
-        shortlist_parts_k<<<kTiles, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            static_cast<const float *>(a->logits), a->n, parts);
-        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        if (failure.ok()) {
-            shortlist_final_k<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(parts);
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        if (a->k == kWidthA) {
+            auto parts = static_cast<PartK<kWidthA> *>(a->scratch);
+            shortlist_parts_k<kWidthA><<<kTiles, kThreads, 0, s>>>(
+                static_cast<const float *>(a->logits), a->n, parts);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (failure.ok()) {
+                shortlist_final_k<kWidthA><<<1, kThreads, 0, s>>>(parts);
+                failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            }
+        } else {
+            auto parts = static_cast<PartK<kWidthB> *>(a->scratch);
+            shortlist_parts_k<kWidthB><<<kTiles, kThreads, 0, s>>>(
+                static_cast<const float *>(a->logits), a->n, parts);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (failure.ok()) {
+                shortlist_final_k<kWidthB><<<1, kThreads, 0, s>>>(parts);
+                failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            }
         }
         report_stage(out_stage, failure.stage);
         return int(failure.err);
@@ -265,16 +295,21 @@ extern "C" int inference_cuda_shortlist_rows_launch(const inference_cuda_shortli
         if (!valid_rows(a, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
-        shortlist_parts_rows_k<<<dim3(kTiles, a->m), kThreads, 0, s>>>(
-            static_cast<const float *>(a->logits), a->ld, a->n, static_cast<char *>(a->scratch),
-            a->scratch_stride);
-        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        if (failure.ok()) {
-            shortlist_final_rows_k<<<a->m, kThreads, 0, s>>>(static_cast<const char *>(a->scratch),
-                                                             a->scratch_stride,
-                                                             static_cast<Part *>(a->out));
+        auto run = [&](auto width) {
+            constexpr int K = decltype(width)::value;
+            shortlist_parts_rows_k<K><<<dim3(kTiles, a->m), kThreads, 0, s>>>(
+                static_cast<const float *>(a->logits), a->ld, a->n, static_cast<char *>(a->scratch),
+                a->scratch_stride);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        }
+            if (failure.ok()) {
+                shortlist_final_rows_k<K><<<a->m, kThreads, 0, s>>>(
+                    static_cast<const char *>(a->scratch), a->scratch_stride,
+                    static_cast<PartK<K> *>(a->out));
+                failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            }
+        };
+        if (a->k == kWidthA) run(std::integral_constant<int, kWidthA>{});
+        else run(std::integral_constant<int, kWidthB>{});
         report_stage(out_stage, failure.stage);
         return int(failure.err);
     } catch (...) {
@@ -290,7 +325,7 @@ extern "C" int inference_cuda_shortlist_mass_launch(const inference_cuda_shortli
         Failure failure;
         shortlist_mass_k<<<kMassBlocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const float *>(a->logits), a->n, static_cast<char *>(a->scratch),
-            a->inv_temperature);
+            a->inv_temperature, result_offset(a->k), mass_offset(a->k));
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return int(failure.err);
