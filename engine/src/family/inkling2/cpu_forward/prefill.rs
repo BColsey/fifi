@@ -301,6 +301,9 @@ impl CpuForward {
         } else {
             None
         };
+        if let Some(values) = chained.as_ref() {
+            self.diagnose_chained_projections(visit, &layer, rows, weights, values)?;
+        }
         let mut attention_inputs = if chained.is_some() {
             None
         } else {
@@ -516,6 +519,60 @@ impl CpuForward {
                 Ok(MlpRow { route, input })
             })
             .collect()
+    }
+
+    fn diagnose_chained_projections(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        rows: &[PromptRow<'_>],
+        weights: &GgufTextWeights,
+        fused: &[super::super::cpu_attention::AttentionProjection],
+    ) -> Result<(), EngError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if std::env::var("FIFI_INKLING_DEBUG_CHAIN_COMPARE").as_deref() != Ok("1")
+            || DONE.swap(true, Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let (inputs, batched) = self
+            .prompt_attention_inputs(visit, layer, rows)?
+            .ok_or_else(|| bad("diagnostic requires baseline grouped inputs"))?;
+        let baseline = self
+            .project_prompt_attention(weights, layer, visit, &inputs, batched)?
+            .ok_or_else(|| bad("diagnostic requires baseline attention projections"))?;
+        if baseline.len() != fused.len() {
+            return Err(bad("diagnostic row count differs"));
+        }
+        let mut stats = [(0.0f32, 0usize, 0usize, 0usize); 8];
+        for (row, (a, b)) in baseline.iter().zip(fused).enumerate() {
+            for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                if a.len() != b.len() {
+                    return Err(bad("diagnostic projection width differs"));
+                }
+                for (column, (&x, &y)) in a.iter().zip(b).enumerate() {
+                    if !x.is_finite() || !y.is_finite() {
+                        return Err(bad("nonfinite diagnostic projection"));
+                    }
+                    let delta = (x - y).abs();
+                    stats[index].3 += usize::from(x.to_bits() != y.to_bits());
+                    if delta > stats[index].0 {
+                        stats[index].0 = delta;
+                        stats[index].1 = row;
+                        stats[index].2 = column;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "Inkling grouped chain diagnostic {}",
+            serde_json::json!({
+                "layer":layer, "state_slot":visit.state_slot, "rows":rows.len(), "baseline_batched":batched,
+                "projections":stats.map(|(max_abs,row,column,unequal)| serde_json::json!({"max_abs":max_abs,"row":row,"column":column,"unequal":unequal})),
+            })
+        );
+        Ok(())
     }
 
     fn prompt_attention_inputs(
