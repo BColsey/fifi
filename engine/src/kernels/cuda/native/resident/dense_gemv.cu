@@ -228,6 +228,8 @@ bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelect
     return true;
 }
 
+#include "resident/inkling_gate_dot.cuh"
+
 size_t weight_row_bytes(int dtype, int cols) {
     switch (dtype) {
     case kDtypeF16:
@@ -526,14 +528,18 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
                 cudaStream_t stream, Failure &failure, int *grouped_iq2_gate) {
     float *middle = a.scratch + size_t(a.count) * 2 * a.middle;
     float *down = middle + size_t(a.count) * a.middle;
-    bool grouped = false;
+    int selected_gate = 0;
     if constexpr (DevicePicks) {
-        if (grouped_iq2_gate && *grouped_iq2_gate == 1) {
-            grouped = launch_inkling_iq2_gate(a, gate, stream, failure);
+        if (grouped_iq2_gate && *grouped_iq2_gate == 2 &&
+            launch_inkling_gate_dot(a, gate, middle, stream, failure)) {
+            selected_gate = 2;
+        } else if (grouped_iq2_gate && *grouped_iq2_gate != 0 &&
+                   launch_inkling_iq2_gate(a, gate, stream, failure)) {
+            selected_gate = 1;
         }
     }
-    if (grouped_iq2_gate) *grouped_iq2_gate = grouped;
-    if (!grouped) {
+    if (grouped_iq2_gate) *grouped_iq2_gate = selected_gate;
+    if (!selected_gate) {
         launch_packed({a.gate, a.x, a.scratch, a.count, 2 * a.middle, a.hidden,
                        0, 2 * a.middle, a.gate_dtype}, stream, failure, gate);
     }

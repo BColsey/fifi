@@ -7,7 +7,7 @@ use crate::{
         CudaContext, DeviceRange, DeviceStream,
         context::{Claim, require_apart, require_fit},
         native::resident::dense_gemv::moe::{
-            GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, launch_gguf_moe,
+            GgufGate, GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, launch_gguf_moe,
         },
     },
 };
@@ -59,20 +59,21 @@ impl CudaContext {
         stream: &DeviceStream,
         call: GgufMoeCall<'_>,
     ) -> Result<(), EngError> {
-        self.gguf_moe_with_iq2_gate(stream, call, false).map(|_| ())
+        self.gguf_moe_with_gate(stream, call, GgufGate::Packed)
+            .map(|_| ())
     }
 
-    /// Requests the Inkling-specific IQ2 gate schedule; reports whether it was queued.
-    pub(crate) fn gguf_moe_with_iq2_gate(
+    /// Requests a resident gate schedule and reports what was queued.
+    pub(crate) fn gguf_moe_with_gate(
         &self,
         stream: &DeviceStream,
         call: GgufMoeCall<'_>,
-        grouped_iq2_gate: bool,
-    ) -> Result<bool, EngError> {
+        schedule: GgufGate,
+    ) -> Result<GgufGate, EngError> {
         self.ensure_usable()?;
         let raw = self.plan_gguf_moe(&call)?;
         self.launch_on(stream, |stream_raw| {
-            launch_gguf_moe(stream_raw, raw, grouped_iq2_gate)
+            launch_gguf_moe(stream_raw, raw, schedule)
         })
     }
 

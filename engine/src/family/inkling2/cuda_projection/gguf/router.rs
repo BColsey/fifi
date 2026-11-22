@@ -13,7 +13,7 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
         resident::{
-            dense_gemv::{DenseDtype, GgufMoeCall, GgufMoePicks, GgufMoeWeights},
+            dense_gemv::{DenseDtype, GgufGate, GgufMoeCall, GgufMoePicks, GgufMoeWeights},
             router::{
                 RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
                 router_packed_logits_bytes,
@@ -245,8 +245,7 @@ impl GgufCuda {
                     scale: route.scale,
                 },
             )?;
-            static IQ2_GATE: OnceLock<bool> = OnceLock::new();
-            let grouped = self.context.gguf_moe_with_iq2_gate(
+            let gate = self.context.gguf_moe_with_gate(
                 stream,
                 GgufMoeCall {
                     shape: moe.shape,
@@ -263,15 +262,20 @@ impl GgufCuda {
                     scratch,
                     y,
                 },
-                *IQ2_GATE.get_or_init(|| {
-                    std::env::var("FIFI_INKLING_CUDA_IQ2_GATE").as_deref() == Ok("1")
-                }),
+                gate_schedule(),
             )?;
-            if grouped {
-                static NOTICE: Once = Once::new();
-                NOTICE.call_once(|| {
-                    eprintln!("Inkling CUDA used grouped IQ2 expert gate GEMV");
-                });
+            match gate {
+                GgufGate::Packed => (),
+                GgufGate::GroupedIq2 => {
+                    static NOTICE: Once = Once::new();
+                    NOTICE
+                        .call_once(|| eprintln!("Inkling CUDA used grouped IQ2 expert gate GEMV"));
+                }
+                GgufGate::IntegerDot => {
+                    static NOTICE: Once = Once::new();
+                    NOTICE
+                        .call_once(|| eprintln!("Inkling CUDA used integer dot expert gate GEMV"));
+                }
             }
             Ok(())
         };
@@ -303,6 +307,19 @@ impl GgufCuda {
             .run_routed_layer(&self.context, route.input, &bias, enqueue)
             .map(Some)
     }
+}
+
+fn gate_schedule() -> GgufGate {
+    static SCHEDULE: OnceLock<GgufGate> = OnceLock::new();
+    *SCHEDULE.get_or_init(|| {
+        if std::env::var("FIFI_INKLING_CUDA_GATE_DOT").as_deref() == Ok("1") {
+            GgufGate::IntegerDot
+        } else if std::env::var("FIFI_INKLING_CUDA_IQ2_GATE").as_deref() == Ok("1") {
+            GgufGate::GroupedIq2
+        } else {
+            GgufGate::Packed
+        }
+    })
 }
 
 #[cfg(test)]

@@ -138,11 +138,19 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GgufGate {
+    Packed = 0,
+    GroupedIq2 = 1,
+    IntegerDot = 2,
+}
+
 pub(in crate::kernels::cuda) fn launch_gguf_moe(
     stream: &RawStream,
     call: GgufMoeRaw<'_>,
-    grouped_iq2_gate: bool,
-) -> Result<bool, DeviceFailure> {
+    schedule: GgufGate,
+) -> Result<GgufGate, DeviceFailure> {
     let mut picks = [GgufMoePick::default(); MAX_GGUF_MOE_PICKS];
     let (count, device_ids, device_weights, [gate_scales, down_scales]) = match call.picks {
         GgufMoeRawPicks::Host(host) => {
@@ -206,8 +214,8 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     let matrices = matrices
         .as_ref()
         .map_or(std::ptr::null(), std::ptr::from_ref);
-    let mut grouped = c_int::from(grouped_iq2_gate);
-    let request = if grouped_iq2_gate {
+    let mut grouped = schedule as c_int;
+    let request = if schedule != GgufGate::Packed {
         &raw mut grouped
     } else {
         std::ptr::null_mut()
@@ -216,5 +224,9 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
         inference_cuda_gguf_moe_launch(&args, matrices, stream.0.as_ptr(), &mut stage, request)
     };
     checked(status, stage)?;
-    Ok(grouped == 1)
+    Ok(match grouped {
+        2 => GgufGate::IntegerDot,
+        1 => GgufGate::GroupedIq2,
+        _ => GgufGate::Packed,
+    })
 }
