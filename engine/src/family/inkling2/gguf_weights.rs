@@ -539,6 +539,26 @@ pub(super) struct GgufTextWeights {
 
 impl GgufTextWeights {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn enable_cuda_draft_head(&mut self, cap: f32) -> Result<(), EngError> {
+        self.cuda
+            .as_mut()
+            .ok_or_else(|| bad("CUDA draft head requires resident GGUF projections"))?
+            .enable_draft_head(cap)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn draft_greedy(
+        &self,
+        rows: [&[f32]; 2],
+        vocab: usize,
+        cap: f32,
+    ) -> Result<Option<u32>, EngError> {
+        self.cuda
+            .as_ref()
+            .map_or(Ok(None), |cuda| cuda.draft_greedy(rows, vocab, cap))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
         self.cuda.as_ref().map(GgufCuda::context)
     }
@@ -586,7 +606,7 @@ impl GgufTextWeights {
             {
                 continue;
             }
-            let rows = if name == "model.llm.unembed.weight" {
+            let rows = if name == super::OUTPUT_HEAD {
                 spec.unpadded_vocab_size as usize
             } else {
                 tensor.rows

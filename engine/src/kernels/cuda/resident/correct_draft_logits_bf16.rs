@@ -1,10 +1,5 @@
 //! Combine the base and recurrent correction for one speculative logits row.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the CUDA draft head")
-)]
-
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,

@@ -2,11 +2,6 @@
 //! bounds, and this module checks access sizes, alignment and write disjointness.
 //! The backing device allocations synchronize before free.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the CUDA draft head")
-)]
-
 use std::ffi::{c_int, c_void};
 use std::mem::offset_of;
 

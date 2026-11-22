@@ -152,11 +152,17 @@ fn select_block(
             *value += bias;
         }
 
-        // Applying the tied head twice gives the dense reference to the
-        // folded low-rank projection, without constructing a second LM head.
-        let base = output.project(&hidden)?;
-        let correction = output.project(&correction)?;
-        previous = choose_token(&base, &correction, config.vocab, config.final_logit_softcap)?;
+        let cap = config.final_logit_softcap;
+        previous =
+            match output.project_corrected_greedy([&hidden, &correction], config.vocab, cap)? {
+                Some(token) => token,
+                None => {
+                    // The two tied projections have separate BF16 rounding boundaries.
+                    let base = output.project(&hidden)?;
+                    let correction = output.project(&correction)?;
+                    choose_token(&base, &correction, config.vocab, cap)?
+                }
+            };
         tokens.push(previous);
     }
     Ok(tokens)
@@ -184,7 +190,16 @@ fn update_markov(state: &mut [f32], latent: &mut [f32], gates: &[f32]) -> Result
     Ok(())
 }
 
-fn choose_token(base: &[f32], correction: &[f32], vocab: usize, cap: f32) -> Result<u32, EngError> {
+pub(crate) fn softcap_logit_bf16(merged: f32, cap: f32) -> bf16 {
+    bf16::from_f32(cap * (merged / cap).tanh())
+}
+
+pub(in crate::family) fn choose_token(
+    base: &[f32],
+    correction: &[f32],
+    vocab: usize,
+    cap: f32,
+) -> Result<u32, EngError> {
     if vocab == 0
         || base.len() < vocab
         || correction.len() < vocab
@@ -199,7 +214,7 @@ fn choose_token(base: &[f32], correction: &[f32], vocab: usize, cap: f32) -> Res
         if !merged.is_finite() {
             return Err(invalid("nonfinite corrected draft logit"));
         }
-        let logit = round(cap * (merged / cap).tanh());
+        let logit = softcap_logit_bf16(merged, cap).to_f32();
         // Strict comparison preserves the lowest vocabulary ID on a BF16 tie.
         if logit > best.1 {
             best = (id, logit);

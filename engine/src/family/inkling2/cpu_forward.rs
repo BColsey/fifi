@@ -207,6 +207,14 @@ impl CpuForward {
         }
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn enable_cuda_draft_head(&mut self, cap: f32) -> Result<(), EngError> {
+        let Weights::Gguf(weights) = &mut self.weights else {
+            return Err(bad("CUDA draft head requires an Inkling GGUF target"));
+        };
+        weights.enable_cuda_draft_head(cap)
+    }
+
     pub(super) fn vocab_size(&self) -> u32 {
         self.spec.unpadded_vocab_size as u32
     }
@@ -408,7 +416,7 @@ impl CpuForward {
 
     fn project_logits(&self, hidden: &[f32]) -> Result<Vec<f32>, EngError> {
         self.weights.project(
-            "model.llm.unembed.weight",
+            super::OUTPUT_HEAD,
             hidden,
             self.spec.unpadded_vocab_size as usize,
         )

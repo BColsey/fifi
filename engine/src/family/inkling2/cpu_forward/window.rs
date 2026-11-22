@@ -145,6 +145,19 @@ impl DraftOutput for CpuForward {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn project_corrected_greedy(
+        &self,
+        rows: [&[f32]; 2],
+        vocab: usize,
+        cap: f32,
+    ) -> Result<Option<u32>, EngError> {
+        match &self.weights {
+            super::Weights::Gguf(weights) => weights.draft_greedy(rows, vocab, cap),
+            super::Weights::Native(_) => Ok(None),
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     fn cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
         self.draft_cuda_context()
     }

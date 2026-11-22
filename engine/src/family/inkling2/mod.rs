@@ -35,6 +35,8 @@ use serde::Deserialize;
 use crate::{EngError, checkpoint_json::UniqueValue};
 
 pub(crate) const FAMILY: &str = "inkling2_loop";
+#[cfg(target_pointer_width = "64")]
+const OUTPUT_HEAD: &str = "model.llm.unembed.weight";
 const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
 const CUDA_REFERENCE_ENV: &str = "FIFI_INKLING_CUDA_REFERENCE";
 pub(crate) const DEFAULT_TEXT_CONTEXT: u32 = 128;

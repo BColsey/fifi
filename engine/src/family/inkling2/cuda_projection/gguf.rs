@@ -3,7 +3,8 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
 use super::{
-    DEVICE_HEADROOM, DensePlan, DenseStep, DenseUpload, Resident, bad, dense::ResidentProjection,
+    DEVICE_HEADROOM, DensePlan, DenseStep, DenseUpload, Resident, bad,
+    dense::{DraftHead, ResidentProjection},
     upload_tensor,
 };
 use crate::family::inkling2::cpu_weights::Projection;
@@ -32,6 +33,7 @@ use residency::{PackedBudget, ResidentExperts};
 
 pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
+    draft_head: Option<DraftHead>,
     dense: Projections,
     packed_gguf: bool,
     group_projections: bool,
@@ -331,6 +333,7 @@ impl GgufCuda {
         }
         Ok(Self {
             step,
+            draft_head: None,
             dense,
             packed_gguf: packed,
             group_projections,
@@ -353,6 +356,40 @@ impl GgufCuda {
             }),
             context,
         })
+    }
+
+    pub(in crate::family::inkling2) fn enable_draft_head(
+        &mut self,
+        cap: f32,
+    ) -> Result<(), EngError> {
+        let (weight, dtype) = self.draft_head_weight()?;
+        let head = DraftHead::new(&self.context, weight.shape, *dtype, cap)?;
+        eprintln!("Inkling CUDA DSpark corrected head enabled");
+        self.draft_head = Some(head);
+        Ok(())
+    }
+
+    pub(in crate::family::inkling2) fn draft_greedy(
+        &self,
+        rows: [&[f32]; 2],
+        vocab: usize,
+        cap: f32,
+    ) -> Result<Option<u32>, EngError> {
+        let Some(head) = &self.draft_head else {
+            return Ok(None);
+        };
+        let (weight, dtype) = self.draft_head_weight()?;
+        if weight.shape[0] != vocab {
+            return Err(bad("CUDA draft head vocabulary changed after admission"));
+        }
+        head.choose(&self.step, &self.context, (weight, *dtype), rows, cap)
+            .map(Some)
+    }
+
+    fn draft_head_weight(&self) -> Result<&(Resident, DenseDtype), EngError> {
+        self.dense
+            .get(crate::family::inkling2::OUTPUT_HEAD)
+            .ok_or_else(|| bad("CUDA draft head requires a resident GGUF vocabulary projection"))
     }
 
     pub(in crate::family::inkling2) fn project(

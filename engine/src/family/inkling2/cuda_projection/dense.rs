@@ -21,6 +21,9 @@ use crate::{
 use super::{Resident, bad};
 
 mod attention_prefill;
+mod draft_head;
+
+pub(super) use draft_head::DraftHead;
 
 #[repr(usize)]
 enum Slot {
@@ -140,32 +143,9 @@ impl DenseStep {
         }
         let stream = stream.unwrap_or(&self.stream);
         let output = self.range(Slot::Output, 0, rows)?;
-        let q8 = self.q8_scratch(dtype, weight, [rows, cols]);
         let values = self.run(context, stream, x, output, |input| {
-            if let Some(x_q8) = q8 {
-                context.quantize_q8_1(
-                    stream,
-                    QuantizeCall {
-                        x: input,
-                        y: x_q8,
-                        k: cols,
-                        ncols: 1,
-                    },
-                )?;
-                return context.matvec_q(
-                    stream,
-                    MatvecCall {
-                        ty: QuantType::Q80,
-                        w: weight,
-                        x_q8,
-                        y: output,
-                        k: cols,
-                        rows,
-                        ncols: 1,
-                    },
-                );
-            }
-            context.dense_gemv(
+            self.enqueue_gguf_projection(
+                context,
                 stream,
                 DenseGemvCall {
                     shape: DenseGemvShape::packed(1, rows, cols),
@@ -177,6 +157,40 @@ impl DenseStep {
             )
         })?;
         scale_projection(values, scale)
+    }
+
+    fn enqueue_gguf_projection(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        call: DenseGemvCall<'_>,
+    ) -> Result<(), EngError> {
+        let [rows, cols] = [call.shape.rows, call.shape.cols];
+        if let Some(x_q8) = self.q8_scratch(call.dtype, call.w, [rows, cols]) {
+            context.quantize_q8_1(
+                stream,
+                QuantizeCall {
+                    x: call.x,
+                    y: x_q8,
+                    k: cols,
+                    ncols: 1,
+                },
+            )?;
+            context.matvec_q(
+                stream,
+                MatvecCall {
+                    ty: QuantType::Q80,
+                    w: call.w,
+                    x_q8,
+                    y: call.y,
+                    k: cols,
+                    rows,
+                    ncols: 1,
+                },
+            )
+        } else {
+            context.dense_gemv(stream, call)
+        }
     }
 
     pub(super) fn fits_gguf_rows(

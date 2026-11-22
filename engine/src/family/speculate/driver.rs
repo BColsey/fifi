@@ -37,6 +37,16 @@ pub(crate) trait DraftOutput {
     fn embedding(&self, token: u32) -> Result<Vec<f32>>;
     fn project(&self, hidden: &[f32]) -> Result<Vec<f32>>;
 
+    /// An optional target implementation of DSpark's corrected greedy head.
+    fn project_corrected_greedy(
+        &self,
+        _rows: [&[f32]; 2],
+        _vocab: usize,
+        _cap: f32,
+    ) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     fn cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
         None

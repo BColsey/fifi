@@ -80,7 +80,7 @@ pub(crate) fn start_engine(
         let speculator = settings
             .draft
             .take()
-            .map(|draft| start_draft(draft, &forward))
+            .map(|draft| start_draft(draft, &mut forward))
             .transpose()?;
         if grouped_verify_requested {
             let enabled = plan.grouped_verify && enable_grouped_verify(&mut forward);
@@ -121,14 +121,22 @@ pub(crate) fn start_engine(
 
 fn start_draft(
     draft: InklingDraft,
-    forward: &CpuForward,
+    forward: &mut CpuForward,
 ) -> Result<Speculator<DsparkDrafter>, EngError> {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    let cap = draft.model.config().final_logit_softcap;
     let drafter = DsparkDrafter::new(draft.model);
     let drafter = if draft.cuda {
         cuda_draft(drafter, forward)?
     } else {
         drafter
     };
+    if draft.cuda_head {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        forward.enable_cuda_draft_head(cap)?;
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+        return Err(super::bad("CUDA draft head requires native-cuda on Linux"));
+    }
     Ok(Speculator::new(drafter, draft.max_drafts))
 }
 
@@ -241,6 +249,7 @@ pub(crate) struct TextSettings {
 pub(crate) struct InklingDraft {
     pub(super) model: DsparkGguf,
     pub(super) cuda: bool,
+    pub(super) cuda_head: bool,
     pub(super) taps: Vec<usize>,
     pub(super) max_drafts: usize,
     pub(super) width: usize,

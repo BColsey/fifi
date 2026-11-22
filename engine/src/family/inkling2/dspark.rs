@@ -7,7 +7,15 @@ use crate::{EngError, weights::dspark_gguf::DsparkGguf};
 
 pub(crate) fn configured_draft(context: usize) -> Result<Option<InklingDraft>, EngError> {
     const PATH: &str = "FIFI_INKLING_DSPARK_GGUF";
-    let Some(path) = std::env::var_os(PATH) else {
+    let cuda = std::env::var("FIFI_INKLING_DSPARK_CUDA").as_deref() == Ok("1");
+    let cuda_head = std::env::var("FIFI_INKLING_DSPARK_CUDA_HEAD").as_deref() == Ok("1");
+    let path = std::env::var_os(PATH);
+    if cuda_head && (!cuda || path.is_none()) {
+        return Err(super::bad(
+            "FIFI_INKLING_DSPARK_CUDA_HEAD requires FIFI_INKLING_DSPARK_CUDA=1 and a DSpark GGUF sidecar",
+        ));
+    }
+    let Some(path) = path else {
         return Ok(None);
     };
     let model = DsparkGguf::open(Path::new(&path))?;
@@ -21,7 +29,8 @@ pub(crate) fn configured_draft(context: usize) -> Result<Option<InklingDraft>, E
     );
     Ok(Some(InklingDraft {
         model,
-        cuda: std::env::var("FIFI_INKLING_DSPARK_CUDA").as_deref() == Ok("1"),
+        cuda,
+        cuda_head,
         taps,
         max_drafts,
         width,
