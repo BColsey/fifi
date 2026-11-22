@@ -1202,6 +1202,90 @@ fn two_real_expert_slots_match_host() {
         assert!((hit - want).abs() <= tolerance, "resident gate row {index}");
     }
     eprintln!("checked {rows} resident gate rows and zero filler before miss");
+    let hidden = bank
+        .projection(&state, crate::family::recipe::Role::ExpertDown)
+        .unwrap()
+        .rows;
+    let repaired_down = ctx.allocate(2 * hidden * 4).unwrap();
+    macro_rules! full_pass {
+        ($ids:expr, $count:expr) => {{
+            use crate::family::recipe::Role;
+            use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
+            let count = $count;
+            let gu = ctx.allocate(count * 2 * rows * 4).unwrap();
+            for (role, off) in [(Role::ExpertGate, 0), (Role::ExpertUp, rows * 4)] {
+                bank.projection(&state, role)
+                    .unwrap()
+                    .launch(
+                        &ctx,
+                        &stream,
+                        ExpertProjectionInputs {
+                            ids: $ids.range(0, count * 4).unwrap(),
+                            x_q8: q.range(0, qbytes).unwrap(),
+                            x_per_slot: false,
+                            output: gu.range(off, (2 * count - 1) * rows * 4).unwrap(),
+                            output_stride: 2 * rows,
+                            used: count,
+                        },
+                    )
+                    .unwrap();
+            }
+            let act = ctx.allocate(count * rows * 4).unwrap();
+            ctx.swiglu_rows(
+                &stream,
+                SwigluRowsCall {
+                    shape: SwigluRowsShape {
+                        rows: count,
+                        n_ff: rows,
+                        up_off: rows,
+                        ld_in: 2 * rows,
+                        ld_out: rows,
+                    },
+                    gu: gu.range(0, count * 2 * rows * 4).unwrap(),
+                    act: act.range(0, count * rows * 4).unwrap(),
+                },
+            )
+            .unwrap();
+            let act_qbytes = q8_1_bytes(rows, count).unwrap();
+            let act_q = ctx.allocate(act_qbytes).unwrap();
+            ctx.quantize_q8_1(
+                &stream,
+                QuantizeCall {
+                    x: act.range(0, count * rows * 4).unwrap(),
+                    y: act_q.range(0, act_qbytes).unwrap(),
+                    k: rows,
+                    ncols: count,
+                },
+            )
+            .unwrap();
+            bank.projection(&state, Role::ExpertDown)
+                .unwrap()
+                .launch(
+                    &ctx,
+                    &stream,
+                    ExpertProjectionInputs {
+                        ids: $ids.range(0, count * 4).unwrap(),
+                        x_q8: act_q.range(0, act_qbytes).unwrap(),
+                        x_per_slot: true,
+                        output: repaired_down.range(0, count * hidden * 4).unwrap(),
+                        output_stride: hidden,
+                        used: count,
+                    },
+                )
+                .unwrap();
+        }};
+    }
+    full_pass!(before, 2);
+    let mut resident_down = vec![0; hidden * 8];
+    repaired_down
+        .read_at(&stream, 0, &mut resident_down)
+        .unwrap();
+    assert!(
+        resident_down[..hidden * 4]
+            .chunks_exact(4)
+            .all(|b| f32::from_ne_bytes(b.try_into().unwrap()) == 0.0),
+        "filler down must be zero"
+    );
     let copies = bank
         .step_disk(&stream, &model, &mut state, 0, &[257, 256])
         .unwrap();
@@ -1216,6 +1300,19 @@ fn two_real_expert_slots_match_host() {
     miss_id
         .write_at(&stream, 0, &slots[0].to_ne_bytes())
         .unwrap();
+    full_pass!(miss_id, 1);
+    let mut repaired = vec![0; hidden * 8];
+    repaired_down.read_at(&stream, 0, &mut repaired).unwrap();
+    assert_eq!(
+        &repaired[hidden * 4..],
+        &resident_down[hidden * 4..],
+        "resident down must remain unchanged"
+    );
+    assert_ne!(
+        &repaired[..hidden * 4],
+        &resident_down[..hidden * 4],
+        "miss must overwrite filler down"
+    );
     bank.projection(&state, crate::family::recipe::Role::ExpertGate)
         .unwrap()
         .launch(
@@ -1542,7 +1639,7 @@ fn two_real_expert_slots_match_host() {
                 ld_down: hidden,
             },
             res: residual.range(0, hidden * 4).unwrap(),
-            down: y_down.range(0, hidden * 8).unwrap(),
+            down: repaired_down.range(0, hidden * 8).unwrap(),
             weights: route_weights.range(0, 8).unwrap(),
             shared: None,
             out: CombineOut::To(combined.range(0, hidden * 4).unwrap()),
