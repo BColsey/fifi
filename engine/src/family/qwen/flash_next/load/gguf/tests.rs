@@ -471,6 +471,49 @@ fn expert_stacks_are_part_major_aligned_and_checked() {
 }
 
 #[test]
+fn expert_stack_copy_preserves_parts_slots_and_rejects_bad_input() {
+    use super::expert_layout::{ExpertLayout, ExpertStacks};
+    let (_written, model) = open(&Spec::default());
+    let layout = ExpertLayout::for_layer(&model, 0).unwrap();
+    let stacks = ExpertStacks::new(&layout, 2).unwrap();
+    let mut target = vec![0; stacks.bytes];
+    let mut record = vec![0; layout.bytes];
+    for (i, part) in layout.parts.iter().enumerate() {
+        record[part.bytes.clone()].fill(0x10 + i as u8);
+    }
+    stacks
+        .copy_record(&layout, 1, &record, &mut target)
+        .unwrap();
+    for (i, _) in layout.parts.iter().enumerate() {
+        assert!(
+            target[stacks.slot(i, 1).unwrap()]
+                .iter()
+                .all(|&v| v == 0x10 + i as u8)
+        );
+        assert!(target[stacks.slot(i, 0).unwrap()].iter().all(|&v| v == 0));
+    }
+    let before = target.clone();
+    assert!(
+        stacks
+            .copy_record(&layout, 2, &record, &mut target)
+            .is_err()
+    );
+    assert!(
+        stacks
+            .copy_record(&layout, 0, &record[..1], &mut target)
+            .is_err()
+    );
+    let mut malformed = layout.clone();
+    malformed.parts[2].bytes.end = usize::MAX;
+    assert!(
+        stacks
+            .copy_record(&malformed, 0, &record, &mut target)
+            .is_err()
+    );
+    assert_eq!(target, before);
+}
+
+#[test]
 fn packed_expert_read_preserves_role_boundaries_and_rejects_bad_requests() {
     use super::expert_layout::ExpertLayout;
     let (written, model) = open(&Spec {

@@ -61,6 +61,36 @@ impl ExpertStacks {
         })
     }
 
+    /// Copy one packed host record into its part-major slot; validation occurs before writes.
+    pub(in super::super::super) fn copy_record(
+        &self,
+        layout: &ExpertLayout,
+        slot: usize,
+        record: &[u8],
+        stack: &mut [u8],
+    ) -> Result<(), EngError> {
+        let bad = || EngError::BadRequest("invalid GGUF expert stack copy".into());
+        if record.len() != layout.bytes
+            || stack.len() != self.bytes
+            || *self != Self::new(layout, self.slots)?
+        {
+            return Err(bad());
+        }
+        let mut destinations = Vec::with_capacity(3);
+        for (index, part) in layout.parts.iter().enumerate() {
+            let source = record.get(part.bytes.clone()).ok_or_else(bad)?;
+            let dest = self.slot(index, slot)?;
+            if source.len() != dest.len() || dest.end > stack.len() {
+                return Err(bad());
+            }
+            destinations.push(dest);
+        }
+        for (part, dest) in layout.parts.iter().zip(destinations) {
+            stack[dest].copy_from_slice(&record[part.bytes.clone()]);
+        }
+        Ok(())
+    }
+
     pub(in super::super::super) fn slot(
         &self,
         part: usize,
