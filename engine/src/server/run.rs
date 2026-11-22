@@ -642,10 +642,7 @@ fn start_fake(
     })
 }
 
-/// The Gemma4 row. The Bolt E4B dispatches by its model directory's
-/// `config.json` (validated by `gemma4::serve::bolt_configured`) and starts
-/// on the CUDA build; any other model in the family reaches this refusal
-/// (the Starter doc above documents the one-row contract).
+/// The Gemma4 row serves Bolt E4B on CUDA after the shared identity check.
 fn start_gemma4(
     config: &EngineConfig,
     _prefix_reuse: bool,
@@ -653,55 +650,30 @@ fn start_gemma4(
 ) -> Result<StartedEngine, EngError> {
     #[cfg(feature = "native-cuda")]
     {
-        let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-        // A directory with no `config.json` is the weights file alone: its header states the
-        // same geometry.
-        let gate = gemma4::serve::bolt_configured(&model_directory).or_else(|error| {
-            if model_directory.join("config.json").exists() {
-                return Err(error);
-            }
-            crate::family::gguf_select::check_header_identity(
-                &config.model_dir,
-                "gemma4",
-                crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_KEYS,
-                Some(crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_SOFTCAP),
-            )
-        });
-        match gate {
-            Ok(()) => {
-                let started = gemma4::serve::start_bolt_engine(
-                    &config.model_dir,
-                    &config.tokenizer_dir,
-                    _ready_note,
-                    config.gemma4.clone().unwrap_or_default().seqs(),
-                    config
-                        .gemma4
-                        .as_ref()
-                        .and_then(gemma4::Gemma4Options::prompt_rows),
-                    config
-                        .gemma4
-                        .as_ref()
-                        .and_then(|options| options.kv_cache.as_ref())
-                        .map(crate::family::kv_disk::KvCacheOptions::checked)
-                        .transpose()
-                        .map_err(|message| {
-                            EngError::BadRequest(format!("engine config: {message}"))
-                        })?,
-                )?;
-                Ok(StartedEngine {
-                    engine: started.engine,
-                    bundle: Arc::new(started.bundle),
-                    context_limit: started.context_limit,
-                    effective: Vec::new(),
-                })
-            }
-            Err(cause) => Err(EngError::BadRequest(format!(
-                "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
-                     the model directory {} failed the Bolt configuration check: {}",
-                model_directory.display(),
-                cause.describe()
-            ))),
-        }
+        gemma4::serve::check_checkpoint(&config.model_dir)?;
+        let started = gemma4::serve::start_bolt_engine(
+            &config.model_dir,
+            &config.tokenizer_dir,
+            _ready_note,
+            config.gemma4.clone().unwrap_or_default().seqs(),
+            config
+                .gemma4
+                .as_ref()
+                .and_then(gemma4::Gemma4Options::prompt_rows),
+            config
+                .gemma4
+                .as_ref()
+                .and_then(|options| options.kv_cache.as_ref())
+                .map(crate::family::kv_disk::KvCacheOptions::checked)
+                .transpose()
+                .map_err(|message| EngError::BadRequest(format!("engine config: {message}")))?,
+        )?;
+        Ok(StartedEngine {
+            engine: started.engine,
+            bundle: Arc::new(started.bundle),
+            context_limit: started.context_limit,
+            effective: Vec::new(),
+        })
     }
     #[cfg(not(feature = "native-cuda"))]
     Err(gemma4::serve::cuda_required(&config.model_dir))
