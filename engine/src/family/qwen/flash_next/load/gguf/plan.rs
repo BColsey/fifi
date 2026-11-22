@@ -35,6 +35,12 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
     EngError::MemoryPlan(format!("Flash-Next GGUF plan: {}", detail.as_ref()))
 }
 
+fn add_expert_bytes(total: u64, bytes: u64) -> Result<u64, EngError> {
+    total
+        .checked_add(bytes)
+        .ok_or_else(|| refuse("expert byte total overflows"))
+}
+
 /// Two additional part starts per layer, each rounded up by at most three bytes.
 pub(in super::super::super) fn stack_alignment_reserve(layers: usize) -> Result<u64, EngError> {
     u64::try_from(layers)
@@ -87,6 +93,11 @@ impl GgufModel {
         let layers = self.config.layers();
         let experts = u64::from(self.config.dims.experts);
         let top_k = self.config.dims.top_k as usize;
+        let count = u64::try_from(layers)
+            .ok()
+            .and_then(|n| n.checked_mul(experts))
+            .filter(|&n| n != 0)
+            .ok_or_else(|| refuse("expert count is zero or overflows"))?;
         let mut total = 0u64;
         let mut record_max = 0u64;
         for layer in 0..layers {
@@ -102,12 +113,11 @@ impl GgufModel {
                         tensor.name, tensor.bytes
                     )));
                 }
-                layer_bytes += tensor.bytes;
+                layer_bytes = add_expert_bytes(layer_bytes, tensor.bytes)?;
             }
-            total += layer_bytes;
+            total = add_expert_bytes(total, layer_bytes)?;
             record_max = record_max.max(layer_bytes / experts);
         }
-        let count = layers as u64 * experts;
         let shape = TierShape {
             layers,
             experts: experts as usize,
@@ -161,5 +171,16 @@ impl GgufModel {
             sizes.ngram_bytes,
             inputs,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_expert_bytes;
+
+    #[test]
+    fn expert_byte_sum_refuses_overflow() {
+        assert_eq!(add_expert_bytes(u64::MAX - 1, 1).unwrap(), u64::MAX);
+        assert!(add_expert_bytes(u64::MAX, 1).is_err());
     }
 }
