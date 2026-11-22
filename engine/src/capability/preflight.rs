@@ -15,6 +15,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use super::{Probe, inspect::ModelInspection, probe::HardwareFacts};
+use crate::family::qwen36::settings::{Backend as Q36Backend, Q36Options};
 use crate::memory::MemoryPolicy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -209,6 +210,17 @@ pub fn preflight(
     candidate: &Candidate,
     facts: &HardwareFacts,
 ) -> Result<PreflightReport, crate::EngError> {
+    preflight_with_q36_options(model_dir, tokenizer_dir, candidate, facts, None)
+}
+
+/// Configured Qwen GGUF entries carry the actual options; a standalone check has only overrides.
+pub(crate) fn preflight_with_q36_options(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    candidate: &Candidate,
+    facts: &HardwareFacts,
+    q36_options: Option<&Q36Options>,
+) -> Result<PreflightReport, crate::EngError> {
     let inspection = super::inspect::inspect(model_dir, tokenizer_dir)?;
     Ok(evaluate(
         model_dir,
@@ -216,6 +228,7 @@ pub fn preflight(
         &inspection,
         candidate,
         facts,
+        q36_options,
     ))
 }
 
@@ -225,6 +238,7 @@ fn evaluate(
     inspection: &ModelInspection,
     candidate: &Candidate,
     facts: &HardwareFacts,
+    q36_options: Option<&Q36Options>,
 ) -> PreflightReport {
     let mut checks = Vec::new();
     inventory_checks(inspection, &mut checks);
@@ -242,16 +256,34 @@ fn evaluate(
     }
     // A GGUF directory with no tokenizer files starts from the vocabulary in the weights.
     gguf_tokenizer_check(inspection, &mut checks);
+    if family_name == Some(crate::family::gemma4::FAMILY) {
+        checks.push(
+            match crate::family::gemma4::serve::check_checkpoint(model_dir) {
+                Ok(()) => Check::new(
+                    "Bolt checkpoint",
+                    CheckStatus::Pass,
+                    "matches Bolt identity; tensor validation and memory admission run at load"
+                        .to_string(),
+                ),
+                Err(error) => Check::new("Bolt checkpoint", CheckStatus::Fail, error.describe()),
+            },
+        );
+        return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
+    }
     if family_name == Some(crate::family::qwen36::factory::FAMILY) {
-        // `None` when this binary has no GPU backend at all;
-        // `backend_of_build`'s fallback arm must not masquerade as one.
-        let backend =
-            (!facts.backends.none()).then(crate::family::qwen36::factory::backend_of_build);
+        let backend = if facts.backends.mlx {
+            Some(Q36Backend::Mlx)
+        } else {
+            facts.backends.cuda.then_some(Q36Backend::Cuda)
+        };
         return q36_preflight(
             model_dir,
             tokenizer_dir,
             inspection,
-            candidate,
+            Q36Inputs {
+                candidate,
+                configured: q36_options,
+            },
             facts,
             backend,
             checks,
@@ -673,16 +705,21 @@ fn shallow_preflight(
     }
 }
 
+struct Q36Inputs<'a> {
+    candidate: &'a Candidate,
+    configured: Option<&'a Q36Options>,
+}
+
 fn q36_preflight(
     model_dir: &Path,
     tokenizer_dir: &Path,
     inspection: &ModelInspection,
-    candidate: &Candidate,
+    inputs: Q36Inputs<'_>,
     facts: &HardwareFacts,
-    backend: Option<crate::family::qwen36::settings::Backend>,
+    backend: Option<Q36Backend>,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+    use crate::family::qwen36::settings::{Backend, Q36Env, Q36Settings};
 
     let family = Some(crate::family::qwen36::factory::FAMILY.to_string());
     let finish = |checks: Vec<Check>,
@@ -736,15 +773,21 @@ fn q36_preflight(
         return finish(checks, None, Vec::new(), Qualification::Unverified);
     }
 
-    // The factory's own settings resolution: identical validation of the
-    // candidate options, including every range and combination rule.
-    let options = Q36Options {
-        context_limit: candidate.context_limit,
-        kv_dtype: candidate.kv_dtype.clone(),
-        ..Q36Options::default()
+    // The factory's own settings resolution applies the same range and combination rules.
+    let candidate = inputs.candidate;
+    let standalone;
+    let options = if let Some(configured) = inputs.configured {
+        configured
+    } else {
+        standalone = Q36Options {
+            context_limit: candidate.context_limit,
+            kv_dtype: candidate.kv_dtype.clone(),
+            ..Q36Options::default()
+        };
+        &standalone
     };
     let env = Q36Env::from_process(model_dir);
-    let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(&options), &env, backend) {
+    let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(options), &env, backend) {
         Ok(settings) => {
             checks.push(Check::new(
                 "settings",
@@ -2253,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_preflight_distinguishes_recognition_from_cuda_eligibility() {
+    fn gemma4_preflight_requires_cuda_and_bolt_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("model.gguf"),
@@ -2283,9 +2326,29 @@ mod tests {
             assert_eq!(backend.status, CheckStatus::Fail);
             assert!(backend.detail.contains("this build has no CUDA engine"));
 
-            // A compiled backend passes the build gate, not the model's load checks.
-            assert_eq!(check(&cuda).verdict, Verdict::Experimental);
+            let other_gemma = check(&cuda);
+            assert_eq!(other_gemma.verdict, Verdict::Unsupported);
+            let identity = check_named(&other_gemma, "Bolt checkpoint");
+            assert_eq!(identity.status, CheckStatus::Fail);
+            assert!(identity.detail.contains("gemma4.block_count"));
         }
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            include_bytes!("../../testdata/gemma4/bolt-config.json"),
+        )
+        .expect("write Bolt configuration");
+        let candidate = Candidate {
+            family: Some(crate::family::gemma4::FAMILY.to_owned()),
+            ..Candidate::default()
+        };
+        let bolt = super::preflight(dir.path(), dir.path(), &candidate, &cuda).expect("report");
+        assert_eq!(
+            check_named(&bolt, "Bolt checkpoint").status,
+            CheckStatus::Pass
+        );
+        assert_eq!(bolt.verdict, Verdict::Experimental);
+        assert_eq!(bolt.dimensions.qualification, Qualification::Unverified);
     }
 
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {
@@ -2477,7 +2540,10 @@ mod tests {
             &dir,
             &dir,
             &inspection,
-            &super::Candidate::default(),
+            super::Q36Inputs {
+                candidate: &Candidate::default(),
+                configured: None,
+            },
             &cuda_facts(24u64 << 30),
             Some(Backend::Cuda),
             Vec::new(),
@@ -2495,9 +2561,9 @@ mod tests {
     #[test]
     fn an_mlx_pack_passes_the_weight_format_check_without_a_gguf_file() {
         use crate::family::qwen36::settings::Backend;
-        let candidate = super::Candidate {
+        let candidate = Candidate {
             context_limit: Some(4096),
-            ..super::Candidate::default()
+            ..Candidate::default()
         };
         let report_for = |with_shard: bool| {
             let dir = tempfile::tempdir().unwrap().keep();
@@ -2512,7 +2578,10 @@ mod tests {
                 &dir,
                 &dir,
                 &inspection,
-                &candidate,
+                super::Q36Inputs {
+                    candidate: &candidate,
+                    configured: None,
+                },
                 &cuda_facts(24u64 << 30),
                 Some(Backend::Mlx),
                 Vec::new(),
@@ -2537,15 +2606,18 @@ mod tests {
         use crate::family::qwen36::settings::Backend;
         let dir = tempfile::tempdir().unwrap().keep();
         let inspection = crate::capability::inspect::inspect(&dir, &dir).unwrap();
-        let candidate = super::Candidate {
+        let candidate = Candidate {
             kv_dtype: Some("q4".to_string()),
-            ..super::Candidate::default()
+            ..Candidate::default()
         };
         let report = super::q36_preflight(
             &dir,
             &dir,
             &inspection,
-            &candidate,
+            super::Q36Inputs {
+                candidate: &candidate,
+                configured: None,
+            },
             &cuda_facts(24u64 << 30),
             Some(Backend::Cuda),
             Vec::new(),
@@ -2718,7 +2790,10 @@ mod tests {
             &dir,
             &dir,
             &inspection,
-            &super::Candidate::default(),
+            super::Q36Inputs {
+                candidate: &Candidate::default(),
+                configured: None,
+            },
             &cuda_facts(0),
             None,
             Vec::new(),

@@ -1,12 +1,11 @@
 # Shared architecture TODO
 
-Share decisions that must agree across serving and diagnostics. Keep model-specific execution order, numerical paths, and device ownership with their families.
+Scope: GGUF serving only. Share decisions that must agree across serving and diagnostics. Keep model-specific execution order, numerical paths, and device ownership with their families.
 
 - [x] **Share `gemma4` build eligibility.** The family name is recognized on every build, but the starter only serves Nemotron Bolt E4B on CUDA. Startup rejects a build without CUDA before reading sampling defaults. `check` reports it as unsupported for both explicitly named and GGUF-detected entries.
-- [ ] **Compare checkpoint eligibility across boot, simplified startup, and preflight.** Use the same model-identity rules where applicable without merging their discovery rules or treating an eligible checkpoint as qualified.
-- [ ] **Publish settings from the engine that opened.** Flint's server wrapper reads a process-wide prefill order immediately after starting an asynchronous load. Publish the actual order per engine when its worker becomes ready. Test delayed success, the jobs-to-token-major fallback, and isolation between engine IDs.
-- [ ] **Preflight the options from each support-bundle entry.** The bundle still projects config entries onto partial candidate options. Start with non-default Flint options. Keep estimated fit, actual admission, and quality qualification separate; do not initialize a device from the serving diagnostics endpoint.
-- [ ] **Test scheduler invariants across single and batched workers.** Upstream now attributes batched expert-bank counters per piece. Keep that behavior and test cancellation, denied-prefill retries, prefix resume, and publication through both workers before sharing more lifecycle code.
-- [ ] **Qualify shared EXL3 prefill before extending it.** Compare Flash-Next's opt-in and legacy paths on chunk tails, prefix resume, memory admission, and output quality. Keep family-owned launch ordering and existing defaults unless qualification supports a change.
+- [x] **Share Bolt checkpoint identity between boot and preflight.** Simplified startup already calls preflight. The check distinguishes a compatible identity from tensor validation, memory fit, and qualification.
+- [x] **Use configured Qwen GGUF options in support-bundle preflight.** Use the loader's settings resolver for context, KV, and content-pin syntax. The loader still verifies the digest and decides memory admission.
+- [x] **Test scheduler invariants across single and batched workers.** Check that final-prefill cancellation publishes no tokens and a memory denial restarts with the request's own saved prefix.
+- [ ] **Make diagnostic file selection match startup.** Accept an explicitly selected `.gguf` file without inspecting sibling weight files. For directory inputs, make the estimate identify and size the selected GGUF rather than the directory inventory.
 
 See [model support](reference/models.md) and [diagnostic commands](how-to/diagnostics.md).
