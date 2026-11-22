@@ -55,7 +55,7 @@ use super::{
         fixed_chunk_rows, fixed_staging_rows, ledger_line, needs_arena, stage_label,
         wide_stage_candidate,
     },
-    prefill_plan::{chunk_costs, exl3_chunk_costs, state_bytes},
+    prefill_plan::{PART_CHARGE, SPARE_MIN, chunk_costs, exl3_chunk_costs, state_bytes},
     prefix::{CudaPrefillPath, CudaSavedPrefix, PendingPrefix},
     readback::{
         ReadbackPlan, SHORTLIST_VAR, SYNC_EACH_VAR, captured_report, check_mode,
@@ -1277,6 +1277,21 @@ impl<'a> QwenResidentStep<'a> {
             );
             (Some(cost.m), Some(plan))
         } else {
+            // The unfixed admission's figures, so a start that keeps one token per step can be
+            // closed by subtraction: which charge left no room.
+            let smallest = costs.last().map_or((0, 0), |cost| (cost.arena, cost.part));
+            eprintln!(
+                "q36 cuda: prefill admission ledger: budget={} decode_arena={} state={} cap={} \
+                 smallest_arena={} smallest_part={} part_charge={PART_CHARGE} spare_min={SPARE_MIN} \
+                 extras_fixed={}",
+                admit.budget,
+                admit.decode_arena,
+                admit.state_planned,
+                admit.cap,
+                smallest.0,
+                smallest.1,
+                budget.extras.iter().map(|extra| extra.fixed).sum::<usize>(),
+            );
             admit_with_staging(&admit, &budget.extras, &costs, staging)?
         };
         if admit.cap == 4096 {
