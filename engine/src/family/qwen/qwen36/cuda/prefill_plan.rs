@@ -1023,7 +1023,13 @@ mod card_tests {
                     "{name:60.60} weights {:.2} GiB | without {without:?} | with {with:?}",
                     weights as f64 / (1u64 << 30) as f64
                 );
-                assert!(with.map_or(0, |f| f.context) <= without.map_or(0, |f| f.context));
+                // Asking the admission never lengthens the same form's context; a form that has no
+                // arena at any context gives way to the next one.
+                if let (Some(with), Some(without)) = (with, without)
+                    && with.form == without.form
+                {
+                    assert!(with.context <= without.context);
+                }
             }
         }
     }
