@@ -341,7 +341,7 @@ pub(crate) fn start_one(
     config: &crate::server::config::EngineConfig,
     file_prefix_reuse: Option<bool>,
 ) -> Result<(Engine, EngineEntry), StartupError> {
-    check_staged_family(&config.family).map_err(|error| {
+    check_family_backend(config).map_err(|error| {
         StartupError(format!(
             "engine {} failed to start: {}",
             config.id,
@@ -491,11 +491,15 @@ fn defaults_line(
     }
 }
 
-fn check_staged_family(family: &str) -> Result<(), EngError> {
-    if family == flint::FAMILY {
-        flint::factory::check_backend()?;
+fn check_family_backend(config: &EngineConfig) -> Result<(), EngError> {
+    match config.family.as_str() {
+        flint::FAMILY => flint::factory::check_backend(),
+        gemma4::FAMILY => gemma4::serve::check_backend(
+            &config.model_dir,
+            &crate::capability::probe::CompiledBackends::of_this_build(),
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// One family's start result: the uniform shape every factory already
@@ -510,10 +514,7 @@ pub(crate) struct StartedEngine {
 }
 
 /// The uniform starter signature: one config entry, the process-wide
-/// prefix_reuse flag, the ready note. A future family (Gemma4) is one new
-/// table entry with this same signature and no other registry edit;
-/// adding its name to the config's FAMILIES list is config surface, not
-/// registry.
+/// prefix_reuse flag, and the ready note.
 pub(crate) type Starter = fn(&EngineConfig, bool, ReadyNote) -> Result<StartedEngine, EngError>;
 
 fn start_flint(
@@ -703,16 +704,11 @@ fn start_gemma4(
         }
     }
     #[cfg(not(feature = "native-cuda"))]
-    Err(EngError::BadRequest(format!(
-        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
-         this build has no CUDA engine (model directory {})",
-        config.model_dir.display()
-    )))
+    Err(gemma4::serve::cuda_required(&config.model_dir))
 }
 
-/// The closed registry of families this build starts. Staged backends
-/// refuse inside their starter before model or tokenizer reads; the
-/// config gate owns the unknown-family rejection text.
+/// Starter dispatch for recognized families, not a list of usable backends.
+/// The config gate owns the unknown-family rejection text.
 // The third column: the starter builds a Metal-resident executor on a
 // `native-mlx` build. The auto-budget one-model rule reads it, so the family
 // set it counts can never drift from this dispatch table.
@@ -1341,6 +1337,30 @@ mod tests {
             ),
             Ok(_) => panic!("staged Flint must refuse before sampling-default reads"),
         }
+    }
+
+    #[cfg(not(feature = "native-cuda"))]
+    #[test]
+    fn gemma4_without_cuda_refuses_before_sampling_defaults() {
+        let dir = tempfile::tempdir().expect("temporary model directory");
+        std::fs::write(dir.path().join("generation_config.json"), "not JSON")
+            .expect("write malformed sampling defaults");
+        let mut config = engine_config("bolt", None);
+        config.family = crate::family::gemma4::FAMILY.into();
+        config.model_dir = dir.path().to_path_buf();
+        config.context_limit = None;
+
+        let error = start_engines(&file_with(vec![config], None))
+            .err()
+            .expect("unsupported Bolt must not start");
+        assert_eq!(
+            error.0,
+            format!(
+                "engine bolt failed to start: gemma4 serves only the Nemotron Bolt E4B on the \
+                 native-cuda build; this build has no CUDA engine (model directory {})",
+                dir.path().display()
+            )
+        );
     }
 
     // The real startup path on a real network mount: without the guard the

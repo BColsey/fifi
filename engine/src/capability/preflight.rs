@@ -234,6 +234,12 @@ fn evaluate(
 
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
+    if family_name == Some(crate::family::gemma4::FAMILY)
+        && let Err(error) = crate::family::gemma4::serve::check_backend(model_dir, &facts.backends)
+    {
+        checks.push(Check::new("backend", CheckStatus::Fail, error.describe()));
+        return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
+    }
     // A GGUF directory with no tokenizer files starts from the vocabulary in the weights.
     gguf_tokenizer_check(inspection, &mut checks);
     if family_name == Some(crate::family::qwen36::factory::FAMILY) {
@@ -511,9 +517,8 @@ fn inventory_checks(inspection: &ModelInspection, checks: &mut Vec<Check>) {
     }
 }
 
-/// The servable families this build recognizes, from the one list the
-/// server config validates against.
-fn servable_families() -> &'static [&'static str] {
+/// The family names the server config accepts, whether or not the build can serve them.
+fn recognized_families() -> &'static [&'static str] {
     &crate::server::config::FAMILIES
 }
 
@@ -523,7 +528,7 @@ fn identify_family(
     checks: &mut Vec<Check>,
 ) -> Option<String> {
     if let Some(family) = &candidate.family {
-        if servable_families().contains(&family.as_str()) {
+        if recognized_families().contains(&family.as_str()) {
             checks.push(Check::new(
                 "family",
                 CheckStatus::Pass,
@@ -536,7 +541,7 @@ fn identify_family(
             CheckStatus::Fail,
             format!(
                 "family {family} is not recognized by this build (supported: {})",
-                servable_families().join(", ")
+                recognized_families().join(", ")
             ),
         ));
         return None;
@@ -582,7 +587,7 @@ fn identify_family(
         CheckStatus::Fail,
         format!(
             "the family cannot be identified from this directory; pass --family (supported: {})",
-            servable_families().join(", ")
+            recognized_families().join(", ")
         ),
     ));
     None
@@ -2245,6 +2250,42 @@ mod tests {
         let check = check_named(&report, "tokenizer files");
         assert_eq!(check.status, super::CheckStatus::Pass, "{}", check.detail);
         assert!(check.detail.contains("model.gguf"), "{}", check.detail);
+    }
+
+    #[test]
+    fn gemma4_preflight_distinguishes_recognition_from_cuda_eligibility() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("model.gguf"),
+            crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon"),
+        )
+        .expect("write the weights file");
+
+        let cuda = cuda_facts(22 << 30);
+        let mut without_cuda = cuda.clone();
+        without_cuda.backends.cuda = false;
+        for family in [Some(crate::family::gemma4::FAMILY.to_owned()), None] {
+            let candidate = Candidate {
+                family,
+                ..Candidate::default()
+            };
+            let check = |facts| {
+                super::preflight(dir.path(), dir.path(), &candidate, facts).expect("report")
+            };
+            let refused = check(&without_cuda);
+            assert_eq!(
+                refused.family.as_deref(),
+                Some(crate::family::gemma4::FAMILY)
+            );
+            assert_eq!(refused.verdict, Verdict::Unsupported);
+            assert!(!refused.verdict.servable());
+            let backend = check_named(&refused, "backend");
+            assert_eq!(backend.status, CheckStatus::Fail);
+            assert!(backend.detail.contains("this build has no CUDA engine"));
+
+            // A compiled backend passes the build gate, not the model's load checks.
+            assert_eq!(check(&cuda).verdict, Verdict::Experimental);
+        }
     }
 
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {

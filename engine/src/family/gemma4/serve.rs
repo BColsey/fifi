@@ -11,10 +11,28 @@
 //! the pending token's decode runs the head.
 
 #[cfg(any(feature = "native-cuda", test))]
-use std::{fs, path::Path};
-
+use super::config;
+use crate::{EngError, capability::probe::CompiledBackends};
 #[cfg(any(feature = "native-cuda", test))]
-use {super::config, crate::EngError};
+use std::fs;
+use std::path::Path;
+
+/// Build eligibility only. A CUDA build still has to pass the Bolt checkpoint checks at load.
+pub(crate) fn check_backend(model: &Path, backends: &CompiledBackends) -> Result<(), EngError> {
+    if backends.cuda {
+        Ok(())
+    } else {
+        Err(cuda_required(model))
+    }
+}
+
+pub(crate) fn cuda_required(model: &Path) -> EngError {
+    EngError::BadRequest(format!(
+        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+         this build has no CUDA engine (model directory {})",
+        model.display()
+    ))
+}
 
 /// Reads and validates the model directory's `config.json` against the Bolt
 /// descriptor; the server starter uses this to dispatch inside the gemma4
