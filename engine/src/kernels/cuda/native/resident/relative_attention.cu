@@ -103,7 +103,9 @@ __device__ void finish(const Args &a, const Rows &r, const Partials &p) {
                                   kHeadDim, sum, value);
         const int out = r.head * kHeadDim + d;
         const float gate = 1.f / (1.f + expf(-a.gates[out]));
-        a.out[out] = (value / sum) * gate;
+        const float result = (value / sum) * gate;
+        if (!isfinite(result)) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
+        a.out[out] = result;
     }
 }
 

@@ -14,8 +14,11 @@ use crate::{
         resident_history::upload_rows,
     },
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceStream, PinnedBuf,
-        resident::relative_attention::{HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape},
+        CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
+        resident::{
+            dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
+            relative_attention::{HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape},
+        },
     },
 };
 
@@ -43,6 +46,7 @@ pub(in crate::family::inkling2) struct Plan {
     visits: Vec<Visit>,
     tables: Vec<u8>,
     scratch_bytes: usize,
+    projected_rows: Option<usize>,
 }
 
 pub(in crate::family::inkling2) struct Row<'a> {
@@ -52,6 +56,12 @@ pub(in crate::family::inkling2) struct Row<'a> {
     pub relative: &'a [f32],
     pub sinks: &'a [f32],
     pub gates: &'a [f32],
+}
+
+pub(in crate::family::inkling2) struct OutputProjection<'a> {
+    pub(super) weight: DeviceRange<'a>,
+    pub(super) dtype: DenseDtype,
+    pub(super) rows: usize,
 }
 
 pub(in crate::family::inkling2) struct History<'a> {
@@ -64,6 +74,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     visits: Vec<Visit>,
     arena: DeviceBuffer,
     scratch_at: usize,
+    projected_rows: Option<usize>,
     projection_headroom: u64,
     reserve_credit: u64,
     stream: DeviceStream,
@@ -74,6 +85,7 @@ struct Runtime {
     transfer: PinnedBuf,
     encoded: Vec<u8>,
     next_position: Vec<Option<usize>>,
+    chained_projection_used: bool,
 }
 
 impl Plan {
@@ -136,10 +148,19 @@ impl Plan {
                 .and_then(|at| at.checked_add(cache_bytes))
                 .ok_or_else(|| bad("CUDA relative attention cache overflows"))?;
         }
+        let projected_rows = (std::env::var("FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT").as_deref()
+            == Ok("1"))
+        .then_some(spec.hidden_size as usize);
+        if let Some(rows) = projected_rows {
+            scratch_bytes = scratch_bytes
+                .checked_add(f32_bytes(rows)?)
+                .ok_or_else(|| bad("CUDA relative attention projection scratch overflows"))?;
+        }
         Ok(Some(Self {
             visits,
             tables,
             scratch_bytes,
+            projected_rows,
         }))
     }
 
@@ -201,6 +222,7 @@ impl Plan {
             visits: self.visits,
             arena,
             scratch_at,
+            projected_rows: self.projected_rows,
             projection_headroom,
             reserve_credit: credit,
             stream,
@@ -208,6 +230,7 @@ impl Plan {
                 transfer,
                 encoded: Vec::with_capacity(self.scratch_bytes),
                 next_position,
+                chained_projection_used: false,
             }),
         }))
     }
@@ -246,6 +269,10 @@ impl ResidentAttention {
         self.reserve_credit
     }
 
+    pub(super) fn projected_rows(&self) -> Option<usize> {
+        self.projected_rows
+    }
+
     pub(in crate::family::inkling2) fn invalidate(&self) {
         self.state.borrow_mut().next_position.fill(None);
     }
@@ -256,6 +283,7 @@ impl ResidentAttention {
         state_slot: usize,
         row: Row<'_>,
         history: History<'_>,
+        projection: Option<OutputProjection<'_>>,
     ) -> Result<Vec<f32>, EngError> {
         let visit = self.visits[state_slot];
         let mut state = self.state.borrow_mut();
@@ -266,7 +294,9 @@ impl ResidentAttention {
 
         let ordered = row.encode(visit.shape, history.position, &mut state.encoded)?;
         let input_bytes = state.encoded.len();
-        let output_bytes = f32_bytes(row.query.len())?;
+        let attention_bytes = f32_bytes(row.query.len())?;
+        let output_rows = projection.as_ref().map_or(row.query.len(), |p| p.rows);
+        let output_bytes = f32_bytes(output_rows)?;
         let Runtime {
             transfer, encoded, ..
         } = &mut *state;
@@ -274,6 +304,10 @@ impl ResidentAttention {
         let [q, k, v, relative, sinks, gates, pos, status] =
             ordered.map(|offset| offset + self.scratch_at);
         let out = self.scratch_at + input_bytes;
+        // Put the final result immediately after the status word for one readback.
+        let chained = projection.is_some();
+        let attention_at = out + if chained { output_bytes } else { 0 };
+        let attention_out = self.arena.range(attention_at, attention_bytes)?;
         let call = RelativeAttentionCall {
             shape: visit.shape,
             q: self.arena.range(q, k - q)?,
@@ -285,7 +319,7 @@ impl ResidentAttention {
             gates: self.arena.range(gates, pos - gates)?,
             pos: self.arena.range(pos, size_of::<u32>())?,
             status: self.arena.range(status, size_of::<u32>())?,
-            out: self.arena.range(out, output_bytes)?,
+            out: attention_out,
             k_cache: self.arena.range(visit.cache_at, visit.cache_bytes)?,
             v_cache: self
                 .arena
@@ -299,6 +333,18 @@ impl ResidentAttention {
                 self.arena.range(self.scratch_at, input_bytes)?,
             )?;
             context.relative_attention(&self.stream, call)?;
+            if let Some(projection) = projection {
+                context.dense_gemv(
+                    &self.stream,
+                    DenseGemvCall {
+                        shape: DenseGemvShape::packed(1, projection.rows, row.query.len()),
+                        dtype: projection.dtype,
+                        w: projection.weight,
+                        x: attention_out,
+                        y: self.arena.range(out, output_bytes)?,
+                    },
+                )?;
+            }
             context.copy_to_pinned(
                 &self.stream,
                 self.arena.range(status, size_of::<u32>() + output_bytes)?,
@@ -315,12 +361,18 @@ impl ResidentAttention {
         if u32::from_ne_bytes(health) != 0 {
             return Err(bad("invalid CUDA relative attention state"));
         }
-        let mut result = vec![0.0; row.query.len()];
+        let mut result = vec![0.0; output_rows];
         transfer.read_f32(size_of::<u32>(), &mut result)?;
         if !result.iter().all(|v| v.is_finite()) {
-            return Err(bad("non-finite CUDA relative attention output"));
+            return Err(bad(
+                "non-finite CUDA relative attention or projection output",
+            ));
         }
         state.next_position[state_slot] = Some(history.position + 1);
+        if chained && !state.chained_projection_used {
+            eprintln!("Inkling CUDA used chained relative attention output projection");
+            state.chained_projection_used = true;
+        }
         Ok(result)
     }
 
@@ -488,47 +540,72 @@ mod tests {
                 cache_bytes,
             }],
             tables: vec![0; table_bytes],
-            scratch_bytes: q + k + v + relative + sinks + gates + pos + status + out,
+            scratch_bytes: q
+                + k
+                + v
+                + relative
+                + sinks
+                + gates
+                + pos
+                + status
+                + out
+                + f32_bytes(2).unwrap(),
+            projected_rows: Some(2),
         }
         .load(&ctx, false)
         .unwrap()
         .unwrap();
         let zero = [0.0; HEAD_DIM];
-        let run = |position, value, history: &[f32]| {
+        let stream = ctx.stream().unwrap();
+        let weight = ctx.allocate(f32_bytes(2 * HEAD_DIM).unwrap()).unwrap();
+        let mut weights = [0.0; 2 * HEAD_DIM];
+        weights[0] = 2.0;
+        weights[HEAD_DIM] = -1.0;
+        let mut encoded = Vec::new();
+        extend_words(&mut encoded, &weights);
+        weight.write_at(&stream, 0, &encoded).unwrap();
+        let run = |position, value, history: &[f32], project: bool| {
             let keys = history.iter().map(|_| Arc::new(zero.to_vec())).collect();
             let values = history
                 .iter()
                 .map(|&v| Arc::new(vec![v; HEAD_DIM]))
                 .collect();
-            attention
-                .step(
-                    &ctx,
-                    0,
-                    Row {
-                        query: &zero,
-                        key: &zero,
-                        value: &[value; HEAD_DIM],
-                        relative: &[0.0],
-                        sinks: &[0.0],
-                        gates: &zero,
-                    },
-                    History {
-                        position,
-                        keys: &keys,
-                        values: &values,
-                    },
-                )
-                .unwrap()
+            attention.step(
+                &ctx,
+                0,
+                Row {
+                    query: &zero,
+                    key: &zero,
+                    value: &[value; HEAD_DIM],
+                    relative: &[0.0],
+                    sinks: &[0.0],
+                    gates: &zero,
+                },
+                History {
+                    position,
+                    keys: &keys,
+                    values: &values,
+                },
+                project.then(|| OutputProjection {
+                    weight: weight.range(0, weight.bytes()).unwrap(),
+                    dtype: DenseDtype::F32,
+                    rows: 2,
+                }),
+            )
         };
-        assert_eq!(run(0, 2.0, &[]), [0.5; HEAD_DIM]);
-        assert_eq!(run(1, 4.0, &[2.0]), [1.0; HEAD_DIM]);
+        assert_eq!(run(0, 2.0, &[], false).unwrap(), [0.5; HEAD_DIM]);
+        assert_eq!(run(1, 4.0, &[2.0], true).unwrap(), [2.0, -1.0]);
         attention.invalidate();
-        assert_eq!(run(2, 2.0, &[40.0, 20.0]), [7.75; HEAD_DIM]);
-        assert_eq!(run(3, 6.0, &[2.0, 40.0, 20.0]), [6.0; HEAD_DIM]);
+        assert_eq!(run(2, 2.0, &[40.0, 20.0], true).unwrap(), [15.5, -7.75]);
+        assert_eq!(
+            run(3, 6.0, &[2.0, 40.0, 20.0], false).unwrap(),
+            [6.0; HEAD_DIM]
+        );
 
         // Abandon two speculative rows after they overwrite a visible value.
-        run(4, 100.0, &[6.0, 2.0, 40.0]);
-        run(5, 200.0, &[100.0, 6.0, 2.0]);
-        assert_eq!(run(4, 8.0, &[6.0, 2.0, 40.0]), [2.0; HEAD_DIM]);
+        run(4, 100.0, &[6.0, 2.0, 40.0], true).unwrap();
+        run(5, 200.0, &[100.0, 6.0, 2.0], false).unwrap();
+        assert_eq!(run(4, 8.0, &[6.0, 2.0, 40.0], true).unwrap(), [4.0, -2.0]);
+        assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
     }
 }

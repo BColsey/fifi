@@ -682,6 +682,18 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn relative_attention_projection(
+        &self,
+        name: &str,
+        shape: [usize; 2],
+    ) -> Result<Option<attention::OutputProjection<'_>>, EngError> {
+        match &self.cuda {
+            Some(cuda) => cuda.relative_attention_projection(name, shape),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn predict_experts(&self, layer: usize, hidden: impl FnOnce() -> Vec<f32>) {
         if let Some(ram) = &self.ram {
             ram.predict(layer, hidden, &self.mapping, |id| {

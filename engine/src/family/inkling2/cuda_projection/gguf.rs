@@ -194,6 +194,30 @@ impl GgufCuda {
             .map(|attn| (&self.context, attn))
     }
 
+    pub(in crate::family::inkling2) fn relative_attention_projection(
+        &self,
+        name: &str,
+        shape: [usize; 2],
+    ) -> Result<Option<attention::OutputProjection<'_>>, EngError> {
+        let Some(attention) = &self.resident_attention else {
+            return Ok(None);
+        };
+        if attention.projected_rows() != Some(shape[0]) {
+            return Ok(None);
+        }
+        let Some((weight, dtype)) = self.dense.get(name) else {
+            return Ok(None);
+        };
+        if weight.shape != shape || self.step.uses_q8_activations(*dtype) {
+            return Ok(None);
+        }
+        Ok(Some(attention::OutputProjection {
+            weight: weight.codes.range(0, weight.codes.bytes())?,
+            dtype: *dtype,
+            rows: shape[0],
+        }))
+    }
+
     pub(in crate::family::inkling2) fn load(
         dense: Vec<GgufDenseUpload<'_>>,
         spec: &super::TextSpec,

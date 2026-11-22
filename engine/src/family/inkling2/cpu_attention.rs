@@ -138,12 +138,16 @@ impl CpuForward {
             self.math.d_rel,
             self.math.rel_l2_clip_threshold,
         );
+        let output_name = format!("{attn}.wo_ud.weight");
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         let device_output = if let Weights::Gguf(weights) = &self.weights
             && let Some((context, attention)) = weights.resident_attention()
         {
             let _span = self.phase_span(Work::DeviceAttention);
-            Some(attention.step(
+            let projection =
+                weights.relative_attention_projection(&output_name, [self.hidden(), q.len()])?;
+            let projected = projection.is_some();
+            let output = attention.step(
                 context,
                 visit.state_slot,
                 attention::Row {
@@ -159,7 +163,9 @@ impl CpuForward {
                     keys: &state.keys,
                     values: &state.values,
                 },
-            )?)
+                projection,
+            )?;
+            Some((output, projected))
         } else {
             None
         };
@@ -167,7 +173,7 @@ impl CpuForward {
         let device_output = None;
         state.push(k, v, self.kv_capacity(visit.attention));
 
-        let out = if let Some(out) = device_output {
+        let (out, projected_output) = if let Some(out) = device_output {
             out
         } else {
             let _span = self.phase_span(Work::CpuAttention);
@@ -179,12 +185,13 @@ impl CpuForward {
             for (out, gate) in out.iter_mut().zip(gates) {
                 *out *= sigmoid(gate);
             }
-            out
+            (out, false)
         };
-        let raw = {
+        let raw = if projected_output {
+            out
+        } else {
             let _span = self.phase_span(Work::Projection);
-            self.weights
-                .project(&format!("{attn}.wo_ud.weight"), &out, self.hidden())?
+            self.weights.project(&output_name, &out, self.hidden())?
         };
         self.output_conv(
             raw,
