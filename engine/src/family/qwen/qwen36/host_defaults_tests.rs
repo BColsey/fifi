@@ -213,6 +213,21 @@ fn the_dense_family_derives_the_budget_but_keeps_compile_off() {
     .expect("dense settings");
     assert!(got.prefill_budget.is_some());
     assert!(!got.compile);
+    // The dense family decodes one sequence at a time: no count is derived for it.
+    assert_eq!((got.max_seqs, got.max_seqs_derived()), (1, false));
+}
+
+#[test]
+fn speculation_keeps_the_start_at_one_session() {
+    let options = Q36Options {
+        draft_mode: Some("ngram".into()),
+        ..Q36Options::default()
+    };
+    let got = resolve(Some(&options), &env(36));
+    // A start with speculation on keeps compile off, and no count is derived without it.
+    let got = got.expect("serves");
+    assert!(got.speculation.enabled());
+    assert_eq!((got.max_seqs, got.max_seqs_derived()), (1, false));
 }
 
 /// The shard bytes of a 6-bit dense 27B pack: 21.7 GiB.

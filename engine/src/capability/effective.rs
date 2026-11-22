@@ -203,7 +203,7 @@ pub(crate) fn q36_effective(
         row(
             "max_seqs",
             settings.max_seqs.to_string(),
-            present(&options.max_seqs),
+            from_host("max_seqs", present(&options.max_seqs)),
         ),
         row(
             "prefix_store_entries",
