@@ -809,11 +809,48 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
     let mut serial = GgufTokenFeeds::new(&model, &rows, 2).unwrap();
     let shape = model.config().model_shape().unwrap();
     let weights = super::ple_weights::GgufPleWeights::load(&model).unwrap();
+    // Populate only the planned IQ4_NL n-gram rows in this sparse synthetic file.
+    // These are test bytes, not a sample from the pinned checkpoint.
+    {
+        use std::os::unix::fs::FileExt;
+        let mapped = model
+            .map()
+            .get(crate::family::recipe::Global::NgramTable, None)
+            .unwrap();
+        let tensor = model.weights.header().tensor(&mapped.name).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&model.weights.paths()[tensor.shard()])
+            .unwrap();
+        let mut block = vec![0x00, 0x3c]; // F16 scale 1.0
+        block.extend([0x88; 16]);
+        let encoded = block.repeat(mapped.dims[0] as usize / 32);
+        let mut history = Vec::new();
+        for token in [1, 2, shape.ple.dims().eos] {
+            let plan =
+                super::super::super::ple::plan_rows(&shape.ple, &weights.view(), &history, token)
+                    .unwrap();
+            for (_, row) in plan.rows {
+                file.write_all_at(
+                    &encoded,
+                    tensor.abs_offset() + u64::from(row) * encoded.len() as u64,
+                )
+                .unwrap();
+            }
+            history = plan.history;
+        }
+    }
     let mut projector = super::projector::HostProjector::new(&model.weights, &rows, 2);
     let mut state = super::super::super::ple::PleState::new(&shape.ple);
     let tokens = [1, 2];
     let starts = chunk.begin_chunk(&tokens, false).unwrap();
     assert_eq!(starts.len(), 2);
+    assert!(
+        starts
+            .iter()
+            .all(|start| start.ple_embedding.iter().any(|&x| x != 0.0)),
+        "synthetic n-gram rows must be nonzero"
+    );
     assert!(chunk.begin_chunk(&[u32::MAX], false).is_err());
     assert!(chunk.ple_update(2, &starts[0].stream).is_err());
     for (token, start) in tokens.into_iter().zip(&starts) {
