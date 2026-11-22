@@ -140,7 +140,7 @@ fn a_chat_request_writes_one_json_line_to_standard_error_without_text_or_key() {
         reply["usage"]["completion_tokens"]
     );
     assert!(line["prompt_tokens"].as_u64().expect("count") > 0);
-    for secret in ["zebra-prompt", "Pong", KEY, "Bearer"] {
-        assert!(!stderr.contains(secret), "{secret} reached the log");
+    for canary in ["zebra-prompt", "Pong", KEY, "Bearer"] {
+        assert!(!stderr.contains(canary), "{canary} reached the log");
     }
 }

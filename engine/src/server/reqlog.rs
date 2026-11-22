@@ -2274,8 +2274,8 @@ mod tests {
         let expected = "Adding.".len() + CALL.len() + 1;
         assert_eq!(line["completion_tokens"], expected);
         let raw = &capture.writes()[0];
-        for secret in ["zebra-prompt", "Adding", "function", testkit::API_KEY] {
-            assert!(!raw.contains(secret), "{secret} reached the log: {raw}");
+        for canary in ["zebra-prompt", "Adding", "function", testkit::API_KEY] {
+            assert!(!raw.contains(canary), "{canary} reached the log: {raw}");
         }
     }
 
