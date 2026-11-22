@@ -133,15 +133,19 @@ pub(in crate::family::qwen::flash_next) fn stream_plan(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for _ in 0..8 {
+    let limit = budget.card_bytes;
+    for _ in 0..16 {
         let plan = StreamPlan::choose(&layers, budget)?;
-        let real = staging_bytes_per_slot(stacks, &plan) * plan.staging_slots() as u64;
-        if real <= plan.staging_bytes() {
+        let staging = staging_bytes_per_slot(stacks, &plan) * plan.staging_slots() as u64;
+        let used = plan.resident_bytes() + staging;
+        if used <= limit {
             return Ok(plan);
         }
-        budget.card_bytes = budget.card_bytes.saturating_sub(real - plan.staging_bytes());
+        budget.card_bytes = budget.card_bytes.saturating_sub(used - limit);
     }
-    Err(refuse("the staging of the streamed layers does not settle against the card budget"))
+    Err(refuse(
+        "the staging of the streamed layers does not settle against the card budget",
+    ))
 }
 
 #[cfg(test)]
@@ -210,11 +214,11 @@ mod tests {
         .expect("plan");
         let homes = |home: Home| (0..48).filter(|&layer| plan.home(layer) == home).count();
         assert!(homes(Home::Card) > 0 && homes(Home::Pinned) > 0 && homes(Home::Disk) > 0);
-        assert!(plan.resident_bytes() + plan.staging_bytes() <= total / 3);
-        // The staging the transport allocates is within what the plan charged.
+        // The layers on the card and the staging the transport allocates fit the card budget.
         assert!(
-            super::staging_bytes_per_slot(&stacks, &plan) * plan.staging_slots() as u64
-                <= plan.staging_bytes()
+            plan.resident_bytes()
+                + super::staging_bytes_per_slot(&stacks, &plan) * plan.staging_slots() as u64
+                <= total / 3
         );
         // A card that holds everything streams nothing.
         let all = stream_plan(
