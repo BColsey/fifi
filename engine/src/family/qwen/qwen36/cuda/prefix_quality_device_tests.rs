@@ -3,6 +3,8 @@
 mod exl3_restore;
 #[path = "prefix_quality_kv8_device_tests.rs"]
 mod kv8;
+#[path = "prefix_quality_partition_device_tests.rs"]
+mod partition;
 
 use super::super::{
     common_tests::{dims, inventory},
