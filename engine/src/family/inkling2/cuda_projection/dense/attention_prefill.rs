@@ -2,10 +2,11 @@
 
 use super::{
     DenseGemvCall, DenseGemvShape, DenseStep, ResidentProjection, Slot, bad, dense_gemv_bytes,
+    float_bytes,
 };
 use crate::{
     EngError,
-    kernels::cuda::{CudaContext, DeviceRange},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
 };
 
 const SIDE: [usize; 2] = [4, 5];
@@ -14,6 +15,7 @@ pub(in crate::family::inkling2) struct PrefillProjection<'a> {
     pub(in crate::family::inkling2::cuda_projection) context: &'a CudaContext,
     pub(in crate::family::inkling2::cuda_projection) step: &'a DenseStep,
     pub(in crate::family::inkling2::cuda_projection) weights: [Option<ResidentProjection<'a>>; 8],
+    pub(in crate::family::inkling2::cuda_projection) scratch: Option<&'a DeviceBuffer>,
 }
 
 impl PrefillProjection<'_> {
@@ -22,7 +24,7 @@ impl PrefillProjection<'_> {
         input: [&[f32]; 3],
     ) -> Result<usize, EngError> {
         self.step
-            .projection_tile_capacity(&Layout::new(input, self.weights, &SIDE))
+            .projection_tile_capacity(&Layout::new(input, self.weights, &SIDE), self.scratch)
     }
 
     pub(in crate::family::inkling2) fn tile(
@@ -33,9 +35,13 @@ impl PrefillProjection<'_> {
             .first()
             .ok_or_else(|| bad("empty Inkling prefill projection tile"))?;
         let layout = Layout::new(*first, self.weights, &SIDE);
-        let (values, side) =
-            self.step
-                .project_group_tile(self.context, inputs, self.weights, &layout)?;
+        let (values, side) = self.step.project_group_tile(
+            self.context,
+            inputs,
+            self.weights,
+            &layout,
+            self.scratch,
+        )?;
         Ok((
             layout.host_rows(&values).collect(),
             side.ok_or_else(|| bad("missing Inkling attention sidecar"))?,
@@ -90,13 +96,13 @@ impl DenseStep {
             return Ok(None);
         };
         let layout = Layout::new(*first, weights, &[]);
-        let tile = self.projection_tile_capacity(&layout)?;
+        let tile = self.projection_tile_capacity(&layout, None)?;
         if tile < 2 || layout.host.iter().all(|&n| n == 0) {
             return Ok(None);
         }
         let mut rows = Vec::with_capacity(inputs.len());
         for chunk in inputs.chunks(tile) {
-            let (values, _) = self.project_group_tile(context, chunk, weights, &layout)?;
+            let (values, _) = self.project_group_tile(context, chunk, weights, &layout, None)?;
             rows.extend(layout.host_rows(&values));
         }
         Ok(Some(rows))
@@ -105,8 +111,12 @@ impl DenseStep {
     fn projection_tile_capacity<const N: usize>(
         &self,
         layout: &Layout<N>,
+        scratch: Option<&DeviceBuffer>,
     ) -> Result<usize, EngError> {
-        let capacity = self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>();
+        let capacity = match scratch {
+            Some(buffer) => buffer.bytes(),
+            None => self.arena.tensor(Slot::Output as usize)?.bytes(),
+        } / size_of::<f32>();
         let per_row = layout
             .input
             .iter()
@@ -119,13 +129,14 @@ impl DenseStep {
             .min(DenseGemvShape::MAX_ACTIVATION_ROWS))
     }
 
-    fn project_group_tile<const N: usize>(
-        &self,
+    fn project_group_tile<'a, const N: usize>(
+        &'a self,
         context: &CudaContext,
         inputs: &[[&[f32]; 3]],
         weights: [Option<ResidentProjection<'_>>; N],
         layout: &Layout<N>,
-    ) -> Result<(Vec<f32>, Option<DeviceRange<'_>>), EngError> {
+        scratch: Option<&'a DeviceBuffer>,
+    ) -> Result<(Vec<f32>, Option<DeviceRange<'a>>), EngError> {
         if inputs
             .iter()
             .any(|row| row.map(<[f32]>::len) != layout.input)
@@ -142,10 +153,14 @@ impl DenseStep {
         let ld_side: usize = layout.side.iter().sum();
         let input_words = m * ld_x;
         let side_at = input_words + m * ld_host;
-        let input = self.range(Slot::Output, 0, input_words)?;
-        let output = self.range(Slot::Output, input_words, m * ld_host)?;
+        let range = |offset, len| match scratch {
+            Some(buffer) => buffer.range(float_bytes(offset)?, float_bytes(len)?),
+            None => self.range(Slot::Output, offset, len),
+        };
+        let input = range(0, input_words)?;
+        let output = range(input_words, m * ld_host)?;
         let side = (ld_side > 0)
-            .then(|| self.range(Slot::Output, side_at, m * ld_side))
+            .then(|| range(side_at, m * ld_side))
             .transpose()?;
         let mut calls = Vec::with_capacity(N);
         for (i, p) in weights
@@ -173,14 +188,33 @@ impl DenseStep {
                 shape,
                 dtype: p.dtype,
                 w: p.weight.codes.range(0, need.w)?,
-                x: self.range(Slot::Output, input_offset, need.x / size_of::<f32>())?,
-                y: self.range(Slot::Output, output_offset, need.y / size_of::<f32>())?,
+                x: range(input_offset, need.x / size_of::<f32>())?,
+                y: range(output_offset, need.y / size_of::<f32>())?,
             });
         }
         let input_rows: Vec<_> = inputs.iter().flatten().copied().collect();
-        let values = self.run_rows(context, &self.stream, &input_rows, [input, output], || {
-            context.dense_gemv_group(&self.stream, &calls)
-        })?;
+        let values = if let Some(buffer) = scratch {
+            let mut encoded = Vec::with_capacity(input.bytes());
+            for row in &input_rows {
+                if !row.iter().all(|v| v.is_finite()) {
+                    return Err(bad("CUDA projection requires finite input"));
+                }
+                encoded.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
+            }
+            buffer.write_at(&self.stream, input.offset(), &encoded)?;
+            context.dense_gemv_group(&self.stream, &calls)?;
+            let mut bytes = vec![[0; 4]; output.bytes() / 4];
+            buffer.read_at(&self.stream, output.offset(), bytes.as_flattened_mut())?;
+            let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
+            if !values.iter().all(|v| v.is_finite()) {
+                return Err(bad("CUDA projection produced a nonfinite output"));
+            }
+            values
+        } else {
+            self.run_rows(context, &self.stream, &input_rows, [input, output], || {
+                context.dense_gemv_group(&self.stream, &calls)
+            })?
+        };
         // run_rows fenced the producer stream; attention may consume this range on its own stream.
         Ok((values, side))
     }
@@ -274,6 +308,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(tiled, scalar);
+        let scratch = context.allocate(7 * (3 * 32 + 17) * 4).unwrap();
+        let layout = Layout::new(input[0], weights, &[]);
+        assert_eq!(
+            step.projection_tile_capacity(&layout, Some(&scratch))
+                .unwrap(),
+            7
+        );
+        let (values, side) = step
+            .project_group_tile(&context, &input, weights, &layout, Some(&scratch))
+            .unwrap();
+        assert!(side.is_none());
+        assert_eq!(layout.host_rows(&values).collect::<Vec<_>>(), scalar);
         assert!(
             step.project_group_rows(&context, &input[..1], weights)
                 .unwrap()

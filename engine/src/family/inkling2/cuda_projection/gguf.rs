@@ -797,10 +797,23 @@ impl GgufCuda {
         if weights[..6].iter().any(Option::is_none) {
             return Ok(None);
         }
+        static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reuse = *REUSE.get_or_init(|| {
+            std::env::var("FIFI_INKLING_CUDA_PREFILL_REUSE_EXPERT_STAGE").as_deref() == Ok("1")
+        });
+        if reuse {
+            static USED: std::sync::Once = std::sync::Once::new();
+            USED.call_once(|| {
+                eprintln!("Inkling CUDA reused expert staging for attention projection")
+            });
+        }
+        // Cold-expert calls upload each weight afresh and fence before returning;
+        // attention finishes consuming its sidecar before this stage is reused.
         Ok(Some(PrefillProjection {
             context: &self.context,
             step: &self.step,
             weights,
+            scratch: reuse.then_some(&self.expert_codes),
         }))
     }
 
