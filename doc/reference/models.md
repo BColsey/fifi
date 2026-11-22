@@ -70,6 +70,8 @@ Set `FIFI_INKLING_CUDA_PREFILL_ROWS` from 2 to 16 to group prompt tokens on the 
 
 Set `FIFI_INKLING_DSPARK_GROUPED_PREFILL=1` to capture target features during grouped prompt prefill on the same compatible CUDA backend as grouped verification. Set `FIFI_INKLING_CUDA_PREFILL_ROWS` above one to request a group width. The host memory planner admits the width, and the startup prefill report shows the admitted value. The prefill and verification switches can be enabled independently. Token-major feature capture is the default.
 
+Set `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1` with `FIFI_INKLING_CUDA_GROUP_PROJECTIONS=1` to group resident Q, K, and V cross-pass controller projections in one transfer. Grouped prefill also batches those controllers across prompt rows when `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS=1` is set. Controllers with missing resident matrices use their existing fallback.
+
 ## Tokenizer files
 
 Engines that use external tokenizer files read `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

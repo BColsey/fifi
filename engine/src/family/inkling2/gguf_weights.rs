@@ -843,6 +843,18 @@ impl GgufTextWeights {
         self.cuda.as_ref()?.controller(names, x, shape)
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn attention_controllers(
+        &self,
+        names: [[&str; 3]; 3],
+        shape: [usize; 2],
+        rows: usize,
+    ) -> Result<Option<super::cuda_projection::gguf::AttentionControllers<'_>>, EngError> {
+        self.cuda.as_ref().map_or(Ok(None), |cuda| {
+            cuda.attention_controllers(names, shape, rows)
+        })
+    }
+
     pub(super) fn expert(&self, name: &str, id: ExpertId, x: &[f32]) -> Result<Vec<f32>, EngError> {
         let (tensor, bytes) = self.tensor(name)?;
         let index = id.expert as usize;

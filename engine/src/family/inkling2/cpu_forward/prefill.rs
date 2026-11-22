@@ -3,7 +3,7 @@
 
 use super::{
     CpuForward, LayerVisit, MessageBank, MoeRoute, Stream, TapRow, VisitState, Weights, add, bad,
-    window::PendingRow,
+    controller_batch::controller_batch_enabled, window::PendingRow,
 };
 use crate::{
     EngError,
@@ -126,6 +126,14 @@ impl CpuForward {
             projection_metadata = (size_of::<[Vec<f32>; 3]>()
                 + size_of::<super::super::cpu_attention::AttentionProjection>()
                 + size_of::<[&[f32]; 3]>()) as u128;
+            if controller_batch_enabled() {
+                // Three gates, messages, gain/forget outputs and temporary transfer copies.
+                projection_values += 33 * hidden;
+                projection_metadata += (15 * size_of::<Vec<f32>>()
+                    + 3 * size_of::<[&[f32]; 3]>()
+                    + 18 * size_of::<crate::kernels::cuda::resident::dense_gemv::DenseGemvCall<'_>>(
+                    )) as u128;
+            }
         }
         // Batched router logits coexist with the selected rows' scores.
         let numeric_bytes =
@@ -343,11 +351,32 @@ impl CpuForward {
         if !prefill_projection_batch_enabled() {
             return Ok(None);
         }
-        let inputs = rows
-            .iter()
-            .map(|row| self.attention_inputs(visit, layer, &row.stream, row.bank.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.prefill_attention_projections(weights, layer, visit.attention, &inputs)
+        let grouped = self.grouped_attention_inputs(
+            visit,
+            layer,
+            rows.iter().map(|row| (&row.stream, row.bank.as_ref())),
+        )?;
+        let batched_controllers = grouped.is_some();
+        let inputs = match grouped {
+            Some(inputs) => inputs,
+            None => rows
+                .iter()
+                .map(|row| {
+                    self.attention_inputs_scalar(visit, layer, &row.stream, row.bank.as_ref())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let projected =
+            self.prefill_attention_projections(weights, layer, visit.attention, &inputs)?;
+        if projected.is_none() && batched_controllers {
+            // Keep the completed controller rows when Q/K/V projection itself falls back.
+            return inputs
+                .iter()
+                .map(|input| self.project_attention(layer, visit.attention, input))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some);
+        }
+        Ok(projected)
     }
 
     fn prompt_experts(

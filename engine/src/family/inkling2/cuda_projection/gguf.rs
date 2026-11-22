@@ -4,7 +4,7 @@ use std::{cell::RefCell, collections::BTreeMap};
 
 use super::{
     DEVICE_HEADROOM, DensePlan, DenseStep, DenseUpload, Resident, bad,
-    dense::{DraftHead, ResidentProjection},
+    dense::{ControllerRow, ControllerWeights, DraftHead, ResidentProjection},
     upload_tensor,
 };
 use crate::family::inkling2::cpu_weights::Projection;
@@ -60,6 +60,50 @@ pub(in crate::family::inkling2) struct GgufDenseUpload<'a> {
 }
 
 type Projections = BTreeMap<String, (Resident, DenseDtype)>;
+
+type ControllerOutput = Option<[Vec<f32>; 2]>;
+
+pub(in crate::family::inkling2) struct AttentionControllers<'a> {
+    cuda: &'a GgufCuda,
+    weights: [Option<ControllerWeights<'a>>; 3],
+    shape: [usize; 2],
+}
+
+impl AttentionControllers<'_> {
+    pub(in crate::family::inkling2) fn project(
+        &self,
+        inputs: &[[&[f32]; 3]],
+    ) -> Result<Vec<[ControllerOutput; 3]>, EngError> {
+        let rows: Vec<_> = inputs
+            .iter()
+            .flat_map(|row| self.weights.into_iter().zip(row))
+            .filter_map(|(weights, &input)| weights.map(|weights| ControllerRow { weights, input }))
+            .collect();
+        let values = self
+            .cuda
+            .step
+            .controller_rows(&self.cuda.context, &rows, self.shape)?;
+        if self.cuda.prefill_report.is_some() {
+            eprintln!(
+                "Inkling CUDA grouped controllers {}",
+                serde_json::json!({"attention_rows": inputs.len(), "controller_rows": rows.len()})
+            );
+        }
+        let mut values = values.into_iter();
+        Ok(inputs
+            .iter()
+            .map(|_| {
+                self.weights.map(|weights| {
+                    weights.map(|_| {
+                        values
+                            .next()
+                            .expect("each resident controller produced a row")
+                    })
+                })
+            })
+            .collect())
+    }
+}
 
 fn projection_bytes(matrices: &[GgufDenseUpload<'_>]) -> u64 {
     matrices
@@ -509,14 +553,26 @@ impl GgufCuda {
 
     pub(in crate::family::inkling2) fn controller(
         &self,
-        [down, gain, forget]: [&str; 3],
+        names: [&str; 3],
         x: &[f32],
-        [rank, hidden]: [usize; 2],
+        shape: [usize; 2],
     ) -> Option<Result<[Vec<f32>; 2], EngError>> {
+        Some(
+            self.controller_weights(names, x.len(), shape)?
+                .and_then(|weights| self.step.controller(&self.context, weights, x)),
+        )
+    }
+
+    fn controller_weights(
+        &self,
+        [down, gain, forget]: [&str; 3],
+        input_width: usize,
+        [rank, hidden]: [usize; 2],
+    ) -> Option<Result<ControllerWeights<'_>, EngError>> {
         if !self.group_projections {
             return None;
         }
-        let shapes = [[rank, x.len()], [hidden, rank], [hidden, rank]];
+        let shapes = [[rank, input_width], [hidden, rank], [hidden, rank]];
         let weights = [
             self.dense.get(down)?,
             self.dense.get(gain)?,
@@ -529,10 +585,31 @@ impl GgufCuda {
         {
             return Some(Err(bad("bad GGUF CUDA controller projection shape")));
         }
-        Some(
-            self.step
-                .controller(&self.context, weights.map(|(w, dtype)| (w, *dtype)), x),
-        )
+        Some(Ok(weights.map(|(w, dtype)| (w, *dtype))))
+    }
+
+    pub(in crate::family::inkling2) fn attention_controllers(
+        &self,
+        names: [[&str; 3]; 3],
+        shape: [usize; 2],
+        rows: usize,
+    ) -> Result<Option<AttentionControllers<'_>>, EngError> {
+        let mut weights = [None; 3];
+        for (weight, names) in weights.iter_mut().zip(names) {
+            *weight = self
+                .controller_weights(names, 2 * shape[1], shape)
+                .transpose()?;
+        }
+        if weights.iter().flatten().count().saturating_mul(rows) < 2
+            || self.step.controller_capacity(shape[1])? < 2
+        {
+            return Ok(None);
+        }
+        Ok(Some(AttentionControllers {
+            cuda: self,
+            weights,
+            shape,
+        }))
     }
 
     pub(in crate::family::inkling2) fn expert_dtype(&self, kind: GgufType) -> Option<DenseDtype> {

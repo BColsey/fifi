@@ -14,6 +14,8 @@ use super::{
 use crate::{EngError, expert_tier::ExpertId};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod controller_batch;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prefill;
 mod window;
 
@@ -134,6 +136,17 @@ enum Role {
     Key,
     Value,
     Mlp,
+}
+
+const ATTENTION_ROLES: [(Role, &str); 3] = [
+    (Role::Query, "q_input_norm"),
+    (Role::Key, "k_input_norm"),
+    (Role::Value, "v_input_norm"),
+];
+
+struct ControlInput {
+    gate: Vec<f32>,
+    message: Vec<f32>,
 }
 
 impl Role {
@@ -534,38 +547,72 @@ impl CpuForward {
         stream: &Stream,
         bank: Option<&MessageBank>,
     ) -> Result<[Vec<f32>; 3], EngError> {
-        let physical = visit.weight_layer;
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some(mut rows) =
+            self.grouped_attention_inputs(visit, layer, std::iter::once((stream, bank)))?
+        {
+            return Ok(rows.pop().expect("one attention input row was requested"));
+        }
+        self.attention_inputs_scalar(visit, layer, stream, bank)
+    }
+
+    fn attention_inputs_scalar(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        stream: &Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<[Vec<f32>; 3], EngError> {
         let local = visit.attention == Attention::Local;
         let mut inputs = [Vec::new(), Vec::new(), Vec::new()];
-        for (i, (role, norm)) in [
-            (Role::Query, "q_input_norm"),
-            (Role::Key, "k_input_norm"),
-            (Role::Value, "v_input_norm"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (i, (role, _)) in ATTENTION_ROLES.into_iter().enumerate() {
             if local && i > 0 && bank.is_none() {
                 inputs[i] = inputs[0].clone();
                 continue;
             }
-            let mut input = if let Some(query_index) = physical.checked_sub(1) {
-                let row = if local { 0 } else { i };
-                let query = self.weights.row(
-                    &format!("model.llm.attn_res.attn_queries.{query_index}"),
-                    row,
-                    self.hidden(),
-                )?;
-                stream.mix(0, &query)
-            } else {
-                stream.current.clone()
-            };
-            self.control(&mut input, bank, physical, layer, role)?;
-            let norm = if local { "attn_norm" } else { norm };
-            self.norm(&mut input, &format!("{layer}.{norm}.weight"))?;
+            let mut input = self.attention_input(visit, stream, i)?;
+            self.control(&mut input, bank, visit.weight_layer, layer, role)?;
+            self.norm_attention_input(&mut input, layer, local, i)?;
             inputs[i] = input;
         }
         Ok(inputs)
+    }
+
+    fn attention_input(
+        &self,
+        visit: LayerVisit,
+        stream: &Stream,
+        role_index: usize,
+    ) -> Result<Vec<f32>, EngError> {
+        let Some(query_index) = visit.weight_layer.checked_sub(1) else {
+            return Ok(stream.current.clone());
+        };
+        let row = if visit.attention == Attention::Local {
+            0
+        } else {
+            role_index
+        };
+        let query = self.weights.row(
+            &format!("model.llm.attn_res.attn_queries.{query_index}"),
+            row,
+            self.hidden(),
+        )?;
+        Ok(stream.mix(0, &query))
+    }
+
+    fn norm_attention_input(
+        &self,
+        input: &mut [f32],
+        layer: &str,
+        local: bool,
+        role_index: usize,
+    ) -> Result<(), EngError> {
+        let norm = if local {
+            "attn_norm"
+        } else {
+            ATTENTION_ROLES[role_index].1
+        };
+        self.norm(input, &format!("{layer}.{norm}.weight"))
     }
 
     fn norm(&self, values: &mut [f32], weight: &str) -> Result<(), EngError> {
@@ -589,6 +636,24 @@ impl CpuForward {
             return Ok(());
         };
         let _span = self.phase_span(Work::Controller);
+        let ControlInput { gate, message } = self.control_input(input, bank, physical, role)?;
+        let names = control_names(layer, role);
+        let projection = self.weights.controller(
+            names.each_ref().map(String::as_str),
+            &gate,
+            [self.spec.core.gate_rank as usize, self.hidden()],
+        )?;
+        apply_control(input, message, projection);
+        Ok(())
+    }
+
+    fn control_input(
+        &self,
+        input: &[f32],
+        bank: &MessageBank,
+        physical: usize,
+        role: Role,
+    ) -> Result<ControlInput, EngError> {
         let (kind, offset) = match role {
             Role::Query => ("cross_pass_queries", 0),
             Role::Key => ("cross_pass_kv_queries", 0),
@@ -602,28 +667,12 @@ impl CpuForward {
             self.hidden(),
         )?;
         let message = bank.stream.mix(bank.first_block, &query);
-        let ctrl = format!("{layer}.controllers.{}", role.name());
-
         let mut gate = input.to_vec();
         gate.extend_from_slice(&message);
         for half in gate.chunks_exact_mut(self.hidden()) {
             rms_norm(half, MIX_EPS);
         }
-        let [gain, forget] = self.weights.controller(
-            [
-                &format!("{ctrl}.down_weight"),
-                &format!("{ctrl}.gain_weight"),
-                &format!("{ctrl}.forget_weight"),
-            ],
-            &gate,
-            [self.spec.core.gate_rank as usize, self.hidden()],
-        )?;
-        for (((value, message), gain), forget) in
-            input.iter_mut().zip(message).zip(gain).zip(forget)
-        {
-            *value = (*value - forget.tanh() * *value) + gain.tanh() * message;
-        }
-        Ok(())
+        Ok(ControlInput { gate, message })
     }
 
     fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {
@@ -734,6 +783,17 @@ impl CpuForward {
             );
         }
         Ok(output)
+    }
+}
+
+fn control_names(layer: &str, role: Role) -> [String; 3] {
+    let ctrl = format!("{layer}.controllers.{}", role.name());
+    ["down", "gain", "forget"].map(|part| format!("{ctrl}.{part}_weight"))
+}
+
+fn apply_control(input: &mut [f32], message: Vec<f32>, [gain, forget]: [Vec<f32>; 2]) {
+    for (((value, message), gain), forget) in input.iter_mut().zip(message).zip(gain).zip(forget) {
+        *value = (*value - forget.tanh() * *value) + gain.tanh() * message;
     }
 }
 

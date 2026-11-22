@@ -72,6 +72,13 @@ pub(super) struct ResidentProjection<'a> {
     pub(super) input: usize,
 }
 
+pub(super) type ControllerWeights<'a> = [(&'a Resident, DenseDtype); 3];
+
+pub(super) struct ControllerRow<'a> {
+    pub(super) weights: ControllerWeights<'a>,
+    pub(super) input: &'a [f32],
+}
+
 pub(super) struct ProjectionBatch<'a> {
     pub(super) weight: DeviceRange<'a>,
     pub(super) activations: usize,
@@ -439,7 +446,7 @@ impl DenseStep {
     pub(super) fn controller(
         &self,
         context: &CudaContext,
-        [(down, down_type), (gain, gain_type), (forget, forget_type)]: [(&Resident, DenseDtype); 3],
+        [(down, down_type), (gain, gain_type), (forget, forget_type)]: ControllerWeights<'_>,
         x: &[f32],
     ) -> Result<[Vec<f32>; 2], EngError> {
         let rank = down.shape[0];
@@ -470,6 +477,62 @@ impl DenseStep {
         })?;
         let forget = values.split_off(width);
         Ok([values, forget])
+    }
+
+    pub(super) fn controller_capacity(&self, hidden: usize) -> Result<usize, EngError> {
+        let output = self.arena.tensor(Slot::Output as usize)?;
+        let per_row = float_bytes(
+            hidden
+                .checked_mul(4)
+                .ok_or_else(|| bad("CUDA grouped controller row size overflows"))?,
+        )?;
+        Ok(output.bytes().checked_div(per_row).unwrap_or(0))
+    }
+
+    pub(super) fn controller_rows(
+        &self,
+        context: &CudaContext,
+        rows: &[ControllerRow<'_>],
+        [rank, hidden]: [usize; 2],
+    ) -> Result<Vec<[Vec<f32>; 2]>, EngError> {
+        let capacity = self.controller_capacity(hidden)?;
+        if capacity < 2 || rows.iter().any(|row| row.input.len() != 2 * hidden) {
+            return Err(bad(
+                "CUDA grouped controller rows exceed their workspace or shape",
+            ));
+        }
+        let reduced = self.range(Slot::Reduced, 0, rank)?;
+        let mut results = Vec::with_capacity(rows.len());
+        for tile in rows.chunks(capacity) {
+            let words = tile.len() * 2 * hidden;
+            let input = self.range(Slot::Output, 0, words)?;
+            let output = self.range(Slot::Output, words, words)?;
+            let mut calls = Vec::with_capacity(tile.len() * 3);
+            let mut inputs = Vec::with_capacity(tile.len());
+            for (index, row) in tile.iter().enumerate() {
+                let offset = index * 2 * hidden;
+                let gate = self.range(Slot::Output, offset, 2 * hidden)?;
+                let gain = self.range(Slot::Output, words + offset, hidden)?;
+                let forget = self.range(Slot::Output, words + offset + hidden, hidden)?;
+                // Each triple finishes reading the shared reduction before the next down GEMV.
+                for ((weight, dtype), (x, y)) in row.weights.into_iter().zip([
+                    (gate, reduced),
+                    (reduced, gain),
+                    (reduced, forget),
+                ]) {
+                    calls.push(self.call((&weight.codes, weight.shape, dtype), x, y)?);
+                }
+                inputs.push(row.input);
+            }
+            let values = self.run_rows(context, &self.stream, &inputs, [input, output], || {
+                context.dense_gemv_group(&self.stream, &calls)
+            })?;
+            results.extend(values.chunks_exact(2 * hidden).map(|row| {
+                let (gain, forget) = row.split_at(hidden);
+                [gain.to_vec(), forget.to_vec()]
+            }));
+        }
+        Ok(results)
     }
 
     fn launch(
@@ -590,4 +653,70 @@ fn scale_values(values: &mut [f32], scale: f32) -> Result<(), EngError> {
 fn float_bytes(len: usize) -> Result<usize, EngError> {
     len.checked_mul(size_of::<f32>())
         .ok_or_else(|| bad("CUDA BF16 projection byte count overflows"))
+}
+
+#[cfg(test)]
+mod controller_tests {
+    use super::*;
+    use crate::{family::inkling2::cuda_projection::upload_tensor, kernels::cuda::device_present};
+
+    #[test]
+    fn grouped_controller_tiles_match_scalar_bits() {
+        if !device_present("Inkling grouped controller tiles") {
+            return;
+        }
+        let context = CudaContext::new().unwrap();
+        let [rank, hidden] = [32, 32];
+        let plan = DensePlan::new([8 * hidden, 2 * hidden], hidden, rank).unwrap();
+        let step = DenseStep::new(&context, &plan).unwrap();
+        assert_eq!(step.controller_capacity(hidden).unwrap(), 2);
+        let bank = |seed: usize| {
+            [[rank, 2 * hidden], [hidden, rank], [hidden, rank]].map(|shape: [usize; 2]| Resident {
+                codes: upload_tensor(
+                    &context,
+                    &(0..shape[0] * shape[1])
+                        .flat_map(|i| {
+                            ((i.wrapping_mul(seed) % 73) as f32 * 0.003 - 0.06).to_ne_bytes()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+                shape,
+            })
+        };
+        let banks = [bank(19), bank(23)];
+        let inputs: Vec<Vec<f32>> = (0..5)
+            .map(|row| {
+                (0..2 * hidden)
+                    .map(|i| ((row * 13 + i * 5) % 113) as f32 * -0.012 + 0.3)
+                    .collect()
+            })
+            .collect();
+        let rows: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| ControllerRow {
+                weights: banks[index % 2]
+                    .each_ref()
+                    .map(|weight| (weight, DenseDtype::F32)),
+                input,
+            })
+            .collect();
+        let expected: Vec<_> = rows
+            .iter()
+            .map(|row| step.controller(&context, row.weights, row.input).unwrap())
+            .collect();
+        let actual = step
+            .controller_rows(&context, &rows, [rank, hidden])
+            .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().flatten().zip(expected.iter().flatten()) {
+            assert!(
+                actual
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(expected.iter().map(|v| v.to_bits()))
+            );
+        }
+    }
 }
