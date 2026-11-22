@@ -77,6 +77,32 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
             assert!((got - want).abs() < 1e-5, "{got} != {want}");
         }
     }
+    let batch_raw: Vec<[Vec<f32>; 3]> = (0..3)
+        .map(|row| std::array::from_fn(|i| fixture(hidden, 2 + 5 * row + 7 * i)))
+        .collect();
+    let rows = make_rows(&batch_raw, &gates, &messages, &gamma);
+    let wide = DensePlan::new(
+        [3 * (24 * hidden + 3 * rank + 3 + 36), 2 * hidden],
+        hidden,
+        rank,
+    )
+    .unwrap();
+    let batch_step = DenseStep::new(&context, &wide).unwrap();
+    let batch = batch_step
+        .controlled_attention_batch(&context, &rows, controllers, weights, eps)
+        .unwrap()
+        .unwrap();
+    for (row, got) in batch_raw.iter().zip(batch) {
+        let want = run(&step, row).unwrap().unwrap();
+        for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
+            assert!((g - w).abs() < 1e-5, "batch={g} single={w}");
+        }
+    }
+    assert!(
+        step.controlled_attention_batch(&context, &rows, controllers, weights, eps)
+            .unwrap()
+            .is_none()
+    );
     let small = DensePlan::new([24 * hidden - 32, 2 * hidden], hidden, rank).unwrap();
     assert!(
         run(&DenseStep::new(&context, &small).unwrap(), &raw)
@@ -88,6 +114,25 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
         run(&step, &raw).unwrap_err(),
         bad("CUDA projection produced a nonfinite output")
     );
+}
+
+fn make_rows<'a>(
+    values: &'a [[Vec<f32>; 3]],
+    gates: &'a [Vec<f32>; 3],
+    messages: &'a [Vec<f32>; 3],
+    gamma: &'a [Vec<f32>; 3],
+) -> Vec<[ControlledAttentionInput<'a>; 3]> {
+    values
+        .iter()
+        .map(|raw| {
+            std::array::from_fn(|i| ControlledAttentionInput {
+                gate: &gates[i],
+                input: &raw[i],
+                message: &messages[i],
+                gamma: &gamma[i],
+            })
+        })
+        .collect()
 }
 
 fn fixture(n: usize, seed: usize) -> Vec<f32> {
