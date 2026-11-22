@@ -159,13 +159,13 @@ struct Case {
 
 impl Case {
     fn shape(&self) -> Kv8Shape {
-        Kv8Shape {
-            rows: self.rows,
-            n_kv_head: self.n_kv_head,
-            head_dim: self.head_dim,
-            cells: self.cells,
-            code_scale: self.code_scale,
-        }
+        Kv8Shape::linear(
+            self.rows,
+            self.n_kv_head,
+            self.head_dim,
+            self.cells,
+            self.code_scale,
+        )
     }
 
     fn label(&self) -> String {
@@ -591,13 +591,7 @@ struct Plan {
 
 impl Plan {
     fn base(head_dim: usize, code_scale: Kv8CodeScale) -> Self {
-        let shape = Kv8Shape {
-            rows: 2,
-            n_kv_head: 2,
-            head_dim,
-            cells: 8,
-            code_scale,
-        };
+        let shape = Kv8Shape::linear(2, 2, head_dim, 8, code_scale);
         let empty = Slot {
             offset: 0,
             bytes: 0,

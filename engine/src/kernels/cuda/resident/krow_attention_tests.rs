@@ -635,13 +635,7 @@ impl<'r> Kv8Run<'r> {
                 status: c.status()?,
             },
         )?;
-        let shape = Kv8Shape {
-            rows: s.m,
-            n_kv_head: N_KV,
-            head_dim: D,
-            cells: rows,
-            code_scale: Kv8CodeScale::StoredHalf,
-        };
+        let shape = Kv8Shape::linear(s.m, N_KV, D, rows, Kv8CodeScale::StoredHalf);
         ctx.kv8_append(
             stream,
             shape,

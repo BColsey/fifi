@@ -19,6 +19,12 @@
  * one thread. The chunk append takes t rows of prefill at the HOST base position pos0
  * (0 <= pos0, pos0 + t <= cells), checked here before any launch.
  *
+ * Sliding ring: ring = 0 keeps `cell = position`. ring = R > 0 puts position p in cell p % R
+ * (R <= cells, rows <= R) so a layer that attends to the last W positions keeps R = W + rows - 1
+ * cells instead of the whole context. Ring positions are absolute: pos + rows <= 2^30 - 1
+ * independent of the physical cells; the caller keeps R >= window + rows - 1 so no row a
+ * query still reads is overwritten (attn_decode_gemma checks the same rule at the read side).
+ *
  * All geometry is run-time: n_kv_head 1..64, head_dim a multiple of 32 in 32..1024
  * (one warp quantizes one group of 32), cells 1..2^30 - 1. Both entries enqueue one kernel on
  * stream (NULL: the default stream; the Rust wrapper always passes one) and return
@@ -48,6 +54,7 @@ typedef struct inference_cuda_kv8_append_args {
     int head_dim;         /* a multiple of 32, 32..1024 */
     int cells;            /* plane cells per head (the KV capacity), 1..2^30 - 1 */
     int code_scale;       /* required: 1 = stored half, 2 = unrounded f32 */
+    int ring;             /* 0: cell = position; R > 0: cell = position % R, R <= cells, m <= R */
 } inference_cuda_kv8_append_args;
 
 /* The prefill chunk append: t rows at the host base position pos0. */
@@ -64,17 +71,19 @@ typedef struct inference_cuda_kv8_chunk_args {
     int head_dim;         /* a multiple of 32, 32..1024 */
     int cells;            /* plane cells per head, 1..2^30 - 1 */
     int code_scale;       /* required, including the former tail padding: 1 or 2 */
+    int ring;             /* 0: cell = position; R > 0: cell = position % R, R <= cells, t <= R */
+    int reserved;         /* must be 0 */
 } inference_cuda_kv8_chunk_args;
 
 #ifdef __cplusplus
-static_assert(alignof(inference_cuda_kv8_append_args) == 8 && sizeof(inference_cuda_kv8_append_args) == 88 && offsetof(inference_cuda_kv8_append_args, code_scale) == 80 && offsetof(inference_cuda_kv8_append_args, k_codes) == 16 && offsetof(inference_cuda_kv8_append_args, pos) == 48 && offsetof(inference_cuda_kv8_append_args, status) == 56 && offsetof(inference_cuda_kv8_append_args, m) == 64,
+static_assert(alignof(inference_cuda_kv8_append_args) == 8 && sizeof(inference_cuda_kv8_append_args) == 88 && offsetof(inference_cuda_kv8_append_args, code_scale) == 80 && offsetof(inference_cuda_kv8_append_args, ring) == 84 && offsetof(inference_cuda_kv8_append_args, k_codes) == 16 && offsetof(inference_cuda_kv8_append_args, pos) == 48 && offsetof(inference_cuda_kv8_append_args, status) == 56 && offsetof(inference_cuda_kv8_append_args, m) == 64,
               "inference_cuda_kv8_append_args layout");
-static_assert(alignof(inference_cuda_kv8_chunk_args) == 8 && sizeof(inference_cuda_kv8_chunk_args) == 72 && offsetof(inference_cuda_kv8_chunk_args, code_scale) == 68 && offsetof(inference_cuda_kv8_chunk_args, k_codes) == 16 && offsetof(inference_cuda_kv8_chunk_args, pos0) == 48 && offsetof(inference_cuda_kv8_chunk_args, t) == 52,
+static_assert(alignof(inference_cuda_kv8_chunk_args) == 8 && sizeof(inference_cuda_kv8_chunk_args) == 80 && offsetof(inference_cuda_kv8_chunk_args, code_scale) == 68 && offsetof(inference_cuda_kv8_chunk_args, ring) == 72 && offsetof(inference_cuda_kv8_chunk_args, k_codes) == 16 && offsetof(inference_cuda_kv8_chunk_args, pos0) == 48 && offsetof(inference_cuda_kv8_chunk_args, t) == 52,
               "inference_cuda_kv8_chunk_args layout");
 #else
-_Static_assert(_Alignof(inference_cuda_kv8_append_args) == 8 && sizeof(inference_cuda_kv8_append_args) == 88 && offsetof(inference_cuda_kv8_append_args, code_scale) == 80 && offsetof(inference_cuda_kv8_append_args, k_codes) == 16 && offsetof(inference_cuda_kv8_append_args, pos) == 48 && offsetof(inference_cuda_kv8_append_args, status) == 56 && offsetof(inference_cuda_kv8_append_args, m) == 64,
+_Static_assert(_Alignof(inference_cuda_kv8_append_args) == 8 && sizeof(inference_cuda_kv8_append_args) == 88 && offsetof(inference_cuda_kv8_append_args, code_scale) == 80 && offsetof(inference_cuda_kv8_append_args, ring) == 84 && offsetof(inference_cuda_kv8_append_args, k_codes) == 16 && offsetof(inference_cuda_kv8_append_args, pos) == 48 && offsetof(inference_cuda_kv8_append_args, status) == 56 && offsetof(inference_cuda_kv8_append_args, m) == 64,
                "inference_cuda_kv8_append_args layout");
-_Static_assert(_Alignof(inference_cuda_kv8_chunk_args) == 8 && sizeof(inference_cuda_kv8_chunk_args) == 72 && offsetof(inference_cuda_kv8_chunk_args, code_scale) == 68 && offsetof(inference_cuda_kv8_chunk_args, k_codes) == 16 && offsetof(inference_cuda_kv8_chunk_args, pos0) == 48 && offsetof(inference_cuda_kv8_chunk_args, t) == 52,
+_Static_assert(_Alignof(inference_cuda_kv8_chunk_args) == 8 && sizeof(inference_cuda_kv8_chunk_args) == 80 && offsetof(inference_cuda_kv8_chunk_args, code_scale) == 68 && offsetof(inference_cuda_kv8_chunk_args, ring) == 72 && offsetof(inference_cuda_kv8_chunk_args, k_codes) == 16 && offsetof(inference_cuda_kv8_chunk_args, pos0) == 48 && offsetof(inference_cuda_kv8_chunk_args, t) == 52,
                "inference_cuda_kv8_chunk_args layout");
 #endif
 

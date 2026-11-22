@@ -54,13 +54,7 @@ impl Mini {
         let host = data(&shape, 0xc0de_1616 ^ p0 as u64, 1.7);
         let ctx = CudaContext::new()?;
         let stream = ctx.stream()?;
-        let kv = Kv8Shape {
-            rows: M,
-            n_kv_head: 2,
-            head_dim: D,
-            cells,
-            code_scale: Kv8CodeScale::StoredHalf,
-        };
+        let kv = Kv8Shape::linear(M, 2, D, cells, Kv8CodeScale::StoredHalf);
         let result = Self {
             proj: ctx.upload(&le(&host.proj))?,
             qn: ctx.upload(&le(&host.q_norm))?,
@@ -85,13 +79,7 @@ impl Mini {
     }
 
     fn kv_shape(&self, rows: usize) -> Kv8Shape {
-        Kv8Shape {
-            rows,
-            n_kv_head: 2,
-            head_dim: D,
-            cells: self.shape.rows,
-            code_scale: Kv8CodeScale::StoredHalf,
-        }
+        Kv8Shape::linear(rows, 2, D, self.shape.rows, Kv8CodeScale::StoredHalf)
     }
 
     fn kv_data(&self, route: usize, row: usize, rows: usize) -> Result<Kv8Data<'_>, EngError> {

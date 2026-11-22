@@ -64,9 +64,30 @@ pub(crate) struct Kv8Shape {
     pub(crate) head_dim: usize,
     pub(crate) cells: usize,
     pub(crate) code_scale: Kv8CodeScale,
+    /// 0: cell = position. R > 0: position p goes to cell p % R (`rows <= R <= cells`), the cache
+    /// of a sliding layer; `pos` is then bounded by the position range, not by `cells`.
+    pub(crate) ring: usize,
 }
 
 impl Kv8Shape {
+    /// The shape of a plane that holds one cell per position.
+    pub(crate) fn linear(
+        rows: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        cells: usize,
+        code_scale: Kv8CodeScale,
+    ) -> Self {
+        Self {
+            rows,
+            n_kv_head,
+            head_dim,
+            cells,
+            code_scale,
+            ring: 0,
+        }
+    }
+
     pub(crate) fn code_bytes(&self) -> usize {
         self.n_kv_head
             .saturating_mul(self.cells)
@@ -78,6 +99,17 @@ impl Kv8Shape {
             .saturating_mul(self.cells)
             .saturating_mul(self.head_dim / GROUP)
             .saturating_mul(2)
+    }
+
+    /// The positions a launch may address: the cells of a linear plane, the position range of a
+    /// ring.
+    pub(crate) fn position_limit(&self) -> usize {
+        if self.ring > 0 { MAX_CELLS } else { self.cells }
+    }
+
+    fn position_limit_text(&self) -> String {
+        let unit = if self.ring > 0 { "positions" } else { "cells" };
+        format!("{} {unit}", self.position_limit())
     }
 
     pub(crate) fn row_bytes(&self) -> usize {
@@ -150,7 +182,19 @@ fn check_shape(tag: &str, shape: &Kv8Shape, max_rows: usize) -> Result<Kv8Ints, 
             ),
         ));
     }
+    if shape.ring != 0 && !(shape.rows..=shape.cells).contains(&shape.ring) {
+        return Err(rule(
+            tag,
+            &format!(
+                "ring is {}, not 0 or {rows} to cells {}",
+                shape.ring,
+                shape.cells,
+                rows = shape.rows
+            ),
+        ));
+    }
     Ok(Kv8Ints {
+        ring: to_int(tag, shape.ring)?,
         rows: to_int(tag, shape.rows)?,
         n_kv_head: to_int(tag, shape.n_kv_head)?,
         head_dim: to_int(tag, shape.head_dim)?,
@@ -273,13 +317,14 @@ impl CudaContext {
         let ints = check_shape("kv8_chunk", &shape, MAX_CHUNK_ROWS)?;
         if pos0
             .checked_add(shape.rows)
-            .is_none_or(|end| end > shape.cells)
+            .is_none_or(|end| end > shape.position_limit())
         {
             return Err(rule(
                 "kv8_chunk",
                 &format!(
-                    "pos0 {pos0} + rows {} is above cells {}",
-                    shape.rows, shape.cells
+                    "pos0 {pos0} + rows {} is above the {} of the plane",
+                    shape.rows,
+                    shape.position_limit_text()
                 ),
             ));
         }
@@ -312,13 +357,14 @@ impl CudaContext {
         let ints = check_shape("kv8_chunk_k", &shape, MAX_CHUNK_ROWS)?;
         if pos0
             .checked_add(shape.rows)
-            .is_none_or(|end| end > shape.cells)
+            .is_none_or(|end| end > shape.position_limit())
         {
             return Err(rule(
                 "kv8_chunk_k",
                 &format!(
-                    "pos0 {pos0} + rows {} is above cells {}",
-                    shape.rows, shape.cells
+                    "pos0 {pos0} + rows {} is above the {} of the plane",
+                    shape.rows,
+                    shape.position_limit_text()
                 ),
             ));
         }

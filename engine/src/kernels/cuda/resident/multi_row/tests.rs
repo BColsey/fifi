@@ -339,13 +339,7 @@ fn kv_row(buffers: &RowBuffers) -> KvRow<'_> {
 }
 
 fn kv_shape(rows: usize) -> Kv8Shape {
-    Kv8Shape {
-        rows,
-        n_kv_head: N_KV,
-        head_dim: D,
-        cells: CELLS,
-        code_scale: Kv8CodeScale::StoredHalf,
-    }
+    Kv8Shape::linear(rows, N_KV, D, CELLS, Kv8CodeScale::StoredHalf)
 }
 
 fn decode_shape(m: usize) -> AttnQ8Shape {

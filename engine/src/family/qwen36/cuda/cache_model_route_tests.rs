@@ -89,13 +89,7 @@ use crate::family::state_words::Word;
         let row_bytes = 2 * 256 * 4;
         ctx.kv8_chunk(
             &stream,
-            Kv8Shape {
-                rows: cache_rows,
-                n_kv_head: 2,
-                head_dim: 256,
-                cells: cache_rows,
-                code_scale: Kv8CodeScale::StoredHalf,
-            },
+            Kv8Shape::linear(cache_rows, 2, 256, cache_rows, Kv8CodeScale::StoredHalf),
             Kv8Data {
                 k: k.range(0, cache_rows * row_bytes)?,
                 v: v.range(0, cache_rows * row_bytes)?,
@@ -259,13 +253,7 @@ use crate::family::state_words::Word;
         )?;
         ctx.kv8_chunk(
             &stream,
-            Kv8Shape {
-                rows: 1,
-                n_kv_head: 2,
-                head_dim: 256,
-                cells: cache_rows,
-                code_scale: Kv8CodeScale::StoredHalf,
-            },
+            Kv8Shape::linear(1, 2, 256, cache_rows, Kv8CodeScale::StoredHalf),
             Kv8Data {
                 k: v.range(0, row_bytes)?,
                 v: k.range(0, row_bytes)?,

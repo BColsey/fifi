@@ -31,6 +31,15 @@ __host__ __device__ inline void gemma_split_plan(
 }
 
 
+// Ring cache (ring > 0): the key at position p sits in cell p % ring and a length is bounded by the
+// position range, not by the physical cells. A linear cache (ring 0) keeps cell = position.
+__host__ __device__ inline bool gemma_len_ok(long long len, int cells, int ring) {
+    return len >= 1 && (ring > 0 ? len < (1 << 30) : len <= cells);
+}
+__host__ __device__ inline int gemma_cell(int position, int ring) {
+    return ring > 0 ? position % ring : position;
+}
+
 bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
 bool apart(const void *a, size_t ab, const void *b, size_t bb) {
     const uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
@@ -41,7 +50,7 @@ __global__ void attn_decode_gemma_kernel(
     float *out, unsigned int *status, const float *q,
     const signed char *k_codes, const unsigned short *k_scales,
     const signed char *v_codes, const unsigned short *v_scales, const int *kv_len_word,
-    int n_q_head, int n_kv_head, int head_dim, int cells, int window, float scale) {
+    int n_q_head, int n_kv_head, int head_dim, int cells, int window, float scale, int ring) {
     const int token = blockIdx.y;
     const int qh = blockIdx.x;
     const int tid = threadIdx.x;
@@ -50,7 +59,7 @@ __global__ void attn_decode_gemma_kernel(
     const int nwarps = (int)blockDim.x / 32;
     const int kvh = (int)(((long long)qh * n_kv_head) / n_q_head);
     const int64_t requested_len = (int64_t)*kv_len_word + token;
-    const int out_of_range = (requested_len < 1 || requested_len > cells);
+    const int out_of_range = !gemma_len_ok(requested_len, cells, ring);
     const size_t out_base = ((size_t)token * n_q_head + qh) * (size_t)head_dim;
     if (out_of_range) {
         for (int d = tid; d < head_dim; d += blockDim.x)
@@ -70,8 +79,9 @@ __global__ void attn_decode_gemma_kernel(
     float run_m = -INFINITY;
     float run_l = 0.0f;
     for (int cell = first + warp; cell < kv_len; cell += nwarps) {
-        const size_t plane = ((size_t)kvh * cells + cell) * (size_t)head_dim;
-        const size_t sbase = ((size_t)kvh * cells + cell) * (size_t)groups;
+        const size_t at = (size_t)kvh * cells + gemma_cell(cell, ring);
+        const size_t plane = at * (size_t)head_dim;
+        const size_t sbase = at * (size_t)groups;
         float partial = 0.0f;
         for (int k = 0; k < per_lane; ++k) {
             const float kscale = __half2float(__ushort_as_half(k_scales[sbase + k]));
@@ -137,7 +147,7 @@ __global__ void __launch_bounds__(256) attn_decode_gemma_part_k(
     const signed char *k_codes, const unsigned short *k_scales,
     const signed char *v_codes, const unsigned short *v_scales, const int *kv_len_word,
     int n_q_head, int n_kv_head, int head_dim, int cells, int window, float scale,
-    int max_splits, int min_keys) {
+    int max_splits, int min_keys, int ring) {
     const int token = blockIdx.y;
     const int qh = blockIdx.x;
     const int slot = blockIdx.z;
@@ -147,7 +157,7 @@ __global__ void __launch_bounds__(256) attn_decode_gemma_part_k(
     const int nwarps = (int)blockDim.x / 32;
     const int kvh = (int)(((long long)qh * n_kv_head) / n_q_head);
     const int64_t requested_len = (int64_t)*kv_len_word + token;
-    if (requested_len < 1 || requested_len > cells) {
+    if (!gemma_len_ok(requested_len, cells, ring)) {
         // The combine kernel owns the NaN output and the status word; nothing to stage.
         if (tid == 0 && status != NULL) atomicOr(status, 4u);
         return;
@@ -170,8 +180,9 @@ __global__ void __launch_bounds__(256) attn_decode_gemma_part_k(
     float run_m = -INFINITY;
     float run_l = 0.0f;
     for (int cell = begin + warp; cell < end; cell += nwarps) {
-        const size_t plane = ((size_t)kvh * cells + cell) * (size_t)head_dim;
-        const size_t sbase = ((size_t)kvh * cells + cell) * (size_t)groups;
+        const size_t at = (size_t)kvh * cells + gemma_cell(cell, ring);
+        const size_t plane = at * (size_t)head_dim;
+        const size_t sbase = at * (size_t)groups;
         float partial = 0.0f;
         for (int k = 0; k < per_lane; ++k) {
             const float kscale = __half2float(__ushort_as_half(k_scales[sbase + k]));
@@ -239,12 +250,12 @@ template <int D>
 __global__ void __launch_bounds__(D) attn_decode_gemma_combine_k(
     float *out, unsigned int *status, const int *kv_len_word, const float *part,
     int n_q_head, int m, int head_dim, int cells, int window, int max_splits,
-    int min_keys) {
+    int min_keys, int ring) {
     __shared__ float s_w[kMaxSplits], s_l[kMaxSplits], s_red[D / 32];
     const int qh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     float *o = out + ((size_t)t * n_q_head + qh) * (size_t)head_dim + d;
     const int64_t requested_len = (int64_t)*kv_len_word + t;
-    if (requested_len < 1 || requested_len > cells) {
+    if (!gemma_len_ok(requested_len, cells, ring)) {
         // Same contract as the single-pass kernel: NaN out, status bit 4.
         *o = __int_as_float(0x7fc00000);
         if (d == 0 && status != NULL) atomicOr(status, 4u);
@@ -289,6 +300,10 @@ extern "C" int inference_cuda_attn_decode_gemma_launch(
         if (args->head_dim != 256 && args->head_dim != 512)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (args->cells < 1 || args->window < 0 || args->window > args->cells)
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args->ring < 0 || (args->ring > 0 && (args->window < 1 ||
+                                                  args->ring < args->window + args->m - 1 ||
+                                                  args->ring > args->cells)))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (!(args->scale > -1e30f && args->scale < 1e30f))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
@@ -338,7 +353,7 @@ extern "C" int inference_cuda_attn_decode_gemma_launch(
                 (const signed char *)args->v_codes, (const unsigned short *)args->v_scales,
                 (const int *)args->kv_len, args->n_q_head, args->n_kv_head,
                 args->head_dim, args->cells, args->window, args->scale,
-                args->max_splits, args->min_keys);
+                args->max_splits, args->min_keys, args->ring);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             if (failure.ok()) {
                 const dim3 comb_grid((unsigned)args->n_q_head, (unsigned)args->m);
@@ -347,13 +362,13 @@ extern "C" int inference_cuda_attn_decode_gemma_launch(
                         (float *)args->out, (unsigned int *)args->status,
                         (const int *)args->kv_len, (const float *)args->part,
                         args->n_q_head, args->m, args->head_dim, args->cells,
-                        args->window, args->max_splits, args->min_keys);
+                        args->window, args->max_splits, args->min_keys, args->ring);
                 } else {
                     attn_decode_gemma_combine_k<256><<<comb_grid, 256, 0, s>>>(
                         (float *)args->out, (unsigned int *)args->status,
                         (const int *)args->kv_len, (const float *)args->part,
                         args->n_q_head, args->m, args->head_dim, args->cells,
-                        args->window, args->max_splits, args->min_keys);
+                        args->window, args->max_splits, args->min_keys, args->ring);
                 }
                 failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             }
@@ -364,7 +379,7 @@ extern "C" int inference_cuda_attn_decode_gemma_launch(
                 (const signed char *)args->k_codes, (const unsigned short *)args->k_scales,
                 (const signed char *)args->v_codes, (const unsigned short *)args->v_scales,
                 (const int *)args->kv_len, args->n_q_head, args->n_kv_head,
-                args->head_dim, args->cells, args->window, args->scale);
+                args->head_dim, args->cells, args->window, args->scale, args->ring);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
         report_stage(out_stage, failure.stage);

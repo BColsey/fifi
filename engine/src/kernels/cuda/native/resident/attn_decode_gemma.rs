@@ -98,6 +98,7 @@ struct AttnDecodeGemmaArgsRepr {
     split: c_int,
     max_splits: c_int,
     min_keys: c_int,
+    ring: c_int,
 }
 
 const _: () = assert!(
@@ -121,6 +122,7 @@ const _: () = assert!(
         && offset_of!(AttnDecodeGemmaArgsRepr, split) == 104
         && offset_of!(AttnDecodeGemmaArgsRepr, max_splits) == 108
         && offset_of!(AttnDecodeGemmaArgsRepr, min_keys) == 112
+        && offset_of!(AttnDecodeGemmaArgsRepr, ring) == 116
 );
 
 /// One attention launch over the KV8 planes.
@@ -144,6 +146,7 @@ pub(in crate::kernels::cuda) struct AttnDecodeGemmaRaw<'a> {
     pub(in crate::kernels::cuda) split: bool,
     pub(in crate::kernels::cuda) max_splits: usize,
     pub(in crate::kernels::cuda) min_keys: usize,
+    pub(in crate::kernels::cuda) ring: usize,
 }
 
 fn plane_bytes(kv_heads: usize, cells: usize, head_dim: usize) -> Option<(usize, usize)> {
@@ -153,6 +156,17 @@ fn plane_bytes(kv_heads: usize, cells: usize, head_dim: usize) -> Option<(usize,
         .checked_mul(head_dim.checked_div(32)?)?
         .checked_mul(2)?;
     Some((codes, scales))
+}
+
+/// Ring 0 is a linear cache; R > 0 needs a window and `window + m - 1 <= R <= cells`, the rule of
+/// the other attention kernels' rings.
+pub(in crate::kernels::cuda) fn ring_admitted(
+    ring: usize,
+    window: usize,
+    m: usize,
+    cells: usize,
+) -> bool {
+    ring == 0 || (window > 0 && ring >= window + m - 1 && ring <= cells)
 }
 
 fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFailure> {
@@ -169,6 +183,7 @@ fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFa
         && matches!(call.head_dim, 256 | 512)
         && (1..=i32::MAX as usize).contains(&call.cells)
         && call.window <= call.cells
+        && ring_admitted(call.ring, call.window, call.m, call.cells)
         && call.scale.is_finite()
         && call.scale.abs() < 1e30;
     let reads = [
@@ -261,6 +276,7 @@ pub(in crate::kernels::cuda) fn attn_decode_gemma_launch(
         split: c_int::from(call.split),
         max_splits: c_int::try_from(call.max_splits).map_err(|_| invalid_argument())?,
         min_keys: c_int::try_from(call.min_keys).map_err(|_| invalid_argument())?,
+        ring: c_int::try_from(call.ring).map_err(|_| invalid_argument())?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: check_attn_decode_gemma proved the ranges inside their live allocations,

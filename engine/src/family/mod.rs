@@ -75,6 +75,7 @@ pub mod keys;
 )]
 pub(crate) mod kv_disk;
 pub(crate) mod kv_format;
+pub(crate) mod kv_ring;
 #[allow(
     dead_code,
     reason = "the interface of the shared resident step: a family reaches it through its recipe as each family moves onto the step"

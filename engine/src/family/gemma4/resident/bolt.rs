@@ -871,13 +871,7 @@ impl Bolt {
                     k_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
                     v_codes: plane(KV_HEADS * cells * head)?,
                     v_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
-                    shape: Kv8Shape {
-                        rows: 1,
-                        n_kv_head: KV_HEADS,
-                        head_dim: head,
-                        cells,
-                        code_scale: Kv8CodeScale::UnroundedF32,
-                    },
+                    shape: Kv8Shape::linear(1, KV_HEADS, head, cells, Kv8CodeScale::UnroundedF32),
                 })
             } else {
                 None
@@ -1799,6 +1793,7 @@ impl Bolt {
                         window: if layer.global { 0 } else { LOCAL_WINDOW },
                         scale: 1.0,
                         split: attn_split,
+                        ring: 0,
                     },
                 )
             };
@@ -2757,13 +2752,13 @@ mod tests {
         .expect("gelu 256");
         // The attention path at both head widths, 8 q heads, 2 kv heads.
         for head in [256usize, 512] {
-            let shape = Kv8Shape {
-                rows: 1,
-                n_kv_head: 2,
-                head_dim: head,
-                cells: 32768,
-                code_scale: crate::kernels::cuda::resident::kv8_append::Kv8CodeScale::UnroundedF32,
-            };
+            let shape = Kv8Shape::linear(
+                1,
+                2,
+                head,
+                32768,
+                crate::kernels::cuda::resident::kv8_append::Kv8CodeScale::UnroundedF32,
+            );
             let codes = 2 * 32768 * head;
             let scales = 2 * 32768 * (head / 32);
             ctx.kv8_chunk(
@@ -2815,6 +2810,7 @@ mod tests {
                     window: if head == 512 { 0 } else { 512 },
                     scale: 1.0,
                     split: None,
+                    ring: 0,
                 },
             )
             .expect("attn {head}");
@@ -2848,6 +2844,7 @@ mod tests {
                         max_splits: super::ATTN_SPLIT_MAX,
                         min_keys: super::ATTN_SPLIT_MIN_KEYS,
                     }),
+                    ring: 0,
                 },
             )
             .expect("attn split {head}");

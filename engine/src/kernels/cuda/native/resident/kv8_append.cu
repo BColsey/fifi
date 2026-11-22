@@ -51,6 +51,7 @@ struct Args {
     int m, n_kv_head, head_dim, cells;
     int code_scale;
     const inference_cuda_kv_row *rows;  // the many-rows entry: row t appends to rows[t]'s planes; else null
+    int ring;                   // 0: cell = position; R > 0: cell = position % R (never with rows)
 };
 
 // NaN-propagating max: `fmaxf` returns the other operand when one is NaN, so a group holding a
@@ -118,13 +119,13 @@ __global__ void kv8_append_k(Args a) {
     } else {
         base = a.pos_dev ? (long long)*a.pos_dev : (long long)a.pos0;
     }
-    if (base < 0 || base + (kMany ? 1 : a.m) > a.cells) {
+    if (base < 0 || base + (kMany ? 1 : a.m) > (a.ring > 0 ? (long long)kMaxCells : (long long)a.cells)) {
         if (status && blockIdx.x == 0 && threadIdx.x == 0 && (kMany || blockIdx.y == 0))
             atomicOr(status, kStatusInvalidStepState);
         return;
     }
     const int groups = a.head_dim / kGroup;
-    const size_t cell = (size_t)(kMany ? base : base + t);
+    const size_t cell = (size_t)(kMany ? base : (a.ring > 0 ? (base + t) % a.ring : base + t));
     const size_t in_at = ((size_t)t * a.n_kv_head + kvh) * a.head_dim + d;
     const size_t code_at = (size_t)kvh * a.cells * a.head_dim + cell * a.head_dim + d;
     const size_t scale_at = (size_t)kvh * a.cells * groups + cell * groups + d / kGroup;
@@ -152,13 +153,13 @@ __global__ void kv8_append_k(Args a) {
 __global__ void kv8_chunk_k_k(Args a) {
     const int kvh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const long long base = (long long)a.pos0;
-    if (base < 0 || base + a.m > a.cells) {
+    if (base < 0 || base + a.m > (a.ring > 0 ? (long long)kMaxCells : (long long)a.cells)) {
         if (a.status && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
             atomicOr(a.status, kStatusInvalidStepState);
         return;
     }
     const int groups = a.head_dim / kGroup;
-    const size_t cell = (size_t)(base + t);
+    const size_t cell = (size_t)(a.ring > 0 ? (base + t) % a.ring : base + t);
     const size_t in_at = ((size_t)t * a.n_kv_head + kvh) * a.head_dim + d;
     const size_t code_at = (size_t)kvh * a.cells * a.head_dim + cell * a.head_dim + d;
     const size_t scale_at = (size_t)kvh * a.cells * groups + cell * groups + d / kGroup;
@@ -191,12 +192,18 @@ bool valid_geometry(int rows, int n_kv_head, int head_dim, int cells) {
            head_dim <= kMaxHead && head_dim % kGroup == 0 && cells >= rows && cells <= kMaxCells;
 }
 
+// ring 0 is the linear plane; R > 0 needs R <= cells and every row of one launch in its own cell.
+bool valid_ring(int ring, int rows, int cells) {
+    return ring == 0 || (ring >= rows && ring <= cells);
+}
+
 bool valid_code_scale(int code_scale) {
     return code_scale == kStoredHalf || code_scale == kUnroundedF32;
 }
 
 Args make_args(const void *k, const void *v, void *k_codes, void *k_scales, void *v_codes,
-               void *v_scales, int rows, int n_kv_head, int head_dim, int cells, int code_scale) {
+               void *v_scales, int rows, int n_kv_head, int head_dim, int cells, int code_scale,
+               int ring) {
     Args a = {};
     a.k = (const float *)k;
     a.v = (const float *)v;
@@ -209,6 +216,7 @@ Args make_args(const void *k, const void *v, void *k_codes, void *k_scales, void
     a.head_dim = head_dim;
     a.cells = cells;
     a.code_scale = code_scale;
+    a.ring = ring;
     return a;
 }
 
@@ -244,11 +252,12 @@ extern "C" int inference_cuda_kv8_append_launch(const inference_cuda_kv8_append_
                               in->pos != NULL && in->status != NULL && aligned_to(in->pos, 4) &&
                               aligned_to(in->status, 4);
         if (!pointers || !valid_geometry(in->m, in->n_kv_head, in->head_dim, in->cells) ||
-            in->m > kMaxM || !valid_code_scale(in->code_scale)) {
+            in->m > kMaxM || !valid_code_scale(in->code_scale) ||
+            !valid_ring(in->ring, in->m, in->cells)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Args a = make_args(in->k, in->v, in->k_codes, in->k_scales, in->v_codes, in->v_scales,
-                           in->m, in->n_kv_head, in->head_dim, in->cells, in->code_scale);
+                           in->m, in->n_kv_head, in->head_dim, in->cells, in->code_scale, in->ring);
         a.pos_dev = (const int *)in->pos;
         a.status = (int *)in->status;
         const Failure failure = launch(a, (cudaStream_t)stream);
@@ -271,7 +280,7 @@ extern "C" int inference_cuda_kv8_append_multi_launch(const inference_cuda_kv8_a
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Args a = make_args(in->k, in->v, NULL, NULL, NULL, NULL, in->n, in->n_kv_head,
-                           in->head_dim, in->cells, in->code_scale);
+                           in->head_dim, in->cells, in->code_scale, 0);
         a.rows = in->rows;
         const Failure failure = launch_many(a, (cudaStream_t)stream);
         report_stage(out_stage, failure.stage);
@@ -288,14 +297,15 @@ extern "C" int inference_cuda_kv8_chunk_launch(const inference_cuda_kv8_chunk_ar
         const bool pointers =
             in != NULL && valid_data(in->k, in->v, in->k_codes, in->k_scales, in->v_codes,
                                      in->v_scales);
-        const bool position = in == NULL || (in->pos0 >= 0 && (long long)in->pos0 + in->t <= in->cells);
+        const bool position = in == NULL || (in->pos0 >= 0 && (long long)in->pos0 + in->t <= (in->ring > 0 ? (long long)kMaxCells : (long long)in->cells));
         if (!pointers || !position ||
             !valid_geometry(in->t, in->n_kv_head, in->head_dim, in->cells) ||
-            in->t > kMaxChunk || !valid_code_scale(in->code_scale)) {
+            in->t > kMaxChunk || !valid_code_scale(in->code_scale) || in->reserved != 0 ||
+            !valid_ring(in->ring, in->t, in->cells)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Args a = make_args(in->k, in->v, in->k_codes, in->k_scales, in->v_codes, in->v_scales,
-                           in->t, in->n_kv_head, in->head_dim, in->cells, in->code_scale);
+                           in->t, in->n_kv_head, in->head_dim, in->cells, in->code_scale, in->ring);
         a.pos0 = in->pos0;
         const Failure failure = launch(a, (cudaStream_t)stream);
         report_stage(out_stage, failure.stage);
@@ -316,14 +326,15 @@ extern "C" int inference_cuda_kv8_chunk_k_launch(const inference_cuda_kv8_chunk_
         const bool pointers = k_only && in->k != NULL && in->k_codes != NULL &&
                               in->k_scales != NULL && aligned_to(in->k, 4) &&
                               aligned_to(in->k_codes, 4) && aligned_to(in->k_scales, 4);
-        const bool position = in == NULL || (in->pos0 >= 0 && (long long)in->pos0 + in->t <= in->cells);
+        const bool position = in == NULL || (in->pos0 >= 0 && (long long)in->pos0 + in->t <= (in->ring > 0 ? (long long)kMaxCells : (long long)in->cells));
         if (!pointers || !position ||
             !valid_geometry(in->t, in->n_kv_head, in->head_dim, in->cells) ||
-            in->t > kMaxChunk || !valid_code_scale(in->code_scale)) {
+            in->t > kMaxChunk || !valid_code_scale(in->code_scale) || in->reserved != 0 ||
+            !valid_ring(in->ring, in->t, in->cells)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Args a = make_args(in->k, NULL, in->k_codes, in->k_scales, NULL, NULL,
-                           in->t, in->n_kv_head, in->head_dim, in->cells, in->code_scale);
+                           in->t, in->n_kv_head, in->head_dim, in->cells, in->code_scale, in->ring);
         a.pos0 = in->pos0;
         const Failure failure = launch_k(a, (cudaStream_t)stream);
         report_stage(out_stage, failure.stage);

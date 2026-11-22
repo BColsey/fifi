@@ -313,13 +313,7 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
         let v_host: Vec<f32> = (0..rows * kv_row).map(|_| rng.unit()).collect();
         let factors_host: Vec<f32> = (0..256).map(|i| 1.0 + i as f32 / 64.0).collect();
         let factors = ctx.upload(&floats(&factors_host)).expect("factors");
-        let shape = Kv8Shape {
-            rows: 1,
-            n_kv_head: kv_heads,
-            head_dim: head,
-            cells: CELLS,
-            code_scale: Kv8CodeScale::UnroundedF32,
-        };
+        let shape = Kv8Shape::linear(1, kv_heads, head, CELLS, Kv8CodeScale::UnroundedF32);
         for armed in [false, true] {
             // The window: one q/k/v buffer of all rows, one planes set and word pair per slot.
             let q_win = ctx.upload(&floats(&q_host)).expect("q");
@@ -423,6 +417,7 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
                         window: if global { 0 } else { 512 },
                         scale: 1.0,
                         split: split(armed),
+                        ring: 0,
                     },
                 )
                 .expect("attention");

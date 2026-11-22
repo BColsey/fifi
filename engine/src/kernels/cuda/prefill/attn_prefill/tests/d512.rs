@@ -379,6 +379,7 @@ fn observe(
                     window,
                     scale: 1.0,
                     split: None,
+                    ring: 0,
                 },
             )?;
         }
@@ -662,6 +663,7 @@ fn d512_report_ms() {
                                     window: 0,
                                     scale: 1.0,
                                     split: None,
+                                    ring: 0,
                                 },
                             )?;
                         }

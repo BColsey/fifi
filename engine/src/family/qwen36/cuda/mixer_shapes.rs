@@ -104,13 +104,13 @@ pub(super) fn attn_decode_shape(g: &MixerGeometry, rows: usize) -> AttnShape {
 /// The KV8 append of the Int8G32 step: `cells` is the plane cell count (the KV capacity of the
 /// state), which bounds the device pos word.
 pub(super) fn kv8_shape(g: &MixerGeometry, cells: usize) -> Kv8Shape {
-    Kv8Shape {
-        rows: BLOCK_ROWS,
-        n_kv_head: g.attn.heads_kv,
-        head_dim: g.attn.head_dim,
+    Kv8Shape::linear(
+        BLOCK_ROWS,
+        g.attn.heads_kv,
+        g.attn.head_dim,
         cells,
-        code_scale: Kv8CodeScale::StoredHalf,
-    }
+        Kv8CodeScale::StoredHalf,
+    )
 }
 
 /// The KV8 decode attention of the Int8G32 step: `cells` is the plane cell count.

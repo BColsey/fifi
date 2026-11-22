@@ -279,13 +279,13 @@ impl PagedKv {
         let was_dirty = self.slots[slot].dirty.replace(true);
         let result = context.kv8_paged_append(
             stream,
-            Kv8Shape {
-                rows: 1,
-                n_kv_head: self.kv_heads,
-                head_dim: self.head_dim,
-                cells: self.plan.group_cells,
-                code_scale: Kv8CodeScale::StoredHalf,
-            },
+            Kv8Shape::linear(
+                1,
+                self.kv_heads,
+                self.head_dim,
+                self.plan.group_cells,
+                Kv8CodeScale::StoredHalf,
+            ),
             Kv8Data {
                 k: call.k,
                 v: call.v,
@@ -349,13 +349,13 @@ impl PagedKv {
         let was_dirty = self.slots[slot].dirty.replace(true);
         let result = context.kv8_chunk(
             stream,
-            Kv8Shape {
-                rows: call.rows,
-                n_kv_head: self.kv_heads,
-                head_dim: self.head_dim,
-                cells: self.plan.group_cells,
-                code_scale: Kv8CodeScale::StoredHalf,
-            },
+            Kv8Shape::linear(
+                call.rows,
+                self.kv_heads,
+                self.head_dim,
+                self.plan.group_cells,
+                Kv8CodeScale::StoredHalf,
+            ),
             Kv8Data {
                 k: call.k,
                 v: call.v,

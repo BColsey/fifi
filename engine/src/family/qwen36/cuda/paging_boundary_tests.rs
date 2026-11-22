@@ -39,13 +39,7 @@ fn produce(
     let dense = ctx.allocate(pool.total)?;
     ctx.kv8_chunk(
         stream,
-        Kv8Shape {
-            rows: ROWS,
-            n_kv_head: KV,
-            head_dim: D,
-            cells: ROWS,
-            code_scale: Kv8CodeScale::StoredHalf,
-        },
+        Kv8Shape::linear(ROWS, KV, D, ROWS, Kv8CodeScale::StoredHalf),
         Kv8Data {
             k: k.range(0, k.bytes())?,
             v: v.range(0, v.bytes())?,

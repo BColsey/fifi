@@ -47,13 +47,7 @@ fn check_boundary() -> Result<(), EngError> {
     let (k, v) = inputs(1);
     let k = upload(&ctx, &stream, &floats(&k))?;
     let v = upload(&ctx, &stream, &floats(&v))?;
-    let shape = Kv8Shape {
-        rows: 1,
-        n_kv_head: KV,
-        head_dim: D,
-        cells: C,
-        code_scale: Kv8CodeScale::StoredHalf,
-    };
+    let shape = Kv8Shape::linear(1, KV, D, C, Kv8CodeScale::StoredHalf);
     let reference = upload(&ctx, &stream, &vec![0; plan.group.total])?;
     ctx.kv8_chunk(&stream, shape, data(&k, &v, &reference, &plan.group)?, 0)?;
     let expected = read(&ctx, &stream, reference.range(0, reference.bytes())?)?;

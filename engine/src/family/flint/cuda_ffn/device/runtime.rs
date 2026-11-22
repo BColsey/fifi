@@ -1454,13 +1454,7 @@ fn write_cache<'b>(
             // "q8k": only K quantizes; V stays the f16 rows written above.
             group.ctx.kv8_chunk_k(
                 group.stream,
-                Kv8Shape {
-                    rows: source.len(),
-                    n_kv_head: 4,
-                    head_dim: 128,
-                    cells,
-                    code_scale: Kv8CodeScale::StoredHalf,
-                },
+                Kv8Shape::linear(source.len(), 4, 128, cells, Kv8CodeScale::StoredHalf),
                 kv[0].range(offset, bytes)?,
                 cache[0].range(0, cache[0].bytes())?,
                 scales[0].range(0, scales[0].bytes())?,
@@ -1469,13 +1463,7 @@ fn write_cache<'b>(
         } else {
             group.ctx.kv8_chunk(
                 group.stream,
-                Kv8Shape {
-                    rows: source.len(),
-                    n_kv_head: 4,
-                    head_dim: 128,
-                    cells,
-                    code_scale: Kv8CodeScale::StoredHalf,
-                },
+                Kv8Shape::linear(source.len(), 4, 128, cells, Kv8CodeScale::StoredHalf),
                 Kv8Data {
                     k: kv[0].range(offset, bytes)?,
                     v: kv[1].range(offset, bytes)?,

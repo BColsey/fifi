@@ -85,6 +85,7 @@ fn matches_the_frozen_reference_in_both_geometries() {
                 window,
                 scale: 1.0,
                 split: None,
+                ring: 0,
             },
         )
         .expect("attention");
@@ -138,6 +139,7 @@ fn refuses_an_unsupported_head_dim() {
                 window: 0,
                 scale: 1.0,
                 split: None,
+                ring: 0,
             },
         )
         .expect_err("head dim refused");
@@ -235,6 +237,7 @@ fn split_matches_the_frozen_reference_in_both_geometries() {
                     // the merge order matters on the frozen fixtures.
                     min_keys: 10,
                 }),
+                ring: 0,
             },
         )
         .expect("split attention");
@@ -384,6 +387,7 @@ fn split_matches_the_reference_at_long_context() {
                 window: 0,
                 scale: 1.0,
                 split,
+                ring: 0,
             },
         )
     };
@@ -423,6 +427,7 @@ fn split_matches_the_reference_at_long_context() {
                 window: 0,
                 scale: 1.0,
                 split,
+                ring: 0,
             },
         )
     };
@@ -499,6 +504,7 @@ fn split_refuses_bad_plans() {
                     max_splits: max,
                     min_keys: min,
                 }),
+                ring: 0,
             },
         )
     };
@@ -563,6 +569,7 @@ fn combines_per_lane_values_across_warps() {
             window: 0,
             scale: 1.0,
             split: None,
+            ring: 0,
         },
     )
     .expect("attention");
@@ -661,6 +668,7 @@ fn attn_decode_gemma_timing_at_four_depths() {
                         window: 0,
                         scale: 1.0,
                         split,
+                        ring: 0,
                     },
                 )
             };

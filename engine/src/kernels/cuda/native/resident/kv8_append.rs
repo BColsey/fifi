@@ -37,6 +37,7 @@ struct Kv8AppendArgsRaw {
     head_dim: c_int,
     cells: c_int,
     code_scale: c_int,
+    ring: c_int,
 }
 
 /// Mirror of `inference_cuda_kv8_chunk_args` in `kv8_append.h`, field for field.
@@ -54,12 +55,15 @@ struct Kv8ChunkArgsRaw {
     head_dim: c_int,
     cells: c_int,
     code_scale: c_int,
+    ring: c_int,
+    reserved: c_int,
 }
 
 const _: () = assert!(
     size_of::<Kv8AppendArgsRaw>() == 88
         && align_of::<Kv8AppendArgsRaw>() == 8
         && offset_of!(Kv8AppendArgsRaw, code_scale) == 80
+        && offset_of!(Kv8AppendArgsRaw, ring) == 84
         && offset_of!(Kv8AppendArgsRaw, k_codes) == 16
         && offset_of!(Kv8AppendArgsRaw, pos) == 48
         && offset_of!(Kv8AppendArgsRaw, status) == 56
@@ -67,9 +71,10 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
-    size_of::<Kv8ChunkArgsRaw>() == 72
+    size_of::<Kv8ChunkArgsRaw>() == 80
         && align_of::<Kv8ChunkArgsRaw>() == 8
         && offset_of!(Kv8ChunkArgsRaw, code_scale) == 68
+        && offset_of!(Kv8ChunkArgsRaw, ring) == 72
         && offset_of!(Kv8ChunkArgsRaw, k_codes) == 16
         && offset_of!(Kv8ChunkArgsRaw, pos0) == 48
         && offset_of!(Kv8ChunkArgsRaw, t) == 52
@@ -105,6 +110,7 @@ pub(in crate::kernels::cuda) struct Kv8Ints {
     pub(in crate::kernels::cuda) head_dim: c_int,
     pub(in crate::kernels::cuda) cells: c_int,
     pub(in crate::kernels::cuda) code_scale: c_int,
+    pub(in crate::kernels::cuda) ring: c_int,
 }
 
 pub(in crate::kernels::cuda) struct Kv8DataRaw<'a> {
@@ -235,6 +241,7 @@ pub(in crate::kernels::cuda) fn kv8_append_launch(
         head_dim: ints.head_dim,
         cells: ints.cells,
         code_scale: ints.code_scale,
+        ring: ints.ring,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: (a) `check_data` and `check_words` proved every range inside its live allocation,
@@ -268,6 +275,8 @@ pub(in crate::kernels::cuda) fn kv8_chunk_launch(
         head_dim: ints.head_dim,
         cells: ints.cells,
         code_scale: ints.code_scale,
+        ring: ints.ring,
+        reserved: 0,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: as `kv8_append_launch`; `check_data` proved the six data ranges, and the C entry
@@ -316,6 +325,8 @@ pub(in crate::kernels::cuda) fn kv8_chunk_k_launch(
         head_dim: ints.head_dim,
         cells: ints.cells,
         code_scale: ints.code_scale,
+        ring: ints.ring,
+        reserved: 0,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: as `kv8_chunk_launch`, with the K-only extents proved above; the C
@@ -334,8 +345,10 @@ mod tests {
         assert_eq!(size_of::<Kv8AppendArgsRaw>(), 88);
         assert_eq!(offset_of!(Kv8AppendArgsRaw, code_scale), 80);
         assert_eq!(align_of::<Kv8AppendArgsRaw>(), 8);
-        assert_eq!(size_of::<Kv8ChunkArgsRaw>(), 72);
+        assert_eq!(size_of::<Kv8ChunkArgsRaw>(), 80);
         assert_eq!(offset_of!(Kv8ChunkArgsRaw, code_scale), 68);
+        assert_eq!(offset_of!(Kv8ChunkArgsRaw, ring), 72);
+        assert_eq!(offset_of!(Kv8AppendArgsRaw, ring), 84);
         assert_eq!(align_of::<Kv8ChunkArgsRaw>(), 8);
     }
 }

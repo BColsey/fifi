@@ -302,13 +302,13 @@ impl DeviceFirstKv {
         };
         context.kv8_paged_append(
             stream,
-            Kv8Shape {
-                rows: 1,
-                n_kv_head: p.kv_heads,
-                head_dim: p.head_dim,
-                cells: self.plan.pool.capacity,
-                code_scale: Kv8CodeScale::StoredHalf,
-            },
+            Kv8Shape::linear(
+                1,
+                p.kv_heads,
+                p.head_dim,
+                self.plan.pool.capacity,
+                Kv8CodeScale::StoredHalf,
+            ),
             Kv8Data {
                 k: call.k,
                 v: call.v,
@@ -570,13 +570,7 @@ mod tests {
         ] {
             ctx.kv8_chunk(
                 &stream,
-                Kv8Shape {
-                    rows: ROWS,
-                    n_kv_head: 2,
-                    head_dim: 256,
-                    cells: ROWS,
-                    code_scale: Kv8CodeScale::StoredHalf,
-                },
+                Kv8Shape::linear(ROWS, 2, 256, ROWS, Kv8CodeScale::StoredHalf),
                 Kv8Data {
                     k: key.range(0, key.bytes())?,
                     v: value.range(0, value.bytes())?,

@@ -119,13 +119,7 @@ fn observe() -> Result<Observation, EngError> {
     let reference = upload(&ctx, &stream, &vec![0; pool.total])?;
     ctx.kv8_chunk(
         &stream,
-        Kv8Shape {
-            rows: N,
-            n_kv_head: KV,
-            head_dim: D,
-            cells: N,
-            code_scale: Kv8CodeScale::StoredHalf,
-        },
+        Kv8Shape::linear(N, KV, D, N, Kv8CodeScale::StoredHalf),
         Kv8Data {
             k: k.range(0, k.bytes())?,
             v: v.range(0, v.bytes())?,

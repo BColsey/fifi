@@ -54,6 +54,9 @@ pub(crate) struct AttnDecodeGemmaCall<'b> {
     pub(crate) head_dim: usize,
     pub(crate) cells: usize,
     pub(crate) window: usize,
+    /// 0: cell = position. R > 0: the key at position p is in cell p % R (needs a window and
+    /// `window + m - 1 <= R <= cells`); `kv_len` is then bounded by the position range, not by `cells`.
+    pub(crate) ring: usize,
     pub(crate) scale: f32,
     pub(crate) split: Option<AttnDecodeGemmaSplit<'b>>,
 }
@@ -134,6 +137,18 @@ impl CudaContext {
             return Err(EngError::BadRequest(
                 "the attention needs an i32 cell capacity and a window within it".to_owned(),
             ));
+        }
+        if !crate::kernels::cuda::native::resident::attn_decode_gemma::ring_admitted(
+            call.ring,
+            call.window,
+            call.m,
+            call.cells,
+        ) {
+            return Err(EngError::BadRequest(format!(
+                "the attention ring {} needs a window and window + m - 1 <= ring <= cells, \
+                 got window {}, m {}, cells {}",
+                call.ring, call.window, call.m, call.cells
+            )));
         }
         if !call.scale.is_finite() || call.scale.abs() >= 1e30 {
             return Err(EngError::BadRequest(format!(
@@ -217,6 +232,7 @@ impl CudaContext {
             head_dim: call.head_dim,
             cells: call.cells,
             window: call.window,
+            ring: call.ring,
             scale: call.scale,
             part: split
                 .as_ref()
@@ -229,5 +245,7 @@ impl CudaContext {
     }
 }
 
+#[cfg(test)]
+mod ring_tests;
 #[cfg(test)]
 mod tests;

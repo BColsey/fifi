@@ -34,6 +34,7 @@ mod tests;
 mod window_tests;
 
 use crate::EngError;
+use crate::family::kv_ring::KvRing;
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
@@ -182,17 +183,22 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         let head = if global { 512 } else { 256 };
         let n_kv = if global { 1 } else { 8 };
         let base = format!("blk.{layer}.");
+        // A local layer reaches the last LOCAL_WINDOW positions, so it keeps a ring of that many
+        // cells plus one prefill batch; a global layer keeps every position.
+        let geometry = KvRing::sliding(if global { 0 } else { LOCAL_WINDOW }, Gemma::PREFILL_BATCH);
+        let cells = geometry.cells(CELLS);
         let kv = Kv {
-            k_codes: zero(&ctx, n_kv * CELLS * head)?,
-            k_scales: zero(&ctx, n_kv * CELLS * (head / 32) * 2)?,
-            v_codes: zero(&ctx, n_kv * CELLS * head)?,
-            v_scales: zero(&ctx, n_kv * CELLS * (head / 32) * 2)?,
+            k_codes: zero(&ctx, n_kv * cells * head)?,
+            k_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
+            v_codes: zero(&ctx, n_kv * cells * head)?,
+            v_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
             shape: Kv8Shape {
                 rows: 1,
                 n_kv_head: n_kv,
                 head_dim: head,
-                cells: CELLS,
+                cells,
                 code_scale: Kv8CodeScale::UnroundedF32,
+                ring: geometry.kernel_ring(CELLS),
             },
         };
         layers.push(Layer {

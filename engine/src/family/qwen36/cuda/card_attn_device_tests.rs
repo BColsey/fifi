@@ -261,12 +261,14 @@ fn run_two_context_pipeline(steps: usize, poison_v: bool) -> Result<Pipeline, En
     let ref_norm = upload_on(reference_context, reference_stream, &f32_bytes(&norm))?;
     let ref_pos = upload_on(reference_context, reference_stream, &u32_bytes(&[0]))?;
     let ref_status = upload_on(reference_context, reference_stream, &u32_bytes(&[0]))?;
-    let kv8_shape = |heads_kv: usize| Kv8Shape {
-        rows: 1,
-        n_kv_head: heads_kv,
-        head_dim: full.attn.head_dim,
-        cells: CELLS,
-        code_scale: Kv8CodeScale::StoredHalf,
+    let kv8_shape = |heads_kv: usize| {
+        Kv8Shape::linear(
+            1,
+            heads_kv,
+            full.attn.head_dim,
+            CELLS,
+            Kv8CodeScale::StoredHalf,
+        )
     };
     let code_bytes = full.attn.heads_kv * CELLS * full.attn.head_dim;
     let scale_bytes = full.attn.heads_kv * CELLS * full.attn.head_dim / 32 * 2;

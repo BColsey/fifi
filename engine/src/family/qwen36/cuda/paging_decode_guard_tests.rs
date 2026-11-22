@@ -66,13 +66,7 @@ fn check_case(position: usize, params: StepParams, valid: bool) -> Result<(), En
     if valid {
         ctx.kv8_chunk(
             &stream,
-            Kv8Shape {
-                rows: 1,
-                n_kv_head: 2,
-                head_dim: 256,
-                cells: plan.group_cells,
-                code_scale: Kv8CodeScale::StoredHalf,
-            },
+            Kv8Shape::linear(1, 2, 256, plan.group_cells, Kv8CodeScale::StoredHalf),
             data(&k, &v, &reference, &plan.group)?,
             position % plan.group_cells,
         )?;

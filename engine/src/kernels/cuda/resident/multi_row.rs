@@ -461,11 +461,12 @@ impl CudaContext {
         let geometry_ok = (1..=64).contains(&shape.n_kv_head)
             && (32..=1024).contains(&shape.head_dim)
             && shape.head_dim.is_multiple_of(QUANT_GROUP)
-            && (1..(1 << 30)).contains(&shape.cells);
+            && (1..(1 << 30)).contains(&shape.cells)
+            && shape.ring == 0;
         if !geometry_ok {
             return Err(rule(
                 "shape",
-                "kv heads, head_dim or cells are outside the limits",
+                "kv heads, head_dim or cells are outside the limits, or the planes are a ring",
             ));
         }
         require_fit("k", &call.k, shape.row_bytes(), 4)?;
@@ -529,13 +530,13 @@ impl CudaContext {
         let part_bytes =
             attn_q8_part_bytes(n, shape.n_kv_head, shape.head_dim, call.split.max_splits)?;
         require_fit("part", &call.part, part_bytes, 16)?;
-        let plane = Kv8Shape {
-            rows: n,
-            n_kv_head: shape.n_kv_head,
-            head_dim: shape.head_dim,
-            cells: shape.cells,
-            code_scale: Kv8CodeScale::StoredHalf,
-        };
+        let plane = Kv8Shape::linear(
+            n,
+            shape.n_kv_head,
+            shape.head_dim,
+            shape.cells,
+            Kv8CodeScale::StoredHalf,
+        );
         check_planes(call.rows, &plane, false)?;
         let proj_bytes = match &call.proj {
             Some(proj) => {
