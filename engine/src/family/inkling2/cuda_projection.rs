@@ -27,6 +27,7 @@ use crate::{
 
 mod dense;
 pub(super) mod gguf;
+mod q8_row_reuse;
 
 use dense::{DensePlan, DenseStep};
 

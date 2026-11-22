@@ -44,6 +44,14 @@ typedef struct inference_cuda_dense_gemv_args {
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
 
+/* Opt-in: pair independent F32 activation rows sharing one dense Q8_0 matrix.
+ * Same operand checks, strides and arithmetic as packed GEMV. Selects an active
+ * SM75 device only, for (N,K)=(1024,2304) or (3072,2304) at M=7..12, or
+ * (2304,3072) at M=63..64. Other valid calls use ordinary GEMV. Optional host
+ * out_pair reports 1 after a paired enqueue, 0 otherwise. No retry on error. */
+int inference_cuda_gguf_q8_row_reuse_launch(const inference_cuda_dense_gemv_args *args,
+                                            void *stream, int *out_stage, int *out_pair);
+
 /* Opt-in: args describe one already-grouped expert matrix and
  * its F32 activation rows. Same layout, checks and per-row arithmetic as
  * packed GEMV. Tiles IQ2_XXS (16) and Q2_0 (42) only, for 2 <= m <= 512 and

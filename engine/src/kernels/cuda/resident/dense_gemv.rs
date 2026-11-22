@@ -14,8 +14,8 @@ use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, DenseGemvBytes};
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
-    dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_wmma_launch, typed_gemv_need,
-    typed_wmma_need,
+    dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_q8_row_reuse_launch, gguf_wmma_launch,
+    typed_gemv_need, typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 use crate::weights::GgufType;
@@ -78,6 +78,7 @@ pub(crate) fn dense_gemv_bytes(
 pub(crate) struct DenseGemvGroupCounts {
     pub(crate) wmma: usize,
     pub(crate) exact_tiles: usize,
+    pub(crate) q8_row_pairs: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +86,7 @@ enum GroupKernel {
     Gemv,
     Wmma,
     ExactTile,
+    Q8RowPair,
 }
 
 fn group_kernel(
@@ -92,6 +94,7 @@ fn group_kernel(
     dtype: DenseDtype,
     min_wmma_rows: Option<usize>,
     exact_tile: bool,
+    q8_row_reuse: bool,
 ) -> Result<(GroupKernel, DenseGemvBytes), EngError> {
     if let Some(need) = min_wmma_rows
         .filter(|&rows| shape.m >= rows)
@@ -112,6 +115,14 @@ fn group_kernel(
         && shape.cols <= 2304
     {
         GroupKernel::ExactTile
+    } else if q8_row_reuse
+        && dtype == DenseDtype::PackedGguf(GgufType::Q80)
+        && matches!(
+            (shape.rows, shape.cols, shape.m),
+            (1024 | 3072, 2304, 7..=12) | (2304, 3072, 63..=64)
+        )
+    {
+        GroupKernel::Q8RowPair
     } else {
         GroupKernel::Gemv
     };
@@ -149,21 +160,57 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
     ) -> Result<(), EngError> {
-        self.dense_gemv_group_with_tiles(stream, calls, None, false)
+        self.dense_gemv_group_impl(stream, calls, None, false, false)
             .map(|_| ())
+    }
+
+    /// Opts dense attention projections into SM75 Q8_0 row pairing; returns paired enqueues.
+    pub(crate) fn dense_gemv_group_with_q8_row_reuse(
+        &self,
+        stream: &DeviceStream,
+        calls: &[DenseGemvCall<'_>],
+    ) -> Result<usize, EngError> {
+        self.dense_gemv_group_impl(stream, calls, None, false, true)
+            .map(|counts| counts.q8_row_pairs)
+    }
+
+    /// Opts a single dense attention projection (possibly multirow) into Q8_0 row pairing.
+    pub(crate) fn dense_gemv_with_q8_row_reuse(
+        &self,
+        stream: &DeviceStream,
+        call: DenseGemvCall<'_>,
+    ) -> Result<bool, EngError> {
+        self.ensure_usable()?;
+        let (kernel, need) = group_kernel(call.shape, call.dtype, None, false, true)?;
+        let raw = self.plan_dense_projection(&call, need)?;
+        self.launch_on(stream, |raw_stream| match kernel {
+            GroupKernel::Q8RowPair => gguf_q8_row_reuse_launch(raw_stream, raw),
+            _ => dense_gemv_launch(raw_stream, raw).map(|()| false),
+        })
     }
 
     /// Queues the group in order. Where supported, an explicit row threshold permits WMMA
     /// (F16 operands, F32 accumulation); only the remaining ordinary GEMVs may opt into exact
-    /// FP32 expert tiling. Validates all calls before the first launch, including capacity,
-    /// alignment, overlap and adapter ownership. Counts actual enqueues, and never retries a
-    /// native launch failure.
+    /// F32 expert tiling. Grouped launchers validate all calls before the first enqueue,
+    /// including capacity, alignment, overlap and adapter ownership. They count actual
+    /// enqueues and never retry a native launch failure.
     pub(crate) fn dense_gemv_group_with_tiles(
         &self,
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
         min_wmma_rows: Option<usize>,
         exact_tile: bool,
+    ) -> Result<DenseGemvGroupCounts, EngError> {
+        self.dense_gemv_group_impl(stream, calls, min_wmma_rows, exact_tile, false)
+    }
+
+    fn dense_gemv_group_impl(
+        &self,
+        stream: &DeviceStream,
+        calls: &[DenseGemvCall<'_>],
+        min_wmma_rows: Option<usize>,
+        exact_tile: bool,
+        q8_row_reuse: bool,
     ) -> Result<DenseGemvGroupCounts, EngError> {
         self.check_launch_stream(stream)?;
         let min_wmma_rows = match min_wmma_rows {
@@ -173,8 +220,13 @@ impl CudaContext {
         let planned = calls
             .iter()
             .map(|call| {
-                let (kernel, need) =
-                    group_kernel(call.shape, call.dtype, min_wmma_rows, exact_tile)?;
+                let (kernel, need) = group_kernel(
+                    call.shape,
+                    call.dtype,
+                    min_wmma_rows,
+                    exact_tile,
+                    q8_row_reuse,
+                )?;
                 self.plan_dense_projection(call, need)
                     .map(|raw| (kernel, raw))
             })
@@ -184,6 +236,10 @@ impl CudaContext {
             for (kernel, call) in planned {
                 match kernel {
                     GroupKernel::Gemv => dense_gemv_launch(raw_stream, call)?,
+                    GroupKernel::Q8RowPair => {
+                        counts.q8_row_pairs +=
+                            usize::from(gguf_q8_row_reuse_launch(raw_stream, call)?);
+                    }
                     GroupKernel::Wmma => {
                         gguf_wmma_launch(raw_stream, call)?;
                         counts.wmma += 1;
@@ -244,7 +300,8 @@ mod group_tests {
         let q8 = DenseDtype::PackedGguf(GgufType::Q80);
         let gate = |m| DenseGemvShape::packed(m, 2304, 2304);
         let down = |m| DenseGemvShape::packed(m, 2304, 1152);
-        let kernel = |shape, dtype, wmma, tile| group_kernel(shape, dtype, wmma, tile).unwrap().0;
+        let kernel =
+            |shape, dtype, wmma, tile| group_kernel(shape, dtype, wmma, tile, false).unwrap().0;
         assert_eq!(kernel(gate(15), iq2, Some(16), false), GroupKernel::Gemv);
         assert_eq!(
             kernel(gate(15), iq2, Some(16), true),
@@ -265,7 +322,68 @@ mod group_tests {
         ] {
             assert_eq!(kernel(shape, iq2, None, true), GroupKernel::Gemv);
         }
-        assert!(group_kernel(gate(0), iq2, None, true).is_err());
-        assert!(group_kernel(DenseGemvShape::packed(4, 2304, 2303), iq2, None, true).is_err());
+        assert!(group_kernel(gate(0), iq2, None, true, false).is_err());
+        assert!(
+            group_kernel(
+                DenseGemvShape::packed(4, 2304, 2303),
+                iq2,
+                None,
+                true,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn q8_row_pairs_are_opt_in_and_select_only_measured_windows() {
+        let q8 = DenseDtype::PackedGguf(GgufType::Q80);
+        let iq2 = DenseDtype::PackedGguf(GgufType::Iq2Xxs);
+        for (rows, cols, first, last) in [
+            (1024, 2304, 7, 12),
+            (3072, 2304, 7, 12),
+            (2304, 3072, 63, 64),
+        ] {
+            for m in [1, first - 1, first, last, last + 1, 512] {
+                // QKV subranges use shared row strides; W_o uses packed rows.
+                let mut shape = DenseGemvShape::packed(m, rows, cols);
+                shape.ld_x += 3;
+                shape.ld_y += 7;
+                let (kernel, need) = group_kernel(shape, q8, Some(2), true, true).unwrap();
+                let expected = if (first..=last).contains(&m) {
+                    GroupKernel::Q8RowPair
+                } else {
+                    GroupKernel::Gemv
+                };
+                assert_eq!(kernel, expected);
+                assert_eq!(need.w, rows * (cols / 32) * 34);
+                assert_eq!(need.x, ((m - 1) * shape.ld_x + cols) * 4);
+                assert_eq!(need.y, ((m - 1) * shape.ld_y + rows) * 4);
+                assert_eq!(
+                    group_kernel(shape, q8, Some(2), true, false).unwrap().0,
+                    GroupKernel::Gemv
+                );
+            }
+        }
+        let mut shape = DenseGemvShape::packed(7, 1024, 2304);
+        // A WMMA-eligible codec still takes priority with both exact options enabled.
+        assert_eq!(
+            group_kernel(shape, iq2, Some(2), true, true).unwrap().0,
+            GroupKernel::Wmma
+        );
+        assert_eq!(
+            group_kernel(shape, DenseDtype::F16, None, false, true)
+                .unwrap()
+                .0,
+            GroupKernel::Gemv
+        );
+        assert_eq!(
+            group_kernel(DenseGemvShape::packed(7, 384, 2304), q8, None, false, true)
+                .unwrap()
+                .0,
+            GroupKernel::Gemv
+        );
+        shape.ld_y -= 1;
+        assert!(group_kernel(shape, q8, None, false, true).is_err());
     }
 }

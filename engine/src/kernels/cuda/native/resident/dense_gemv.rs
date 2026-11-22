@@ -121,6 +121,13 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_gguf_q8_row_reuse_launch"]
+    fn gguf_q8_row_reuse_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        out_pair: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_gguf_exact_expert_tile_launch"]
     fn gguf_exact_expert_tile_raw(
         args: *const DenseGemvArgsRaw,
@@ -258,6 +265,16 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
     projection_launch(stream, call, need, ProjectionEntry::Gemv).map(|_| ())
 }
 
+/// Same strided F32 extents and checks as ordinary GEMV. Native dispatch checks the active device.
+/// Returns whether a pair kernel was enqueued; a launch failure is never retried.
+pub(in crate::kernels::cuda) fn gguf_q8_row_reuse_launch(
+    stream: &RawStream,
+    call: DenseGemvRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+    projection_launch(stream, call, need, ProjectionEntry::Q8RowReuse).map(|pair| pair != 0)
+}
+
 /// Same operands as dense GEMV. The native entry selects the exact tile or ordinary GEMV
 /// before enqueueing, and reports whether it tiled. Do not retry a launch failure.
 pub(in crate::kernels::cuda) fn gguf_exact_expert_tile_launch(
@@ -280,6 +297,7 @@ enum ProjectionEntry {
     Gemv,
     Wmma,
     ExactExpertTile,
+    Q8RowReuse,
 }
 
 fn projection_launch(
@@ -303,24 +321,27 @@ fn projection_launch(
         weight_dtype: call.dtype.code(),
     };
     let mut stage = STAGE_NONE;
-    let mut tile = 0;
+    let mut selected = 0;
     let stream = stream.0.as_ptr();
     // SAFETY: `check` proved every range inside its live allocation (`RawRange::new`), large
     // enough for the call, aligned (the weight to 2, x and y to 4), and the written `y` apart from
     // `w` and `x`; the entry checks the addresses again. The allocations outlive the queued work
     // (`inference_cuda_free` synchronizes first). `args` is a live local that the entry reads only
-    // during the call, `stream` is live, and `stage` and `tile` are writable c_ints.
+    // during the call, `stream` is live, and `stage` and `selected` are writable c_ints.
     let status = unsafe {
         match entry {
             ProjectionEntry::Gemv => dense_gemv_raw(&raw const args, stream, &mut stage),
             ProjectionEntry::Wmma => gguf_wmma_raw(&raw const args, stream, &mut stage),
             ProjectionEntry::ExactExpertTile => {
-                gguf_exact_expert_tile_raw(&raw const args, stream, &mut stage, &mut tile)
+                gguf_exact_expert_tile_raw(&raw const args, stream, &mut stage, &mut selected)
+            }
+            ProjectionEntry::Q8RowReuse => {
+                gguf_q8_row_reuse_raw(&raw const args, stream, &mut stage, &mut selected)
             }
         }
     };
     checked(status, stage)?;
-    Ok(tile)
+    Ok(selected)
 }
 
 #[cfg(test)]

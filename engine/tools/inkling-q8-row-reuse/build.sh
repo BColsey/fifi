@@ -9,6 +9,6 @@ out=$(cd -- "$out" && pwd)
 export TMPDIR="$out/tmp" TMP="$out/tmp" TEMP="$out/tmp"
 native="$engine/src/kernels/cuda/native"
 "${NVCC:-nvcc}" -ccbin "${CXX:-g++}" -arch=sm_75 -std=c++17 -O3 -lineinfo \
-    --Werror all-warnings -Xptxas=-v -DFIFI_BUILD_INKLING_Q8_REUSE_PROBE \
+    --Werror all-warnings -Xptxas=-v \
     -I "$native" -I "$engine/vendor/ggml-cuda-mmq/src" \
     "$native/resident/dense_gemv.cu" "$fixture/probe.cu" -o "$out/probe"

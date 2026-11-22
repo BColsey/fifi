@@ -829,6 +829,7 @@ impl GgufCuda {
         &self,
         inputs: &[[&[f32]; 3]],
         requests: [Option<Projection<'_>>; N],
+        allow_q8_row_reuse: bool,
     ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
         let Some(first) = inputs.first() else {
             return Ok(None);
@@ -836,9 +837,9 @@ impl GgufCuda {
         let Some(weights) = self.attention_group(first.map(<[f32]>::len), requests) else {
             return Ok(None);
         };
-        let projected = self
-            .step
-            .project_group_rows(&self.context, inputs, weights?)?;
+        let projected =
+            self.step
+                .project_group_rows(&self.context, inputs, weights?, allow_q8_row_reuse)?;
         if projected.is_some() && self.prefill_report.is_some() {
             eprintln!(
                 "Inkling CUDA batched attention projections: {} rows",

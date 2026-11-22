@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::inkling2::cuda_projection::q8_row_reuse,
     kernels::cuda::{CudaContext, resident::inkling_controller::Arithmetic},
 };
 
@@ -167,7 +168,7 @@ impl DenseStep {
                 ([hidden, 3 * m], eps),
                 arithmetic,
             )?;
-            context.dense_gemv_group(&self.stream, &projections)
+            q8_row_reuse::project_group(context, &self.stream, &projections, "controlled_qkv")
         })?;
         self.capture_first_controller_tile(m, hidden)?;
         let mut values = values.into_iter().skip(3 * m);

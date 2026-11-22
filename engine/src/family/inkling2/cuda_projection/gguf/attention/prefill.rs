@@ -1,7 +1,7 @@
 //! Batch transfer and fences, not causal ring updates: each row still runs in order.
 
 use super::*;
-use crate::family::inkling2::cuda_projection::DEVICE_HEADROOM;
+use crate::family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse};
 
 const LIMIT: usize = 64;
 const ARENA_BYTES: usize = 8 << 20;
@@ -235,7 +235,8 @@ impl ResidentAttention {
                 )?;
             }
             if let Some(p) = projection {
-                context.dense_gemv(
+                q8_row_reuse::project_output(
+                    context,
                     &self.stream,
                     DenseGemvCall {
                         shape: DenseGemvShape::packed(count, p.rows, layout.attention / 4),

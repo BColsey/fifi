@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::inkling2::cuda_projection::q8_row_reuse,
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream},
 };
 
@@ -56,6 +57,7 @@ impl PrefillProjection<'_> {
             self.weights,
             &layout,
             self.scratch,
+            true,
         )?;
         Ok((
             layout.host_rows(&values).collect(),
@@ -106,6 +108,7 @@ impl DenseStep {
         context: &CudaContext,
         inputs: &[[&[f32]; 3]],
         weights: [Option<ResidentProjection<'_>>; N],
+        allow_q8_row_reuse: bool,
     ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
         let Some(first) = inputs.first().filter(|_| inputs.len() > 1) else {
             return Ok(None);
@@ -117,7 +120,14 @@ impl DenseStep {
         }
         let mut rows = Vec::with_capacity(inputs.len());
         for chunk in inputs.chunks(tile) {
-            let (values, _) = self.project_group_tile(context, chunk, weights, &layout, None)?;
+            let (values, _) = self.project_group_tile(
+                context,
+                chunk,
+                weights,
+                &layout,
+                None,
+                allow_q8_row_reuse,
+            )?;
             rows.extend(layout.host_rows(&values));
         }
         Ok(Some(rows))
@@ -151,6 +161,7 @@ impl DenseStep {
         weights: [Option<ResidentProjection<'_>>; N],
         layout: &Layout<N>,
         scratch: Option<&'a DeviceBuffer>,
+        allow_q8_row_reuse: bool,
     ) -> Result<(Vec<f32>, Option<DeviceRange<'a>>), EngError> {
         if inputs
             .iter()
@@ -207,6 +218,18 @@ impl DenseStep {
                 y: range(output_offset, need.y / size_of::<f32>())?,
             });
         }
+        let project = || {
+            if allow_q8_row_reuse {
+                let stage = if layout.side.iter().any(|&n| n > 0) {
+                    "qkv_sidecar"
+                } else {
+                    "qkv"
+                };
+                q8_row_reuse::project_group(context, &self.stream, &calls, stage)
+            } else {
+                context.dense_gemv_group(&self.stream, &calls)
+            }
+        };
         let input_rows: Vec<_> = inputs.iter().flatten().copied().collect();
         let values = if let Some(buffer) = scratch {
             let mut encoded = Vec::with_capacity(input.bytes());
@@ -219,7 +242,7 @@ impl DenseStep {
             buffer.write_at(&self.stream, input.offset(), &encoded)?;
             let mut bytes = vec![[0; 4]; output.bytes() / 4];
             finish_borrowed(&self.stream, || {
-                context.dense_gemv_group(&self.stream, &calls)?;
+                project()?;
                 buffer.read_at(&self.stream, output.offset(), bytes.as_flattened_mut())
             })?;
             let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
@@ -228,9 +251,7 @@ impl DenseStep {
             }
             values
         } else {
-            self.run_rows(context, &self.stream, &input_rows, [input, output], || {
-                context.dense_gemv_group(&self.stream, &calls)
-            })?
+            self.run_rows(context, &self.stream, &input_rows, [input, output], project)?
         };
         // run_rows fenced the producer stream; attention may consume this range on its own stream.
         Ok((values, side))
@@ -349,7 +370,7 @@ mod tests {
             .map(|&row| step.project_group(&context, row, weights).unwrap())
             .collect();
         let tiled = step
-            .project_group_rows(&context, &input, weights)
+            .project_group_rows(&context, &input, weights, true)
             .unwrap()
             .unwrap();
         assert_eq!(tiled, scalar);
@@ -361,7 +382,7 @@ mod tests {
             7
         );
         let (values, side) = step
-            .project_group_tile(&context, &input, weights, &layout, Some(&scratch))
+            .project_group_tile(&context, &input, weights, &layout, Some(&scratch), true)
             .unwrap();
         assert!(side.is_none());
         assert_eq!(layout.host_rows(&values).collect::<Vec<_>>(), scalar);
@@ -377,7 +398,7 @@ mod tests {
             step.project(&context, &cold_resident, input[0][0]).unwrap()
         );
         assert!(
-            step.project_group_rows(&context, &input[..1], weights)
+            step.project_group_rows(&context, &input[..1], weights, true)
                 .unwrap()
                 .is_none()
         );

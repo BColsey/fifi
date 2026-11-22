@@ -857,9 +857,10 @@ impl GgufTextWeights {
         &self,
         inputs: &[[&[f32]; 3]],
         requests: [Option<Projection<'_>>; N],
+        allow_q8_row_reuse: bool,
     ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
         self.cuda.as_ref().map_or(Ok(None), |cuda| {
-            cuda.attention_projections_rows(inputs, requests)
+            cuda.attention_projections_rows(inputs, requests, allow_q8_row_reuse)
         })
     }
 

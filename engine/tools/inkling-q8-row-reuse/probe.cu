@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "abi.h"
-#include "resident/inkling_q8_reuse_probe.h"
+#include "resident/dense_gemv.h"
 
 namespace {
 
@@ -68,53 +68,41 @@ struct Counts {
 };
 
 struct Run {
-    int cc;
     cudaStream_t stream;
 
     void launch(const inference_cuda_dense_gemv_args &args, bool compare, Counts &counts) const {
-        InklingQ8ReuseLaunch result;
-        const int rc = inkling_q8_reuse_probe_launch(&args, stream, {compare, cc}, result);
+        int stage = -1, paired = 0;
+        const int rc = compare
+            ? inference_cuda_gguf_q8_row_reuse_launch(&args, stream, &stage, &paired)
+            : inference_cuda_dense_gemv_launch(&args, stream, &stage);
         if (rc != 0) {
-            std::fprintf(stderr, "dispatch failed: code=%d stage=%d\n", rc, result.stage);
+            std::fprintf(stderr, "dispatch failed: code=%d stage=%d\n", rc, stage);
             throw std::runtime_error("projection launch");
         }
-        if (result.used_pair) ++counts.paired;
+        if (paired) ++counts.paired;
         else ++counts.baseline;
     }
 };
 
 void host_checks() {
-    constexpr InklingQ8ReusePolicy on{true, 75}, off{};
     constexpr inference_cuda_dense_gemv_args a{nullptr, nullptr, nullptr, 7, 1024, 2304,
                                               2304, 1024, kQ8};
-    struct PolicyCase { InklingQ8ReusePolicy policy; int m, rows, cols, type; bool pair; };
-    constexpr PolicyCase policies[] = {
-        {off, 7, 1024, 2304, kQ8, false}, {{false, 75}, 7, 1024, 2304, kQ8, false},
-        {{true, 80}, 7, 1024, 2304, kQ8, false}, {{true, 70}, 7, 1024, 2304, kQ8, false},
-        {on, 2, 1024, 2304, kQ8, true}, {on, 7, 3072, 2304, kQ8, true},
-        {on, 64, 2304, 3072, kQ8, true}, {on, 65, 2304, 3072, kQ8, false},
-        {on, 1, 1024, 2304, kQ8, false}, {on, 7, 1023, 2304, kQ8, false},
-        {on, 7, 1024, 2336, kQ8, false}, {on, 7, 1024, 2304, 256 + 14, false},
-    };
-    for (auto p : policies) {
-        auto args = a;
-        args.m = p.m; args.rows = p.rows; args.cols = p.cols; args.weight_dtype = p.type;
-        require(p.policy.use_pair(args) == p.pair, "wrong host selection");
-    }
     auto valid_shape = a;
     valid_shape.w = reinterpret_cast<void *>(uintptr_t{0x1000000});
     valid_shape.x = reinterpret_cast<void *>(uintptr_t{0x2000000});
     valid_shape.y = reinterpret_cast<void *>(uintptr_t{0x3000000});
     void *fake_stream = reinterpret_cast<void *>(uintptr_t{1});
     const auto rejected = [&](const inference_cuda_dense_gemv_args *args, void *stream) {
-        InklingQ8ReuseLaunch out{99, true};
-        require(inkling_q8_reuse_probe_launch(args, stream, on, out) == INFERENCE_CUDA_INVALID_ARGUMENT &&
-                out.stage == INFERENCE_CUDA_STAGE_NONE && !out.used_pair, "bad operand accepted");
+        int stage = 99, pair = 99;
+        require(inference_cuda_gguf_q8_row_reuse_launch(args, stream, &stage, &pair) ==
+                    INFERENCE_CUDA_INVALID_ARGUMENT &&
+                stage == INFERENCE_CUDA_STAGE_NONE && pair == 0, "bad operand accepted");
     };
     rejected(nullptr, fake_stream);
     rejected(&a, fake_stream);
     rejected(&valid_shape, nullptr);
-    for (int i = 0; i < 7; ++i) {
+    constexpr int mutations = 14;
+    for (int i = 0; i < mutations; ++i) {
         auto args = valid_shape;
         switch (i) {
         case 0: args.y = const_cast<void *>(args.w); break;
@@ -124,10 +112,21 @@ void host_checks() {
         case 4: args.ld_y--; break;
         case 5: args.m = 32769; break;
         case 6: args.weight_dtype = 999; break;
+        case 7: args.ld_x--; break;
+        case 8: args.ld_y = (1 << 20) + 1; break;
+        case 9: args.x = reinterpret_cast<void *>(uintptr_t{0x2000002}); break;
+        case 10: args.y = reinterpret_cast<void *>(uintptr_t{0x3000002}); break;
+        case 11: args.x = nullptr; break;
+        case 12: args.y = nullptr; break;
+        case 13: // y overlaps only the last strided activation row.
+            args.ld_x += 3;
+            args.y = reinterpret_cast<void *>(uintptr_t{0x2000000} +
+                     ((args.m - 1) * args.ld_x + args.cols - 1) * sizeof(float));
+            break;
         }
         rejected(&args, fake_stream);
     }
-    std::printf("host-only: %zu dispatch cases and 10 ABI refusals passed\n", std::size(policies));
+    std::printf("host-only: %d production ABI refusals passed\n", 3 + mutations);
 }
 
 std::vector<uint8_t> load(const std::string &path, size_t bytes) {
@@ -253,7 +252,7 @@ void run_shape(const Run &run, const std::string &directory, Shape shape, Option
         }
     }
     for (auto c : {Case{1, shape.rows, 7, 7, false}, Case{65, shape.rows, 0, 0, false},
-                   Case{7, shape.rows - 1, 7, 7, false}, Case{2, shape.rows, 0, 0, true}}) {
+                   Case{7, shape.rows - 1, 7, 7, false}, Case{2, shape.rows, 0, 0, false}}) {
         verify_case(run, {dw.p, shape.cols}, c, options);
     }
 }
@@ -282,10 +281,9 @@ int main(int argc, char **argv) {
         cudaDeviceProp prop;
         check(cudaGetDevice(&device));
         check(cudaGetDeviceProperties(&prop, device));
-        const int cc = 10 * prop.major + prop.minor;
-        require(cc == 75, "fixture built for SM75 only");
+        require(prop.major == 7 && prop.minor == 5, "fixture built for SM75 only");
         Stream stream;
-        for (auto shape : kShapes) run_shape({cc, stream.id}, argv[1], shape, {compare, repeats, seed});
+        for (auto shape : kShapes) run_shape({stream.id}, argv[1], shape, {compare, repeats, seed});
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

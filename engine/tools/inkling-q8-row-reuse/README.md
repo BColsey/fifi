@@ -1,9 +1,42 @@
 # Exact F32 Inkling Q8_0 projection reuse (SM75)
 
-This is a component experiment, not an engine opt-in. Normal builds do not
-compile the candidate, and the fixture also defaults to ordinary GEMV. Only
-`probe WEIGHTS_DIR --compare` requests the candidate. Build and host tests do
-not initialize a GPU.
+The exact F32 paired-row kernel is compiled into the native engine, but is
+**off by default**. The fixture links the same native entries and also
+defaults to ordinary GEMV; `probe WEIGHTS_DIR --compare` exercises the
+production pair policy. Build and host tests do not initialize a GPU.
+
+## Engine opt-in and attribution
+
+Set `FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE=1` on an SM75 build/device. This
+changes only the projection kernel on existing, admitted multirow Inkling
+prefill attention paths. Decode, including grouped speculative verification,
+keeps its existing dispatch. The flag does not enable batching, choose the
+tile size, or alter model state, workspaces, scaling or stream fences. Use
+the same settings in both comparison arms, for example:
+
+- Use resident packed weights (`FIFI_INKLING_CUDA_PACKED_GGUF=1`) and an
+  admitted grouped prefill (`FIFI_INKLING_CUDA_PREFILL_ROWS`). Keep
+  `FIFI_INKLING_CUDA_Q8_ACTIVATIONS` unset for the F32-activation comparison.
+- For Q/K/V and other projections in the same attention group, use
+  `FIFI_INKLING_CUDA_GROUP_ATTENTION=1` and
+  `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS=1`. The existing sidecar
+  and grouped chained-controller paths also opt in at their attention
+  projection calls, not at the controller projections.
+- For W_o, use `FIFI_INKLING_CUDA_RESIDENT_ATTENTION=1`,
+  `FIFI_INKLING_CUDA_BATCH_RELATIVE_ATTENTION=1` and
+  `FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT=1`; the resident output weight
+  and attention workspace must both be admitted.
+
+The only paired shapes are `(M,N,K)=(7–12,1024,2304)`, `(7–12,3072,2304)`
+(QKV group, independent F32 input and output strides), and `(63–64,2304,3072)`
+(W_o, compact rows). Singletons, ragged tiles outside those bounds, other
+codecs and non-SM75 devices keep ordinary dispatch. Routed experts and WMMA
+selection are unchanged. Set `FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT=1`
+in either arm to log actual paired and baseline Q8_0 enqueues per relevant
+attention submission (`q8_pair_calls`, `q8_gemv_calls`, stage and activation
+row count); counts are not completions. Check them separately from timing.
+Zero counts or no reports can mean routing, residency, tile size, or model
+choices never reached the candidate, not that a matched kernel regressed.
 
 ## Why these shapes
 
@@ -48,11 +81,14 @@ The resource tradeoff matters on [Turing](https://docs.nvidia.com/cuda/archive/1
 18/24 KiB shared per paired CTA versus 9/12 KiB baseline, plus six extra
 registers/thread in the local CUDA 12.4 build (42 vs 36, no spills). The
 paired SASS uses `LDS.U.64`/`STS.64`; this says nothing about observed cache
-traffic or latency. No speedup is claimed. The candidate is limited to the
-three geometries above, Q8_0, SM75 and M=2–64. Other valid calls fall back to
-ordinary GEMV, and invalid operands fail before enqueue. Selected launch
-errors are returned, never retried via the baseline. No production Rust or
-model-loading path changed.
+traffic or latency. In the separate leased RTX 2080 Ti component run at
+`cda2b92ae94cb0dc0ab272e572425b080e15624a`, 1,261,803 output bits matched,
+memcheck reported zero errors, and three seeds of warmed ABBA/BAAB timings
+of six geometry endpoints gave **1.30–1.66×** speedup (ratio of arm medians).
+These are component results on real weights with synthetic activations, not
+engine measurements. The current production dispatch is narrower than that
+probe: M=2 now falls back. Invalid operands fail before enqueue, and a
+selected launch error is returned, never retried via the baseline.
 
 ## Build and validate without a GPU
 
@@ -65,7 +101,7 @@ out=$(realpath -m ../tmp/q8-build)
 model="$HOME/fifi-scratch/ee8307597ab8/inkling-2-mini-20261120/quants/UD-IQ1_M/Inkling-2-Mini-UD-IQ1_M.gguf"
 mkdir -p "$out"
 NVCC=/usr/bin/nvcc CXX=/usr/bin/g++-13 bash "$fixture/build.sh" "$out" 2>&1 | tee "$out/build.log"
-"$out/probe" --host-only   # 12 dispatch cases and 10 ABI refusals
+"$out/probe" --host-only   # 17 production ABI refusals; selection bounds checked at compile time
 python3 -B "$fixture/extract.py" "$model" "$out/weights"  # weights must be a new directory
 (cd "$out/weights" && jq -r '.weights[] | "\(.sha256)  \(.file)"' manifest.json | sha256sum -c)
 ```
@@ -110,7 +146,7 @@ mkdir "$out/results"
 ' _ "$out"
 jq -es 'length == 33 and all(.[]; .kind == "bits" and .pair_launches == 0 and .baseline_launches == 1)' \
   "$out/results/default.jsonl"
-jq -es 'length == 33 and (map(.bitwise)|add) == 1261803 and (map(.pair_launches)|add) == 24 and (map(.baseline_launches)|add) == 9' \
+jq -es 'length == 33 and (map(.bitwise)|add) == 1261803 and (map(.pair_launches)|add) == 21 and (map(.baseline_launches)|add) == 12' \
   "$out/results/verify.jsonl"
 grep -F 'ERROR SUMMARY: 0 errors' "$out/results/memcheck.log"
 for file in "$out"/results/timing-*.jsonl; do
@@ -120,14 +156,15 @@ done
 
 Both arms use the same packed bytes, F32 data, strides and stream. Bitwise
 checks include finiteness, output padding and guards, unchanged inputs,
-2-byte-aligned packed weights, odd tails, M=2 and valid fallbacks (singletons,
-M>64, unsupported output extent). Inputs are deterministic synthetic F32,
+2-byte-aligned packed weights, odd tails, and valid fallbacks (singletons,
+M=2, M>64, unsupported output extent). Inputs are deterministic synthetic F32,
 including signed zero and subnormal operands, **not recorded prompt hidden
 states**. Compare medians of the four warm ABBA/BAAB samples per arm, shape
 and seed (in microseconds per call). Uploads, verification and setup are outside the
-CUDA event intervals. The fixture reuses one tensor across repetitions; the
-engine contends for cache with other tensors and does other work between
-calls. Treat bitwise or sanitizer failure as a stop; otherwise require
-consistent shape-level gains before testing an engine integration. Serving
-speed, strict logits, prefix/continuation and speculative parity are not
-qualified by this component.
+CUDA event intervals. The production opt-in queries the active device before
+matched enqueues, unlike the historical probe which queried once at setup.
+The fixture reuses one tensor across repetitions; the engine contends for
+cache with other tensors and does other work between calls. Treat bitwise or sanitizer failure as a stop; otherwise require
+consistent shape-level gains before enabling this in an engine qualification
+run. Actual model dispatch, serving speed, strict logits,
+prefix/continuation and speculative parity are not qualified by this component.

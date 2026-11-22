@@ -268,7 +268,7 @@ impl CpuForward {
                     row.prelude = None;
                 }
             }
-            self.prompt_visit(visit, &mut state[slot], &mut rows, weights)?;
+            self.prompt_visit(visit, &mut state[slot], &mut rows, weights, verify)?;
         }
         Ok(rows)
     }
@@ -279,6 +279,7 @@ impl CpuForward {
         state: &mut VisitState,
         rows: &mut [PromptRow<'_>],
         weights: &GgufTextWeights,
+        verify: bool,
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
@@ -289,7 +290,7 @@ impl CpuForward {
         let batched_attention = batch_router
             && !self.draft_window_enabled()
             && rows.len() > 1
-            && rows.iter().all(|row| row.journal.is_none())
+            && !verify
             && crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled()
             && weights.resident_attention().is_some();
         let chained = if batched_attention {
@@ -345,6 +346,7 @@ impl CpuForward {
                             visit,
                             &inputs,
                             batched_controllers,
+                            true,
                         )?
                         .map(|p| self.attention_prefill_batch(&layer, visit, state, p))
                         .transpose()?,
@@ -373,6 +375,7 @@ impl CpuForward {
                 visit,
                 &inputs,
                 batched_controllers,
+                !verify,
             )?;
         }
         let mut projected = projected.into_iter().flatten();
@@ -548,7 +551,7 @@ impl CpuForward {
             .prompt_attention_inputs(visit, layer, rows)?
             .ok_or_else(|| bad("diagnostic requires baseline grouped inputs"))?;
         let baseline = self
-            .project_prompt_attention(weights, layer, visit, &inputs, batched)?
+            .project_prompt_attention(weights, layer, visit, &inputs, batched, false)?
             .ok_or_else(|| bad("diagnostic requires baseline attention projections"))?;
         if baseline.len() != fused.len() {
             return Err(bad("diagnostic row count differs"));
@@ -617,9 +620,16 @@ impl CpuForward {
         visit: LayerVisit,
         inputs: &[[Vec<f32>; 3]],
         batched_controllers: bool,
+        allow_q8_row_reuse: bool,
     ) -> Result<Option<Vec<super::super::cpu_attention::AttentionProjection>>, EngError> {
-        let projected =
-            self.prefill_attention_projections(weights, layer, visit.attention, inputs)?;
+        // Grouped verification shares this path but keeps the existing projection dispatch.
+        let projected = self.prefill_attention_projections(
+            weights,
+            layer,
+            visit.attention,
+            inputs,
+            allow_q8_row_reuse,
+        )?;
         if projected.is_none() && batched_controllers {
             // Keep the completed controller rows when Q/K/V projection itself falls back.
             return inputs

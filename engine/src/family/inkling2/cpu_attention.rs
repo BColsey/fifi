@@ -473,13 +473,14 @@ impl CpuForward {
         layer: &str,
         attention: Attention,
         inputs: &[[Vec<f32>; 3]],
+        allow_q8_row_reuse: bool,
     ) -> Result<Option<Vec<AttentionProjection>>, EngError> {
         let refs: Vec<_> = inputs
             .iter()
             .map(|input| input.each_ref().map(Vec::as_slice))
             .collect();
         self.attention_requests(layer, attention, |calls| {
-            weights.attention_projections_rows(&refs, calls)
+            weights.attention_projections_rows(&refs, calls, allow_q8_row_reuse)
         })
     }
 
