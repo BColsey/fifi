@@ -182,19 +182,48 @@ fn in_hub(root: &Path, query: &str) -> Vec<PathBuf> {
         };
         let repo_name = repo.rsplit("--").next().unwrap_or(repo).to_string();
         let snapshots = entry.path().join("snapshots");
-        let mut snapshot_dirs: Vec<PathBuf> = std::fs::read_dir(&snapshots)
+        // The newest snapshot that is whole and holds a GGUF: one still being filled, or with a
+        // link to a blob that is not there, is not a model yet.
+        let latest = std::fs::read_dir(&snapshots)
             .into_iter()
             .flatten()
             .flatten()
-            .map(|snapshot| snapshot.path())
-            .filter(|path| has_gguf(path))
-            .collect();
-        snapshot_dirs.sort();
-        if let Some(latest) = snapshot_dirs.pop() {
-            candidates.push((repo_name, latest));
+            .filter(|snapshot| {
+                let commit = snapshot.file_name().to_string_lossy().into_owned();
+                has_gguf(&snapshot.path())
+                    && super::hf::snapshot_complete(&entry.path(), &commit, &snapshot.path())
+            })
+            .max_by_key(|snapshot| (modified(&snapshot.path()), snapshot.file_name()));
+        if let Some(latest) = latest {
+            candidates.push((repo_name, latest.path()));
         }
     }
     best(query, candidates)
+}
+
+/// Whether the GGUF file at `path`, or every GGUF file of the directory, holds all its tensor
+/// data: the header parses and every tensor lies inside the file. A download that was killed
+/// leaves a file that does not.
+fn gguf_whole(path: &Path) -> bool {
+    if path.is_dir() {
+        return std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|file| {
+                file.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            })
+            .all(|file| gguf_whole(&file));
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(length) = file.metadata().map(|meta| meta.len()) else {
+        return false;
+    };
+    crate::weights::GgufHeader::parse(&mut std::io::BufReader::new(file), length, 256 << 20).is_ok()
 }
 
 /// A model of a local store, for choosing one when none was named.
@@ -231,7 +260,10 @@ pub(crate) fn all(stores: &Stores) -> Vec<Local> {
         }
     };
     let mut found = Vec::new();
-    for path in in_models(&stores.models, "") {
+    for path in in_models(&stores.models, "")
+        .into_iter()
+        .filter(|path| gguf_whole(path))
+    {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -332,6 +364,16 @@ mod tests {
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         std::fs::write(path, b"x").expect("write");
+    }
+
+    /// A real (tensor-less) GGUF, or the same file cut short as a killed download leaves it.
+    fn write_gguf(path: &Path, cut: bool) {
+        let mut bytes = crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon");
+        if cut {
+            bytes.truncate(bytes.len() / 2);
+        }
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("write");
     }
 
     fn stores(root: &Path) -> Stores {
@@ -472,11 +514,14 @@ mod tests {
     fn every_store_is_listed_newest_first_with_the_name_to_pass() {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path();
-        touch(&root.join("models/a/a-Q4.gguf"));
+        write_gguf(&root.join("models/a/a-Q4.gguf"), false);
         std::thread::sleep(std::time::Duration::from_millis(30));
         ollama_model(root, "qwen3", "8b", "abc");
         std::thread::sleep(std::time::Duration::from_millis(30));
-        touch(&root.join("hub/models--org--repo/snapshots/c0ffee/m.gguf"));
+        write_gguf(
+            &root.join("hub/models--org--repo/snapshots/c0ffee/m.gguf"),
+            false,
+        );
         let listed: Vec<(String, &str)> = super::all(&stores(root))
             .into_iter()
             .map(|model| (model.name, model.store))
@@ -488,6 +533,48 @@ mod tests {
                 ("qwen3:8b".to_string(), "the Ollama store"),
                 ("a".to_string(), "the models directory"),
             ]
+        );
+    }
+
+    #[test]
+    fn a_half_downloaded_file_or_snapshot_is_not_a_model_to_pick() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path();
+        write_gguf(&root.join("models/killed/killed.gguf"), true);
+        write_gguf(&root.join("models/whole/whole.gguf"), false);
+        // A snapshot still being filled (marker in the repo directory).
+        let filling = root.join("hub/models--org--filling");
+        write_gguf(&filling.join("snapshots/aa11/m.gguf"), false);
+        std::fs::write(filling.join(".fifi-incomplete-aa11"), b"").expect("marker");
+        // A snapshot whose link reaches no blob.
+        let dangling = root.join("hub/models--org--dangling");
+        std::fs::create_dir_all(dangling.join("snapshots/bb22")).expect("dirs");
+        std::os::unix::fs::symlink(
+            "../../blobs/missing",
+            dangling.join("snapshots/bb22/m.gguf"),
+        )
+        .expect("link");
+        let names: Vec<String> = super::all(&stores(root))
+            .into_iter()
+            .map(|model| model.name)
+            .collect();
+        assert_eq!(names, ["whole"]);
+    }
+
+    #[test]
+    fn the_newest_snapshot_of_a_repo_is_by_write_time_not_by_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path();
+        let repo = root.join("hub/models--org--repo/snapshots");
+        write_gguf(&repo.join("zzz-older/m.gguf"), false);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        write_gguf(&repo.join("aaa-newer/m.gguf"), false);
+        let listed = super::all(&stores(root));
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].path.ends_with("aaa-newer"),
+            "{:?}",
+            listed[0].path
         );
     }
 }

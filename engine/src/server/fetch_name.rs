@@ -453,29 +453,28 @@ fn fetch(
     Ok(snapshot.join(&picked.first().path))
 }
 
-/// Removes the planning stubs of processes that are gone: a `.fifi-plan-<pid>` directory whose
-/// process no longer runs (where `/proc` says so; elsewhere, one untouched for ten minutes).
+/// An exclusive advisory lock on a directory, taken without waiting.
+fn try_lock(dir: &Path) -> Option<std::fs::File> {
+    let file = std::fs::File::open(dir).ok()?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .ok()
+        .map(|()| file)
+}
+
+/// Removes the planning stubs nobody is using: a `.fifi-plan-<pid>` directory is locked by the
+/// process that plans in it for as long as it plans, so one whose lock can be taken belongs to a
+/// process that is gone. The lock, unlike a process-table lookup, holds for processes in other
+/// containers that share the cache.
 fn sweep_stale_plans(cache: &Path) {
-    let own = std::process::id().to_string();
     for entry in std::fs::read_dir(cache).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name.strip_prefix(".fifi-plan-") else {
-            continue;
-        };
-        if pid == own {
+        let owner = name
+            .strip_prefix(".fifi-plan-")
+            .and_then(|pid| pid.parse::<u32>().ok());
+        if owner.is_none() || owner == Some(std::process::id()) {
             continue;
         }
-        let gone = if Path::new("/proc/self").exists() {
-            !Path::new("/proc").join(pid).exists()
-        } else {
-            entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.elapsed().ok())
-                .is_some_and(|age| age > std::time::Duration::from_secs(600))
-        };
-        if gone {
+        if let Some(_held) = try_lock(&entry.path()) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -486,6 +485,8 @@ fn sweep_stale_plans(cache: &Path) {
 struct Stubs {
     dir: PathBuf,
     header: Vec<u8>,
+    /// Holds the planning lock on `dir` until the stubs are dropped.
+    _lock: std::fs::File,
 }
 
 impl Stubs {
@@ -494,9 +495,16 @@ impl Stubs {
         let dir = cache.join(format!(".fifi-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .map_err(|error| StartupError(format!("cannot plan in {}: {error}", dir.display())))?;
+        let lock = try_lock(&dir).ok_or_else(|| {
+            StartupError(format!(
+                "cannot lock the planning directory {}",
+                dir.display()
+            ))
+        })?;
         Ok(Self {
             dir,
             header: header.to_vec(),
+            _lock: lock,
         })
     }
 
@@ -684,18 +692,22 @@ mod tests {
     }
 
     #[test]
-    fn stubs_of_a_process_that_is_gone_are_swept_and_a_live_one_is_not() {
+    fn only_the_stubs_nobody_holds_are_swept() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let dead = dir.path().join(".fifi-plan-4194999");
-        let live = dir
-            .path()
-            .join(format!(".fifi-plan-{}", std::process::id()));
+        let free = dir.path().join(".fifi-plan-4194999");
+        let held = dir.path().join(".fifi-plan-4194998");
+        let not_a_pid = dir.path().join(".fifi-plan-abc");
         let other = dir.path().join("models--a--b");
-        for path in [&dead, &live, &other] {
+        for path in [&free, &held, &not_a_pid, &other] {
             std::fs::create_dir_all(path.join("x")).expect("dirs");
         }
-        let _stubs = Stubs::new(dir.path(), b"GGUF").expect("stubs");
-        assert!(!dead.exists());
-        assert!(live.exists() && other.exists());
+        // Another process (here, another open file description) is planning in `held`.
+        let _holder = try_lock(&held).expect("lock");
+        let own = Stubs::new(dir.path(), b"GGUF").expect("stubs");
+        assert!(!free.exists());
+        assert!(held.exists() && not_a_pid.exists() && other.exists());
+        assert!(own.dir.exists());
+        // A second planner cannot take a held directory's lock.
+        assert!(try_lock(&held).is_none());
     }
 }

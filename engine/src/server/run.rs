@@ -73,22 +73,6 @@ fn purge_kv_caches(_config: &Config) -> Result<(), StartupError> {
     Ok(())
 }
 
-/// The kept loopback key, with the line that tells the user where it is and how to send it.
-fn generated_key(variable: &str) -> Result<String, StartupError> {
-    let path = super::loopback_key::key_path().ok_or_else(|| {
-        StartupError(format!(
-            "no home directory to keep a generated API key in; set {variable} to name one"
-        ))
-    })?;
-    let (key, created) = super::loopback_key::load_or_create(&path)?;
-    eprintln!(
-        "api key: {variable} is not set; using the key {} {} (send it as `Authorization: Bearer <key>`): {key}",
-        if created { "generated into" } else { "kept in" },
-        path.display()
-    );
-    Ok(key)
-}
-
 /// `args` are the command-line arguments after the program name.
 /// The call returns after a shutdown signal, the end of the running requests
 /// and the end of the supervised workers.
@@ -135,13 +119,19 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     } else {
         Config::from_file(&config_path(args)?)?
     };
-    let address = config.listen_address()?;
-    let key = match config.api_key(|name| std::env::var(name).ok()) {
-        Ok(key) => key,
-        // A simplified start on loopback with no key set uses the key it keeps for the user.
-        Err(_) if simplified && address.ip().is_loopback() => generated_key(&config.api_key_env)?,
-        Err(error) => return Err(error),
-    };
+    let (address, key) = super::loopback_key::listen_and_key(
+        &config,
+        simplified,
+        &super::loopback_key::Host {
+            env: &|name| std::env::var(name).ok(),
+            key_file: super::loopback_key::key_path(
+                std::env::var_os("XDG_CONFIG_HOME"),
+                std::env::var_os("HOME"),
+            ),
+            terminal: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        },
+        &mut |line| eprintln!("{line}"),
+    )?;
     if purge_kv_cache {
         purge_kv_caches(&config)?;
     }

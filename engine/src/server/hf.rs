@@ -1610,6 +1610,12 @@ fn ref_list(refs_dir: &Path) -> Vec<serde_json::Value> {
 }
 
 /// True when every link under `dir` resolves to a file.
+/// Whether a snapshot of a repo is whole: no marker of a fill in progress, and every link in it
+/// reaches a blob.
+pub(crate) fn snapshot_complete(repo_dir: &Path, commit: &str, snapshot: &Path) -> bool {
+    !incomplete_marker(repo_dir, commit).exists() && links_resolve(snapshot)
+}
+
 fn links_resolve(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -1652,7 +1658,7 @@ fn snapshot_list(repo_dir: &Path, supervised: bool) -> Vec<serde_json::Value> {
             let commit = entry.file_name().into_string().ok()?;
             let path = entry.path();
             let gguf = gguf_files(&path);
-            let complete = !incomplete_marker(repo_dir, &commit).exists() && links_resolve(&path);
+            let complete = snapshot_complete(repo_dir, &commit, &path);
             let family = if complete {
                 super::model_serve::servable_family(&path).ok()
             } else {

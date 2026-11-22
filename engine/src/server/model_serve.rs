@@ -222,9 +222,8 @@ fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupErr
         return resolve_default_model(
             args,
             &super::local_models::Stores::from_env(),
-            &mut |line| {
-                eprintln!("{line}");
-            },
+            &|candidate| vet(candidate).map(|_| ()),
+            &mut |line| eprintln!("{line}"),
         );
     }
     let text = args.model_dir.to_string_lossy();
@@ -275,6 +274,7 @@ fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupErr
 fn resolve_default_model(
     args: &ModelServeArgs,
     stores: &super::local_models::Stores,
+    can_start: &dyn Fn(&ModelServeArgs) -> Result<(), StartupError>,
     say: &mut dyn FnMut(&str),
 ) -> Result<ModelServeArgs, StartupError> {
     let local = super::local_models::all(stores);
@@ -282,13 +282,21 @@ fn resolve_default_model(
     for model in &local {
         let mut resolved = args.clone();
         resolved.model_dir = model.path.clone();
-        match discover(&resolved) {
-            Ok(_) => {
+        match can_start(&resolved) {
+            Ok(()) => {
                 for line in &skipped {
                     say(line);
                 }
+                let passed_over = if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", after passing over {} newer that could not start",
+                        skipped.len()
+                    )
+                };
                 say(&format!(
-                    "model: no --model given; serving {} from {} (the newest of {} local); name another with --model <name>",
+                    "model: no --model given; serving {} from {} (the newest of {} local{passed_over}); name another with --model <name>",
                     model.name,
                     model.store,
                     local.len()
@@ -361,20 +369,18 @@ fn planned_fit(stub: &Path, facts: &HardwareFacts) -> Result<super::fetch_name::
     })
 }
 
-/// Discover the model, run the non-probing preflight, and build the
-/// in-memory `Config` for the existing serve path. Prints the chosen
-/// configuration and any qualification acknowledgement before the
-/// engines start.
-pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
-    // An `org/repo` id names a hub-cache download (the GUI's model
-    // page, or `hf download`); a literal existing path always wins.
-    let args = resolve_model_dir(args)?;
-    let discovered = discover(&args)?;
+/// A model that a family serves and the preflight passes, before anything is printed.
+struct Vetted {
+    args: ModelServeArgs,
+    discovered: Discovered,
+    report: preflight::PreflightReport,
+}
 
-    // The preflight of a serving process: every check that needs no
-    // device. CUDA facts stay deliberately unavailable (the module
-    // docs); host facts are a /proc read the system endpoint already
-    // does per request.
+/// Discovery and the preflight of a serving process: every check that needs no device. CUDA
+/// facts stay deliberately unavailable (the module docs); host facts are a /proc read the
+/// system endpoint already does per request. An unsupported verdict is the error.
+fn vet(args: &ModelServeArgs) -> Result<Vetted, StartupError> {
+    let discovered = discover(args)?;
     let facts = HardwareFacts {
         backends: CompiledBackends::of_this_build(),
         cuda: no_cuda_facts(),
@@ -393,15 +399,35 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         &facts,
     )
     .map_err(|error| StartupError(describe_error(&error)))?;
+    if report.verdict == preflight::Verdict::Unsupported {
+        return Err(StartupError(format!(
+            "serve --model: this build cannot serve {}:\n{}next: {}",
+            args.model_dir.display(),
+            failed_checks(&report),
+            report.next_step
+        )));
+    }
+    Ok(Vetted {
+        args: args.clone(),
+        discovered,
+        report,
+    })
+}
+
+/// Discover the model, run the non-probing preflight, and build the
+/// in-memory `Config` for the existing serve path. Prints the chosen
+/// configuration and any qualification acknowledgement before the
+/// engines start.
+pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
+    // An `org/repo` id names a hub-cache download (the GUI's model
+    // page, or `hf download`); a literal existing path always wins.
+    let args = resolve_model_dir(args)?;
+    let Vetted {
+        args,
+        discovered,
+        report,
+    } = vet(&args)?;
     match report.verdict {
-        preflight::Verdict::Unsupported => {
-            return Err(StartupError(format!(
-                "serve --model: this build cannot serve {}:\n{}next: {}",
-                args.model_dir.display(),
-                failed_checks(&report),
-                report.next_step
-            )));
-        }
         preflight::Verdict::Experimental => {
             eprintln!(
                 "qualification: EXPERIMENTAL — the quality gates for this configuration have not passed; serving it because serve --model prints this acknowledgement"
@@ -1514,6 +1540,7 @@ mod tests {
         let chosen = super::resolve_default_model(
             &ModelServeArgs::default(),
             &stores_in(root.path()),
+            &|candidate| discover(candidate).map(|_| ()),
             &mut |line| said.push(line.to_string()),
         )
         .expect("chosen");
@@ -1524,7 +1551,9 @@ mod tests {
         );
         let last = said.last().expect("a line");
         assert!(
-            last.contains("serving new ") && last.contains("--model <name>"),
+            last.contains("serving new ")
+                && last.contains("passing over 1 newer")
+                && last.contains("--model <name>"),
             "{last}"
         );
     }
@@ -1535,6 +1564,7 @@ mod tests {
         let error = super::resolve_default_model(
             &ModelServeArgs::default(),
             &stores_in(root.path()),
+            &|_| Ok(()),
             &mut |_| {},
         )
         .unwrap_err()
