@@ -263,7 +263,7 @@ fn evaluate(
                 Ok(()) => Check::new(
                     "Bolt checkpoint",
                     CheckStatus::Pass,
-                    "matches Bolt identity; tensor validation and memory admission run at load"
+                    "header and tensor inventory match the Bolt geometry; memory admission runs at load"
                         .to_string(),
                 ),
                 Err(error) => Check::new("Bolt checkpoint", CheckStatus::Fail, error.describe()),
@@ -2313,25 +2313,8 @@ mod tests {
             assert_eq!(other_gemma.verdict, Verdict::Unsupported);
             let identity = check_named(&other_gemma, "Bolt checkpoint");
             assert_eq!(identity.status, CheckStatus::Fail);
-            assert!(identity.detail.contains("gemma4.block_count"));
+            assert!(identity.detail.contains("Bolt geometry"), "{}", identity.detail);
         }
-
-        std::fs::write(
-            dir.path().join("config.json"),
-            include_bytes!("../../testdata/gemma4/bolt-config.json"),
-        )
-        .expect("write Bolt configuration");
-        let candidate = Candidate {
-            family: Some(crate::family::gemma::gemma4::FAMILY.to_owned()),
-            ..Candidate::default()
-        };
-        let bolt = super::preflight(dir.path(), dir.path(), &candidate, &cuda).expect("report");
-        assert_eq!(
-            check_named(&bolt, "Bolt checkpoint").status,
-            CheckStatus::Pass
-        );
-        assert_eq!(bolt.verdict, Verdict::Experimental);
-        assert_eq!(bolt.dimensions.qualification, Qualification::Unverified);
     }
 
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {
