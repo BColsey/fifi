@@ -415,6 +415,39 @@ fn expert_reader_uses_each_layers_mixed_quantization_and_role() {
 }
 
 #[test]
+fn stored_expert_layout_matches_per_layer_and_global_file_sizes() {
+    use super::expert_layout::ExpertLayout;
+    let (_written, model) = open(&Spec::default());
+    let mut sum = 0u64;
+    let mut max = 0u64;
+    let mut sizes = std::collections::BTreeSet::new();
+    for layer in 0..model.config().layers() {
+        let layout = ExpertLayout::for_layer(&model, layer).unwrap();
+        let mut offset = 0;
+        for part in &layout.parts {
+            let tensor = model.map().get(part.role, Some(layer)).unwrap();
+            assert_eq!(part.ty, tensor.ty);
+            assert_eq!(part.bytes.start, offset);
+            assert_eq!(part.bytes.len() as u64 * tensor.dims[2], tensor.bytes);
+            offset = part.bytes.end;
+        }
+        assert_eq!(offset, layout.bytes);
+        let experts = model.config().dims.experts as u64;
+        sum += layout.bytes as u64 * experts;
+        max = max.max(layout.bytes as u64);
+        sizes.insert(layout.bytes);
+    }
+    assert!(
+        sizes.len() > 1,
+        "fixture should exercise mixed layer record sizes"
+    );
+    let planned = model.sizes().unwrap();
+    assert_eq!(sum, planned.expert_bytes);
+    assert_eq!(max, planned.record_bytes_max);
+    assert!(ExpertLayout::for_layer(&model, model.config().layers()).is_err());
+}
+
+#[test]
 fn expert_row_spans_check_bounds_alignment_and_overflow() {
     let (_written, model) = open(&Spec::default());
     let mut stack = model

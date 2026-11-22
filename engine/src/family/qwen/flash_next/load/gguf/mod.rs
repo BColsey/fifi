@@ -25,6 +25,7 @@
 pub(super) mod config;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod cuda_probe;
+mod expert_layout;
 #[cfg(test)]
 mod host;
 pub(super) mod ngram;
