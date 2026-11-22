@@ -27,6 +27,8 @@ use crate::{
 use super::DEVICE_HEADROOM;
 use super::{super::state_headroom, bad};
 
+pub(in crate::family::inkling2) mod prefill;
+
 #[derive(Clone, Copy)]
 pub(in crate::family::inkling2) struct Config {
     pub context: usize,
@@ -80,6 +82,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     reserve_credit: u64,
     stream: DeviceStream,
     state: RefCell<Runtime>,
+    prefill: RefCell<Option<prefill::Workspace>>,
 }
 
 struct Runtime {
@@ -227,6 +230,7 @@ impl Plan {
             projection_headroom,
             reserve_credit: credit,
             stream,
+            prefill: RefCell::default(),
             state: RefCell::new(Runtime {
                 transfer,
                 encoded: Vec::with_capacity(self.scratch_bytes),
@@ -437,6 +441,18 @@ impl Row<'_> {
         position: i32,
         bytes: &mut Vec<u8>,
     ) -> Result<[usize; 8], EngError> {
+        bytes.clear();
+        let offsets = self.append_inputs(shape, position, bytes)?;
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        Ok(offsets)
+    }
+
+    fn append_inputs(
+        &self,
+        shape: RelativeAttentionShape,
+        position: i32,
+        bytes: &mut Vec<u8>,
+    ) -> Result<[usize; 8], EngError> {
         let slices = [
             self.query,
             self.key,
@@ -458,7 +474,6 @@ impl Row<'_> {
         if slices.each_ref().map(|slice| slice.len()) != sizes {
             return Err(bad("incorrect CUDA relative attention input shape"));
         }
-        bytes.clear();
         let mut offsets = [0; 8];
         for (offset, slice) in offsets.iter_mut().zip(slices) {
             *offset = bytes.len();
@@ -467,7 +482,6 @@ impl Row<'_> {
         offsets[6] = bytes.len();
         bytes.extend_from_slice(&position.to_ne_bytes());
         offsets[7] = bytes.len();
-        bytes.extend_from_slice(&0_u32.to_ne_bytes());
         Ok(offsets)
     }
 }
@@ -607,6 +621,45 @@ mod tests {
         run(4, 100.0, &[6.0, 2.0, 40.0], true).unwrap();
         run(5, 200.0, &[100.0, 6.0, 2.0], false).unwrap();
         assert_eq!(run(4, 8.0, &[6.0, 2.0, 40.0], true).unwrap(), [4.0, -2.0]);
+        let base = [6.0, 2.0, 40.0];
+        let mut expected = Vec::new();
+        let mut serial_history = base.to_vec();
+        for (position, value) in (4..).zip([8.0, 9.0, 10.0, 11.0]) {
+            expected.push(run(position, value, &serial_history, true).unwrap());
+            serial_history.insert(0, value);
+            serial_history.truncate(3);
+        }
+        *attention.prefill.borrow_mut() = prefill::Workspace::allocate(&ctx).unwrap();
+        let values = [8.0, 9.0, 10.0, 11.0].map(|value| [value; HEAD_DIM]);
+        let rows = values.each_ref().map(|value| Row {
+            query: &zero,
+            key: &zero,
+            value,
+            relative: &[0.0],
+            sinks: &[0.0],
+            gates: &zero,
+        });
+        let keys = base.iter().map(|_| Arc::new(zero.to_vec())).collect();
+        let values = base.iter().map(|&v| Arc::new(vec![v; HEAD_DIM])).collect();
+        let projection = OutputProjection {
+            weight: weight.range(0, weight.bytes()).unwrap(),
+            dtype: DenseDtype::F32,
+            rows: 2,
+        };
+        let actual = attention
+            .step_prefill(
+                &ctx,
+                0,
+                &rows,
+                History {
+                    position: 4,
+                    keys: &keys,
+                    values: &values,
+                },
+                Some(&projection),
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
         assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
         assert_eq!(
             run(POS_MAX as usize + 1, 1.0, &[], true),

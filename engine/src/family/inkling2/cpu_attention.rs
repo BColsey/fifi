@@ -111,7 +111,62 @@ impl Heads {
     }
 }
 
+struct PreparedAttention {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    relative: Vec<f32>,
+    sinks: Vec<f32>,
+    gates: Vec<f32>,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl PreparedAttention {
+    fn device_row(&self) -> attention::Row<'_> {
+        attention::Row {
+            query: &self.q,
+            key: &self.k,
+            value: &self.v,
+            relative: &self.relative,
+            sinks: &self.sinks,
+            gates: &self.gates,
+        }
+    }
+}
+
 impl CpuForward {
+    fn prepare_attention(
+        &self,
+        attn: &str,
+        heads: Heads,
+        state: &mut VisitState,
+        projected: AttentionProjection,
+    ) -> Result<PreparedAttention, EngError> {
+        let [mut q, k, v, mut relative, sinks, gates, k_taps, v_taps] = projected;
+        self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
+        clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
+        let mut k = self.attention_plane(attn, "k", [k, k_taps], heads, &mut state.conv.k)?;
+        let mut v = self.attention_plane(attn, "v", [v, v_taps], heads, &mut state.conv.v)?;
+        clip_rows(&mut k, heads.width, self.math.qk_l2_clip_threshold);
+        for head in v.chunks_exact_mut(heads.width) {
+            rms_norm(head, self.math.rms_norm_eps);
+        }
+        self.scale_channels(&mut relative, &format!("{attn}.rel_l2_clip.scale"))?;
+        clip_rows(
+            &mut relative,
+            self.math.d_rel,
+            self.math.rel_l2_clip_threshold,
+        );
+        Ok(PreparedAttention {
+            q,
+            k,
+            v,
+            relative,
+            sinks,
+            gates,
+        })
+    }
+
     pub(super) fn attention(
         &self,
         layer: &str,
@@ -121,43 +176,20 @@ impl CpuForward {
     ) -> Result<Vec<f32>, EngError> {
         let heads = self.heads(visit.attention);
         let attn = format!("{layer}.attn");
-        let [mut q, k, v, mut relative, sinks, gates, k_taps, v_taps] = projected;
-        self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
-        clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
-
-        let mut k = self.attention_plane(&attn, "k", [k, k_taps], heads, &mut state.conv.k)?;
-        let mut v = self.attention_plane(&attn, "v", [v, v_taps], heads, &mut state.conv.v)?;
-        clip_rows(&mut k, heads.width, self.math.qk_l2_clip_threshold);
-        for head in v.chunks_exact_mut(heads.width) {
-            rms_norm(head, self.math.rms_norm_eps);
-        }
-
-        self.scale_channels(&mut relative, &format!("{attn}.rel_l2_clip.scale"))?;
-        clip_rows(
-            &mut relative,
-            self.math.d_rel,
-            self.math.rel_l2_clip_threshold,
-        );
+        let prepared = self.prepare_attention(&attn, heads, state, projected)?;
         let output_name = format!("{attn}.wo_ud.weight");
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         let device_output = if let Weights::Gguf(weights) = &self.weights
             && let Some((context, attention)) = weights.resident_attention()
         {
             let _span = self.phase_span(Work::DeviceAttention);
-            let projection =
-                weights.relative_attention_projection(&output_name, [self.hidden(), q.len()])?;
+            let projection = weights
+                .relative_attention_projection(&output_name, [self.hidden(), prepared.q.len()])?;
             let projected = projection.is_some();
             let output = attention.step(
                 context,
                 visit.state_slot,
-                attention::Row {
-                    query: &q,
-                    key: &k,
-                    value: &v,
-                    relative: &relative,
-                    sinks: &sinks,
-                    gates: &gates,
-                },
+                prepared.device_row(),
                 attention::History {
                     position: state.position,
                     keys: &state.keys,
@@ -171,6 +203,14 @@ impl CpuForward {
         };
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
         let device_output = None;
+        let PreparedAttention {
+            q,
+            k,
+            v,
+            relative,
+            sinks,
+            gates,
+        } = prepared;
         state.push(k, v, self.kv_capacity(visit.attention));
 
         let (out, projected_output) = if let Some(out) = device_output {
@@ -187,17 +227,91 @@ impl CpuForward {
             }
             (out, false)
         };
+        self.finish_attention(layer, state, &output_name, out, projected_output)
+    }
+
+    fn finish_attention(
+        &self,
+        layer: &str,
+        state: &mut VisitState,
+        output_name: &str,
+        out: Vec<f32>,
+        projected_output: bool,
+    ) -> Result<Vec<f32>, EngError> {
         let raw = if projected_output {
             out
         } else {
             let _span = self.phase_span(Work::Projection);
-            self.weights.project(&output_name, &out, self.hidden())?
+            self.weights.project(output_name, &out, self.hidden())?
         };
         self.output_conv(
             raw,
             &format!("{layer}.attn_sconv.weight"),
             &mut state.conv.attn,
         )
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn attention_prefill_batch(
+        &self,
+        layer: &str,
+        visit: LayerVisit,
+        state: &mut VisitState,
+        projections: Vec<AttentionProjection>,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let Weights::Gguf(weights) = &self.weights else {
+            return Err(super::bad("Inkling attention batch requires GGUF"));
+        };
+        let (context, device) = weights
+            .resident_attention()
+            .ok_or_else(|| super::bad("Inkling attention batch requires resident state"))?;
+        let heads = self.heads(visit.attention);
+        let prefix = format!("{layer}.attn");
+        let output_name = format!("{prefix}.wo_ud.weight");
+        let projection = weights
+            .relative_attention_projection(&output_name, [self.hidden(), heads.q_channels()])?;
+        let capacity = device.prefill_capacity(context, visit.state_slot, projection.as_ref())?;
+        if capacity < 2 {
+            return projections
+                .into_iter()
+                .map(|p| self.attention(layer, visit, state, p))
+                .collect();
+        }
+        let mut outputs = Vec::with_capacity(projections.len());
+        let mut projections = projections.into_iter();
+        while projections.len() != 0 {
+            let tile = projections
+                .by_ref()
+                .take(capacity)
+                .map(|p| self.prepare_attention(&prefix, heads, state, p))
+                .collect::<Result<Vec<_>, _>>()?;
+            let rows: Vec<_> = tile.iter().map(PreparedAttention::device_row).collect();
+            let values = {
+                let _span = self.phase_span(Work::DeviceAttention);
+                device.step_prefill(
+                    context,
+                    visit.state_slot,
+                    &rows,
+                    attention::History {
+                        position: state.position,
+                        keys: &state.keys,
+                        values: &state.values,
+                    },
+                    projection.as_ref(),
+                )?
+            };
+            for (prepared, out) in tile.into_iter().zip(values) {
+                state.push(prepared.k, prepared.v, self.kv_capacity(visit.attention));
+                outputs.push(self.finish_attention(
+                    layer,
+                    state,
+                    &output_name,
+                    out,
+                    projection.is_some(),
+                )?);
+            }
+        }
+        Ok(outputs)
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

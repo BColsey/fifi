@@ -546,13 +546,23 @@ impl CpuForward {
             },
         };
         let attn = self.attention(layer, visit, state, projected)?;
+        Ok(self.mlp_residual_after_attention(physical, stream, &query, attn))
+    }
+
+    fn mlp_residual_after_attention(
+        &self,
+        physical: usize,
+        stream: &mut Stream,
+        query: &[f32],
+        attn: Vec<f32>,
+    ) -> Vec<f32> {
         if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
             stream.seal(attn);
         } else {
             stream.add_current(&attn);
         }
 
-        Ok(stream.mix(0, &query))
+        stream.mix(0, query)
     }
 
     fn finish_mlp_input(

@@ -381,16 +381,21 @@ impl TextSettings {
                         }
                     }
                     if requested_rows > 1 {
-                        // The pinned expert prefill arena may outlive prefill.
+                        // Pinned and encoded attention staging can outlive prefill.
+                        let fixed =
+                            super::cuda_projection::gguf::attention::prefill::host_reserve();
+                        let base = plan.host_reserve.saturating_add(fixed);
                         let (prefill_rows, host_reserve) = fit_prefill(
                             requested_rows,
                             forward.context,
-                            plan.host_reserve,
+                            base,
                             forward.prefill_workspace_bytes_per_row()?,
                             capacity,
                         );
-                        plan.prefill_rows = prefill_rows;
-                        plan.host_reserve = host_reserve;
+                        if prefill_rows > 1 {
+                            plan.prefill_rows = prefill_rows;
+                            plan.host_reserve = host_reserve;
+                        }
                     }
                     return Ok(plan);
                 }

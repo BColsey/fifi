@@ -145,6 +145,11 @@ impl CpuForward {
             projection_values += 12 * hidden;
             projection_metadata += (8 * size_of::<Vec<f32>>()) as u128;
         }
+        if crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled() {
+            // Finished attention rows coexist until the residual update phase.
+            projection_values += hidden;
+            projection_metadata += size_of::<Vec<f32>>() as u128;
+        }
         // Batched router logits coexist with the selected rows' scores.
         let numeric_bytes =
             (stream_values + projection_values + 2 * experts) * size_of::<f32>() as u128;
@@ -278,10 +283,7 @@ impl CpuForward {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let prefix = format!("{layer}.mlp");
-        let mut projected = self
-            .prompt_attention_inputs(visit, &layer, rows, weights)?
-            .into_iter()
-            .flatten();
+        let mut projected = self.prompt_attention_inputs(visit, &layer, rows, weights)?;
         let router = format!("{prefix}.gate.weight");
         let batch_router = weights.batch_prefill_router(physical as u32, &router);
         // Without the resident batched router, preserve the interleave between
@@ -300,6 +302,28 @@ impl CpuForward {
         } else {
             None
         };
+        let batched = if batch_router
+            && !self.draft_window_enabled()
+            && rows.len() > 1
+            && rows.iter().all(|row| row.journal.is_none())
+            && crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled()
+            && weights.resident_attention().is_some()
+        {
+            projected.take().map_or(Ok(None), |projected| {
+                self.prompt_attention_residuals(
+                    visit,
+                    &layer,
+                    state,
+                    rows,
+                    projected,
+                    controller.is_some(),
+                )
+                .map(Some)
+            })?
+        } else {
+            None
+        };
+        let mut projected = projected.into_iter().flatten();
         let inputs = rows.iter_mut().map(|row| {
             row.taps.capture(visit.state_slot, row.stream.current());
             if let Some(journal) = &mut row.journal {
@@ -321,7 +345,10 @@ impl CpuForward {
             }
         });
         let mlp = if batch_router {
-            let mut inputs = inputs.collect::<Result<Vec<_>, _>>()?;
+            let mut inputs = match batched {
+                Some(inputs) => inputs,
+                None => inputs.collect::<Result<Vec<_>, _>>()?,
+            };
             if let Some(controller) = controller {
                 self.prompt_mlp_control(visit, &layer, rows, &mut inputs, controller)?;
             }
@@ -347,6 +374,38 @@ impl CpuForward {
             self.finish_layer(&layer, state, &mut row.stream, output)?;
         }
         Ok(())
+    }
+
+    fn prompt_attention_residuals(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        state: &mut VisitState,
+        rows: &mut [PromptRow<'_>],
+        projected: Vec<super::super::cpu_attention::AttentionProjection>,
+        control_batched: bool,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let physical = visit.weight_layer;
+        let query = self.weights.vec(
+            &format!("model.llm.attn_res.mlp_queries.{physical}"),
+            self.hidden(),
+        )?;
+        for row in rows.iter_mut() {
+            row.taps.capture(visit.state_slot, row.stream.current());
+        }
+        let outputs = self.attention_prefill_batch(layer, visit, state, projected)?;
+        rows.iter_mut()
+            .zip(outputs)
+            .map(|(row, attn)| {
+                let input =
+                    self.mlp_residual_after_attention(physical, &mut row.stream, &query, attn);
+                if control_batched {
+                    Ok(input)
+                } else {
+                    self.finish_mlp_input(input, row.bank.as_ref(), physical, layer)
+                }
+            })
+            .collect()
     }
 
     fn prompt_mlp_control(
