@@ -5,12 +5,12 @@ const HUMANIZER_CONFIG: &[u8] = include_bytes!("../../../../testdata/gemma4/huma
 const BOLT_CONFIG: &[u8] = include_bytes!("../../../../testdata/gemma4/bolt-config.json");
 
 #[test]
-fn accepts_the_pinned_bolt_configuration() {
+fn accepts_the_bolt_configuration() {
     check_bolt_config(BOLT_CONFIG).unwrap();
 }
 
 #[test]
-fn the_pinned_bolt_configuration_agrees_with_the_family_descriptor() {
+fn the_bolt_configuration_agrees_with_the_family_descriptor() {
     check_bolt_config(BOLT_CONFIG).unwrap();
     let spec = NEMOTRON_BOLT_E4B;
     let root: serde_json::Value = serde_json::from_slice(BOLT_CONFIG).unwrap();
@@ -83,7 +83,7 @@ fn assert_bolt_field(config: &[u8], field: &str) {
 }
 
 #[test]
-fn accepts_the_pinned_humanizer_configuration() {
+fn accepts_the_humanizer_configuration() {
     check_humanizer_config(HUMANIZER_CONFIG).unwrap();
 }
 
@@ -107,7 +107,7 @@ fn assert_checkpoint_field(config: &[u8], field: &str) {
 }
 
 #[test]
-fn checks_the_pinned_architecture_and_both_tied_embedding_flags() {
+fn checks_the_architecture_and_both_tied_embedding_flags() {
     let mut config: serde_json::Value = serde_json::from_slice(HUMANIZER_CONFIG).unwrap();
     config["architectures"][0] = "OtherForConditionalGeneration".into();
     assert_checkpoint_field(&serde_json::to_vec(&config).unwrap(), "architectures");
@@ -504,7 +504,7 @@ fn kv_bool_array(key: &str, values: &[bool]) -> Kv {
     }
 }
 
-/// The scalar metadata of the pinned checkpoint, minus excluded keys.
+/// The scalar metadata of a Humanizer checkpoint, minus excluded keys.
 fn base_kvs(exclude: &[&str]) -> Vec<Kv> {
     let mut heads = Vec::new();
     let mut pattern = Vec::new();
@@ -1416,7 +1416,7 @@ fn a_humanizer_window_of_zero_or_past_the_resident_limit_is_refused() {
         .map(|item| (item.name, item.ty, item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
-    for window in [0u32, 4097] {
+    for window in [0u32, 8193] {
         let path = dir.path().join(format!("humanizer-{window}.gguf"));
         write_bolt_gguf(&humanizer_kvs(window, "w"), &tensors, &path);
         expect_rejection(
@@ -1478,5 +1478,27 @@ fn the_bolt_configuration_takes_its_own_context_and_ids_but_only_the_built_windo
     assert_bolt_field(
         &edit(&|text| text["max_position_embeddings"] = 256.into()),
         "text_config.max_position_embeddings",
+    );
+}
+
+#[test]
+fn a_lone_bolt_gguf_passes_the_dispatch_gate_with_no_side_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bolt_gguf(
+        &bolt_base_kvs(&[]),
+        &bolt_tensors(),
+        &dir.path().join("bolt.gguf"),
+    );
+    super::serve::bolt_geometry(dir.path()).expect("a directory of the one file passes");
+    super::serve::bolt_geometry(&dir.path().join("bolt.gguf")).expect("the file path passes");
+    let other = tempfile::tempdir().expect("tempdir");
+    let kvs: Vec<Kv> = bolt_base_kvs(&["gemma4.block_count"])
+        .into_iter()
+        .chain([kv_u32("gemma4.block_count", 30)])
+        .collect();
+    write_bolt_gguf(&kvs, &bolt_tensors(), &other.path().join("bolt.gguf"));
+    expect_rejection(
+        super::serve::bolt_geometry(other.path()),
+        "gemma4.block_count",
     );
 }

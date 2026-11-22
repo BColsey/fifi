@@ -27,8 +27,8 @@ const BOLT_LIMITS: GgufLimits = GgufLimits {
     // sits just above it (the legacy per-tensor ceiling was ~712 MiB).
     max_tensor_bytes: 3 << 30,
 };
-/// The most the Humanizer's resident ring and attention kernels take as a window.
-const HUMANIZER_MAX_WINDOW: u64 = 4096;
+/// The positions the Humanizer keeps per head; a window is at most that many.
+pub(super) const HUMANIZER_CELLS: u64 = 8192;
 const LAYERS: usize = 48;
 const HIDDEN: u64 = 3840;
 const FEED_FORWARD: u64 = 15360;
@@ -61,7 +61,7 @@ const FLOAT_SCALARS: [(&str, f64); 4] = [
     ("gemma4.attention.layer_norm_rms_epsilon", 1.0e-6),
 ];
 
-/// Opens the pinned Humanizer Q8_0 GGUF and checks its metadata and tensors.
+/// Opens a Humanizer-geometry Q8_0 GGUF and checks its metadata and tensors.
 ///
 /// Opener rejections are EngError::Checkpoint with the prefix gguf model: and
 /// name the offending metadata key or tensor. Failures of GgufWeights::open
@@ -91,7 +91,7 @@ pub(crate) fn open_humanizer_weights(path: &Path) -> Result<HumanizerFile, EngEr
     check_int_scalars(header, &HUMANIZER_INT_SCALARS)?;
     check_float_scalars(header)?;
     check_bool_scalar(header, "tokenizer.ggml.add_bos_token", true)?;
-    let window = read_window(header, HUMANIZER_MAX_WINDOW)?;
+    let window = read_window(header, HUMANIZER_CELLS)?;
     let kv = read_i32_array(
         &weights,
         header,
@@ -114,16 +114,7 @@ pub(crate) fn open_humanizer_weights(path: &Path) -> Result<HumanizerFile, EngEr
 /// The sliding window of the header: present, positive and at most `most`.
 fn read_window(header: &crate::weights::GgufHeader, most: u64) -> Result<usize, EngError> {
     let key = "gemma4.attention.sliding_window";
-    let window = match header.meta(key) {
-        Some(MetaValue::U32(value)) => u64::from(*value),
-        Some(MetaValue::U64(value)) => *value,
-        Some(_) => {
-            return Err(reject(format!(
-                "metadata key {key} is not an unsigned integer"
-            )));
-        }
-        None => return Err(reject(format!("metadata key {key} is missing"))),
-    };
+    let window = uint_meta(header, key)?;
     if window == 0 || window > most {
         return Err(reject(format!(
             "metadata key {key} is {window}, expected 1 to {most}"
@@ -305,16 +296,7 @@ fn check_int_scalars(
     scalars: &[(&str, u64)],
 ) -> Result<(), EngError> {
     for (key, want) in scalars {
-        let found = match header.meta(key) {
-            Some(MetaValue::U32(value)) => u64::from(*value),
-            Some(MetaValue::U64(value)) => *value,
-            Some(_) => {
-                return Err(reject(format!(
-                    "metadata key {key} is not an unsigned integer"
-                )));
-            }
-            None => return Err(reject(format!("metadata key {key} is missing"))),
-        };
+        let found = uint_meta(header, key)?;
         if found != *want {
             return Err(reject(format!(
                 "metadata key {key} is {found}, expected {want}"
@@ -322,6 +304,14 @@ fn check_int_scalars(
         }
     }
     Ok(())
+}
+
+fn uint_meta(header: &crate::weights::GgufHeader, key: &str) -> Result<u64, EngError> {
+    header.meta_u64(key).ok_or_else(|| {
+        reject(format!(
+            "metadata key {key} is missing or not an unsigned integer"
+        ))
+    })
 }
 
 /// Checks each float scalar against the expected value in its stored precision.

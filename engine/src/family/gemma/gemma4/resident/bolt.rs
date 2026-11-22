@@ -484,6 +484,24 @@ fn cell_figures(attn_splits: Option<usize>, wide_prefill: bool) -> Result<CellFi
     .ok_or_else(|| EngError::MemoryPlan("the Bolt cell figures overflow".into()))
 }
 
+/// The positions a weights file's header gives as its context, at most the model maximum. `None`
+/// when the header cannot be read or gives no positive count.
+fn header_context(path: &std::path::Path) -> Option<usize> {
+    use crate::weights::MetaValue;
+    let header = crate::weights::shared_header(path, 256 << 20).ok()?;
+    let value = match header.meta("gemma4.context_length")? {
+        MetaValue::U32(value) => u64::from(*value),
+        MetaValue::U64(value) => *value,
+        MetaValue::I32(value) => u64::try_from(*value).ok()?,
+        MetaValue::I64(value) => u64::try_from(*value).ok()?,
+        _ => return None,
+    };
+    usize::try_from(value)
+        .ok()
+        .filter(|&value| value > 0)
+        .map(|value| value.min(MAX_CELLS))
+}
+
 /// The sessions a start plans its cells for: the count the config names, else the most the
 /// planner would ever fund (one when the decode graph is asked for, which serves one session).
 fn planned_sessions(seqs: super::super::config::MaxSeqs) -> Result<usize, EngError> {
@@ -533,12 +551,18 @@ pub(crate) fn load_choosing(
     let wide_load = WideLoad::read(&ctx, "gemma4 bolt", wide_geometry(MAX_CELLS))?;
     let wide = wide_load.passed();
     // The cells a card serves for a file, and the demand of that load.
-    let plan = |bytes: u64| -> Result<(usize, crate::kernels::cuda::plan::Demand), EngError> {
-        let cells = cell_figures(split, wide)?.serve(free, bytes, sessions);
-        Ok((cells, bolt_demand(bytes, split, cells, wide)?))
+    // A file serves no more cells than its header gives as its context.
+    let plan = |file: &crate::family::gguf_select::GgufFile| -> Result<
+        (usize, crate::kernels::cuda::plan::Demand),
+        EngError,
+    > {
+        let cells = cell_figures(split, wide)?
+            .serve(free, file.bytes, sessions)
+            .min(header_context(&file.path).unwrap_or(MAX_CELLS));
+        Ok((cells, bolt_demand(file.bytes, split, cells, wide)?))
     };
     let choice = crate::family::gguf_select::choose(files, &|file| {
-        plan(file.bytes)
+        plan(file)
             .and_then(|(_, demand)| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
             .map_err(|error| error.describe())
@@ -553,7 +577,13 @@ pub(crate) fn load_choosing(
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
     )
     .to_string();
-    let (cells, demand) = plan(choice.chosen.bytes)?;
+    if header_context(&choice.chosen.path).is_none() {
+        eprintln!(
+            "bolt cuda: {} states no context length; serving up to the model maximum of {MAX_CELLS} cells",
+            choice.chosen.path.display()
+        );
+    }
+    let (cells, demand) = plan(&choice.chosen)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     planned(cells);
     eprintln!(
@@ -2209,6 +2239,41 @@ impl Bolt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_serves_no_more_cells_than_its_header_gives_as_context() {
+        use crate::tokenizer::gguf::tests::{gguf_file, kv_u32_for_tests};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = |name: &str, kvs: Vec<Vec<u8>>| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, gguf_file(&kvs)).expect("write");
+            header_context(&path)
+        };
+        assert_eq!(
+            at(
+                "short.gguf",
+                vec![kv_u32_for_tests("gemma4.context_length", 4096)]
+            ),
+            Some(4096)
+        );
+        assert_eq!(
+            at(
+                "long.gguf",
+                vec![kv_u32_for_tests("gemma4.context_length", 1 << 20)]
+            ),
+            Some(MAX_CELLS),
+            "never past the model maximum"
+        );
+        assert_eq!(
+            at(
+                "zero.gguf",
+                vec![kv_u32_for_tests("gemma4.context_length", 0)]
+            ),
+            None
+        );
+        assert_eq!(at("none.gguf", vec![]), None);
+        assert_eq!(header_context(&dir.path().join("missing.gguf")), None);
+    }
+
     use super::*;
 
     fn plan_cells(

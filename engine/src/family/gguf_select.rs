@@ -139,43 +139,6 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
     Ok((model.to_path_buf(), files))
 }
 
-/// Whether the weights file of `model` (the first of its candidates) states `architecture` and
-/// every integer key of `keys` with the given value, and `softcap` as a float: the identity a
-/// directory with no `config.json` is checked by. The error names the key that differs.
-#[cfg(any(feature = "native-cuda", test))]
-pub(crate) fn check_header_identity(
-    model: &Path,
-    architecture: &str,
-    keys: &[(&str, u32)],
-    softcap: Option<(&str, f32)>,
-) -> Result<(), EngError> {
-    use crate::weights::{MetaValue, shared_header};
-    let (_, files) = candidates(model)?;
-    let header = shared_header(&files[0].path, 256 << 20)?;
-    let bad =
-        |message: String| EngError::Checkpoint(format!("{}: {message}", files[0].path.display()));
-    match header.meta("general.architecture") {
-        Some(MetaValue::String(name)) if name == architecture => {}
-        _ => return Err(bad(format!("general.architecture is not {architecture}"))),
-    }
-    for (key, expected) in keys {
-        match header.meta(key) {
-            Some(MetaValue::U32(found)) if found == expected => {}
-            Some(MetaValue::U32(found)) => {
-                return Err(bad(format!("{key} is {found}, expected {expected}")));
-            }
-            _ => return Err(bad(format!("{key} is missing or not an integer"))),
-        }
-    }
-    if let Some((key, expected)) = softcap {
-        match header.meta(key) {
-            Some(MetaValue::F32(found)) if (*found - expected).abs() < 1e-6 => {}
-            _ => return Err(bad(format!("{key} is not {expected}"))),
-        }
-    }
-    Ok(())
-}
-
 /// The chosen file and the log line that names it and the other candidates.
 #[derive(Debug)]
 pub(crate) struct Choice {
@@ -384,33 +347,5 @@ mod tests {
             "{}",
             error.describe()
         );
-    }
-
-    #[test]
-    fn a_header_that_states_the_identity_passes_and_a_changed_key_is_named() {
-        use crate::tokenizer::gguf::tests::{
-            gguf_file, kv_f32_for_tests, kv_string_for_tests, kv_u32_for_tests,
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let keys = crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_KEYS;
-        let soft = crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_SOFTCAP;
-        let mut kvs = vec![kv_string_for_tests("general.architecture", "gemma4")];
-        kvs.extend(
-            keys.iter()
-                .map(|(key, value)| kv_u32_for_tests(key, *value)),
-        );
-        kvs.push(kv_f32_for_tests(soft.0, soft.1));
-        std::fs::write(dir.path().join("bolt.gguf"), gguf_file(&kvs)).expect("write");
-        super::check_header_identity(dir.path(), "gemma4", keys, Some(soft)).expect("identity");
-        kvs[1] = kv_u32_for_tests(keys[0].0, 30);
-        std::fs::write(dir.path().join("bolt.gguf"), gguf_file(&kvs)).expect("write");
-        let error = super::check_header_identity(dir.path(), "gemma4", keys, Some(soft))
-            .expect_err("another depth")
-            .describe();
-        assert!(error.contains("gemma4.block_count is 30"), "{error}");
-        let error = super::check_header_identity(dir.path(), "other", keys, Some(soft))
-            .expect_err("another architecture")
-            .describe();
-        assert!(error.contains("general.architecture"), "{error}");
     }
 }

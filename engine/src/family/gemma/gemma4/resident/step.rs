@@ -641,9 +641,9 @@ mod tests {
 
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.
     #[test]
-    #[ignore = "requires the pinned Humanizer file and Xavier; use --release --test-threads=1"]
+    #[ignore = "requires a Humanizer Q8_0 file and Xavier; use --release --test-threads=1"]
     fn batched_prefill_matches_single_steps() {
-        let path = std::env::var("GEMMA4_Q8_FILE").expect("pinned model path");
+        let path = std::env::var("GEMMA4_Q8_FILE").expect("model path");
         let mut model = super::super::load(std::path::Path::new(&path)).expect("load");
         assert!(matches!(
             model.prefill_batch(&[], 0, false),

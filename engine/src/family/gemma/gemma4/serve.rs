@@ -11,19 +11,18 @@
 //! the pending token's decode runs the head.
 
 #[cfg(any(feature = "native-cuda", test))]
-use std::{fs, path::Path};
+use std::path::Path;
 
 #[cfg(any(feature = "native-cuda", test))]
-use {super::config, crate::EngError};
+use crate::EngError;
 
-/// Reads and validates the model directory's `config.json` against the Bolt
-/// descriptor; the server starter uses this to dispatch inside the gemma4
-/// family. A directory that is not a Bolt checkpoint fails the check.
+/// Whether the weights file a model path names has the geometry the Bolt engine runs. The file's
+/// own header says so: no `config.json` or tokenizer file has to sit beside it. The server starter
+/// uses this to dispatch inside the gemma4 family.
 #[cfg(any(feature = "native-cuda", test))]
-pub(crate) fn bolt_configured(model_dir: &Path) -> Result<(), EngError> {
-    let json = fs::read(model_dir.join("config.json"))
-        .map_err(|error| EngError::Checkpoint(format!("gemma4 config.json: {error}")))?;
-    config::check_bolt_config(&json)
+pub(crate) fn bolt_geometry(model_path: &Path) -> Result<(), EngError> {
+    let (_, files) = crate::family::gguf_select::candidates(model_path)?;
+    super::open_bolt_q8(&files[0].path)
 }
 
 #[cfg(feature = "native-cuda")]
@@ -33,10 +32,7 @@ fn bad(message: &str) -> EngError {
 
 #[cfg(test)]
 mod tests {
-    use super::bolt_configured;
     use crate::family::gguf_select::candidates;
-
-    const BOLT_CONFIG: &[u8] = include_bytes!("../../../../testdata/gemma4/bolt-config.json");
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("gemma4-serve-{tag}-{}", std::process::id()));
@@ -55,42 +51,6 @@ mod tests {
         let (_, files) = candidates(&dir).expect("two");
         assert_eq!(files[0].path, dir.join("other.gguf"));
         assert_eq!(files[1].path, dir.join("bolt.gguf"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_config_gate_reads_the_directory_of_a_gguf_file_path() {
-        let dir = scratch("file-path");
-        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write config");
-        std::fs::write(dir.join("bolt-q4.gguf"), b"weights").expect("write weights");
-        std::fs::write(dir.join("bolt-q8.gguf"), b"weights-bigger").expect("write weights");
-        let (found, files) = candidates(&dir.join("bolt-q4.gguf")).expect("file path");
-        assert_eq!(found, dir);
-        assert_eq!(files.len(), 1);
-        bolt_configured(&found).expect("the Bolt config gate passes beside the file");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bolt_configured_reads_the_pinned_config_shape() {
-        let dir = scratch("config");
-        assert!(bolt_configured(&dir).is_err());
-        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write");
-        assert!(bolt_configured(&dir).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_bolt_directory_passes_the_config_gate_and_finds_its_gguf() {
-        // Checks the two helpers start_gemma4 dispatches on: bolt_configured
-        // accepts the pinned Bolt config, and the candidates are the single weights
-        // file. The server's engine start itself needs a device and is not run here.
-        let dir = scratch("dispatch");
-        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write config");
-        std::fs::write(dir.join("bolt-e4b-q8_0.gguf"), b"weights").expect("write weights");
-        bolt_configured(&dir).expect("the Bolt config gate passes");
-        let (_, files) = candidates(&dir).expect("the weights file is found");
-        assert_eq!(files[0].path, dir.join("bolt-e4b-q8_0.gguf"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -621,6 +581,7 @@ mod device {
         let tier_plan = kv_cache::plan_tier(kv_cache.as_ref(), "gemma4", TIER_LABEL)?;
         let (_, files) = crate::family::gguf_select::candidates(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
+        let text_identity = *bundle.identity();
         let eos = bundle.eos_token_ids().to_vec();
         if eos.is_empty() || eos.iter().any(|&id| id as usize >= VOCAB) {
             return Err(super::bad(
@@ -666,6 +627,7 @@ mod device {
             // pinned tokenizer and template, the layout of a snapshot and the numeric path.
             let load = kv_tier::load_identity(
                 &model.weights_identity,
+                &text_identity,
                 &model.snapshot_layer_bytes(1),
                 bolt::attn_split_wanted()?.then(|| model.attn_splits()),
             );
@@ -724,12 +686,12 @@ mod device {
     mod prefix_tests {
         use super::*;
 
-        /// Panics when the pinned Bolt file is not configured: an explicit
+        /// Panics when no Bolt Q8_0 file is configured: an explicit
         /// `--ignored` run without `BOLT_Q8_FILE` is a setup error, not a pass.
-        fn pinned_bolt() -> std::path::PathBuf {
+        fn bolt_file() -> std::path::PathBuf {
             std::env::var("BOLT_Q8_FILE")
                 .map(std::path::PathBuf::from)
-                .expect("BOLT_Q8_FILE must point at the pinned Bolt q8 file")
+                .expect("BOLT_Q8_FILE must point at a Bolt Q8_0 file")
         }
 
         /// Greedy argmax of the capped logits after one decode step.
@@ -769,9 +731,9 @@ mod device {
         /// and break the equality. The prompt is 3,000 tokens so turn 1 crosses
         /// the 512-cell sliding window.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_restore_past_a_decode_matches_the_cold_replay() {
-            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
+            let mut model: Bolt = bolt::load(&bolt_file()).expect("load");
             let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..3_000u32).map(|index| 100 + (index % 977)).collect();
             feed(&mut model, &seq, &prompt);
@@ -821,9 +783,9 @@ mod device {
         /// mid-run prefill too — the restore flow feeds rows while the graph
         /// exists, and the next decode must still replay it.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_graphed_greedy_run_matches_the_eager_run() {
-            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
+            let mut model: Bolt = bolt::load(&bolt_file()).expect("load");
             let seq = model.new_seq().expect("sequence");
             assert!(
                 !model.graph_mode.active(),
@@ -893,9 +855,9 @@ mod device {
         /// as the unsplit parity test, at a shorter draw to keep the suite
         /// time bounded.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_graphed_split_run_matches_the_eager_split_run() {
-            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
+            let mut model: Bolt = bolt::load(&bolt_file()).expect("load");
             let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             // The chain AND the logits bits per step: matching the greedy
@@ -1015,7 +977,7 @@ mod device {
         /// continuation matches a cold run bit for bit, with the source session having moved on
         /// (decoded and reset) since the save.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_saved_prefix_restores_into_another_session_and_matches_a_cold_run() {
             restore_matches_a_cold_run(300);
         }
@@ -1025,13 +987,13 @@ mod device {
         /// local one). The largest range a snapshot can copy is 16 MB (32,768 cells of 512), under
         /// the 64 MiB staging chunk of a device copy, so one copy never splits a range.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_long_saved_prefix_restores_bit_exact_past_the_window_and_the_copy_chunk() {
             restore_matches_a_cold_run(20_000);
         }
 
         fn restore_matches_a_cold_run(base_len: usize) {
-            let mut serve = serve_of(bolt::load(&pinned_bolt()).expect("load"));
+            let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
             let mut source = serve.new_session().expect("source");
             let mut target = serve.new_session().expect("target");
             let mut cold = serve.new_session().expect("cold");
@@ -1093,9 +1055,9 @@ mod device {
         /// A different prompt saves over the tip, and the old key no longer restores: the store
         /// holds one entry and answers only for keys the prompt extends.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn the_store_answers_only_for_a_key_the_prompt_extends() {
-            let mut serve = serve_of(bolt::load(&pinned_bolt()).expect("load"));
+            let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
             let mut first = serve.new_session().expect("first");
             let first_key = prompt(64, 0);
             let other_key = prompt(64, 300);

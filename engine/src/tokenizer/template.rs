@@ -161,6 +161,18 @@ impl ChatTemplate {
         self.render_with(msgs, tools, thinking, false)
     }
 
+    /// Renders without a generation prompt, with each tool call also given in the OpenAI shape
+    /// (`function` holding `name` and `arguments`) that some templates read. For probing a
+    /// template's own markers; serving renders through [`Self::render`].
+    pub(crate) fn render_openai_calls(
+        &self,
+        msgs: &[PromptMessage],
+        tools: &[ToolSpec],
+        thinking: Thinking,
+    ) -> Result<String, EngError> {
+        self.render_inner(msgs, tools, thinking, false, true)
+    }
+
     fn render_with(
         &self,
         msgs: &[PromptMessage],
@@ -168,10 +180,21 @@ impl ChatTemplate {
         thinking: Thinking,
         generation_prompt: bool,
     ) -> Result<String, EngError> {
+        self.render_inner(msgs, tools, thinking, generation_prompt, false)
+    }
+
+    fn render_inner(
+        &self,
+        msgs: &[PromptMessage],
+        tools: &[ToolSpec],
+        thinking: Thinking,
+        generation_prompt: bool,
+        openai_calls: bool,
+    ) -> Result<String, EngError> {
         if msgs.is_empty() {
             return Err(EngError::BadRequest("message list is empty".to_string()));
         }
-        let context = build_context(msgs, tools, thinking, generation_prompt, self)?;
+        let context = build_context(msgs, tools, thinking, generation_prompt, openai_calls, self)?;
         let template = self.env.get_template("chat").map_err(render_defect)?;
         template.render(context).map_err(render_error)
     }
@@ -333,10 +356,11 @@ fn build_context(
     tools: &[ToolSpec],
     thinking: Thinking,
     generation_prompt: bool,
+    openai_calls: bool,
     template: &ChatTemplate,
 ) -> Result<Value, EngError> {
     let mut context = serde_json::Map::new();
-    let mut messages = message_context(msgs)?;
+    let mut messages = message_context(msgs, openai_calls)?;
     let rows = messages
         .as_array_mut()
         .expect("message_context returns an array");
@@ -443,7 +467,10 @@ fn build_context(
     Ok(Value::from_serialize(serde_json::Value::Object(context)))
 }
 
-fn message_context(msgs: &[PromptMessage]) -> Result<serde_json::Value, EngError> {
+fn message_context(
+    msgs: &[PromptMessage],
+    openai_calls: bool,
+) -> Result<serde_json::Value, EngError> {
     let mut messages = to_value(msgs, "messages")?;
     let rows = messages
         .as_array_mut()
@@ -471,6 +498,12 @@ fn message_context(msgs: &[PromptMessage]) -> Result<serde_json::Value, EngError
                 ));
             }
             call["arguments"] = parsed;
+            if openai_calls {
+                call["function"] = serde_json::json!({
+                    "name": call["name"].clone(),
+                    "arguments": call["arguments"].clone(),
+                });
+            }
         }
     }
     Ok(messages)

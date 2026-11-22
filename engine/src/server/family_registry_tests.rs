@@ -100,10 +100,10 @@ fn gemma4_row_refuses_without_a_bolt_model() {
             #[cfg(feature = "native-cuda")]
             assert!(
                 message.starts_with(
-                    "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
-                     the model directory m failed the Bolt configuration check:"
+                    "gemma4 serves only the Bolt geometry on the native-cuda build; \
+                     m is not a file of it:"
                 ),
-                "the refusal must name the Bolt configuration cause, got {message}"
+                "the refusal must name the geometry cause, got {message}"
             );
             #[cfg(not(feature = "native-cuda"))]
             assert_eq!(

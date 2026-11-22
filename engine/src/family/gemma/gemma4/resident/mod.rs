@@ -1,6 +1,6 @@
 //! The resident Gemma 4 Humanizer decode step on one CUDA device.
 //!
-//! This module composes the checked resident operations over the pinned Q8_0
+//! This module composes the checked resident operations over a Q8_0
 //! checkpoint: a Q8_0 embedding gather, forty-eight decoder layers (attention over
 //! the KV8 planes, split-half RoPE, the GELU-tanh gated feed-forward, the residual
 //! sums and the layer scalar), the final RMSNorm, the tied-embedding logit
@@ -51,7 +51,7 @@ pub(crate) const HIDDEN: usize = 3840;
 pub(crate) const VOCAB: usize = 262_144;
 pub(crate) const HEADS: usize = 16;
 /// KV cells held per head: the 8,192-token combined context of the goal.
-pub(crate) const CELLS: usize = 8192;
+pub(crate) const CELLS: usize = super::gguf::HUMANIZER_CELLS as usize;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 pub(crate) const FFN: usize = 15360;
 

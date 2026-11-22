@@ -233,7 +233,12 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     }
     // The context and the window are the checkpoint's own: any positive window the resident
     // ring takes, and any context that holds it.
-    let window = u32_in(text, "sliding_window", 1, 4096)?;
+    let window = u32_in(
+        text,
+        "sliding_window",
+        1,
+        super::gguf::HUMANIZER_CELLS as u32,
+    )?;
     u32_in(text, "max_position_embeddings", window, u32::MAX)?;
     Ok(())
 }

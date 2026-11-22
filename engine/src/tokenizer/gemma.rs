@@ -1,46 +1,10 @@
-use super::{TokenizerBundle, TokenizerPin};
+use super::TokenizerBundle;
 use crate::EngError;
 use std::path::Path;
 
-const NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_TOKENIZER_JSON_SHA256: [u8; 32] = [
-    0xcc, 0x8d, 0x3a, 0x0c, 0xe3, 0x64, 0x66, 0xcc, 0xc1, 0x27, 0x8b, 0xf9, 0x87, 0xdf, 0x5f, 0x71,
-    0xdb, 0x17, 0x19, 0xb9, 0xca, 0x6b, 0x41, 0x18, 0x26, 0x4f, 0x45, 0xcb, 0x62, 0x7b, 0xfe, 0x0f,
-];
-const NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_TOKENIZER_CONFIG_SHA256: [u8; 32] = [
-    0xb3, 0xda, 0x1b, 0x72, 0x27, 0xc5, 0xd3, 0x5f, 0xd9, 0x05, 0xad, 0x13, 0x20, 0x0a, 0x08, 0xbe,
-    0x63, 0xcb, 0x34, 0x6b, 0x2d, 0x1b, 0xd4, 0xf6, 0xd5, 0x88, 0x78, 0xc9, 0x78, 0x3d, 0x5d, 0xe1,
-];
-const NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_CHAT_TEMPLATE_SHA256: [u8; 32] = [
-    0x35, 0xb7, 0xd0, 0x64, 0x1b, 0x6f, 0xb4, 0xee, 0x41, 0xc3, 0xbc, 0x62, 0x3e, 0x85, 0xbd, 0xb7,
-    0xd5, 0x83, 0xc4, 0x0f, 0x6a, 0xe9, 0xf2, 0x45, 0x14, 0xae, 0x58, 0xa9, 0xd5, 0x71, 0x19, 0xf3,
-];
-const NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_GENERATION_CONFIG_SHA256: [u8; 32] = [
-    0xd4, 0x22, 0x6b, 0xbe, 0x31, 0x17, 0xd2, 0xd2, 0x53, 0xba, 0x46, 0x09, 0x72, 0x0b, 0xa8, 0x2c,
-    0x6c, 0x4c, 0xe4, 0x62, 0x7a, 0x9a, 0x6a, 0xe0, 0x53, 0x87, 0xc7, 0x89, 0x83, 0xac, 0x03, 0xde,
-];
-
-const NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN: TokenizerPin = TokenizerPin {
-    tokenizer_json: NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_TOKENIZER_JSON_SHA256,
-    tokenizer_config_json: NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_TOKENIZER_CONFIG_SHA256,
-    chat_template_jinja: NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_CHAT_TEMPLATE_SHA256,
-    generation_config_json: NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_GENERATION_CONFIG_SHA256,
-    vocab_size: 262_144,
-};
-
-/// The digests of the pinned tokenizer file and chat template, which a loaded bundle matches
-/// byte for byte: what a persisted prefix names as the text it was built from.
-#[cfg_attr(
-    not(feature = "native-cuda"),
-    allow(dead_code, reason = "only the CUDA starter names the pinned files")
-)]
-pub(crate) fn pinned_digests() -> ([u8; 32], [u8; 32]) {
-    (
-        NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN.tokenizer_json,
-        NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN.chat_template_jinja,
-    )
-}
-
-/// Loads files pinned to `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16@49843eed`.
+/// Loads the tokenizer of a Gemma 4 model as it is: the files of `dir` when it holds a
+/// `tokenizer.json`, else the vocabulary and chat template in the header of the GGUF beside the
+/// weights. No revision is pinned: what the bundle read names it.
 pub fn load(dir: &Path) -> Result<TokenizerBundle, EngError> {
-    TokenizerBundle::load(dir, &NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN)
+    TokenizerBundle::load_observed(dir)
 }

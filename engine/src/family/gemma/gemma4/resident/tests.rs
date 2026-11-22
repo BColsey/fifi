@@ -2,7 +2,7 @@
 use super::{Gemma, VOCAB};
 
 #[test]
-#[ignore = "requires the pinned Humanizer file and a device"]
+#[ignore = "requires a Humanizer Q8_0 file and a device"]
 fn decodes_one_token_against_the_pinned_checkpoint() {
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         return;
@@ -31,10 +31,10 @@ fn decodes_one_token_against_the_pinned_checkpoint() {
     assert!(peak <= 30.0 + 1e-3, "softcap exceeded: {peak}");
 }
 
-/// Measures the decode matvec against the pinned gate matrix: one 15,360-row
+/// Measures the decode matvec against a gate matrix: one 15,360-row
 /// width read per launch. Set GEMMA4_BANDWIDTH_PROBE to the launch count.
 #[test]
-#[ignore = "requires the pinned Humanizer file, a device and GEMMA4_BANDWIDTH_PROBE"]
+#[ignore = "requires a Humanizer Q8_0 file, a device and GEMMA4_BANDWIDTH_PROBE"]
 fn measures_matvec_bandwidth() {
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         return;
@@ -146,7 +146,7 @@ fn each_layer_reads_the_previous_layers_output() {
 
 /// This trace downloads five ids and five log probabilities, never a logits row.
 #[test]
-#[ignore = "requires the pinned Humanizer file and an exclusive device lease"]
+#[ignore = "requires a Humanizer Q8_0 file and an exclusive device lease"]
 fn traces_first_position_top_five() {
     let path = std::env::var("GEMMA4_Q8_FILE").expect("checkpoint path required");
     let mut model = super::load(std::path::Path::new(&path)).expect("load");
