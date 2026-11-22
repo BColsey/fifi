@@ -839,6 +839,23 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
             }
             history = plan.history;
         }
+        // One nonzero Q8_0 block of the PLE value matrix gives a nonzero update.
+        let mapped = model
+            .map()
+            .get(
+                crate::family::recipe::Role::PleValue,
+                Some(model.config().dims.ple_layer),
+            )
+            .unwrap();
+        assert_eq!(mapped.ty, crate::weights::GgufType::Q80);
+        let tensor = model.weights.header().tensor(&mapped.name).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&model.weights.paths()[tensor.shard()])
+            .unwrap();
+        let mut block = vec![0x00, 0x2c]; // F16 scale 1/16
+        block.extend([1; 32]);
+        file.write_all_at(&block, tensor.abs_offset()).unwrap();
     }
     let mut projector = super::projector::HostProjector::new(&model.weights, &rows, 2);
     let mut state = super::super::super::ple::PleState::new(&shape.ple);
@@ -869,6 +886,10 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
         .unwrap();
         assert_eq!(a, b);
         assert_eq!(a, oracle);
+        assert!(
+            a.iter().any(|&value| value != 0.0),
+            "synthetic PLE update must be nonzero"
+        );
     }
     assert_eq!(chunk.ple_state(), serial.ple_state());
     let (history, ring) = chunk.ple_state().unwrap();
