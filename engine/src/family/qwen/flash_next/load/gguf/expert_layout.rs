@@ -58,4 +58,41 @@ impl ExpertLayout {
             bytes: offset,
         })
     }
+
+    /// Fill a packed host record. Validation precedes reads; an I/O error can still leave
+    /// an already-read prefix in `out`, so callers must discard the whole record on error.
+    pub(in super::super::super) fn read(
+        &self,
+        model: &GgufModel,
+        layer: usize,
+        expert: u64,
+        out: &mut [u8],
+    ) -> Result<(), EngError> {
+        let bad = || EngError::BadRequest("invalid GGUF expert record request".into());
+        if out.len() != self.bytes || *self != Self::for_layer(model, layer)? {
+            return Err(bad());
+        }
+        let mut rows = [0u64; 3];
+        for (i, part) in self.parts.iter().enumerate() {
+            let tensor = model.map().get(part.role, Some(layer)).ok_or_else(bad)?;
+            let [_, outputs, _] = tensor.dims.as_slice() else {
+                return Err(bad());
+            };
+            let (_, bytes) = tensor.row_span(Some(expert), 0..*outputs)?;
+            if bytes != part.bytes.len() {
+                return Err(bad());
+            }
+            rows[i] = *outputs;
+        }
+        for (part, outputs) in self.parts.iter().zip(rows) {
+            model.read_expert_rows(
+                layer,
+                part.role,
+                expert,
+                0..outputs,
+                &mut out[part.bytes.clone()],
+            )?;
+        }
+        Ok(())
+    }
 }

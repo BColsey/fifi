@@ -448,6 +448,56 @@ fn stored_expert_layout_matches_per_layer_and_global_file_sizes() {
 }
 
 #[test]
+fn packed_expert_read_preserves_role_boundaries_and_rejects_bad_requests() {
+    use super::expert_layout::ExpertLayout;
+    let (written, model) = open(&Spec {
+        shards: 4,
+        ..Spec::default()
+    });
+    let layer = 0;
+    let layout = ExpertLayout::for_layer(&model, layer).unwrap();
+    let expert = 1;
+    for (index, part) in layout.parts.iter().enumerate() {
+        let tensor = model.map().get(part.role, Some(layer)).unwrap();
+        written.patch(
+            &tensor.name,
+            expert * part.bytes.len() as u64,
+            &vec![0x31 + index as u8; part.bytes.len()],
+        );
+    }
+    let mut output = vec![0; layout.bytes];
+    layout.read(&model, layer, expert, &mut output).unwrap();
+    for (index, part) in layout.parts.iter().enumerate() {
+        assert!(
+            output[part.bytes.clone()]
+                .iter()
+                .all(|&byte| byte == 0x31 + index as u8)
+        );
+    }
+    output.fill(0x55);
+    assert!(
+        layout
+            .read(
+                &model,
+                layer,
+                model.config().dims.experts as u64,
+                &mut output
+            )
+            .is_err()
+    );
+    assert!(output.iter().all(|&byte| byte == 0x55));
+    assert!(
+        layout
+            .read(&model, layer, expert, &mut output[..1])
+            .is_err()
+    );
+    let mut stale = layout.clone();
+    stale.parts[0].bytes.start += 1;
+    assert!(stale.read(&model, layer, expert, &mut output).is_err());
+    assert!(output.iter().all(|&byte| byte == 0x55));
+}
+
+#[test]
 fn expert_row_spans_check_bounds_alignment_and_overflow() {
     let (_written, model) = open(&Spec::default());
     let mut stack = model
