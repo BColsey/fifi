@@ -5,15 +5,15 @@
 use super::{
     common_tests::{dims, plan_of},
     dims::KvMode,
+    prefill_driver::pieces_of,
     prefill_plan::{
         Admission, ChunkCost, ChunkSlot as S, EXL3_SLOTS, EXL3_TILE_ROWS, Extra, M_LADDER,
         PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_tensors,
         exl3_chunk_cost, exl3_chunk_costs, exl3_chunk_tensors, kv_bytes, state_bytes,
     },
-    prefill_driver::pieces_of,
 };
-use crate::family::prefill::piece_rows::{MEASURED_ANCHORS, piece_rows};
 use crate::family::prefill::arena::PrefillStep;
+use crate::family::prefill::piece_rows::{MEASURED_ANCHORS, piece_rows};
 use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
     EngError,

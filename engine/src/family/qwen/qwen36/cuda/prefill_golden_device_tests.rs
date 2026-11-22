@@ -49,12 +49,10 @@ use super::common_tests::dims;
 use super::common_tests::inventory;
 use super::dims::{KvMode, StepDims, StepOptions};
 use super::exl3_load::load_exl3_dir;
+use super::prefill_driver::pieces_of;
 use super::prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillArena, PrefillBudget, ZERO_CHUNK};
 use super::prefill_exl3_step_device_tests::{SAMPLER_VOCAB, rules as step_rules};
-use super::prefill_plan::{
-    ChunkSlot, chunk_tensors, exl3_chunk_tensors,
-};
-use super::prefill_driver::pieces_of;
+use super::prefill_plan::{ChunkSlot, chunk_tensors, exl3_chunk_tensors};
 use super::resources::StepResources;
 use super::state::export::ExportedState;
 use super::step::ChunkVerdict;
@@ -556,15 +554,14 @@ fn capture(
             (record.p0, record.rows, kind)
         })
         .collect();
-    let expected: Vec<(usize, usize, &'static str)> =
-        pieces_of(0, FED_ROWS, wanted, 0)
-            .expect("chunk list")
-            .iter()
-            .map(|step| match step {
-                PrefillStep::Chunk { p0, rows } => (*p0, *rows, "chunk"),
-                PrefillStep::Feed { p0 } => (*p0, 1, "feed"),
-            })
-            .collect();
+    let expected: Vec<(usize, usize, &'static str)> = pieces_of(0, FED_ROWS, wanted, 0)
+        .expect("chunk list")
+        .iter()
+        .map(|step| match step {
+            PrefillStep::Chunk { p0, rows } => (*p0, *rows, "chunk"),
+            PrefillStep::Feed { p0 } => (*p0, 1, "feed"),
+        })
+        .collect();
     assert_eq!(
         stages, expected,
         "the stage rows must be the partition the host golden pins"

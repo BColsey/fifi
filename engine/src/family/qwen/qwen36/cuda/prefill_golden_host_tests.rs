@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use super::common_tests::{dims, plan_of};
 use super::dims::KvMode;
 use super::prefill::exl3::dense_jobs;
+use super::prefill_driver::pieces_of;
 use super::prefill_driver::{AdmitFacts, ZERO_CHUNK, admit_m_sess, zero_spans};
 use super::prefill_golden_device_tests::{
     FED_ROWS, IDS_SHA256, PROMPT_IDS, planned_table, prompt_ids, store_goldens, table_text,
@@ -30,7 +31,6 @@ use super::prefill_plan::{
     M_LADDER, PART_CHARGE, SPARE_MIN, chunk_tensors, exl3_chunk_costs, exl3_chunk_tensors,
     state_bytes,
 };
-use super::prefill_driver::pieces_of;
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::plan_arena;

@@ -196,10 +196,7 @@ impl ColdSet {
 
     /// The set over `stagings`, with the staging each layer uses.
     pub(super) fn new(stagings: Vec<ColdStaging>, of_layer: Vec<Option<usize>>) -> Self {
-        Self {
-            stagings,
-            of_layer,
-        }
+        Self { stagings, of_layer }
     }
 
     fn of(&self, layer: usize) -> Option<usize> {

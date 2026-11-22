@@ -2015,7 +2015,10 @@ mod tests {
         let block: Vec<f32> = (0..m * REAL.hidden)
             .map(|_| rng.f32_between(-1.0, 1.0))
             .collect();
-        let groups = [(vec![0usize, 2], vec![0.5f32, -0.25]), (vec![1, 2], vec![0.75, 0.125])];
+        let groups = [
+            (vec![0usize, 2], vec![0.5f32, -0.25]),
+            (vec![1, 2], vec![0.75, 0.125]),
+        ];
         let jobs: Vec<super::GroupedExpertJob> = groups
             .iter()
             .enumerate()

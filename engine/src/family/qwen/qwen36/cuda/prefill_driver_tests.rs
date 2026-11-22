@@ -693,7 +693,11 @@ fn the_shared_loop_plans_pieces_from_the_arena_and_the_model() {
             82,
             155_136,
             1024,
-            vec![chunk(155_136, 512), chunk(155_648, 256), chunk(155_904, 256)],
+            vec![
+                chunk(155_136, 512),
+                chunk(155_648, 256),
+                chunk(155_904, 256),
+            ],
         ),
         (
             512,
@@ -733,7 +737,12 @@ fn the_shared_loop_plans_pieces_from_the_arena_and_the_model() {
             0,
             5,
             400,
-            vec![chunk(5, 128), chunk(133, 128), chunk(261, 128), chunk(389, 16)],
+            vec![
+                chunk(5, 128),
+                chunk(133, 128),
+                chunk(261, 128),
+                chunk(389, 16),
+            ],
         ),
         (
             16,
@@ -752,8 +761,8 @@ fn the_shared_loop_plans_pieces_from_the_arena_and_the_model() {
     ];
     for (m_sess, sm, p0, rows, want) in cases {
         let tokens = vec![0u32; rows];
-        let got = drive_chunks(p0, &tokens, (m_sess, sm), |_, _| Ok(()))
-            .expect("a ladder size plans");
+        let got =
+            drive_chunks(p0, &tokens, (m_sess, sm), |_, _| Ok(())).expect("a ladder size plans");
         assert_eq!(got, want, "arena {m_sess}, {sm} SMs, {p0}+{rows}");
     }
     assert!(drive_chunks(0, &[0u32; 4], (300, 0), |_, _| Ok(())).is_err());

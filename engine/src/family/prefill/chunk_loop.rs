@@ -146,7 +146,12 @@ mod tests {
 
     #[test]
     fn pieces_cover_the_rows_once_in_order_and_never_exceed_the_arena() {
-        for (start, rows, max) in [(0, 1, 256), (0, 4096, 4096), (7, 5000, 1024), (300, 257, 128)] {
+        for (start, rows, max) in [
+            (0, 1, 256),
+            (0, 4096, 4096),
+            (7, 5000, 1024),
+            (300, 257, 128),
+        ] {
             let steps = plan_pieces(start, rows, &plan(max)).unwrap();
             covers(&steps, start, rows);
             for step in &steps {
@@ -207,7 +212,10 @@ mod tests {
         .unwrap();
         assert_eq!(ran.len(), seen.len());
         assert_eq!(seen[0].1, vec![0, 1, 2, 3]);
-        assert_eq!(seen[2], (PrefillStep::Chunk { p0: 108, rows: 2 }, vec![8, 9]));
+        assert_eq!(
+            seen[2],
+            (PrefillStep::Chunk { p0: 108, rows: 2 }, vec![8, 9])
+        );
     }
 
     struct Log(Vec<&'static str>);
@@ -265,15 +273,32 @@ mod tests {
         .unwrap();
         assert_eq!(
             log.0,
-            ["window", "before", "clear", "inputs", "layers", "after-layers", "health", "commit"]
+            [
+                "window",
+                "before",
+                "clear",
+                "inputs",
+                "layers",
+                "after-layers",
+                "health",
+                "commit"
+            ]
         );
         let mut log = Log(Vec::new());
         let order = ChunkOrder {
             open_window: false,
             clear_status: StatusClear::AfterInputs,
         };
-        drive_chunk(&mut log, &mut (), (8, 8), order, |_, _| Ok(()), |_, _| Ok(()), |_| Ok(()))
-            .unwrap();
+        drive_chunk(
+            &mut log,
+            &mut (),
+            (8, 8),
+            order,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(log.0, ["inputs", "clear", "layers", "health", "commit"]);
     }
 
