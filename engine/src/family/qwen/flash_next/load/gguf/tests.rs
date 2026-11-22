@@ -742,6 +742,46 @@ fn card(free: u64, total: u64, available: u64) -> Card {
 }
 
 #[test]
+fn card_budget_charges_ring_and_expert_alignment_without_underflow() {
+    let mut machine = card(1000, 62 * GIB, 40 * GIB);
+    machine.ring_budget = 200;
+    assert_eq!(machine.free_after_reserves(48).unwrap(), 512);
+    machine.free_vram = 487;
+    assert_eq!(machine.free_after_reserves(48).unwrap(), 0);
+    machine.free_vram = 199;
+    assert_eq!(machine.free_after_reserves(48).unwrap(), 0);
+}
+
+#[test]
+fn context_admission_charges_ring_budget_at_the_exact_boundary() {
+    use super::super::super::moe::context_budget::KvFormat;
+    let (_file, model) = open(&Spec::default());
+    let min_free = |ring: u64| {
+        let admits = |free| {
+            let mut machine = card(free, 62 * GIB, 40 * GIB);
+            machine.ring_budget = ring;
+            model
+                .load_plan(machine)
+                .and_then(|plan| plan.at_context(4096, KvFormat::F16, 11))
+                .is_ok()
+        };
+        let mut low = 0;
+        let mut high = 24 * GIB;
+        assert!(!admits(low) && admits(high));
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            if admits(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        high
+    };
+    assert_eq!(min_free(288), min_free(0) + 288);
+}
+
+#[test]
 fn the_plan_on_a_24_gib_card_and_a_62_gib_host_does_not_refuse() {
     let (_written, model) = open(&Spec::default());
     let sizes = model.sizes().expect("sizes");

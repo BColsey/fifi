@@ -69,6 +69,18 @@ pub(in super::super::super) struct Card {
     pub(in super::super::super) ring_budget: u64,
 }
 
+impl Card {
+    pub(in super::super::super) fn free_after_reserves(
+        self,
+        layers: usize,
+    ) -> Result<u64, EngError> {
+        Ok(self
+            .free_vram
+            .saturating_sub(self.ring_budget)
+            .saturating_sub(stack_alignment_reserve(layers)?))
+    }
+}
+
 impl GgufModel {
     /// The sizes the memory plan needs.
     pub(in super::super::super) fn sizes(&self) -> Result<GgufSizes, EngError> {
@@ -134,9 +146,7 @@ impl GgufModel {
                 positions: 1,
                 bytes_per_position: 1,
             },
-            card.free_vram
-                .saturating_sub(card.ring_budget)
-                .saturating_sub(stack_alignment_reserve(sizes.shape.layers)?),
+            card.free_after_reserves(sizes.shape.layers)?,
             HostFrame::with_default_terms(card.host),
             rung_ring_placeholder_bytes(
                 usize::try_from(sizes.record_bytes_max)
