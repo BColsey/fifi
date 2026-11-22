@@ -435,27 +435,36 @@ pub(super) fn route_device(
         let ids = BoundedIndices::from_clamped(ids, experts);
         return Ok(DeviceRoute { ids, gates, health });
     }
-    // A stable ascending sort of the negated row lists the largest probability first and keeps the
-    // lower index first among equal values.
-    let negated = ctx.kernels.unary(UnaryOp::Neg, &flat)?;
-    let order = ctx.kernels.argsort(&negated, 0)?;
-    let ids = ctx.kernels.slice(&order, &[0], &[k])?;
+    let (ids, gates) = route_op_chain(ctx.kernels, &flat, experts, k, renorm)?;
+    Ok(DeviceRoute { ids, gates, health })
+}
+
+/// The op chain of one router row `flat` `[experts]`: the `k` largest probabilities in rank order
+/// as ids already clamped below `experts`, and their gates `[k, 1, 1]`. A stable ascending sort of
+/// the negated row lists the largest probability first and keeps the lower index first among equal
+/// values. The fused top-k kernel returns the same ids and gate bits for the rows it accepts.
+pub(super) fn route_op_chain(
+    kernels: &mut crate::kernels::MlxKernels,
+    flat: &ExecutionTensor,
+    experts: u32,
+    k: u32,
+    renorm: bool,
+) -> Result<(BoundedIndices, ExecutionTensor), EngError> {
+    let negated = kernels.unary(UnaryOp::Neg, flat)?;
+    let order = kernels.argsort(&negated, 0)?;
+    let ids = kernels.slice(&order, &[0], &[k])?;
     // One clamp below the expert count for the whole layer: the take below
     // and the three gathered products of `combine` share it.
-    let bounded = ctx.kernels.bound_indices(&ids, experts)?;
-    let top = ctx.kernels.take_bounded(&flat, &bounded, 0)?;
+    let bounded = kernels.bound_indices(&ids, experts)?;
+    let top = kernels.take_bounded(flat, &bounded, 0)?;
     let gates = if renorm {
-        let sum = ctx.kernels.reduce(ReduceOp::Sum, &top, 0, true)?;
-        ctx.kernels.binary(BinaryOp::Div, &top, &sum)?
+        let sum = kernels.reduce(ReduceOp::Sum, &top, 0, true)?;
+        kernels.binary(BinaryOp::Div, &top, &sum)?
     } else {
         top
     };
-    let gates = ctx.kernels.reshape(&gates, &[k, 1, 1])?;
-    Ok(DeviceRoute {
-        ids: bounded,
-        gates,
-        health,
-    })
+    let gates = kernels.reshape(&gates, &[k, 1, 1])?;
+    Ok((bounded, gates))
 }
 
 /// Runs one resident MoE step on `x` `[1, H]` with device routing and returns `[1, H]` with the

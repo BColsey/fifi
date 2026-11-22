@@ -123,6 +123,7 @@ unsafe extern "C" {
     pub(super) fn mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     #[link_name = "inference_mlx_reset_peak_memory"]
     pub(super) fn mlx_reset_peak_memory() -> i32;
+    #[cfg(test)]
     #[link_name = "inference_mlx_row_invariant_products"]
     pub(super) fn mlx_row_invariant_products() -> bool;
     #[link_name = "inference_mlx_set_row_invariant_products"]

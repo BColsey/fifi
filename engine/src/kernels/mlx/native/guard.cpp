@@ -478,8 +478,8 @@ extern "C" int inference_mlx_async_eval(const mlx_vector_array outputs) noexcept
 // One row meets a weight through the same tiled kernel a window of rows does: the row is stacked
 // with a copy of itself and the first result row is kept. The one-row (vector) kernel adds in
 // another order than the tiled one, so without this a row's result depends on whether it shares
-// its step with another row. A decoder that decodes windows turns it on for its engine thread
-// before it traces anything.
+// its step with another row. A decoder turns it on for its engine thread before it traces
+// anything and the context turns it off again when it drops.
 static thread_local bool one_row_products_tiled = false;
 
 extern "C" void inference_mlx_set_row_invariant_products(bool on) noexcept {
@@ -498,7 +498,7 @@ extern "C" int inference_mlx_quantized_matmul(
     mlx_optional_int bits, const char* mode, mlx_stream stream) noexcept {
   return run_selected_operation(result, stream, [&] {
     if (one_row_products_are_tiled() && mlx_array_ndim(activation) == 2 &&
-        mlx_array_shape(activation)[0] == 1) {
+        mlx_array_ndim(weight) == 2 && mlx_array_shape(activation)[0] == 1) {
       mlx_vector_array parts = mlx_vector_array_new();
       mlx_vector_array_append_value(parts, activation);
       mlx_vector_array_append_value(parts, activation);
@@ -2912,8 +2912,8 @@ static int compile_moe_lhs_index(int batch) noexcept {
 }
 
 // Builds one (rows, flat) pair of the persistent row-index operands for `batch` rows over
-// `top_k` experts. `rows` matches the clamped ids shape ([k] at B=1, [B,k] above) with the row
-// id broadcast along the experts; `flat` enumerates the B*k gathered rows in the same shape.
+// `top_k` experts. `rows` matches the clamped ids shape ([k] at B=1, read as [1,k] by the closure, [B,k] above)
+// with the row id broadcast along the experts; `flat` enumerates the B*k gathered rows in the same shape.
 // Both are evaluated, so the traced closures bind them as constants instead of replaying their
 // producers as kernels. Called only on a cache miss of the pair below. The values equal exactly what mlx_gather_qmm derives internally when
 // the lhs slot is null, so the gathers read the same indices as before.
@@ -3034,7 +3034,7 @@ static int compile_moe_lhs_for(
   return 0;
 }
 
-// Vectorized B>1 MoE. The single-row body below stays on its original op sequence.
+// Vectorized MoE for 1, 2, 4 and 8 rows; one row is the same graph as a window of one.
 // Row indices [B,1] broadcast against the once-clamped expert ids [B,k], so each gate/up
 // gather reads only that row's activation. The down input already has batch axes [B,k];
 // MLX's default lhs indices enumerate those pairs, matching the same expert ids [B,k].
@@ -3210,11 +3210,10 @@ static int compile_moe_rows(
   return status != 0 ? status : release;
 }
 
-// The compiled device-routed MoE decode block body. B>1 dispatches to the row-vectorized
-// helper after argument collection; B=1 replays the original op sequence of
-// `engine/src/family/qwen/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`,
-// calling the same inference_mlx_* shims that the uncompiled Rust path calls, in the same
-// order. A stable
+// The compiled device-routed MoE decode block body. Every row count dispatches to the
+// row-vectorized helper after argument collection; its op order follows
+// `engine/src/family/qwen/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`
+// and calls the same inference_mlx_* shims the uncompiled Rust path calls. A stable
 // ascending argsort of the negated probabilities keeps the lowest index first on ties, like the
 // host rule. The expert ids are clamped below the expert count ONCE per layer: the
 // top-probability take and the three gathered products share the one `mlx_minimum` node. The
@@ -3229,9 +3228,9 @@ static int compile_moe_rows(
 // scales, biases of the shared gate, up, and down weights; shared_scalar_t [H,1]; payload,
 // scales, biases of the gate, up, and down expert stacks (a null biases slot when the weight
 // has none); post_norm [H] (the folded post-attention RMS norm weight).
-// Output order (4), B=1: out [1,H] in the activation dtype (the folded residual sum);
-// ids [k] (U32, once-clamped);
-// gates [k,1,1] (F32); health [1] (F32). B>1: [B,H], [B,k], [B,k,1,1], [B].
+// Output order (4): out [B,H] in the activation dtype (the folded residual sum); ids [B,k]
+// (U32, once-clamped); gates [B,k,1,1] (F32); health [B] (F32). One row reports its route as
+// ids [k] and gates [k,1,1], the shapes its readers take.
 static int compile_moe_body(
     mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
   compile_moe_body_entries_.fetch_add(1, std::memory_order_relaxed);

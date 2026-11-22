@@ -226,6 +226,7 @@ impl Context {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Whether this thread's one-row products take the tiled kernel a window of rows takes.
     pub(super) fn row_invariant_products(&self) -> bool {
         unsafe { ffi::mlx_row_invariant_products() }
@@ -366,6 +367,9 @@ impl Drop for Context {
             // so it only drops the count.
             compile::teardown_clear();
         }
+        // The tiled one-row products belong to the thread this context ran on: the next context
+        // there starts with the ordinary kernels until its decoder asks otherwise.
+        unsafe { ffi::mlx_set_row_invariant_products(false) };
     }
 }
 

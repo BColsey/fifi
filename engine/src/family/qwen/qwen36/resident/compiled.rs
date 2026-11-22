@@ -348,8 +348,8 @@ fn delta_args<'a>(
 }
 
 /// Runs B1/2/4/8 device-routed MoE rows through the existing compiled seam.
-/// B1 retains its legacy graph and route ranks. Multirow routes retain every health row,
-/// which the caller must check before publication. The activation dtype is `ctx.consts.act`.
+/// One row is the same graph as a window of one; its route reads as [k] ids. Every route retains each
+/// row's health value, which the caller must check before publication. The activation dtype is `ctx.consts.act`.
 pub(super) fn moe_step_device(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,

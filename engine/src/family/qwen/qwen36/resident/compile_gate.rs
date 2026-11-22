@@ -3217,3 +3217,74 @@ mod fault_tests {
         );
     }
 }
+
+fn raw_bytes(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Vec<u8> {
+    kernels
+        .readback(tensor)
+        .unwrap()
+        .host_bytes()
+        .unwrap()
+        .to_vec()
+}
+
+fn router_lcg(seed: &mut u64) -> u32 {
+    *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    (*seed >> 33) as u32
+}
+
+/// The fused router top-k gives a window the ids and gate bits the op chain gives each row.
+#[test]
+#[ignore = "requires an explicit Mac GPU allocation; no model weights"]
+fn the_fused_router_matches_the_op_chain_for_every_row_of_a_window() {
+    const EXPERTS: usize = 64;
+    let _serial = crate::native_test_lock();
+    let mut k = MlxKernels::try_new().unwrap();
+    for (top_k, renorm) in [(8u32, true), (8, false), (4, true)] {
+        for batch in [1usize, 2, 4, 8] {
+            let mut seed = 0x70b_u64 + batch as u64;
+            // Every row gets a tied pair, so the lowest-index rule is part of the comparison.
+            let mut logits: Vec<f32> = (0..batch * EXPERTS)
+                .map(|_| (router_lcg(&mut seed) % 4000) as f32 / 500.0 - 4.0)
+                .collect();
+            for row in logits.chunks_mut(EXPERTS) {
+                row[40] = row[7];
+            }
+            let host = Tensor::try_from_host(
+                Dtype::F32,
+                vec![batch as u32, EXPERTS as u32],
+                logits.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+            .unwrap();
+            let logits = k.import_tensor(&host).unwrap();
+            let probs = k.softmax(&logits).unwrap();
+            let (ids, gates) = k
+                .router_topk(&probs, EXPERTS as u32, top_k, renorm)
+                .unwrap();
+            let ids = raw_bytes(&mut k, &ids);
+            let gates = raw_bytes(&mut k, &gates);
+            let width = top_k as usize;
+            for row in 0..batch {
+                let one = k
+                    .slice(&probs, &[row as u32, 0], &[row as u32 + 1, EXPERTS as u32])
+                    .unwrap();
+                let one = k.reshape(&one, &[EXPERTS as u32]).unwrap();
+                let (want_ids, want_gates) =
+                    moe::route_op_chain(&mut k, &one, EXPERTS as u32, top_k, renorm).unwrap();
+                let want_ids = raw_bytes(&mut k, want_ids.ids());
+                let want_gates = raw_bytes(&mut k, &want_gates);
+                assert_eq!(
+                    ids[row * width * 4..(row + 1) * width * 4],
+                    want_ids,
+                    "ids of row {row} in a window of {batch} (k {top_k}, renorm {renorm})"
+                );
+                assert_eq!(
+                    gates[row * width * 4..(row + 1) * width * 4],
+                    want_gates,
+                    "gates of row {row} in a window of {batch} (k {top_k}, renorm {renorm})"
+                );
+            }
+        }
+    }
+}

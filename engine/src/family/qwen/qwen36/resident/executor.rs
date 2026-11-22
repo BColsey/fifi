@@ -1066,10 +1066,6 @@ impl Q36Executor {
         device_plan: Option<ExpertDevicePlan>,
     ) -> Result<(Self, Q36Session)> {
         admit(host.shape(), &rules)?;
-        // A start that can run windows of rows gives a row the product kernel a window gives it,
-        // alone or not: set before anything traces, since compiled blocks keep the products they
-        // traced. A one-session start keeps the single-row kernels and their dispatch count.
-        kernels.set_row_invariant_products(rules.max_seqs > 1)?;
         kernels.set_program_limit(rules.compile_program_limit)?;
         let fixed_state_bytes = if rules.max_seqs > 1 {
             fixed_session_bytes(host.shape())?
@@ -2138,27 +2134,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_start_that_can_run_windows_tiles_the_one_row_products() {
+    fn every_start_tiles_the_one_row_products_and_dropping_it_restores_the_kernels() {
         let _serial = crate::native_test_lock();
         let (single, _) = build(prefix_rules());
         assert!(
-            !single.decoder.kernels.row_invariant_products(),
-            "a one-session start keeps the single-row kernels"
+            single.decoder.kernels.row_invariant_products(),
+            "a one-session start tiles its one-row products like a window does"
         );
         drop(single);
-        let ckpt = Box::leak(Box::new(tiny::checkpoint(&TINY_GQA)));
-        let host = HostWeights::load(ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap();
-        let windowed = Q36Rules {
-            compile: true,
-            max_seqs: 2,
-            session_cap: 1 << 30,
-            ..rules(vec![], VOCAB)
-        };
-        let (windows, _) =
-            Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host, windowed).unwrap();
         assert!(
-            windows.decoder.kernels.row_invariant_products(),
-            "a start that can run windows tiles them"
+            !MlxKernels::try_new().unwrap().row_invariant_products(),
+            "the next context on the thread starts with the ordinary kernels"
         );
     }
 

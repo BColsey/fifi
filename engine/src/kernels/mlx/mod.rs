@@ -10,6 +10,13 @@ mod attention_ab;
 #[path = "attention_contract_native.rs"]
 mod contract_tests;
 pub(crate) mod native;
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod row_products_tests;
 mod staging;
 
 /// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
@@ -781,6 +788,7 @@ impl MlxKernels {
         self.context.reset_peak_memory()
     }
 
+    #[cfg(test)]
     /// Whether the one-row products of this thread take the tiled kernel a window of rows takes.
     pub fn row_invariant_products(&self) -> bool {
         self.context.row_invariant_products()
@@ -2147,10 +2155,11 @@ impl MlxKernels {
         self.context.moe_combine(eo, inverse, gates, so, raw, rows)
     }
 
-    /// The fused MoE router top-k: the stable selection and renormalized gates of one
-    /// `[1, experts]` F32 probability row in one kernel. Returns `(ids [k], gates [k, 1, 1])`;
-    /// the ids are already below `experts`. `BadRequest` outside the launch contract
-    /// (F32 row, experts a multiple of 32 up to 1024, top-k up to 32).
+    /// The fused MoE router top-k: the stable selection and renormalized gates of `[rows,
+    /// experts]` F32 probability rows (one to eight) in one kernel. One row returns `(ids [k],
+    /// gates [k, 1, 1])`, a window `(ids [rows, k], gates [rows, k, 1, 1])`; the ids are already
+    /// below `experts`. `BadRequest` outside the launch contract (F32 rows, experts a multiple
+    /// of 32 up to 1024, top-k up to 32).
     pub fn router_topk(
         &mut self,
         probs: &ExecutionTensor,

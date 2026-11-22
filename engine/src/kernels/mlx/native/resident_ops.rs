@@ -2348,14 +2348,15 @@ impl Context {
         Ok(state.resident(out, Dtype::Bf16, vec![rows, hidden], byte_len))
     }
 
-    /// The fused MoE router top-k (Q36 decode): the stable top-k selection of one probability
-    /// row `probs` `[1, experts]` F32 plus the renormalized gates in ONE kernel - the same
-    /// rank order, tie rule, and gate rounding as the op chain of `route_device`. Returns
-    /// `(ids, gates)`: `ids` `[k]` U32 in rank order (already below `experts`, so the caller
-    /// wraps them in `BoundedIndices` without a clamp node) and `gates` `[k, 1, 1]` F32.
-    /// `BadRequest` unless the row is F32 `[1, experts]` with `experts` a nonzero multiple of
-    /// 32 at most 1024 and `top_k` between 1 and `experts` at most 32; the general path stays
-    /// the op chain. Health is NOT computed here: the caller keeps its own reduce node.
+    /// The fused MoE router top-k (Q36 decode): the stable top-k selection of `[rows, experts]`
+    /// F32 probability rows (one to eight rows) plus the renormalized gates in ONE kernel - the
+    /// same rank order, tie rule, and gate rounding as the op chain of `route_device`. Returns
+    /// `(ids, gates)`: one row gives `ids` `[k]` and `gates` `[k, 1, 1]`, a window gives `[rows,
+    /// k]` and `[rows, k, 1, 1]`. The ids are U32 in rank order, already below `experts`, so the
+    /// caller wraps them in `BoundedIndices` without a clamp node. `BadRequest` unless the rows
+    /// are F32 with `experts` a nonzero multiple of 32 at most 1024 and `top_k` between 1 and
+    /// `experts` at most 32; the general path stays the op chain. Health is NOT computed here:
+    /// the caller keeps its own reduce node.
     pub(in crate::kernels::mlx) fn router_topk(
         &mut self,
         probs: &ExecutionTensor,
@@ -2373,9 +2374,14 @@ impl Context {
                 "moe router top-k needs the F32 softmax row".into(),
             ));
         }
-        if probs.shape() != [1, experts] {
+        let &[rows, width] = probs.shape() else {
             return Err(EngError::BadRequest(
-                "moe router top-k needs the [1, experts] probability row".into(),
+                "moe router top-k needs a [rows, experts] probability matrix".into(),
+            ));
+        };
+        if width != experts || !(1..=8).contains(&rows) {
+            return Err(EngError::BadRequest(
+                "moe router top-k needs one to eight [experts] probability rows".into(),
             ));
         }
         if experts == 0
@@ -2390,9 +2396,14 @@ impl Context {
                     .into(),
             ));
         }
-        let dims = native_ints(label, &[1, experts, top_k, top_k.max(8), renorm as u32])?;
-        let ids_shape = native_ints(label, &[top_k])?;
-        let gates_shape = native_ints(label, &[top_k, 1, 1])?;
+        let dims = native_ints(label, &[rows, experts, top_k, top_k.max(8), renorm as u32])?;
+        let (ids_dims, gates_dims): (Vec<u32>, Vec<u32>) = if rows == 1 {
+            (vec![top_k], vec![top_k, 1, 1])
+        } else {
+            (vec![rows, top_k], vec![rows, top_k, 1, 1])
+        };
+        let ids_shape = native_ints(label, &ids_dims)?;
+        let gates_shape = native_ints(label, &gates_dims)?;
         let _input = probs.share();
         clear_message();
         let stream = state.stream.0;
@@ -2405,31 +2416,31 @@ impl Context {
                 probs.storage.native_array(),
                 dims.as_ptr(),
                 ids_shape.as_ptr(),
-                1,
+                ids_shape.len() as i32,
                 gates_shape.as_ptr(),
-                3,
+                gates_shape.len() as i32,
                 MOE_ROUTER_SOURCE.as_ptr().cast(),
                 stream,
             )
         });
-        let ids_len = u64::from(top_k);
+        let ids_len = u64::from(rows) * u64::from(top_k);
         let expected_ids = ExpectedOutput {
             operation: label,
             stream,
-            shape: &[top_k],
+            shape: &ids_dims,
             byte_len: ids_len * 4,
             dtype: Dtype::U32,
             promotes: false,
         };
         expected_ids.complete(&ids, built)?;
         let expected_gates = ExpectedOutput {
-            shape: &[top_k, 1, 1],
+            shape: &gates_dims,
             dtype: Dtype::F32,
             ..expected_ids
         };
         expected_gates.complete(&gates, Ok(()))?;
-        let ids = state.resident(ids, Dtype::U32, vec![top_k], ids_len * 4);
-        let gates = state.resident(gates, Dtype::F32, vec![top_k, 1, 1], ids_len * 4);
+        let ids = state.resident(ids, Dtype::U32, ids_dims, ids_len * 4);
+        let gates = state.resident(gates, Dtype::F32, gates_dims, ids_len * 4);
         Ok((ids, gates))
     }
 

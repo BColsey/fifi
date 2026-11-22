@@ -10,14 +10,6 @@ use crate::{
 
 const STEPS: usize = 6;
 
-/// The kernels of a decoder that runs windows: its one-row products are tiled, as in an engine
-/// that can run several sessions.
-fn window_kernels() -> MlxKernels {
-    let mut kernels = MlxKernels::try_new().unwrap();
-    kernels.set_row_invariant_products(true).unwrap();
-    kernels
-}
-
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 struct RowObservation {
     batch: usize,
@@ -344,7 +336,7 @@ fn tiny_identity(compiled: bool) -> Vec<Agreement> {
     let host = HostWeights::load(&ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap();
     let boundary = super::super::kv_plan::KV_STEP;
     let mut decoder = ResidentDecoder::new_with_activation(
-        window_kernels(),
+        MlxKernels::try_new().unwrap(),
         &ckpt,
         host,
         u32::try_from(2 * boundary).unwrap(),
@@ -415,7 +407,7 @@ fn real_identity(compiled: bool) {
     )
     .unwrap();
     let mut decoder = ResidentDecoder::new_with_activation(
-        window_kernels(),
+        MlxKernels::try_new().unwrap(),
         &real.ckpt,
         host,
         512,
@@ -481,7 +473,7 @@ fn real_weights_first_layer_where_a_window_row_differs_from_solo() {
     let dir = super::super::real::env_path("Q36_CKPT_DIR");
     let bytes = std::fs::read(dir.join("tokenizer.json")).unwrap();
     let tokenizer = crate::tokenizer::Tokenizer::from_bytes(&bytes).unwrap();
-    let prompts: Vec<_> = (0..4)
+    let prompts: Vec<_> = (0..8)
         .map(|slot| {
             let text = format!(
                 "Prompt {slot}. {}",
@@ -498,7 +490,7 @@ fn real_weights_first_layer_where_a_window_row_differs_from_solo() {
     )
     .unwrap();
     let mut decoder = ResidentDecoder::new_with_activation(
-        window_kernels(),
+        MlxKernels::try_new().unwrap(),
         &real.ckpt,
         host,
         512,
@@ -518,7 +510,7 @@ fn real_weights_first_layer_where_a_window_row_differs_from_solo() {
     for (kind, routing, references) in kinds {
         decoder.routing = routing;
         let compiled_window = kind == "compiled";
-        for rows in [2usize, 4] {
+        for rows in [2usize, 4, 8] {
             decoder.set_compile(false).unwrap();
             let (mut first, mut window_states, tokens) =
                 paired_states(&mut decoder, &prompts[..rows]);
