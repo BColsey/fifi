@@ -102,7 +102,7 @@ fn project(
 #[test]
 #[ignore = "requires an admitted CUDA device; synthetic packed expert stacks"]
 fn packed_expert_stacks_run_indexed_cuda_matvec() {
-    use super::expert_layout::{ExpertLayout, ExpertPart, ExpertStacks};
+    use super::expert_layout::{ExpertDeviceStacks, ExpertLayout, ExpertPart, ExpertStacks};
     use crate::{family::recipe::Role, kernels::cuda::resident::matvec_expert::ExpertMatvecCall};
     let per_part = 4 * 34;
     let parts = [Role::ExpertGate, Role::ExpertUp, Role::ExpertDown].map(|role| ExpertPart {
@@ -123,6 +123,8 @@ fn packed_expert_stacks_run_indexed_cuda_matvec() {
     let stream = ctx.stream().unwrap();
     let w = ctx.allocate(packed.len()).unwrap();
     w.write_at(&stream, 0, &packed).unwrap();
+    let mut device = ExpertDeviceStacks::new(&ctx, layout.clone(), 2).unwrap();
+    assert!(device.part(0).is_err());
     for slot in 0..2 {
         let mut record = vec![0; layout.bytes];
         for (part_index, part) in layout.parts.iter().enumerate() {
@@ -137,7 +139,23 @@ fn packed_expert_stacks_run_indexed_cuda_matvec() {
         stacks
             .upload_record(&layout, slot, &record, &w, &stream)
             .unwrap();
+        device.upload(&stream, slot, &record).unwrap();
+        if slot == 0 {
+            assert!(device.part(0).is_err());
+        }
     }
+    assert!(device.part(0).is_ok());
+    assert!(device.upload(&stream, 1, &[0]).is_err());
+    assert!(device.part(0).is_err());
+    let mut restored = vec![0; layout.bytes];
+    for (i, part) in layout.parts.iter().enumerate() {
+        for row in restored[part.bytes.clone()].chunks_exact_mut(34) {
+            row[..2].copy_from_slice(&0x3800u16.to_le_bytes());
+            row[2..].fill((2 + i * 2) as u8);
+        }
+    }
+    device.upload(&stream, 1, &restored).unwrap();
+    assert!(device.part(3).is_err());
     assert!(
         stacks
             .upload_record(&layout, 2, &vec![0; layout.bytes], &w, &stream)
@@ -167,12 +185,12 @@ fn packed_expert_stacks_run_indexed_cuda_matvec() {
     )
     .unwrap();
     let y = ctx.allocate(8 * 4).unwrap();
-    for (i, part) in stacks.parts.iter().enumerate() {
+    for (i, _) in stacks.parts.iter().enumerate() {
         ctx.matvec_expert(
             &stream,
             ExpertMatvecCall {
                 ty: QuantType::Q80,
-                w_stack: w.range(part.start, part.len()).unwrap(),
+                w_stack: device.part(i).unwrap(),
                 ids: ids.range(0, 8).unwrap(),
                 x_q8: q.range(0, qbytes).unwrap(),
                 x_per_slot: false,

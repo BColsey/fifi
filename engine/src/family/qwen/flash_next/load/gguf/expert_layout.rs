@@ -138,6 +138,69 @@ impl ExpertStacks {
     }
 }
 
+/// Staged device owner. Every slot must be initialized before exposing any stack,
+/// since indexed kernels may access any slot. Cross-stream ordering is the caller's duty.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in super::super::super) struct ExpertDeviceStacks {
+    layout: ExpertLayout,
+    stacks: ExpertStacks,
+    buffer: crate::kernels::cuda::DeviceBuffer,
+    ready: Vec<bool>,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl ExpertDeviceStacks {
+    pub(in super::super::super) fn new(
+        ctx: &crate::kernels::cuda::CudaContext,
+        layout: ExpertLayout,
+        slots: usize,
+    ) -> Result<Self, EngError> {
+        let stacks = ExpertStacks::new(&layout, slots)?;
+        let buffer = ctx.allocate(stacks.bytes)?;
+        Ok(Self {
+            layout,
+            stacks,
+            buffer,
+            ready: vec![false; slots],
+        })
+    }
+
+    /// An upload error invalidates that slot, including when the copy failed partway.
+    pub(in super::super::super) fn upload(
+        &mut self,
+        stream: &crate::kernels::cuda::DeviceStream,
+        slot: usize,
+        record: &[u8],
+    ) -> Result<(), EngError> {
+        let ready = self
+            .ready
+            .get_mut(slot)
+            .ok_or_else(|| EngError::BadRequest("invalid GGUF device expert slot".into()))?;
+        *ready = false;
+        self.stacks
+            .upload_record(&self.layout, slot, record, &self.buffer, stream)?;
+        *ready = true;
+        Ok(())
+    }
+
+    pub(in super::super::super) fn part(
+        &self,
+        index: usize,
+    ) -> Result<crate::kernels::cuda::DeviceRange<'_>, EngError> {
+        if self.ready.iter().any(|ready| !ready) {
+            return Err(EngError::BadRequest(
+                "GGUF expert stack has uninitialized slots".into(),
+            ));
+        }
+        let range = self
+            .stacks
+            .parts
+            .get(index)
+            .ok_or_else(|| EngError::BadRequest("invalid GGUF expert stack part".into()))?;
+        self.buffer.range(range.start, range.len())
+    }
+}
+
 impl ExpertLayout {
     pub(in super::super::super) fn for_layer(
         model: &GgufModel,
