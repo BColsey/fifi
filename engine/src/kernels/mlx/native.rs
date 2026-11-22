@@ -152,6 +152,29 @@ impl State {
     }
 }
 
+/// The contexts alive on this thread. The per-thread kernel choice in the native layer outlives
+/// no thread's last context, and never a context that is still running.
+mod live_contexts {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn enter() {
+        LIVE.with(|live| live.set(live.get() + 1));
+    }
+
+    /// Records one context gone; true when it was the last one of the thread.
+    pub(super) fn leave() -> bool {
+        LIVE.with(|live| {
+            let left = live.get().saturating_sub(1);
+            live.set(left);
+            left == 0
+        })
+    }
+}
+
 pub(super) struct Context {
     state: Option<State>,
     _thread: PhantomData<Rc<()>>,
@@ -306,6 +329,7 @@ impl Context {
                 message: "Metal threadgroup-memory limit is unavailable".into(),
             });
         }
+        live_contexts::enter();
         Ok(Self {
             state: Some(State {
                 retire,
@@ -367,9 +391,11 @@ impl Drop for Context {
             // so it only drops the count.
             compile::teardown_clear();
         }
-        // The tiled one-row products belong to the thread this context ran on: the next context
-        // there starts with the ordinary kernels until its decoder asks otherwise.
-        unsafe { ffi::mlx_set_row_invariant_products(false) };
+        // The tiled one-row products belong to the thread's contexts: the last one to go leaves
+        // the ordinary kernels to the next context there, until its decoder asks otherwise.
+        if live_contexts::leave() {
+            unsafe { ffi::mlx_set_row_invariant_products(false) };
+        }
     }
 }
 

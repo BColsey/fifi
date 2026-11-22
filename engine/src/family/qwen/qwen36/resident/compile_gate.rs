@@ -3234,13 +3234,21 @@ fn router_lcg(seed: &mut u64) -> u32 {
     (*seed >> 33) as u32
 }
 
-/// The fused router top-k gives a window the ids and gate bits the op chain gives each row.
+/// The fused router top-k gives every row of a window the ids of the op chain and the bits of its
+/// own one-row call. Its gates differ from the op chain's in the last digits (the kernel sums and
+/// divides in its own order), so those compare within two units in the last place.
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; no model weights"]
 fn the_fused_router_matches_the_op_chain_for_every_row_of_a_window() {
     const EXPERTS: usize = 64;
     let _serial = crate::native_test_lock();
     let mut k = MlxKernels::try_new().unwrap();
+    let floats = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    };
     for (top_k, renorm) in [(8u32, true), (8, false), (4, true)] {
         for batch in [1usize, 2, 4, 8] {
             let mut seed = 0x70b_u64 + batch as u64;
@@ -3266,24 +3274,39 @@ fn the_fused_router_matches_the_op_chain_for_every_row_of_a_window() {
             let gates = raw_bytes(&mut k, &gates);
             let width = top_k as usize;
             for row in 0..batch {
+                let at = row * width * 4..(row + 1) * width * 4;
                 let one = k
                     .slice(&probs, &[row as u32, 0], &[row as u32 + 1, EXPERTS as u32])
                     .unwrap();
-                let one = k.reshape(&one, &[EXPERTS as u32]).unwrap();
+                let (solo_ids, solo_gates) =
+                    k.router_topk(&one, EXPERTS as u32, top_k, renorm).unwrap();
+                let flat = k.reshape(&one, &[EXPERTS as u32]).unwrap();
                 let (want_ids, want_gates) =
-                    moe::route_op_chain(&mut k, &one, EXPERTS as u32, top_k, renorm).unwrap();
-                let want_ids = raw_bytes(&mut k, want_ids.ids());
-                let want_gates = raw_bytes(&mut k, &want_gates);
+                    moe::route_op_chain(&mut k, &flat, EXPERTS as u32, top_k, renorm).unwrap();
+                let context =
+                    format!("row {row} of a window of {batch} (k {top_k}, renorm {renorm})");
                 assert_eq!(
-                    ids[row * width * 4..(row + 1) * width * 4],
-                    want_ids,
-                    "ids of row {row} in a window of {batch} (k {top_k}, renorm {renorm})"
+                    ids[at.clone()],
+                    raw_bytes(&mut k, want_ids.ids()),
+                    "ids of {context}"
                 );
                 assert_eq!(
-                    gates[row * width * 4..(row + 1) * width * 4],
-                    want_gates,
-                    "gates of row {row} in a window of {batch} (k {top_k}, renorm {renorm})"
+                    ids[at.clone()],
+                    raw_bytes(&mut k, &solo_ids),
+                    "solo ids of {context}"
                 );
+                assert_eq!(
+                    gates[at.clone()],
+                    raw_bytes(&mut k, &solo_gates),
+                    "gates of {context} against its one-row call"
+                );
+                let want = floats(&raw_bytes(&mut k, &want_gates));
+                for (got, want) in floats(&gates[at]).iter().zip(&want) {
+                    assert!(
+                        (got - want).abs() <= 2.0 * f32::EPSILON * want.abs(),
+                        "gates of {context} against the op chain: {got} against {want}"
+                    );
+                }
             }
         }
     }

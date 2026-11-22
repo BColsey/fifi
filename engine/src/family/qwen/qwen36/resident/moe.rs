@@ -426,7 +426,7 @@ pub(super) fn route_device(
     let health = ctx.kernels.reduce(ReduceOp::Sum, &flat, 0, true)?;
     // The fused top-k kernel of the decode contract: an F32 row with a multiple-of-32 expert
     // count up to 1024 and a top-k up to 32 selects and renormalizes in ONE launch, with the
-    // same rank order, tie rule, and gate rounding as the op chain below (the general path,
+    // same rank order and tie rule as the op chain below and gates within two units in the last place (the general path,
     // which the tiny shapes and any exotic expert count keep using).
     if probs.dtype() == Dtype::F32 && experts % 32 == 0 && experts <= 1024 && top_k <= 32 {
         let (ids, gates) = ctx.kernels.router_topk(probs, experts, k, renorm)?;

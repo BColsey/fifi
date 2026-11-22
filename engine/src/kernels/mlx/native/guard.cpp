@@ -3068,9 +3068,9 @@ static int compile_moe_rows(
   if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
   // The fused router top-k kernel replaces the eight selection and renorm ops below at the
   // decode contract (a multiple-of-32 expert count up to 1024 and top-k up to 32); the ids and
-  // the gates come out in the exact shapes and the same rank order, tie rule, and gate rounding
-  // as the op chain, for one row and for a window alike, so a row's gates do not depend on its
-  // window.
+  // the gates come out in the exact shapes and the same rank order and tie rule as the op chain
+  // (the gates within two units in the last place of it), for one row and for a window alike, so
+  // a row's gates do not depend on its window.
   const bool router_kernel =
       p->experts % 32 == 0 && p->experts <= 1024 && p->top_k <= 32;
   if (status == 0 && router_kernel) {

@@ -2350,7 +2350,7 @@ impl Context {
 
     /// The fused MoE router top-k (Q36 decode): the stable top-k selection of `[rows, experts]`
     /// F32 probability rows (one to eight rows) plus the renormalized gates in ONE kernel - the
-    /// same rank order, tie rule, and gate rounding as the op chain of `route_device`. Returns
+    /// same rank order and tie rule as the op chain of `route_device`, with gates within two units in the last place. Returns
     /// `(ids, gates)`: one row gives `ids` `[k]` and `gates` `[k, 1, 1]`, a window gives `[rows,
     /// k]` and `[rows, k, 1, 1]`. The ids are U32 in rank order, already below `experts`, so the
     /// caller wraps them in `BoundedIndices` without a clamp node. `BadRequest` unless the rows
