@@ -696,6 +696,19 @@ fn full_expert_device_stacks_match_host() {
     );
     let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
     let mut state = state();
+    let other = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    assert!(
+        bank.step_disk(&stream, &other, &mut state, 0, &[0])
+            .is_err()
+    );
+    assert!(
+        bank.step_disk(&stream, &model, &mut state, 1, &[0])
+            .is_err()
+    );
+    assert!(!state.is_poisoned());
+    assert_eq!(state.slot_row(0)[0], 0);
     let copies = bank
         .step_disk(&stream, &model, &mut state, 0, &[256])
         .unwrap();

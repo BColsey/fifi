@@ -141,7 +141,8 @@ impl ExpertStacks {
 /// Staged device owner. Every slot must be initialized before exposing any stack,
 /// since indexed kernels may access any slot. Cross-stream ordering is the caller's duty.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(in super::super::super) struct ExpertDeviceStacks {
+pub(in super::super::super) struct ExpertDeviceStacks<'a> {
+    source: Option<(&'a GgufModel, usize)>,
     layout: ExpertLayout,
     stacks: ExpertStacks,
     buffer: crate::kernels::cuda::DeviceBuffer,
@@ -150,7 +151,7 @@ pub(in super::super::super) struct ExpertDeviceStacks {
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-impl ExpertDeviceStacks {
+impl<'a> ExpertDeviceStacks<'a> {
     pub(in super::super::super) fn new(
         ctx: &crate::kernels::cuda::CudaContext,
         layout: ExpertLayout,
@@ -159,6 +160,7 @@ impl ExpertDeviceStacks {
         let stacks = ExpertStacks::new(&layout, slots)?;
         let buffer = ctx.allocate(stacks.bytes)?;
         Ok(Self {
+            source: None,
             layout,
             stacks,
             buffer,
@@ -172,7 +174,7 @@ impl ExpertDeviceStacks {
     pub(in super::super::super) fn from_model(
         ctx: &crate::kernels::cuda::CudaContext,
         stream: &crate::kernels::cuda::DeviceStream,
-        model: &GgufModel,
+        model: &'a GgufModel,
         layer: usize,
         experts: &[u32],
     ) -> Result<Self, EngError> {
@@ -184,6 +186,7 @@ impl ExpertDeviceStacks {
         }
         let layout = ExpertLayout::for_layer(model, layer)?;
         let mut device = Self::new(ctx, layout, experts.len())?;
+        device.source = Some((model, layer));
         let mut record = vec![0; device.layout.bytes];
         for (slot, &expert) in experts.iter().enumerate() {
             device
@@ -214,6 +217,7 @@ impl ExpertDeviceStacks {
                 "GGUF disk step requires disk mode".into(),
             ));
         }
+        self.check_source(model, layer)?;
         let copies = match state.begin_pass(layer, picks) {
             Ok(copies) => copies,
             Err(error) => {
@@ -255,6 +259,7 @@ impl ExpertDeviceStacks {
         slot: usize,
         expert: u32,
     ) -> Result<(), EngError> {
+        self.check_source(model, layer)?;
         if slot >= self.ready.len() || expert >= model.config().dims.experts {
             return Err(EngError::BadRequest(
                 "invalid GGUF expert replacement".into(),
@@ -269,6 +274,17 @@ impl ExpertDeviceStacks {
         self.layout
             .read(model, layer, u64::from(expert), &mut record)?;
         self.upload(stream, slot, &record)
+    }
+
+    fn check_source(&self, model: &GgufModel, layer: usize) -> Result<(), EngError> {
+        if !self.source.is_some_and(|(source, original_layer)| {
+            std::ptr::eq(source, model) && original_layer == layer
+        }) {
+            return Err(EngError::BadRequest(
+                "GGUF expert bank source mismatch".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// An upload error invalidates that slot, including when the copy failed partway.
