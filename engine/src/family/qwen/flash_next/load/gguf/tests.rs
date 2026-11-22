@@ -45,6 +45,24 @@ fn expert_allocation_accounts_for_each_layer_and_staging() {
     );
 }
 
+#[test]
+fn part_major_alignment_can_exceed_packed_record_accounting() {
+    use super::expert_layout::{ExpertLayout, ExpertPart, ExpertStacks};
+    let roles = [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown];
+    let layout = ExpertLayout {
+        parts: std::array::from_fn(|i| ExpertPart {
+            role: roles[i],
+            ty: GgufType::Q80,
+            bytes: i * 34..(i + 1) * 34,
+        }),
+        bytes: 102,
+    };
+    let stacks = ExpertStacks::new(&layout, 1).unwrap();
+    assert_eq!(stacks.parts, [0..34, 36..70, 72..106]);
+    assert_eq!(stacks.bytes, 106);
+    assert!(stacks.bytes > layout.bytes);
+}
+
 /// The EXL3 configuration of the same model, as the pack path reads it.
 fn exl3_dims() -> Dims {
     let mut dims = Dims::read(CONFIG).expect("the fixture config");

@@ -4,9 +4,11 @@
 //! What differs from the pack is the expert size. A pack stores every routed expert in one
 //! format, so every expert has one size. A GGUF quantizes each layer's expert matrices on
 //! their own (a 3-bit mixed-quant file mixes IQ2_S, IQ3_XXS, IQ4_XS, IQ4_NL and Q2_0 across layers),
-//! so the size of an expert differs between layers. The planner's uniform slot is the mean
-//! expert size (the bank of a layer is sized by that layer's own records, so the bank's total
-//! bytes are exact), and the staging ring of the disk tier is charged for the largest record.
+//! so the size of an expert differs between layers. The planner's uniform slot is the rounded-up
+//! mean expert size. It does not include per-layer part-major alignment padding, so it is not
+//! generally an exact allocation or admission bound. The staged `ExpertAllocation` computes
+//! those sizes separately; it is not yet wired into this planner. The disk-tier staging ring is
+//! charged for the largest record.
 //!
 //! The tiers: expert slots in video memory first (the same count in every layer), the rest in
 //! pinned host memory while the host's budget carries it, and otherwise read from the GGUF
