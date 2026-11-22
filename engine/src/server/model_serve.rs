@@ -393,6 +393,14 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
     }
     config
 }
+
+/// The configuration a supervised worker reads for a family that has
+/// no simplified startup (Flash-Next): the bare entry a `--config`
+/// file carries, with the family named rather than detected and every
+/// option left to its default. `serve --model` still refuses such a
+/// family on its own, because a command line has nothing to name it
+/// by.
+pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
     Config {
         listen: args
             .listen
