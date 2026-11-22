@@ -4007,9 +4007,9 @@ mod rebind_tests {
         true
     }
 
-    fn resident(kernels: &mut MlxKernels, salt: f32) -> ExecutionTensor {
+    fn resident(kernels: &mut MlxKernels, base: f32) -> ExecutionTensor {
         let values: Vec<u8> = (0..8)
-            .flat_map(|lane| (salt + lane as f32 / 8.0).to_le_bytes())
+            .flat_map(|lane| (base + lane as f32 / 8.0).to_le_bytes())
             .collect();
         kernels
             .import_tensor(&Tensor::try_from_host(Dtype::F32, vec![1, 1, 8], values).unwrap())
