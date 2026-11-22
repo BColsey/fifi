@@ -959,7 +959,8 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
             .all(|start| start.ple_embedding.iter().any(|&x| x != 0.0)),
         "synthetic n-gram rows must be nonzero"
     );
-    assert!(chunk.begin_chunk(&[u32::MAX], false).is_err());
+    // A late failure after preparing token 1 must preserve the previous pending chunk.
+    assert!(chunk.begin_chunk(&[1, u32::MAX], false).is_err());
     assert!(chunk.ple_update(2, &starts[0].stream).is_err());
     for (token, start) in tokens.into_iter().zip(&starts) {
         let reference = serial.begin(token).unwrap();
@@ -1018,6 +1019,13 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
             );
         }
     }
+    let pending = chunk.begin(1).unwrap();
+    assert!(chunk.begin_chunk(&[], false).unwrap().is_empty());
+    assert!(
+        chunk.ple_update(1, &pending.stream).is_err(),
+        "empty chunk clears pending rows"
+    );
+    assert_eq!(chunk.ple_state(), serial.ple_state());
 }
 
 #[test]
