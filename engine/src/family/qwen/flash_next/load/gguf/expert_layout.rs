@@ -192,6 +192,32 @@ impl ExpertDeviceStacks {
         Ok(device)
     }
 
+    /// Read the incoming expert before overwriting its slot. The caller commits its
+    /// slot map only after success and must discard this bank on a device-copy error.
+    pub(in super::super::super) fn replace_from_model(
+        &mut self,
+        stream: &crate::kernels::cuda::DeviceStream,
+        model: &GgufModel,
+        layer: usize,
+        slot: usize,
+        expert: u32,
+    ) -> Result<(), EngError> {
+        if slot >= self.ready.len() || expert >= model.config().dims.experts {
+            return Err(EngError::BadRequest(
+                "invalid GGUF expert replacement".into(),
+            ));
+        }
+        if ExpertLayout::for_layer(model, layer)? != self.layout {
+            return Err(EngError::BadRequest(
+                "GGUF expert replacement layout mismatch".into(),
+            ));
+        }
+        let mut record = vec![0; self.layout.bytes];
+        self.layout
+            .read(model, layer, u64::from(expert), &mut record)?;
+        self.upload(stream, slot, &record)
+    }
+
     /// An upload error invalidates that slot, including when the copy failed partway.
     pub(in super::super::super) fn upload(
         &mut self,

@@ -659,7 +659,15 @@ fn full_expert_device_stacks_match_host() {
         .unwrap();
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    let bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[256]).unwrap();
+    // Slot zero initially reads sparse fixture zeros; replacement must install expert 256.
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0]).unwrap();
+    assert!(bank.replace_from_model(&stream, &model, 0, 1, 256).is_err());
+    assert!(
+        bank.replace_from_model(&stream, &model, 0, 0, model.config().dims.experts)
+            .is_err()
+    );
+    assert!(bank.part(0).is_ok());
+    bank.replace_from_model(&stream, &model, 0, 0, 256).unwrap();
     let ids = ctx.allocate(4).unwrap();
     ids.write_at(&stream, 0, &0i32.to_ne_bytes()).unwrap();
     let mut checked = 0;
