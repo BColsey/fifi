@@ -10,16 +10,42 @@
 //! after the prefix write no cache cells and feed nothing but the final norm);
 //! the pending token's decode runs the head.
 
-#[cfg(any(feature = "native-cuda", test))]
 use std::path::Path;
 
-#[cfg(any(feature = "native-cuda", test))]
-use crate::EngError;
+use crate::{EngError, capability::probe::CompiledBackends};
+
+/// Build eligibility only. A CUDA build still has to pass the Bolt checkpoint check at load.
+pub(crate) fn check_backend(model: &Path, backends: &CompiledBackends) -> Result<(), EngError> {
+    if backends.cuda {
+        Ok(())
+    } else {
+        Err(cuda_required(model))
+    }
+}
+
+pub(crate) fn cuda_required(model: &Path) -> EngError {
+    EngError::BadRequest(format!(
+        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+         this build has no CUDA engine (model directory {})",
+        model.display()
+    ))
+}
 
 /// Whether the weights file a model path names has the geometry the Bolt engine runs. The file's
-/// own header says so: no `config.json` or tokenizer file has to sit beside it. The server starter
-/// uses this to dispatch inside the gemma4 family.
-#[cfg(any(feature = "native-cuda", test))]
+/// own header says so: no `config.json` or tokenizer file has to sit beside it. Serving and
+/// diagnostics share this gate; it is not a memory check.
+pub(crate) fn check_checkpoint(model_path: &Path) -> Result<(), EngError> {
+    bolt_geometry(model_path).map_err(|cause| {
+        EngError::BadRequest(format!(
+            "gemma4 serves only the Bolt geometry on the native-cuda build; \
+             {} is not a file of it: {}",
+            model_path.display(),
+            cause.describe()
+        ))
+    })
+}
+
+/// The header and tensor inventory check of the selected weights file.
 pub(crate) fn bolt_geometry(model_path: &Path) -> Result<(), EngError> {
     let (_, files) = crate::family::gguf_select::candidates(model_path)?;
     super::open_bolt_q8(&files[0].path)

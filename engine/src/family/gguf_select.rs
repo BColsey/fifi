@@ -40,7 +40,7 @@ impl GgufFile {
     }
 }
 
-fn is_gguf(path: &Path) -> bool {
+pub(crate) fn is_gguf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
 }
