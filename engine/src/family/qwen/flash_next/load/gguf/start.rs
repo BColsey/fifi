@@ -1,10 +1,10 @@
-//! The CUDA start of a Flash-Next GGUF: opens the card, plans the memory, prints the plan, and
-//! refuses to serve while a tensor type of the file has no decode kernel.
+//! The CUDA start of a Flash-Next GGUF: opens the card, plans memory, prints the plan, and
+//! refuses to serve because the resident executor cannot yet load GGUF weights.
 //!
 //! Order: the CUDA context (for the card's free memory), the host admission snapshot, the
-//! context the plan chooses when the entry sets none, the plan line, then the kernel check.
-//! The plan runs first so that an operator whose model is refused still sees the tiers the
-//! start would use once the kernels exist.
+//! context the plan chooses when the entry sets none, the plan line, then the refusal. Missing
+//! decode kernels are reported first; their availability alone does not enable execution.
+//! The plan is preliminary and does not account for a future GGUF executor's scratch buffers.
 
 use std::convert::Infallible;
 
