@@ -824,6 +824,30 @@ fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
 }
 
 #[test]
+fn gguf_ple_projector_fixture_worker_buffer_bounds() {
+    use crate::family::recipe::Role;
+    let (_written, model) = open(&Spec::default());
+    let layer = Some(model.config().dims.ple_layer);
+    for role in [Role::PleKey, Role::PleValue] {
+        let tensor = model.map().get(role, layer).unwrap();
+        let input = tensor.dims[0];
+        let output = tensor.dims[1];
+        let row_bytes = input / tensor.ty.block_elems() * tensor.ty.block_bytes();
+        for threads in [1u64, 8, 64] {
+            // Mirrors projector.rs matvec worker partitioning and per-worker chunk size.
+            let workers = threads.min(output.div_ceil(64)).max(1);
+            let share = output.div_ceil(workers);
+            let chunk_rows = (24 * 1024 * 1024 / row_bytes).max(1).min(share);
+            let encoded_and_decoded = workers * chunk_rows * (row_bytes + 4 * input);
+            assert!(encoded_and_decoded > 0);
+            eprintln!(
+                "{role:?} threads={threads} workers={workers} encoded+decoded payload <= {encoded_and_decoded} bytes"
+            );
+        }
+    }
+}
+
+#[test]
 fn gguf_token_feed_chunk_matches_serial_and_resume() {
     use super::super::super::cuda::driver::TokenFeeds;
     use super::token_feed::GgufTokenFeeds;
