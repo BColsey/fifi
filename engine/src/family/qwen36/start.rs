@@ -156,6 +156,7 @@ pub(crate) fn start(
         if let Some(line) = plan_prefill(&mut executor, &owned, device)? {
             eprintln!("{line}");
         }
+        executor.enable_disk_tier(&owned)?;
         Ok((executor, session))
     })?;
     Ok((engine, bundle))

@@ -67,6 +67,8 @@
 //! entries, retries, and reports `false` when no victim is left; a `MemoryPlan` from the restore
 //! drops that entry and tries the next candidate.
 
+mod kv_tier;
+
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
@@ -97,7 +99,7 @@ use crate::{
         speculate::window::Commit,
     },
     kernels::MlxKernels,
-    sched::job::{PrefixHit, PrefixReport},
+    sched::job::{PrefixHit, PrefixReport, PrefixTier},
     sched::{GrowthPermit, SessionBudget},
     tokenizer::DecodeBatch,
     weights::StreamedCheckpoint,
@@ -168,6 +170,11 @@ pub(crate) struct Q36Executor {
     /// Flash-parity invariant that no test can observe on this build, because every resident array
     /// shares the retire core, which holds the process lease and outlives the decoder.
     prefix: PrefixSlot<ResidentSnapshot, PrefillPath>,
+    /// The on-disk tier behind the prefix store, when it runs. Declared beside the store so its
+    /// write queue, which holds host copies only, drops before the decoder does.
+    disk: Option<crate::family::kv_disk::HostStoreDisk>,
+    /// The tier facts of the last restore, for `prefix_report`.
+    prefix_tier: PrefixTier,
     decoder: ResidentDecoder<'static>,
     eos: Vec<u32>,
     sampler_vocab: usize,
@@ -1101,6 +1108,8 @@ impl Q36Executor {
         };
         let mut executor = Self {
             prefix: PrefixSlot::with_limits(rules.prefix_store),
+            disk: None,
+            prefix_tier: PrefixTier::default(),
             decoder,
             eos: rules.eos,
             sampler_vocab: rules.sampler_vocab,
@@ -1656,7 +1665,7 @@ impl ExecutorOps for Q36Executor {
             restore_drops: self.prefix.restore_drop_count(),
             evictions: self.prefix.eviction_count(),
             save_side: self.prefix.save_side_totals(),
-            tier: Default::default(),
+            tier: self.prefix_tier,
         })
     }
 
@@ -1669,6 +1678,7 @@ impl ExecutorOps for Q36Executor {
         // and skips the restore when the job has no boundary, so the report of such a job
         // must not carry the hit of the job before it.
         self.prefix_hit = PrefixHit::Miss;
+        self.prefix_tier = PrefixTier::default();
         self.prefix_uncached = 0;
         self.prefix_shadow = None;
         Ok(())
@@ -1777,7 +1787,8 @@ impl ExecutorOps for Q36Executor {
         let decoder = &mut self.decoder;
         let room = self.prefix_room;
         let fed = fed_positions(&st.state);
-        st.core
+        let saved = st
+            .core
             .save_prefix(&mut self.prefix, key, path, fed, kind, || {
                 if let Some(room) = room {
                     // The session budget holds the live permits and one permit per stored entry,
@@ -1793,12 +1804,18 @@ impl ExecutorOps for Q36Executor {
                     }
                 }
                 decoder.snapshot(&st.state)
-            })
+            })?;
+        if saved {
+            self.spill_after_save();
+        }
+        Ok(saved)
     }
 
     /// Restores the saved prefix into the reset session when the session rules accept the prompt.
     fn restore_prefix(&mut self, st: &mut Q36Session, prompt: &[u32]) -> Result<usize> {
         let path = self.prefill_path();
+        // The host store missed or holds a shorter prefix: the disk may hold a longer one.
+        self.promote_from_disk(st, prompt);
         let decoder = &mut self.decoder;
         let Q36Session { state, core, .. } = st;
         let covered = core.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
@@ -1809,7 +1826,29 @@ impl ExecutorOps for Q36Executor {
         self.prefix_hit = self.prefix.restored_kind().into();
         self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
         self.prefix_shadow = self.prefix.shadow_report();
+        // Without a disk tier the report keeps its default tier facts.
+        self.prefix_tier = if self.disk.is_some() {
+            self.restore_tier(covered)
+        } else {
+            PrefixTier::default()
+        };
         Ok(covered)
+    }
+
+    /// Whether the disk tier has saves the engine thread should advance while it waits.
+    fn background_pending(&self) -> bool {
+        self.disk_pending()
+    }
+
+    /// Copies a bounded part of the pending saves to the writer: the worker calls it between
+    /// jobs.
+    fn background_step(&mut self) {
+        self.pump_disk();
+    }
+
+    /// A graceful stop: writes the tips that exist only in host memory, within the tier's bound.
+    fn background_drain(&mut self) {
+        self.drain_disk();
     }
 
     /// Evicts ONE LRU entry of the engine's store per the incremental denial order of the radix
@@ -5861,6 +5900,85 @@ mod tests {
             want,
             "tokens of the restored job"
         );
+    }
+
+    /// A snapshot that goes through the family adapter the way the disk tier drives it - the host
+    /// copy a write reads, the layout, a landing filled object by object, the snapshot a landing
+    /// becomes - restores a session whose next logits equal the original's bit for bit.
+    #[test]
+    fn a_snapshot_through_the_family_adapter_restores_bit_for_bit() {
+        use super::kv_tier::{MlxFamily, Restore};
+        use crate::family::kv_disk::HostFamily;
+        let _serial = crate::native_test_lock();
+        let (mut executor, mut session) = build(prefix_rules());
+        let want = run_job(&mut executor, &mut session, &PREFIX_PROMPT, 6);
+        assert!(
+            save_key(&mut executor, &mut session),
+            "the save was refused"
+        );
+        let snapshot = executor.decoder.snapshot(&session.state).unwrap();
+        let positions = snapshot.pos() as usize;
+        let context_limit = executor.context_limit;
+        let decoder = &mut executor.decoder;
+        let mut family = MlxFamily {
+            kernels: std::cell::RefCell::new(&mut decoder.kernels),
+            weights: &decoder.weights,
+            restore: Some(Restore {
+                state: &session.state,
+                budget: &mut decoder.budget,
+                room: None,
+                held: 0,
+            }),
+            context_limit,
+        };
+        family.prepare(&snapshot).unwrap();
+        let view = family.view(&snapshot).unwrap();
+        assert_eq!(view.positions, positions);
+        let mut bytes = vec![0u8; view.bytes as usize];
+        view.slot.read(0, &mut bytes).unwrap();
+        let layout = family.layout(positions).unwrap();
+        assert_eq!(
+            layout.object_bytes().iter().sum::<u64>(),
+            view.bytes,
+            "the layout spans the bytes the view names"
+        );
+        assert!(
+            family.layout(context_limit).is_err(),
+            "an entry as long as the context does not fit"
+        );
+        let mut landing = vec![0u8; view.bytes as usize];
+        for run in layout.flat() {
+            family
+                .place(
+                    &mut landing,
+                    run.slab,
+                    &bytes[run.slab..run.slab + run.bytes],
+                )
+                .unwrap();
+        }
+        let loaded = family.finish_landing(landing, positions).unwrap();
+        drop(snapshot);
+        executor.reset(&mut session).unwrap();
+        executor
+            .decoder
+            .restore(&mut session.state, &loaded)
+            .unwrap();
+        for &token in &PREFIX_PROMPT[positions..PREFIX_PROMPT.len() - 1] {
+            executor
+                .decoder
+                .step(&mut session.state, token, StepMode::Prompt)
+                .unwrap();
+        }
+        let last = *PREFIX_PROMPT.last().unwrap();
+        for (n, token) in std::iter::once(last).chain(FORCED).enumerate() {
+            let row = executor
+                .decoder
+                .step(&mut session.state, token, StepMode::Logits)
+                .unwrap()
+                .logits
+                .unwrap();
+            assert_eq!(bits(&row), bits(&want.rows[n]), "logits row {n}");
+        }
     }
 
     #[test]

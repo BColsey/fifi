@@ -235,24 +235,18 @@ pub(crate) struct Q36Options {
     /// uncaptured body with host-mapped slot picks on a banked engine). `krow` needs
     /// `draft_rollback` `device` and the EXL3 pack.
     pub(crate) draft_verify: Option<String>,
-    /// The on-disk prefix cache of the CUDA arm: saved prefixes that survive a restart and an
+    /// The on-disk prefix cache: saved prefixes that survive a restart and an
     /// eviction from pinned host memory. Absent means the default (see `kv_disk::KV_CACHE_DEFAULT_ON`).
     pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheOptions>,
 }
 
 fn kv_cache_settings(
     options: &Q36Options,
-    backend: Backend,
     devices: &[usize],
 ) -> Result<Option<crate::family::kv_disk::KvCacheSettings>, EngError> {
     let Some(cache) = &options.kv_cache else {
         return Ok(None);
     };
-    if backend == Backend::Mlx {
-        return Err(bad(
-            "kv_cache is a CUDA member; the MLX arm refuses it".into()
-        ));
-    }
     if devices.len() > 1 {
         return Err(bad(
             "kv_cache is refused with more than one CUDA device: the card path keeps no disk tier"
@@ -1622,7 +1616,7 @@ impl Q36Settings {
         };
         let tiered = tiered_settings(options, backend)?;
         let expert_bank = expert_bank_settings(options, backend, weights)?;
-        let kv_cache = kv_cache_settings(options, backend, &cuda_devices)?;
+        let kv_cache = kv_cache_settings(options, &cuda_devices)?;
         // The card-driven choices apply to the single-device GGUF start that names neither
         // tiered experts nor host-paged KV; every member the config names is taken as given.
         let card_chosen = backend == Backend::Cuda
@@ -2056,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_member_is_checked_and_cuda_single_device_only() {
+    fn kv_cache_member_is_checked_and_single_device_only() {
         assert_eq!(cuda_offload("{}").unwrap().kv_cache, None);
         let named =
             cuda_offload(r#"{"kv_cache":{"dir":"/c","quota_bytes":2147483648,"enabled":true}}"#)
@@ -2086,12 +2080,12 @@ mod tests {
         }
         let options: Q36Options =
             serde_json::from_str(r#"{"cache_limit_bytes":1024,"kv_cache":{"dir":"/c"}}"#).unwrap();
-        let text = message(settings_for(
-            Some(&options),
-            &Q36Env::default(),
-            Backend::Mlx,
-        ));
-        assert!(text.contains("CUDA member"), "{text}");
+        let mlx = settings_for(Some(&options), &Q36Env::default(), Backend::Mlx).unwrap();
+        assert_eq!(
+            mlx.kv_cache.and_then(|cache| cache.dir),
+            Some(PathBuf::from("/c")),
+            "the MLX arm reads the member"
+        );
         assert!(serde_json::from_str::<Q36Options>(r#"{"kv_cache":{"path":"/c"}}"#).is_err());
     }
 

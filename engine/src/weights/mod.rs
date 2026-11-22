@@ -31,6 +31,8 @@ mod header;
 mod indexed;
 pub mod nemotron_index;
 pub mod nemotron_shards;
+mod pack_digest;
+pub(crate) use pack_digest::pack_digest;
 pub mod page_cache;
 mod shard;
 mod tiered;

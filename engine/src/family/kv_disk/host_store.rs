@@ -7,8 +7,9 @@
 //! damaged entry falls back. The family keeps its own store and its own restore.
 
 use super::{
-    Capture, DiskTier, Held, Hit, KvDisk, LoadIdentity, MIN_POSITIONS, PUMP_EMIT_BYTES, Reason,
-    Resolved, SlabLayout, SlotBytes, Stored, drain_bound, host_memory_is_short, hurry_flag,
+    Capture, DiskTier, Held, Hit, KV_CACHE_DEFAULT_ON, KvCacheSettings, KvDisk, KvEnv,
+    LoadIdentity, MIN_POSITIONS, ObjectRole, PUMP_EMIT_BYTES, Plan, Reason, Resolved, Run,
+    SlabLayout, SlotBytes, Stored, drain_bound, free_bytes, host_memory_is_short, hurry_flag, plan,
     restore_report, retry_while_removed, spill_candidates, spill_picks, start_line, stop_picks,
 };
 use crate::{
@@ -40,6 +41,13 @@ pub(crate) trait HostFamily {
     /// What the disk may take of a snapshot, or `None` for one that cannot be written (an entry
     /// that is not kept in host memory).
     fn view(&self, snapshot: &Self::Snapshot) -> Option<SnapshotView>;
+    /// Readies `snapshot` to be read as a slot, for a family whose host copy is made on demand
+    /// (its state lives in device memory). Called before a snapshot is queued for a write; an
+    /// error leaves it out of the queue. Families whose snapshot is host memory already keep
+    /// the default.
+    fn prepare(&self, _snapshot: &Self::Snapshot) -> Result<(), EngError> {
+        Ok(())
+    }
     /// The layout of an entry of `positions`, or why this load cannot hold one that long.
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError>;
     /// Makes room for a snapshot of `positions` laid out as `layout`: a free slot, or host memory.
@@ -58,6 +66,24 @@ pub(crate) trait HostFamily {
         landing: Self::Landing,
         positions: usize,
     ) -> Result<Self::Snapshot, EngError>;
+}
+
+/// The layout of an entry that is one object per part, the parts back to back in one slab in the
+/// order given: a family that cuts a snapshot per layer says how many bytes each layer takes.
+pub(crate) fn object_per_part(part_bytes: &[usize]) -> SlabLayout {
+    let mut at = 0;
+    let objects = part_bytes
+        .iter()
+        .map(|&bytes| {
+            let run = Run { slab: at, bytes };
+            at += bytes;
+            vec![run]
+        })
+        .collect();
+    SlabLayout {
+        objects,
+        roles: vec![ObjectRole::Pages; part_bytes.len()],
+    }
 }
 
 /// A landing in a vector of host memory, for a family whose snapshot is one: the budget is
@@ -115,6 +141,10 @@ pub(crate) fn held_of<F: HostFamily>(
     snapshot: &F::Snapshot,
     reason: Reason,
 ) -> Option<Held> {
+    if let Err(error) = family.prepare(snapshot) {
+        eprintln!("kv disk: a snapshot could not be prepared for a write: {error:?}");
+        return None;
+    }
     let view = family.view(snapshot)?;
     if view.positions < MIN_POSITIONS || key.len() != view.positions + 1 {
         return None;
@@ -150,6 +180,30 @@ pub(crate) fn host_is_short(label: &'static str, entry_bytes: u64) -> bool {
         crate::family::mem::HOST_HEADROOM_BYTES,
         entry_bytes,
     )
+}
+
+/// Plans the tier of `family_key`'s engines from the config member, the environment and the build
+/// default, and says in one line when it stays off. A malformed override stops the start; a
+/// directory that cannot be used is found later, when the tier opens, and leaves it off.
+pub(crate) fn plan_tier(
+    settings: Option<&KvCacheSettings>,
+    family_key: &'static str,
+    label: &str,
+) -> Result<Option<(Resolved, &'static str)>, EngError> {
+    let planned = plan(
+        settings,
+        &KvEnv::from_process().for_family(family_key),
+        KV_CACHE_DEFAULT_ON,
+        free_bytes,
+    )
+    .map_err(|message| EngError::BadRequest(format!("engine config: {message}")))?;
+    match planned {
+        Plan::Off(reason) => {
+            eprintln!("{label}: kv disk tier off: {reason}");
+            Ok(None)
+        }
+        Plan::On { resolved, origin } => Ok(Some((resolved, origin))),
+    }
 }
 
 /// The disk tier of one engine whose prefixes live in a host store.

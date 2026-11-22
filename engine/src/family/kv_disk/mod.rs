@@ -26,7 +26,8 @@ mod tier;
 
 pub(crate) use config::{KV_CACHE_DEFAULT_ON, KvCacheOptions, KvCacheSettings};
 pub(crate) use host_store::{
-    HostFamily, HostStoreDisk, SnapshotView, place_in_vec, restore_tier, vec_landing,
+    HostFamily, HostStoreDisk, SnapshotView, object_per_part, place_in_vec, plan_tier,
+    restore_tier, vec_landing,
 };
 pub(crate) use slab::{ObjectRole, Put, Run, SlabLayout};
 pub(crate) use tier::{

@@ -8,8 +8,8 @@ use super::resident::bolt::BoltSnapshot;
 use crate::{
     EngError,
     family::kv_disk::{
-        DiskTier, FamilyContract, HostFamily, LoadIdentity, ObjectRole, Run, SlabLayout,
-        SnapshotView, place_in_vec, vec_landing,
+        DiskTier, FamilyContract, HostFamily, LoadIdentity, SlabLayout, SnapshotView,
+        object_per_part, place_in_vec, vec_landing,
     },
 };
 
@@ -32,19 +32,7 @@ const CONTRACT: FamilyContract = FamilyContract {
 /// The layout of an entry: one object per physical layer, each the layer's part of the snapshot,
 /// back to back in the order the snapshot stores them.
 pub(super) fn entry_slab(layer_bytes: &[usize]) -> SlabLayout {
-    let mut at = 0;
-    let objects = layer_bytes
-        .iter()
-        .map(|&bytes| {
-            let run = Run { slab: at, bytes };
-            at += bytes;
-            vec![run]
-        })
-        .collect();
-    SlabLayout {
-        objects,
-        roles: vec![ObjectRole::Pages; layer_bytes.len()],
-    }
+    object_per_part(layer_bytes)
 }
 
 /// The Bolt model as the host-store adapter sees it: the bytes of each physical layer's part of
@@ -136,6 +124,7 @@ pub(super) fn load_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::kv_disk::{ObjectRole, Run};
 
     #[test]
     fn an_entry_has_one_object_per_physical_layer_back_to_back() {

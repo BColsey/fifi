@@ -109,7 +109,7 @@ mod device {
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
-            kv_disk::{self as kv_cache, HostStoreDisk, KV_CACHE_DEFAULT_ON, KvCacheSettings},
+            kv_disk::{self as kv_cache, HostStoreDisk, KvCacheSettings},
             seq_plan::{SeqInputs, plan_seqs},
             session::{
                 DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, ShadowLcp,
@@ -558,13 +558,7 @@ mod device {
         prompt_rows: Option<usize>,
         kv_cache: Option<KvCacheSettings>,
     ) -> Result<StartedEngine, EngError> {
-        let tier_plan = kv_cache::plan(
-            kv_cache.as_ref(),
-            &kv_cache::KvEnv::from_process().for_family("gemma4"),
-            KV_CACHE_DEFAULT_ON,
-            kv_cache::free_bytes,
-        )
-        .map_err(|message| EngError::BadRequest(format!("engine config: {message}")))?;
+        let tier_plan = kv_cache::plan_tier(kv_cache.as_ref(), "gemma4", TIER_LABEL)?;
         let (_, files) = crate::family::gguf_select::candidates(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
         let eos = bundle.eos_token_ids().to_vec();
@@ -620,15 +614,9 @@ mod device {
                 tokenizer: load.tokenizer.as_str().into(),
                 template: load.template.as_str().into(),
             };
-            let disk = match &tier_plan {
-                kv_cache::Plan::Off(reason) => {
-                    eprintln!("gemma4 bolt: kv disk tier off: {reason}");
-                    None
-                }
-                kv_cache::Plan::On { resolved, origin } => {
-                    HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
-                }
-            };
+            let disk = tier_plan.as_ref().and_then(|(resolved, origin)| {
+                HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
+            });
             let serve = BoltServe {
                 model,
                 eos: eos.clone(),

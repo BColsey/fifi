@@ -20,6 +20,9 @@
 //! charge). The session reserve margin and the retire cap cover it. The fixed DeltaNet state of 65,863,680 bytes is not charged by the steps; a snapshot
 //! charges it once with its entry.
 
+mod snapshot_io;
+pub(in crate::family::qwen36::resident) use snapshot_io::object_bytes;
+
 use super::attn::{KvCache, growth_bytes};
 use super::kv_plan::{KV_STEP, next_capacity, session_bytes};
 use super::ops::{Bytes, dim, short_import, zeros};
@@ -293,6 +296,8 @@ pub(super) struct ResidentSnapshot {
     /// and the last holder's drop releases them.
     kv_permits: Vec<GrowthPermit>,
     generation: u64,
+    /// The snapshot's bytes on the host, made when the disk tier first asks for them.
+    host: snapshot_io::HostCopy,
 }
 
 impl ResidentSnapshot {
@@ -695,6 +700,7 @@ impl ResidentState {
             charge,
             kv_permits,
             generation: self.generation,
+            host: snapshot_io::HostCopy::default(),
         })
     }
 
