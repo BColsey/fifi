@@ -258,11 +258,6 @@ impl CudaContext {
     /// reuse promise needs a token to compute the same thing whatever batch it rode in
     /// (a prefill batch vs a decode step) select this entry; the default entry keeps the vendored
     /// numerics, so served defaults do not move.
-    #[cfg_attr(not(test), expect(dead_code))]
-    // No production launch takes the invariant entry yet: the speed pair
-    // measured it 21 to 26 percent slower per call on the wide launches, so
-    // every projection keeps the split-plane kernel and only the device tests
-    // call this. The expect comes off when a series routes a launch here.
     pub(crate) fn matvec_q_invariant(
         &self,
         stream: &DeviceStream,

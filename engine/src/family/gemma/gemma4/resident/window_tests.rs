@@ -11,7 +11,6 @@ const CELLS: usize = 32_768;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
-use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
@@ -80,92 +79,6 @@ fn activation_columns(rng: &mut Lcg, columns: usize, k: usize) -> Vec<f32> {
         }
     }
     x
-}
-
-/// Every projection shape of the Bolt step: (rows, k).
-const PROJECTIONS: [(usize, usize); 11] = [
-    (2048, 2560),
-    (4096, 2560),
-    (512, 2560),
-    (1024, 2560),
-    (10240, 2560),
-    (2560, 10240),
-    (2560, 2048),
-    (2560, 4096),
-    (256, 2560),
-    (2560, 256),
-    (10752, 2560),
-];
-
-/// Column j of a launch of 2 to 64 columns is, byte for byte, the launch of that column alone,
-/// at every projection shape of the Bolt step.
-#[test]
-#[ignore = "requires a device; use --test-threads=1"]
-fn gemma_matvec_columns_equal_a_lone_column_at_every_bolt_shape() {
-    let (ctx, stream) = context();
-    let mut rng = Lcg(7);
-    const SCALES: [u16; 6] = [0x2800, 0x2c00, 0x3000, 0x3400, 0x1c00, 0x3800];
-    for (rows, k) in PROJECTIONS {
-        let qs: Vec<u8> = (0..rows * k).map(|_| rng.byte()).collect();
-        let scales: Vec<u8> = (0..rows * (k / 32))
-            .flat_map(|_| SCALES[rng.next() as usize % SCALES.len()].to_le_bytes())
-            .collect();
-        let w_qs = ctx.upload(&qs).expect("weights");
-        let w_scales = ctx.upload(&scales).expect("scales");
-        let x = ctx
-            .upload(&floats(&activation_columns(&mut rng, 64, k)))
-            .expect("activations");
-        let row_bytes = q8_1_bytes(k, 1).expect("row bytes");
-        let q8 = ctx.upload(&vec![0u8; row_bytes * 64]).expect("q8");
-        ctx.quantize_q8_1(
-            &stream,
-            QuantizeCall {
-                x: x.range(0, 64 * k * 4).expect("x"),
-                y: q8.range(0, row_bytes * 64).expect("y"),
-                k,
-                ncols: 64,
-            },
-        )
-        .expect("quantize");
-        let launch = |first: usize, columns: usize, y: &DeviceBuffer| {
-            ctx.gemma_matvec(
-                &stream,
-                GemmaMatvecCall {
-                    w_qs: w_qs.range(0, w_qs.bytes()).expect("qs"),
-                    w_scales: w_scales.range(0, w_scales.bytes()).expect("scales"),
-                    x_q8: q8
-                        .range(first * row_bytes, q8_1_bytes(k, columns).expect("bytes"))
-                        .expect("x"),
-                    y: y.range(0, rows * columns * 4).expect("y"),
-                    k,
-                    rows,
-                    ncols: columns,
-                },
-            )
-            .expect("launch");
-            stream.synchronize().expect("sync");
-        };
-        let single = ctx.upload(&vec![0u8; rows * 4]).expect("single");
-        let wide = ctx.upload(&vec![0u8; rows * 64 * 4]).expect("wide");
-        let alone: Vec<Vec<u8>> = (0..64)
-            .map(|column| {
-                launch(column, 1, &single);
-                download(&ctx, &single, rows * 4)
-            })
-            .collect();
-        for columns in 2..=64 {
-            launch(0, columns, &wide);
-            let got = download(&ctx, &wide, rows * 64 * 4);
-            for column in 0..columns {
-                assert_eq!(
-                    &got[column * rows * 4..(column + 1) * rows * 4],
-                    &alone[column][..],
-                    "rows {rows} k {k}: column {column} of {columns}"
-                );
-            }
-        }
-        eprintln!("gemma_matvec rows {rows} k {k}: columns 2 to 64 equal the lone column");
-    }
 }
 
 /// The head of a window runs the vendored Q8_0 matvec. Column j of a launch of up to
@@ -583,7 +496,7 @@ fn a_window_of_sessions_equals_the_solo_runs() {
     };
     let mut model = super::bolt::load_choosing(
         &[file],
-        crate::family::gemma4::config::MaxSeqs::Count(Bolt::WINDOW_ROWS),
+        crate::family::gemma::gemma4::config::MaxSeqs::Count(Bolt::WINDOW_ROWS),
         &|_| {},
     )
     .expect("load");

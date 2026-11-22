@@ -91,7 +91,6 @@ pub(crate) mod expert_activation;
 pub(crate) mod gdn_conv;
 pub(crate) mod gdn_delta;
 pub(crate) mod gelu_ffn;
-pub(crate) mod gemma_matvec;
 pub(crate) mod hyper;
 pub(crate) mod kv8_append;
 pub(crate) mod kv_f16_append;

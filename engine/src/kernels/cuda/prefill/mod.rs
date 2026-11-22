@@ -26,6 +26,7 @@
 // One `pub(crate) mod <n>;` line per kernel, alphabetical, below this line.
 pub(crate) mod attn_prefill;
 pub(crate) mod attn_prep_chunk;
+pub(crate) mod dense_chunk_gemm;
 pub(crate) mod flint_qk;
 pub(crate) mod gdn_scan_seq;
 pub(crate) mod gemm_dq;

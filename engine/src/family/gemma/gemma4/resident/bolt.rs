@@ -37,8 +37,7 @@ use super::bolt_graph::{
 };
 use super::step::layer_buffers;
 use super::{
-    Kv, PackedMatrix, Vector, epsilon, matrix, matrix_from_bytes, packed_matrix, scalar, vector,
-    vector_filled, zero,
+    Kv, Vector, epsilon, matrix, matrix_from_bytes, matvec, scalar, vector, vector_filled, zero,
 };
 use crate::EngError;
 use crate::family::card_fit::CellFigures;
@@ -48,13 +47,13 @@ use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{
     WideAttention, WideCall, WideGeometry, WideLoad,
 };
+use crate::kernels::cuda::prefill::dense_chunk_gemm::DenseChunkGemm;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
 use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
-use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
@@ -85,6 +84,10 @@ pub(crate) const GLOBAL_HEAD: usize = NEMOTRON_BOLT_E4B.global_head_dim as usize
 /// Width of one per-layer input and of the gated mixing inside every layer.
 pub(crate) const PLE: usize = 256;
 pub(crate) const FFN: usize = 10_240;
+/// The fewest prompt rows of a chunk that run on the tensor cores; a shorter chunk keeps the matvec.
+const MMQ_MIN_ROWS: usize = 16;
+/// The widest activation a chunk projects.
+const MMQ_K_MAX: usize = FFN;
 /// The model's maximum positions: the ceiling of the planned KV cells per physical layer.
 pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {
     Some(dense) => dense.context_limit as usize,
@@ -139,7 +142,7 @@ pub(crate) fn scratch_bytes(splits: Option<usize>, wide: bool, rows: usize) -> O
     // The wide prefill attention's partial buffer, present only when the device gate passed; the
     // buffer holds at most 128 splits, so the model maximum bounds it for every planned cell count.
     total = total.checked_add(wide_geometry(MAX_CELLS).charge(wide)?)?;
-    Some(total)
+    total.checked_add(DenseChunkGemm::bytes(MMQ_K_MAX, rows)?)
 }
 
 /// The parity dump directory, read from BOLT_TRACE_DIR once. The trace hook
@@ -220,18 +223,18 @@ pub(crate) struct BoltLayer {
     attn_norm: Vector,
     q_norm: Vector,
     k_norm: Option<Vector>,
-    q: PackedMatrix,
-    k: Option<PackedMatrix>,
-    v: Option<PackedMatrix>,
-    out: PackedMatrix,
+    q: NativeWeight,
+    k: Option<NativeWeight>,
+    v: Option<NativeWeight>,
+    out: NativeWeight,
     post_attn_norm: Vector,
     ffn_norm: Vector,
-    ffn_gate: PackedMatrix,
-    ffn_up: PackedMatrix,
-    ffn_down: PackedMatrix,
+    ffn_gate: NativeWeight,
+    ffn_up: NativeWeight,
+    ffn_down: NativeWeight,
     post_ffw_norm: Vector,
-    ple_gate: PackedMatrix,
-    ple_proj: PackedMatrix,
+    ple_gate: NativeWeight,
+    ple_proj: NativeWeight,
     post_ple_norm: Vector,
     table: NativeWeight,
     scale: f32,
@@ -419,11 +422,13 @@ pub(crate) struct Bolt {
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<BoltLayer>,
     pub(crate) embed: NativeWeight,
-    pub(crate) ple_model: PackedMatrix,
+    pub(crate) ple_model: NativeWeight,
     pub(crate) ple_model_norm: Vector,
     pub(crate) out_norm: Vector,
     pub(crate) rope_freqs: Option<Vector>,
     pub(crate) scratch: Scratch,
+    /// The tensor-core GEMM of a prompt chunk's projections.
+    mmq: Option<DenseChunkGemm>,
     pub(crate) logits: Vector,
     pub(crate) logits_capped: Vector,
     pub(crate) eps: f32,
@@ -641,7 +646,7 @@ pub(crate) fn load_choosing(
             } else {
                 None
             },
-            q: packed_matrix(
+            q: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_q.weight"),
@@ -649,7 +654,7 @@ pub(crate) fn load_choosing(
                 HEADS * head,
             )?,
             k: if physical {
-                Some(packed_matrix(
+                Some(matrix(
                     &weights,
                     &ctx,
                     &format!("{base}attn_k.weight"),
@@ -660,7 +665,7 @@ pub(crate) fn load_choosing(
                 None
             },
             v: if physical {
-                Some(packed_matrix(
+                Some(matrix(
                     &weights,
                     &ctx,
                     &format!("{base}attn_v.weight"),
@@ -670,7 +675,7 @@ pub(crate) fn load_choosing(
             } else {
                 None
             },
-            out: packed_matrix(
+            out: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_output.weight"),
@@ -684,15 +689,15 @@ pub(crate) fn load_choosing(
                 HIDDEN,
             )?,
             ffn_norm: vector(&weights, &ctx, &format!("{base}ffn_norm.weight"), HIDDEN)?,
-            ffn_gate: packed_matrix(
+            ffn_gate: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_gate.weight"),
                 HIDDEN,
                 FFN,
             )?,
-            ffn_up: packed_matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
-            ffn_down: packed_matrix(
+            ffn_up: matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
+            ffn_down: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_down.weight"),
@@ -705,14 +710,14 @@ pub(crate) fn load_choosing(
                 &format!("{base}post_ffw_norm.weight"),
                 HIDDEN,
             )?,
-            ple_gate: packed_matrix(
+            ple_gate: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}{}", spelling.ple_gate()),
                 HIDDEN,
                 PLE,
             )?,
-            ple_proj: packed_matrix(
+            ple_proj: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}{}", spelling.ple_proj()),
@@ -753,7 +758,7 @@ pub(crate) fn load_choosing(
         });
     }
     let embed = matrix(&weights, &ctx, "token_embd.weight", HIDDEN, VOCAB)?;
-    let ple_model = packed_matrix(
+    let ple_model = matrix(
         &weights,
         &ctx,
         spelling.ple_model_proj(),
@@ -818,6 +823,9 @@ pub(crate) fn load_choosing(
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
     let wide_prefill = wide_load.build(&ctx, wide_geometry(cells))?;
+    let mmq = DenseChunkGemm::new(&ctx, MMQ_K_MAX, rows)
+        .inspect_err(|error| eprintln!("bolt cuda: no tensor-core prefill: {}", error.describe()))
+        .ok();
     let draw = crate::family::decode_step::draw::DrawBuffers::new(
         &ctx,
         Bolt::WINDOW_ROWS,
@@ -837,6 +845,7 @@ pub(crate) fn load_choosing(
         out_norm,
         rope_freqs,
         scratch,
+        mmq,
         logits,
         logits_capped,
         eps,
@@ -1342,6 +1351,47 @@ impl Bolt {
     }
 
     /// Keeps the existing norm reduction and quantization order for every activation row.
+    /// Quantizes the `m` f32 rows `x` of `weight`'s width for the [`Self::project`] calls that
+    /// follow, when the chunk runs on the tensor cores.
+    fn project_input(&self, weight: &NativeWeight, x: &Vector, m: usize) -> Result<(), EngError> {
+        match self.mmq.as_ref().filter(|_| m >= MMQ_MIN_ROWS) {
+            Some(gemm) => {
+                let x = x.buf.range(0, m * weight.k() * 4)?;
+                gemm.input(&self.ctx, &self.stream, weight, x, m)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// One projection of `m` rows into `y`: the tensor-core GEMM of a wide chunk on the rows of the
+    /// last [`Self::project_input`], else the matvec on their q8_1 rows `x_q8`.
+    fn project(
+        &self,
+        weight: &NativeWeight,
+        x_q8: &DeviceBuffer,
+        y: &Vector,
+        m: usize,
+    ) -> Result<(), EngError> {
+        match self.mmq.as_ref().filter(|_| m >= MMQ_MIN_ROWS) {
+            Some(gemm) => {
+                let y = y.buf.range(0, m * weight.n_rows() * 4)?;
+                gemm.project(&self.ctx, &self.stream, weight, m, y)
+            }
+            None => self.matvec(weight, weight.n_rows(), x_q8, y, m),
+        }
+    }
+
+    fn matvec(
+        &self,
+        weight: &NativeWeight,
+        rows: usize,
+        x_q8: &DeviceBuffer,
+        y: &Vector,
+        m: usize,
+    ) -> Result<(), EngError> {
+        matvec(&self.ctx, &self.stream, weight, rows, x_q8, y, m)
+    }
+
     fn norm_rows<'b>(
         &self,
         stream: &DeviceStream,
@@ -1642,21 +1692,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: self.ple_model.qs.range(0, self.ple_model.qs_bytes())?,
-                w_scales: self
-                    .ple_model
-                    .scales
-                    .range(0, self.ple_model.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.ple_all.buf.range(0, m * ple_rows * 4)?,
-                k: HIDDEN,
-                rows: ple_rows,
-                ncols: m,
-            },
-        )?;
+        self.matvec(&self.ple_model, ple_rows, &sc.q8_hidden, &sc.ple_all, m)?;
         ctx.row_scale(
             stream,
             RowScaleCall {
@@ -1867,33 +1903,11 @@ impl Bolt {
             sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             m,
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.q.qs.range(0, layer.q.qs_bytes())?,
-                w_scales: layer.q.scales.range(0, layer.q.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.q.buf.range(0, m * q_rows * 4)?,
-                k: HIDDEN,
-                rows: q_rows,
-                ncols: m,
-            },
-        )?;
+        self.project_input(&layer.q, &sc.nrm, m)?;
+        self.project(&layer.q, &sc.q8_hidden, &sc.q, m)?;
         if let (Some(k), Some(v)) = (&layer.k, &layer.v) {
-            for (weight, y) in [(k, &sc.k), (v, &sc.v)] {
-                ctx.gemma_matvec(
-                    stream,
-                    GemmaMatvecCall {
-                        w_qs: weight.qs.range(0, weight.qs_bytes())?,
-                        w_scales: weight.scales.range(0, weight.scales_bytes())?,
-                        x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                        y: y.buf.range(0, m * kv_rows * 4)?,
-                        k: HIDDEN,
-                        rows: kv_rows,
-                        ncols: m,
-                    },
-                )?;
-            }
+            self.project(k, &sc.q8_hidden, &sc.k, m)?;
+            self.project(v, &sc.q8_hidden, &sc.v, m)?;
         }
         // The QK-norm of the reference graph: each head of q and of k is
         // RMS-normalized and scaled by its own weight before RoPE. Values get the
@@ -1958,18 +1972,8 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.out.qs.range(0, layer.out.qs_bytes())?,
-                w_scales: layer.out.scales.range(0, layer.out.scales_bytes())?,
-                x_q8: sc.q8_ctx.range(0, sc.q8_ctx.bytes())?,
-                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
-                k: q_rows,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        self.project_input(&layer.out, &sc.ctx_out, m)?;
+        self.project(&layer.out, &sc.q8_ctx, &sc.proj, m)?;
         self.trace(pos, &format!("L{index}_proj"), &sc.proj, m * HIDDEN * 4);
         self.norm_rows(
             stream,
@@ -2003,20 +2007,9 @@ impl Bolt {
             sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             m,
         )?;
-        for (weight, y) in [(&layer.ffn_gate, &sc.gate), (&layer.ffn_up, &sc.up)] {
-            ctx.gemma_matvec(
-                stream,
-                GemmaMatvecCall {
-                    w_qs: weight.qs.range(0, weight.qs_bytes())?,
-                    w_scales: weight.scales.range(0, weight.scales_bytes())?,
-                    x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                    y: y.buf.range(0, m * FFN * 4)?,
-                    k: HIDDEN,
-                    rows: FFN,
-                    ncols: m,
-                },
-            )?;
-        }
+        self.project_input(&layer.ffn_gate, &sc.nrm, m)?;
+        self.project(&layer.ffn_gate, &sc.q8_hidden, &sc.gate, m)?;
+        self.project(&layer.ffn_up, &sc.q8_hidden, &sc.up, m)?;
         ctx.gelu_ffn(
             stream,
             GeluFfnCall {
@@ -2036,21 +2029,8 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.ffn_down.qs.range(0, layer.ffn_down.qs_bytes())?,
-                w_scales: layer
-                    .ffn_down
-                    .scales
-                    .range(0, layer.ffn_down.scales_bytes())?,
-                x_q8: sc.q8_mixed.range(0, sc.q8_mixed.bytes())?,
-                y: sc.down.buf.range(0, m * HIDDEN * 4)?,
-                k: FFN,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        self.project_input(&layer.ffn_down, &sc.mixed, m)?;
+        self.project(&layer.ffn_down, &sc.q8_mixed, &sc.down, m)?;
         self.norm_rows(
             stream,
             sc.down.buf.range(0, m * HIDDEN * 4)?,
@@ -2150,21 +2130,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.ple_gate.qs.range(0, layer.ple_gate.qs_bytes())?,
-                w_scales: layer
-                    .ple_gate
-                    .scales
-                    .range(0, layer.ple_gate.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.ple_nrm.buf.range(0, m * PLE * 4)?,
-                k: HIDDEN,
-                rows: PLE,
-                ncols: m,
-            },
-        )?;
+        self.matvec(&layer.ple_gate, PLE, &sc.q8_hidden, &sc.ple_nrm, m)?;
         ctx.gelu_ffn(
             stream,
             GeluFfnCall {
@@ -2186,21 +2152,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.ple_proj.qs.range(0, layer.ple_proj.qs_bytes())?,
-                w_scales: layer
-                    .ple_proj
-                    .scales
-                    .range(0, layer.ple_proj.scales_bytes())?,
-                x_q8: sc.q8_ple_mixed.range(0, sc.q8_ple_mixed.bytes())?,
-                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
-                k: PLE,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        self.matvec(&layer.ple_proj, HIDDEN, &sc.q8_ple_mixed, &sc.proj, m)?;
         self.trace(pos, &format!("L{index}_pled"), &sc.proj, m * HIDDEN * 4);
         self.norm_rows(
             stream,
@@ -2320,8 +2272,9 @@ mod tests {
         let disarmed = scratch_bytes(None, false, 8).expect("the disarmed scratch computes");
         let armed =
             scratch_bytes(Some(ATTN_SPLIT_MAX), false, 8).expect("the armed scratch computes");
-        assert_eq!(disarmed, 5_172_748);
-        assert_eq!(armed, 9_383_436);
+        let gemm = DenseChunkGemm::bytes(MMQ_K_MAX, 8).expect("the gemm charge computes");
+        assert_eq!(disarmed, 5_172_748 + gemm);
+        assert_eq!(armed, 9_383_436 + gemm);
         assert_eq!(armed - disarmed, attn_part_bytes(ATTN_SPLIT_MAX, 8) as u64);
         // The wide prefill attention's partial buffer is charged only where the gate passed.
         let wide = wide_geometry(MAX_CELLS)
@@ -2715,37 +2668,7 @@ mod tests {
                 },
             )
             .expect("quantize {k}");
-            ctx.gemma_matvec(
-                &stream,
-                GemmaMatvecCall {
-                    w_qs: i8s(256 * k).range(0, 256 * k).unwrap(),
-                    w_scales: u16s(256 * (k / 32)).range(0, 256 * (k / 32) * 2).unwrap(),
-                    x_q8: i8s(q8_1_bytes(k, 1).unwrap())
-                        .range(0, q8_1_bytes(k, 1).unwrap())
-                        .unwrap(),
-                    y: f32s(256).range(0, 256 * 4).unwrap(),
-                    k,
-                    rows: 256,
-                    ncols: 1,
-                },
-            )
-            .expect("matvec k={k}");
         }
-        ctx.gemma_matvec(
-            &stream,
-            GemmaMatvecCall {
-                w_qs: i8s(10752 * 2560).range(0, 10752 * 2560).unwrap(),
-                w_scales: u16s(10752 * 80).range(0, 10752 * 80 * 2).unwrap(),
-                x_q8: i8s(q8_1_bytes(2560, 1).unwrap())
-                    .range(0, q8_1_bytes(2560, 1).unwrap())
-                    .unwrap(),
-                y: f32s(10752).range(0, 10752 * 4).unwrap(),
-                k: 2560,
-                rows: 10752,
-                ncols: 1,
-            },
-        )
-        .expect("matvec ple projection");
         // The per-head norm at 256 and 512, including the interior-slice pattern.
         let ple = f32s(256 * 42);
         for n in [256usize, 512] {
@@ -3068,11 +2991,22 @@ mod tests {
                 pos += batch.len();
             }
             let elapsed = started.elapsed();
-            assert_logits(&logits(&model), &expected);
+            // A chunk of 16 rows or more runs on the tensor cores, whose f32 sums add in another
+            // order: its logits stay within the distribution tolerance instead of the matvec's.
+            let check = |got: &[f32], want: &[f32]| {
+                if width < MMQ_MIN_ROWS {
+                    return assert_logits(got, want);
+                }
+                let (kl, max_abs, same_top) = compare_logits(want, got);
+                eprintln!("tensor cores m={width}: kl {kl:.3e} max|dlogit| {max_abs:.3e}");
+                assert!(kl < 0.1, "m={width}: a different distribution");
+                let _ = (same_top, max_abs);
+            };
+            check(&logits(&model), &expected);
             model
                 .decode(&seq, 2, prompt.len())
                 .expect("batch continuation");
-            assert_logits(&logits(&model), &continued);
+            check(&logits(&model), &continued);
             eprintln!(
                 "timing {} batched tokens m={width} {elapsed:?}; speedup {:.3}",
                 prompt.len(),
@@ -3167,8 +3101,7 @@ mod tests {
             let (new, new_launches, new_time) = run(&mut model, true);
             // Pieces of any width whose rows all sit in chunks of two or more leave the logits of
             // pieces of 8 bit for bit: the wide attention of a row does not depend on the cut.
-            let planned = model.rows;
-            for &width in widths.iter().chain([&planned, &33]) {
+            for &width in &widths {
                 // A lone row at the end of a prompt takes the decode attention, so a width that
                 // leaves one differs from pieces of 8 by the attention paths' own difference.
                 if len % width == 1 || len % Bolt::WINDOW_ROWS == 1 {
@@ -3262,17 +3195,36 @@ mod tests {
                 .map_or(0, |(i, _)| i)
         };
         let lone_heavy = std::env::var("BOLT_SCORE_CUT").is_ok_and(|cut| cut == "lone-heavy");
+        let tensor_mode = std::env::var("BOLT_SCORE_MODE").is_ok_and(|mode| mode == "tensor");
+        let mut stash = None;
         let mut report = String::new();
         for (doc, line) in docs.lines().enumerate() {
             let tokens: Vec<u32> = line
                 .split_whitespace()
                 .map(|t| t.parse().expect("a token id"))
                 .collect();
-            let widths = score_widths(tokens.len(), doc as u64 + 1, lone_heavy);
+            let widths = if tensor_mode {
+                // Chunks of the planned rows, which run on the tensor cores, and the remainder.
+                let mut widths = vec![model.rows; tokens.len() / model.rows];
+                widths.extend(Some(tokens.len() % model.rows).filter(|&rest| rest > 0));
+                widths
+            } else {
+                score_widths(tokens.len(), doc as u64 + 1, lone_heavy)
+            };
             // Scored positions: the last token of every third piece, whose next token is known.
             let mut rows: Vec<(usize, usize, [Vec<f32>; 2])> = Vec::new();
             for (pass, wide) in [false, true].into_iter().enumerate() {
-                model.use_wide_prefill(wide);
+                if tensor_mode {
+                    // The two passes differ in the projections only: the matvec, then the tensor cores.
+                    model.use_wide_prefill(true);
+                    if pass == 0 {
+                        stash = model.mmq.take();
+                    } else {
+                        model.mmq = stash.take();
+                    }
+                } else {
+                    model.use_wide_prefill(wide);
+                }
                 let mut pos = 0;
                 for (index, &width) in widths.iter().enumerate() {
                     let batch = &tokens[pos..pos + width];
@@ -3334,7 +3286,7 @@ mod tests {
         let n = prompt.len();
         // The planned rows (the shipped cap), 33 and 3 (partial final batches) and 1.
         for width in [
-            crate::family::gemma4::budget::BOLT_PREFILL_LADDER[0],
+            crate::family::gemma::gemma4::budget::BOLT_PREFILL_LADDER[0],
             33,
             Bolt::WINDOW_ROWS,
             3,
@@ -3362,7 +3314,7 @@ mod tests {
             // Full-layer prefill overwrites the same cells from position 0:
             // every batch reads logits, so every layer runs.
             let mut pos = 0;
-            for batch in prompt.chunks(Bolt::WINDOW_ROWS) {
+            for batch in prompt.chunks(width) {
                 model
                     .prefill_batch(&seq, batch, pos, true)
                     .expect("full batch");

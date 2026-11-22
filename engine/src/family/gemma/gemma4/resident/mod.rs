@@ -40,6 +40,7 @@ use crate::family::project::cuda::matrix::{
 };
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};
+use crate::kernels::cuda::resident::matvec_q::MatvecCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, NativeWeight};
 use crate::weights::{GgufType, GgufWeights};
@@ -54,25 +55,6 @@ pub(crate) const HEADS: usize = 16;
 pub(crate) const CELLS: usize = super::gguf::HUMANIZER_CELLS as usize;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 pub(crate) const FFN: usize = 15360;
-
-/// One Q8_0 matrix resident on the device in the split layout gemma_matvec reads: one
-/// int8 quant plane per row, then one half scale per 32-value block.
-pub(crate) struct PackedMatrix {
-    pub(crate) qs: DeviceBuffer,
-    pub(crate) scales: DeviceBuffer,
-    rows: usize,
-    k: usize,
-}
-
-impl PackedMatrix {
-    fn qs_bytes(&self) -> usize {
-        self.rows * self.k
-    }
-
-    fn scales_bytes(&self) -> usize {
-        self.rows * (self.k / 32) * 2
-    }
-}
 
 pub(crate) struct Vector {
     pub(crate) buf: DeviceBuffer,
@@ -97,15 +79,15 @@ pub(crate) struct Layer {
     attn_norm: Vector,
     q_norm: Vector,
     k_norm: Vector,
-    q: PackedMatrix,
-    k: PackedMatrix,
-    v: Option<PackedMatrix>,
-    out: PackedMatrix,
+    q: NativeWeight,
+    k: NativeWeight,
+    v: Option<NativeWeight>,
+    out: NativeWeight,
     post_attn_norm: Vector,
     ffn_norm: Vector,
-    gate: PackedMatrix,
-    up: PackedMatrix,
-    down: PackedMatrix,
+    gate: NativeWeight,
+    up: NativeWeight,
+    down: NativeWeight,
     post_ffw_norm: Vector,
     scale: f32,
     global: bool,
@@ -198,14 +180,14 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
             attn_norm: vector(&weights, &ctx, &format!("{base}attn_norm.weight"), HIDDEN)?,
             q_norm: vector(&weights, &ctx, &format!("{base}attn_q_norm.weight"), head)?,
             k_norm: vector(&weights, &ctx, &format!("{base}attn_k_norm.weight"), head)?,
-            q: packed_matrix(
+            q: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_q.weight"),
                 HIDDEN,
                 HEADS * head,
             )?,
-            k: packed_matrix(
+            k: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_k.weight"),
@@ -215,7 +197,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
             v: if global {
                 None
             } else {
-                Some(packed_matrix(
+                Some(matrix(
                     &weights,
                     &ctx,
                     &format!("{base}attn_v.weight"),
@@ -223,7 +205,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
                     n_kv * head,
                 )?)
             },
-            out: packed_matrix(
+            out: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_output.weight"),
@@ -237,15 +219,15 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
                 HIDDEN,
             )?,
             ffn_norm: vector(&weights, &ctx, &format!("{base}ffn_norm.weight"), HIDDEN)?,
-            gate: packed_matrix(
+            gate: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_gate.weight"),
                 HIDDEN,
                 FFN,
             )?,
-            up: packed_matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
-            down: packed_matrix(
+            up: matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
+            down: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_down.weight"),
@@ -334,67 +316,34 @@ fn vector_filled(ctx: &CudaContext, len: usize, value: f32) -> Result<Vector, En
     })
 }
 
-/// Reads one Q8_0 tensor and splits each 34-byte block into the quant plane and the
-/// half scale plane that gemma_matvec reads.
-fn packed_matrix(
-    weights: &GgufWeights,
+/// The shared matvec of the first `rows` rows of `weight` over the `m` q8_1 rows `x_q8`, into the
+/// rows of `y`, in launches of up to 8 columns; the column-invariant entry makes a column the same
+/// bytes whatever launch it sits in, which the window and chunk equalities of the step rely on.
+fn matvec(
     ctx: &CudaContext,
-    name: &str,
-    k: usize,
+    stream: &DeviceStream,
+    weight: &NativeWeight,
     rows: usize,
-) -> Result<PackedMatrix, EngError> {
-    let (ty, bytes) = weights.read_tensor(name)?;
-    if ty != GgufType::Q80 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} is {}, expected Q8_0",
-            ty.name()
-        )));
+    x_q8: &DeviceBuffer,
+    y: &Vector,
+    m: usize,
+) -> Result<(), EngError> {
+    let k = weight.k();
+    let row_bytes = q8_1_bytes(k, 1).expect("activation row size");
+    for first in (0..m).step_by(8) {
+        let columns = 8.min(m - first);
+        let call = MatvecCall {
+            ty: weight.quant(),
+            w: weight.buffer().range(0, weight.buffer().bytes())?,
+            x_q8: x_q8.range(first * row_bytes, columns * row_bytes)?,
+            y: y.buf.range(first * rows * 4, columns * rows * 4)?,
+            k,
+            rows,
+            ncols: columns,
+        };
+        ctx.matvec_q_invariant(stream, call)?;
     }
-    let blocks = k / 32;
-    if bytes.len() != rows * blocks * 34 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} holds {} bytes, expected {}",
-            bytes.len(),
-            rows * blocks * 34
-        )));
-    }
-    let mut qs = vec![0u8; rows * k];
-    let mut scales = vec![0u8; rows * blocks * 2];
-    // The split is a pure copy, so it runs over row chunks: 11.6 GB serially cost 23 s
-    // of load on the Jetson.
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(16);
-    let per = rows.div_ceil(workers.max(1));
-    let source = &bytes;
-    std::thread::scope(|scope| {
-        let chunks = qs
-            .chunks_mut(per * k)
-            .zip(scales.chunks_mut(per * blocks * 2))
-            .enumerate();
-        for (index, (qs_chunk, scales_chunk)) in chunks {
-            let first = index * per;
-            scope.spawn(move || {
-                for (local, r) in (first..rows.min(first + per)).enumerate() {
-                    for b in 0..blocks {
-                        let at = (r * blocks + b) * 34;
-                        let q_at = local * k + b * 32;
-                        let s_at = local * blocks * 2 + b * 2;
-                        scales_chunk[s_at] = source[at];
-                        scales_chunk[s_at + 1] = source[at + 1];
-                        qs_chunk[q_at..q_at + 32].copy_from_slice(&source[at + 2..at + 34]);
-                    }
-                }
-            });
-        }
-    });
-    Ok(PackedMatrix {
-        qs: ctx.upload(&qs)?,
-        scales: ctx.upload(&scales)?,
-        rows,
-        k,
-    })
+    Ok(())
 }
 
 fn vector(

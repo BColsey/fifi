@@ -64,7 +64,6 @@ pub(in crate::kernels::cuda) mod expert_activation;
 pub(in crate::kernels::cuda) mod gdn_conv;
 pub(in crate::kernels::cuda) mod gdn_delta;
 pub(in crate::kernels::cuda) mod gelu_ffn;
-pub(in crate::kernels::cuda) mod gemma_matvec;
 pub(in crate::kernels::cuda) mod graph;
 pub(in crate::kernels::cuda) mod hyper;
 pub(in crate::kernels::cuda) mod kv8_append;
