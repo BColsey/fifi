@@ -20,6 +20,7 @@ mod prefill;
 mod window;
 
 const MIX_EPS: f32 = 1e-6;
+pub(super) const ROUTE_NORMALIZATION_FLOOR: f32 = 1.0 / 16384.0;
 
 #[derive(Deserialize)]
 struct CpuConfig {
@@ -218,8 +219,12 @@ impl CpuForward {
             relative_dims: self.math.d_rel,
             relative_extent: self.math.rel_extent,
         };
+        let config = super::gguf_weights::CudaConfig {
+            attention,
+            draft_target: self.draft_window_enabled(),
+        };
         self.weights
-            .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve, attention)
+            .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve, config)
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -706,7 +711,7 @@ impl CpuForward {
             .iter()
             .map(|&id| scores[id])
             .sum::<f32>()
-            .max(1.0 / 16384.0);
+            .max(ROUTE_NORMALIZATION_FLOOR);
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Weights::Gguf(weights) = &self.weights {
             weights.observe_experts(layer, &selected);
@@ -721,6 +726,22 @@ impl CpuForward {
     }
 
     fn moe(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if !self.draft_window_enabled()
+            && let Weights::Gguf(weights) = &self.weights
+            && let Some(out) = weights.device_routed_experts(
+                prefix,
+                super::cuda_projection::gguf::router::RouteInput {
+                    layer: layer as u32,
+                    input,
+                    caps: [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
+                    scale: self.math.route_scale,
+                },
+                self.phase_profile.as_deref(),
+            )?
+        {
+            return Ok(out);
+        }
         let route = self.moe_route(layer, prefix, input)?;
         self.moe_with_route(layer, prefix, input, &route)
     }

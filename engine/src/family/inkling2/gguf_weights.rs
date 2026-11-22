@@ -31,9 +31,17 @@ use super::{
 use crate::kernels::cuda::resident::dense_gemv::DenseDtype;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod device_route;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod ram;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod streaming;
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) struct CudaConfig {
+    pub(super) attention: attention::Config,
+    pub(super) draft_target: bool,
+}
 
 const HEADER_LIMIT: u64 = 32 * 1024 * 1024;
 
@@ -569,7 +577,10 @@ impl GgufTextWeights {
         spec: &TextSpec,
         eps: f32,
         host_reserve: u64,
-        attention: attention::Config,
+        CudaConfig {
+            attention,
+            draft_target,
+        }: CudaConfig,
     ) -> Result<(), EngError> {
         let resident_attention =
             if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref() == Ok("1") {
@@ -656,6 +667,7 @@ impl GgufTextWeights {
                 budget,
                 cache_reserve,
                 resident_attention,
+                allow_device_routing: !draft_target,
             },
         )?;
         if reuse {

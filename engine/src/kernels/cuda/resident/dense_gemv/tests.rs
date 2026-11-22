@@ -711,7 +711,7 @@ fn original_packed_gguf_gemv_matches_cpu_for_every_supported_format() {
 
 #[test]
 fn indexed_gguf_experts_match_ordered_cpu_projection() {
-    use super::{GgufMoeCall, GgufMoePick, GgufMoeShape, GgufMoeWeights};
+    use super::{GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufMoeWeights};
     use crate::weights::{GgufType, dequantize_into};
 
     if !testkit::device_present("indexed_gguf_experts_match_ordered_cpu_projection") {
@@ -774,7 +774,7 @@ fn indexed_gguf_experts_match_ordered_cpu_projection() {
     let args = || GgufMoeCall {
         shape,
         caps,
-        picks: &picks,
+        picks: GgufMoePicks::Host(&picks),
         dtypes,
         weights: GgufMoeWeights::Stacks([w[0].all(), w[1].all()]),
         x: x.all(),
@@ -801,7 +801,7 @@ fn indexed_gguf_experts_match_ordered_cpu_projection() {
         .gguf_moe(
             &rig.stream,
             GgufMoeCall {
-                picks: &bad_id,
+                picks: GgufMoePicks::Host(&bad_id),
                 ..args()
             },
         )

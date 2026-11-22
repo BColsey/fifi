@@ -576,6 +576,27 @@ impl DenseStep {
         })
     }
 
+    pub(super) fn run_routed_layer(
+        &self,
+        context: &CudaContext,
+        x: &[f32],
+        bias: &[f32],
+        enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
+    ) -> Result<Vec<f32>, EngError> {
+        let full_input = self.range(Slot::Input, 0, x.len() + bias.len() + 1)?;
+        let input = self.range(Slot::Input, 0, x.len())?;
+        let bias_range = self.range(Slot::Input, x.len(), bias.len())?;
+        let status = self.range(Slot::Input, x.len() + bias.len(), 1)?;
+        let output = self.range(Slot::Output, 0, x.len())?;
+        self.run_rows(
+            context,
+            &self.stream,
+            &[x, bias, &[0.0]],
+            [full_input, output],
+            || enqueue(&self.stream, [input, bias_range, status, output]),
+        )
+    }
+
     fn run(
         &self,
         context: &CudaContext,

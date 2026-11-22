@@ -6,7 +6,9 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceRange, DeviceStream,
         context::{Claim, require_apart, require_fit},
-        native::resident::dense_gemv::moe::{GgufMoeRaw, GgufMoeRawWeights, launch_gguf_moe},
+        native::resident::dense_gemv::moe::{
+            GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, launch_gguf_moe,
+        },
     },
 };
 
@@ -20,11 +22,31 @@ pub(crate) enum GgufMoeWeights<'a> {
     Separate(&'a [[DeviceRange<'a>; 2]]),
 }
 
+pub(crate) enum GgufMoePicks<'a> {
+    Host(&'a [GgufMoePick]),
+    /// Rank-ordered i32 IDs and F32 weights, with F32 gate and down scales indexed by expert.
+    Device {
+        count: usize,
+        ids: DeviceRange<'a>,
+        weights: DeviceRange<'a>,
+        scales: [DeviceRange<'a>; 2],
+    },
+}
+
+impl GgufMoePicks<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Host(picks) => picks.len(),
+            Self::Device { count, .. } => *count,
+        }
+    }
+}
+
 pub(crate) struct GgufMoeCall<'a> {
     pub(crate) shape: GgufMoeShape,
     pub(crate) dtypes: [DenseDtype; 2],
     pub(crate) caps: [f32; 2],
-    pub(crate) picks: &'a [GgufMoePick],
+    pub(crate) picks: GgufMoePicks<'a>,
     pub(crate) weights: GgufMoeWeights<'a>,
     pub(crate) x: DeviceRange<'a>,
     pub(crate) scratch: DeviceRange<'a>,
@@ -45,15 +67,7 @@ impl CudaContext {
     fn plan_gguf_moe<'a>(&self, c: &GgufMoeCall<'a>) -> Result<GgufMoeRaw<'a>, EngError> {
         let scratch = c.shape.scratch_bytes(c.picks.len()).ok_or_else(bad_group)?;
         let matrix_bytes = c.shape.matrix_bytes(c.dtypes).ok_or_else(bad_group)?;
-        let positive = |v: f32| v.is_finite() && v > 0.0;
-        if !c.caps.into_iter().all(positive)
-            || !c.picks.iter().all(|p| {
-                (p.expert as usize) < c.shape.experts
-                    && positive(p.gate_scale)
-                    && positive(p.down_scale)
-                    && p.weight.is_finite()
-            })
-        {
+        if !c.caps.into_iter().all(positive) {
             return Err(bad_group());
         }
         let row = c.shape.hidden * size_of::<f32>();
@@ -67,17 +81,69 @@ impl CudaContext {
         let input = Claim::of("x", &c.x, row);
         require_apart(&temporary, &input)?;
         require_apart(&output, &input)?;
-        let weights = self.moe_weights(c, matrix_bytes, [&temporary, &output])?;
+        let writes = [&temporary, &output];
+        let picks = self.moe_picks(c, writes)?;
+        let weights = self.moe_weights(c, matrix_bytes, writes)?;
         Ok(GgufMoeRaw {
             shape: c.shape,
             dtypes: c.dtypes,
             caps: c.caps,
-            picks: c.picks,
+            picks,
             weights,
             x: self.raw_range(&c.x)?,
             scratch: self.raw_range(&c.scratch)?,
             y: self.raw_range(&c.y)?,
         })
+    }
+
+    fn moe_picks<'a>(
+        &self,
+        call: &GgufMoeCall<'a>,
+        writes: [&Claim<'_>; 2],
+    ) -> Result<GgufMoeRawPicks<'a>, EngError> {
+        match &call.picks {
+            GgufMoePicks::Host(picks) => {
+                if !picks.iter().all(|p| {
+                    (p.expert as usize) < call.shape.experts
+                        && positive(p.gate_scale)
+                        && positive(p.down_scale)
+                        && p.weight.is_finite()
+                }) {
+                    return Err(bad_group());
+                }
+                Ok(GgufMoeRawPicks::Host(picks))
+            }
+            GgufMoePicks::Device {
+                count,
+                ids,
+                weights,
+                scales,
+            } => {
+                if *count > call.shape.experts || !matches!(call.weights, GgufMoeWeights::Stacks(_))
+                {
+                    return Err(bad_group());
+                }
+                let picks_bytes = *count * size_of::<f32>();
+                let scales_bytes = call.shape.experts * size_of::<f32>();
+                for (name, range, bytes) in [
+                    ("expert IDs", ids, picks_bytes),
+                    ("route weights", weights, picks_bytes),
+                    ("gate scales", &scales[0], scales_bytes),
+                    ("down scales", &scales[1], scales_bytes),
+                ] {
+                    require_fit(name, range, bytes, 4)?;
+                    for write in writes {
+                        require_apart(write, &Claim::of(name, range, bytes))?;
+                    }
+                }
+                Ok(GgufMoeRawPicks::Device {
+                    count: *count,
+                    ids: self.raw_range(ids)?,
+                    weights: self.raw_range(weights)?,
+                    scales: [self.raw_range(&scales[0])?, self.raw_range(&scales[1])?],
+                })
+            }
+        }
     }
 
     fn moe_weights<'a>(
@@ -112,6 +178,10 @@ impl CudaContext {
             }
         }
     }
+}
+
+fn positive(value: f32) -> bool {
+    value.is_finite() && value > 0.0
 }
 
 fn bad_group() -> EngError {

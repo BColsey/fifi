@@ -22,6 +22,7 @@
 #ifndef INFERENCE_CUDA_RESIDENT_DENSE_GEMV_H
 #define INFERENCE_CUDA_RESIDENT_DENSE_GEMV_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -69,6 +70,11 @@ typedef struct inference_cuda_gguf_moe_args {
     float gate_cap;
     float up_cap;
     inference_cuda_gguf_moe_pick picks[INFERENCE_CUDA_GGUF_MOE_MAX_PICKS];
+    /* All present only for device-produced picks over contiguous stacks. Scales are [experts]. */
+    const int *device_ids;
+    const float *device_weights;
+    const float *gate_scales;
+    const float *down_scales;
 } inference_cuda_gguf_moe_args;
 
 /* Optional matrix addresses in routing rank order, for a mixture of cached
@@ -84,6 +90,12 @@ int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
 
 #ifdef __cplusplus
 }
+static_assert(sizeof(inference_cuda_gguf_moe_args) == 232 &&
+              offsetof(inference_cuda_gguf_moe_args, device_ids) == 200 &&
+              offsetof(inference_cuda_gguf_moe_args, device_weights) == 208 &&
+              offsetof(inference_cuda_gguf_moe_args, gate_scales) == 216 &&
+              offsetof(inference_cuda_gguf_moe_args, down_scales) == 224,
+              "GGUF expert args layout");
 #endif
 
 #endif

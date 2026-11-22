@@ -38,9 +38,8 @@ typedef struct inference_cuda_router_args {
 int inference_cuda_router_launch(const inference_cuda_router_args *args, void *stream,
                                  int *out_stage);
 
-/* Split path: tightly packed logits [m][n_expert], with no shared gate or bias.
- * The caller BF16-publishes input/weights before logits, and logits before select,
- * using the shared publication primitive. Both entries require an explicit stream.
+/* Split path: tightly packed logits [m][n_expert] without a shared gate.
+ * The caller owns any model-specific publication. Both entries require an explicit stream.
  * Every written active extent is disjoint from all other active extents.
  */
 typedef struct inference_cuda_router_logits_args {
@@ -67,6 +66,10 @@ typedef struct inference_cuda_router_sigmoid_args {
     int m;
     int n_expert;
     int top_k;
+    const float *bias;
+    size_t bias_bytes;
+    float floor;
+    float scale;
 } inference_cuda_router_sigmoid_args;
 
 int inference_cuda_router_logits_launch(const inference_cuda_router_logits_args *args,
@@ -98,7 +101,9 @@ int inference_cuda_router_logits_strided_launch(const inference_cuda_router_logi
                                                 void *stream, int *out_stage);
 /* Raw-logit health precedes F32 sigmoid. Rank sigmoid scores (lower-ID ties), then
  * normalize only the selected F32 scores. Bad rows get IDs -1, weights 0, status OR1.
- * Never clears status. Selected gates remain F32 until the caller's BF16 combine.
+ * With bias, rank sigmoid(logit) + bias in descending total order and normalize the unbiased
+ * selected scores by max(sum, floor) before multiplying by scale. Without bias, pass floor 0
+ * and scale 1. Never clears status.
  */
 int inference_cuda_router_sigmoid_select_launch(const inference_cuda_router_sigmoid_args *args,
                                                 void *stream, int *out_stage);
@@ -113,9 +118,11 @@ static_assert(sizeof(inference_cuda_router_logits_strided_args) == 64 &&
               offsetof(inference_cuda_router_logits_strided_args, n_expert) == 56 &&
               offsetof(inference_cuda_router_logits_strided_args, logit_stride) == 60,
               "router logits strided layout");
-static_assert(sizeof(inference_cuda_router_sigmoid_args) == 80 &&
+static_assert(sizeof(inference_cuda_router_sigmoid_args) == 104 &&
               offsetof(inference_cuda_router_sigmoid_args, status) == 48 &&
-              offsetof(inference_cuda_router_sigmoid_args, top_k) == 72, "router sigmoid layout");
+              offsetof(inference_cuda_router_sigmoid_args, top_k) == 72 &&
+              offsetof(inference_cuda_router_sigmoid_args, bias) == 80 &&
+              offsetof(inference_cuda_router_sigmoid_args, scale) == 100, "router sigmoid layout");
 #endif
 
 #endif

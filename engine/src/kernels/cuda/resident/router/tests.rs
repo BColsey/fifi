@@ -693,6 +693,7 @@ fn router_sigmoid_select_ranks_and_flags_above_256_experts() -> Result<(), EngEr
             ctx.router_sigmoid_select_rows(
                 &stream,
                 RouterSigmoidCall {
+                    bias: None,
                     shape,
                     logits: whole_range(&input)?,
                     ids: whole_range(&ids)?,

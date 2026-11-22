@@ -135,7 +135,7 @@ impl CudaContext {
 }
 
 mod moe;
-pub(crate) use moe::{GgufMoeCall, GgufMoePick, GgufMoeShape, GgufMoeWeights};
+pub(crate) use moe::{GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufMoeWeights};
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

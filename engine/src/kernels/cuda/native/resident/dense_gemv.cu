@@ -103,6 +103,18 @@ struct SelectedWeights {
     __device__ size_t offset(unsigned slot) const { return stride * ids[slot]; }
 };
 
+struct DeviceSelectedWeights {
+    size_t stride;
+    const int *ids;
+    unsigned experts;
+
+    __device__ size_t offset(unsigned slot) const {
+        const unsigned id = unsigned(ids[slot]);
+        // Faulty router rows publish -1. Bind them to a safe matrix; the sum reports NaN.
+        return id < experts ? stride * id : 0;
+    }
+};
+
 struct SeparateWeights {
     const void *matrices[INFERENCE_CUDA_GGUF_MOE_MAX_PICKS];
 };
@@ -265,6 +277,18 @@ bool valid_moe(const inference_cuda_gguf_moe_args &a,
     };
     if (!matrices && !weights_fit({a.gate, sizes.gate_stride * a.experts},
                                   {a.down, sizes.down_stride * a.experts})) return false;
+    if (a.device_ids || a.device_weights || a.gate_scales || a.down_scales) {
+        if (matrices || a.count > a.experts) return false;
+        const size_t picks = size_t(a.count) * sizeof(float);
+        const size_t scales = size_t(a.experts) * sizeof(float);
+        const Span inputs[] = {{a.device_ids, picks}, {a.device_weights, picks},
+                               {a.gate_scales, scales}, {a.down_scales, scales}};
+        for (const Span &input : inputs) {
+            if (!input.p || !aligned(input.p, 4) || !apart(input, scratch) ||
+                !apart(input, result)) return false;
+        }
+        return true;
+    }
     for (int i = 0; i < a.count; ++i) {
         const auto pick = a.picks[i];
         if (pick.expert >= uint32_t(a.experts) || !good_scale(pick.gate_scale) ||
@@ -275,29 +299,49 @@ bool valid_moe(const inference_cuda_gguf_moe_args &a,
     return true;
 }
 
+template <bool DevicePicks>
 __global__ void activate_moe(inference_cuda_gguf_moe_args a, float *middle) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= a.middle) return;
     const size_t offset = size_t(blockIdx.y) * a.middle;
-    const float scale = a.picks[blockIdx.y].gate_scale;
+    float scale;
+    if constexpr (DevicePicks) {
+        const unsigned id = unsigned(a.device_ids[blockIdx.y]);
+        scale = a.gate_scales[id < unsigned(a.experts) ? id : 0];
+    } else {
+        scale = a.picks[blockIdx.y].gate_scale;
+    }
     const float gate = a.scratch[2 * offset + col] * scale;
     const float up = a.scratch[2 * offset + a.middle + col] * scale;
     middle[offset + col] = clipped_expert_activation(gate, up, a.gate_cap, a.up_cap);
 }
 
+template <bool DevicePicks>
 __global__ void sum_moe(inference_cuda_gguf_moe_args a, const float *down) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= a.hidden) return;
     float out = 0.0f;
     for (int slot = 0; slot < a.count; ++slot) {
-        const auto pick = a.picks[slot];
-        const float scaled = __fmul_rn(down[size_t(slot) * a.hidden + col], pick.down_scale);
-        out = __fadd_rn(out, __fmul_rn(pick.weight, scaled));
+        float row = down[size_t(slot) * a.hidden + col];
+        float weight;
+        if constexpr (DevicePicks) {
+            const unsigned id = unsigned(a.device_ids[slot]);
+            if (id >= unsigned(a.experts)) {
+                a.y[col] = __int_as_float(0x7fc00000);
+                return;
+            }
+            row = __fmul_rn(row, a.down_scales[id]);
+            weight = a.device_weights[slot];
+        } else {
+            row = __fmul_rn(row, a.picks[slot].down_scale);
+            weight = a.picks[slot].weight;
+        }
+        out = __fadd_rn(out, __fmul_rn(weight, row));
     }
     a.y[col] = out;
 }
 
-template <typename Index>
+template <bool DevicePicks = false, typename Index>
 void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selected_down,
                 cudaStream_t stream, Failure &failure) {
     float *middle = a.scratch + size_t(a.count) * 2 * a.middle;
@@ -308,7 +352,7 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
 
     constexpr int threads = 256;
     const dim3 grid((a.middle + threads - 1) / threads, a.count);
-    activate_moe<<<grid, threads, 0, stream>>>(a, middle);
+    activate_moe<DevicePicks><<<grid, threads, 0, stream>>>(a, middle);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (!failure.ok()) return;
 
@@ -316,7 +360,7 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
                    a.middle, a.hidden, a.down_dtype}, stream, failure, selected_down);
     if (!failure.ok()) return;
 
-    sum_moe<<<(a.hidden + threads - 1) / threads, threads, 0, stream>>>(a, down);
+    sum_moe<DevicePicks><<<(a.hidden + threads - 1) / threads, threads, 0, stream>>>(a, down);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
 }
 
@@ -362,6 +406,11 @@ extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args
                 down.matrices[slot] = matrices->down[slot];
             }
             launch_moe(*args, gate, down, (cudaStream_t)stream, failure);
+        } else if (args->device_ids) {
+            const auto experts = unsigned(args->experts);
+            const DeviceSelectedWeights gate{sizes.gate_stride, args->device_ids, experts};
+            const DeviceSelectedWeights down{sizes.down_stride, args->device_ids, experts};
+            launch_moe<true>(*args, gate, down, (cudaStream_t)stream, failure);
         } else {
             SelectedWeights gate = {sizes.gate_stride, {}};
             for (int slot = 0; slot < args->count; ++slot) gate.ids[slot] = args->picks[slot].expert;

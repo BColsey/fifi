@@ -66,11 +66,21 @@ pub(in crate::kernels::cuda) enum GgufMoeRawWeights<'a> {
     Separate(Vec<[RawRange<'a>; 2]>),
 }
 
+pub(in crate::kernels::cuda) enum GgufMoeRawPicks<'a> {
+    Host(&'a [GgufMoePick]),
+    Device {
+        count: usize,
+        ids: RawRange<'a>,
+        weights: RawRange<'a>,
+        scales: [RawRange<'a>; 2],
+    },
+}
+
 pub(in crate::kernels::cuda) struct GgufMoeRaw<'a> {
     pub(in crate::kernels::cuda) shape: GgufMoeShape,
     pub(in crate::kernels::cuda) dtypes: [DenseDtype; 2],
     pub(in crate::kernels::cuda) caps: [f32; 2],
-    pub(in crate::kernels::cuda) picks: &'a [GgufMoePick],
+    pub(in crate::kernels::cuda) picks: GgufMoeRawPicks<'a>,
     pub(in crate::kernels::cuda) weights: GgufMoeRawWeights<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) scratch: RawRange<'a>,
@@ -93,6 +103,10 @@ struct MoeArgs {
     gate_cap: f32,
     up_cap: f32,
     picks: [GgufMoePick; MAX_GGUF_MOE_PICKS],
+    device_ids: *const c_int,
+    device_weights: *const f32,
+    gate_scales: *const f32,
+    down_scales: *const f32,
 }
 
 #[repr(C)]
@@ -102,12 +116,16 @@ struct MoeMatrices {
 }
 
 const _: () = assert!(
-    size_of::<MoeArgs>() == 200
+    size_of::<MoeArgs>() == 232
         && size_of::<MoeMatrices>() == 128
         && size_of::<GgufMoePick>() == 16
         && offset_of!(MoeArgs, hidden) == 40
         && offset_of!(MoeArgs, gate_cap) == 64
         && offset_of!(MoeArgs, picks) == 72
+        && offset_of!(MoeArgs, device_ids) == 200
+        && offset_of!(MoeArgs, device_weights) == 208
+        && offset_of!(MoeArgs, gate_scales) == 216
+        && offset_of!(MoeArgs, down_scales) == 224
 );
 
 unsafe extern "C" {
@@ -124,7 +142,28 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     call: GgufMoeRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let mut picks = [GgufMoePick::default(); MAX_GGUF_MOE_PICKS];
-    picks[..call.picks.len()].copy_from_slice(call.picks);
+    let (count, device_ids, device_weights, [gate_scales, down_scales]) = match call.picks {
+        GgufMoeRawPicks::Host(host) => {
+            picks[..host.len()].copy_from_slice(host);
+            (
+                host.len(),
+                std::ptr::null(),
+                std::ptr::null(),
+                [std::ptr::null(); 2],
+            )
+        }
+        GgufMoeRawPicks::Device {
+            count,
+            ids,
+            weights,
+            scales,
+        } => (
+            count,
+            ids.address().cast_const().cast(),
+            weights.address().cast_const().cast(),
+            scales.map(|range| range.address().cast_const().cast()),
+        ),
+    };
     let mut matrices = None;
     let [gate, down] = match call.weights {
         GgufMoeRawWeights::Stacks(stacks) => stacks.map(|range| range.address().cast_const()),
@@ -147,12 +186,16 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
         hidden: call.shape.hidden as c_int,
         middle: call.shape.middle as c_int,
         experts: call.shape.experts as c_int,
-        count: call.picks.len() as c_int,
+        count: count as c_int,
         gate_dtype: call.dtypes[0].code(),
         down_dtype: call.dtypes[1].code(),
         gate_cap: call.caps[0],
         up_cap: call.caps[1],
         picks,
+        device_ids,
+        device_weights,
+        gate_scales,
+        down_scales,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: The parent CUDA wrapper checked the adapter, dimensions, ordered picks,

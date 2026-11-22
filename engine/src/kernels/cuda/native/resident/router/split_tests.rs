@@ -36,6 +36,10 @@ fn select() -> RouterSigmoidArgsRaw {
         m: 1,
         n_expert: 8,
         top_k: 6,
+        bias: ptr::null(),
+        bias_bytes: 0,
+        floor: 0.0,
+        scale: 1.0,
     }
 }
 
@@ -62,13 +66,25 @@ fn split_router_logits_c_abi_rejects_geometry_sizes_alignment_wrap_and_alias() {
 
 #[test]
 fn split_router_select_c_abi_rejects_geometry_short_align_wrap_and_alias() {
-    for case in 0..13 {
+    for case in 0..18 {
         let mut a = select();
         match case {
             0 => a.m = 4097,
             12 => {
                 a.n_expert = 513;
                 a.logits_bytes = 513 * 4;
+            }
+            13 => a.bias_bytes = 32,
+            14..=17 => {
+                a.bias = 0x5000usize as *const f32;
+                a.bias_bytes = 32;
+                a.floor = 1.0 / 16384.0;
+                match case {
+                    14 => a.bias_bytes = 31,
+                    15 => a.bias = a.weights.cast_const(),
+                    16 => a.floor = f32::NAN,
+                    _ => a.scale = f32::INFINITY,
+                }
             }
             1 => a.top_k = 9,
             2 => a.logits_bytes = 31,

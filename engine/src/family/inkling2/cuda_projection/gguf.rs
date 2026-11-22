@@ -15,7 +15,9 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
         plan::{Demand, admit},
-        resident::dense_gemv::{DenseDtype, GgufMoeCall, GgufMoeShape, GgufMoeWeights},
+        resident::dense_gemv::{
+            DenseDtype, GgufMoeCall, GgufMoePicks, GgufMoeShape, GgufMoeWeights,
+        },
     },
     sched::job::PrefillBankReport,
     weights::{GgufType, repack_nvfp4_into},
@@ -26,6 +28,7 @@ mod cache;
 mod device_prefill;
 mod residency;
 mod resident_prefill;
+pub(in crate::family::inkling2) mod router;
 pub(in crate::family::inkling2) mod streaming;
 
 pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
@@ -41,6 +44,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     batch_router: bool,
     resident_attention: Option<attention::ResidentAttention>,
     moe_scratch: Option<ResidentMoe>,
+    route_scratch: Option<router::RouteScratch>,
     batch_streamed: bool,
     prefill_resident: bool,
     device_prefill: Option<RefCell<device_prefill::Workspace>>,
@@ -160,6 +164,7 @@ pub(in crate::family::inkling2) struct Options {
     pub budget: u64,
     pub cache_reserve: Option<u64>,
     pub resident_attention: Option<attention::Plan>,
+    pub allow_device_routing: bool,
 }
 
 struct ResidentMoe {
@@ -231,6 +236,7 @@ impl GgufCuda {
             budget,
             cache_reserve,
             resident_attention,
+            allow_device_routing,
         }: Options,
     ) -> Result<Self, EngError> {
         let hidden = spec.hidden_size as usize;
@@ -255,8 +261,20 @@ impl GgufCuda {
         } else {
             rows
         };
+        let batch_experts =
+            packed && std::env::var("FIFI_INKLING_CUDA_BATCH_EXPERTS").as_deref() == Ok("1");
+        let device_route = allow_device_routing
+            && group_projections
+            && batch_experts
+            && std::env::var("FIFI_INKLING_CUDA_DEVICE_ROUTING").as_deref() == Ok("1");
+        let route_shape = device_route.then(|| router::route_shape(spec));
+        let route_plan = route_shape
+            .map(|shape| router::RoutePlan::new(shape, &layers))
+            .transpose()?;
+        let route_bytes = route_plan.as_ref().map_or(0, router::RoutePlan::bytes);
+        let route_input = route_shape.map_or(0, |shape| hidden + shape.n_expert + 1);
         let plan = DensePlan::new(
-            [packed_outputs, columns],
+            [packed_outputs, columns.max(route_input)],
             hidden,
             spec.core.gate_rank as usize,
         )?;
@@ -266,8 +284,6 @@ impl GgufCuda {
         let tensors = projection_bytes(&required);
         let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
         let context = CudaContext::with_admission(&admission)?;
-        let batch_experts =
-            packed && std::env::var("FIFI_INKLING_CUDA_BATCH_EXPERTS").as_deref() == Ok("1");
         let prefill_resident =
             packed && std::env::var("FIFI_INKLING_CUDA_RESIDENT_PREFILL").as_deref() == Ok("1");
         let device_prefill = packed
@@ -288,7 +304,8 @@ impl GgufCuda {
         };
         let demand = Demand {
             tensors,
-            work: (stage[0] + stage[1] + plan.device_bytes + moe_bytes) as u64 + stream_bytes,
+            work: (stage[0] + stage[1] + plan.device_bytes + moe_bytes + route_bytes) as u64
+                + stream_bytes,
             kv_cache: 0,
             headroom: DEVICE_HEADROOM,
         };
@@ -310,6 +327,7 @@ impl GgufCuda {
                 })
             })
             .transpose()?;
+        let route_scratch = route_plan.map(|plan| plan.upload(&context)).transpose()?;
         let experts = spec.n_routed_experts as u32;
         let full_expert_fit = packed && residency::packed_model_fits(&context, &layers, budget)?;
         let mut batch_streamed = false;
@@ -379,6 +397,28 @@ impl GgufCuda {
                 .map(|(weight, _)| weight.codes.bytes() as u64)
                 .sum::<u64>()
         };
+        if let Some(scratch) = &route_scratch {
+            let layers: Vec<_> = resident
+                .placement()
+                .full_layers()
+                .into_iter()
+                .filter(|&layer| {
+                    scratch.has_layer(layer)
+                        && dense
+                            .get(&format!("model.llm.layers.{layer}.mlp.gate.weight"))
+                            .is_some_and(|(_, dtype)| *dtype == DenseDtype::F32)
+                })
+                .collect();
+            let visits = spec
+                .visits()
+                .iter()
+                .filter(|visit| layers.contains(&(visit.weight_layer as u32)))
+                .count();
+            eprintln!(
+                "Inkling GGUF CUDA device routing {}",
+                serde_json::json!({"layers": layers, "visits": visits})
+            );
+        }
         eprintln!(
             "Inkling GGUF CUDA projections {}",
             serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": sum_bytes(Some(DenseDtype::Bf16)), "resident_f32_bytes": sum_bytes(Some(DenseDtype::F32)), "resident_dense_bytes": sum_bytes(None), "packed_gguf": packed, "q8_1_projection_activations": q8_activations, "batched_resident_experts": moe_scratch.is_some(), "batched_streamed_experts": batch_streamed, "batched_resident_prefill": prefill_resident,
@@ -409,6 +449,7 @@ impl GgufCuda {
             batch_router: std::env::var("FIFI_INKLING_CUDA_BATCH_ROUTER").as_deref() == Ok("1"),
             resident_attention,
             moe_scratch,
+            route_scratch,
             batch_streamed,
             prefill_resident,
             device_prefill: device_prefill.then(RefCell::default),
@@ -716,7 +757,7 @@ impl GgufCuda {
                         shape: moe.shape,
                         dtypes: group.dtypes,
                         caps: group.route.caps,
-                        picks: group.picks,
+                        picks: GgufMoePicks::Host(group.picks),
                         weights,
                         x,
                         scratch,

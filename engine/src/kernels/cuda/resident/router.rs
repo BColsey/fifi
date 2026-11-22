@@ -45,8 +45,8 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::RawRange;
 use crate::kernels::cuda::native::resident::router::{
-    RouterInts, RouterLogitsRaw, RouterRaw, RouterSigmoidRaw, router_launch, router_logits_launch,
-    router_sigmoid_launch,
+    RouterInts, RouterLogitsRaw, RouterRaw, RouterSigmoidBiasRaw, RouterSigmoidRaw, router_launch,
+    router_logits_launch, router_sigmoid_launch,
 };
 
 pub(crate) const ROUTER_STATUS_BIT: i32 = 1;
@@ -278,10 +278,20 @@ pub(crate) struct RouterLogitsCall<'a> {
     pub(crate) logits: DeviceRange<'a>,
 }
 
-/// Sigmoid top-k with selected-only F32 normalization. No shared gate or bias.
-/// Logits must already have passed the caller's shared BF16 publication.
+/// Optional bias used only for ranking the sigmoid scores. The outputs use the
+/// selected, unbiased scores divided by max(selected sum, floor) and multiplied by scale.
+pub(crate) struct RouterSigmoidBias<'a> {
+    /// F32 [n_expert], shared by every row.
+    pub(crate) values: DeviceRange<'a>,
+    pub(crate) floor: f32,
+    pub(crate) scale: f32,
+}
+
+/// Sigmoid top-k with selected-only F32 normalization and no shared gate.
+/// The caller applies any model-specific publication to the logits before selection.
 pub(crate) struct RouterSigmoidCall<'a> {
     pub(crate) shape: RouterShape,
+    pub(crate) bias: Option<RouterSigmoidBias<'a>>,
     pub(crate) logits: DeviceRange<'a>,
     pub(crate) ids: DeviceRange<'a>,
     pub(crate) weights: DeviceRange<'a>,
@@ -361,16 +371,32 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let (need, ints) = split_plan(call.shape)?;
-        check_split_regions(
-            self,
-            &[
-                ("logits", &call.logits, need.logits, 4, false),
-                ("ids", &call.ids, need.picks, 4, true),
-                ("weights", &call.weights, need.picks, 4, true),
-                ("status", &call.status, 4, 4, true),
-            ],
-        )?;
+        let mut regions = [
+            ("logits", &call.logits, need.logits, 4, false),
+            ("ids", &call.ids, need.picks, 4, true),
+            ("weights", &call.weights, need.picks, 4, true),
+            ("status", &call.status, 4, 4, true),
+            ("bias", &call.logits, 0, 4, false),
+        ];
+        let bias = if let Some(bias) = &call.bias {
+            if !bias.floor.is_finite() || bias.floor <= 0.0 || !bias.scale.is_finite() {
+                return Err(EngError::BadRequest(
+                    "invalid CUDA sigmoid normalization".into(),
+                ));
+            }
+            regions[4] = ("bias", &bias.values, call.shape.n_expert * 4, 4, false);
+            Some(RouterSigmoidBiasRaw {
+                values: self.raw_range(&bias.values)?,
+                floor: bias.floor,
+                scale: bias.scale,
+            })
+        } else {
+            None
+        };
+        let count = 4 + usize::from(bias.is_some());
+        check_split_regions(self, &regions[..count])?;
         let io = RouterSigmoidRaw {
+            bias,
             logits: self.raw_range(&call.logits)?,
             ids: self.raw_range(&call.ids)?,
             weights: self.raw_range(&call.weights)?,
