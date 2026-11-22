@@ -894,13 +894,8 @@ pub(crate) fn start(
             std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
         )?;
     }
-    let modes = runtime_modes(settings)?;
     let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
-    let plan = if device_first {
-        StartupPlan::new_device_first(settings, verify, allow_unpinned, modes)?
-    } else {
-        StartupPlan::new(settings, verify, allow_unpinned, modes)?
-    };
+    let plan = startup_plan_of(settings, verify, allow_unpinned)?;
     for key in &settings.ignored_mlx_keys {
         eprintln!("{}", ignored_mlx_line(key));
     }
@@ -1449,7 +1444,7 @@ fn int8_cache_usable() -> bool {
 /// headroom, the decode arena and the device prefix tip charged as the admission charges them.
 /// A question it cannot answer is an error, never a yes.
 fn prefill_admits_of<'a>(
-    projector: &CudaProjector,
+    nsm: usize,
     settings: &'a Q36Settings,
     plan: &'a StartupPlan,
     (free, weights): (u64, u64),
@@ -1458,7 +1453,6 @@ fn prefill_admits_of<'a>(
         &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?,
         &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
     )?;
-    let nsm = projector.context().mmq_device_facts()?.nsm;
     let tip = match plan.modes.prefix {
         PrefixMemory::DeviceTip => {
             crate::family::qwen::qwen36::settings::delta_state_bytes(&settings.spec)?
@@ -1558,18 +1552,38 @@ fn require_prefill_room(
     }
 }
 
-/// The cache form and context of a start that left them to the card, asked before any weight is
-/// uploaded. The free bytes are the ones the load's admission compares and the weight bytes are
-/// its native tensors, so the choice charges what the load will. A start whose config fixes both
-/// (or fits no form at all, which the lower rung or the load's own refusal then handles) answers
-/// `None` and goes on unchanged. The variant carries the chosen figures with its own runtime
-/// modes and startup plan, since the cache form picks the prefill path.
-fn card_fit(
-    projector: &CudaProjector,
+/// The multiprocessor count the prefill admission sizes its chunk arena for.
+fn device_nsm(projector: &CudaProjector) -> Result<usize, EngError> {
+    Ok(projector.context().mmq_device_facts()?.nsm)
+}
+
+/// What the card choice reads from the device: the free bytes before the weights are uploaded and
+/// the multiprocessor count.
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceReading {
+    pub(crate) free: u64,
+    pub(crate) nsm: usize,
+}
+
+/// A card choice: the settings and startup plan of the cache form and context the card carries,
+/// with the figures it was made from.
+struct CardChoice {
+    variant: Q36Settings,
+    plan: StartupPlan,
+    fit: super::super::admission_sketch::CudaFit,
+    free: u64,
+}
+
+/// The cache form and context a start that left them to the card serves, from the device reading
+/// and the weight bytes the load pins. `None` when the config fixes both (or fits no form at all,
+/// which the lower rung or the load's own refusal then handles). The start and `check` both
+/// decide through this function.
+fn card_choice(
+    reading: DeviceReading,
     settings: &Q36Settings,
     plan: &StartupPlan,
-    model: &GgufModel,
-) -> Result<Option<(Q36Settings, StartupPlan)>, EngError> {
+    weights: u64,
+) -> Result<Option<CardChoice>, EngError> {
     if !(settings.kv_auto || settings.context_auto)
         || plan.paged.is_some()
         || plan.device_first_native.is_some()
@@ -1577,8 +1591,7 @@ fn card_fit(
     {
         return Ok(None);
     }
-    let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
-    let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    let free = reading.free;
     // A card that leaves the weights below the free-after-load floor holds no context: the lower
     // rung decides, before anything is uploaded (the same figure it is asked with).
     if !weights_leave_the_floor(free, weights, after_load_floor()?) {
@@ -1596,7 +1609,7 @@ fn card_fit(
         &settings.spec,
         ask,
         &load_need,
-        &prefill_admits_of(projector, settings, plan, (free, weights))?,
+        &prefill_admits_of(reading.nsm, settings, plan, (free, weights))?,
     )?
     else {
         require_prefill_room(settings, ask, &load_need)?;
@@ -1609,6 +1622,35 @@ fn card_fit(
     };
     let modes = runtime_modes(&variant)?;
     let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+    Ok(Some(CardChoice {
+        variant,
+        plan: variant_plan,
+        fit,
+        free,
+    }))
+}
+
+/// The cache form and context of a start that left them to the card, asked before any weight is
+/// uploaded. The free bytes are the ones the load's admission compares and the weight bytes are
+/// its native tensors, so the choice charges what the load will. A start whose config fixes both
+/// (or fits no form at all, which the lower rung or the load's own refusal then handles) answers
+/// `None` and goes on unchanged. The variant carries the chosen figures with its own runtime
+/// modes and startup plan, since the cache form picks the prefill path.
+fn card_fit(
+    projector: &CudaProjector,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    model: &GgufModel,
+) -> Result<Option<(Q36Settings, StartupPlan)>, EngError> {
+    let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
+    let reading = DeviceReading {
+        free: u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX),
+        nsm: device_nsm(projector)?,
+    };
+    let Some(choice) = card_choice(reading, settings, plan, weights)? else {
+        return Ok(None);
+    };
+    let (free, fit) = (choice.free, choice.fit);
     let form = match fit.form {
         KvDtype::Q8 => "int8",
         KvDtype::F32 | KvDtype::Bf16 => "fp16",
@@ -1624,7 +1666,54 @@ fn card_fit(
             fit.context
         );
     }
-    Ok(Some((variant, variant_plan)))
+    Ok(Some((choice.variant, choice.plan)))
+}
+
+/// The startup plan of settings: the same one `start` builds before it reads the card.
+fn startup_plan_of(
+    settings: &Q36Settings,
+    verify: bool,
+    allow_unpinned: bool,
+) -> Result<StartupPlan, EngError> {
+    let modes = runtime_modes(settings)?;
+    let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
+    if device_first {
+        StartupPlan::new_device_first(settings, verify, allow_unpinned, modes)
+    } else {
+        StartupPlan::new(settings, verify, allow_unpinned, modes)
+    }
+}
+
+/// The cache form and context a start with these settings would serve on this card, for
+/// `check`: the same choice `start` makes (`card_choice`), from the card read now and the weights
+/// of the checkpoint the start selects. `None` when the settings fix both, the card fits no form,
+/// or the checkpoint cannot be opened (the load reports that itself).
+pub(crate) fn planned_fit(settings: &Q36Settings) -> Result<Option<(KvDtype, u32)>, EngError> {
+    if settings.weights != WeightFormat::Gguf {
+        return Ok(None);
+    }
+    let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
+    let plan = startup_plan_of(settings, false, allow_unpinned)?;
+    let (gguf, _, _) = select_gguf_noted(&settings.artifact, allow_unpinned)?;
+    let model = open_qwen3_6_35b_a3b(&gguf, None)?;
+    let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
+    let projector = CudaProjector::new()?;
+    let reading = DeviceReading {
+        free: u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX),
+        nsm: device_nsm(&projector)?,
+    };
+    planned_fit_from(reading, settings, &plan, weights)
+}
+
+/// `planned_fit` from figures already read.
+fn planned_fit_from(
+    reading: DeviceReading,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    weights: u64,
+) -> Result<Option<(KvDtype, u32)>, EngError> {
+    Ok(card_choice(reading, settings, plan, weights)?
+        .map(|choice| (choice.variant.kv, choice.variant.context_limit)))
 }
 
 /// Positions the context is lowered by when the load's own admission refuses a context the card
@@ -1659,7 +1748,7 @@ fn replan_smaller(
             context: Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
         },
         &load_need_of(settings, plan),
-        &prefill_admits_of(projector, settings, plan, (free, weights))?,
+        &prefill_admits_of(device_nsm(projector)?, settings, plan, (free, weights))?,
     )?
     else {
         return Ok(None);
@@ -2696,5 +2785,45 @@ mod fused_inproj_tests {
             format!("{error:?}").contains("GDN_FUSE_INPROJ"),
             "{error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod check_choice_tests {
+    use super::*;
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options};
+
+    /// The figures a 24 GiB card with the Q4_K_M checkpoint reads at start.
+    const FREE: u64 = 24_188_420_096;
+    const WEIGHTS: u64 = 20_408_576_512;
+    const NSM: usize = 82;
+
+    #[test]
+    fn check_chooses_the_cache_form_and_context_the_start_chooses() {
+        let settings = Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&Q36Options::default()),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("the CUDA settings");
+        assert!(
+            settings.kv_auto && settings.context_auto,
+            "a config that names neither leaves both to the card"
+        );
+        let plan = startup_plan_of(&settings, false, false).expect("startup plan");
+        let reading = DeviceReading {
+            free: FREE,
+            nsm: NSM,
+        };
+        let served = card_choice(reading, &settings, &plan, WEIGHTS)
+            .expect("the card choice")
+            .expect("a fit");
+        let checked = planned_fit_from(reading, &settings, &plan, WEIGHTS)
+            .expect("the check's choice")
+            .expect("a fit");
+        assert_eq!(checked, (served.variant.kv, served.variant.context_limit));
+        assert_eq!(checked, (KvDtype::Q8, 242_688));
     }
 }

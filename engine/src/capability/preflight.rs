@@ -971,6 +971,56 @@ struct Q36Inputs<'a> {
     configured: Option<&'a Q36Options>,
 }
 
+/// The settings a CUDA start serves once the card has chosen the cache form and context the
+/// config left open. The choice is the start's own (`cuda::start::planned_fit`), read from the
+/// card now; the note names it. A choice that cannot be made here leaves the resolved defaults and
+/// says so.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn card_planned(
+    settings: crate::family::qwen::qwen36::settings::Q36Settings,
+    backend: crate::family::qwen::qwen36::settings::Backend,
+    facts: &HardwareFacts,
+) -> (
+    crate::family::qwen::qwen36::settings::Q36Settings,
+    Option<String>,
+) {
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Settings};
+    let device_present = facts.cuda.device_count.as_ref().is_some_and(|n| *n > 0);
+    if backend != Backend::Cuda || !(settings.kv_auto || settings.context_auto) || !device_present {
+        return (settings, None);
+    }
+    match crate::family::qwen::qwen36::cuda::start::planned_fit(&settings) {
+        Ok(Some((kv, context_limit))) => (
+            Q36Settings {
+                kv,
+                context_limit,
+                ..settings
+            },
+            Some("; chosen from the card as the start chooses it".to_string()),
+        ),
+        Ok(None) => (settings, None),
+        Err(error) => (
+            settings,
+            Some(format!(
+                "; the card choice could not be made here ({}), so these are the defaults",
+                super::describe_error(&error)
+            )),
+        ),
+    }
+}
+
+#[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+fn card_planned(
+    settings: crate::family::qwen::qwen36::settings::Q36Settings,
+    _backend: crate::family::qwen::qwen36::settings::Backend,
+    _facts: &HardwareFacts,
+) -> (
+    crate::family::qwen::qwen36::settings::Q36Settings,
+    Option<String>,
+) {
+    (settings, None)
+}
+
 fn q36_preflight(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -1050,11 +1100,12 @@ fn q36_preflight(
     let env = Q36Env::from_process(model_dir);
     let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(options), &env, backend) {
         Ok(settings) => {
+            let (settings, chosen) = card_planned(settings, backend, facts);
             checks.push(Check::new(
                 "settings",
                 CheckStatus::Pass,
                 format!(
-                    "context {}, kv_dtype {}, activation {} resolve under the {} rules",
+                    "context {}, kv_dtype {}, activation {} resolve under the {} rules{}",
                     settings.context_limit,
                     crate::family::qwen::qwen36::settings::kv_dtype_name(settings.kv),
                     crate::family::qwen::qwen36::settings::activation_name(settings.activation),
@@ -1062,6 +1113,7 @@ fn q36_preflight(
                         Backend::Cuda => "CUDA",
                         Backend::Mlx => "MLX",
                     },
+                    chosen.unwrap_or_default(),
                 ),
             ));
             settings
