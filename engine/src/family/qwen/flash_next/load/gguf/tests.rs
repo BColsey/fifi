@@ -61,6 +61,12 @@ fn part_major_alignment_can_exceed_packed_record_accounting() {
     assert_eq!(stacks.parts, [0..34, 36..70, 72..106]);
     assert_eq!(stacks.bytes, 106);
     assert!(stacks.bytes > layout.bytes);
+    let reserve = super::plan::stack_alignment_reserve(1).unwrap() as usize;
+    assert_eq!(reserve, 6);
+    for slots in 1..=512 {
+        let aligned = ExpertStacks::new(&layout, slots).unwrap().bytes;
+        assert!(aligned <= layout.bytes * slots + reserve);
+    }
 }
 
 /// The EXL3 configuration of the same model, as the pack path reads it.

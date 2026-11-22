@@ -5,10 +5,10 @@
 //! format, so every expert has one size. A GGUF quantizes each layer's expert matrices on
 //! their own (a 3-bit mixed-quant file mixes IQ2_S, IQ3_XXS, IQ4_XS, IQ4_NL and Q2_0 across layers),
 //! so the size of an expert differs between layers. The planner's uniform slot is the rounded-up
-//! mean expert size. It does not include per-layer part-major alignment padding, so it is not
-//! generally an exact allocation or admission bound. The staged `ExpertAllocation` computes
-//! those sizes separately; it is not yet wired into this planner. The disk-tier staging ring is
-//! charged for the largest record.
+//! mean expert size. Part-major stacks can add up to six bytes of alignment padding per layer;
+//! the planner reserves that worst case separately from free VRAM. The staged `ExpertAllocation`
+//! computes exact stack sizes but is not yet wired into this planner. The disk-tier staging ring
+//! is charged for the largest record.
 //!
 //! The tiers: expert slots in video memory first (the same count in every layer), the rest in
 //! pinned host memory while the host's budget carries it, and otherwise read from the GGUF
@@ -33,6 +33,14 @@ use crate::{
 
 fn refuse(detail: impl AsRef<str>) -> EngError {
     EngError::MemoryPlan(format!("Flash-Next GGUF plan: {}", detail.as_ref()))
+}
+
+/// Two additional part starts per layer, each rounded up by at most three bytes.
+pub(in super::super::super) fn stack_alignment_reserve(layers: usize) -> Result<u64, EngError> {
+    u64::try_from(layers)
+        .ok()
+        .and_then(|n| n.checked_mul(6))
+        .ok_or_else(|| refuse("expert alignment reserve overflows"))
 }
 
 /// What the plan reads from the file.
@@ -126,7 +134,9 @@ impl GgufModel {
                 positions: 1,
                 bytes_per_position: 1,
             },
-            card.free_vram.saturating_sub(card.ring_budget),
+            card.free_vram
+                .saturating_sub(card.ring_budget)
+                .saturating_sub(stack_alignment_reserve(sizes.shape.layers)?),
             HostFrame::with_default_terms(card.host),
             rung_ring_placeholder_bytes(
                 usize::try_from(sizes.record_bytes_max)
