@@ -23,7 +23,11 @@ pub(in crate::kernels::cuda) fn launch(
     [width, roles]: [usize; 2],
     eps: f32,
 ) -> Result<(), DeviceFailure> {
-    if !(1..=4096).contains(&width) || !matches!(roles, 1 | 3) || !eps.is_finite() || eps <= 0.0 {
+    if !(1..=4096).contains(&width)
+        || !(1..=1536).contains(&roles)
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
         return Err(invalid_argument());
     }
     let bytes = 6 * roles * width * size_of::<f32>();

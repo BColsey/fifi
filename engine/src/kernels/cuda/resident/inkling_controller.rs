@@ -1,5 +1,8 @@
 //! Apply the Q/K/V cross-pass gates and weighted RMSNorm on the projection stream.
 
+#[cfg(test)]
+mod tests;
+
 use crate::EngError;
 use crate::kernels::cuda::{
     CudaContext, DeviceRange, DeviceStream, native::resident::inkling_controller::launch,
@@ -19,7 +22,8 @@ impl CudaContext {
         self.inkling_controller_norm_roles(stream, workspace, health, ([width, 3], eps))
     }
 
-    /// Like the Q/K/V entry, but permits a single controlled MLP row.
+    /// Packs 1..=1536 independent roles: triples, pairs, then outputs.
+    /// Health has one float per role; workspace and health must not overlap.
     pub(crate) fn inkling_controller_norm_roles(
         &self,
         stream: &DeviceStream,

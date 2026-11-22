@@ -51,7 +51,7 @@ extern "C" int inference_cuda_inkling_controller_norm(float *workspace, float *h
                                                       int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (workspace == nullptr || health == nullptr || stream == nullptr || width < 1 ||
-        width > 4096 || (roles != 1 && roles != 3) || !isfinite(eps) || eps <= 0.0f)
+        width > 4096 || roles < 1 || roles > 1536 || !isfinite(eps) || eps <= 0.0f)
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     const uintptr_t work = (uintptr_t)workspace, status = (uintptr_t)health;
     if (work % 4 != 0 || status % 4 != 0 ||
