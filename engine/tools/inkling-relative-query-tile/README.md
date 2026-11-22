@@ -1,10 +1,9 @@
 # Inkling strict-F32 relative-attention query tiles
 
-Standalone, default-off CUDA component probe. It does not change serving, decode,
-workspace admission, draft verification, or prefix handling. The only native
-engine change extracts the serial kernel's K/V addressing behind a compile-time
-reader; the probe includes that translation unit to reuse the production FP32
-arithmetic and test against the actual serial launch.
+The standalone CUDA probe calls the production launchers with packed synthetic
+inputs. The default-off GGUF prefill bridge additionally uses strided inputs and
+can borrow the existing resident sink/gate sidecar. It reuses the batch workspace
+and does not change decode or draft verification.
 
 ## Why this experiment
 
@@ -56,12 +55,20 @@ restore must invalidate lineage before comparing position numbers. The probe
 reseeds both arms explicitly and enforces matching certification in `enqueue`;
 it runs no attention against an unverified cursor.
 
-A future integration would keep the original host history and prefix/rejection
-protocol. It must take/invalidate its per-visit cursor before enqueuing, repair
-history on the same stream, and publish its next cursor only after completion,
-status, and any downstream projection/readback validation. Tile application to a
-restored prompt would require the same proof as fresh prefill. This probe is not
-serving dispatch or speculative transaction support.
+The production bridge (`attention/prefill.rs`) takes its per-visit cursor before
+any repair or launch. The ordinary grouped route in `cpu_forward/prefill.rs`
+excludes draft windows and journaled rows; `CpuForward::restore` and `reset`
+invalidate before replacing host history. A missing, behind or ahead cursor
+requires a full blocking reseed from the host deques on the attention stream.
+An equal cursor may only be reused within that visit and lineage. The sidecar
+producer fences before returning; the consumer drains before the next tile can
+reuse it. Upload, queries, guarded commit, output projection and readback are
+ordered on the attention stream. Cursor publication requires a successful fence,
+zero attention status and finite projected output. On any later failure the
+cursor stays unknown, even if physical commit ran; there is no in-place serial
+retry. The enclosing grouped forward remains failed until reset/restore. It
+still appends each successful row's prepared host K/V and applies output
+convolution in token order.
 
 ## Build and qualify
 
@@ -87,18 +94,32 @@ use synthetic prepared operands with Mini's measured geometry: 24 query heads,
 512-row prefill at context 768 and a 64-row tile starting just before the
 1,024-row SWA ring wraps. No model weights or serving claim.
 
-### Checks completed without a GPU
+### Focused coverage and remaining qualification
 
-- 29,488 CPU source-identity and final-ring cases against a sequential oracle,
-  plus cursor/extent eligibility tests; also passed with UBSan.
-- Targeted nvcc 12.4.131 build/link succeeded for SM75 and SM86 with warnings as
-  errors. On SM75, serial uses 39 registers and the query tile 41, both with
-  4,256 shared bytes per CTA and no spills. Commit uses 22 registers and 4
-  shared bytes, also with no spills. SM86 query tile uses 36 registers, no spills.
-- Standalone production translation unit's serial kernel instructions and raw
-  encodings (`cuobjdump --dump-sass`) matched base `9567f77e` on both SM75 and SM86.
-- Exact **device** parity and timings are pending GPU admission. No full engine
-  build, integration, GPU execution, or flag default change was performed.
+- `build.sh` runs 29,488 CPU source-identity and final-ring cases against a
+  sequential oracle, plus cursor/extent checks, and compiles/links the SM75 probe.
+  The standalone production CUDA TU also compiles for SM75 and SM86 with nvcc
+  12.4.131 (`--Werror all-warnings`). Neither command runs any GPU code.
+- `query_tile_validates_strided_bounds_and_positions` checks byte extents,
+  alignment, tile width and the upper legal position without a GPU.
+- Under a GPU lease, run `cargo test --manifest-path engine/Cargo.toml --features
+  native-cuda restored_attention_replaces_a_divergent_ring_at_the_same_position`.
+  It compares
+  strided host and resident-sidecar routes against serial output bits and physical
+  rings at wrap, checks a singleton continuation, rewinds, rejects missing host
+  history and bad sidecar extents, and checks that status failure suppresses
+  commit and projection failure invalidates an already-written ring. It then
+  retries from authoritative host rows. This test was not run for the bridge.
+  For a real-model A/B, keep all other flags fixed, check the successful-use log
+  (`Inkling CUDA used relative attention query tiles`), then compare fresh and
+  restored prefixes, and the first decode row after a local ring wrap.
+- Component commit `8d59b740` passed synthetic bitwise output, status and ring
+  parity on a leased RTX 2080 Ti (`../evidence/query-device/probe.log` relative to
+  the lane checkout). The 512-token component measured 18.672 ms serial vs
+  1.911 ms tiled, including commit but excluding host preparation and transfers.
+  This predates the production bridge and is not a serving result. Production
+  GPU parity, real-model prefix/continuation checks, end-to-end timings and a
+  full engine build remain outstanding.
 
 [turing]: https://docs.nvidia.com/cuda/turing-tuning-guide/index.html#occupancy
 [fa2]: https://arxiv.org/abs/2307.08691

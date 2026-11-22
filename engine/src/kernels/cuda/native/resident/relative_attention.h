@@ -33,6 +33,14 @@ typedef struct inference_cuda_relative_attention_args {
 int inference_cuda_relative_attention_launch(
     const inference_cuda_relative_attention_args *args, void *stream, int *out_stage);
 
+/* Reads one certified, immutable pre-tile ring, then commits on the same stream.
+ * Output and zero-initialized status are packed. The two strides are in 32-bit
+ * words: input for Q/K/V/relative/position, side for sinks/gates; zero means
+ * tightly packed per plane. Positions must match first + row. No graph replay. */
+int inference_cuda_relative_attention_tile_launch(
+    const inference_cuda_relative_attention_args *args, int first, int count,
+    int input_stride, int side_stride, void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 static_assert(sizeof(inference_cuda_relative_attention_args) == 120 &&

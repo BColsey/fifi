@@ -301,6 +301,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/qsa_attn.h",
     "src/kernels/cuda/native/resident/qsa_index.h",
     "src/kernels/cuda/native/resident/relative_attention.h",
+    "src/kernels/cuda/native/resident/relative_attention_tile.h",
     "src/kernels/cuda/native/resident/qsa_select.h",
 ];
 

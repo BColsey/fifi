@@ -85,6 +85,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     projection_headroom: u64,
     reserve_credit: u64,
     stream: DeviceStream,
+    query_tiles: bool,
     state: RefCell<Runtime>,
     prefill: RefCell<Option<prefill::Workspace>>,
     local_aux: RefCell<Option<local::AuxStore>>,
@@ -249,6 +250,7 @@ impl Plan {
             projection_headroom,
             reserve_credit: credit,
             stream,
+            query_tiles: self.projected_rows.is_some() && prefill::query_tiles_enabled(context),
             prefill: RefCell::default(),
             local_aux: RefCell::default(),
             state: RefCell::new(Runtime {
@@ -711,31 +713,106 @@ mod tests {
             gates: &[],
             ..row
         });
-        let batch = |rows, side| {
-            attention.invalidate();
-            attention.step_prefill(
+        let cursor = || attention.state.borrow().next_position[0];
+        let batch = |position, rows: &[Row<'_>], side, values: &VecDeque<_>, tiled| {
+            attention.step_prefill_dispatch(
                 &ctx,
                 0,
                 (rows, side),
                 History {
-                    position: 4,
+                    position,
                     keys: &keys,
-                    values: &values,
+                    values,
                 },
                 Some(&projection),
+                tiled,
             )
         };
         let mut staged = Vec::new();
         extend_words(&mut staged, side_rows.as_flattened());
         side.write_at(&stream, 0, &staged).unwrap();
+        let ring = || {
+            let mut bytes = vec![0; 2 * cache_bytes];
+            attention
+                .arena
+                .read_at(&attention.stream, table_bytes, &mut bytes)
+                .unwrap();
+            bytes
+        };
+        let bits = |outputs: Vec<Vec<f32>>| {
+            outputs
+                .into_iter()
+                .flatten()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let tail_values = [11.0, 10.0, 9.0]
+            .map(|v| Arc::new(vec![v; HEAD_DIM]))
+            .into();
+        let evaluate = |tiled, side: Option<DeviceRange<'_>>| {
+            // Manufacture an equal cursor from a different lineage before entering
+            // each arm. Invalidate first, as prefix restore does in production.
+            run(3, 100.0, &[200.0, 300.0, 400.0], true).unwrap();
+            assert_eq!(cursor(), Some(4));
+            attention.invalidate();
+            let rows = if side.is_some() {
+                &device_rows
+            } else {
+                &host_rows
+            };
+            let outputs = batch(4, rows, side, &values, tiled).unwrap();
+            assert_eq!(cursor(), Some(8));
+            let committed = ring();
+            let tail = batch(8, &host_rows[..1], None, &tail_values, tiled).unwrap();
+            assert_eq!(cursor(), Some(9));
+            (bits(outputs), committed, bits(tail), ring())
+        };
+        let reference = evaluate(false, None);
+        assert_eq!(evaluate(false, Some(side_in)), reference);
+        assert_eq!(evaluate(true, None), reference);
+        assert_eq!(evaluate(true, Some(side_in)), reference);
+        assert!(batch(4, &device_rows[..3], Some(side_in), &values, true).is_err());
+        assert_eq!(cursor(), Some(9)); // rejected extent is pre-mutation
+
+        // Both rewind and host-ahead cursor gaps must repair before reading.
         assert_eq!(
-            batch(&host_rows[..], None).unwrap(),
-            batch(&device_rows[..], Some(side_in)).unwrap()
+            bits(batch(4, &host_rows, None, &values, true).unwrap()),
+            reference.0
         );
-        assert!(batch(&device_rows[..3], Some(side_in)).is_err());
+        attention.invalidate();
+        run(2, 100.0, &[200.0, 300.0], true).unwrap();
+        assert_eq!(cursor(), Some(3));
+        assert_eq!(
+            batch(4, &host_rows, None, &VecDeque::new(), true),
+            Err(bad("missing host rows for CUDA relative attention restore"))
+        );
+        assert_eq!(cursor(), None);
+
         side.write_at(&stream, size_of::<f32>(), &f32::INFINITY.to_ne_bytes())
             .unwrap();
-        assert!(batch(&device_rows[..], Some(side_in)).is_err());
+        run(3, 6.0, &[2.0, 40.0, 20.0], true).unwrap();
+        let snapshot = ring();
+        assert_eq!(
+            batch(4, &device_rows, Some(side_in), &values, true),
+            Err(bad("invalid CUDA relative attention batch state"))
+        );
+        assert_eq!(cursor(), None);
+        assert_eq!(ring(), snapshot); // attention status prevents physical commit
+
+        weight
+            .write_at(&stream, 0, &f32::NAN.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            batch(4, &host_rows, None, &values, true),
+            Err(bad("non-finite CUDA relative attention batch output"))
+        );
+        assert_eq!(cursor(), None); // projection failed after physical commit
+        assert_eq!(ring(), reference.1);
+        weight.write_at(&stream, 0, &encoded).unwrap();
+        assert_eq!(
+            bits(batch(4, &host_rows, None, &values, true).unwrap()),
+            reference.0
+        );
         assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
         assert_eq!(
             run(POS_MAX as usize + 1, 1.0, &[], true),

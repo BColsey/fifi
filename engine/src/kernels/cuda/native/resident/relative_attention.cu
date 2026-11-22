@@ -5,6 +5,7 @@
 #include "device.h"
 #include "resident/attn_split_reduce.cuh"
 #include "resident/relative_attention.h"
+#include "resident/relative_attention_tile.h"
 #include "resident/step_params.h"
 
 namespace {
@@ -147,6 +148,64 @@ __global__ void relative_attention(Args a) {
     finish(a, r, p);
 }
 
+__device__ int row_stride(int stride, int width) { return stride == 0 ? width : stride; }
+
+struct SnapshotKv {
+    int query, stride;
+    __device__ KvPair operator()(const Args &a, const Rows &r, int distance) const {
+        const auto src = snapshot::source(query, r.slot, distance, a.capacity);
+        const int channels = a.kv_heads * kHeadDim;
+        const size_t offset = size_t(src.row) * (src.staged ? stride : channels)
+                            + r.kv_head * kHeadDim;
+        return {(src.staged ? a.k : a.keys) + offset,
+                (src.staged ? a.v : a.values) + offset};
+    }
+};
+
+__global__ void snapshot_queries(Args a, int first, int input_stride, int side_stride) {
+    __shared__ Partials p;
+    const int query = blockIdx.y, head = blockIdx.x, pos = first + query;
+    a.status += query;
+    const int channels = a.query_heads * kHeadDim;
+    a.out += query * channels;
+    if (a.pos[query * row_stride(input_stride, 1)] != pos) {
+        if (head == 0 && threadIdx.x == 0) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
+        // Output projection can already be queued. Give it initialized inputs even
+        // though the host will discard the whole tile based on status.
+        if (threadIdx.x < kHeadDim) a.out[head * kHeadDim + threadIdx.x] = 0.f;
+        return;
+    }
+    const int group = a.query_heads / a.kv_heads;
+    const Rows r{head, head / group, pos % a.capacity, min(pos + 1, a.capacity)};
+    // K/V stay at the tile base; the reader chooses a staged row or the pre-tile ring.
+    a.q += query * row_stride(input_stride, channels);
+    a.relative += query * row_stride(input_stride, a.query_heads * a.relative_dims);
+    a.sinks += query * row_stride(side_stride, a.query_heads);
+    a.gates += query * row_stride(side_stride, channels);
+    partial(a, r, p, SnapshotKv{query, row_stride(input_stride, a.kv_heads * kHeadDim)});
+    __syncthreads();
+    finish(a, r, p);
+}
+
+__global__ void snapshot_commit(Args a, int first, int count, int input_stride) {
+    __shared__ int valid;
+    if (threadIdx.x == 0) {
+        valid = 1;
+        for (int i = 0; i < count; ++i) valid &= (a.status[i] == 0);
+    }
+    __syncthreads();
+    if (!valid) return;
+    const int row = snapshot::first_commit(count, a.capacity) + blockIdx.x;
+    const int slot = (first + row) % a.capacity;
+    const int channels = a.kv_heads * kHeadDim;
+    for (int d = threadIdx.x; d < channels; d += blockDim.x) {
+        const size_t src = size_t(row) * row_stride(input_stride, channels) + d;
+        const size_t dst = size_t(slot) * channels + d;
+        a.keys[dst] = a.k[src];
+        a.values[dst] = a.v[src];
+    }
+}
+
 bool valid(const inference_cuda_relative_attention_args &a) {
     if (a.kv_heads < 1 || a.query_heads < a.kv_heads || a.query_heads > kMaxHeads ||
         a.query_heads % a.kv_heads != 0 || a.relative_dims < 1 || a.relative_dims > kWarp ||
@@ -172,6 +231,40 @@ extern "C" int inference_cuda_relative_attention_launch(
         Failure failure;
         relative_attention<<<in->query_heads, kThreads, 0, (cudaStream_t)stream>>>(*in);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_relative_attention_tile_launch(
+    const Args *in, int first, int count, int input_stride, int side_stride,
+    void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (in == nullptr || stream == nullptr || !valid(*in) ||
+            count < 2 || count > snapshot::kLimit || !snapshot::valid_interval(first, count)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const int channels = in->query_heads * kHeadDim;
+        auto valid_stride = [channels](int stride) {
+            return stride == 0 || (stride >= channels && stride <= snapshot::kMaxStride);
+        };
+        if (!valid_stride(input_stride) || !valid_stride(side_stride)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        const auto s = (cudaStream_t)stream;
+        snapshot_queries<<<dim3(in->query_heads, count), kThreads, 0, s>>>(
+            *in, first, input_stride, side_stride);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.err == cudaSuccess) {
+            // The stream, not CTA ordering, separates all snapshot reads from writes.
+            snapshot_commit<<<min(count, in->capacity), kThreads, 0, s>>>(
+                *in, first, count, input_stride);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

@@ -1,5 +1,5 @@
-#ifndef INKLING_RELATIVE_QUERY_TILE_SNAPSHOT_PLAN_H
-#define INKLING_RELATIVE_QUERY_TILE_SNAPSHOT_PLAN_H
+#ifndef INFERENCE_CUDA_RESIDENT_RELATIVE_ATTENTION_TILE_H
+#define INFERENCE_CUDA_RESIDENT_RELATIVE_ATTENTION_TILE_H
 
 #ifdef __CUDACC__
 #define INK_TILE_HD __host__ __device__
@@ -10,6 +10,7 @@
 namespace snapshot {
 
 constexpr int kLimit = 64;
+constexpr int kMaxStride = (1 << 20) / 4;  // words; bounds row offset arithmetic
 constexpr int kLastPosition = (1 << 30) - 2;  // native relative attention position limit
 
 inline bool valid_interval(int first, int count) {

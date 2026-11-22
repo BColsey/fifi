@@ -1,7 +1,5 @@
-// Standalone TU: use the production kernels and their internal FP32 recurrence
-// verbatim. The engine build does not compile or dispatch this experiment.
+// Standalone TU: exercise the production launchers with packed input planes.
 #include "resident/relative_attention.cu"
-#include "snapshot_plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,52 +10,6 @@
 #include <vector>
 
 namespace {
-
-struct SnapshotKv {
-    int query;
-    __device__ KvPair operator()(const Args &a, const Rows &r, int distance) const {
-        const auto src = snapshot::source(query, r.slot, distance, a.capacity);
-        const size_t offset = (size_t(src.row) * a.kv_heads + r.kv_head) * kHeadDim;
-        return {(src.staged ? a.k : a.keys) + offset,
-                (src.staged ? a.v : a.values) + offset};
-    }
-};
-
-__global__ void snapshot_queries(Args a, int first) {
-    __shared__ Partials p;
-    const int query = blockIdx.y, head = blockIdx.x, pos = first + query;
-    const int group = a.query_heads / a.kv_heads;
-    const Rows r{head, head / group, pos % a.capacity, min(pos + 1, a.capacity)};
-    const int channels = a.query_heads * kHeadDim;
-    // K/V stay at the tile base, unlike the per-query planes.
-    a.q += query * channels;
-    a.relative += query * a.query_heads * a.relative_dims;
-    a.sinks += query * a.query_heads;
-    a.gates += query * channels;
-    a.out += query * channels;
-    a.status += query;
-    partial(a, r, p, SnapshotKv{query});
-    __syncthreads();
-    finish(a, r, p);
-}
-
-__global__ void snapshot_commit(Args a, int first, int count) {
-    __shared__ int valid;
-    if (threadIdx.x == 0) {
-        valid = 1;
-        for (int i = 0; i < count; ++i) valid &= (a.status[i] == 0);
-    }
-    __syncthreads();
-    if (!valid) return;
-    const int row = snapshot::first_commit(count, a.capacity) + blockIdx.x;
-    const int slot = (first + row) % a.capacity;
-    const int channels = a.kv_heads * kHeadDim;
-    for (int d = threadIdx.x; d < channels; d += blockDim.x) {
-        const size_t src = size_t(row) * channels + d, dst = size_t(slot) * channels + d;
-        a.keys[dst] = a.k[src];
-        a.values[dst] = a.v[src];
-    }
-}
 
 void check(bool ok, const char *description) {
     if (!ok) {
@@ -97,11 +49,9 @@ bool enqueue(Args a, int first, int certified_cursor, int count, bool enabled, c
     check(certified_cursor == first, "ring must be reseeded before either path");
     check(valid(a) && snapshot::valid_interval(first, count), "invalid packed probe geometry or position");
     if (snapshot::eligible(enabled, certified_cursor, first, count, a.capacity)) {
-        snapshot_queries<<<dim3(a.query_heads, count), kThreads, 0, s>>>(a, first);
-        cuda(cudaGetLastError());
-        // Stream order, not CTA order, separates all ring reads from all writes.
-        snapshot_commit<<<std::min(count, a.capacity), kThreads, 0, s>>>(a, first, count);
-        cuda(cudaGetLastError());
+        int stage;
+        cuda(static_cast<cudaError_t>(
+            inference_cuda_relative_attention_tile_launch(&a, first, count, 0, 0, s, &stage)));
         return true;
     }
     for (int i = 0; i < count; ++i) {

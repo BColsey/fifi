@@ -22,6 +22,8 @@ use crate::kernels::cuda::native::resident::relative_attention::{
 pub(crate) const HEAD_DIM: usize = 128;
 const MAX_HEADS: usize = 64;
 const MAX_WORD: usize = (1 << 30) - 1;
+const MAX_STRIDE: usize = 1 << 20;
+pub(crate) const QUERY_TILE_LIMIT: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RelativeAttentionShape {
@@ -30,6 +32,42 @@ pub(crate) struct RelativeAttentionShape {
     pub(crate) relative_dims: usize,
     pub(crate) relative_extent: usize,
     pub(crate) capacity: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RelativeAttentionTile {
+    pub(crate) first: usize,
+    pub(crate) count: usize,
+    // Byte strides, or zero for packed planes. Output/status are always packed.
+    pub(crate) input_stride: usize,
+    pub(crate) side_stride: usize,
+}
+
+impl RelativeAttentionTile {
+    pub(crate) fn region_bytes(self, shape: RelativeAttentionShape) -> Option<[usize; RANGES]> {
+        let mut bytes = shape.region_bytes()?;
+        if !(2..=QUERY_TILE_LIMIT).contains(&self.count)
+            || self.first.checked_add(self.count)? > MAX_WORD
+            || [self.input_stride, self.side_stride]
+                .into_iter()
+                .any(|stride| {
+                    stride != 0 && (!(bytes[0]..=MAX_STRIDE).contains(&stride) || stride % 4 != 0)
+                })
+        {
+            return None;
+        }
+        // Strided read-only bounds may overlap each other, but cannot cover any writer.
+        for (i, width) in bytes.iter_mut().enumerate() {
+            let stride = match i {
+                0 | 3 => *width,
+                4..=7 | 11 => self.input_stride.max(*width),
+                9 | 10 => self.side_stride.max(*width),
+                _ => continue, // the two rings and the bias table are not batched
+            };
+            *width += (self.count - 1) * stride;
+        }
+        Some(bytes)
+    }
 }
 
 pub(crate) struct RelativeAttentionCall<'a> {
@@ -85,8 +123,34 @@ impl CudaContext {
         stream: &DeviceStream,
         call: RelativeAttentionCall<'_>,
     ) -> Result<(), EngError> {
+        self.relative_attention_dispatch(stream, call, None)
+    }
+
+    /// Queues all queries and then the status-guarded ring commit on one stream.
+    /// The caller must exclusively own the visit's ring and certify `tile.first`
+    /// against its lineage before launch. Not a graph-replay or decode entry point.
+    pub(crate) fn relative_attention_tile(
+        &self,
+        stream: &DeviceStream,
+        call: RelativeAttentionCall<'_>,
+        tile: RelativeAttentionTile,
+    ) -> Result<(), EngError> {
+        self.ensure_uncaptured("a relative attention query tile")?;
+        self.relative_attention_dispatch(stream, call, Some(tile))
+    }
+
+    fn relative_attention_dispatch(
+        &self,
+        stream: &DeviceStream,
+        call: RelativeAttentionCall<'_>,
+        tile: Option<RelativeAttentionTile>,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        let bytes = call.shape.region_bytes().ok_or_else(|| {
+        let bytes = match tile {
+            Some(tile) => tile.region_bytes(call.shape),
+            None => call.shape.region_bytes(),
+        }
+        .ok_or_else(|| {
             EngError::BadRequest("relative attention: invalid geometry or overflow".into())
         })?;
         let ranges = [
@@ -119,6 +183,7 @@ impl CudaContext {
         let raw = RelativeAttentionRaw {
             ranges: raw_ranges,
             shape: call.shape,
+            tile,
         };
         self.launch_on(stream, |stream| relative_attention_launch(stream, &raw))
     }

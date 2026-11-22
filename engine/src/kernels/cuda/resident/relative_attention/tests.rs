@@ -247,6 +247,52 @@ fn geometry_rejects_invalid_shapes() {
 }
 
 #[test]
+fn query_tile_validates_strided_bounds_and_positions() {
+    let tile = RelativeAttentionTile {
+        first: POS_MAX as usize - 1,
+        count: 2,
+        input_stride: 32_768,
+        side_stride: (SHAPE.query_heads + QUERY) * 4,
+    };
+    let row = SHAPE.region_bytes().unwrap();
+    let extents = tile.region_bytes(SHAPE).unwrap();
+    assert_eq!(extents[0], 2 * row[0]);
+    assert_eq!(extents[1..3], row[1..3]);
+    assert_eq!(extents[3], 8);
+    assert_eq!(extents[4], row[4] + tile.input_stride);
+    assert_eq!(extents[8], row[8]);
+    assert_eq!(extents[9], row[9] + tile.side_stride);
+    assert_eq!(extents[10], row[10] + tile.side_stride);
+    assert_eq!(extents[11], 4 + tile.input_stride);
+    for invalid in [
+        RelativeAttentionTile { count: 1, ..tile },
+        RelativeAttentionTile { count: 65, ..tile },
+        RelativeAttentionTile {
+            first: POS_MAX as usize,
+            ..tile
+        },
+        RelativeAttentionTile {
+            first: usize::MAX,
+            ..tile
+        },
+        RelativeAttentionTile {
+            input_stride: 4,
+            ..tile
+        },
+        RelativeAttentionTile {
+            side_stride: tile.side_stride + 1,
+            ..tile
+        },
+        RelativeAttentionTile {
+            input_stride: MAX_STRIDE + 4,
+            ..tile
+        },
+    ] {
+        assert!(invalid.region_bytes(SHAPE).is_none());
+    }
+}
+
+#[test]
 fn rolling_relative_attention_capture_matches_cpu() {
     if !device_present("rolling relative attention") {
         return;

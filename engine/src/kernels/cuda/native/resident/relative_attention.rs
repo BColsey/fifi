@@ -9,7 +9,9 @@ use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
-use crate::kernels::cuda::resident::relative_attention::{RANGES, RelativeAttentionShape, WRITTEN};
+use crate::kernels::cuda::resident::relative_attention::{
+    RANGES, RelativeAttentionShape, RelativeAttentionTile, WRITTEN,
+};
 
 #[repr(C)]
 struct Args {
@@ -30,18 +32,33 @@ const _: () = assert!(
 unsafe extern "C" {
     #[link_name = "inference_cuda_relative_attention_launch"]
     fn raw_launch(args: *const Args, stream: *mut c_void, stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_relative_attention_tile_launch"]
+    fn raw_tile_launch(
+        args: *const Args,
+        first: c_int,
+        count: c_int,
+        input_stride: c_int,
+        side_stride: c_int,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
 }
 
 pub(in crate::kernels::cuda) struct RelativeAttentionRaw<'a> {
     pub(in crate::kernels::cuda) ranges: [RawRange<'a>; RANGES],
     pub(in crate::kernels::cuda) shape: RelativeAttentionShape,
+    pub(in crate::kernels::cuda) tile: Option<RelativeAttentionTile>,
 }
 
 pub(in crate::kernels::cuda) fn relative_attention_launch(
     stream: &RawStream,
     call: &RelativeAttentionRaw<'_>,
 ) -> Result<(), DeviceFailure> {
-    let bytes = call.shape.region_bytes().ok_or_else(invalid_argument)?;
+    let bytes = match call.tile {
+        Some(tile) => tile.region_bytes(call.shape),
+        None => call.shape.region_bytes(),
+    }
+    .ok_or_else(invalid_argument)?;
     let spans = std::array::from_fn::<_, RANGES, _>(|i| Span::of(&call.ranges[i], bytes[i]));
     for (i, range) in call.ranges.iter().enumerate() {
         if range.bytes() < bytes[i]
@@ -61,10 +78,22 @@ pub(in crate::kernels::cuda) fn relative_attention_launch(
         capacity: shape.capacity as c_int,
     };
     let mut stage = STAGE_NONE;
-    // SAFETY: region_bytes bounded the geometry and the checks above prove all
-    // touched ranges are aligned and in bounds, with writes disjoint from all other
-    // regions. The explicit stream is live, and the adapter copies the args into
-    // the launch before returning.
-    let status = unsafe { raw_launch(&args, stream.as_ptr(), &mut stage) };
+    // SAFETY: region_bytes bounded the geometry, interval and strides. The checks
+    // above prove all touched ranges are aligned and in bounds, with writes disjoint
+    // from all other regions. The adapter copies the args before returning.
+    let status = unsafe {
+        match call.tile {
+            Some(tile) => raw_tile_launch(
+                &args,
+                tile.first as c_int,
+                tile.count as c_int,
+                (tile.input_stride / 4) as c_int,
+                (tile.side_stride / 4) as c_int,
+                stream.as_ptr(),
+                &mut stage,
+            ),
+            None => raw_launch(&args, stream.as_ptr(), &mut stage),
+        }
+    };
     checked(status, stage)
 }

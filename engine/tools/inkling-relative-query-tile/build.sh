@@ -8,7 +8,7 @@ mkdir -p -- "$out/tmp"
 out=$(cd -- "$out" && pwd)
 export TMPDIR="$out/tmp" TMP="$out/tmp" TEMP="$out/tmp"
 "${CXX:-g++}" -std=c++17 -O2 -Wall -Wextra -Werror \
-    "$fixture/snapshot_test.cc" -o "$out/snapshot-test"
+    -I "$engine/src/kernels/cuda/native" "$fixture/snapshot_test.cc" -o "$out/snapshot-test"
 "$out/snapshot-test"
 "${NVCC:-nvcc}" -ccbin "${CXX:-g++}" -arch="sm_${2:-75}" -std=c++17 -O3 -lineinfo \
     --Werror all-warnings -Xptxas=-v -I "$engine/src/kernels/cuda/native" \
