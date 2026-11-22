@@ -950,13 +950,22 @@ mod tests {
             delta_input(shape.hyper.width(), 0),
         ];
         for token in 0..4 {
-            for (projector, state, residual) in [(&mut cpu, &mut states[0], &mut residuals[0])] {
-                let read = hyper::read(projector, &shape.hyper, &hw, residual).unwrap();
-                let block =
-                    deltanet::step(projector, &shape.delta, &weights.view(), state, &read.mixed)
-                        .unwrap();
-                hyper::apply(&shape.hyper, residual, read.gate.as_ref().unwrap(), &block).unwrap();
-            }
+            let cpu_read = hyper::read(&mut cpu, &shape.hyper, &hw, &residuals[0]).unwrap();
+            let cpu_block = deltanet::step(
+                &mut cpu,
+                &shape.delta,
+                &weights.view(),
+                &mut states[0],
+                &cpu_read.mixed,
+            )
+            .unwrap();
+            hyper::apply(
+                &shape.hyper,
+                &mut residuals[0],
+                cpu_read.gate.as_ref().unwrap(),
+                &cpu_block,
+            )
+            .unwrap();
             let read = hyper::read(&mut gpu, &shape.hyper, &hw, &residuals[1]).unwrap();
             let block = deltanet::step(
                 &mut gpu,
@@ -973,20 +982,34 @@ mod tests {
                 &block,
             )
             .unwrap();
-            let norm = residuals[0]
-                .iter()
-                .map(|v| f64::from(*v).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            let err = residuals[0]
-                .iter()
-                .zip(&residuals[1])
-                .map(|(a, b)| f64::from(a - b).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            assert!(norm.is_finite() && norm > 0.0 && err.is_finite());
-            eprintln!("step {token} hyper residual relative L2 {}", err / norm);
-            assert!(err / norm < 0.03);
+            for (name, expected, actual) in [
+                ("mixed", cpu_read.mixed.as_slice(), read.mixed.as_slice()),
+                (
+                    "gate",
+                    cpu_read.gate.as_ref().unwrap().as_slice(),
+                    read.gate.as_ref().unwrap().as_slice(),
+                ),
+                ("block", cpu_block.as_slice(), block.as_slice()),
+                ("recurrent", states[0].rec(), states[1].rec()),
+                ("ring", states[0].ring(), states[1].ring()),
+                ("residual", residuals[0].as_slice(), residuals[1].as_slice()),
+            ] {
+                assert_eq!(expected.len(), actual.len());
+                let norm = expected
+                    .iter()
+                    .map(|v| f64::from(*v).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let err = expected
+                    .iter()
+                    .zip(actual)
+                    .map(|(a, b)| f64::from(a - b).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(norm.is_finite() && norm > 0.0 && err.is_finite());
+                eprintln!("step {token} {name} relative L2 {}", err / norm);
+                assert!(err / norm < 0.03, "step {token} {name}");
+            }
         }
         assert!(launches.get() > 0);
         eprintln!("CUDA projection launches: {}", launches.get());
