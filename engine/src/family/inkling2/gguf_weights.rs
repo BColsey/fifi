@@ -668,6 +668,7 @@ impl GgufTextWeights {
                 cache_reserve,
                 resident_attention,
                 allow_device_routing: !draft_target,
+                context_limit: attention.context,
             },
         )?;
         if reuse {

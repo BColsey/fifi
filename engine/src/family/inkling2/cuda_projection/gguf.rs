@@ -26,6 +26,7 @@ use crate::{
 pub(in crate::family::inkling2) mod attention;
 mod cache;
 mod cold_controller;
+mod controller_residency;
 mod device_prefill;
 mod residency;
 mod resident_prefill;
@@ -243,6 +244,10 @@ fn upload_projections(
         .collect()
 }
 
+fn projection_group(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
+}
+
 fn upload_optional_projections(
     context: &CudaContext,
     matrices: &[GgufDenseUpload<'_>],
@@ -250,10 +255,9 @@ fn upload_optional_projections(
     headroom: u64,
 ) -> Result<(), EngError> {
     // A controller needs all three matrices resident to use one upload and readback.
-    fn group_name(name: &str) -> &str {
-        name.rsplit_once('.').map_or(name, |(stem, _)| stem)
-    }
-    for group in matrices.chunk_by(|a, b| group_name(a.matrix.name) == group_name(b.matrix.name)) {
+    for group in
+        matrices.chunk_by(|a, b| projection_group(a.matrix.name) == projection_group(b.matrix.name))
+    {
         let free = (context.memory_info()?.free as u64).saturating_sub(headroom);
         if projection_bytes(group) > free {
             continue;
@@ -275,6 +279,7 @@ pub(in crate::family::inkling2) struct Options {
     pub cache_reserve: Option<u64>,
     pub resident_attention: Option<attention::Plan>,
     pub allow_device_routing: bool,
+    pub context_limit: usize,
 }
 
 struct ResidentMoe {
@@ -347,6 +352,7 @@ impl GgufCuda {
             cache_reserve,
             resident_attention,
             allow_device_routing,
+            context_limit,
         }: Options,
     ) -> Result<Self, EngError> {
         let hidden = spec.hidden_size as usize;
@@ -499,6 +505,20 @@ impl GgufCuda {
                 attention::ResidentAttention::projection_headroom,
             );
             upload_optional_projections(&context, &optional, &mut dense, headroom)?;
+            if allow_device_routing
+                && group_projections
+                && controller_residency::enabled()
+                && resident_attention.is_some()
+                && let Some(workspace) =
+                    controller_residency::expert_workspace(spec, context_limit, device_prefill)
+            {
+                controller_residency::admit(
+                    &context,
+                    &optional,
+                    &mut dense,
+                    [headroom, workspace],
+                )?;
+            }
         }
         let sum_bytes = |kind: Option<DenseDtype>| {
             dense

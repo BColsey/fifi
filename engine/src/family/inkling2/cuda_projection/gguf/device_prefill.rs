@@ -80,6 +80,17 @@ impl Layout {
     }
 }
 
+/// Maximum device arena useful at this model's context, before driver rounding.
+pub(super) fn device_workspace_bytes(spec: &super::super::TextSpec, context: usize) -> Option<u64> {
+    let shape = Geometry {
+        hidden: usize::try_from(spec.hidden_size).ok()?,
+        middle: usize::try_from(spec.intermediate_size).ok()?,
+        rank: usize::try_from(spec.num_experts_per_tok).ok()?,
+    };
+    let rows = context.min(DenseGemvShape::MAX_ACTIVATION_ROWS.checked_div(shape.rank)?);
+    Some(u64::try_from(Layout::new(rows, shape)?.down.end).ok()?)
+}
+
 #[derive(Default)]
 pub(super) struct Workspace {
     scratch: Option<Scratch>,
