@@ -1,0 +1,562 @@
+//! Project directly from mapped GGUF matrices. Cold experts reuse fixed staging buffers.
+
+use std::{cell::RefCell, collections::BTreeMap};
+
+use super::{
+    DEVICE_HEADROOM, DensePlan, DenseStep, DenseUpload, Resident, bad, dense::ResidentProjection,
+    upload_tensor,
+};
+use crate::family::inkling2::cpu_weights::Projection;
+use crate::{
+    EngError,
+    expert_tier::{ExpertId, ExpertPayloadSource, Placement, VRAM_HEADROOM_BYTES},
+    family::mapped_file::MappedFile,
+    kernels::cuda::{
+        CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
+        plan::{Demand, admit},
+        resident::dense_gemv::{DenseDtype, GgufMoeCall, GgufMoeShape, GgufMoeWeights},
+    },
+    sched::job::PrefillBankReport,
+    weights::{GgufType, repack_nvfp4_into},
+};
+
+mod cache;
+mod residency;
+pub(in crate::family::inkling2) mod streaming;
+
+pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
+use residency::{PackedBudget, ResidentExperts};
+
+pub(in crate::family::inkling2) struct GgufCuda {
+    step: DenseStep,
+    dense: Projections,
+    packed_gguf: bool,
+    group_projections: bool,
+    group_attention: bool,
+    moe_scratch: Option<ResidentMoe>,
+    batch_streamed: bool,
+    resident: ResidentExperts,
+    cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
+    prefill_report: Option<RefCell<PrefillBankReport>>,
+    stream_banks: Option<RefCell<crate::expert_tier::CudaStreamBanks>>,
+    expert_codes: DeviceBuffer,
+    expert_scales: DeviceBuffer,
+    packed: RefCell<Packed>,
+    context: CudaContext,
+}
+
+pub(in crate::family::inkling2) struct GgufDenseUpload<'a> {
+    pub matrix: DenseUpload<'a>,
+    pub dtype: DenseDtype,
+}
+
+type Projections = BTreeMap<String, (Resident, DenseDtype)>;
+
+fn projection_bytes(matrices: &[GgufDenseUpload<'_>]) -> u64 {
+    matrices
+        .iter()
+        .map(|item| item.matrix.codes.len() as u64)
+        .sum()
+}
+
+fn upload_projections(
+    context: &CudaContext,
+    matrices: &[GgufDenseUpload<'_>],
+) -> Result<Projections, EngError> {
+    matrices
+        .iter()
+        .map(|GgufDenseUpload { matrix, dtype }| {
+            let codes = upload_tensor(context, matrix.codes)?;
+            let weight = Resident {
+                codes,
+                shape: matrix.shape,
+            };
+            Ok((matrix.name.to_owned(), (weight, *dtype)))
+        })
+        .collect()
+}
+
+fn upload_optional_projections(
+    context: &CudaContext,
+    matrices: &[GgufDenseUpload<'_>],
+    dense: &mut Projections,
+) -> Result<(), EngError> {
+    // A controller needs all three matrices resident to use one upload and readback.
+    fn group_name(name: &str) -> &str {
+        name.rsplit_once('.').map_or(name, |(stem, _)| stem)
+    }
+    for group in matrices.chunk_by(|a, b| group_name(a.matrix.name) == group_name(b.matrix.name)) {
+        let free = (context.memory_info()?.free as u64).saturating_sub(VRAM_HEADROOM_BYTES);
+        if projection_bytes(group) > free {
+            continue;
+        }
+        let uploaded = upload_projections(context, group)?;
+        if context.memory_info()?.free as u64 >= VRAM_HEADROOM_BYTES {
+            dense.extend(uploaded);
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::family::inkling2) struct Options {
+    pub direct: bool,
+    pub packed: bool,
+    pub group_projections: bool,
+    pub stream: bool,
+    pub budget: u64,
+    pub cache_reserve: Option<u64>,
+}
+
+struct ResidentMoe {
+    shape: GgufMoeShape,
+    scratch: DeviceBuffer,
+}
+
+struct Packed {
+    codes: Vec<u8>,
+    scales: Vec<u8>,
+}
+
+pub(in crate::family::inkling2) struct ExpertView<'a> {
+    pub id: ExpertId,
+    pub part: usize,
+    pub kind: GgufType,
+    pub shape: [usize; 2],
+    pub bytes: &'a [u8],
+    pub factor: f32,
+}
+
+impl GgufCuda {
+    pub(in crate::family::inkling2) fn load(
+        dense: Vec<GgufDenseUpload<'_>>,
+        spec: &super::TextSpec,
+        layers: Vec<ExpertLayer<'_>>,
+        file: &MappedFile,
+        Options {
+            direct,
+            packed,
+            group_projections,
+            stream,
+            budget,
+            cache_reserve,
+        }: Options,
+    ) -> Result<Self, EngError> {
+        let hidden = spec.hidden_size as usize;
+        let ff = spec.intermediate_size as usize;
+        let rows = hidden.max(2 * ff);
+        let shape = dense.iter().fold([rows, hidden.max(ff)], |[r, c], item| {
+            [r.max(item.matrix.shape[0]), c.max(item.matrix.shape[1])]
+        });
+        let elements = rows * hidden.max(ff);
+        let stage = [2 * elements, elements / 16];
+        let group_attention =
+            std::env::var("FIFI_INKLING_CUDA_GROUP_ATTENTION").as_deref() == Ok("1");
+        let [rows, columns] = shape;
+        let attention_rows = dense
+            .iter()
+            .filter(|item| item.matrix.name.contains(".attn."))
+            .map(|item| item.matrix.shape[0])
+            .max()
+            .unwrap_or(0);
+        let packed_outputs = if group_attention {
+            rows.max(3 * hidden + 8 * attention_rows)
+        } else {
+            rows
+        };
+        let plan = DensePlan::new(
+            [packed_outputs, columns],
+            hidden,
+            spec.core.gate_rank as usize,
+        )?;
+        let (required, mut optional): (Vec<_>, Vec<_>) = dense
+            .into_iter()
+            .partition(|item| item.dtype != DenseDtype::F32);
+        let tensors = projection_bytes(&required);
+        let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
+        let context = CudaContext::with_admission(&admission)?;
+        let batch_experts =
+            packed && std::env::var("FIFI_INKLING_CUDA_BATCH_EXPERTS").as_deref() == Ok("1");
+        let stream_plan = stream.then(|| streaming::plan(hidden, ff)).transpose()?;
+        let mut stream_bytes = stream_plan.map_or(0, |plan| plan.device_bytes());
+        let moe_shape = GgufMoeShape {
+            hidden,
+            middle: ff,
+            experts: spec.n_routed_experts as usize,
+        };
+        let moe_bytes = if batch_experts {
+            moe_shape
+                .scratch_bytes(spec.num_experts_per_tok as usize)
+                .ok_or_else(|| bad("CUDA GGUF expert group exceeds its limits"))?
+        } else {
+            0
+        };
+        let demand = Demand {
+            tensors,
+            work: (stage[0] + stage[1] + plan.device_bytes + moe_bytes) as u64 + stream_bytes,
+            kv_cache: 0,
+            headroom: DEVICE_HEADROOM,
+        };
+        admit(&demand, context.memory_info()?.free as u64)?;
+        let q8_activations =
+            std::env::var("FIFI_INKLING_CUDA_Q8_ACTIVATIONS").as_deref() == Ok("1");
+        let step = DenseStep::new(&context, &plan)?.with_q8_activations(q8_activations);
+        let expert_codes = context.allocate(stage[0])?;
+        let expert_scales = context.allocate(stage[1])?;
+        let mut dense = upload_projections(&context, &required)?;
+        let mut stream_banks = stream_plan
+            .map(|plan| crate::expert_tier::CudaStreamBanks::new(&context, plan))
+            .transpose()?;
+        let moe_scratch = (moe_bytes > 0)
+            .then(|| {
+                context.allocate(moe_bytes).map(|scratch| ResidentMoe {
+                    shape: moe_shape,
+                    scratch,
+                })
+            })
+            .transpose()?;
+        let experts = spec.n_routed_experts as u32;
+        let full_expert_fit = packed && residency::packed_model_fits(&context, &layers, budget)?;
+        let mut batch_streamed = false;
+        // Keep the exact resident placement when the model fits with the original banks.
+        // A streamed group needs one larger slot; the second still serves serial prefill.
+        if batch_experts
+            && !full_expert_fit
+            && std::env::var("FIFI_INKLING_CUDA_BATCH_STREAMED_EXPERTS").as_deref() == Ok("1")
+            && let (Some(banks), Some(original)) = (&mut stream_banks, stream_plan)
+        {
+            let plan = streaming::group_plan(
+                &layers,
+                experts as usize,
+                spec.num_experts_per_tok as usize,
+                original,
+            )?;
+            let free = (context.memory_info()?.free as u64).saturating_sub(VRAM_HEADROOM_BYTES);
+            if plan.bank_bytes() <= free {
+                banks.replace_first(&context, plan)?;
+                stream_bytes = original.bank_bytes() + plan.bank_bytes();
+                batch_streamed = true;
+            }
+        }
+        optional.sort_by_key(|item| !item.matrix.name.ends_with(".mlp.gate.weight"));
+        if !full_expert_fit {
+            upload_optional_projections(&context, &optional, &mut dense)?;
+        }
+        let resident = if packed {
+            ResidentExperts::load_packed(
+                &context,
+                experts,
+                layers,
+                file,
+                PackedBudget {
+                    total: budget,
+                    cache: cache_reserve,
+                },
+            )?
+        } else {
+            ResidentExperts::load_nvfp4(&context, experts, layers, file, direct)?
+        };
+        // Use actual free bytes after expert allocation, including CUDA allocator rounding.
+        if full_expert_fit {
+            upload_optional_projections(&context, &optional, &mut dense)?;
+        }
+        let sum_bytes = |kind: Option<DenseDtype>| {
+            dense
+                .values()
+                .filter(|(_, dtype)| kind.is_none_or(|kind| kind == *dtype))
+                .map(|(weight, _)| weight.codes.bytes() as u64)
+                .sum::<u64>()
+        };
+        eprintln!(
+            "Inkling GGUF CUDA projections {}",
+            serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": sum_bytes(Some(DenseDtype::Bf16)), "resident_f32_bytes": sum_bytes(Some(DenseDtype::F32)), "resident_dense_bytes": sum_bytes(None), "packed_gguf": packed, "q8_1_projection_activations": q8_activations, "batched_resident_experts": moe_scratch.is_some(), "batched_streamed_experts": batch_streamed,
+                "direct_resident_nvfp4": direct || packed, "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
+                "resident_expert_bytes": resident.bytes(),
+                "resident_expert_layers": resident.placement().full_layers(),
+                "resident_expert_count": resident.placement().resident_experts()})
+        );
+        Ok(Self {
+            step,
+            dense,
+            packed_gguf: packed,
+            group_projections,
+            group_attention,
+            moe_scratch,
+            batch_streamed,
+            resident,
+            cache: RefCell::default(),
+            prefill_report: (stream
+                && std::env::var("FIFI_INKLING_CUDA_PROFILE").as_deref() == Ok("1"))
+            .then(RefCell::default),
+            stream_banks: stream_banks.map(RefCell::new),
+            expert_codes,
+            expert_scales,
+            packed: RefCell::new(Packed {
+                codes: vec![0; elements / 2],
+                scales: vec![0; elements / 16],
+            }),
+            context,
+        })
+    }
+
+    pub(in crate::family::inkling2) fn project(
+        &self,
+        name: &str,
+        rows: usize,
+        x: &[f32],
+    ) -> Option<Result<Vec<f32>, EngError>> {
+        let (resident, dtype) = self.dense.get(name)?;
+        if resident.shape != [rows, x.len()] {
+            return Some(Err(bad(format!(
+                "bad GGUF CUDA projection shape for {name}"
+            ))));
+        }
+        Some(
+            if *dtype == DenseDtype::F32 && name.ends_with(".mlp.gate.weight") {
+                self.step.project_router(&self.context, resident, x)
+            } else if *dtype == DenseDtype::Bf16 {
+                self.step.project(&self.context, resident, x)
+            } else {
+                resident
+                    .codes
+                    .range(0, resident.codes.bytes())
+                    .and_then(|raw| {
+                        self.step.project_gguf(
+                            &self.context,
+                            None,
+                            (*dtype, raw, resident.shape, 1.0),
+                            x,
+                        )
+                    })
+            },
+        )
+    }
+
+    pub(in crate::family::inkling2) fn attention_projections<const N: usize>(
+        &self,
+        inputs: [&[f32]; 3],
+        requests: [Option<Projection<'_>>; N],
+    ) -> Option<Result<[Vec<f32>; N], EngError>> {
+        if !self.group_attention {
+            return None;
+        }
+        let mut weights = [None; N];
+        for (request, out) in requests.into_iter().zip(&mut weights) {
+            let Some(p) = request else { continue };
+            let (weight, dtype) = self.dense.get(p.name)?;
+            if weight.shape != [p.rows, inputs[p.input].len()] {
+                return Some(Err(bad(format!(
+                    "bad GGUF CUDA projection shape for {}",
+                    p.name
+                ))));
+            }
+            *out = Some(ResidentProjection {
+                weight,
+                dtype: *dtype,
+                input: p.input,
+            });
+        }
+        Some(self.step.project_group(&self.context, inputs, weights))
+    }
+
+    pub(in crate::family::inkling2) fn controller(
+        &self,
+        [down, gain, forget]: [&str; 3],
+        x: &[f32],
+        [rank, hidden]: [usize; 2],
+    ) -> Option<Result<[Vec<f32>; 2], EngError>> {
+        if !self.group_projections {
+            return None;
+        }
+        let shapes = [[rank, x.len()], [hidden, rank], [hidden, rank]];
+        let weights = [
+            self.dense.get(down)?,
+            self.dense.get(gain)?,
+            self.dense.get(forget)?,
+        ];
+        if weights
+            .iter()
+            .zip(shapes)
+            .any(|((w, _), shape)| w.shape != shape)
+        {
+            return Some(Err(bad("bad GGUF CUDA controller projection shape")));
+        }
+        Some(
+            self.step
+                .controller(&self.context, weights.map(|(w, dtype)| (w, *dtype)), x),
+        )
+    }
+
+    pub(in crate::family::inkling2) fn expert_dtype(&self, kind: GgufType) -> Option<DenseDtype> {
+        if self.packed_gguf || matches!(kind, GgufType::Bf16 | GgufType::Nvfp4) {
+            DenseDtype::from_gguf(kind)
+        } else {
+            None
+        }
+    }
+
+    pub(in crate::family::inkling2) fn expert(
+        &self,
+        expert: &ExpertView<'_>,
+        x: &[f32],
+    ) -> Option<Result<Vec<f32>, EngError>> {
+        if self.packed_gguf {
+            let dtype = self.expert_dtype(expert.kind)?;
+            return (self.resident.placement().placement(expert.id) == Placement::Gpu)
+                .then(|| self.resident_packed_expert(expert, dtype, x));
+        }
+        match expert.kind {
+            GgufType::Bf16 => Some(self.bf16_expert(expert, x)),
+            GgufType::Nvfp4 => {
+                if self.resident.placement().placement(expert.id) != Placement::Gpu
+                    && !can_repack(expert.bytes)
+                {
+                    return None;
+                }
+                Some(self.nvfp4_expert(expert, x))
+            }
+            _ => None,
+        }
+    }
+
+    pub(in crate::family::inkling2) fn batches_expert_layer(
+        &self,
+        layer: u32,
+        dtypes: [DenseDtype; 2],
+    ) -> bool {
+        self.moe_scratch.is_some()
+            && (!self.resident.placement().has_cold(layer)
+                || (self.batch_streamed
+                    && self.streams_layer(layer)
+                    && !dtypes
+                        .into_iter()
+                        .any(|dtype| self.step.uses_q8_activations(dtype))))
+    }
+
+    pub(in crate::family::inkling2) fn expert_group(
+        &self,
+        source: &mut impl ExpertPayloadSource,
+        group: streaming::ExpertGroup<'_>,
+    ) -> Result<Vec<f32>, EngError> {
+        if self.streams_layer(group.route.layer) {
+            return self.stream_expert_group(source, &group);
+        }
+        let stacks = self.resident.original_layer(group.route.layer)?;
+        self.run_expert_group(None, &group, GgufMoeWeights::Stacks(stacks))
+    }
+
+    fn run_expert_group(
+        &self,
+        stream: Option<&DeviceStream>,
+        group: &streaming::ExpertGroup<'_>,
+        weights: GgufMoeWeights<'_>,
+    ) -> Result<Vec<f32>, EngError> {
+        let moe = self
+            .moe_scratch
+            .as_ref()
+            .ok_or_else(|| bad("no CUDA GGUF expert scratch"))?;
+        if group.route.input.len() != moe.shape.hidden {
+            return Err(bad("CUDA GGUF expert group input width differs"));
+        }
+        let scratch = moe.scratch.range(0, moe.scratch.bytes())?;
+        self.step
+            .run_layer(&self.context, stream, group.route.input, |stream, x, y| {
+                self.context.gguf_moe(
+                    stream,
+                    GgufMoeCall {
+                        shape: moe.shape,
+                        dtypes: group.dtypes,
+                        caps: group.route.caps,
+                        picks: group.picks,
+                        weights,
+                        x,
+                        scratch,
+                        y,
+                    },
+                )
+            })
+    }
+
+    fn resident_packed_expert(
+        &self,
+        expert: &ExpertView<'_>,
+        dtype: DenseDtype,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        let Some(residency::Weight::Original(raw)) =
+            self.resident
+                .ranges(expert.id, expert.part, [expert.bytes.len(), 0])?
+        else {
+            return Err(bad("resident GGUF expert has no original packed weight"));
+        };
+        self.step.project_gguf(
+            &self.context,
+            None,
+            (dtype, raw, expert.shape, expert.factor),
+            x,
+        )
+    }
+
+    fn bf16_expert(&self, expert: &ExpertView<'_>, x: &[f32]) -> Result<Vec<f32>, EngError> {
+        self.context
+            .upload_at(&self.expert_codes, 0, expert.bytes)?;
+        let mut output =
+            self.step
+                .project_buffer(&self.context, &self.expert_codes, expert.shape, x)?;
+        if expert.factor != 1.0 {
+            for value in &mut output {
+                *value *= expert.factor;
+            }
+        }
+        Ok(output)
+    }
+
+    fn nvfp4_expert(&self, expert: &ExpertView<'_>, x: &[f32]) -> Result<Vec<f32>, EngError> {
+        if expert.factor == 0.0 {
+            return Ok(vec![0.0; expert.shape[0]]);
+        }
+        let n = expert.shape[0] * expert.shape[1];
+        if let Some(buffers) = self
+            .resident
+            .ranges(expert.id, expert.part, [n / 2, n / 16])?
+        {
+            return match buffers {
+                residency::Weight::Original(raw) => self.step.project_gguf(
+                    &self.context,
+                    None,
+                    (DenseDtype::GgufNvfp4, raw, expert.shape, expert.factor),
+                    x,
+                ),
+                residency::Weight::Converted(pair) => self.project_nvfp4(pair, expert, x),
+            };
+        }
+        let Packed { codes, scales } = &mut *self.packed.borrow_mut();
+        let (codes, scales) = (&mut codes[..n / 2], &mut scales[..n / 16]);
+        repack_nvfp4_into(expert.bytes, codes, scales)?;
+        self.context.upload_at(&self.expert_codes, 0, codes)?;
+        self.context.upload_at(&self.expert_scales, 0, scales)?;
+        self.project_nvfp4(
+            [
+                self.expert_codes.range(0, codes.len())?,
+                self.expert_scales.range(0, scales.len())?,
+            ],
+            expert,
+            x,
+        )
+    }
+
+    fn project_nvfp4(
+        &self,
+        [codes, scales]: [DeviceRange<'_>; 2],
+        expert: &ExpertView<'_>,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        self.context
+            .nvfp4_matvec_range(codes, scales, expert.factor, expert.shape, x)
+    }
+}
+
+pub(in crate::family::inkling2) fn can_repack(bytes: &[u8]) -> bool {
+    let (blocks, tail) = bytes.as_chunks::<36>();
+    // The GGUF unsigned scale 0xff has no E4M3FN representation.
+    tail.is_empty() && blocks.iter().all(|b| !b[..4].contains(&0xff))
+}

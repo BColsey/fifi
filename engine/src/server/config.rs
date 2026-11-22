@@ -4,6 +4,7 @@
 
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
 use crate::family::gemma::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
+use crate::family::inkling2::FAMILY as INKLING2_FAMILY;
 use crate::family::inkling2_mini::FAMILY as INKLING_FAMILY;
 use crate::family::qwen::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::qwen::sensenova::{ARCHITECTURE as SENSENOVA_ARCH, FAMILY as SENSENOVA_FAMILY};
@@ -31,7 +32,7 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// The family names that this build recognizes, including staged backends.
-pub(crate) const FAMILIES: [&str; 9] = [
+pub(crate) const FAMILIES: [&str; 10] = [
     FAKE_FAMILY,
     FLASH_FAMILY,
     Q36_FAMILY,
@@ -41,6 +42,7 @@ pub(crate) const FAMILIES: [&str; 9] = [
     GEMMA4_FAMILY,
     INKLING_FAMILY,
     SENSENOVA_FAMILY,
+    INKLING2_FAMILY,
 ];
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;

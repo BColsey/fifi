@@ -1,5 +1,5 @@
 //! Raw FFI to `inference_cuda_dense_gemv_launch` of `native/resident/dense_gemv.cu` (declared in
-//! `native/resident/dense_gemv.h`): the dense half-precision matvec of the Flash-Next step.
+//! `native/resident/dense_gemv.h`): shared dense matvec for floating-point and packed GGUF weights.
 //! Child of `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
@@ -13,13 +13,11 @@
 //! - The argument struct is a live local that the entry reads only during the call. Its `repr(C)`
 //!   mirror is private here and pinned by `const` asserts to the field order of `dense_gemv.h`.
 //!   No raw pointer and no unsafe function leaves this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the Flash-Next CUDA step")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
+
+use crate::weights::GgufType;
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
@@ -29,21 +27,62 @@ pub(in crate::kernels::cuda) const GEMV_MAX_ROWS: usize = 1 << 20;
 pub(in crate::kernels::cuda) const GEMV_MAX_COLS: usize = 12288;
 pub(in crate::kernels::cuda) const GEMV_MAX_LD: usize = 1 << 20;
 
+pub(in crate::kernels::cuda) mod moe;
+
 const FLOAT: usize = 4;
 const HALF: usize = 2;
+const GGUF_DTYPE_BASE: c_int = 256;
 
 /// Element type of the weight matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenseDtype {
     F16,
     Bf16,
+    F32,
+    GgufNvfp4,
+    PackedGguf(GgufType),
 }
 
 impl DenseDtype {
+    /// Types supported by the packed GGUF loader, including its half formats.
+    pub(crate) fn from_gguf(kind: GgufType) -> Option<Self> {
+        use GgufType::*;
+        match kind {
+            F16 => Some(Self::F16),
+            Bf16 => Some(Self::Bf16),
+            Nvfp4 => Some(Self::GgufNvfp4),
+            Q40 | Q50 | Q80 | Q20 | Q2K | Q3K | Q4K | Q5K | Q6K | Iq1S | Iq1M | Iq2Xxs | Iq2Xs
+            | Iq2S | Iq3Xxs | Iq3S | Iq4Nl | Iq4Xs | Mxfp4 => Some(Self::PackedGguf(kind)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_packed_gguf(self) -> bool {
+        self.gguf_kind().is_some()
+    }
+
+    fn gguf_kind(self) -> Option<GgufType> {
+        match self {
+            Self::GgufNvfp4 => Some(GgufType::Nvfp4),
+            Self::PackedGguf(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    pub(in crate::kernels::cuda) fn weight_alignment(self) -> usize {
+        match self {
+            Self::F32 => FLOAT,
+            _ => HALF,
+        }
+    }
+
     fn code(self) -> c_int {
         match self {
             Self::F16 => 0,
             Self::Bf16 => 1,
+            Self::GgufNvfp4 => 2,
+            Self::F32 => 3,
+            Self::PackedGguf(kind) => GGUF_DTYPE_BASE + kind.id() as c_int,
         }
     }
 }
@@ -114,7 +153,15 @@ pub(crate) struct DenseGemvBytes {
 
 /// `None` outside the limits of `dense_gemv.h` or when a size overflows. The last activation row
 /// and the last result row hold only `cols` and `rows` values: the strides pad between rows.
+#[cfg(test)]
 pub(in crate::kernels::cuda) fn gemv_need(dims: GemvDims) -> Option<DenseGemvBytes> {
+    typed_gemv_need(dims, DenseDtype::F16)
+}
+
+pub(in crate::kernels::cuda) fn typed_gemv_need(
+    dims: GemvDims,
+    dtype: DenseDtype,
+) -> Option<DenseGemvBytes> {
     let inside = (1..=GEMV_MAX_M).contains(&dims.m)
         && (1..=GEMV_MAX_ROWS).contains(&dims.rows)
         && (1..=GEMV_MAX_COLS).contains(&dims.cols)
@@ -129,8 +176,18 @@ pub(in crate::kernels::cuda) fn gemv_need(dims: GemvDims) -> Option<DenseGemvByt
             .checked_add(tail)?
             .checked_mul(FLOAT)
     };
+    let row_bytes = match dtype.gguf_kind() {
+        Some(kind) => {
+            let block = kind.block_elems() as usize;
+            if DenseDtype::from_gguf(kind) != Some(dtype) || !dims.cols.is_multiple_of(block) {
+                return None;
+            }
+            (dims.cols / block).checked_mul(kind.block_bytes() as usize)?
+        }
+        None => dims.cols.checked_mul(dtype.weight_alignment())?,
+    };
     Some(DenseGemvBytes {
-        w: dims.rows.checked_mul(dims.cols)?.checked_mul(HALF)?,
+        w: dims.rows.checked_mul(row_bytes)?,
         x: strided(dims.m, dims.ld_x, dims.cols)?,
         y: strided(dims.m, dims.ld_y, dims.rows)?,
     })
@@ -142,9 +199,10 @@ fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
 
 /// The result is apart from both inputs; the inputs may share bytes.
 fn check(call: &DenseGemvRaw<'_>) -> Result<DenseGemvBytes, DeviceFailure> {
-    let need = gemv_need(call.dims).ok_or_else(invalid_argument)?;
-    let sized =
-        fits(&call.w, need.w, HALF) && fits(&call.x, need.x, FLOAT) && fits(&call.y, need.y, FLOAT);
+    let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+    let sized = fits(&call.w, need.w, call.dtype.weight_alignment())
+        && fits(&call.x, need.x, FLOAT)
+        && fits(&call.y, need.y, FLOAT);
     let out = Span::of(&call.y, need.y);
     let apart = out.apart(&Span::of(&call.w, need.w)) && out.apart(&Span::of(&call.x, need.x));
     if !(sized && apart) {
