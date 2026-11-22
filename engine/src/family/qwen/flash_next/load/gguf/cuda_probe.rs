@@ -865,6 +865,63 @@ fn full_expert_device_stacks_match_host() {
                 tensor.name
             );
         }
+        if role == crate::family::recipe::Role::ExpertDown {
+            let two_inputs: Vec<u8> = input
+                .iter()
+                .chain(input.iter())
+                .enumerate()
+                .flat_map(|(i, &v)| (if i < k { v } else { -v }).to_ne_bytes())
+                .collect();
+            let x2 = ctx.allocate(two_inputs.len()).unwrap();
+            x2.write_at(&stream, 0, &two_inputs).unwrap();
+            let q2bytes = q8_1_bytes(k, 2).unwrap();
+            let q2 = ctx.allocate(q2bytes).unwrap();
+            ctx.quantize_q8_1(
+                &stream,
+                QuantizeCall {
+                    x: x2.range(0, two_inputs.len()).unwrap(),
+                    y: q2.range(0, q2bytes).unwrap(),
+                    k,
+                    ncols: 2,
+                },
+            )
+            .unwrap();
+            let ids2 = ctx.allocate(8).unwrap();
+            let slot_bytes = i32::from(slot).to_ne_bytes();
+            ids2.write_at(&stream, 0, &[slot_bytes, slot_bytes].concat())
+                .unwrap();
+            let y2 = ctx.allocate(rows * 8).unwrap();
+            bank.projection(&state, role)
+                .unwrap()
+                .launch(
+                    &ctx,
+                    &stream,
+                    ExpertProjectionInputs {
+                        ids: ids2.range(0, 8).unwrap(),
+                        x_q8: q2.range(0, q2bytes).unwrap(),
+                        x_per_slot: true,
+                        output: y2.range(0, rows * 8).unwrap(),
+                        output_stride: rows,
+                        used: 2,
+                    },
+                )
+                .unwrap();
+            let mut both = vec![0u8; rows * 8];
+            y2.read_at(&stream, 0, &mut both).unwrap();
+            for (index, row) in weights.chunks_exact(k).enumerate() {
+                let expected: f32 = row.iter().zip(&input).map(|(a, b)| a * b).sum();
+                let tolerance = 0.003 * row.iter().map(|v| v.abs()).sum::<f32>() + 1e-5;
+                for (slot_index, sign) in [1.0, -1.0].into_iter().enumerate() {
+                    let offset = (slot_index * rows + index) * 4;
+                    let got = f32::from_ne_bytes(both[offset..offset + 4].try_into().unwrap());
+                    assert!(
+                        (got - sign * expected).abs() <= tolerance,
+                        "down slot {slot_index} row {index}"
+                    );
+                }
+            }
+            eprintln!("checked {rows} down rows with two distinct slot activations");
+        }
         eprintln!("checked {} {:?} {rows} rows", tensor.name, tensor.ty);
         checked += 1;
     }
