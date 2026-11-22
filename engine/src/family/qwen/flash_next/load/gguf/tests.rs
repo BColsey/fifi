@@ -849,6 +849,26 @@ fn gguf_token_feed_chunk_matches_serial_and_resume() {
         chunk.ple_update(1, &start.stream).is_err(),
         "failed update consumes matching rows"
     );
+    chunk.reset();
+    serial.reset();
+    let eos = shape.ple.dims().eos;
+    let tokens = [1, eos, 2];
+    let starts = chunk.begin_chunk(&tokens, false).unwrap();
+    for (index, (token, start)) in tokens.into_iter().zip(&starts).enumerate() {
+        let reference = serial.begin(token).unwrap();
+        assert_eq!(*start, reference, "token {index}");
+        assert_eq!(
+            chunk.ple_update(token, &start.stream).unwrap(),
+            serial.ple_update(token, &reference.stream).unwrap()
+        );
+        assert_eq!(chunk.ple_state(), serial.ple_state());
+        if index == 1 {
+            assert!(
+                chunk.ple_state().unwrap().0.is_empty(),
+                "EOS clears history"
+            );
+        }
+    }
 }
 
 #[test]
