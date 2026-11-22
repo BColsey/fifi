@@ -1029,7 +1029,10 @@ mod tests {
         .expect("write another architecture");
         let args = args_for(&file);
         let discovered = discover(&args).expect("discover explicit checkpoint");
-        assert_eq!(discovered.family, crate::family::qwen::qwen36::factory::FAMILY);
+        assert_eq!(
+            discovered.family,
+            crate::family::qwen::qwen36::factory::FAMILY
+        );
         assert_eq!(discovered.tokenizer_dir, dir.path());
         let config = super::config_from(&discovered, &args);
         assert_eq!(config.engines[0].model_dir, file);

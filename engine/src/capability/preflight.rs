@@ -250,7 +250,8 @@ fn evaluate(
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
     if family_name == Some(crate::family::gemma::gemma4::FAMILY)
-        && let Err(error) = crate::family::gemma::gemma4::serve::check_backend(model_dir, &facts.backends)
+        && let Err(error) =
+            crate::family::gemma::gemma4::serve::check_backend(model_dir, &facts.backends)
     {
         checks.push(Check::new("backend", CheckStatus::Fail, error.describe()));
         return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
@@ -2313,7 +2314,11 @@ mod tests {
             assert_eq!(other_gemma.verdict, Verdict::Unsupported);
             let identity = check_named(&other_gemma, "Bolt checkpoint");
             assert_eq!(identity.status, CheckStatus::Fail);
-            assert!(identity.detail.contains("Bolt geometry"), "{}", identity.detail);
+            assert!(
+                identity.detail.contains("Bolt geometry"),
+                "{}",
+                identity.detail
+            );
         }
     }
 
