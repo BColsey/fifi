@@ -1564,7 +1564,8 @@ impl<'a> QwenResidentStep<'a> {
             .sparse
             .as_ref()
             .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds));
-        // The tiered chunk path stays behind its existing, default-off gate.
+        // The tiered chunk arm runs for a session whose start asked for it and whose file it can
+        // read (`tiered_load::tiered_chunk_arm`).
         let tiered_chunk = self.tiered.as_ref().filter(|_| self.tiered_chunk);
         let mut fam = Q36ChunkFamily::new(
             self.exl3_bank,

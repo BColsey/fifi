@@ -199,19 +199,26 @@ pub(super) fn tiered_chunk_arm(header: &GgufHeader, dims: &StepDims) -> Result<b
     ) {
         return Ok(false);
     }
-    let unsupported = require_q4k_shexp(header, dims.shape.kinds.len())
-        .err()
-        .map(|error| format!("{error:?}"))
-        .or_else(|| {
-            let types = expert_quant(header, dims).ok()?;
-            let q4k = [GgufType::Q4K; 3];
-            let mixed = types.iter().any(|quant| *quant != q4k);
-            mixed.then(|| "the routed experts are not Q4_K in every layer".to_owned())
-        });
+    let shared = require_q4k_shexp(header, dims.shape.kinds.len());
+    let routed = expert_quant(header, dims)?;
+    let unsupported = chunk_arm_refusal(shared.err().map(|error| format!("{error:?}")), &routed);
     if let Some(why) = &unsupported {
         eprintln!("q36 cuda: Q36_TIERED_CHUNK=1 ignored, the chunk arm reads Q4_K experts: {why}");
     }
     Ok(unsupported.is_none())
+}
+
+/// Why the chunk arm cannot read a file: its shared experts are not Q4_K (`shared`, the refusal
+/// of the shared-expert check), or some layer stores a routed stack in another type. `None` when
+/// it can.
+fn chunk_arm_refusal(shared: Option<String>, routed: &[[GgufType; 3]]) -> Option<String> {
+    shared.or_else(|| {
+        let q4k = [GgufType::Q4K; 3];
+        routed
+            .iter()
+            .any(|quant| *quant != q4k)
+            .then(|| "the routed experts are not Q4_K in every layer".to_owned())
+    })
 }
 
 pub(super) fn build_tiered(
@@ -412,6 +419,19 @@ fn build_router_guess(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_chunk_arm_needs_q4k_shared_and_routed_experts_in_every_layer() {
+        use super::{GgufType, chunk_arm_refusal};
+        let q4k = [GgufType::Q4K; 3];
+        let mixed = [GgufType::Q4K, GgufType::Q4K, GgufType::Q6K];
+        assert_eq!(chunk_arm_refusal(None, &[q4k, q4k]), None);
+        let routed = chunk_arm_refusal(None, &[q4k, mixed]).expect("one layer stores a Q6_K down");
+        assert!(routed.contains("not Q4_K in every layer"), "{routed}");
+        let shared = chunk_arm_refusal(Some("shexp is Q8_0".into()), &[q4k]).expect("shared");
+        assert_eq!(shared, "shexp is Q8_0");
+        assert!(chunk_arm_refusal(None, &[[GgufType::Q80; 3]]).is_some());
+    }
+
     use super::*;
     use crate::family::qwen::qwen36::cuda::common_tests::dims;
 

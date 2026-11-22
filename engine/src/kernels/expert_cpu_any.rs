@@ -400,9 +400,17 @@ mod tests {
         y
     }
 
+    /// The sign byte of a 7-bit pattern: the pattern with an eighth bit that makes the parity of
+    /// the byte even, which is how the format stores eight signs in seven bits.
+    #[cfg(feature = "native-cuda")]
+    fn iq3_signs(pattern: u32) -> u8 {
+        let low = (pattern & 127) as u8;
+        low | (((low.count_ones() & 1) as u8) << 7)
+    }
+
     #[cfg(feature = "native-cuda")]
     fn iq3_xxs_block(b: &[u8]) -> Vec<f32> {
-        use crate::weights::{IQ3XXS_GRID, KSIGNS_IQ2XS};
+        use crate::weights::IQ3XXS_GRID;
         let d = f16(u16::from_le_bytes([b[0], b[1]]));
         let (qs, sas) = (&b[2..66], &b[66..98]);
         let mut y = Vec::with_capacity(256);
@@ -415,7 +423,7 @@ mod tests {
             ]);
             let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
             for l in 0..4 {
-                let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                let signs = iq3_signs(aux >> (7 * l));
                 for (half, grid) in [
                     IQ3XXS_GRID[usize::from(qs[ib * 8 + 2 * l])],
                     IQ3XXS_GRID[usize::from(qs[ib * 8 + 2 * l + 1])],
@@ -532,6 +540,25 @@ mod tests {
             [&iq4_xs_block, &iq4_xs_block, &q8_0_block],
             7,
         );
+    }
+
+    /// The crate's one IQ3_XXS table is 256 distinct entries in ascending order whose bytes are
+    /// the eight magnitudes of the format, and the sign byte of every 7-bit pattern the reference
+    /// derives has even parity.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn the_iq3_xxs_grid_has_the_structure_of_the_format() {
+        use crate::weights::IQ3XXS_GRID;
+        let mut bytes = std::collections::BTreeSet::new();
+        for entry in IQ3XXS_GRID {
+            bytes.extend(entry.to_le_bytes());
+        }
+        assert_eq!(
+            bytes.into_iter().collect::<Vec<_>>(),
+            [4, 12, 20, 28, 36, 44, 52, 62]
+        );
+        assert!(IQ3XXS_GRID.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!((0..128u32).all(|pattern| iq3_signs(pattern).count_ones().is_multiple_of(2)));
     }
 
     #[cfg(feature = "native-cuda")]

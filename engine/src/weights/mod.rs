@@ -54,16 +54,14 @@ pub(crate) mod acquire_read {
 }
 pub(crate) use gguf::shared_header;
 pub use gguf::{
-    ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SplitInfo, check_split_set,
-    hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
+    ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SMALL_VECTOR_BYTES, SplitInfo,
+    check_split_set, hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
 };
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,
 };
-pub use gguf_encode::{
-    encode_plain_float_rows, encode_q8_0, is_plain_float, plain_float_as_q8_0, q8_0_len,
-};
+pub use gguf_encode::{encode_plain_float_rows, encode_q8_0, is_plain_float, q8_0_len};
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };
