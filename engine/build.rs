@@ -141,6 +141,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/dense_gemv.cu",
     "src/kernels/cuda/native/resident/relative_attention.cu",
     "src/kernels/cuda/native/resident/inkling_controller.cu",
+    "src/kernels/cuda/native/resident/inkling_local_prep.cu",
     "src/kernels/cuda/native/resident/draft_attention_bf16.cu",
     "src/kernels/cuda/native/resident/correct_draft_logits_bf16.cu",
 ];

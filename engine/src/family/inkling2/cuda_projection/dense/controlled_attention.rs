@@ -66,7 +66,7 @@ impl DenseStep {
         Ok(Some(split_projections(values.into_iter().skip(3), weights)))
     }
 
-    fn controlled_attention_calls<'a>(
+    pub(super) fn controlled_attention_calls<'a>(
         &'a self,
         hidden: usize,
         controllers: [ControllerWeights<'a>; 3],

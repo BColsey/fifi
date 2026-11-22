@@ -3,13 +3,15 @@
 use std::sync::{Once, OnceLock};
 
 use super::{
-    ATTENTION_ROLES, Attention, ControlInput, CpuForward, LayerVisit, MessageBank, Stream, Weights,
-    Work, apply_control, attention_norm_name, bad, control_names,
+    ATTENTION_ROLES, Attention, ControlInput, CpuForward, LayerVisit, MessageBank, Stream,
+    VisitState, Weights, Work, apply_control, attention_norm_name, bad, control_names,
 };
 use crate::EngError;
 use crate::family::inkling2::{
     cpu_attention::AttentionProjection,
-    cuda_projection::gguf::{ControlledAttentionInput, project_controller_roles},
+    cuda_projection::gguf::{
+        AttentionControllers, ControlledAttentionInput, LocalDecode, project_controller_roles,
+    },
 };
 
 type AttentionInputs = [Vec<f32>; 3];
@@ -27,6 +29,102 @@ impl CpuForward {
         stream: &Stream,
         bank: &MessageBank,
     ) -> Result<Option<AttentionProjection>, EngError> {
+        let projected = self.with_chained_attention_inputs(
+            visit,
+            layer,
+            stream,
+            bank,
+            |controllers, inputs| {
+                self.attention_requests(layer, visit.attention, |calls| {
+                    controllers.chained_projections(inputs, calls, self.math.rms_norm_eps)
+                })
+            },
+        )?;
+        if projected.is_some() {
+            static USED: Once = Once::new();
+            USED.call_once(|| eprintln!("Inkling CUDA used chained controller attention input"));
+        }
+        Ok(projected)
+    }
+
+    pub(super) fn chained_local_decode(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        state: &mut VisitState,
+        stream: &Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<Option<Vec<f32>>, EngError> {
+        if visit.attention != Attention::Local || self.draft_window_enabled() {
+            return Ok(None);
+        }
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        let Some(cuda) = weights.cuda() else {
+            return Ok(None);
+        };
+        let cursor = (visit.state_slot, state.position());
+        if !cuda
+            .resident_attention()
+            .is_some_and(|(_, attention)| attention.can_chain_local(cursor.0, cursor.1))
+        {
+            return Ok(None);
+        }
+        let read_weights = |[q, relative, k, v]: [usize; 4]| {
+            let read = |name, len| self.weights.vec(&format!("{layer}.attn.{name}"), len);
+            Ok([
+                read("q_l2_clip.scale", q)?,
+                read("rel_l2_clip.scale", relative)?,
+                read("k_sconv.weight", k)?,
+                read("v_sconv.weight", v)?,
+            ])
+        };
+        let decode = LocalDecode {
+            cursor,
+            prep: self.local_decode_prep(state, &read_weights),
+            output: weights.relative_attention_projection(
+                &format!("{layer}.attn.wo_ud.weight"),
+                [self.hidden(), self.local_query_channels()],
+            )?,
+        };
+        let result = {
+            let _span = self.phase_span(Work::DeviceAttention);
+            if let Some(bank) = bank {
+                self.with_chained_attention_inputs(
+                    visit,
+                    layer,
+                    stream,
+                    bank,
+                    |controllers, inputs| {
+                        self.attention_requests(layer, visit.attention, |calls| {
+                            controllers.local_decode(inputs, calls, decode)
+                        })
+                    },
+                )?
+            } else {
+                let inputs = self.attention_inputs(visit, layer, stream, None)?;
+                self.attention_requests(layer, visit.attention, |calls| {
+                    cuda.plain_local_decode(inputs.each_ref().map(Vec::as_slice), calls, decode)
+                })?
+            }
+        };
+        result
+            .map(|result| self.finish_local_decode(layer, state, result))
+            .transpose()
+    }
+
+    fn with_chained_attention_inputs<R>(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        stream: &Stream,
+        bank: &MessageBank,
+        run: impl FnOnce(
+            &AttentionControllers<'_>,
+            [ControlledAttentionInput<'_>; 3],
+        ) -> Result<Option<R>, EngError>,
+    ) -> Result<Option<R>, EngError> {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         if !controller_batch_enabled()
             || !*ENABLED.get_or_init(|| {
@@ -65,14 +163,7 @@ impl CpuForward {
             message: &prepared[i].control.message,
             gamma: &gamma[i],
         });
-        let projected = self.attention_requests(layer, visit.attention, |calls| {
-            controllers.chained_projections(inputs, calls, self.math.rms_norm_eps)
-        })?;
-        if projected.is_some() {
-            static USED: Once = Once::new();
-            USED.call_once(|| eprintln!("Inkling CUDA used chained controller attention input"));
-        }
-        Ok(projected)
+        run(&controllers, inputs)
     }
 
     pub(super) fn grouped_attention_inputs<'a>(

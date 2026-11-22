@@ -373,7 +373,7 @@ impl CpuForward {
         collect_head_input: bool,
     ) -> Result<ForwardRow, EngError> {
         let mut taps = TapRow::new(&self.taps, self.hidden());
-        let stream = self.forward(state, id, &mut taps)?;
+        let stream = self.forward(state, id, &mut taps, collect_head_input)?;
         self.finish_row(&stream, taps, collect_head_input)
     }
 
@@ -410,6 +410,7 @@ impl CpuForward {
         state: &mut [VisitState],
         id: u32,
         taps: &mut TapRow<'_>,
+        decode: bool,
     ) -> Result<Stream, EngError> {
         let mut stream = self.embed(id)?;
         let core = &self.spec.core;
@@ -421,6 +422,7 @@ impl CpuForward {
             &mut stream,
             None,
             taps,
+            decode,
         )?;
         let prelude = stream.clone();
         let mut bank = None;
@@ -438,10 +440,18 @@ impl CpuForward {
                 &mut stream,
                 bank.as_ref(),
                 taps,
+                decode,
             )?;
         }
         let suffix = core.core_start + core.num_passes * width;
-        self.run_visits(&self.visits[suffix..], state, &mut stream, None, taps)?;
+        self.run_visits(
+            &self.visits[suffix..],
+            state,
+            &mut stream,
+            None,
+            taps,
+            decode,
+        )?;
         Ok(stream)
     }
 
@@ -474,6 +484,7 @@ impl CpuForward {
         Ok(logits)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_visits(
         &self,
         visits: &[LayerVisit],
@@ -481,10 +492,11 @@ impl CpuForward {
         stream: &mut Stream,
         bank: Option<&MessageBank>,
         taps: &mut TapRow<'_>,
+        decode: bool,
     ) -> Result<(), EngError> {
         for &visit in visits {
             taps.capture(visit.state_slot, stream.current());
-            self.layer(visit, &mut state[visit.state_slot], stream, bank)?;
+            self.layer(visit, &mut state[visit.state_slot], stream, bank, decode)?;
         }
         Ok(())
     }
@@ -495,10 +507,18 @@ impl CpuForward {
         state: &mut VisitState,
         stream: &mut Stream,
         bank: Option<&MessageBank>,
+        decode: bool,
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
-        let input = self.mlp_input(visit, &layer, state, stream, bank, AttentionInput::Token)?;
+        let input = self.mlp_input(
+            visit,
+            &layer,
+            state,
+            stream,
+            bank,
+            AttentionInput::Token { decode },
+        )?;
         let mlp = self.moe(physical, &format!("{layer}.mlp"), &input)?;
         self.finish_layer(&layer, state, stream, mlp)
     }
@@ -534,18 +554,7 @@ impl CpuForward {
         if let Weights::Gguf(weights) = &self.weights {
             weights.predict_experts(physical, || stream.mix(0, &query));
         }
-        let projected = match attention {
-            AttentionInput::Token => self.project_layer_attention(visit, layer, stream, bank)?,
-            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            AttentionInput::Grouped(projected) => match projected {
-                Some(projected) => projected,
-                None => {
-                    let inputs = self.attention_inputs(visit, layer, stream, bank)?;
-                    self.project_attention(layer, visit.attention, &inputs)?
-                }
-            },
-        };
-        let attn = self.attention(layer, visit, state, projected)?;
+        let attn = self.layer_attention(visit, layer, state, stream, bank, attention)?;
         Ok(self.mlp_residual_after_attention(physical, stream, &query, attn))
     }
 
@@ -588,22 +597,42 @@ impl CpuForward {
         Ok(())
     }
 
-    fn project_layer_attention(
+    #[allow(clippy::too_many_arguments)]
+    fn layer_attention(
         &self,
         visit: LayerVisit,
         layer: &str,
+        state: &mut VisitState,
         stream: &Stream,
         bank: Option<&MessageBank>,
-    ) -> Result<super::cpu_attention::AttentionProjection, EngError> {
+        attention: AttentionInput,
+    ) -> Result<Vec<f32>, EngError> {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        if let Some(bank) = bank
-            && !self.draft_window_enabled()
-            && let Some(projected) = self.chained_attention_inputs(visit, layer, stream, bank)?
         {
-            return Ok(projected);
+            if let AttentionInput::Grouped(Some(projected)) = attention {
+                return self.attention(layer, visit, state, projected);
+            }
+            if let AttentionInput::Token { decode } = attention {
+                if decode
+                    && let Some(output) =
+                        self.chained_local_decode(visit, layer, state, stream, bank)?
+                {
+                    return Ok(output);
+                }
+                if let Some(bank) = bank
+                    && !self.draft_window_enabled()
+                    && let Some(projected) =
+                        self.chained_attention_inputs(visit, layer, stream, bank)?
+                {
+                    return self.attention(layer, visit, state, projected);
+                }
+            }
         }
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+        let AttentionInput::Token { decode: _decode } = attention;
         let inputs = self.attention_inputs(visit, layer, stream, bank)?;
-        self.project_attention(layer, visit.attention, &inputs)
+        let projected = self.project_attention(layer, visit.attention, &inputs)?;
+        self.attention(layer, visit, state, projected)
     }
 
     fn attention_inputs(
@@ -884,7 +913,9 @@ fn apply_control(input: &mut [f32], message: Vec<f32>, [gain, forget]: [Vec<f32>
 }
 
 enum AttentionInput {
-    Token,
+    Token {
+        decode: bool,
+    },
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     Grouped(Option<super::cpu_attention::AttentionProjection>),
 }

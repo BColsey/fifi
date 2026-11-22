@@ -76,6 +76,8 @@ Set `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1` with `FIFI_INKLING_CUDA_GROUP_PROJEC
 
 Set `FIFI_INKLING_CUDA_CHAIN_ATTENTION_INPUT=1` with `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1`, `FIFI_INKLING_CUDA_GROUP_PROJECTIONS=1`, and `FIFI_INKLING_CUDA_GROUP_ATTENTION=1` to keep cross-pass controller outputs on CUDA through residual gating, weighted RMSNorm, and the attention input projections. This applies to ordinary single-row GGUF execution when all required matrices are resident. Grouped prefill and speculative verification retain their existing paths. The chain is off by default.
 
+Set `FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE=1` with `FIFI_INKLING_CUDA_GROUP_ATTENTION=1` and `FIFI_INKLING_CUDA_RESIDENT_ATTENTION=1` to run local decode attention projections, causal K/V convolution, clipping and normalization, and relative attention before one readback. Enable the controller input chain above to include cross-pass local visits. The readback still commits raw convolution history and processed KV rows to the host for snapshots and rollback. Global attention, grouped prefill, draft-enabled sessions, missing resident weights, and visits whose device cursor has not been restored use the existing path. The chain is off by default.
+
 Set `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT=1` to reduce the DSpark draft width after a rejection and restore it after fully accepted windows. Two consecutive windows accepting fewer than half their proposals switch that generation to one-token target decode. Each new request starts at the configured width, including a request that restores a saved prefix. The request log reports adaptive stand-down steps when they occur. The fixed DSpark width is the default.
 
 ## Tokenizer files

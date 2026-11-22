@@ -72,6 +72,13 @@ type Projections = BTreeMap<String, (Resident, DenseDtype)>;
 type ControllerOutput = Option<[Vec<f32>; 2]>;
 
 pub(in crate::family::inkling2) use super::dense::ControlledAttentionInput;
+use super::dense::{LocalInputs, LocalProjection};
+
+pub(in crate::family::inkling2) struct LocalDecode<'a> {
+    pub cursor: (usize, usize),
+    pub prep: attention::LocalPrep<'a>,
+    pub output: Option<attention::OutputProjection<'a>>,
+}
 
 type ControllerPayload<'a> = [&'a [u8]; 3];
 
@@ -150,6 +157,24 @@ impl AttentionControllers<'_> {
         self.cuda
             .step
             .controlled_attention(&self.cuda.context, inputs, [q, k, v], weights?, eps)
+    }
+
+    pub(in crate::family::inkling2) fn local_decode(
+        &self,
+        inputs: [ControlledAttentionInput<'_>; 3],
+        requests: [Option<Projection<'_>>; 8],
+        decode: LocalDecode<'_>,
+    ) -> Result<Option<attention::LocalResult>, EngError> {
+        let [Some(q), Some(k), Some(v)] = self.weights else {
+            return Ok(None);
+        };
+        let eps = decode.prep.math.eps;
+        self.cuda.local_decode(
+            LocalInputs::Controlled(inputs, [q, k, v], eps),
+            self.shape[1],
+            requests,
+            decode,
+        )
     }
 
     pub(in crate::family::inkling2) fn project(
@@ -732,6 +757,66 @@ impl GgufCuda {
             );
         }
         Ok(projected)
+    }
+
+    pub(in crate::family::inkling2) fn plain_local_decode(
+        &self,
+        inputs: [&[f32]; 3],
+        requests: [Option<Projection<'_>>; 8],
+        decode: LocalDecode<'_>,
+    ) -> Result<Option<attention::LocalResult>, EngError> {
+        self.local_decode(
+            LocalInputs::Plain(inputs),
+            inputs[0].len(),
+            requests,
+            decode,
+        )
+    }
+
+    fn local_decode(
+        &self,
+        inputs: LocalInputs<'_>,
+        hidden: usize,
+        requests: [Option<Projection<'_>>; 8],
+        decode: LocalDecode<'_>,
+    ) -> Result<Option<attention::LocalResult>, EngError> {
+        let Some(attention) = &self.resident_attention else {
+            return Ok(None);
+        };
+        if !self
+            .step
+            .local_inputs_fit(hidden, matches!(inputs, LocalInputs::Controlled(..)))
+        {
+            return Ok(None);
+        }
+        let Some(weights) = self.attention_group([hidden; 3], requests).transpose()? else {
+            return Ok(None);
+        };
+        let [
+            Some(q),
+            Some(k),
+            Some(v),
+            Some(rel),
+            Some(sinks),
+            Some(gates),
+            None,
+            None,
+        ] = weights
+        else {
+            return Ok(None);
+        };
+        let projections = LocalProjection {
+            dense: &self.step,
+            inputs,
+            weights: [q, k, v, rel, sinks, gates],
+        };
+        attention.step_local(
+            &self.context,
+            decode.cursor,
+            decode.prep,
+            projections,
+            decode.output,
+        )
     }
 
     fn attention_group<const N: usize>(

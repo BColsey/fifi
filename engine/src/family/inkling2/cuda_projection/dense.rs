@@ -24,6 +24,8 @@ mod attention_prefill;
 mod controlled_attention;
 mod controller_prefill;
 mod draft_head;
+mod local_attention;
+pub(super) use local_attention::{LocalInputs, LocalProjection, LocalTargets};
 
 pub(in crate::family::inkling2) use controlled_attention::ControlledAttentionInput;
 

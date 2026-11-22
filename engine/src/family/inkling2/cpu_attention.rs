@@ -167,6 +167,52 @@ impl CpuForward {
         })
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn local_decode_prep<'a>(
+        &self,
+        state: &'a VisitState,
+        read_weights: &'a dyn Fn([usize; 4]) -> Result<[Vec<f32>; 4], EngError>,
+    ) -> attention::LocalPrep<'a> {
+        use crate::kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape};
+        debug_assert_eq!(self.math.sconv_kernel_size, PrepShape::TAPS);
+        attention::LocalPrep {
+            math: PrepMath {
+                qk_limit: self.math.qk_l2_clip_threshold,
+                rel_limit: self.math.rel_l2_clip_threshold,
+                eps: self.math.rms_norm_eps,
+            },
+            read_weights,
+            raw: [&state.conv.k.0, &state.conv.v.0],
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn finish_local_decode(
+        &self,
+        layer: &str,
+        state: &mut VisitState,
+        result: attention::LocalResult,
+    ) -> Result<Vec<f32>, EngError> {
+        let attention::LocalResult {
+            output,
+            projected,
+            rows: [raw_k, raw_v, k, v],
+        } = result;
+        let past = self.math.sconv_kernel_size - 1;
+        for (history, raw) in [(&mut state.conv.k.0, raw_k), (&mut state.conv.v.0, raw_v)] {
+            history.push_front(raw);
+            history.truncate(past);
+        }
+        state.push(k, v, self.kv_capacity(Attention::Local));
+        self.finish_attention(
+            layer,
+            state,
+            &format!("{layer}.attn.wo_ud.weight"),
+            output,
+            projected,
+        )
+    }
+
     pub(super) fn attention(
         &self,
         layer: &str,
@@ -391,6 +437,11 @@ impl CpuForward {
         run(calls)
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn local_query_channels(&self) -> usize {
+        self.heads(Attention::Local).q_channels()
+    }
+
     fn heads(&self, attention: Attention) -> Heads {
         let spec = &self.spec;
         let (query, kv, width) = match attention {
@@ -521,6 +572,11 @@ impl CpuForward {
 }
 
 impl VisitState {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn position(&self) -> usize {
+        self.position
+    }
+
     pub(super) fn checkpoint(&self, capacity: usize) -> VisitUndo {
         self.checkpoint_attention(capacity).with_mlp(self)
     }

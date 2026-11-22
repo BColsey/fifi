@@ -135,6 +135,7 @@ impl ResidentAttention {
                 &mut work.encoded,
             )?);
         }
+        self.invalidate_local_aux(slot);
         let mut state = self.state.borrow_mut();
         let cursor = state.next_position[slot].take();
         // This path serves ordinary prompts only. A rewind reseeds from host

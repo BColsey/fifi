@@ -95,6 +95,7 @@ pub(crate) mod gdn_delta;
 pub(crate) mod gelu_ffn;
 pub(crate) mod hyper;
 pub(crate) mod inkling_controller;
+pub(crate) mod inkling_local_prep;
 pub(crate) mod kv8_append;
 pub(crate) mod kv_f16_append;
 pub(crate) mod kv_f16_rows;

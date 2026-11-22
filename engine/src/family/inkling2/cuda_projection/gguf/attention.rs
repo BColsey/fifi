@@ -27,7 +27,9 @@ use crate::{
 use super::DEVICE_HEADROOM;
 use super::{super::state_headroom, bad};
 
+mod local;
 pub(in crate::family::inkling2) mod prefill;
+pub(in crate::family::inkling2) use local::{LocalPrep, LocalResult};
 
 #[derive(Clone, Copy)]
 pub(in crate::family::inkling2) struct Config {
@@ -49,6 +51,7 @@ pub(in crate::family::inkling2) struct Plan {
     visits: Vec<Visit>,
     tables: Vec<u8>,
     scratch_bytes: usize,
+    local_workspace: Option<(usize, usize)>,
     projected_rows: Option<usize>,
 }
 
@@ -77,12 +80,14 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     visits: Vec<Visit>,
     arena: DeviceBuffer,
     scratch_at: usize,
+    local_workspace: Option<(usize, usize)>,
     projected_rows: Option<usize>,
     projection_headroom: u64,
     reserve_credit: u64,
     stream: DeviceStream,
     state: RefCell<Runtime>,
     prefill: RefCell<Option<prefill::Workspace>>,
+    local_aux: RefCell<Option<local::AuxStore>>,
 }
 
 struct Runtime {
@@ -112,6 +117,13 @@ impl Plan {
             extend_words(&mut tables, &table);
         }
 
+        let hidden = spec.hidden_size as usize;
+        let projected_rows = (std::env::var("FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT").as_deref()
+            == Ok("1"))
+        .then_some(hidden);
+        let local_enabled = (1..=4096).contains(&hidden)
+            && std::env::var("FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE").as_deref() == Ok("1");
+        let mut local_workspace = None::<(usize, usize)>;
         let mut visits = Vec::new();
         let mut cache_at = tables.len();
         let mut scratch_bytes = 0;
@@ -140,6 +152,11 @@ impl Plan {
             };
             scratch_bytes =
                 scratch_bytes.max(q + k + v + relative + sinks + gates + pos + status + out);
+            if local_enabled && visit.attention == Attention::Local {
+                let (device, host) = local::workspace(shape, projected_rows, hidden);
+                let (old_device, old_host) = local_workspace.unwrap_or_default();
+                local_workspace = Some((device.max(old_device), host.max(old_host)));
+            }
             visits.push(Visit {
                 shape,
                 table_at: visit.weight_layer * table_bytes,
@@ -152,9 +169,6 @@ impl Plan {
                 .and_then(|at| at.checked_add(cache_bytes))
                 .ok_or_else(|| bad("CUDA relative attention cache overflows"))?;
         }
-        let projected_rows = (std::env::var("FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT").as_deref()
-            == Ok("1"))
-        .then_some(spec.hidden_size as usize);
         if let Some(rows) = projected_rows {
             scratch_bytes = scratch_bytes
                 .checked_add(f32_bytes(rows)?)
@@ -164,6 +178,7 @@ impl Plan {
             visits,
             tables,
             scratch_bytes,
+            local_workspace,
             projected_rows,
         }))
     }
@@ -178,12 +193,15 @@ impl Plan {
             .last()
             .ok_or_else(|| bad("CUDA attention requires at least one visit"))?;
         let scratch_at = last.cache_at + 2 * last.cache_bytes;
+        let before = context.memory_info()?.free as u64;
+        let spare = |bytes: u64| {
+            before.saturating_sub(state_headroom(if charge_reserve { bytes } else { 0 }))
+        };
         let bytes = scratch_at
             .checked_add(self.scratch_bytes)
             .ok_or_else(|| bad("CUDA relative attention arena overflows"))?;
-        let before = context.memory_info()?.free as u64;
         let proposed_credit = if charge_reserve { bytes as u64 } else { 0 };
-        let spare = before.saturating_sub(state_headroom(proposed_credit));
+        let spare = spare(bytes as u64);
         if before < VRAM_HEADROOM_BYTES || bytes as u64 > spare {
             eprintln!(
                 "Inkling CUDA relative attention not admitted: needs {bytes} bytes, {spare} available"
@@ -226,11 +244,13 @@ impl Plan {
             visits: self.visits,
             arena,
             scratch_at,
+            local_workspace: self.local_workspace,
             projected_rows: self.projected_rows,
             projection_headroom,
             reserve_credit: credit,
             stream,
             prefill: RefCell::default(),
+            local_aux: RefCell::default(),
             state: RefCell::new(Runtime {
                 transfer,
                 encoded: Vec::with_capacity(self.scratch_bytes),
@@ -280,6 +300,9 @@ impl ResidentAttention {
 
     pub(in crate::family::inkling2) fn invalidate(&self) {
         self.state.borrow_mut().next_position.fill(None);
+        if let Some(aux) = self.local_aux.borrow_mut().as_mut() {
+            aux.invalidate();
+        }
     }
 
     pub(in crate::family::inkling2) fn step(
@@ -295,6 +318,7 @@ impl ResidentAttention {
             .filter(|&position| position <= POS_MAX)
             .ok_or_else(|| bad("CUDA relative attention position overflows"))?;
         let visit = self.visits[state_slot];
+        self.invalidate_local_aux(state_slot);
         let mut state = self.state.borrow_mut();
         // The kernel can publish a cache row even when its output or a
         // later transfer fails. Leave this cursor unknown until completion.
@@ -378,9 +402,8 @@ impl ResidentAttention {
             ));
         }
         state.next_position[state_slot] = Some(history.position + 1);
-        if chained && !state.chained_projection_used {
-            eprintln!("Inkling CUDA used chained relative attention output projection");
-            state.chained_projection_used = true;
+        if chained {
+            state.mark_chained_projection();
         }
         Ok(result)
     }
@@ -431,6 +454,15 @@ impl ResidentAttention {
             }
         }
         Ok(())
+    }
+}
+
+impl Runtime {
+    fn mark_chained_projection(&mut self) {
+        if !self.chained_projection_used {
+            eprintln!("Inkling CUDA used chained relative attention output projection");
+            self.chained_projection_used = true;
+        }
     }
 }
 
@@ -565,6 +597,7 @@ mod tests {
                 + status
                 + out
                 + f32_bytes(2).unwrap(),
+            local_workspace: None,
             projected_rows: Some(2),
         }
         .load(&ctx, false)

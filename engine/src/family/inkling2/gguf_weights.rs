@@ -685,6 +685,11 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn cuda(&self) -> Option<&GgufCuda> {
+        self.cuda.as_ref()
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_attention(
         &self,
     ) -> Option<(
