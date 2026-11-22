@@ -1664,7 +1664,8 @@ fn two_real_expert_slots_match_host() {
 #[test]
 #[ignore = "requires the complete pinned GGUF and an admitted CUDA device"]
 fn checkpoint_greedy_rows_with_cuda_projections() {
-    use super::host::{HostModel, HostProjector, greedy_rows, greedy_rows_with, greedy_token};
+    use super::host::{HostModel, greedy_rows, greedy_rows_with, greedy_token};
+    use super::projector::HostProjector;
     let path =
         std::env::var_os("FIFI_FLASH_GGUF").expect("set FIFI_FLASH_GGUF to the verified pack");
     let model = GgufModel::open(std::path::Path::new(&path))

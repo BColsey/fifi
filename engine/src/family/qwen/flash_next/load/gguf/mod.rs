@@ -30,6 +30,7 @@ mod expert_layout;
 mod host;
 pub(super) mod ngram;
 pub(super) mod plan;
+pub(super) mod projector;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in super::super) mod start;
 pub(super) mod tensors;
