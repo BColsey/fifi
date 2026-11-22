@@ -16,7 +16,6 @@
 use crate::EngError;
 use crate::kernels::cuda::native;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
-use crate::weights::GgufType;
 use std::{marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 
 use super::{
@@ -360,34 +359,11 @@ impl NativeWeight {
 /// read, `k` a positive multiple of the type's block size up to `native::MAX_DIM`, `n_rows` at
 /// least one (any count: no 8-row rule), and the source length exactly the native byte count.
 fn checked_native(tensor: QuantTensor<'_>) -> Result<QuantType, EngError> {
-    let quant = match tensor.ty {
-        GgufType::Q4K => QuantType::Q4K,
-        GgufType::Q50 => QuantType::Q50,
-        GgufType::Q6K => QuantType::Q6K,
-        GgufType::Q80 => QuantType::Q80,
-        // The in-house matvecs (native/resident/matvec_q5k.cu, matvec_q40.cu,
-        // matvec_q3k.cu): native blocks, no ggml_type discriminant.
-        GgufType::Q5K => QuantType::Q5K,
-        GgufType::Q40 => QuantType::Q40,
-        GgufType::Q3K => QuantType::Q3K,
-        GgufType::Iq4Xs => QuantType::Iq4Xs,
-        // The in-house codebook matvec (native/resident/matvec_gguf.cu).
-        GgufType::Iq4Nl => QuantType::Iq4Nl,
-        GgufType::Iq2S => QuantType::Iq2S,
-        GgufType::Iq3Xxs => QuantType::Iq3Xxs,
-        GgufType::Iq2Xxs => QuantType::Iq2Xxs,
-        GgufType::Q20 => QuantType::Q20,
-        GgufType::Iq2Xs => QuantType::Iq2Xs,
-        GgufType::Iq3S => QuantType::Iq3S,
-        GgufType::Q2K => QuantType::Q2K,
-        GgufType::Iq1S => QuantType::Iq1S,
-        GgufType::Iq1M => QuantType::Iq1M,
-        other => {
-            return Err(EngError::Checkpoint(format!(
-                "tensor {} has type {other:?}, which the CUDA native weights do not take",
-                tensor.name
-            )));
-        }
+    let Some(quant) = QuantType::from_gguf(tensor.ty) else {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {} has type {:?}, which the CUDA native weights do not take",
+            tensor.name, tensor.ty
+        )));
     };
     let shape = |why: &str| {
         EngError::Checkpoint(format!(

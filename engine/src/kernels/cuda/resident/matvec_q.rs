@@ -25,6 +25,7 @@ use crate::kernels::cuda::native::resident::matvec_q3k::matvec_q3k_launch;
 use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
 use crate::kernels::cuda::native::resident::matvec_q40::matvec_q40_launch;
 use crate::kernels::cuda::native::resident::matvec_q80::matvec_q80_launch;
+use crate::weights::GgufType;
 
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 #[cfg(test)]
@@ -169,6 +170,31 @@ impl QuantType {
             Self::Iq1S => 50,
             Self::Iq1M => 56,
         }
+    }
+
+    /// The kernel type of a file's tensor type, `None` for a type without a native kernel.
+    pub(crate) fn from_gguf(ty: GgufType) -> Option<Self> {
+        Some(match ty {
+            GgufType::Q4K => Self::Q4K,
+            GgufType::Q50 => Self::Q50,
+            GgufType::Q6K => Self::Q6K,
+            GgufType::Q80 => Self::Q80,
+            GgufType::Q5K => Self::Q5K,
+            GgufType::Q40 => Self::Q40,
+            GgufType::Q3K => Self::Q3K,
+            GgufType::Iq4Xs => Self::Iq4Xs,
+            GgufType::Iq4Nl => Self::Iq4Nl,
+            GgufType::Iq2S => Self::Iq2S,
+            GgufType::Iq3Xxs => Self::Iq3Xxs,
+            GgufType::Iq2Xxs => Self::Iq2Xxs,
+            GgufType::Q20 => Self::Q20,
+            GgufType::Iq2Xs => Self::Iq2Xs,
+            GgufType::Iq3S => Self::Iq3S,
+            GgufType::Q2K => Self::Q2K,
+            GgufType::Iq1S => Self::Iq1S,
+            GgufType::Iq1M => Self::Iq1M,
+            _ => return None,
+        })
     }
 
     pub(crate) fn weight_bytes(self, rows: usize, k: usize) -> Option<usize> {

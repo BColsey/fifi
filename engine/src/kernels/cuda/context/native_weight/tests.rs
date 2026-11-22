@@ -11,6 +11,7 @@ use super::*;
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, tests::reference};
 use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::{CHUNK_LIMIT, testkit};
+use crate::weights::GgufType;
 
 /// The error text of a result, so the helpers need no `T: Debug` on `Ok`.
 fn error_text<T>(result: Result<T, EngError>) -> String {
