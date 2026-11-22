@@ -4,9 +4,9 @@ use std::ffi::{c_int, c_void};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
-pub(in crate::kernels::cuda) enum Arithmetic {
+pub(crate) enum Arithmetic {
     Generic = 0,
     CpuParity = 1,
 }

@@ -4,7 +4,10 @@ use super::{
     ControllerWeights, DenseGemvCall, DenseGemvShape, DenseStep, ResidentProjection, Slot, bad,
     dense_gemv_bytes, split_projections,
 };
-use crate::{EngError, kernels::cuda::CudaContext};
+use crate::{
+    EngError,
+    kernels::cuda::{CudaContext, resident::inkling_controller::Arithmetic},
+};
 
 #[cfg(test)]
 mod tests;
@@ -55,7 +58,7 @@ impl DenseStep {
         ))
     }
 
-    // Staged transaction: the grouped prefill caller is wired separately after quality checks.
+    // Fused transaction for grouped prefill; the caller selects controller arithmetic.
     pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch<
         const N: usize,
     >(
@@ -64,7 +67,7 @@ impl DenseStep {
         inputs: &[[ControlledAttentionInput<'_>; 3]],
         controllers: [ControllerWeights<'_>; 3],
         weights: [Option<ResidentProjection<'_>>; N],
-        eps: f32,
+        (eps, arithmetic): (f32, Arithmetic),
     ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
         let Some(first) = inputs.first() else {
             return Ok(None);
@@ -157,11 +160,12 @@ impl DenseStep {
         }
         let values = self.run_rows(context, &self.stream, &staged, [upload, readback], || {
             context.dense_gemv_group(&self.stream, &control)?;
-            context.inkling_controller_norm_roles(
+            context.inkling_controller_norm_with_arithmetic(
                 &self.stream,
                 workspace,
                 health,
                 ([hidden, 3 * m], eps),
+                arithmetic,
             )?;
             context.dense_gemv_group(&self.stream, &projections)
         })?;

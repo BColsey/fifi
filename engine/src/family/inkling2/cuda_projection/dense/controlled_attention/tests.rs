@@ -89,7 +89,13 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
     .unwrap();
     let batch_step = DenseStep::new(&context, &wide).unwrap();
     let batch = batch_step
-        .controlled_attention_batch(&context, &rows, controllers, weights, eps)
+        .controlled_attention_batch(
+            &context,
+            &rows,
+            controllers,
+            weights,
+            (eps, Arithmetic::Generic),
+        )
         .unwrap()
         .unwrap();
     for (row, got) in batch_raw.iter().zip(batch) {
@@ -99,9 +105,15 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
         }
     }
     assert!(
-        step.controlled_attention_batch(&context, &rows, controllers, weights, eps)
-            .unwrap()
-            .is_none()
+        step.controlled_attention_batch(
+            &context,
+            &rows,
+            controllers,
+            weights,
+            (eps, Arithmetic::CpuParity),
+        )
+        .unwrap()
+        .is_none()
     );
     let small = DensePlan::new([24 * hidden - 32, 2 * hidden], hidden, rank).unwrap();
     assert!(

@@ -28,6 +28,7 @@ mod cache;
 mod cold_controller;
 mod controller_residency;
 mod device_prefill;
+mod grouped_controller_arithmetic;
 mod residency;
 mod resident_prefill;
 pub(in crate::family::inkling2) mod router;
@@ -168,12 +169,19 @@ impl AttentionControllers<'_> {
         if capacity < 2 {
             return Ok(None);
         }
+        let arithmetic = grouped_controller_arithmetic::select();
         let mut result = Vec::with_capacity(inputs.len());
         for chunk in inputs.chunks(capacity) {
             let values = self
                 .cuda
                 .step
-                .controlled_attention_batch(&self.cuda.context, chunk, [q, k, v], weights, eps)?
+                .controlled_attention_batch(
+                    &self.cuda.context,
+                    chunk,
+                    [q, k, v],
+                    weights,
+                    (eps, arithmetic),
+                )?
                 .ok_or_else(|| bad("admitted CUDA controlled attention batch declined"))?;
             if values.len() != chunk.len() {
                 return Err(bad(

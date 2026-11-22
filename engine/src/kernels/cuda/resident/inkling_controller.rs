@@ -3,24 +3,11 @@
 #[cfg(test)]
 mod tests;
 
-use std::sync::OnceLock;
-
 use crate::EngError;
-use crate::kernels::cuda::{
-    CudaContext, DeviceRange, DeviceStream,
-    native::resident::inkling_controller::{Arithmetic, launch},
-};
+use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
-fn controller_arithmetic() -> Arithmetic {
-    static MODE: OnceLock<Arithmetic> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        if std::env::var("FIFI_INKLING_CUDA_CONTROLLER_CPU_PARITY").as_deref() == Ok("1") {
-            Arithmetic::CpuParity
-        } else {
-            Arithmetic::Generic
-        }
-    })
-}
+pub(crate) use super::super::native::resident::inkling_controller::Arithmetic;
+use super::super::native::resident::inkling_controller::launch;
 
 impl CudaContext {
     /// The workspace packs three [input, message, gamma] triples, three
@@ -37,7 +24,8 @@ impl CudaContext {
     }
 
     /// Packs 1..=1536 independent roles: triples, pairs, then outputs.
-    /// Health has one float per role; workspace and health must not overlap.
+    /// Always uses generic arithmetic. Health has one float per role;
+    /// workspace and health must not overlap.
     pub(crate) fn inkling_controller_norm_roles(
         &self,
         stream: &DeviceStream,
@@ -50,11 +38,12 @@ impl CudaContext {
             workspace,
             health,
             shape_eps,
-            controller_arithmetic(),
+            Arithmetic::Generic,
         )
     }
 
-    fn inkling_controller_norm_with_arithmetic(
+    /// Same packed layout and health contract; grouped prefill may opt into parity.
+    pub(crate) fn inkling_controller_norm_with_arithmetic(
         &self,
         stream: &DeviceStream,
         workspace: DeviceRange<'_>,
