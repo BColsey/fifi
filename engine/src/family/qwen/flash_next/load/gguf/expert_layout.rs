@@ -69,9 +69,40 @@ impl ExpertStacks {
         record: &[u8],
         stack: &mut [u8],
     ) -> Result<(), EngError> {
+        let destinations = self.copy_ranges(layout, slot, record, stack.len())?;
+        for (part, dest) in layout.parts.iter().zip(destinations) {
+            stack[dest].copy_from_slice(&record[part.bytes.clone()]);
+        }
+        Ok(())
+    }
+
+    /// Synchronous ordered uploads. If a device copy fails, discard the partially written slot.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(in super::super::super) fn upload_record(
+        &self,
+        layout: &ExpertLayout,
+        slot: usize,
+        record: &[u8],
+        stack: &crate::kernels::cuda::DeviceBuffer,
+        stream: &crate::kernels::cuda::DeviceStream,
+    ) -> Result<(), EngError> {
+        let destinations = self.copy_ranges(layout, slot, record, stack.bytes())?;
+        for (part, dest) in layout.parts.iter().zip(destinations) {
+            stack.write_at(stream, dest.start, &record[part.bytes.clone()])?;
+        }
+        Ok(())
+    }
+
+    fn copy_ranges(
+        &self,
+        layout: &ExpertLayout,
+        slot: usize,
+        record: &[u8],
+        stack_bytes: usize,
+    ) -> Result<Vec<Range<usize>>, EngError> {
         let bad = || EngError::BadRequest("invalid GGUF expert stack copy".into());
         if record.len() != layout.bytes
-            || stack.len() != self.bytes
+            || stack_bytes != self.bytes
             || *self != Self::new(layout, self.slots)?
         {
             return Err(bad());
@@ -80,15 +111,12 @@ impl ExpertStacks {
         for (index, part) in layout.parts.iter().enumerate() {
             let source = record.get(part.bytes.clone()).ok_or_else(bad)?;
             let dest = self.slot(index, slot)?;
-            if source.len() != dest.len() || dest.end > stack.len() {
+            if source.len() != dest.len() || dest.end > stack_bytes {
                 return Err(bad());
             }
             destinations.push(dest);
         }
-        for (part, dest) in layout.parts.iter().zip(destinations) {
-            stack[dest].copy_from_slice(&record[part.bytes.clone()]);
-        }
-        Ok(())
+        Ok(destinations)
     }
 
     pub(in super::super::super) fn slot(

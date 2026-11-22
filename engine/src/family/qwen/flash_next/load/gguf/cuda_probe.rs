@@ -119,6 +119,10 @@ fn packed_expert_stacks_run_indexed_cuda_matvec() {
     }
     let stacks = ExpertStacks::new(&layout, 2).unwrap();
     let mut packed = vec![0; stacks.bytes];
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let w = ctx.allocate(packed.len()).unwrap();
+    w.write_at(&stream, 0, &packed).unwrap();
     for slot in 0..2 {
         let mut record = vec![0; layout.bytes];
         for (part_index, part) in layout.parts.iter().enumerate() {
@@ -130,11 +134,18 @@ fn packed_expert_stacks_run_indexed_cuda_matvec() {
         stacks
             .copy_record(&layout, slot, &record, &mut packed)
             .unwrap();
+        stacks
+            .upload_record(&layout, slot, &record, &w, &stream)
+            .unwrap();
     }
-    let ctx = CudaContext::new().unwrap();
-    let stream = ctx.stream().unwrap();
-    let w = ctx.allocate(packed.len()).unwrap();
-    w.write_at(&stream, 0, &packed).unwrap();
+    assert!(
+        stacks
+            .upload_record(&layout, 2, &vec![0; layout.bytes], &w, &stream)
+            .is_err()
+    );
+    let mut copied = vec![0; packed.len()];
+    w.read_at(&stream, 0, &mut copied).unwrap();
+    assert_eq!(copied, packed);
     let ids = ctx.allocate(8).unwrap();
     ids.write_at(&stream, 0, &[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
     let x = ctx.allocate(32 * 4).unwrap();
