@@ -173,13 +173,32 @@ fn make_private_dir(dir: &Path) -> std::io::Result<()> {
 
 fn generate() -> std::io::Result<String> {
     let mut bytes = [0_u8; KEY_BYTES];
+    random_bytes(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Fills `bytes` from the operating system's random source: the `getrandom` call where rustix
+/// has it (Linux, Android), the `/dev/urandom` device on every other unix.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < bytes.len() {
         filled +=
             rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty())
                 .map_err(std::io::Error::from)?;
     }
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
+    from_device(bytes)
+}
+
+/// Fills `bytes` from `/dev/urandom`.
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
+fn from_device(bytes: &mut [u8]) -> std::io::Result<()> {
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, bytes)
 }
 
 #[cfg(test)]
@@ -366,5 +385,21 @@ mod tests {
             std::fs::metadata(&path).expect("meta").uid(),
             rustix::process::geteuid().as_raw()
         );
+    }
+
+    #[test]
+    fn both_random_sources_fill_the_key_and_differ_between_calls() {
+        let (mut first, mut second) = ([0_u8; KEY_BYTES], [0_u8; KEY_BYTES]);
+        random_bytes(&mut first).expect("the system source");
+        random_bytes(&mut second).expect("the system source");
+        assert_ne!(first, second);
+        assert_ne!(first, [0_u8; KEY_BYTES]);
+        let (mut third, mut fourth) = ([0_u8; KEY_BYTES], [0_u8; KEY_BYTES]);
+        from_device(&mut third).expect("the device");
+        from_device(&mut fourth).expect("the device");
+        assert_ne!(third, fourth);
+        assert_ne!(third, [0_u8; KEY_BYTES]);
+        let key = generate().expect("a key");
+        assert_eq!(key.len(), KEY_BYTES * 2);
     }
 }
