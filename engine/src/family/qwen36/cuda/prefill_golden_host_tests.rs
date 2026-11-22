@@ -247,7 +247,7 @@ fn the_plan_tables_hold_their_golden_digests() {
     // is fed; the token after them goes through decode.
     let mut partition_text = String::new();
     for &cap in &SIZES {
-        let steps = chunk_list_with_depth_tier(0, FED_ROWS, cap, false).expect("chunk list");
+        let steps = chunk_list_with_depth_tier(0, FED_ROWS, cap, None).expect("chunk list");
         for step in &steps {
             match step {
                 PrefillStep::Chunk { p0, rows } => {
@@ -277,7 +277,7 @@ fn the_plan_tables_hold_their_golden_digests() {
         }
     }
     // At cap 2048 the depth tier, not the cap, cuts the chunks from position 4,096 on.
-    let deep = chunk_list_with_depth_tier(0, FED_ROWS, 2048, false).expect("chunk list");
+    let deep = chunk_list_with_depth_tier(0, FED_ROWS, 2048, None).expect("chunk list");
     assert!(
         deep.iter().any(|step| matches!(
             step,

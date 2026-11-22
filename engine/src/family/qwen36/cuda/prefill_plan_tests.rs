@@ -68,12 +68,12 @@ fn fixed_depth_tier_preserves_early_chunks_and_the_legacy_plan() {
         (255_000, 512, 256),
         (196_608, 128, 128),
         (196_608, 16, 16),
-        (usize::MAX, 512, 256),
+        (usize::MAX, 512, 128),
     ] {
-        assert_eq!(fixed_depth_rows(p0, rows), want);
+        assert_eq!(fixed_depth_rows(p0, rows, 82), want);
     }
     assert_eq!(
-        chunk_list_with_depth_tier(155_136, 1024, 512, true).unwrap(),
+        chunk_list_with_depth_tier(155_136, 1024, 512, Some(82)).unwrap(),
         vec![
             chunk(155_136, 512),
             chunk(155_648, 256),
@@ -81,17 +81,17 @@ fn fixed_depth_tier_preserves_early_chunks_and_the_legacy_plan() {
         ]
     );
     assert_eq!(
-        chunk_list_with_depth_tier(155_648, 257, 512, true).unwrap(),
+        chunk_list_with_depth_tier(155_648, 257, 512, Some(82)).unwrap(),
         vec![chunk(155_648, 256), feed(155_904)]
     );
     for (p0, count, arena) in [(0, 3000, 1024), (196_096, 1024, 512), (245_760, 1024, 512)] {
         assert_eq!(
-            chunk_list_with_depth_tier(p0, count, arena, false).unwrap(),
+            chunk_list_with_depth_tier(p0, count, arena, None).unwrap(),
             chunk_list(p0, count, arena).unwrap()
         );
     }
-    assert!(chunk_list_with_depth_tier(usize::MAX, 1, 512, true).is_err());
-    assert!(chunk_list_with_depth_tier(0, 1, 0, true).is_err());
+    assert!(chunk_list_with_depth_tier(usize::MAX, 1, 512, Some(82)).is_err());
+    assert!(chunk_list_with_depth_tier(0, 1, 0, Some(82)).is_err());
 }
 
 #[test]

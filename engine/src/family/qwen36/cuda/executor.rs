@@ -32,12 +32,14 @@
 //! addresses, not positions, and the next token rewrites the `pos`/`kv_len` words from the
 //! imported `tokens` count.
 
+use super::prefill_plan::DEPTH_ANCHORS;
 use super::prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes, stored_prefix_report};
 use super::step::{ChunkVerdict, QwenResidentStep};
 use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        prefill::piece_rows::piece_rows,
         sampler::Sampler,
         session::{
             DecodeSession, Limits, PrefixIdentity, SaveKind, StoreLimits, TokenStepper,
@@ -72,7 +74,7 @@ pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
 }
 
 /// Keep the admitted arena, but cap every worker piece by its current depth.
-pub(super) fn piece_of(verdict: &ChunkVerdict, p0: usize) -> Option<usize> {
+pub(super) fn piece_of(verdict: &ChunkVerdict, p0: usize, sm_count: usize) -> Option<usize> {
     match verdict {
         ChunkVerdict::Ready { m_sess } => {
             // The experimental arena is larger, but only its initial 8K may use
@@ -82,7 +84,7 @@ pub(super) fn piece_of(verdict: &ChunkVerdict, p0: usize) -> Option<usize> {
             } else {
                 *m_sess
             };
-            Some(super::prefill_plan::fixed_depth_rows(p0, rows))
+            Some(piece_rows(DEPTH_ANCHORS, sm_count, p0, rows))
         }
         _ => None,
     }
@@ -201,7 +203,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
     /// The worker refreshes this hint between pieces so a deep piece is itself cancellable.
     /// Refused sessions retain the worker's existing fallback.
     fn prefill_piece(&self) -> Option<usize> {
-        piece_of(&self.chunk_ready(), self.tokens())
+        piece_of(&self.chunk_ready(), self.tokens(), self.prefill_sm_count())
     }
 
     fn decode(

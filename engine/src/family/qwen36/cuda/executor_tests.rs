@@ -99,14 +99,14 @@ fn kv8_chunking_is_opt_in_and_keeps_the_other_refusals() {
         chunk_path_of(&chunk_verdict(&kv8)),
         ChunkPath::Chunked { m_sess: 512 }
     );
-    assert_eq!(piece_of(&chunk_verdict(&kv8), 0), Some(512));
+    assert_eq!(piece_of(&chunk_verdict(&kv8), 0, 82), Some(512));
     let small = ChunkFacts {
         m_sess_cap: 16,
         arena: Some(128),
         ..kv8
     };
     assert_eq!(chunk_verdict(&small), ChunkVerdict::Ready { m_sess: 16 });
-    assert_eq!(piece_of(&chunk_verdict(&small), 0), Some(16));
+    assert_eq!(piece_of(&chunk_verdict(&small), 0, 82), Some(16));
     assert_eq!(
         chunk_verdict(&ChunkFacts { arena: None, ..kv8 }),
         ChunkVerdict::NoArena
@@ -454,7 +454,7 @@ fn default_worker_piece_caps_measured_depth_without_shrinking_the_arena() {
         (73_728, 512),
         (127_000, 512),
     ] {
-        assert_eq!(piece_of(&arena, p0), Some(want), "depth {p0}");
+        assert_eq!(piece_of(&arena, p0, 82), Some(want), "depth {p0}");
     }
     assert_eq!(arena, ChunkVerdict::Ready { m_sess: 1024 });
 }
@@ -469,7 +469,7 @@ fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
         let mut at = p0;
         let mut grouped = Vec::new();
         while at < end {
-            let rows = piece_of(&arena, at).unwrap().min(end - at);
+            let rows = piece_of(&arena, at, 82).unwrap().min(end - at);
             grouped.extend(chunk_list(at, rows, 1024).unwrap());
             at += rows;
         }
@@ -481,7 +481,7 @@ fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
 fn the_worker_piece_follows_the_verdict() {
     for m_sess in [2048usize, 1024, 512, 256, 128] {
         assert_eq!(
-            piece_of(&ChunkVerdict::Ready { m_sess }, 0),
+            piece_of(&ChunkVerdict::Ready { m_sess }, 0, 82),
             Some(m_sess),
             "the admitted size is the piece"
         );
@@ -493,20 +493,20 @@ fn the_worker_piece_follows_the_verdict() {
         ChunkVerdict::NoArena,
     ] {
         assert_eq!(
-            piece_of(&refusal, 245_760),
+            piece_of(&refusal, 245_760, 82),
             None,
             "{refusal:?} keeps the fallback"
         );
     }
     let arena = ChunkVerdict::Ready { m_sess: 512 };
-    assert_eq!(piece_of(&arena, 155_136), Some(512));
-    assert_eq!(piece_of(&arena, 155_137), Some(256));
-    assert_eq!(piece_of(&arena, 196_096), Some(256));
-    assert_eq!(piece_of(&arena, 196_097), Some(256));
-    assert_eq!(piece_of(&arena, 245_760), Some(256));
+    assert_eq!(piece_of(&arena, 155_136, 82), Some(512));
+    assert_eq!(piece_of(&arena, 155_137, 82), Some(256));
+    assert_eq!(piece_of(&arena, 196_096, 82), Some(256));
+    assert_eq!(piece_of(&arena, 196_097, 82), Some(256));
+    assert_eq!(piece_of(&arena, 245_760, 82), Some(256));
     for m_sess in [16, 128, 256] {
         assert_eq!(
-            piece_of(&ChunkVerdict::Ready { m_sess }, 127_000),
+            piece_of(&ChunkVerdict::Ready { m_sess }, 127_000, 82),
             Some(m_sess)
         );
     }

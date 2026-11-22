@@ -537,7 +537,7 @@ pub(super) struct PrefillArena {
     kv8_staging: Option<(Kv8StagingPlan, DeviceBuffer, bool)>,
     m_sess: usize,
     /// The device facts of the admission (`cc`, `nsm`, `smpbo`), kept for the chunk builds.
-    facts: MmqFacts,
+    pub(super) facts: MmqFacts,
     /// The admission budget, for the run report.
     budget: usize,
 }
@@ -695,7 +695,7 @@ pub(super) fn drive_chunks(
     start: usize,
     tokens: &[u32],
     m_sess: usize,
-    fixed_depth: bool,
+    fixed_depth: Option<usize>,
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
     let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
@@ -739,7 +739,7 @@ pub(super) fn drive_tiered_wide_chunks(
     start: usize,
     tokens: &[u32],
     m_sess: usize,
-    fixed_depth: bool,
+    fixed_depth: Option<usize>,
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
     let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;

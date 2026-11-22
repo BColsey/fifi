@@ -92,6 +92,7 @@ pub(crate) fn m_pos(p0: usize) -> usize {
 // keep the old paths alive for the driver, the step and the plan tests.
 pub(crate) use crate::family::prefill::admission::{Admission, ChunkCost, Extra};
 use crate::family::prefill::arena::PrefillStep;
+use crate::family::prefill::piece_rows::{Anchor, piece_rows};
 use crate::family::project::exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_max_jobs};
 
 impl Admission {
@@ -111,28 +112,28 @@ pub(crate) fn chunk_list(
     n_rows: usize,
     m_sess: usize,
 ) -> Result<Vec<PrefillStep>, EngError> {
-    chunk_list_with_depth_tier(p0, n_rows, m_sess, false)
+    chunk_list_with_depth_tier(p0, n_rows, m_sess, None)
 }
 
-/// Bound a piece without changing the session arena or sampling free VRAM.
-pub(crate) fn fixed_depth_rows(p0: usize, rows: usize) -> usize {
-    let end = p0.saturating_add(rows);
-    if end > 155_648 {
-        // Two 3090 runs keep 512-token pieces below 0.454 s through 152K.
-        rows.min(256)
-    } else if end > 73_728 {
-        // On the 3090, 1,024-token pieces reach 0.45 s by 72K; halve before 0.5 s.
-        rows.min(512)
-    } else {
-        rows
-    }
+/// The measured anchors of the piece-time model: on the 82-SM RTX 3090 a piece of 1,024 rows
+/// reaches 0.45 s at 73,728 positions of depth, and a piece of 512 rows at 155,648 (two runs keep
+/// 512-row pieces below 0.454 s through 152K). The rows at every depth and on every device
+/// follow from them ([`piece_rows`]).
+pub(super) const DEPTH_ANCHORS: (Anchor, Anchor) =
+    (Anchor::at(73_728, 1024), Anchor::at(155_648, 512));
+
+/// Bound a piece without changing the session arena or sampling free VRAM: the rows a piece may
+/// have at its end depth on a device of `sm_count` multiprocessors.
+#[cfg(test)]
+pub(crate) fn fixed_depth_rows(p0: usize, rows: usize, sm_count: usize) -> usize {
+    piece_rows(DEPTH_ANCHORS, sm_count, p0, rows)
 }
 
 pub(crate) fn chunk_list_with_depth_tier(
     p0: usize,
     n_rows: usize,
     m_sess: usize,
-    fixed_depth: bool,
+    fixed_depth: Option<usize>,
 ) -> Result<Vec<PrefillStep>, EngError> {
     if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
         return Err(EngError::BadRequest(format!(
@@ -144,10 +145,9 @@ pub(crate) fn chunk_list_with_depth_tier(
     let mut at = p0;
     while at < end {
         let rows = m_pos(at).min(m_sess).min(end - at);
-        let rows = if fixed_depth {
-            fixed_depth_rows(at, rows)
-        } else {
-            rows
+        let rows = match fixed_depth {
+            Some(sm_count) => piece_rows(DEPTH_ANCHORS, sm_count, at, rows),
+            None => rows,
         };
         steps.push(match rows {
             1 => PrefillStep::Feed { p0: at },

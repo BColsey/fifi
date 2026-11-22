@@ -1458,8 +1458,15 @@ impl<'a> QwenResidentStep<'a> {
         result.map(|_| ())
     }
 
-    pub(super) fn fixed_prefill_depth(&self) -> bool {
-        self.prefill.as_ref().is_some_and(PrefillArena::segmented)
+    /// The multiprocessors of the device, when the prefill pieces are depth-bound.
+    pub(super) fn fixed_prefill_depth(&self) -> Option<usize> {
+        let segmented = self.prefill.as_ref().is_some_and(PrefillArena::segmented);
+        segmented.then(|| self.prefill_sm_count())
+    }
+
+    /// The multiprocessors the prefill arena was admitted on, 0 before there is one.
+    pub(super) fn prefill_sm_count(&self) -> usize {
+        self.prefill.as_ref().map_or(0, |arena| arena.facts.nsm)
     }
 
     pub(super) fn record_feed(&mut self, p0: usize, ns: u64) {

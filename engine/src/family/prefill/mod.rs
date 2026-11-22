@@ -14,6 +14,13 @@ pub(crate) mod mlx;
 )]
 pub(crate) mod admission;
 
+/// The rows of a prefill piece at a depth, from a latency target and the device.
+#[allow(
+    dead_code,
+    reason = "the CUDA family drivers consume the piece rule; host builds use it only in tests"
+)]
+pub(crate) mod piece_rows;
+
 // Both CUDA drivers consume these helpers. Host builds use them only in tests.
 #[allow(
     dead_code,

@@ -556,7 +556,7 @@ fn capture(
         })
         .collect();
     let expected: Vec<(usize, usize, &'static str)> =
-        chunk_list_with_depth_tier(0, FED_ROWS, wanted, false)
+        chunk_list_with_depth_tier(0, FED_ROWS, wanted, None)
             .expect("chunk list")
             .iter()
             .map(|step| match step {

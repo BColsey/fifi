@@ -623,7 +623,7 @@ fn drive_chunks_slices_rows_at_their_positions() {
         for &count in &[0usize, 1, 2, 129, 300] {
             let tokens: Vec<u32> = (0..count as u32).map(|at| at + 7).collect();
             let mut log: Vec<(PrefillStep, Vec<u32>)> = Vec::new();
-            let ran = drive_chunks(start, &tokens, 128, false, |step, rows| {
+            let ran = drive_chunks(start, &tokens, 128, None, |step, rows| {
                 log.push((step, rows.to_vec()));
                 Ok(())
             })
@@ -739,7 +739,7 @@ fn fixed_drive_limits_depth_without_shrinking_the_session_arena() {
     let tokens: Vec<u32> = (0..1024).collect();
     let mut seen = Vec::new();
     let mut copied = Vec::new();
-    drive_chunks(155_136, &tokens, 512, true, |step, rows| {
+    drive_chunks(155_136, &tokens, 512, Some(82), |step, rows| {
         seen.push(step);
         copied.extend_from_slice(rows);
         Ok(())
@@ -2037,7 +2037,7 @@ fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
         let mut seen = Vec::new();
         let mut at = start;
         while at < start + total {
-            let size = piece_of(&ChunkVerdict::Ready { m_sess: 4096 }, at)
+            let size = piece_of(&ChunkVerdict::Ready { m_sess: 4096 }, at, 82)
                 .unwrap()
                 .min(start + total - at);
             assert!(size > 0 && size <= 4096);
@@ -2045,7 +2045,7 @@ fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
                 assert!(size <= 2048);
             }
             let chunk = &tokens[at - start..at - start + size];
-            drive_tiered_wide_chunks(at, chunk, 4096, false, |step, rows| {
+            drive_tiered_wide_chunks(at, chunk, 4096, None, |step, rows| {
                 let (p0, count) = match step {
                     PrefillStep::Feed { p0 } => (p0, 1),
                     PrefillStep::Chunk { p0, rows } => (p0, rows),
