@@ -786,7 +786,8 @@ mod tests {
             assert_eq!(found.tokenizer_dir, expected_dir);
 
             let report = crate::capability::inspect::inspect(path, &found.tokenizer_dir).unwrap();
-            assert_eq!(report.model_dir, *path);
+            assert_eq!(report.model_dir, *model.path());
+            assert_eq!(report.weights_path, *path);
             assert_eq!(report.files.len(), 1);
             assert_eq!(report.gguf_files.len(), 1);
             assert_eq!(report.gguf_files[0].file, basename);
