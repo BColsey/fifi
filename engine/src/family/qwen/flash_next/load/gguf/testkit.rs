@@ -11,9 +11,12 @@ use std::{
 
 use super::{
     config::{GgufConfig, NgramHash},
-    tensors::{Convention, Form, Mapped, Place, Role},
+    tensors::{Convention, Form, Mapped, Place, Slot},
 };
-use crate::weights::{GgufLimits, GgufType, GgufWeights};
+use crate::{
+    family::recipe::{Global, Role as Wanted, SiteTensor},
+    weights::{GgufLimits, GgufType, GgufWeights},
+};
 
 const ALIGN: u64 = 32;
 
@@ -315,20 +318,22 @@ pub(super) fn flash_tensors(spec: &Spec, config: &GgufConfig) -> Vec<TensorSpec>
         }
         let mut dims = item.dims;
         let mut ty = match item.role {
-            Role::ExpertGate | Role::ExpertUp => spec.expert_types[item.layer.unwrap()].0,
-            Role::ExpertDown => spec.expert_types[item.layer.unwrap()].1,
-            Role::HyperDown(_)
-            | Role::HyperUp(_)
-            | Role::PleKey
-            | Role::PleValue
-            | Role::SharedDown => GgufType::Q80,
-            Role::HyperInject(_) => GgufType::F32,
-            Role::QsaIndexQ | Role::QsaIndexK => GgufType::Bf16,
-            Role::NgramTable => GgufType::Iq4Nl,
+            Slot::Layer(Wanted::ExpertGate) | Slot::Layer(Wanted::ExpertUp) => {
+                spec.expert_types[item.layer.unwrap()].0
+            }
+            Slot::Layer(Wanted::ExpertDown) => spec.expert_types[item.layer.unwrap()].1,
+            Slot::Layer(Wanted::Hyper(_, SiteTensor::Down | SiteTensor::Up))
+            | Slot::Global(Global::HeadSite(SiteTensor::Down | SiteTensor::Up))
+            | Slot::Layer(Wanted::PleKey)
+            | Slot::Layer(Wanted::PleValue)
+            | Slot::Layer(Wanted::SharedDown) => GgufType::Q80,
+            Slot::Layer(Wanted::Hyper(_, SiteTensor::Inject)) => GgufType::F32,
+            Slot::Layer(Wanted::IndexProj) | Slot::Layer(Wanted::IndexKey) => GgufType::Bf16,
+            Slot::Global(Global::NgramTable) => GgufType::Iq4Nl,
             _ if item.vector => GgufType::F32,
             _ => GgufType::Q6K,
         };
-        if item.role == Role::NgramTable {
+        if item.role == Slot::Global(Global::NgramTable) {
             dims[1] = spec.ngram_rows;
         }
         if let Some((_, other)) = spec.reshape.iter().find(|(n, _)| *n == name) {
@@ -456,7 +461,7 @@ pub(super) fn tiny_table(ty: GgufType, rows: u64, payload: Vec<u8>) -> TinyTable
     );
     let weights = GgufWeights::open_any_type(&path, LIMITS, None).expect("open the table");
     let table = Mapped {
-        role: Role::NgramTable,
+        role: Slot::Global(Global::NgramTable),
         layer: None,
         name: "per_layer_token_embd.weight".into(),
         ty,

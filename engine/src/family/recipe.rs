@@ -294,7 +294,7 @@ impl Recipe {
 }
 
 /// The tensors of one stored layer a recipe can ask for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Role {
     AttnNorm,
     QProj,
@@ -328,19 +328,50 @@ pub(crate) enum Role {
     DenseGate,
     DenseUp,
     DenseDown,
-    /// The hyper-connection sites before the mixer and before the feed-forward.
-    MixerSite,
-    FfnSite,
+    /// The QSA indexer's key projection (the query projection is `IndexProj`).
+    IndexKey,
+    /// The norms of the indexer's queries and keys.
+    IndexQNorm,
+    IndexKNorm,
+    /// One tensor of a hyper-connection site of the layer.
+    Hyper(Site, SiteTensor),
+    /// The tensors of the per-layer embedding step of the layer that carries it.
+    PleKey,
+    PleValue,
+    PleNormKey,
+    PleNormQuery,
+    PleNormConv,
+    PleConv,
+}
+
+/// Where a hyper-connection site sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Site {
+    /// Before the token mixer of a layer.
+    Mixer,
+    /// Before the feed-forward of a layer.
+    Ffn,
+    /// The final site that feeds the head (it has no inject projection).
+    Head,
+}
+
+/// The tensors of one hyper-connection site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SiteTensor {
+    Norm,
+    Down,
+    Up,
+    Inject,
 }
 
 /// The tensors outside the layers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Global {
     Embedding,
     FinalNorm,
     Head,
-    /// The hyper-connection mixer that feeds the head.
-    HeadSite,
+    /// A tensor of the hyper-connection site that feeds the head.
+    HeadSite(SiteTensor),
     NgramTable,
 }
 

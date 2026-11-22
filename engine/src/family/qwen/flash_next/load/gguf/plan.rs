@@ -13,11 +13,11 @@
 //! files on a miss through the staging ring. A host that cannot pin the cold experts of an
 //! 83.6 GB model therefore plans the disk tier and does not refuse.
 
-use super::{
-    GgufModel,
-    tensors::{Place, Role},
+use super::{GgufModel, tensors::Place};
+use crate::family::{
+    qwen::flash_next::host_plan::{HostFrame, HostMemory},
+    recipe::{Global, Role as Wanted},
 };
-use crate::family::qwen::flash_next::host_plan::{HostFrame, HostMemory};
 use crate::{
     EngError,
     family::{
@@ -69,7 +69,7 @@ impl GgufModel {
         let mut record_max = 0u64;
         for layer in 0..layers {
             let mut layer_bytes = 0u64;
-            for role in [Role::ExpertGate, Role::ExpertUp, Role::ExpertDown] {
+            for role in [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown] {
                 let tensor = self
                     .map
                     .get(role, Some(layer))
@@ -94,12 +94,12 @@ impl GgufModel {
         };
         let embedding = self
             .map
-            .get(Role::Embedding, None)
+            .get(Global::Embedding, None)
             .ok_or_else(|| refuse("no embedding tensor"))?
             .bytes;
         let ngram = self
             .map
-            .get(Role::NgramTable, None)
+            .get(Global::NgramTable, None)
             .ok_or_else(|| refuse("no n-gram table"))?
             .bytes;
         debug_assert_eq!(total, self.map.file_bytes(Place::Experts));

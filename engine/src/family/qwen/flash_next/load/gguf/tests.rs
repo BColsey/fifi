@@ -2,13 +2,14 @@ use super::{
     GgufModel,
     config::{ARCHITECTURE, GgufConfig},
     plan::Card,
-    tensors::{KernelGap, Place, Role, TensorMap},
+    tensors::{KernelGap, Place, Slot, TensorMap},
     testkit::{REAL_EXPERT_TYPES, Spec, flash_kvs, write_flash, write_gguf},
 };
 use crate::{
     EngError,
     family::qwen::flash_next::host_plan::HostMemory,
     family::qwen::flash_next::load::{Dims, tests::CONFIG},
+    family::recipe::{Global, Role as Wanted, Site, SiteTensor, WeightMap},
     weights::GgufType,
 };
 
@@ -70,22 +71,30 @@ fn every_tensor_of_the_real_layout_is_mapped_with_its_place_and_bytes() {
     assert_eq!(model.expert_bytes(), experts);
     assert_eq!(map.file_bytes(Place::Ngram), 320_001_536 * 90);
     assert_eq!(
-        map.get(Role::Embedding, None).expect("embedding").bytes,
+        map.get(Slot::Global(Global::Embedding), None)
+            .expect("embedding")
+            .bytes,
         521_472_000
     );
     // Layer 1 holds the PLE block; no other layer does.
-    assert!(map.get(Role::PleKey, Some(1)).is_some());
-    assert!(map.get(Role::PleKey, Some(5)).is_none());
+    assert!(map.get(Slot::Layer(Wanted::PleKey), Some(1)).is_some());
+    assert!(map.get(Slot::Layer(Wanted::PleKey), Some(5)).is_none());
     // Layer 3 attends, layer 0 runs DeltaNet.
-    assert!(map.get(Role::QsaQ, Some(3)).is_some() && map.get(Role::DeltaQkv, Some(3)).is_none());
-    assert!(map.get(Role::DeltaQkv, Some(0)).is_some() && map.get(Role::QsaQ, Some(0)).is_none());
+    assert!(
+        map.get(Slot::Layer(Wanted::QProj), Some(3)).is_some()
+            && map.get(Slot::Layer(Wanted::DeltaQkv), Some(3)).is_none()
+    );
+    assert!(
+        map.get(Slot::Layer(Wanted::DeltaQkv), Some(0)).is_some()
+            && map.get(Slot::Layer(Wanted::QProj), Some(0)).is_none()
+    );
     // The mixer has no inject projection; every layer site does.
     assert!(
-        map.get(Role::HyperInject(super::tensors::Site::Mixer), None)
+        map.get(Slot::hyper(Site::Head, SiteTensor::Inject), None)
             .is_none()
     );
     assert!(
-        map.get(Role::HyperInject(super::tensors::Site::Attn), Some(7))
+        map.get(Slot::hyper(Site::Mixer, SiteTensor::Inject), Some(7))
             .is_some()
     );
 }
@@ -94,20 +103,26 @@ fn every_tensor_of_the_real_layout_is_mapped_with_its_place_and_bytes() {
 fn the_device_trunk_counts_each_tensor_in_the_form_the_executor_holds_it() {
     let (_written, model) = open(&Spec::default());
     let map = model.map();
-    let at = |role: Role, layer: Option<usize>| map.get(role, layer).expect("mapped");
+    let at = |role: Slot, layer: Option<usize>| map.get(role, layer).expect("mapped");
     // Quantized matrices stay as stored blocks.
-    let qkv = at(Role::DeltaQkv, Some(0));
+    let qkv = at(Slot::Layer(Wanted::DeltaQkv), Some(0));
     assert_eq!(qkv.device_bytes(), qkv.bytes);
     // Hyper-connection matrices are widened to half precision: 10240 x 320 elements.
     assert_eq!(
-        at(Role::HyperDown(super::tensors::Site::Attn), Some(0)).device_bytes(),
+        at(Slot::hyper(Site::Mixer, SiteTensor::Down), Some(0)).device_bytes(),
         10240 * 320 * 2
     );
     // The router is F32 as stored.
-    assert_eq!(at(Role::Router, Some(0)).device_bytes(), 2560 * 512 * 4);
+    assert_eq!(
+        at(Slot::Layer(Wanted::Router), Some(0)).device_bytes(),
+        2560 * 512 * 4
+    );
     // The embedding and the experts are not on the card.
-    assert_eq!(at(Role::Embedding, None).device_bytes(), 0);
-    assert_eq!(at(Role::ExpertGate, Some(0)).device_bytes(), 0);
+    assert_eq!(at(Slot::Global(Global::Embedding), None).device_bytes(), 0);
+    assert_eq!(
+        at(Slot::Layer(Wanted::ExpertGate), Some(0)).device_bytes(),
+        0
+    );
     let trunk = map.device_bytes();
     assert!(trunk > 2 * GIB && trunk < 6 * GIB, "trunk {trunk}");
 }
@@ -118,7 +133,10 @@ fn a_model_without_its_own_output_matrix_uses_the_embedding() {
         output: false,
         ..Spec::default()
     });
-    let head = model.map().get(Role::Head, None).expect("head");
+    let head = model
+        .map()
+        .get(Slot::Global(Global::Head), None)
+        .expect("head");
     assert_eq!(head.name, "token_embd.weight");
     assert_eq!(model.map().mapped(), model.map().total());
 }
@@ -758,4 +776,54 @@ fn real_file_extents_read_in_parallel_with_direct_io() {
         plan.threads,
         plan.chunk >> 10
     );
+}
+
+#[test]
+fn the_weight_map_names_each_recipe_role_and_gives_its_stored_type() {
+    let (_written, model) = open(&Spec::default());
+    let map = model.map();
+    // A DeltaNet layer holds the gated recurrence, no attention and no indexer.
+    assert_eq!(
+        map.layer(0, Wanted::DeltaQkv).as_deref(),
+        Some("blk.0.attn_qkv.weight")
+    );
+    assert_eq!(map.layer(0, Wanted::QProj), None);
+    assert_eq!(map.layer(0, Wanted::IndexProj), None);
+    // Every fourth layer is the QSA layer, with the indexer's two matrices.
+    assert_eq!(
+        map.layer(3, Wanted::QProj).as_deref(),
+        Some("blk.3.attn_q.weight")
+    );
+    assert!(map.layer(3, Wanted::IndexProj).is_some());
+    assert!(map.layer(3, Wanted::IndexKey).is_some());
+    assert_eq!(map.layer(3, Wanted::DeltaQkv), None);
+    // The hyper-connection sites carry the norm the plain model holds as a separate role.
+    assert_eq!(
+        map.layer(5, Wanted::Hyper(Site::Mixer, SiteTensor::Down))
+            .as_deref(),
+        Some("blk.5.hc_attn_down.weight")
+    );
+    assert_eq!(
+        map.layer(5, Wanted::Hyper(Site::Ffn, SiteTensor::Inject))
+            .as_deref(),
+        Some("blk.5.hc_ffn_inject.weight")
+    );
+    assert_eq!(map.layer(5, Wanted::AttnNorm), None);
+    // Only the layer that carries the per-layer embedding step has its tensors.
+    assert!(map.layer(1, Wanted::PleKey).is_some());
+    assert_eq!(map.layer(2, Wanted::PleKey), None);
+    // The stored type is the file's own, per layer and role.
+    let expert = model
+        .map()
+        .get(Slot::Layer(Wanted::ExpertGate), Some(2))
+        .expect("expert gate");
+    assert_eq!(map.storage(2, Wanted::ExpertGate), Some(expert.ty));
+    assert!(map.storage(2, Wanted::DeltaQkv).is_some());
+    assert_eq!(
+        map.global(Global::Embedding).as_deref(),
+        Some("token_embd.weight")
+    );
+    assert!(map.global(Global::NgramTable).is_some());
+    assert!(map.global(Global::HeadSite(SiteTensor::Norm)).is_some());
+    assert_eq!(map.global(Global::FinalNorm), None);
 }

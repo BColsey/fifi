@@ -49,11 +49,19 @@ fn layer_role(role: Role) -> Option<GgufRole> {
         Role::SharedUp => GgufRole::FfnUpShexp,
         Role::SharedDown => GgufRole::FfnDownShexp,
         Role::IndexProj
+        | Role::IndexKey
+        | Role::IndexQNorm
+        | Role::IndexKNorm
         | Role::DenseGate
         | Role::DenseUp
         | Role::DenseDown
-        | Role::MixerSite
-        | Role::FfnSite => return None,
+        | Role::Hyper(..)
+        | Role::PleKey
+        | Role::PleValue
+        | Role::PleNormKey
+        | Role::PleNormQuery
+        | Role::PleNormConv
+        | Role::PleConv => return None,
     })
 }
 
@@ -87,7 +95,7 @@ impl WeightMap for Qwen36GgufMap<'_> {
             Global::Embedding => GgufRole::TokenEmbd,
             Global::FinalNorm => GgufRole::OutputNorm,
             Global::Head => GgufRole::Output,
-            Global::HeadSite | Global::NgramTable => return None,
+            Global::HeadSite(_) | Global::NgramTable => return None,
         };
         self.named(role.tensor_name(None))
     }
@@ -100,7 +108,10 @@ impl WeightMap for Qwen36GgufMap<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::{recipe::Ffn, spec::AttentionKind};
+    use crate::family::{
+        recipe::{Ffn, Site, SiteTensor},
+        spec::AttentionKind,
+    };
     use std::collections::HashSet;
 
     /// Every role a visit of this kind reads.
@@ -181,7 +192,10 @@ mod tests {
         assert!(map.layer(0, Role::DeltaQkv).is_some());
         assert_eq!(map.layer(3, Role::DeltaQkv), None);
         assert_eq!(map.layer(0, Role::DenseUp), None);
-        assert_eq!(map.layer(0, Role::MixerSite), None);
+        assert_eq!(
+            map.layer(0, Role::Hyper(Site::Mixer, SiteTensor::Down)),
+            None
+        );
         assert_eq!(map.global(Global::NgramTable), None);
         assert_eq!(
             map.layer(3, Role::ExpertDown).as_deref(),

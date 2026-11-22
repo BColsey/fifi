@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use super::{
     GgufModel,
     ngram::GgufNgramRows,
-    tensors::{Convention, Mapped, Role, Site},
+    tensors::{Convention, Mapped, Slot},
 };
 use crate::{
     EngError,
@@ -36,6 +36,7 @@ use crate::{
             qsa::QsaWeights,
             step::{AttnWeights, FlashLayerWeights, ModelShape, ModelWeights},
         },
+        recipe::{Global, Role as Wanted, Site, SiteTensor},
     },
     weights::{GgufType, GgufWeights, dequantize, dequantize_into},
 };
@@ -134,7 +135,7 @@ impl HostWeight {
             parts,
             remap,
             experts,
-            ngram: entries[0].role == Role::NgramTable,
+            ngram: entries[0].role == Global::NgramTable.into(),
         }
     }
 }
@@ -392,7 +393,7 @@ impl HostModel {
         let vd = dims.value_dim as usize;
         let map = model.map();
         let weights = &model.weights;
-        let get = |role: Role, layer: Option<usize>| -> Result<&Mapped, EngError> {
+        let get = |role: Slot, layer: Option<usize>| -> Result<&Mapped, EngError> {
             map.get(role, layer)
                 .ok_or_else(|| refuse(format!("{role:?} of layer {layer:?} is not mapped")))
         };
@@ -403,13 +404,13 @@ impl HostModel {
             |role, layer| -> Result<Vec<f32>, EngError> { read_floats(weights, get(role, layer)?) };
         let hyper = |site: Site, layer: Option<usize>| -> Result<HHyper, EngError> {
             Ok(HHyper {
-                norm: floats(Role::HyperNorm(site), layer)?,
-                down: plain(Role::HyperDown(site), layer)?,
-                up: plain(Role::HyperUp(site), layer)?,
-                inject: if site == Site::Mixer {
+                norm: floats(Slot::hyper(site, SiteTensor::Norm), layer)?,
+                down: plain(Slot::hyper(site, SiteTensor::Down), layer)?,
+                up: plain(Slot::hyper(site, SiteTensor::Up), layer)?,
+                inject: if site == Site::Head {
                     None
                 } else {
-                    Some(plain(Role::HyperInject(site), layer)?)
+                    Some(plain(Slot::hyper(site, SiteTensor::Inject), layer)?)
                 },
             })
         };
@@ -418,18 +419,21 @@ impl HostModel {
             let at = Some(index);
             let attn = if attention {
                 HAttn::Qsa(HQsa {
-                    q: plain(Role::QsaQ, at)?,
-                    k: plain(Role::QsaK, at)?,
-                    v: plain(Role::QsaV, at)?,
-                    o: plain(Role::QsaO, at)?,
+                    q: plain(Wanted::QProj.into(), at)?,
+                    k: plain(Wanted::KProj.into(), at)?,
+                    v: plain(Wanted::VProj.into(), at)?,
+                    o: plain(Wanted::OProj.into(), at)?,
                     idx: HostWeight::new(
-                        &[get(Role::QsaIndexQ, at)?, get(Role::QsaIndexK, at)?],
+                        &[
+                            get(Wanted::IndexProj.into(), at)?,
+                            get(Wanted::IndexKey.into(), at)?,
+                        ],
                         Remap::None,
                     ),
-                    q_norm: floats(Role::QsaQNorm, at)?,
-                    k_norm: floats(Role::QsaKNorm, at)?,
-                    idx_q_norm: floats(Role::QsaIndexQNorm, at)?,
-                    idx_k_norm: floats(Role::QsaIndexKNorm, at)?,
+                    q_norm: floats(Wanted::QNorm.into(), at)?,
+                    k_norm: floats(Wanted::KNorm.into(), at)?,
+                    idx_q_norm: floats(Wanted::IndexQNorm.into(), at)?,
+                    idx_k_norm: floats(Wanted::IndexKNorm.into(), at)?,
                 })
             } else {
                 let key_width = (dims.key_heads * dims.key_dim) as usize;
@@ -439,7 +443,9 @@ impl HostModel {
                         &[get(role, at)?],
                         Remap::ValueOut {
                             skip,
-                            hd: if role == Role::DeltaBeta || role == Role::DeltaAlpha {
+                            hd: if role == Wanted::DeltaBeta.into()
+                                || role == Wanted::DeltaAlpha.into()
+                            {
                                 1
                             } else {
                                 vd
@@ -450,23 +456,23 @@ impl HostModel {
                     ))
                 };
                 let conv = untile(
-                    &floats(Role::DeltaConv, at)?,
+                    &floats(Wanted::DeltaConv.into(), at)?,
                     2 * key_width * ck,
                     vd * ck,
                     kh,
                     vh,
                 );
-                let a_log: Vec<f32> = floats(Role::DeltaDecay, at)?
+                let a_log: Vec<f32> = floats(Wanted::DeltaDecay.into(), at)?
                     .iter()
                     .map(|decay| (-decay).ln())
                     .collect();
                 HAttn::Delta(HDelta {
-                    qkv: tiled_rows(Role::DeltaQkv, 2 * key_width)?,
-                    z: tiled_rows(Role::DeltaZ, 0)?,
-                    b: tiled_rows(Role::DeltaBeta, 0)?,
-                    a: tiled_rows(Role::DeltaAlpha, 0)?,
+                    qkv: tiled_rows(Wanted::DeltaQkv.into(), 2 * key_width)?,
+                    z: tiled_rows(Wanted::DeltaGate.into(), 0)?,
+                    b: tiled_rows(Wanted::DeltaBeta.into(), 0)?,
+                    a: tiled_rows(Wanted::DeltaAlpha.into(), 0)?,
                     out: HostWeight::new(
-                        &[get(Role::DeltaOut, at)?],
+                        &[get(Wanted::DeltaOut.into(), at)?],
                         Remap::ValueIn {
                             hd: vd,
                             key_heads: kh,
@@ -475,45 +481,45 @@ impl HostModel {
                     ),
                     conv,
                     a_log: untile(&a_log, 0, 1, kh, vh),
-                    dt_bias: untile(&floats(Role::DeltaDtBias, at)?, 0, 1, kh, vh),
-                    norm: floats(Role::DeltaNorm, at)?,
+                    dt_bias: untile(&floats(Wanted::DeltaDtBias.into(), at)?, 0, 1, kh, vh),
+                    norm: floats(Wanted::DeltaNorm.into(), at)?,
                 })
             };
             out_layers.push(HLayer {
-                attn_hyper: hyper(Site::Attn, at)?,
+                attn_hyper: hyper(Site::Mixer, at)?,
                 attn,
-                mlp_hyper: hyper(Site::Mlp, at)?,
+                mlp_hyper: hyper(Site::Ffn, at)?,
                 moe: HMoe {
-                    router: floats(Role::Router, at)?,
-                    gate: plain(Role::ExpertGate, at)?,
-                    up: plain(Role::ExpertUp, at)?,
-                    down: plain(Role::ExpertDown, at)?,
-                    shared_gate: plain(Role::SharedGate, at)?,
-                    shared_up: plain(Role::SharedUp, at)?,
-                    shared_down: plain(Role::SharedDown, at)?,
-                    shared_scalar: plain(Role::SharedScalar, at)?,
+                    router: floats(Wanted::Router.into(), at)?,
+                    gate: plain(Wanted::ExpertGate.into(), at)?,
+                    up: plain(Wanted::ExpertUp.into(), at)?,
+                    down: plain(Wanted::ExpertDown.into(), at)?,
+                    shared_gate: plain(Wanted::SharedGate.into(), at)?,
+                    shared_up: plain(Wanted::SharedUp.into(), at)?,
+                    shared_down: plain(Wanted::SharedDown.into(), at)?,
+                    shared_scalar: plain(Wanted::SharedRouterGate.into(), at)?,
                 },
             });
         }
         let ple = Some(dims.ple_layer);
-        let table = get(Role::NgramTable, None)?;
+        let table = get(Global::NgramTable.into(), None)?;
         let hash = &config.hash;
         Ok(Self {
             shape: config.model_shape()?,
-            embed: plain(Role::Embedding, None)?,
-            lm_head: plain(Role::Head, None)?,
-            mixer: hyper(Site::Mixer, None)?,
+            embed: plain(Global::Embedding.into(), None)?,
+            lm_head: plain(Global::Head.into(), None)?,
+            mixer: hyper(Site::Head, None)?,
             layers: out_layers,
             ple_table: HostWeight::new(&[table], Remap::None),
             ple_rows: [table.dims[1]],
-            ple_key: plain(Role::PleKey, ple)?,
-            ple_value: plain(Role::PleValue, ple)?,
+            ple_key: plain(Wanted::PleKey.into(), ple)?,
+            ple_value: plain(Wanted::PleValue.into(), ple)?,
             ple_norms: [
-                floats(Role::PleNormKey, ple)?,
-                floats(Role::PleNormQuery, ple)?,
-                floats(Role::PleNormConv, ple)?,
+                floats(Wanted::PleNormKey.into(), ple)?,
+                floats(Wanted::PleNormQuery.into(), ple)?,
+                floats(Wanted::PleNormConv.into(), ple)?,
             ],
-            ple_conv: floats(Role::PleConv, ple)?,
+            ple_conv: floats(Wanted::PleConv.into(), ple)?,
             multipliers: hash.multipliers.clone(),
             vocab: hash.vocab.clone(),
             offsets: hash.offsets.clone(),

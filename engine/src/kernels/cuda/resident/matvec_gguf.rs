@@ -435,8 +435,20 @@ fn run_dense(
 ) -> DenseRun {
     let mut rng = testkit::Rng::new(seed);
     let w_bytes = random_blocks(ty, rows * (k / ty.block_size()), &mut rng, 0.0005, 0.01);
+    run_dense_on(ctx, stream, ty, (k, rows, ncols), w_bytes, &mut rng)
+}
+
+/// [`run_dense`] over the given weight bytes.
+fn run_dense_on(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    ty: QuantType,
+    (k, rows, ncols): (usize, usize, usize),
+    w_bytes: Vec<u8>,
+    rng: &mut testkit::Rng,
+) -> DenseRun {
     let w = testkit::upload_bytes(ctx, &w_bytes);
-    let x = quantize_rows(ctx, stream, &mut rng, k, ncols);
+    let x = quantize_rows(ctx, stream, rng, k, ncols);
     let y_bytes = rows * ncols * 4;
     let y = testkit::upload_filled(ctx, 0xAA, y_bytes);
     ctx.matvec_q(
@@ -537,6 +549,88 @@ fn gguf_dense_matvec_matches_the_cpu_reference() {
             shapes.len()
         );
     }
+}
+
+/// The tensors of the real Flash-Next pack, one per stored type and role, through the dense
+/// matvec against the oracle: the pack's bytes (not random blocks) at the shapes the model
+/// uses. Reads rows from the first, a middle and the last expert of a stack, so an offset or a
+/// layout difference of the file shows. Skips when the pack is not on this host
+/// (`FLASH_NEXT_GGUF_DIR` names a directory with its first shard).
+#[test]
+#[ignore = "device: needs the card and the Flash-Next GGUF pack"]
+fn gguf_matvec_matches_the_oracle_on_the_real_flash_next_pack() {
+    use crate::weights::{GgufLimits, GgufWeights};
+    if !testkit::device_present("gguf_matvec_matches_the_oracle_on_the_real_flash_next_pack") {
+        return;
+    }
+    let dir = std::env::var_os("FLASH_NEXT_GGUF_DIR").map(std::path::PathBuf::from);
+    let Some(first) = dir.and_then(|d| {
+        std::fs::read_dir(d)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with("-00001-of-00004.gguf"))
+    }) else {
+        eprintln!("FLASH_NEXT_GGUF_DIR names no Flash-Next pack: skipped");
+        return;
+    };
+    let pack = GgufWeights::open_any_type(
+        &first,
+        GgufLimits {
+            max_header_bytes: 1 << 30,
+            max_tensor_bytes: u64::MAX,
+        },
+        None,
+    )
+    .expect("open the pack");
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    // The first tensor of each (type, role) with at least two dimensions and a block-aligned k.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut checked = 0usize;
+    for tensor in pack.header().tensors() {
+        let dims = tensor.dims();
+        let role = tensor
+            .name()
+            .split('.')
+            .skip(2)
+            .collect::<Vec<_>>()
+            .join(".");
+        let Some(ty) = QuantType::from_gguf(tensor.ggml_type()) else {
+            continue;
+        };
+        if dims.len() < 2
+            || !(dims[0] as usize).is_multiple_of(ty.block_size())
+            || !block_ok(ty, dims[0] as usize)
+            || !seen.insert((tensor.ggml_type().id(), role.clone()))
+        {
+            continue;
+        }
+        let (k, rows) = (dims[0] as usize, dims[1] as usize);
+        let experts = dims.get(2).copied().unwrap_or(1) as usize;
+        let row_bytes = k / ty.block_size() * ty.block_bytes();
+        let take = rows.min(48);
+        let mut worst = 0.0f64;
+        for (i, expert) in [0, experts / 2, experts - 1].into_iter().enumerate() {
+            let offset = ((expert * rows + rows - take) * row_bytes) as u64;
+            let mut w_bytes = vec![0u8; take * row_bytes];
+            pack.read_range(tensor.name(), offset, &mut w_bytes)
+                .expect("read the pack rows");
+            let mut rng = testkit::Rng::new(0x9ac4_0000 + i as u64);
+            let run = run_dense_on(&ctx, &stream, ty, (k, take, 2), w_bytes, &mut rng);
+            worst = worst.max(check_dense(ty, tensor.ggml_type(), &run, k, take, 2));
+        }
+        println!(
+            "pack {} ({:?}, k {k}, {rows} rows x {experts}): max error over tolerance {worst:.3}",
+            tensor.name(),
+            tensor.ggml_type()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 6,
+        "the pack gave only {checked} (type, role) cases"
+    );
 }
 
 /// Column `j` of an `ncols` launch equals a one-column launch over the same bytes, bit for bit

@@ -26,63 +26,39 @@ use super::{
 };
 use crate::{
     EngError,
+    family::recipe::{Global, Role as Wanted, Site, SiteTensor},
     weights::{GgufHeader, GgufType},
 };
 
-/// Where one of the three hyper-connection sites sits.
+/// What a tensor of the file serves: a role of one layer, or a role outside the layers, named as
+/// the recipe names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in super::super::super) enum Site {
-    /// The final mixer that feeds the head (no inject projection).
-    Mixer,
-    /// Before the token mixer of a layer.
-    Attn,
-    /// Before the MoE block of a layer.
-    Mlp,
+pub(in super::super::super) enum Slot {
+    Layer(Wanted),
+    Global(Global),
 }
 
-/// What a tensor is for: one field of the executor's weight structures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in super::super::super) enum Role {
-    Embedding,
-    Head,
-    HyperNorm(Site),
-    HyperDown(Site),
-    HyperUp(Site),
-    HyperInject(Site),
-    DeltaQkv,
-    DeltaZ,
-    DeltaBeta,
-    DeltaAlpha,
-    DeltaOut,
-    DeltaConv,
-    DeltaDecay,
-    DeltaDtBias,
-    DeltaNorm,
-    QsaQ,
-    QsaK,
-    QsaV,
-    QsaO,
-    QsaIndexQ,
-    QsaIndexK,
-    QsaQNorm,
-    QsaKNorm,
-    QsaIndexQNorm,
-    QsaIndexKNorm,
-    Router,
-    SharedGate,
-    SharedUp,
-    SharedDown,
-    SharedScalar,
-    ExpertGate,
-    ExpertUp,
-    ExpertDown,
-    PleKey,
-    PleValue,
-    PleNormKey,
-    PleNormQuery,
-    PleNormConv,
-    PleConv,
-    NgramTable,
+impl Slot {
+    /// One tensor of a hyper-connection site: a site of a layer, or the final site that feeds
+    /// the head.
+    pub(in super::super::super) fn hyper(site: Site, part: SiteTensor) -> Self {
+        match site {
+            Site::Head => Self::Global(Global::HeadSite(part)),
+            Site::Mixer | Site::Ffn => Self::Layer(Wanted::Hyper(site, part)),
+        }
+    }
+}
+
+impl From<Wanted> for Slot {
+    fn from(role: Wanted) -> Self {
+        Self::Layer(role)
+    }
+}
+
+impl From<Global> for Slot {
+    fn from(role: Global) -> Self {
+        Self::Global(role)
+    }
 }
 
 /// Which memory a role's bytes serve.
@@ -127,7 +103,7 @@ pub(in super::super::super) enum Convention {
 /// One tensor of the file claimed by a role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in super::super::super) struct Mapped {
-    pub(in super::super::super) role: Role,
+    pub(in super::super::super) role: Slot,
     pub(in super::super::super) layer: Option<usize>,
     pub(in super::super::super) name: String,
     pub(in super::super::super) ty: GgufType,
@@ -176,7 +152,7 @@ enum Kind {
 }
 
 struct Expect {
-    role: Role,
+    role: Slot,
     layer: Option<usize>,
     names: Vec<String>,
     dims: Vec<u64>,
@@ -185,9 +161,9 @@ struct Expect {
 
 fn site_prefix(site: Site, layer: Option<usize>) -> String {
     match (site, layer) {
-        (Site::Mixer, _) => "output_hc".to_string(),
-        (Site::Attn, Some(layer)) => format!("blk.{layer}.hc_attn"),
-        (Site::Mlp, Some(layer)) => format!("blk.{layer}.hc_ffn"),
+        (Site::Head, _) => "output_hc".to_string(),
+        (Site::Mixer, Some(layer)) => format!("blk.{layer}.hc_attn"),
+        (Site::Ffn, Some(layer)) => format!("blk.{layer}.hc_ffn"),
         _ => unreachable!("a layer site has a layer"),
     }
 }
@@ -213,7 +189,7 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
     };
     let one = |name: &str| vec![name.to_string()];
     add(
-        Role::Embedding,
+        Slot::Global(Global::Embedding),
         None,
         one("token_embd.weight"),
         vec![hidden, d(dims.vocab)],
@@ -221,40 +197,40 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
     );
     // A model without its own output matrix reuses the embedding.
     add(
-        Role::Head,
+        Slot::Global(Global::Head),
         None,
         vec!["output.weight".into(), "token_embd.weight".into()],
         vec![hidden, d(dims.vocab)],
         Kind::Matrix,
     );
-    let hyper = |add: &mut dyn FnMut(Role, Option<usize>, Vec<String>, Vec<u64>, Kind),
+    let hyper = |add: &mut dyn FnMut(Slot, Option<usize>, Vec<String>, Vec<u64>, Kind),
                  site: Site,
                  layer: Option<usize>| {
         let prefix = site_prefix(site, layer);
         add(
-            Role::HyperNorm(site),
+            Slot::hyper(site, SiteTensor::Norm),
             layer,
             vec![format!("{prefix}_norm.weight")],
             vec![width],
             Kind::Vector,
         );
         add(
-            Role::HyperDown(site),
+            Slot::hyper(site, SiteTensor::Down),
             layer,
             vec![format!("{prefix}_down.weight")],
             vec![width, rank],
             Kind::Matrix,
         );
         add(
-            Role::HyperUp(site),
+            Slot::hyper(site, SiteTensor::Up),
             layer,
             vec![format!("{prefix}_up.weight")],
             vec![rank, width],
             Kind::Matrix,
         );
-        if site != Site::Mixer {
+        if site != Site::Head {
             add(
-                Role::HyperInject(site),
+                Slot::hyper(site, SiteTensor::Inject),
                 layer,
                 vec![format!("{prefix}_inject.weight")],
                 vec![width, branches],
@@ -262,7 +238,7 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
             );
         }
     };
-    hyper(&mut add, Site::Mixer, None);
+    hyper(&mut add, Site::Head, None);
     let key_width = d(dims.key_heads) * d(dims.key_dim);
     let value_width = d(dims.value_heads) * d(dims.value_dim);
     let conv_dim = 2 * key_width + value_width;
@@ -272,73 +248,73 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
     for (layer, &attention) in dims.kinds.iter().enumerate() {
         let at = Some(layer);
         let blk = |suffix: &str| vec![format!("blk.{layer}.{suffix}")];
-        hyper(&mut add, Site::Attn, at);
+        hyper(&mut add, Site::Mixer, at);
         if attention {
             add(
-                Role::QsaQ,
+                Slot::Layer(Wanted::QProj),
                 at,
                 blk("attn_q.weight"),
                 vec![hidden, 2 * q_width],
                 Kind::Matrix,
             );
             add(
-                Role::QsaK,
+                Slot::Layer(Wanted::KProj),
                 at,
                 blk("attn_k.weight"),
                 vec![hidden, kv_width],
                 Kind::Matrix,
             );
             add(
-                Role::QsaV,
+                Slot::Layer(Wanted::VProj),
                 at,
                 blk("attn_v.weight"),
                 vec![hidden, kv_width],
                 Kind::Matrix,
             );
             add(
-                Role::QsaO,
+                Slot::Layer(Wanted::OProj),
                 at,
                 blk("attn_output.weight"),
                 vec![q_width, hidden],
                 Kind::Matrix,
             );
             add(
-                Role::QsaIndexQ,
+                Slot::Layer(Wanted::IndexProj),
                 at,
                 blk("indexer.q_proj.weight"),
                 vec![hidden, d(dims.idx_heads) * d(dims.idx_dim)],
                 Kind::Matrix,
             );
             add(
-                Role::QsaIndexK,
+                Slot::Layer(Wanted::IndexKey),
                 at,
                 blk("indexer.k_proj.weight"),
                 vec![hidden, d(dims.idx_dim)],
                 Kind::Matrix,
             );
             add(
-                Role::QsaQNorm,
+                Slot::Layer(Wanted::QNorm),
                 at,
                 blk("attn_q_norm.weight"),
                 vec![d(dims.head_dim)],
                 Kind::Vector,
             );
             add(
-                Role::QsaKNorm,
+                Slot::Layer(Wanted::KNorm),
                 at,
                 blk("attn_k_norm.weight"),
                 vec![d(dims.head_dim)],
                 Kind::Vector,
             );
             add(
-                Role::QsaIndexQNorm,
+                Slot::Layer(Wanted::IndexQNorm),
                 at,
                 blk("indexer.q_norm.weight"),
                 vec![d(dims.idx_dim)],
                 Kind::Vector,
             );
             add(
-                Role::QsaIndexKNorm,
+                Slot::Layer(Wanted::IndexKNorm),
                 at,
                 blk("indexer.k_norm.weight"),
                 vec![d(dims.idx_dim)],
@@ -346,63 +322,63 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
             );
         } else {
             add(
-                Role::DeltaQkv,
+                Slot::Layer(Wanted::DeltaQkv),
                 at,
                 blk("attn_qkv.weight"),
                 vec![hidden, conv_dim],
                 Kind::Matrix,
             );
             add(
-                Role::DeltaZ,
+                Slot::Layer(Wanted::DeltaGate),
                 at,
                 blk("attn_gate.weight"),
                 vec![hidden, value_width],
                 Kind::Matrix,
             );
             add(
-                Role::DeltaBeta,
+                Slot::Layer(Wanted::DeltaBeta),
                 at,
                 blk("ssm_beta.weight"),
                 vec![hidden, d(dims.value_heads)],
                 Kind::Matrix,
             );
             add(
-                Role::DeltaAlpha,
+                Slot::Layer(Wanted::DeltaAlpha),
                 at,
                 blk("ssm_alpha.weight"),
                 vec![hidden, d(dims.value_heads)],
                 Kind::Matrix,
             );
             add(
-                Role::DeltaOut,
+                Slot::Layer(Wanted::DeltaOut),
                 at,
                 blk("ssm_out.weight"),
                 vec![value_width, hidden],
                 Kind::Matrix,
             );
             add(
-                Role::DeltaConv,
+                Slot::Layer(Wanted::DeltaConv),
                 at,
                 blk("ssm_conv1d.weight"),
                 vec![d(dims.conv_kernel), conv_dim],
                 Kind::Vector,
             );
             add(
-                Role::DeltaDecay,
+                Slot::Layer(Wanted::DeltaDecay),
                 at,
                 blk("ssm_a"),
                 vec![d(dims.value_heads)],
                 Kind::Vector,
             );
             add(
-                Role::DeltaDtBias,
+                Slot::Layer(Wanted::DeltaDtBias),
                 at,
                 blk("ssm_dt.bias"),
                 vec![d(dims.value_heads)],
                 Kind::Vector,
             );
             add(
-                Role::DeltaNorm,
+                Slot::Layer(Wanted::DeltaNorm),
                 at,
                 blk("ssm_norm.weight"),
                 vec![d(dims.value_dim)],
@@ -412,100 +388,100 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
         if layer == dims.ple_layer {
             let embed = d(dims.ple_embed);
             add(
-                Role::PleKey,
+                Slot::Layer(Wanted::PleKey),
                 at,
                 blk("ple_key.weight"),
                 vec![embed, width],
                 Kind::Matrix,
             );
             add(
-                Role::PleValue,
+                Slot::Layer(Wanted::PleValue),
                 at,
                 blk("ple_value.weight"),
                 vec![embed, hidden],
                 Kind::Matrix,
             );
             add(
-                Role::PleNormKey,
+                Slot::Layer(Wanted::PleNormKey),
                 at,
                 blk("ple_norm_key.weight"),
                 vec![width],
                 Kind::Vector,
             );
             add(
-                Role::PleNormQuery,
+                Slot::Layer(Wanted::PleNormQuery),
                 at,
                 blk("ple_norm_query.weight"),
                 vec![width],
                 Kind::Vector,
             );
             add(
-                Role::PleNormConv,
+                Slot::Layer(Wanted::PleNormConv),
                 at,
                 blk("ple_norm_conv.weight"),
                 vec![width],
                 Kind::Vector,
             );
             add(
-                Role::PleConv,
+                Slot::Layer(Wanted::PleConv),
                 at,
                 blk("ple_conv1d.weight"),
                 vec![d(dims.ple_conv), width],
                 Kind::Vector,
             );
         }
-        hyper(&mut add, Site::Mlp, at);
+        hyper(&mut add, Site::Ffn, at);
         add(
-            Role::Router,
+            Slot::Layer(Wanted::Router),
             at,
             blk("ffn_gate_inp.weight"),
             vec![hidden, experts],
             Kind::Vector,
         );
         add(
-            Role::SharedScalar,
+            Slot::Layer(Wanted::SharedRouterGate),
             at,
             blk("ffn_gate_inp_shexp.weight"),
             vec![hidden],
             Kind::Vector,
         );
         add(
-            Role::SharedGate,
+            Slot::Layer(Wanted::SharedGate),
             at,
             blk("ffn_gate_shexp.weight"),
             vec![hidden, shared],
             Kind::Matrix,
         );
         add(
-            Role::SharedUp,
+            Slot::Layer(Wanted::SharedUp),
             at,
             blk("ffn_up_shexp.weight"),
             vec![hidden, shared],
             Kind::Matrix,
         );
         add(
-            Role::SharedDown,
+            Slot::Layer(Wanted::SharedDown),
             at,
             blk("ffn_down_shexp.weight"),
             vec![shared, hidden],
             Kind::Matrix,
         );
         add(
-            Role::ExpertGate,
+            Slot::Layer(Wanted::ExpertGate),
             at,
             blk("ffn_gate_exps.weight"),
             vec![hidden, inter, experts],
             Kind::Matrix,
         );
         add(
-            Role::ExpertUp,
+            Slot::Layer(Wanted::ExpertUp),
             at,
             blk("ffn_up_exps.weight"),
             vec![hidden, inter, experts],
             Kind::Matrix,
         );
         add(
-            Role::ExpertDown,
+            Slot::Layer(Wanted::ExpertDown),
             at,
             blk("ffn_down_exps.weight"),
             vec![inter, hidden, experts],
@@ -513,7 +489,7 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
         );
     }
     add(
-        Role::NgramTable,
+        Slot::Global(Global::NgramTable),
         None,
         vec!["per_layer_token_embd.weight".into()],
         vec![d(dims.ple_head_dim), rows_needed],
@@ -523,51 +499,63 @@ fn expected(dims: &Dims, rows_needed: u64) -> Vec<Expect> {
 }
 
 /// The place, device form and value convention of a role.
-fn traits_of(role: Role) -> (Place, Form, Convention) {
+fn traits_of(role: Slot) -> (Place, Form, Convention) {
     use Convention::{AsStored, GammaOnePlusW};
     use Form::{Blocks, Decay, Float, Half, NormPlusOne};
     use Place::{Device, Experts, Host, Ngram};
     match role {
-        Role::Embedding => (Host, Form::None, AsStored),
-        Role::Head
-        | Role::DeltaQkv
-        | Role::DeltaZ
-        | Role::DeltaOut
-        | Role::QsaQ
-        | Role::QsaK
-        | Role::QsaV
-        | Role::QsaO
-        | Role::SharedGate
-        | Role::SharedUp
-        | Role::SharedDown
-        | Role::PleKey
-        | Role::PleValue => (Device, Blocks, AsStored),
-        Role::HyperDown(_) | Role::HyperUp(_) | Role::HyperInject(_) => (Device, Half, AsStored),
-        Role::QsaIndexQ | Role::QsaIndexK => (Device, Half, AsStored),
-        Role::HyperNorm(_) => (Device, Float, GammaOnePlusW),
-        Role::QsaIndexQNorm | Role::QsaIndexKNorm => (Device, Float, GammaOnePlusW),
-        Role::QsaQNorm | Role::QsaKNorm => (Device, NormPlusOne, GammaOnePlusW),
-        Role::DeltaDecay => (Device, Decay, AsStored),
-        Role::DeltaBeta
-        | Role::DeltaAlpha
-        | Role::DeltaConv
-        | Role::DeltaDtBias
-        | Role::DeltaNorm
-        | Role::Router
-        | Role::SharedScalar => (Device, Float, AsStored),
-        Role::PleNormKey | Role::PleNormQuery | Role::PleNormConv => {
-            (Host, Form::None, GammaOnePlusW)
+        Slot::Global(Global::Embedding) => (Host, Form::None, AsStored),
+        Slot::Global(Global::Head)
+        | Slot::Layer(Wanted::DeltaQkv)
+        | Slot::Layer(Wanted::DeltaGate)
+        | Slot::Layer(Wanted::DeltaOut)
+        | Slot::Layer(Wanted::QProj)
+        | Slot::Layer(Wanted::KProj)
+        | Slot::Layer(Wanted::VProj)
+        | Slot::Layer(Wanted::OProj)
+        | Slot::Layer(Wanted::SharedGate)
+        | Slot::Layer(Wanted::SharedUp)
+        | Slot::Layer(Wanted::SharedDown)
+        | Slot::Layer(Wanted::PleKey)
+        | Slot::Layer(Wanted::PleValue) => (Device, Blocks, AsStored),
+        Slot::Layer(Wanted::Hyper(_, SiteTensor::Down | SiteTensor::Up | SiteTensor::Inject))
+        | Slot::Global(Global::HeadSite(SiteTensor::Down | SiteTensor::Up)) => {
+            (Device, Half, AsStored)
         }
-        Role::PleConv => (Host, Form::None, AsStored),
-        Role::ExpertGate | Role::ExpertUp | Role::ExpertDown => (Experts, Form::None, AsStored),
-        Role::NgramTable => (Ngram, Form::None, AsStored),
+        Slot::Layer(Wanted::IndexProj) | Slot::Layer(Wanted::IndexKey) => (Device, Half, AsStored),
+        Slot::Layer(Wanted::Hyper(_, SiteTensor::Norm))
+        | Slot::Global(Global::HeadSite(SiteTensor::Norm)) => (Device, Float, GammaOnePlusW),
+        Slot::Layer(Wanted::IndexQNorm) | Slot::Layer(Wanted::IndexKNorm) => {
+            (Device, Float, GammaOnePlusW)
+        }
+        Slot::Layer(Wanted::QNorm) | Slot::Layer(Wanted::KNorm) => {
+            (Device, NormPlusOne, GammaOnePlusW)
+        }
+        Slot::Layer(Wanted::DeltaDecay) => (Device, Decay, AsStored),
+        Slot::Layer(Wanted::DeltaBeta)
+        | Slot::Layer(Wanted::DeltaAlpha)
+        | Slot::Layer(Wanted::DeltaConv)
+        | Slot::Layer(Wanted::DeltaDtBias)
+        | Slot::Layer(Wanted::DeltaNorm)
+        | Slot::Layer(Wanted::Router)
+        | Slot::Layer(Wanted::SharedRouterGate) => (Device, Float, AsStored),
+        Slot::Layer(Wanted::PleNormKey)
+        | Slot::Layer(Wanted::PleNormQuery)
+        | Slot::Layer(Wanted::PleNormConv) => (Host, Form::None, GammaOnePlusW),
+        Slot::Layer(Wanted::PleConv) => (Host, Form::None, AsStored),
+        Slot::Layer(Wanted::ExpertGate)
+        | Slot::Layer(Wanted::ExpertUp)
+        | Slot::Layer(Wanted::ExpertDown) => (Experts, Form::None, AsStored),
+        Slot::Global(Global::NgramTable) => (Ngram, Form::None, AsStored),
+        // The roles of other architectures: the file's inventory never lists them.
+        _ => unreachable!("no tensor of this role is expected"),
     }
 }
 
 /// One tensor of the inventory: what [`TensorMap::build`] looks for.
 #[cfg(test)]
 pub(super) struct InventoryItem {
-    pub(super) role: Role,
+    pub(super) role: Slot,
     pub(super) layer: Option<usize>,
     pub(super) name: String,
     pub(super) dims: Vec<u64>,
@@ -600,7 +588,6 @@ pub(in super::super::super) struct TensorMap {
     unmapped: Vec<String>,
     total: usize,
     mapped_names: usize,
-    experts: u64,
 }
 
 impl TensorMap {
@@ -625,7 +612,7 @@ impl TensorMap {
                 problems.push(format!("{} is missing", want.names[0]));
                 continue;
             };
-            let is_ngram = want.role == Role::NgramTable;
+            let is_ngram = want.role == Slot::Global(Global::NgramTable);
             // The n-gram table may hold more rows than the heads address.
             let dims_agree = if is_ngram {
                 tensor.dims().len() == 2
@@ -689,7 +676,6 @@ impl TensorMap {
             unmapped,
             total: header.tensors().len(),
             mapped_names: claimed.len(),
-            experts: u64::from(dims.experts),
         })
     }
 
@@ -714,7 +700,12 @@ impl TensorMap {
     }
 
     /// The entry of `role` in `layer` (`None` for roles outside the layers).
-    pub(in super::super::super) fn get(&self, role: Role, layer: Option<usize>) -> Option<&Mapped> {
+    pub(in super::super::super) fn get(
+        &self,
+        role: impl Into<Slot>,
+        layer: Option<usize>,
+    ) -> Option<&Mapped> {
+        let role = role.into();
         self.entries
             .iter()
             .find(|entry| entry.role == role && entry.layer == layer)
@@ -732,15 +723,6 @@ impl TensorMap {
     /// Device bytes of the resident trunk in the forms the executor holds it in.
     pub(in super::super::super) fn device_bytes(&self) -> u64 {
         self.entries.iter().map(Mapped::device_bytes).sum()
-    }
-
-    /// Bytes of one expert's three matrices in `layer`, as stored in the file.
-    pub(in super::super::super) fn expert_record_bytes(&self, layer: usize) -> u64 {
-        [Role::ExpertGate, Role::ExpertUp, Role::ExpertDown]
-            .into_iter()
-            .filter_map(|role| self.get(role, Some(layer)))
-            .map(|entry| entry.bytes / self.experts)
-            .sum()
     }
 
     /// The tensor types that matrices of the model have and `supported` does not accept,

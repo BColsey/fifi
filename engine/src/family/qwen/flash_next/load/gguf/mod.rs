@@ -32,17 +32,18 @@ pub(in super::super) mod start;
 pub(super) mod tensors;
 #[cfg(test)]
 mod testkit;
+mod weight_map;
 
 use std::path::Path;
 
 use self::{
     config::{ARCHITECTURE, GgufConfig},
     ngram::GgufNgramRows,
-    tensors::{KernelGap, Place, Role, TensorMap, has_decode_kernel},
+    tensors::{KernelGap, Place, TensorMap, has_decode_kernel},
 };
 use crate::{
     EngError,
-    family::gguf_select,
+    family::{gguf_select, recipe::Global},
     weights::{GgufLimits, GgufWeights, MetaValue},
 };
 
@@ -122,7 +123,7 @@ impl GgufModel {
     pub(in super::super) fn ngram(&self) -> Result<GgufNgramRows, EngError> {
         let table = self
             .map
-            .get(Role::NgramTable, None)
+            .get(Global::NgramTable, None)
             .ok_or_else(|| EngError::Checkpoint("Flash-Next GGUF: no n-gram table".into()))?;
         GgufNgramRows::open(&self.weights, table, self.config.hash.clone())
     }
