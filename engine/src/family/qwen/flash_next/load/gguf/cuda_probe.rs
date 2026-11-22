@@ -1463,12 +1463,36 @@ fn two_real_expert_slots_match_host() {
     let mut down_bytes = vec![0; 2 * hidden * 4];
     y_down.read_at(&stream, 0, &mut down_bytes).unwrap();
     let tensor = model.map().get(Role::ExpertDown, Some(0)).unwrap();
+    let host_input: Vec<f32> = (0..k).map(|i| if i % 5 < 2 { -1.0 } else { 1.0 }).collect();
+    let mut error_sq = 0.0f64;
+    let mut norm_sq = 0.0f64;
     for (rank, expert) in [257u64, 256].into_iter().enumerate() {
         let input: Vec<f32> = act_bytes[rank * n_ff * 4..(rank + 1) * n_ff * 4]
             .chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
             .collect();
         let max_abs = input.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
+        let host_projections: Vec<Vec<f32>> = [Role::ExpertGate, Role::ExpertUp]
+            .into_iter()
+            .map(|role| {
+                let t = model.map().get(role, Some(0)).unwrap();
+                let blocks = mapped_blocks(&model, t, Some(expert), 0..n_ff as u64).unwrap();
+                dequantize(t.ty, &blocks)
+                    .unwrap()
+                    .chunks_exact(k)
+                    .map(|row| row.iter().zip(&host_input).map(|(w, x)| w * x).sum())
+                    .collect()
+            })
+            .collect();
+        let host_activation: Vec<f32> = host_projections[0]
+            .iter()
+            .zip(&host_projections[1])
+            .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        let max_activation_delta = input
+            .iter()
+            .zip(&host_activation)
+            .fold(0.0f32, |max, (&a, &b)| max.max((a - b).abs()));
         let blocks = mapped_blocks(&model, tensor, Some(expert), 0..hidden as u64).unwrap();
         let weights = dequantize(tensor.ty, &blocks).unwrap();
         for (index, row) in weights.chunks_exact(n_ff).enumerate() {
@@ -1480,9 +1504,21 @@ fn two_real_expert_slots_match_host() {
                 (got - want).abs() <= tolerance,
                 "down after SwiGLU rank {rank} row {index}"
             );
+            let host_want: f32 = row.iter().zip(&host_activation).map(|(w, x)| w * x).sum();
+            let bound = tolerance + max_activation_delta * row.iter().map(|w| w.abs()).sum::<f32>();
+            assert!(
+                (got - host_want).abs() <= bound,
+                "independent expert rank {rank} row {index}"
+            );
+            error_sq += f64::from(got - host_want).powi(2);
+            norm_sq += f64::from(host_want).powi(2);
         }
     }
-    eprintln!("checked {hidden} down rows for two per-expert SwiGLU activations");
+    let relative_l2 = (error_sq / norm_sq).sqrt();
+    eprintln!(
+        "checked {hidden} down rows for two independent host expert MLPs; relative L2 {relative_l2}"
+    );
+    assert!(norm_sq > 0.0 && relative_l2 <= 0.05);
 }
 
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
