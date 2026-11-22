@@ -692,7 +692,12 @@ mod controller_tests {
         let step = DenseStep::new(&context, &plan).unwrap();
         assert_eq!(step.controller_capacity(hidden).unwrap(), 2);
         let bank = |seed: usize| {
-            [[rank, 2 * hidden], [hidden, rank], [hidden, rank]].map(|shape: [usize; 2]| Resident {
+            [
+                ([rank, 2 * hidden], seed),
+                ([hidden, rank], seed + 1),
+                ([hidden, rank], seed + 2),
+            ]
+            .map(|(shape, seed)| Resident {
                 codes: upload_tensor(
                     &context,
                     &(0..shape[0] * shape[1])
@@ -727,6 +732,7 @@ mod controller_tests {
             .iter()
             .map(|row| step.controller(&context, row.weights, row.input).unwrap())
             .collect();
+        assert!(expected.iter().all(|[gain, forget]| gain != forget));
         let actual = step
             .controller_rows(&context, &rows, [rank, hidden])
             .unwrap();
