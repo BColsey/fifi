@@ -346,6 +346,129 @@ fn the_ring_is_bit_identical_to_the_linear_plane_at_32k() {
     }
 }
 
+/// The four planes read back, as `(codes, scales)` bytes per plane.
+fn read_planes(rig: &Rig, planes: &Planes) -> [Vec<u8>; 4] {
+    [
+        testkit::read_bytes(&rig.ctx, &planes.k_codes, planes.k_codes.bytes()),
+        testkit::read_bytes(&rig.ctx, &planes.k_scales, planes.k_scales.bytes()),
+        testkit::read_bytes(&rig.ctx, &planes.v_codes, planes.v_codes.bytes()),
+        testkit::read_bytes(&rig.ctx, &planes.v_scales, planes.v_scales.bytes()),
+    ]
+}
+
+/// The append kernels alone: after `positions` rows written in chunks of `chunk` rows (so some
+/// chunks straddle the ring's end) and decode appends, cell `c` of every head of every ring plane
+/// holds the bytes of the newest position `p` with `p % ring == c` of the linear plane, and a
+/// cell no position reached is still zero.
+fn append_fills_ring_cells(g: &Geometry, positions: usize, chunk: usize) {
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rig = Rig { ctx, stream };
+    let decode_steps = 11usize;
+    let total = positions + decode_steps;
+    let linear = Planes::new(&rig.ctx, g, total);
+    let ring_cells = g.window + ROWS - 1;
+    let ring = Planes::new(&rig.ctx, g, ring_cells);
+    let mut rng = testkit::Rng::new(0xa99e_0000 + positions as u64 + chunk as u64);
+    let row = g.n_kv_head * g.head_dim;
+    let mut pos0 = 0;
+    while pos0 < positions {
+        let rows = chunk.min(positions - pos0);
+        let (k, v) = (
+            rows_f32(&mut rng, rows * row),
+            rows_f32(&mut rng, rows * row),
+        );
+        rig.append_chunk(g, &linear, &ring, &k, &v, pos0);
+        pos0 += rows;
+    }
+    for step in 0..decode_steps {
+        let (k, v) = (rows_f32(&mut rng, row), rows_f32(&mut rng, row));
+        rig.append_one(g, &linear, &ring, &k, &v, positions + step);
+    }
+    let (linear_bytes, ring_bytes) = (read_planes(&rig, &linear), read_planes(&rig, &ring));
+    let units = [
+        g.head_dim,
+        (g.head_dim / 32) * 2,
+        g.head_dim,
+        (g.head_dim / 32) * 2,
+    ];
+    for (plane, unit) in units.into_iter().enumerate() {
+        for head in 0..g.n_kv_head {
+            for cell in 0..ring_cells {
+                // The newest position that landed in this cell.
+                let newest = (0..total).rev().find(|p| p % ring_cells == cell);
+                let got = &ring_bytes[plane][(head * ring_cells + cell) * unit..][..unit];
+                match newest {
+                    Some(p) => assert_eq!(
+                        got,
+                        &linear_bytes[plane][(head * total + p) * unit..][..unit],
+                        "{} plane {plane} head {head} cell {cell} should hold position {p} ({positions} positions, chunk {chunk})",
+                        g.name
+                    ),
+                    None => assert!(
+                        got.iter().all(|b| *b == 0),
+                        "{} cell {cell} untouched",
+                        g.name
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_append_kernels_write_cell_position_mod_ring_across_the_wrap() {
+    if !testkit::device_present("kv8_append ring cells") {
+        return;
+    }
+    for g in &GEOMETRIES {
+        // Fewer positions than the ring (no wrap, some cells untouched), exactly the ring, and
+        // several wraps; the chunk widths straddle the ring's end at different offsets.
+        for (positions, chunk) in [
+            (g.window / 2, 7),
+            (g.window + ROWS - 1, ROWS),
+            (3 * g.window + 5, 1),
+            (3 * g.window + 5, 13),
+            (4 * g.window, ROWS),
+        ] {
+            append_fills_ring_cells(g, positions, chunk);
+        }
+    }
+}
+
+#[test]
+fn an_append_wider_than_the_ring_margin_is_refused_by_the_launch() {
+    if !testkit::device_present("kv8_append ring margin") {
+        return;
+    }
+    let g = &GEOMETRIES[0];
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rig = Rig { ctx, stream };
+    let ring_cells = g.window + 3 - 1;
+    let ring = Planes::new(&rig.ctx, g, ring_cells);
+    let row_bytes = g.n_kv_head * g.head_dim * 4;
+    let rows = ring_cells + 1;
+    let (k, v) = (
+        testkit::upload_f32(&rig.ctx, &vec![0.5; rows * g.n_kv_head * g.head_dim]),
+        testkit::upload_f32(&rig.ctx, &vec![0.5; rows * g.n_kv_head * g.head_dim]),
+    );
+    // More rows than the ring has cells would write one cell twice in one launch.
+    let refused = rig.ctx.kv8_chunk(
+        &rig.stream,
+        ring.shape(g, rows, ring_cells),
+        ring.data(
+            k.range(0, rows * row_bytes).unwrap(),
+            v.range(0, rows * row_bytes).unwrap(),
+        ),
+        0,
+    );
+    assert!(
+        refused.is_err(),
+        "rows beyond the ring's cells are a refusal"
+    );
+}
+
 #[test]
 fn the_ring_rule_is_window_plus_rows_minus_one_up_to_the_cells() {
     use crate::kernels::cuda::native::resident::attn_decode_gemma::ring_admitted;

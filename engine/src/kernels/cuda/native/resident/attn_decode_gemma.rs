@@ -166,7 +166,7 @@ pub(in crate::kernels::cuda) fn ring_admitted(
     m: usize,
     cells: usize,
 ) -> bool {
-    ring == 0 || (window > 0 && ring >= window + m - 1 && ring <= cells)
+    crate::family::kv_ring::ring_admits(ring, window, m, cells)
 }
 
 fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFailure> {

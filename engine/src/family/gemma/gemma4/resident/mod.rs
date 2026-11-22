@@ -167,14 +167,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
             k_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
             v_codes: zero(&ctx, n_kv * cells * head)?,
             v_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
-            shape: Kv8Shape {
-                rows: 1,
-                n_kv_head: n_kv,
-                head_dim: head,
-                cells,
-                code_scale: Kv8CodeScale::UnroundedF32,
-                ring: geometry.kernel_ring(CELLS),
-            },
+            shape: Kv8Shape::of_layer(geometry, CELLS, 1, n_kv, head, Kv8CodeScale::UnroundedF32),
         };
         layers.push(Layer {
             attn_norm: vector(&weights, &ctx, &format!("{base}attn_norm.weight"), HIDDEN)?,

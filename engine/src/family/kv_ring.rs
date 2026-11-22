@@ -8,6 +8,24 @@ use std::ops::Range;
 
 use super::spec::{AttentionKind, FamilySpec};
 
+/// The cells a sliding layer needs when it takes at most `rows` tokens in one append: the window
+/// plus the rows, less the one position both count. `None` if the sum overflows. This is the one
+/// formula of the ring size and of the admission check below.
+pub(crate) fn ring_cells(window: usize, rows: usize) -> Option<usize> {
+    window.checked_add(rows.max(1))?.checked_sub(1)
+}
+
+/// Whether a ring of `ring` cells over a plane of `cells` holds a window of `window` positions
+/// while `rows` are appended at once. Ring 0 is a linear plane and always fits. The attention
+/// kernels and the host share this rule.
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+pub(crate) fn ring_admits(ring: usize, window: usize, rows: usize, cells: usize) -> bool {
+    ring == 0
+        || (window > 0
+            && ring <= cells
+            && ring_cells(window, rows).is_some_and(|need| ring >= need))
+}
+
 /// The cache geometry of one layer kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KvRing {
@@ -45,7 +63,37 @@ impl KvRing {
         }
         Self {
             window,
-            ring: window + rows.max(1) - 1,
+            ring: ring_cells(window, rows).expect("a window and a row count that fit in memory"),
+        }
+    }
+
+    /// Whether one append of `rows` tokens keeps the whole window of every query readable. A
+    /// linear plane takes any count; a ring takes at most [`Self::widest_append`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Bolt append checks its chunk against the ring when bolt.rs takes the ring"
+        )
+    )]
+    pub(crate) fn admits(self, rows: usize) -> bool {
+        self.ring == 0 || ring_admits(self.ring, self.window, rows, self.ring)
+    }
+
+    /// The most tokens one append may write: the ring's cells beyond the window, plus one.
+    /// `usize::MAX` for a linear plane.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Bolt append splits its chunk at the ring margin when bolt.rs takes the ring"
+        )
+    )]
+    pub(crate) fn widest_append(self) -> usize {
+        if self.ring == 0 {
+            usize::MAX
+        } else {
+            self.ring - self.window + 1
         }
     }
 
@@ -207,6 +255,29 @@ mod tests {
         assert_eq!(KvRing::LINEAR.cells(30_464), 30_464);
         assert_eq!(KvRing::LINEAR.kernel_ring(30_464), 0);
         assert_eq!(KvRing::sliding(0, 16), KvRing::LINEAR);
+    }
+
+    #[test]
+    fn one_formula_sizes_the_ring_and_admits_the_append() {
+        // The ring a family builds is exactly the one its widest append needs.
+        let ring = KvRing::sliding(512, 8);
+        assert_eq!(ring.widest_append(), 8);
+        assert!(ring.admits(1) && ring.admits(8));
+        // A chunk one row wider than the margin is refused, never silently wrapped.
+        assert!(!ring.admits(9));
+        assert!(!ring.admits(1024));
+        assert_eq!(KvRing::LINEAR.widest_append(), usize::MAX);
+        assert!(KvRing::LINEAR.admits(1 << 20));
+        // The kernel-side rule is the same function: size, window and rows, up to the cells.
+        assert!(ring_admits(519, 512, 8, 519));
+        assert!(!ring_admits(518, 512, 8, 600));
+        assert!(!ring_admits(601, 512, 8, 600));
+        assert!(!ring_admits(600, 0, 1, 1000), "a ring needs a window");
+        // Sums that overflow are a refusal, not a wrap.
+        assert_eq!(ring_cells(usize::MAX, 2), None);
+        assert!(!ring_admits(usize::MAX, usize::MAX, usize::MAX, usize::MAX));
+        // 2^31 + 8 does not fit an int: the long-long form of the kernel check must refuse it too.
+        assert!(!ring_admits(1 << 20, (1 << 31) + 8, 1, 1 << 20));
     }
 
     #[test]

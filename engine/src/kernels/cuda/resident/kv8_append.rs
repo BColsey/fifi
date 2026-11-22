@@ -88,6 +88,27 @@ impl Kv8Shape {
         }
     }
 
+    /// The shape of one layer's plane for a context of `context` positions, from the layer's ring
+    /// geometry: the one place a ring's cells and kernel argument are derived. A layer whose
+    /// window covers the whole context is a linear plane.
+    pub(crate) fn of_layer(
+        geometry: crate::family::kv_ring::KvRing,
+        context: usize,
+        rows: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        code_scale: Kv8CodeScale,
+    ) -> Self {
+        Self {
+            rows,
+            n_kv_head,
+            head_dim,
+            cells: geometry.cells(context),
+            code_scale,
+            ring: geometry.kernel_ring(context),
+        }
+    }
+
     pub(crate) fn code_bytes(&self) -> usize {
         self.n_kv_head
             .saturating_mul(self.cells)

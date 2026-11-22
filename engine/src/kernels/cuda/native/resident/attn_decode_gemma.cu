@@ -348,7 +348,7 @@ static int gemma_check(const inference_cuda_attn_decode_gemma_args *args, bool e
     if (args->cells < 1 || args->window < 0 || args->window > args->cells)
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     if (args->ring < 0 || (args->ring > 0 && (args->window < 1 ||
-                                              args->ring < args->window + args->m - 1 ||
+                                              (long long)args->ring < (long long)args->window + args->m - 1 ||
                                               args->ring > args->cells)))
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     if (!(args->scale > -1e30f && args->scale < 1e30f))
