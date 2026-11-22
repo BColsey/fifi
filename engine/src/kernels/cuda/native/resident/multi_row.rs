@@ -109,6 +109,26 @@ struct AppendArgsRaw {
     head_dim: c_int,
     cells: c_int,
     code_scale: c_int,
+    ring: c_int,
+}
+
+#[repr(C)]
+struct GemmaArgsRaw {
+    q: *const c_void,
+    rows: *const c_void,
+    part: *mut c_void,
+    out: *mut c_void,
+    n: c_int,
+    n_q_head: c_int,
+    n_kv_head: c_int,
+    head_dim: c_int,
+    cells: c_int,
+    window: c_int,
+    split: c_int,
+    max_splits: c_int,
+    min_keys: c_int,
+    ring: c_int,
+    scale: f32,
 }
 
 #[repr(C)]
@@ -142,6 +162,10 @@ const _: () = assert!(
         && offset_of!(PrepArgsRaw, rope_base) == 88
         && size_of::<AppendArgsRaw>() == 48
         && offset_of!(AppendArgsRaw, n) == 24
+        && size_of::<GemmaArgsRaw>() == 80
+        && offset_of!(GemmaArgsRaw, n) == 32
+        && offset_of!(GemmaArgsRaw, scale) == 72
+        && offset_of!(AppendArgsRaw, ring) == 44
         && size_of::<DecodeArgsRaw>() == 88
         && offset_of!(DecodeArgsRaw, n) == 40
         && offset_of!(DecodeArgsRaw, scale) == 80
@@ -156,6 +180,8 @@ unsafe extern "C" {
     fn prep_raw(args: *const PrepArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_kv8_append_multi_launch"]
     fn append_raw(args: *const AppendArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_attn_decode_gemma_multi_launch"]
+    fn gemma_raw(args: *const GemmaArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_attn_decode_q8_multi_launch"]
     fn decode_raw(args: *const DecodeArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
 }
@@ -410,6 +436,7 @@ pub(in crate::kernels::cuda) struct AppendMultiRaw<'a> {
     pub(in crate::kernels::cuda) head_dim: usize,
     pub(in crate::kernels::cuda) cells: usize,
     pub(in crate::kernels::cuda) code_scale: u32,
+    pub(in crate::kernels::cuda) ring: usize,
 }
 
 pub(in crate::kernels::cuda) fn kv8_append_multi_launch(
@@ -432,6 +459,7 @@ pub(in crate::kernels::cuda) fn kv8_append_multi_launch(
         head_dim: int(call.head_dim)?,
         cells: int(call.cells)?,
         code_scale: c_int::try_from(call.code_scale).map_err(|_| invalid_argument())?,
+        ring: int(call.ring)?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: the `k` and `v` rows and the table are proved live, sized and aligned above (rows to
@@ -529,5 +557,84 @@ pub(in crate::kernels::cuda) fn attn_decode_q8_multi_launch(
     // the entry repeats the shape checks of the single-row entry; the plane and step addresses in
     // the table were proved by the safe layer; `args` and `stage` are live for the call.
     let status = unsafe { decode_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+pub(in crate::kernels::cuda) struct GemmaMultiRaw<'a> {
+    pub(in crate::kernels::cuda) q: RawRange<'a>,
+    pub(in crate::kernels::cuda) table: RawRange<'a>,
+    pub(in crate::kernels::cuda) part: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) out: RawRange<'a>,
+    pub(in crate::kernels::cuda) n: usize,
+    pub(in crate::kernels::cuda) heads: [usize; 2],
+    pub(in crate::kernels::cuda) head_dim: usize,
+    pub(in crate::kernels::cuda) cells: usize,
+    pub(in crate::kernels::cuda) window: usize,
+    pub(in crate::kernels::cuda) ring: usize,
+    pub(in crate::kernels::cuda) split: [usize; 2],
+    pub(in crate::kernels::cuda) scale: f32,
+}
+
+pub(in crate::kernels::cuda) fn attn_decode_gemma_multi_launch(
+    stream: &RawStream,
+    call: GemmaMultiRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let f = size_of::<f32>();
+    let [n_q_head, _] = call.heads;
+    let q_need = call.n * n_q_head * call.head_dim * f;
+    let part_need = match &call.part {
+        Some(_) => call
+            .n
+            .checked_mul(n_q_head)
+            .and_then(|v| v.checked_mul(call.split[0]))
+            .and_then(|v| v.checked_mul((2 + call.head_dim) * f))
+            .ok_or_else(invalid_argument)?,
+        None => 0,
+    };
+    let sized = table_ok(&call.table, call.n, KV_ROW_BYTES)
+        && fits(&call.q, q_need, 4)
+        && fits(&call.out, q_need, 4)
+        && call.part.as_ref().is_none_or(|p| fits(p, part_need, 16));
+    let out = Span::of(&call.out, q_need);
+    let mut reads = vec![
+        Span::of(&call.q, q_need),
+        Span::of(&call.table, call.n * KV_ROW_BYTES),
+    ];
+    let mut apart = true;
+    if let Some(part) = &call.part {
+        let span = Span::of(part, part_need);
+        apart = out.apart(&span);
+        reads.push(span);
+    }
+    apart = apart && reads.iter().all(|read| out.apart(read));
+    if !(sized && apart) {
+        return Err(invalid_argument());
+    }
+    let args = GemmaArgsRaw {
+        q: call.q.address().cast_const(),
+        rows: call.table.address().cast_const(),
+        part: call
+            .part
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |p| p.address()),
+        out: call.out.address(),
+        n: int(call.n)?,
+        n_q_head: int(n_q_head)?,
+        n_kv_head: int(call.heads[1])?,
+        head_dim: int(call.head_dim)?,
+        cells: int(call.cells)?,
+        window: int(call.window)?,
+        split: int(usize::from(call.part.is_some()))?,
+        max_splits: int(call.split[0])?,
+        min_keys: int(call.split[1])?,
+        ring: int(call.ring)?,
+        scale: call.scale,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: the ranges are proved live, sized and aligned above (`part` to 16, the table to 8,
+    // the rest to 4) with `out` apart from every other range; the entry repeats the shape rules of
+    // the single-row entry; the plane and step addresses in the table were proved by the safe
+    // layer; `args` and `stage` are live for the call.
+    let status = unsafe { gemma_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }

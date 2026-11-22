@@ -118,6 +118,7 @@ typedef struct inference_cuda_kv8_append_multi_args {
     int head_dim;         /* a multiple of 32, 32..1024 */
     int cells;
     int code_scale;       /* 1 = stored half, 2 = unrounded f32 */
+    int ring;             /* 0: cell = position; R > 0: cell = position % R, R <= cells */
 } inference_cuda_kv8_append_multi_args;
 int inference_cuda_kv8_append_multi_launch(const inference_cuda_kv8_append_multi_args *args,
                                            void *stream, int *out_stage);
@@ -144,6 +145,30 @@ typedef struct inference_cuda_attn_decode_q8_multi_args {
 } inference_cuda_attn_decode_q8_multi_args;
 int inference_cuda_attn_decode_q8_multi_launch(const inference_cuda_attn_decode_q8_multi_args *args,
                                                void *stream, int *out_stage);
+
+/* attn_decode_gemma for n rows of n sequences (Bolt: n_q_head 8, n_kv_head 2): row r sees the
+ * kv_len word of rows[r].step keys of its own planes; no output gate. The fields beyond rows are
+ * those of attn_decode_gemma.h with m = n; the split-K path (split != 0) takes `part` of
+ * inference_cuda_attn_decode_gemma_part_floats(n, ...) floats, 16-aligned. */
+typedef struct inference_cuda_attn_decode_gemma_multi_args {
+    const void *q;        /* f32 [n][n_q_head][head_dim] */
+    const inference_cuda_kv_row *rows;
+    void *part;           /* NULL when split == 0 */
+    void *out;            /* f32 [n][n_q_head][head_dim] */
+    int n;
+    int n_q_head;
+    int n_kv_head;
+    int head_dim;
+    int cells;
+    int window;
+    int split;
+    int max_splits;
+    int min_keys;
+    int ring;
+    float scale;
+} inference_cuda_attn_decode_gemma_multi_args;
+int inference_cuda_attn_decode_gemma_multi_launch(const inference_cuda_attn_decode_gemma_multi_args *args,
+                                                  void *stream, int *out_stage);
 
 #ifdef __cplusplus
 static_assert(sizeof(inference_cuda_kv_row) == 64, "inference_cuda_kv_row is 64 bytes");

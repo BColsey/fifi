@@ -51,7 +51,7 @@ struct Args {
     int m, n_kv_head, head_dim, cells;
     int code_scale;
     const inference_cuda_kv_row *rows;  // the many-rows entry: row t appends to rows[t]'s planes; else null
-    int ring;                   // 0: cell = position; R > 0: cell = position % R (never with rows)
+    int ring;                   // 0: cell = position; R > 0: cell = position % R (rows: each row's own position word)
 };
 
 // NaN-propagating max: `fmaxf` returns the other operand when one is NaN, so a group holding a
@@ -125,7 +125,8 @@ __global__ void kv8_append_k(Args a) {
         return;
     }
     const int groups = a.head_dim / kGroup;
-    const size_t cell = (size_t)(kMany ? base : (a.ring > 0 ? (base + t) % a.ring : base + t));
+    const size_t cell = (size_t)(kMany ? (a.ring > 0 ? base % a.ring : base)
+                                       : (a.ring > 0 ? (base + t) % a.ring : base + t));
     const size_t in_at = ((size_t)t * a.n_kv_head + kvh) * a.head_dim + d;
     const size_t code_at = (size_t)kvh * a.cells * a.head_dim + cell * a.head_dim + d;
     const size_t scale_at = (size_t)kvh * a.cells * groups + cell * groups + d / kGroup;
@@ -276,11 +277,11 @@ extern "C" int inference_cuda_kv8_append_multi_launch(const inference_cuda_kv8_a
             in->k == NULL || in->v == NULL || !aligned_to(in->k, 4) || !aligned_to(in->v, 4) ||
             in->n < 1 || in->n > INFERENCE_CUDA_MULTI_ROW_MAX ||
             !valid_geometry(1, in->n_kv_head, in->head_dim, in->cells) ||
-            !valid_code_scale(in->code_scale)) {
+            !valid_code_scale(in->code_scale) || !valid_ring(in->ring, 1, in->cells)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Args a = make_args(in->k, in->v, NULL, NULL, NULL, NULL, in->n, in->n_kv_head,
-                           in->head_dim, in->cells, in->code_scale, 0);
+                           in->head_dim, in->cells, in->code_scale, in->ring);
         a.rows = in->rows;
         const Failure failure = launch_many(a, (cudaStream_t)stream);
         report_stage(out_stage, failure.stage);

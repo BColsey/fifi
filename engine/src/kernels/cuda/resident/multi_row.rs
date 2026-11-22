@@ -33,11 +33,13 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::multi_row::{
-    AppendMultiRaw, ConvMultiRaw, DecodeMultiRaw, DeltaMultiRaw, KV_ROW_BYTES, KvRowRaw,
-    MULTI_ROW_MAX, PrepMultiRaw, STATE_ENTRY_BYTES, STEP_BYTES, attn_decode_q8_multi_launch,
-    attn_prep_multi_launch, gdn_conv_multi_launch, gdn_delta_multi_launch, kv8_append_multi_launch,
+    AppendMultiRaw, ConvMultiRaw, DecodeMultiRaw, DeltaMultiRaw, GemmaMultiRaw, KV_ROW_BYTES,
+    KvRowRaw, MULTI_ROW_MAX, PrepMultiRaw, STATE_ENTRY_BYTES, STEP_BYTES,
+    attn_decode_gemma_multi_launch, attn_decode_q8_multi_launch, attn_prep_multi_launch,
+    gdn_conv_multi_launch, gdn_delta_multi_launch, kv8_append_multi_launch,
 };
 use crate::kernels::cuda::resident::attn_decode::{AttnSpan, AttnSplit};
+use crate::kernels::cuda::resident::attn_decode_gemma::{AttnDecodeGemmaSplit, admit_gemma_heads};
 use crate::kernels::cuda::resident::attn_decode_q8::{AttnQ8Shape, GROUP, attn_q8_part_bytes};
 use crate::kernels::cuda::resident::attn_prep::{HEAD_DIM, RopeParams, check_rope};
 use crate::kernels::cuda::resident::gdn_conv::ConvShape;
@@ -164,6 +166,27 @@ impl CudaContext {
                 bytes.extend_from_slice(&word.to_le_bytes());
             }
         }
+        // Two rows never share a step block (its status word is written by each), and no step
+        // block shares a byte with any plane named by the table.
+        let steps: Vec<Claim<'_>> = rows
+            .iter()
+            .map(|row| Claim::of("step", &row.step, STEP_BYTES))
+            .collect();
+        for (i, step) in steps.iter().enumerate() {
+            for other in &steps[i + 1..] {
+                require_apart(step, other)?;
+            }
+            for row in rows {
+                for (name, plane) in [
+                    ("k_codes", &row.k_codes),
+                    ("k_scales", &row.k_scales),
+                    ("v_codes", &row.v_codes),
+                    ("v_scales", &row.v_scales),
+                ] {
+                    require_apart(step, &Claim::of(name, plane, plane.bytes()))?;
+                }
+            }
+        }
         Ok(KvRows {
             table: self.upload(&bytes)?,
             rows: rows.to_vec(),
@@ -194,6 +217,28 @@ fn check_planes(rows: &KvRows<'_>, shape: &Kv8Shape, write: bool) -> Result<(), 
     for (i, claim) in claims.iter().enumerate() {
         for other in &claims[i + 1..] {
             require_apart(claim, other)?;
+        }
+    }
+    Ok(())
+}
+
+/// `range` (`bytes` of it) shares no byte with the step block of any row, nor, when `planes` gives
+/// the byte counts `(codes, scales)` of a row's planes, with any plane of any row.
+fn apart_from_rows(
+    rows: &KvRows<'_>,
+    name: &'static str,
+    range: &DeviceRange<'_>,
+    bytes: usize,
+    planes: Option<(usize, usize)>,
+) -> Result<(), EngError> {
+    let claim = Claim::of(name, range, bytes);
+    for row in &rows.rows {
+        require_apart(&claim, &Claim::of("step", &row.step, STEP_BYTES))?;
+        if let Some((codes, scales)) = planes {
+            require_apart(&claim, &Claim::of("k_codes", &row.k_codes, codes))?;
+            require_apart(&claim, &Claim::of("v_codes", &row.v_codes, codes))?;
+            require_apart(&claim, &Claim::of("k_scales", &row.k_scales, scales))?;
+            require_apart(&claim, &Claim::of("v_scales", &row.v_scales, scales))?;
         }
     }
     Ok(())
@@ -256,6 +301,22 @@ pub(crate) struct DecodeMultiCall<'b> {
     pub(crate) proj: Option<DeviceRange<'b>>,
     pub(crate) rows: &'b KvRows<'b>,
     pub(crate) part: DeviceRange<'b>,
+    pub(crate) out: DeviceRange<'b>,
+}
+
+/// The Gemma decode attention (Bolt) of `rows.len()` rows: `q` and `out` are f32
+/// `[n][n_q_head][head_dim]`, no output gate. `ring` as in the single-row call.
+pub(crate) struct DecodeGemmaMultiCall<'b> {
+    pub(crate) n_q_head: usize,
+    pub(crate) n_kv_head: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) cells: usize,
+    pub(crate) window: usize,
+    pub(crate) ring: usize,
+    pub(crate) scale: f32,
+    pub(crate) q: DeviceRange<'b>,
+    pub(crate) rows: &'b KvRows<'b>,
+    pub(crate) split: Option<AttnDecodeGemmaSplit<'b>>,
     pub(crate) out: DeviceRange<'b>,
 }
 
@@ -425,6 +486,24 @@ impl CudaContext {
                 require_apart(write, other)?;
             }
         }
+        let planes = (
+            call.n_kv_head * call.cells * HEAD_DIM,
+            call.n_kv_head * call.cells * (HEAD_DIM / QUANT_GROUP) * 2,
+        );
+        for (name, range, bytes) in [
+            ("q", &call.q, q_bytes),
+            ("k_rows", &call.k_rows, kv_bytes),
+            ("v_rows", &call.v_rows, kv_bytes),
+        ] {
+            apart_from_rows(call.rows, name, range, bytes, Some(planes))?;
+        }
+        for (name, range, bytes) in [
+            ("proj", &call.proj, ((n - 1) * call.ld + row_w) * f),
+            ("q_norm", &call.q_norm, HEAD_DIM * f),
+            ("k_norm", &call.k_norm, HEAD_DIM * f),
+        ] {
+            apart_from_rows(call.rows, name, range, bytes, None)?;
+        }
         let raw = PrepMultiRaw {
             proj: self.raw_range(&call.proj)?,
             q_norm: self.raw_range(&call.q_norm)?,
@@ -462,7 +541,7 @@ impl CudaContext {
             && (32..=1024).contains(&shape.head_dim)
             && shape.head_dim.is_multiple_of(QUANT_GROUP)
             && (1..(1 << 30)).contains(&shape.cells)
-            && shape.ring == 0;
+            && (shape.ring == 0 || (1..=shape.cells).contains(&shape.ring));
         if !geometry_ok {
             return Err(rule(
                 "shape",
@@ -472,6 +551,9 @@ impl CudaContext {
         require_fit("k", &call.k, shape.row_bytes(), 4)?;
         require_fit("v", &call.v, shape.row_bytes(), 4)?;
         check_planes(call.rows, &shape, true)?;
+        let planes = Some((shape.code_bytes(), shape.scale_bytes()));
+        apart_from_rows(call.rows, "k", &call.k, shape.row_bytes(), planes)?;
+        apart_from_rows(call.rows, "v", &call.v, shape.row_bytes(), planes)?;
         let raw = AppendMultiRaw {
             k: self.raw_range(&call.k)?,
             v: self.raw_range(&call.v)?,
@@ -484,6 +566,7 @@ impl CudaContext {
                 Kv8CodeScale::StoredHalf => 1,
                 Kv8CodeScale::UnroundedF32 => 2,
             },
+            ring: shape.ring,
         };
         self.launch_on(stream, move |raw_stream| {
             kv8_append_multi_launch(raw_stream, raw)
@@ -559,6 +642,9 @@ impl CudaContext {
             require_apart(&out, &claim)?;
             require_apart(&part, &claim)?;
         }
+        let planes = Some((plane.code_bytes(), plane.scale_bytes()));
+        apart_from_rows(call.rows, "out", &call.out, n * width * f, planes)?;
+        apart_from_rows(call.rows, "part", &call.part, part_bytes, planes)?;
         let raw = DecodeMultiRaw {
             q: self.raw_range(&call.q)?,
             proj: call.proj.as_ref().map(|p| self.raw_range(p)).transpose()?,
@@ -576,6 +662,89 @@ impl CudaContext {
         };
         self.launch_on(stream, move |raw_stream| {
             attn_decode_q8_multi_launch(raw_stream, raw)
+        })
+    }
+}
+
+impl CudaContext {
+    /// The Gemma decode attention of each row of `call.rows`, on `stream`.
+    pub(crate) fn attn_decode_gemma_multi(
+        &self,
+        stream: &DeviceStream,
+        call: DecodeGemmaMultiCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let n = call.rows.len();
+        admit_gemma_heads(call.n_q_head, call.n_kv_head)?;
+        let shape_ok = (call.head_dim == 256 || call.head_dim == 512)
+            && call.cells >= 1
+            && call.cells < (1 << 30)
+            && call.window <= call.cells
+            && call.scale.is_finite()
+            && call.scale.abs() < 1e30;
+        let ring_ok = call.ring == 0
+            || (call.window >= 1 && call.ring >= call.window && call.ring <= call.cells);
+        if !(shape_ok && ring_ok) {
+            return Err(rule(
+                "shape",
+                "the geometry, window or ring is outside the limits",
+            ));
+        }
+        let f = size_of::<f32>();
+        let q_bytes = n * call.n_q_head * call.head_dim * f;
+        require_fit("q", &call.q, q_bytes, 4)?;
+        require_fit("out", &call.out, q_bytes, 4)?;
+        let plane = Kv8Shape {
+            rows: n,
+            n_kv_head: call.n_kv_head,
+            head_dim: call.head_dim,
+            cells: call.cells,
+            code_scale: Kv8CodeScale::StoredHalf,
+            ring: 0,
+        };
+        check_planes(call.rows, &plane, false)?;
+        let out = Claim::of("out", &call.out, q_bytes);
+        require_apart(&out, &Claim::of("q", &call.q, q_bytes))?;
+        let mut part_raw = None;
+        let mut split = [1, 8];
+        if let Some(plan) = &call.split {
+            if !(1..=128).contains(&plan.max_splits) || plan.min_keys < 8 {
+                return Err(rule(
+                    "split",
+                    "max_splits is 1 to 128 and min_keys at least 8",
+                ));
+            }
+            let part_bytes = n * call.n_q_head * plan.max_splits * (2 + call.head_dim) * f;
+            require_fit("part", &plan.part, part_bytes, 16)?;
+            let part = Claim::of("part", &plan.part, part_bytes);
+            require_apart(&out, &part)?;
+            require_apart(&part, &Claim::of("q", &call.q, q_bytes))?;
+            part_raw = Some(self.raw_range(&plan.part)?);
+            split = [plan.max_splits, plan.min_keys];
+        }
+        let planes = Some((plane.code_bytes(), plane.scale_bytes()));
+        apart_from_rows(call.rows, "out", &call.out, q_bytes, planes)?;
+        apart_from_rows(call.rows, "q", &call.q, q_bytes, None)?;
+        if let Some(plan) = &call.split {
+            let part_bytes = n * call.n_q_head * plan.max_splits * (2 + call.head_dim) * f;
+            apart_from_rows(call.rows, "part", &plan.part, part_bytes, planes)?;
+        }
+        let raw = GemmaMultiRaw {
+            q: self.raw_range(&call.q)?,
+            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            part: part_raw,
+            out: self.raw_range(&call.out)?,
+            n,
+            heads: [call.n_q_head, call.n_kv_head],
+            head_dim: call.head_dim,
+            cells: call.cells,
+            window: call.window,
+            ring: call.ring,
+            split,
+            scale: call.scale,
+        };
+        self.launch_on(stream, move |raw_stream| {
+            attn_decode_gemma_multi_launch(raw_stream, raw)
         })
     }
 }

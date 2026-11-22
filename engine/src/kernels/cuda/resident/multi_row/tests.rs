@@ -8,9 +8,13 @@
 //! of the same bytes. The timing test prints the kernel time at 1, 4 and 8 rows.
 
 use super::{
-    AppendMultiCall, ConvMultiCall, DecodeMultiCall, DeltaMultiCall, KvRow, PrepMultiCall,
+    AppendMultiCall, ConvMultiCall, DecodeGemmaMultiCall, DecodeMultiCall, DeltaMultiCall, KvRow,
+    PrepMultiCall,
 };
 use crate::kernels::cuda::resident::attn_decode::{AttnSpan, AttnSplit};
+use crate::kernels::cuda::resident::attn_decode_gemma::{
+    AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
+};
 use crate::kernels::cuda::resident::attn_decode_q8::{
     AttnDecodeQ8Call, AttnQ8Shape, attn_q8_part_bytes,
 };
@@ -684,6 +688,551 @@ fn decode_rows_with_a_window_and_a_ring_are_the_bytes_of_single_row_launches() {
             );
         }
     }
+}
+
+// ---- Bolt decode attention and the ring append -----------------------------------------------
+
+/// Rows of `head_dim` planes (Bolt: 2 kv heads, `CELLS` cells), random everywhere.
+fn gemma_row(rig: &Rig, rng: &mut Rng, head_dim: usize, kv_len: i32) -> RowBuffers {
+    let codes_bytes = N_KV * CELLS * head_dim;
+    let scales_bytes = N_KV * CELLS * (head_dim / 32) * 2;
+    let codes = |rng: &mut Rng| -> Vec<u8> {
+        (0..codes_bytes)
+            .map(|_| (rng.below(255) as i32 - 127) as i8 as u8)
+            .collect()
+    };
+    let scales = |rng: &mut Rng| -> Vec<u8> {
+        (0..scales_bytes / 2)
+            .flat_map(|_| testkit::f16_bits(0.004 + 0.03 * rng.unit() as f32).to_le_bytes())
+            .collect()
+    };
+    let mut step = StepParams::new(1, 0).expect("step").to_bytes().to_vec();
+    step[8..12].copy_from_slice(&kv_len.to_le_bytes());
+    RowBuffers {
+        k_codes: rig.up_bytes(&codes(rng)),
+        k_scales: rig.up_bytes(&scales(rng)),
+        v_codes: rig.up_bytes(&codes(rng)),
+        v_scales: rig.up_bytes(&scales(rng)),
+        step: rig.up_bytes(&step),
+    }
+}
+
+fn gemma_kv_row(buffers: &RowBuffers, head_dim: usize) -> KvRow<'_> {
+    KvRow {
+        k_codes: buffers.k_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+        k_scales: buffers
+            .k_scales
+            .range(0, N_KV * CELLS * (head_dim / 32) * 2)
+            .unwrap(),
+        v_codes: buffers.v_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+        v_scales: buffers
+            .v_scales
+            .range(0, N_KV * CELLS * (head_dim / 32) * 2)
+            .unwrap(),
+        step: buffers.step.range(0, STEP_BYTES).unwrap(),
+    }
+}
+
+/// (head_dim, window, ring, split as (max_splits, min_keys)).
+type GemmaCase = (usize, usize, usize, Option<(usize, usize)>);
+
+#[test]
+fn gemma_rows_in_one_launch_are_the_bytes_of_single_row_launches() {
+    if !testkit::device_present("attn_decode_gemma_multi against single-row calls") {
+        return;
+    }
+    let rig = Rig::new();
+    const N_Q: usize = 8;
+    let kv_lens = [1, 30, 99, 100, 101, 149, 150, 190];
+    let n = kv_lens.len();
+    let mut rng = Rng::new(0x6d52_0500);
+    // (head_dim, window, ring, split): local layers (256, window, ring), a global layer (512).
+    let cases: [GemmaCase; 7] = [
+        (256, 0, 0, None),
+        (256, 100, 0, None),
+        (256, 100, 150, None),
+        (256, 100, 150, Some((8, 16))),
+        (256, 0, 0, Some((8, 16))),
+        (512, 0, 0, None),
+        (512, 0, 0, Some((16, 8))),
+    ];
+    for (head_dim, window, ring, split) in cases {
+        let rows: Vec<RowBuffers> = kv_lens
+            .iter()
+            .map(|&len| gemma_row(&rig, &mut rng, head_dim, len))
+            .collect();
+        let q_row = N_Q * head_dim * 4;
+        let q = rig.up(&normal(&mut rng, n * N_Q * head_dim, 1.0));
+        let table = rig
+            .ctx
+            .kv_rows(
+                &rows
+                    .iter()
+                    .map(|r| gemma_kv_row(r, head_dim))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("table");
+        let part_floats = |m: usize, max_splits: usize| m * N_Q * max_splits * (2 + head_dim);
+        let part = rig.filled(SENTINEL, n * N_Q * 16 * (2 + head_dim) * 4);
+        let out = rig.filled(SENTINEL, n * q_row);
+        rig.ctx
+            .attn_decode_gemma_multi(
+                &rig.stream,
+                DecodeGemmaMultiCall {
+                    n_q_head: N_Q,
+                    n_kv_head: N_KV,
+                    head_dim,
+                    cells: CELLS,
+                    window,
+                    ring,
+                    scale: 1.0,
+                    q: q.range(0, n * q_row).unwrap(),
+                    rows: &table,
+                    split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
+                        part: part.range(0, part_floats(n, max_splits) * 4).unwrap(),
+                        max_splits,
+                        min_keys,
+                    }),
+                    out: out.range(0, n * q_row).unwrap(),
+                },
+            )
+            .expect("many rows");
+        let many = rig.read(&out, n * q_row);
+        for (r, row) in rows.iter().enumerate() {
+            let out1 = rig.filled(SENTINEL, q_row);
+            let part1 = rig.filled(SENTINEL, part_floats(1, 16) * 4);
+            let status = rig.filled(0, 4);
+            rig.ctx
+                .attn_decode_gemma(
+                    &rig.stream,
+                    AttnDecodeGemmaCall {
+                        out: out1.range(0, q_row).unwrap(),
+                        status: Some(status.range(0, 4).unwrap()),
+                        q: q.range(r * q_row, q_row).unwrap(),
+                        k_codes: row.k_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+                        k_scales: row
+                            .k_scales
+                            .range(0, N_KV * CELLS * (head_dim / 32) * 2)
+                            .unwrap(),
+                        v_codes: row.v_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+                        v_scales: row
+                            .v_scales
+                            .range(0, N_KV * CELLS * (head_dim / 32) * 2)
+                            .unwrap(),
+                        kv_len: row.step.range(8, 4).unwrap(),
+                        m: 1,
+                        n_q_head: N_Q,
+                        n_kv_head: N_KV,
+                        head_dim,
+                        cells: CELLS,
+                        window,
+                        ring,
+                        scale: 1.0,
+                        split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
+                            part: part1.range(0, part_floats(1, max_splits) * 4).unwrap(),
+                            max_splits,
+                            min_keys,
+                        }),
+                    },
+                )
+                .expect("single row");
+            assert_eq!(
+                rig.read(&out1, q_row),
+                many[r * q_row..(r + 1) * q_row],
+                "gemma out, head_dim {head_dim} window {window} ring {ring} split {split:?}, row {r}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ring_append_rows_are_the_bytes_of_single_row_launches() {
+    if !testkit::device_present("kv8_append_multi with a ring") {
+        return;
+    }
+    let rig = Rig::new();
+    let ring = 150;
+    let positions = [3, 149, 150, 151, 389, 1000, 0, 191];
+    let n = positions.len();
+    let mut rng = Rng::new(0x6d52_0501);
+    let rows: Vec<RowBytes> = positions
+        .iter()
+        .map(|&p| row_bytes(&mut rng, p, p + 1))
+        .collect();
+    let kv_row_bytes = N_KV * D * 4;
+    let k = rig.up(&normal(&mut rng, n * N_KV * D, 1.0));
+    let v = rig.up(&normal(&mut rng, n * N_KV * D, 1.0));
+    let many: Vec<RowBuffers> = rows.iter().map(|r| upload_row(&rig, r)).collect();
+    let table = rig
+        .ctx
+        .kv_rows(&many.iter().map(kv_row).collect::<Vec<_>>())
+        .expect("table");
+    let shape = Kv8Shape {
+        ring,
+        ..kv_shape(n)
+    };
+    rig.ctx
+        .kv8_append_multi(
+            &rig.stream,
+            AppendMultiCall {
+                shape,
+                k: k.range(0, n * kv_row_bytes).unwrap(),
+                v: v.range(0, n * kv_row_bytes).unwrap(),
+                rows: &table,
+            },
+        )
+        .expect("many rows");
+    let single: Vec<RowBuffers> = rows.iter().map(|r| upload_row(&rig, r)).collect();
+    for (r, row) in single.iter().enumerate() {
+        rig.ctx
+            .kv8_append(
+                &rig.stream,
+                Kv8Shape {
+                    ring,
+                    ..kv_shape(1)
+                },
+                Kv8Data {
+                    k: k.range(r * kv_row_bytes, kv_row_bytes).unwrap(),
+                    v: v.range(r * kv_row_bytes, kv_row_bytes).unwrap(),
+                    k_codes: row.k_codes.range(0, CODE_BYTES).unwrap(),
+                    k_scales: row.k_scales.range(0, SCALE_BYTES).unwrap(),
+                    v_codes: row.v_codes.range(0, CODE_BYTES).unwrap(),
+                    v_scales: row.v_scales.range(0, SCALE_BYTES).unwrap(),
+                },
+                row.step.range(4, 4).unwrap(),
+                row.step.range(16, 4).unwrap(),
+            )
+            .expect("single row");
+    }
+    assert_rows_equal(&rig, &many, &single, "ring append");
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn set_step(rig: &Rig, row: &RowBuffers, pos: i32) {
+    let mut step = StepParams::new(1, pos.max(0)).expect("step").to_bytes();
+    step[4..8].copy_from_slice(&pos.to_le_bytes());
+    step[8..12].copy_from_slice(&(pos + 1).to_le_bytes());
+    row.step
+        .write_at(&rig.stream, 0, &step)
+        .expect("step write");
+}
+
+fn zero_row(rig: &Rig) -> RowBuffers {
+    RowBuffers {
+        k_codes: rig.filled(0, CODE_BYTES),
+        k_scales: rig.filled(0, SCALE_BYTES),
+        v_codes: rig.filled(0, CODE_BYTES),
+        v_scales: rig.filled(0, SCALE_BYTES),
+        step: rig.filled(0, STEP_BYTES),
+    }
+}
+
+/// Bolt window layers: rows append one token per step and attend over a ring that wraps for real
+/// (positions run past the ring and past the cells), the position word driving append and decode.
+#[test]
+fn a_ring_wraps_in_the_rows_path_driven_by_append() {
+    if !testkit::device_present("ring wrap through append and decode, many rows") {
+        return;
+    }
+    let rig = Rig::new();
+    const N_Q: usize = 8;
+    let (window, ring) = (100, 150);
+    let starts = [0i32, 30, 90];
+    let n = starts.len();
+    let mut rng = Rng::new(0x6d52_0600);
+    let many: Vec<RowBuffers> = (0..n).map(|_| zero_row(&rig)).collect();
+    let single: Vec<RowBuffers> = (0..n).map(|_| zero_row(&rig)).collect();
+    let table = rig
+        .ctx
+        .kv_rows(&many.iter().map(kv_row).collect::<Vec<_>>())
+        .expect("table");
+    let kv_bytes = N_KV * D * 4;
+    let q_row = N_Q * D * 4;
+    let (k, v) = (rig.filled(0, n * kv_bytes), rig.filled(0, n * kv_bytes));
+    let q = rig.up(&normal(&mut rng, n * N_Q * D, 1.0));
+    let out = rig.filled(SENTINEL, n * q_row);
+    let shape = Kv8Shape {
+        ring,
+        ..kv_shape(n)
+    };
+    let mut wrapped = false;
+    for step in 0..200i32 {
+        let (kk, vv) = (
+            normal(&mut rng, n * N_KV * D, 1.0),
+            normal(&mut rng, n * N_KV * D, 1.0),
+        );
+        k.write_at(&rig.stream, 0, &f32_bytes(&kk)).unwrap();
+        v.write_at(&rig.stream, 0, &f32_bytes(&vv)).unwrap();
+        for r in 0..n {
+            set_step(&rig, &many[r], starts[r] + step);
+            set_step(&rig, &single[r], starts[r] + step);
+            wrapped |= starts[r] + step >= ring as i32 + 5;
+        }
+        rig.ctx
+            .kv8_append_multi(
+                &rig.stream,
+                AppendMultiCall {
+                    shape,
+                    k: k.range(0, n * kv_bytes).unwrap(),
+                    v: v.range(0, n * kv_bytes).unwrap(),
+                    rows: &table,
+                },
+            )
+            .expect("append many");
+        rig.ctx
+            .attn_decode_gemma_multi(
+                &rig.stream,
+                DecodeGemmaMultiCall {
+                    n_q_head: N_Q,
+                    n_kv_head: N_KV,
+                    head_dim: D,
+                    cells: CELLS,
+                    window,
+                    ring,
+                    scale: 1.0,
+                    q: q.range(0, n * q_row).unwrap(),
+                    rows: &table,
+                    split: None,
+                    out: out.range(0, n * q_row).unwrap(),
+                },
+            )
+            .expect("decode many");
+        let many_out = rig.read(&out, n * q_row);
+        for (r, row) in single.iter().enumerate() {
+            rig.ctx
+                .kv8_append(
+                    &rig.stream,
+                    Kv8Shape {
+                        ring,
+                        ..kv_shape(1)
+                    },
+                    Kv8Data {
+                        k: k.range(r * kv_bytes, kv_bytes).unwrap(),
+                        v: v.range(r * kv_bytes, kv_bytes).unwrap(),
+                        k_codes: row.k_codes.range(0, CODE_BYTES).unwrap(),
+                        k_scales: row.k_scales.range(0, SCALE_BYTES).unwrap(),
+                        v_codes: row.v_codes.range(0, CODE_BYTES).unwrap(),
+                        v_scales: row.v_scales.range(0, SCALE_BYTES).unwrap(),
+                    },
+                    row.step.range(4, 4).unwrap(),
+                    row.step.range(16, 4).unwrap(),
+                )
+                .expect("append single");
+            let out1 = rig.filled(SENTINEL, q_row);
+            rig.ctx
+                .attn_decode_gemma(
+                    &rig.stream,
+                    AttnDecodeGemmaCall {
+                        out: out1.range(0, q_row).unwrap(),
+                        status: None,
+                        q: q.range(r * q_row, q_row).unwrap(),
+                        k_codes: row.k_codes.range(0, CODE_BYTES).unwrap(),
+                        k_scales: row.k_scales.range(0, SCALE_BYTES).unwrap(),
+                        v_codes: row.v_codes.range(0, CODE_BYTES).unwrap(),
+                        v_scales: row.v_scales.range(0, SCALE_BYTES).unwrap(),
+                        kv_len: row.step.range(8, 4).unwrap(),
+                        m: 1,
+                        n_q_head: N_Q,
+                        n_kv_head: N_KV,
+                        head_dim: D,
+                        cells: CELLS,
+                        window,
+                        ring,
+                        scale: 1.0,
+                        split: None,
+                    },
+                )
+                .expect("decode single");
+            assert_eq!(
+                rig.read(&out1, q_row),
+                many_out[r * q_row..(r + 1) * q_row],
+                "ring decode, step {step}, row {r}"
+            );
+        }
+    }
+    assert!(wrapped, "the positions passed the ring");
+    assert_rows_equal(&rig, &many, &single, "ring planes after the wrap");
+}
+
+/// The attention entries at the row limit (256), and the table refusal one row past it.
+#[test]
+fn the_row_limit_is_256_and_257_is_refused() {
+    if !testkit::device_present("many rows at the row limit") {
+        return;
+    }
+    let rig = Rig::new();
+    let positions: Vec<i32> = (0..256).map(|r| (r * 7 + 3) % 190).collect();
+    chain_case(&rig, &positions, 0x6d52_0700);
+    conv_case(&rig, 256, 0x6d52_0701);
+    let mut rng = Rng::new(0x6d52_0702);
+    let rows: Vec<RowBuffers> = (0..257)
+        .map(|_| gemma_row(&rig, &mut rng, 256, 5))
+        .collect();
+    let records: Vec<KvRow<'_>> = rows.iter().map(|r| gemma_kv_row(r, 256)).collect();
+    assert!(rig.ctx.kv_rows(&records[..256]).is_ok());
+    let error = rig.ctx.kv_rows(&records).err().expect("257 rows");
+    assert!(format!("{error:?}").contains("rows"), "{error:?}");
+    let states: Vec<DeviceBuffer> = (0..257).map(|_| rig.filled(0, 64)).collect();
+    let ranges: Vec<_> = states.iter().map(|b| b.range(0, 64).unwrap()).collect();
+    assert!(rig.ctx.state_rows(&ranges).is_err());
+}
+
+/// The decode at head_dim 128 (the other instantiation of the q8 kernels).
+#[test]
+fn decode_rows_at_head_dim_128_are_the_bytes_of_single_row_launches() {
+    if !testkit::device_present("decode many rows at head_dim 128") {
+        return;
+    }
+    let rig = Rig::new();
+    let kv_lens = [1, 63, 64, 65, 130, 191, 192, 100];
+    let n = kv_lens.len();
+    let head_dim = 128;
+    let mut rng = Rng::new(0x6d52_0800);
+    let rows: Vec<RowBuffers> = kv_lens
+        .iter()
+        .map(|&len| gemma_row(&rig, &mut rng, head_dim, len))
+        .collect();
+    let q_row = N_HEAD * head_dim * 4;
+    let q = rig.up(&normal(&mut rng, n * N_HEAD * head_dim, 1.0));
+    let table = rig
+        .ctx
+        .kv_rows(
+            &rows
+                .iter()
+                .map(|r| gemma_kv_row(r, head_dim))
+                .collect::<Vec<_>>(),
+        )
+        .expect("table");
+    let split = AttnSplit::Q8;
+    let shape = |m| AttnQ8Shape {
+        m,
+        n_head: N_HEAD,
+        n_kv_head: N_KV,
+        head_dim,
+        cells: CELLS,
+        ld: 0,
+    };
+    let part_bytes = attn_q8_part_bytes(n, N_KV, head_dim, split.max_splits).unwrap();
+    let (part, out) = (
+        rig.filled(SENTINEL, part_bytes),
+        rig.filled(SENTINEL, n * q_row),
+    );
+    rig.ctx
+        .attn_decode_q8_multi(
+            &rig.stream,
+            DecodeMultiCall {
+                shape: shape(n),
+                span: AttnSpan::FULL,
+                split,
+                scale: 1.0 / 16.0,
+                q: q.range(0, n * q_row).unwrap(),
+                proj: None,
+                rows: &table,
+                part: part.range(0, part_bytes).unwrap(),
+                out: out.range(0, n * q_row).unwrap(),
+            },
+        )
+        .expect("many rows");
+    let many = rig.read(&out, n * q_row);
+    for (r, row) in rows.iter().enumerate() {
+        let part_1 = attn_q8_part_bytes(1, N_KV, head_dim, split.max_splits).unwrap();
+        let (part, out) = (rig.filled(SENTINEL, part_1), rig.filled(SENTINEL, q_row));
+        let (codes, scales) = (N_KV * CELLS * head_dim, N_KV * CELLS * (head_dim / 32) * 2);
+        rig.ctx
+            .attn_decode_q8(
+                &rig.stream,
+                AttnDecodeQ8Call {
+                    shape: shape(1),
+                    span: AttnSpan::FULL,
+                    split,
+                    scale: 1.0 / 16.0,
+                    q: q.range(r * q_row, q_row).unwrap(),
+                    proj: None,
+                    k_codes: row.k_codes.range(0, codes).unwrap(),
+                    k_scales: row.k_scales.range(0, scales).unwrap(),
+                    v_codes: row.v_codes.range(0, codes).unwrap(),
+                    v_scales: row.v_scales.range(0, scales).unwrap(),
+                    kv_len: row.step.range(8, 4).unwrap(),
+                    part: part.range(0, part_1).unwrap(),
+                    out: out.range(0, q_row).unwrap(),
+                },
+            )
+            .expect("single row");
+        assert_eq!(
+            rig.read(&out, q_row),
+            many[r * q_row..(r + 1) * q_row],
+            "head_dim 128 decode, row {r}"
+        );
+    }
+}
+
+/// A malformed table is refused when it is built, and a call whose planes do not hold the geometry
+/// or whose outputs overlap a plane or a step block is refused before any launch.
+#[test]
+fn a_malformed_kv_table_or_overlapping_output_is_refused() {
+    if !testkit::device_present("malformed kv rows") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x6d52_0900);
+    let text = |error: crate::EngError| format!("{error:?}");
+    let a = gemma_row(&rig, &mut rng, 256, 5);
+    let b = gemma_row(&rig, &mut rng, 256, 5);
+    // A step block of 16 bytes.
+    let mut short = gemma_kv_row(&a, 256);
+    short.step = a.step.range(0, 16).unwrap();
+    assert!(rig.ctx.kv_rows(&[short]).is_err(), "a short step block");
+    // A misaligned plane.
+    let mut skew = gemma_kv_row(&a, 256);
+    skew.k_codes = a.k_codes.range(1, 1024).unwrap();
+    assert!(rig.ctx.kv_rows(&[skew]).is_err(), "a misaligned plane");
+    // Two rows on one step block.
+    let mut shared = gemma_kv_row(&b, 256);
+    shared.step = a.step.range(0, STEP_BYTES).unwrap();
+    let error = rig
+        .ctx
+        .kv_rows(&[gemma_kv_row(&a, 256), shared])
+        .err()
+        .expect("shared step");
+    assert!(text(error).contains("overlap"));
+    // A step block inside a plane.
+    let mut inside = gemma_kv_row(&a, 256);
+    inside.step = a.k_codes.range(64, STEP_BYTES).unwrap();
+    assert!(
+        rig.ctx.kv_rows(&[inside]).is_err(),
+        "a step block in a plane"
+    );
+    // Planes too short for the geometry of the append.
+    let scales = N_KV * CELLS * 8 * 2;
+    let mut tight = gemma_kv_row(&a, 256);
+    tight.v_scales = a.v_scales.range(0, scales - 2).unwrap();
+    let table = rig.ctx.kv_rows(&[tight]).expect("the table itself is fine");
+    let (k, v) = (rig.filled(0, N_KV * 256 * 4), rig.filled(0, N_KV * 256 * 4));
+    let refused = rig.ctx.kv8_append_multi(
+        &rig.stream,
+        AppendMultiCall {
+            shape: kv_shape(1),
+            k: k.range(0, N_KV * 256 * 4).unwrap(),
+            v: v.range(0, N_KV * 256 * 4).unwrap(),
+            rows: &table,
+        },
+    );
+    assert!(text(refused.expect_err("short plane")).contains("v_scales"));
+    // An append input that is a plane of its row.
+    let table = rig.ctx.kv_rows(&[gemma_kv_row(&a, 256)]).expect("table");
+    let refused = rig.ctx.kv8_append_multi(
+        &rig.stream,
+        AppendMultiCall {
+            shape: kv_shape(1),
+            k: a.k_codes.range(0, N_KV * 256 * 4).unwrap(),
+            v: v.range(0, N_KV * 256 * 4).unwrap(),
+            rows: &table,
+        },
+    );
+    assert!(refused.is_err(), "k inside a plane");
 }
 
 // ---- refusals --------------------------------------------------------------------------------
