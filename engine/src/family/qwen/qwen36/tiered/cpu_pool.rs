@@ -279,12 +279,20 @@ impl Stall {
 
     /// A job answered: the window starts again.
     fn progress(&mut self) {
-        self.last = Instant::now();
+        self.progress_at(Instant::now());
+    }
+
+    fn progress_at(&mut self, now: Instant) {
+        self.last = now;
     }
 
     /// Time left before the watchdog fires; zero when it has.
     fn left(&self) -> Duration {
-        (self.last + self.window).saturating_duration_since(Instant::now())
+        self.left_at(Instant::now())
+    }
+
+    fn left_at(&self, now: Instant) -> Duration {
+        (self.last + self.window).saturating_duration_since(now)
     }
 
     /// Whole milliseconds since the last answer.
@@ -2060,32 +2068,32 @@ mod tests {
 
     #[test]
     fn a_source_that_keeps_answering_never_trips_the_watchdog() {
-        // Eight answers, 60 ms apart: 480 ms in all against a 150 ms window.
+        // Eight answers, 100 ms apart: 800 ms in all against a 600 ms window.
         let started = Instant::now();
-        let sum = paced_layer(8, Duration::from_millis(60), None)
-            .finish(Duration::from_millis(150))
+        let sum = paced_layer(8, Duration::from_millis(100), None)
+            .finish(Duration::from_millis(600))
             .expect("every answer renews the window");
-        assert!(started.elapsed() > Duration::from_millis(400));
+        assert!(started.elapsed() > Duration::from_millis(700));
         assert_eq!(sum, vec![8.0, 16.0]);
     }
 
     #[test]
     fn a_source_that_stops_answering_fails_after_the_window_by_name() {
-        // Two answers, then nothing for 900 ms against a 150 ms window.
+        // Two answers, then nothing for 2.5 s against a 400 ms window.
         let started = Instant::now();
         let err = paced_layer(
             5,
             Duration::from_millis(20),
-            Some((2, Duration::from_millis(900))),
+            Some((2, Duration::from_millis(2500))),
         )
-        .finish(Duration::from_millis(150))
+        .finish(Duration::from_millis(400))
         .unwrap_err();
         let PoolError::Timeout { waited_ms, pending } = err else {
             panic!("expected Timeout, got {err:?}")
         };
         assert_eq!(pending, 3);
-        assert!((140..600).contains(&waited_ms), "waited {waited_ms} ms");
-        assert!(started.elapsed() < Duration::from_millis(800));
+        assert!((390..1500).contains(&waited_ms), "waited {waited_ms} ms");
+        assert!(started.elapsed() < Duration::from_millis(2000));
     }
 
     #[test]
@@ -2095,9 +2103,9 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 for index in 0..6 {
-                    std::thread::sleep(Duration::from_millis(60));
+                    std::thread::sleep(Duration::from_millis(100));
                     if stall && index == 3 {
-                        std::thread::sleep(Duration::from_millis(900));
+                        std::thread::sleep(Duration::from_millis(2500));
                     }
                     if tx
                         .send(ChunkJobOutcome::Done(index, vec![(0, vec![1.0, 1.0])]))
@@ -2115,10 +2123,10 @@ mod tests {
             }
         };
         let out = chunk(false)
-            .finish(Duration::from_millis(150))
+            .finish(Duration::from_millis(600))
             .expect("a slow chunk that keeps answering");
         assert_eq!(out, vec![3.0, 3.0]);
-        let err = chunk(true).finish(Duration::from_millis(150)).unwrap_err();
+        let err = chunk(true).finish(Duration::from_millis(400)).unwrap_err();
         assert!(
             matches!(err, PoolError::Timeout { pending: 3, .. }),
             "{err:?}"
@@ -2127,14 +2135,20 @@ mod tests {
 
     #[test]
     fn the_watchdog_counts_from_the_last_answer() {
+        // Fabricated clock: no sleeping, so a loaded host cannot move it.
+        let start = Instant::now();
         let mut stall = super::Stall::new(Duration::from_millis(80));
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!stall.left().is_zero());
-        stall.progress();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!stall.left().is_zero(), "an answer renewed the window");
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(stall.left().is_zero());
-        assert!(stall.quiet_ms() >= 100);
+        stall.progress_at(start);
+        assert_eq!(
+            stall.left_at(start + Duration::from_millis(50)),
+            Duration::from_millis(30)
+        );
+        stall.progress_at(start + Duration::from_millis(50));
+        assert_eq!(
+            stall.left_at(start + Duration::from_millis(100)),
+            Duration::from_millis(30),
+            "an answer renewed the window"
+        );
+        assert!(stall.left_at(start + Duration::from_millis(131)).is_zero());
     }
 }
