@@ -70,6 +70,8 @@ Set `FIFI_INKLING_CUDA_PREFILL_ROWS` from 2 to 16 to group prompt tokens on the 
 
 Set `FIFI_INKLING_DSPARK_GROUPED_PREFILL=1` to capture target features during grouped prompt prefill on the same compatible CUDA backend as grouped verification. Set `FIFI_INKLING_CUDA_PREFILL_ROWS` above one to request a group width. The host memory planner admits the width, and the startup prefill report shows the admitted value. The prefill and verification switches can be enabled independently. Token-major feature capture is the default.
 
+Set `FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT=1` with `FIFI_INKLING_CUDA_RESIDENT_ATTENTION=1` to keep the attention result on CUDA through its resident output projection. The engine reads back the projected activation before the existing causal convolution. A projection without eligible resident weights uses the existing path.
+
 Set `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1` with `FIFI_INKLING_CUDA_GROUP_PROJECTIONS=1` to group resident Q, K, and V cross-pass controller projections in one transfer. Grouped prefill also batches those controllers across prompt rows when `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS=1` is set. Controllers with missing resident matrices use their existing fallback.
 
 Set `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT=1` to reduce the DSpark draft width after a rejection and restore it after fully accepted windows. Two consecutive windows accepting fewer than half their proposals switch that generation to one-token target decode. Each new request starts at the configured width, including a request that restores a saved prefix. The request log reports adaptive stand-down steps when they occur. The fixed DSpark width is the default.

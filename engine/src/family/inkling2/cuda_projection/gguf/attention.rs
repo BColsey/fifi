@@ -18,6 +18,7 @@ use crate::{
         resident::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
             relative_attention::{HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape},
+            step_params::POS_MAX,
         },
     },
 };
@@ -285,6 +286,10 @@ impl ResidentAttention {
         history: History<'_>,
         projection: Option<OutputProjection<'_>>,
     ) -> Result<Vec<f32>, EngError> {
+        let position = i32::try_from(history.position)
+            .ok()
+            .filter(|&position| position <= POS_MAX)
+            .ok_or_else(|| bad("CUDA relative attention position overflows"))?;
         let visit = self.visits[state_slot];
         let mut state = self.state.borrow_mut();
         // The kernel can publish a cache row even when its output or a
@@ -292,7 +297,7 @@ impl ResidentAttention {
         let device_cursor = state.next_position[state_slot].take();
         self.restore_rows(visit, &history, device_cursor, &mut state.encoded)?;
 
-        let ordered = row.encode(visit.shape, history.position, &mut state.encoded)?;
+        let ordered = row.encode(visit.shape, position, &mut state.encoded)?;
         let input_bytes = state.encoded.len();
         let attention_bytes = f32_bytes(row.query.len())?;
         let output_rows = projection.as_ref().map_or(row.query.len(), |p| p.rows);
@@ -429,7 +434,7 @@ impl Row<'_> {
     fn encode(
         &self,
         shape: RelativeAttentionShape,
-        position: usize,
+        position: i32,
         bytes: &mut Vec<u8>,
     ) -> Result<[usize; 8], EngError> {
         let slices = [
@@ -460,11 +465,7 @@ impl Row<'_> {
             extend_words(bytes, slice);
         }
         offsets[6] = bytes.len();
-        bytes.extend_from_slice(
-            &u32::try_from(position)
-                .map_err(|_| bad("CUDA relative attention position overflows"))?
-                .to_ne_bytes(),
-        );
+        bytes.extend_from_slice(&position.to_ne_bytes());
         offsets[7] = bytes.len();
         bytes.extend_from_slice(&0_u32.to_ne_bytes());
         Ok(offsets)
@@ -607,5 +608,11 @@ mod tests {
         run(5, 200.0, &[100.0, 6.0, 2.0], false).unwrap();
         assert_eq!(run(4, 8.0, &[6.0, 2.0, 40.0], true).unwrap(), [4.0, -2.0]);
         assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
+        assert!(
+            run(POS_MAX as usize + 1, 1.0, &[], true)
+                .unwrap_err()
+                .to_string()
+                .contains("position overflows")
+        );
     }
 }
