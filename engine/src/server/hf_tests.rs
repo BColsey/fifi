@@ -780,3 +780,206 @@ fn a_pack_estimate_counts_one_quantization_of_one_revision() {
     assert_eq!(shards["vram_bytes"], 30);
     assert_eq!(shards["planned"], false);
 }
+
+/// A GGUF file with no keys and no tensors, `length` bytes long: a header the planner can read.
+fn gguf_file(length: usize, fill: u8) -> Vec<u8> {
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.resize(length, fill);
+    bytes
+}
+
+fn fetch_with(
+    hub: &Arc<HfHub>,
+    quant: Option<&str>,
+    fit: &mut dyn FnMut(&Path) -> super::fetch_name::Fit,
+    accepts: &dyn Fn(&Path) -> Result<(), super::config::StartupError>,
+) -> Result<PathBuf, super::config::StartupError> {
+    super::fetch_name::fetch(
+        hub,
+        &super::fetch_name::Wanted {
+            repo: "org/m".to_string(),
+            quant: quant.map(str::to_string),
+        },
+        super::fetch_name::Planner { accepts, fit },
+        &mut |_| {},
+    )
+}
+
+#[test]
+fn a_name_fetches_only_the_files_of_the_quantization_asked_for() {
+    let q4 = gguf_file(300, 4);
+    let q8 = gguf_file(600, 8);
+    let mock = MockHub::start(vec![
+        file("README.md", b"readme"),
+        file("model-Q4_K_M.gguf", &q4),
+        file("model-Q8_0.gguf", &q8),
+        file("mmproj-M-F16.gguf", &gguf_file(90, 1)),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let path = fetch_with(
+        &hub,
+        Some("q8_0"),
+        &mut |_| super::fetch_name::Fit::Resident,
+        &|_| Ok(()),
+    )
+    .expect("fetched");
+    assert_eq!(path, snapshot(dir.path(), "org/m").join("model-Q8_0.gguf"));
+    assert_eq!(std::fs::read(&path).expect("file"), q8);
+    let blobs: Vec<String> = std::fs::read_dir(repo_cache_dir(dir.path(), "org/m").join("blobs"))
+        .expect("blobs")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        blobs,
+        vec![sha256_hex(&q8)],
+        "only the chosen quantization is stored"
+    );
+}
+
+#[test]
+fn without_a_label_the_planner_chooses_and_a_planner_stub_has_the_real_header_and_size() {
+    let q4 = gguf_file(300, 4);
+    let q8 = gguf_file(600, 8);
+    let mock = MockHub::start(vec![
+        file("model-Q4_K_M.gguf", &q4),
+        file("model-Q8_0.gguf", &q8),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let mut seen = Vec::new();
+    let path = fetch_with(
+        &hub,
+        None,
+        &mut |stub| {
+            let length = std::fs::metadata(stub).expect("stub").len();
+            assert_eq!(&std::fs::read(stub).expect("stub")[..4], b"GGUF");
+            seen.push(length);
+            if length <= 300 {
+                super::fetch_name::Fit::Resident
+            } else {
+                super::fetch_name::Fit::NotResident
+            }
+        },
+        &|_| Ok(()),
+    )
+    .expect("fetched");
+    // The planner saw the largest first, then the next, at each one's own size.
+    assert_eq!(seen, vec![600, 300]);
+    assert!(path.ends_with("model-Q4_K_M.gguf"), "{path:?}");
+    // The stubs are gone once the choice is made.
+    assert!(
+        !dir.path()
+            .join(format!(".fifi-plan-{}", std::process::id()))
+            .exists()
+    );
+}
+
+#[test]
+fn a_repo_the_engine_does_not_serve_is_refused_before_any_weight_is_downloaded() {
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| super::fetch_name::Fit::Resident,
+        &|_| {
+            Err(super::config::StartupError(
+                "no family serves the GGUF architecture mamba9".into(),
+            ))
+        },
+    )
+    .expect_err("refused");
+    assert!(error.0.contains("mamba9"), "{}", error.0);
+    assert!(
+        !repo_cache_dir(dir.path(), "org/m").join("blobs").exists(),
+        "nothing was stored"
+    );
+}
+
+#[test]
+fn a_disk_too_small_for_the_smallest_quantization_refuses_before_any_file_is_read() {
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), Some(100));
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| super::fetch_name::Fit::Resident,
+        &|_| Ok(()),
+    )
+    .expect_err("refused");
+    assert!(error.0.contains("free in"), "{}", error.0);
+    assert!(
+        mock.resolve_requests().is_empty(),
+        "{:?}",
+        mock.resolve_requests()
+    );
+}
+
+#[test]
+fn a_repo_with_no_gguf_and_a_label_it_lacks_are_refused_naming_what_it_holds() {
+    let mock = MockHub::start(vec![
+        file("model.safetensors", b"x"),
+        file("config.json", b"{}"),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| super::fetch_name::Fit::Resident,
+        &|_| Ok(()),
+    )
+    .expect_err("no gguf");
+    assert!(error.0.contains("holds no GGUF"), "{}", error.0);
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        Some("Q2_K"),
+        &mut |_| super::fetch_name::Fit::Resident,
+        &|_| Ok(()),
+    )
+    .expect_err("no such quantization");
+    assert!(error.0.contains("Q4_K_M"), "{}", error.0);
+}
+
+#[test]
+fn an_interrupted_download_resumes_from_its_partial_instead_of_starting_over() {
+    let content = payload(200, 7);
+    let mock = MockHub::start(vec![file("model-Q8_0.gguf", &content)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    // An earlier run died after 130 bytes: its partial is named by the file's hash.
+    let blobs = repo_cache_dir(dir.path(), "org/m").join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs");
+    std::fs::write(
+        blobs.join(format!("{}.incomplete", sha256_hex(&content))),
+        &content[..130],
+    )
+    .expect("partial");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let done = hub
+        .download_and_wait("org/m", "main", &|_| true, &mut |_| {})
+        .expect("resumed");
+    assert_eq!(
+        std::fs::read(done.join("model-Q8_0.gguf")).expect("file"),
+        content
+    );
+    let ranges: Vec<String> = mock
+        .resolve_requests()
+        .iter()
+        .filter_map(|line| line.split("range=").nth(1).map(str::to_string))
+        .collect();
+    assert_eq!(ranges, vec!["130-193".to_string(), "194-199".to_string()]);
+    assert!(
+        !blobs
+            .join(format!("{}.incomplete", sha256_hex(&content)))
+            .exists()
+    );
+}

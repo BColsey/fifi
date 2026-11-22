@@ -411,6 +411,11 @@ const CHUNK_RETRIES: usize = 2;
 /// file and fetches it again.
 const FILE_ATTEMPTS: usize = 3;
 
+/// The first read of a GGUF header: most headers (metadata and tensor table) are inside it; a
+/// longer one is read again with four times the length, up to the cap.
+const HEADER_PROBE_BYTES: u64 = 8 << 20;
+const HEADER_CAP_BYTES: u64 = 256 << 20;
+
 /// The directory the hub stores inside a repo that no client wants:
 /// xet bookkeeping, not model data.
 const SKIPPED_PREFIX: &str = ".cache/";
@@ -551,6 +556,16 @@ impl HfHub {
         {
             tap(line);
         }
+    }
+
+    /// The free bytes under the cache directory, as the downloads see them; `None` when unknown.
+    pub(crate) fn free_bytes(&self) -> Option<u64> {
+        (self.free_space)(&self.hub_dir)
+    }
+
+    /// The cache directory this bridge writes into.
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.hub_dir
     }
 
     /// The cached snapshot of one repo's `main` ref in this bridge's cache.
@@ -786,8 +801,23 @@ impl HfHub {
         repo: &str,
         revision: &str,
     ) -> Result<Arc<Job>, String> {
+        self.start_download_selected(repo, revision, &|_| true)
+    }
+
+    /// Like [`Self::start_download`], for the files of the revision that `select` keeps: the files
+    /// one serve loads, not the whole repo.
+    pub(crate) fn start_download_selected(
+        self: &Arc<Self>,
+        repo: &str,
+        revision: &str,
+        select: &dyn Fn(&HubFile) -> bool,
+    ) -> Result<Arc<Job>, String> {
         self.check_slots(repo, revision)?;
-        let tree = self.tree(repo, revision)?;
+        let mut tree = self.tree(repo, revision)?;
+        tree.files.retain(|file| select(file));
+        if tree.files.is_empty() {
+            return Err(format!("{repo} has no file that matches"));
+        }
         let repo_dir = repo_cache_dir(&self.hub_dir, repo);
         let snapshot_dir = repo_dir.join("snapshots").join(&tree.commit);
         let blobs_dir = repo_dir.join("blobs");
@@ -871,6 +901,72 @@ impl HfHub {
                     .saturating_sub(job.written.load(Ordering::Relaxed))
             })
             .sum()
+    }
+
+    /// The first bytes of one file of a commit that hold its complete GGUF header: a ranged read
+    /// of growing length until the header parses. The caller plans against the real header
+    /// without downloading the weights.
+    pub(crate) fn gguf_header_bytes(
+        &self,
+        repo: &str,
+        commit: &str,
+        file: &HubFile,
+    ) -> Result<Vec<u8>, String> {
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            self.endpoint,
+            repo,
+            commit,
+            urlencode_path(&file.path)
+        );
+        let mut length = HEADER_PROBE_BYTES.min(file.size);
+        loop {
+            let bytes = chunk_request(
+                &self.downloader,
+                self.token.as_deref(),
+                &url,
+                0,
+                length,
+                length == file.size,
+            )?;
+            if crate::weights::GgufHeader::from_bytes(&bytes, file.size, HEADER_CAP_BYTES).is_ok() {
+                return Ok(bytes);
+            }
+            if length >= file.size || length >= HEADER_CAP_BYTES {
+                return Err(format!("{} has no readable GGUF header", file.path));
+            }
+            length = (length * 4).min(file.size).min(HEADER_CAP_BYTES);
+        }
+    }
+
+    /// Runs one selected download to its end on the calling thread, handing the live state to
+    /// `progress` about once a second. Returns the snapshot directory when every selected file
+    /// is whole and linked; the cause when the job failed or was cancelled. An interrupted run
+    /// leaves resumable partials that the next call continues.
+    pub(crate) fn download_and_wait(
+        self: &Arc<Self>,
+        repo: &str,
+        revision: &str,
+        select: &dyn Fn(&HubFile) -> bool,
+        progress: &mut dyn FnMut(&JobState),
+    ) -> Result<PathBuf, String> {
+        let job = self.start_download_selected(repo, revision, select)?;
+        let mut last = std::time::Instant::now() - Duration::from_secs(2);
+        loop {
+            let state = job.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match state {
+                JobState::Downloading { .. } => {
+                    if last.elapsed() >= Duration::from_secs(1) {
+                        progress(&state);
+                        last = std::time::Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                JobState::Done { path, .. } => return Ok(path),
+                JobState::Cancelled => return Err("the download was cancelled".to_string()),
+                JobState::Failed(cause) => return Err(cause),
+            }
+        }
     }
 
     /// Asks a running job to stop; a finished job answers what it
@@ -1008,7 +1104,13 @@ impl HfHub {
         blobs_dir: &Path,
         bytes_before: u64,
     ) -> Result<String, String> {
-        let part = blobs_dir.join(format!(".{}.part", job.id));
+        // A file whose hash the hub states keeps its partial under that hash: a later run, in
+        // this process or another, continues it. A file with no stated hash restarts.
+        let resumable = file.sha256.is_some();
+        let part = match &file.sha256 {
+            Some(sha) => blobs_dir.join(format!("{sha}.incomplete")),
+            None => blobs_dir.join(format!(".{}.part", job.id)),
+        };
         let mut last = String::new();
         for _ in 0..FILE_ATTEMPTS {
             set_bytes(job, bytes_before, &file.path);
@@ -1037,7 +1139,9 @@ impl HfHub {
                     return Ok(hash);
                 }
                 Err(cause) => {
-                    let _ = std::fs::remove_file(&part);
+                    if !resumable {
+                        let _ = std::fs::remove_file(&part);
+                    }
                     if cause == CANCELLED {
                         return Err(cause);
                     }
@@ -1064,10 +1168,38 @@ impl HfHub {
             job.commit,
             urlencode_path(&file.path)
         );
-        let mut out = std::fs::File::create(part)
-            .map_err(|error| format!("cannot create {}: {error}", part.display()))?;
         let mut hasher = sha2::Sha256::new();
         let mut offset = 0_u64;
+        // Bytes an earlier pass left in a resumable partial are hashed again and kept; a partial
+        // longer than the file is not one of its prefixes and starts over.
+        let kept = if file.sha256.is_some() {
+            std::fs::metadata(part).map_or(0, |meta| meta.len())
+        } else {
+            0
+        };
+        let mut out = if kept > 0 && kept <= file.size {
+            let mut earlier = std::fs::File::open(part)
+                .map_err(|error| format!("cannot read {}: {error}", part.display()))?;
+            let mut buffer = vec![0_u8; 1 << 20];
+            loop {
+                let read = earlier
+                    .read(&mut buffer)
+                    .map_err(|error| format!("cannot read {}: {error}", part.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                offset += read as u64;
+            }
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(part)
+                .map_err(|error| format!("cannot append to {}: {error}", part.display()))?
+        } else {
+            std::fs::File::create(part)
+                .map_err(|error| format!("cannot create {}: {error}", part.display()))?
+        };
+        job.written.fetch_add(offset, Ordering::Relaxed);
         while offset < file.size {
             let length = self.chunk_bytes.min(file.size - offset);
             let mut tries = 0;

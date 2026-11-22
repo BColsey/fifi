@@ -15,6 +15,7 @@ mod error;
 mod fake;
 #[cfg(test)]
 mod family_registry_tests;
+mod fetch_name;
 #[cfg(test)]
 mod flint_tests;
 mod hf;

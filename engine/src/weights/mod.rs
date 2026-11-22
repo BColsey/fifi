@@ -66,9 +66,9 @@ pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };
 pub use gguf_identity::{TENSOR_SAMPLE, gguf_identity_digest};
-pub(crate) use gguf_split::shard_name_of;
 #[cfg(test)]
 pub(crate) use gguf_split::write_two_shard_set;
+pub(crate) use gguf_split::{ShardName, shard_name_of};
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
 pub use shard::{HeaderEntry, ShardHeader};
