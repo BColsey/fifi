@@ -1066,6 +1066,11 @@ impl Q36Executor {
         device_plan: Option<ExpertDevicePlan>,
     ) -> Result<(Self, Q36Session)> {
         admit(host.shape(), &rules)?;
+        // A compiled MoE start decodes a row with the product kernel a window of rows takes, alone
+        // or not, which is also its faster kernel on the 35B model; the dense family and a start
+        // without compiled blocks keep the one-row kernels, which are faster there (measured on
+        // the Mac). Set before anything traces, since compiled blocks keep the products they traced.
+        kernels.set_row_invariant_products(rules.compile && host.shape().dense_inter.is_none())?;
         kernels.set_program_limit(rules.compile_program_limit)?;
         let fixed_state_bytes = if rules.max_seqs > 1 {
             fixed_session_bytes(host.shape())?
@@ -2134,14 +2139,33 @@ mod tests {
     }
 
     #[test]
-    fn every_start_tiles_the_one_row_products_and_dropping_it_restores_the_kernels() {
+    fn only_a_compiled_moe_start_tiles_the_one_row_products() {
         let _serial = crate::native_test_lock();
-        let (single, _) = build(prefix_rules());
+        let (plain, _) = build(prefix_rules());
         assert!(
-            single.decoder.kernels.row_invariant_products(),
-            "a one-session start tiles its one-row products like a window does"
+            !plain.decoder.kernels.row_invariant_products(),
+            "a start without compiled blocks keeps the one-row kernels"
         );
-        drop(single);
+        drop(plain);
+        let ckpt = Box::leak(Box::new(tiny::checkpoint(&TINY_GQA)));
+        let host = HostWeights::load(ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap();
+        let compiled = Q36Rules {
+            compile: true,
+            max_seqs: 1,
+            session_cap: 1 << 30,
+            ..rules(vec![], VOCAB)
+        };
+        let (executor, _) =
+            Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host, compiled).unwrap();
+        assert!(
+            executor.decoder.kernels.row_invariant_products(),
+            "a compiled MoE start tiles its one-row products, windows or not"
+        );
+        // A context of the same thread that goes away leaves the running engine's kernels alone;
+        // the last one to go restores the ordinary kernels.
+        drop(MlxKernels::try_new().unwrap());
+        assert!(executor.decoder.kernels.row_invariant_products());
+        drop(executor);
         assert!(
             !MlxKernels::try_new().unwrap().row_invariant_products(),
             "the next context on the thread starts with the ordinary kernels"

@@ -10,6 +10,14 @@ use crate::{
 
 const STEPS: usize = 6;
 
+/// The kernels of a decoder that runs windows: its one-row products are tiled, as in an engine
+/// that can run several sessions.
+fn window_kernels() -> MlxKernels {
+    let mut kernels = MlxKernels::try_new().unwrap();
+    kernels.set_row_invariant_products(true).unwrap();
+    kernels
+}
+
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 struct RowObservation {
     batch: usize,
@@ -336,7 +344,7 @@ fn tiny_identity(compiled: bool) -> Vec<Agreement> {
     let host = HostWeights::load(&ckpt, &tiny::TINY_KV8, &tiny::config(&tiny::TINY_KV8)).unwrap();
     let boundary = super::super::kv_plan::KV_STEP;
     let mut decoder = ResidentDecoder::new_with_activation(
-        MlxKernels::try_new().unwrap(),
+        window_kernels(),
         &ckpt,
         host,
         u32::try_from(2 * boundary).unwrap(),
@@ -407,7 +415,7 @@ fn real_identity(compiled: bool) {
     )
     .unwrap();
     let mut decoder = ResidentDecoder::new_with_activation(
-        MlxKernels::try_new().unwrap(),
+        window_kernels(),
         &real.ckpt,
         host,
         512,
@@ -490,7 +498,7 @@ fn real_weights_first_layer_where_a_window_row_differs_from_solo() {
     )
     .unwrap();
     let mut decoder = ResidentDecoder::new_with_activation(
-        MlxKernels::try_new().unwrap(),
+        window_kernels(),
         &real.ckpt,
         host,
         512,
