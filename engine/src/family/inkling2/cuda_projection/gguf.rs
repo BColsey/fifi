@@ -71,7 +71,7 @@ type Projections = BTreeMap<String, (Resident, DenseDtype)>;
 
 type ControllerOutput = Option<[Vec<f32>; 2]>;
 
-pub(in crate::family::inkling2) use super::dense::ControlledAttentionInput;
+pub(in crate::family::inkling2) use super::dense::{ControlledAttentionInput, PrefillProjection};
 use super::dense::{LocalInputs, LocalProjection};
 
 pub(in crate::family::inkling2) struct LocalDecode<'a> {
@@ -781,6 +781,27 @@ impl GgufCuda {
             );
         }
         Ok(projected)
+    }
+
+    pub(in crate::family::inkling2) fn prefill_projection(
+        &self,
+        widths: [usize; 3],
+        requests: [Option<Projection<'_>>; 8],
+    ) -> Result<Option<PrefillProjection<'_>>, EngError> {
+        if !self.packed_gguf {
+            return Ok(None);
+        }
+        let Some(weights) = self.attention_group(widths, requests).transpose()? else {
+            return Ok(None);
+        };
+        if weights[..6].iter().any(Option::is_none) {
+            return Ok(None);
+        }
+        Ok(Some(PrefillProjection {
+            context: &self.context,
+            step: &self.step,
+            weights,
+        }))
     }
 
     pub(in crate::family::inkling2) fn plain_local_decode(

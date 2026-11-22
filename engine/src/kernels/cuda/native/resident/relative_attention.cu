@@ -102,9 +102,13 @@ __device__ void finish(const Args &a, const Rows &r, const Partials &p) {
         inference::attn_split_sum(active, expf(sink - peak), masses, sums, p.values + d,
                                   kHeadDim, sum, value);
         const int out = r.head * kHeadDim + d;
-        const float gate = 1.f / (1.f + expf(-a.gates[out]));
+        const float gate_logit = a.gates[out];
+        const float gate = 1.f / (1.f + expf(-gate_logit));
         const float result = (value / sum) * gate;
-        if (!isfinite(result)) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
+        // A resident gate can bypass host readback; sigmoid alone masks infinite logits.
+        if (!isfinite(result) || !isfinite(gate_logit) || (d == 0 && !isfinite(sink))) {
+            atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
+        }
         a.out[out] = result;
     }
 }

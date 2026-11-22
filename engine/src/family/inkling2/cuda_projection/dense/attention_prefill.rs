@@ -3,19 +3,79 @@
 use super::{
     DenseGemvCall, DenseGemvShape, DenseStep, ResidentProjection, Slot, bad, dense_gemv_bytes,
 };
-use crate::{EngError, kernels::cuda::CudaContext};
+use crate::{
+    EngError,
+    kernels::cuda::{CudaContext, DeviceRange},
+};
+
+const SIDE: [usize; 2] = [4, 5];
+
+pub(in crate::family::inkling2) struct PrefillProjection<'a> {
+    pub(in crate::family::inkling2::cuda_projection) context: &'a CudaContext,
+    pub(in crate::family::inkling2::cuda_projection) step: &'a DenseStep,
+    pub(in crate::family::inkling2::cuda_projection) weights: [Option<ResidentProjection<'a>>; 8],
+}
+
+impl PrefillProjection<'_> {
+    pub(in crate::family::inkling2) fn capacity(
+        &self,
+        input: [&[f32]; 3],
+    ) -> Result<usize, EngError> {
+        self.step
+            .projection_tile_capacity(&Layout::new(input, self.weights, &SIDE))
+    }
+
+    pub(in crate::family::inkling2) fn tile(
+        &self,
+        inputs: &[[&[f32]; 3]],
+    ) -> Result<(Vec<[Vec<f32>; 8]>, DeviceRange<'_>), EngError> {
+        let first = inputs
+            .first()
+            .ok_or_else(|| bad("empty Inkling prefill projection tile"))?;
+        let layout = Layout::new(*first, self.weights, &SIDE);
+        let (values, side) =
+            self.step
+                .project_group_tile(self.context, inputs, self.weights, &layout)?;
+        Ok((
+            layout.host_rows(&values).collect(),
+            side.ok_or_else(|| bad("missing Inkling attention sidecar"))?,
+        ))
+    }
+}
 
 struct Layout<const N: usize> {
     input: [usize; 3],
-    output: [usize; N],
+    host: [usize; N],
+    side: [usize; N],
 }
 
 impl<const N: usize> Layout<N> {
-    fn new(inputs: [&[f32]; 3], weights: [Option<ResidentProjection<'_>>; N]) -> Self {
+    fn new(
+        inputs: [&[f32]; 3],
+        weights: [Option<ResidentProjection<'_>>; N],
+        keep: &[usize],
+    ) -> Self {
+        let mut host = weights.map(|projection| projection.map_or(0, |p| p.weight.shape[0]));
+        let mut side = [0; N];
+        for &i in keep {
+            side[i] = std::mem::take(&mut host[i]);
+        }
         Self {
             input: inputs.map(<[f32]>::len),
-            output: weights.map(|projection| projection.map_or(0, |p| p.weight.shape[0])),
+            host,
+            side,
         }
+    }
+
+    fn host_rows<'a>(&'a self, values: &'a [f32]) -> impl Iterator<Item = [Vec<f32>; N]> + 'a {
+        values.chunks_exact(self.host.iter().sum()).map(|row| {
+            let mut offset = 0;
+            self.host.map(|width| {
+                let result = row[offset..offset + width].to_vec();
+                offset += width;
+                result
+            })
+        })
     }
 }
 
@@ -29,17 +89,43 @@ impl DenseStep {
         let Some(first) = inputs.first().filter(|_| inputs.len() > 1) else {
             return Ok(None);
         };
-        let layout = Layout::new(*first, weights);
-        let ld_x: usize = layout.input.iter().sum();
-        let ld_y: usize = layout.output.iter().sum();
-        let capacity = self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>();
-        let tile = capacity
-            .checked_div(ld_x + ld_y)
-            .unwrap_or(0)
-            .min(DenseGemvShape::MAX_ACTIVATION_ROWS);
-        if tile < 2 || ld_y == 0 {
+        let layout = Layout::new(*first, weights, &[]);
+        let tile = self.projection_tile_capacity(&layout)?;
+        if tile < 2 || layout.host.iter().all(|&n| n == 0) {
             return Ok(None);
         }
+        let mut rows = Vec::with_capacity(inputs.len());
+        for chunk in inputs.chunks(tile) {
+            let (values, _) = self.project_group_tile(context, chunk, weights, &layout)?;
+            rows.extend(layout.host_rows(&values));
+        }
+        Ok(Some(rows))
+    }
+
+    fn projection_tile_capacity<const N: usize>(
+        &self,
+        layout: &Layout<N>,
+    ) -> Result<usize, EngError> {
+        let capacity = self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>();
+        let per_row = layout
+            .input
+            .iter()
+            .chain(&layout.host)
+            .chain(&layout.side)
+            .sum();
+        Ok(capacity
+            .checked_div(per_row)
+            .unwrap_or(0)
+            .min(DenseGemvShape::MAX_ACTIVATION_ROWS))
+    }
+
+    fn project_group_tile<const N: usize>(
+        &self,
+        context: &CudaContext,
+        inputs: &[[&[f32]; 3]],
+        weights: [Option<ResidentProjection<'_>>; N],
+        layout: &Layout<N>,
+    ) -> Result<(Vec<f32>, Option<DeviceRange<'_>>), EngError> {
         if inputs
             .iter()
             .any(|row| row.map(<[f32]>::len) != layout.input)
@@ -50,39 +136,30 @@ impl DenseStep {
         {
             return Err(bad("batched CUDA attention projection input shape differs"));
         }
-
-        let mut rows = Vec::with_capacity(inputs.len());
-        for chunk in inputs.chunks(tile) {
-            let values = self.project_group_tile(context, chunk, weights, &layout)?;
-            for row in values.chunks_exact(ld_y) {
-                let mut offset = 0;
-                rows.push(layout.output.map(|width| {
-                    let result = row[offset..offset + width].to_vec();
-                    offset += width;
-                    result
-                }));
-            }
-        }
-        Ok(Some(rows))
-    }
-
-    fn project_group_tile<const N: usize>(
-        &self,
-        context: &CudaContext,
-        inputs: &[[&[f32]; 3]],
-        weights: [Option<ResidentProjection<'_>>; N],
-        layout: &Layout<N>,
-    ) -> Result<Vec<f32>, EngError> {
         let m = inputs.len();
         let ld_x: usize = layout.input.iter().sum();
-        let ld_y: usize = layout.output.iter().sum();
+        let ld_host: usize = layout.host.iter().sum();
+        let ld_side: usize = layout.side.iter().sum();
         let input_words = m * ld_x;
+        let side_at = input_words + m * ld_host;
         let input = self.range(Slot::Output, 0, input_words)?;
-        let output = self.range(Slot::Output, input_words, m * ld_y)?;
-        let mut output_offset = input_words;
+        let output = self.range(Slot::Output, input_words, m * ld_host)?;
+        let side = (ld_side > 0)
+            .then(|| self.range(Slot::Output, side_at, m * ld_side))
+            .transpose()?;
         let mut calls = Vec::with_capacity(N);
-        for p in weights.into_iter().flatten() {
+        for (i, p) in weights
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.map(|p| (i, p)))
+        {
             let [rows, cols] = p.weight.shape;
+            let (base, widths, ld_y) = if layout.side[i] > 0 {
+                (side_at, &layout.side, ld_side)
+            } else {
+                (input_words, &layout.host, ld_host)
+            };
+            let output_offset = base + widths[..i].iter().sum::<usize>();
             let shape = DenseGemvShape {
                 m,
                 rows,
@@ -99,12 +176,13 @@ impl DenseStep {
                 x: self.range(Slot::Output, input_offset, need.x / size_of::<f32>())?,
                 y: self.range(Slot::Output, output_offset, need.y / size_of::<f32>())?,
             });
-            output_offset += rows;
         }
         let input_rows: Vec<_> = inputs.iter().flatten().copied().collect();
-        self.run_rows(context, &self.stream, &input_rows, [input, output], || {
+        let values = self.run_rows(context, &self.stream, &input_rows, [input, output], || {
             context.dense_gemv_group(&self.stream, &calls)
-        })
+        })?;
+        // run_rows fenced the producer stream; attention may consume this range on its own stream.
+        Ok((values, side))
     }
 }
 

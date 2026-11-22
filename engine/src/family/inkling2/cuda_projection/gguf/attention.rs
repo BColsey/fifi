@@ -474,7 +474,7 @@ impl Row<'_> {
         bytes: &mut Vec<u8>,
     ) -> Result<[usize; 8], EngError> {
         bytes.clear();
-        let offsets = self.append_inputs(shape, position, bytes)?;
+        let offsets = self.append_inputs(shape, position, bytes, false)?;
         bytes.extend_from_slice(&0_u32.to_ne_bytes());
         Ok(offsets)
     }
@@ -484,6 +484,7 @@ impl Row<'_> {
         shape: RelativeAttentionShape,
         position: i32,
         bytes: &mut Vec<u8>,
+        device_side: bool,
     ) -> Result<[usize; 8], EngError> {
         let slices = [
             self.query,
@@ -500,8 +501,8 @@ impl Row<'_> {
             kv,
             kv,
             shape.query_heads * shape.relative_dims,
-            shape.query_heads,
-            q,
+            if device_side { 0 } else { shape.query_heads },
+            if device_side { 0 } else { q },
         ];
         if slices.each_ref().map(|slice| slice.len()) != sizes {
             return Err(bad("incorrect CUDA relative attention input shape"));
@@ -683,7 +684,7 @@ mod tests {
             .step_prefill(
                 &ctx,
                 0,
-                &rows,
+                (&rows, None),
                 History {
                     position: 4,
                     keys: &keys,
@@ -693,6 +694,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(actual, expected);
+
+        let side_bytes = 4 * (HEAD_DIM + 1) * size_of::<f32>();
+        let side = ctx.allocate(side_bytes).unwrap();
+        let side_in = side.range(0, side_bytes).unwrap();
+        let side_rows: [[f32; HEAD_DIM + 1]; 4] = std::array::from_fn(|r| {
+            std::array::from_fn(|i| (i * (r + 1) % 11) as f32 * 0.125 - 0.5)
+        });
+        let host_rows = std::array::from_fn::<_, 4, _>(|i| Row {
+            sinks: &side_rows[i][..1],
+            gates: &side_rows[i][1..],
+            ..rows[i]
+        });
+        let device_rows = rows.map(|row| Row {
+            sinks: &[],
+            gates: &[],
+            ..row
+        });
+        let batch = |rows, side| {
+            attention.invalidate();
+            attention.step_prefill(
+                &ctx,
+                0,
+                (rows, side),
+                History {
+                    position: 4,
+                    keys: &keys,
+                    values: &values,
+                },
+                Some(&projection),
+            )
+        };
+        let mut staged = Vec::new();
+        extend_words(&mut staged, side_rows.as_flattened());
+        side.write_at(&stream, 0, &staged).unwrap();
+        assert_eq!(
+            batch(&host_rows[..], None).unwrap(),
+            batch(&device_rows[..], Some(side_in)).unwrap()
+        );
+        assert!(batch(&device_rows[..3], Some(side_in)).is_err());
+        side.write_at(&stream, size_of::<f32>(), &f32::INFINITY.to_ne_bytes())
+            .unwrap();
+        assert!(batch(&device_rows[..], Some(side_in)).is_err());
         assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
         assert_eq!(
             run(POS_MAX as usize + 1, 1.0, &[], true),

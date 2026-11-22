@@ -13,6 +13,13 @@ pub(in crate::family::inkling2) fn enabled() -> bool {
     })
 }
 
+pub(in crate::family::inkling2) fn device_side_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FIFI_INKLING_CUDA_PREFILL_ATTENTION_SIDE").as_deref() == Ok("1")
+    })
+}
+
 pub(in crate::family::inkling2) fn host_reserve() -> u64 {
     if enabled() {
         (2 * ARENA_BYTES) as u64
@@ -105,13 +112,21 @@ impl ResidentAttention {
         &self,
         context: &CudaContext,
         slot: usize,
-        rows: &[Row<'_>],
+        (rows, side): (&[Row<'_>], Option<DeviceRange<'_>>),
         history: History<'_>,
         projection: Option<&OutputProjection<'_>>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let visit = self.visits[slot];
-        let layout = Layout::new(visit.shape, projection.map(|p| p.rows))
+        let mut layout = Layout::new(visit.shape, projection.map(|p| p.rows))
             .ok_or_else(|| bad("invalid CUDA relative attention batch layout"))?;
+        let sink_bytes = visit.shape.query_heads * size_of::<f32>();
+        let side_bytes = sink_bytes + layout.attention;
+        if let Some(side) = side {
+            if rows.len().checked_mul(side_bytes) != Some(side.bytes()) {
+                return Err(bad("incorrect CUDA attention sidecar extent"));
+            }
+            layout.input -= side_bytes;
+        }
         let count = rows.len();
         let position = history.position;
         if count == 0
@@ -133,6 +148,7 @@ impl ResidentAttention {
                 visit.shape,
                 (position + i) as i32,
                 &mut work.encoded,
+                side.is_some(),
             )?);
         }
         self.invalidate_local_aux(slot);
@@ -146,7 +162,8 @@ impl ResidentAttention {
             cursor.filter(|&cursor| cursor <= position),
             &mut state.encoded,
         )?;
-        let result = self.execute_prefill(context, visit, layout, work, &offsets, projection)?;
+        let result =
+            self.execute_prefill(context, visit, layout, work, (&offsets, side), projection)?;
         state.next_position[slot] = Some(position + count);
         static USED: std::sync::Once = std::sync::Once::new();
         USED.call_once(|| eprintln!("Inkling CUDA used batched relative attention"));
@@ -159,7 +176,7 @@ impl ResidentAttention {
         visit: Visit,
         layout: Layout,
         work: &mut Workspace,
-        offsets: &[[usize; 8]],
+        (offsets, side): (&[[usize; 8]], Option<DeviceRange<'_>>),
         projection: Option<&OutputProjection<'_>>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let count = offsets.len();
@@ -181,6 +198,19 @@ impl ResidentAttention {
                 work.device.range(0, out_at)?,
             )?;
             for (i, &[q, k, v, rel, sinks, gates, pos, end]) in offsets.iter().enumerate() {
+                let (sink_in, gate_in) = if let Some(side) = side {
+                    let sink_bytes = visit.shape.query_heads * size_of::<f32>();
+                    let at = side.offset() + i * (sink_bytes + layout.attention);
+                    (
+                        side.buffer().range(at, sink_bytes)?,
+                        side.buffer().range(at + sink_bytes, layout.attention)?,
+                    )
+                } else {
+                    (
+                        work.device.range(sinks, gates - sinks)?,
+                        work.device.range(gates, pos - gates)?,
+                    )
+                };
                 context.relative_attention(
                     &self.stream,
                     RelativeAttentionCall {
@@ -189,8 +219,8 @@ impl ResidentAttention {
                         k: work.device.range(k, v - k)?,
                         v: work.device.range(v, rel - v)?,
                         relative: work.device.range(rel, sinks - rel)?,
-                        sinks: work.device.range(sinks, gates - sinks)?,
-                        gates: work.device.range(gates, pos - gates)?,
+                        sinks: sink_in,
+                        gates: gate_in,
                         pos: work.device.range(pos, end - pos)?,
                         status: work.device.range(status_at + 4 * i, 4)?,
                         out: work

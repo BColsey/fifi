@@ -864,6 +864,17 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn prefill_projection(
+        &self,
+        widths: [usize; 3],
+        requests: [Option<Projection<'_>>; 8],
+    ) -> Result<Option<super::cuda_projection::gguf::PrefillProjection<'_>>, EngError> {
+        self.cuda
+            .as_ref()
+            .map_or(Ok(None), |cuda| cuda.prefill_projection(widths, requests))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn controller(
         &self,
         names: [&str; 3],

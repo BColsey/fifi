@@ -21,6 +21,7 @@ use crate::{
 use super::{Resident, bad};
 
 mod attention_prefill;
+pub(in crate::family::inkling2) use attention_prefill::PrefillProjection;
 mod controlled_attention;
 mod controlled_mlp;
 mod controller_prefill;

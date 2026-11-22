@@ -283,7 +283,8 @@ impl CpuForward {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let prefix = format!("{layer}.mlp");
-        let mut projected = self.prompt_attention_inputs(visit, &layer, rows, weights)?;
+        let mut attention_inputs = self.prompt_attention_inputs(visit, &layer, rows)?;
+        let mut projected = None;
         let router = format!("{prefix}.gate.weight");
         let batch_router = weights.batch_prefill_router(physical as u32, &router);
         // Without the resident batched router, preserve the interleave between
@@ -309,20 +310,46 @@ impl CpuForward {
             && crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled()
             && weights.resident_attention().is_some()
         {
-            projected.take().map_or(Ok(None), |projected| {
-                self.prompt_attention_residuals(
-                    visit,
-                    &layer,
-                    state,
-                    rows,
-                    projected,
-                    controller.is_some(),
-                )
-                .map(Some)
-            })?
+            if let Some((inputs, batched_controllers)) = attention_inputs.take() {
+                let outputs = match self.attention_prefill_bridge(&layer, visit, state, &inputs)? {
+                    Some(outputs) => Some(outputs),
+                    None => self
+                        .project_prompt_attention(
+                            weights,
+                            &layer,
+                            visit,
+                            &inputs,
+                            batched_controllers,
+                        )?
+                        .map(|p| self.attention_prefill_batch(&layer, visit, state, p))
+                        .transpose()?,
+                };
+                outputs
+                    .map(|outputs| {
+                        self.prompt_attention_residuals(
+                            visit,
+                            &layer,
+                            rows,
+                            outputs,
+                            controller.is_some(),
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            }
         } else {
             None
         };
+        if let Some((inputs, batched_controllers)) = attention_inputs {
+            projected = self.project_prompt_attention(
+                weights,
+                &layer,
+                visit,
+                &inputs,
+                batched_controllers,
+            )?;
+        }
         let mut projected = projected.into_iter().flatten();
         let inputs = rows.iter_mut().map(|row| {
             row.taps.capture(visit.state_slot, row.stream.current());
@@ -380,9 +407,8 @@ impl CpuForward {
         &self,
         visit: LayerVisit,
         layer: &str,
-        state: &mut VisitState,
         rows: &mut [PromptRow<'_>],
-        projected: Vec<super::super::cpu_attention::AttentionProjection>,
+        outputs: Vec<Vec<f32>>,
         control_batched: bool,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let physical = visit.weight_layer;
@@ -393,7 +419,6 @@ impl CpuForward {
         for row in rows.iter_mut() {
             row.taps.capture(visit.state_slot, row.stream.current());
         }
-        let outputs = self.attention_prefill_batch(layer, visit, state, projected)?;
         rows.iter_mut()
             .zip(outputs)
             .map(|(row, attn)| {
@@ -469,8 +494,7 @@ impl CpuForward {
         visit: LayerVisit,
         layer: &str,
         rows: &[PromptRow<'_>],
-        weights: &GgufTextWeights,
-    ) -> Result<Option<Vec<super::super::cpu_attention::AttentionProjection>>, EngError> {
+    ) -> Result<Option<(Vec<[Vec<f32>; 3]>, bool)>, EngError> {
         if !prefill_projection_batch_enabled() {
             return Ok(None);
         }
@@ -489,8 +513,19 @@ impl CpuForward {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        Ok(Some((inputs, batched_controllers)))
+    }
+
+    fn project_prompt_attention(
+        &self,
+        weights: &GgufTextWeights,
+        layer: &str,
+        visit: LayerVisit,
+        inputs: &[[Vec<f32>; 3]],
+        batched_controllers: bool,
+    ) -> Result<Option<Vec<super::super::cpu_attention::AttentionProjection>>, EngError> {
         let projected =
-            self.prefill_attention_projections(weights, layer, visit.attention, &inputs)?;
+            self.prefill_attention_projections(weights, layer, visit.attention, inputs)?;
         if projected.is_none() && batched_controllers {
             // Keep the completed controller rows when Q/K/V projection itself falls back.
             return inputs

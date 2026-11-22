@@ -337,7 +337,7 @@ impl CpuForward {
                 device.step_prefill(
                     context,
                     visit.state_slot,
-                    &rows,
+                    (&rows, None),
                     attention::History {
                         position: state.position,
                         keys: &state.keys,
@@ -358,6 +358,84 @@ impl CpuForward {
             }
         }
         Ok(outputs)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn attention_prefill_bridge(
+        &self,
+        layer: &str,
+        visit: LayerVisit,
+        state: &mut VisitState,
+        inputs: &[[Vec<f32>; 3]],
+    ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
+        if !attention::prefill::device_side_enabled() || inputs.len() < 2 {
+            return Ok(None);
+        }
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        let Some((context, device)) = weights.resident_attention() else {
+            return Ok(None);
+        };
+        let widths = inputs[0].each_ref().map(Vec::len);
+        let Some(projector) = self.attention_requests(layer, visit.attention, |calls| {
+            weights.prefill_projection(widths, calls)
+        })?
+        else {
+            return Ok(None);
+        };
+        let heads = self.heads(visit.attention);
+        let prefix = format!("{layer}.attn");
+        let output_name = format!("{prefix}.wo_ud.weight");
+        // Without a resident output projection, host fallback can reuse the logits scratch.
+        let Some(projection) = weights
+            .relative_attention_projection(&output_name, [self.hidden(), heads.q_channels()])?
+        else {
+            return Ok(None);
+        };
+        let capacity = device
+            .prefill_capacity(context, visit.state_slot, Some(&projection))?
+            .min(projector.capacity(inputs[0].each_ref().map(Vec::as_slice))?);
+        if capacity < 2 {
+            return Ok(None);
+        }
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for tile in inputs.chunks(capacity) {
+            let refs: Vec<_> = tile
+                .iter()
+                .map(|row| row.each_ref().map(Vec::as_slice))
+                .collect();
+            let (host, side) = projector.tile(&refs)?;
+            let prepared = host
+                .into_iter()
+                .map(|p| self.prepare_attention(&prefix, heads, state, p))
+                .collect::<Result<Vec<_>, _>>()?;
+            let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
+            let values = {
+                let _span = self.phase_span(Work::DeviceAttention);
+                // Finish consuming the sidecar before the next tile can overwrite it.
+                device.step_prefill(
+                    context,
+                    visit.state_slot,
+                    (&rows, Some(side)),
+                    attention::History {
+                        position: state.position,
+                        keys: &state.keys,
+                        values: &state.values,
+                    },
+                    Some(&projection),
+                )?
+            };
+            for (prepared, out) in prepared.into_iter().zip(values) {
+                state.push(prepared.k, prepared.v, self.kv_capacity(visit.attention));
+                outputs.push(self.finish_attention(layer, state, &output_name, out, true)?);
+            }
+        }
+        static USED: std::sync::Once = std::sync::Once::new();
+        USED.call_once(|| {
+            eprintln!("Inkling CUDA kept prefill attention sinks and gates resident")
+        });
+        Ok(Some(outputs))
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
