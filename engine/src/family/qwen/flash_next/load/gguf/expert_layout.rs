@@ -177,6 +177,16 @@ impl ExpertStacks {
     }
 }
 
+/// Checked native projection metadata and stack range for one routed expert part.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in super::super::super) struct ExpertProjection<'a> {
+    pub(in super::super::super) ty: crate::kernels::cuda::resident::matvec_q::QuantType,
+    pub(in super::super::super) weights: crate::kernels::cuda::DeviceRange<'a>,
+    pub(in super::super::super) k: usize,
+    pub(in super::super::super) rows: usize,
+    pub(in super::super::super) slots: usize,
+}
+
 /// Staged device owner. Every slot must be initialized before exposing any stack,
 /// since indexed kernels may access any slot. Cross-stream ordering is the caller's duty.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -366,6 +376,37 @@ impl<'a> ExpertDeviceStacks<'a> {
             .upload_record(&self.layout, slot, record, &self.buffer, stream)?;
         *ready = true;
         Ok(())
+    }
+
+    /// Derive the weight type and dimensions from the source tensor, not caller inputs.
+    pub(in super::super::super) fn projection(
+        &self,
+        role: Role,
+    ) -> Result<ExpertProjection<'_>, EngError> {
+        use crate::kernels::cuda::resident::matvec_q::QuantType;
+        let invalid = || EngError::BadRequest("invalid GGUF expert projection".into());
+        let (model, layer) = self.source.ok_or_else(invalid)?;
+        let index = self
+            .layout
+            .parts
+            .iter()
+            .position(|part| part.role == role)
+            .ok_or_else(invalid)?;
+        let part = &self.layout.parts[index];
+        let tensor = model.map().get(role, Some(layer)).ok_or_else(invalid)?;
+        let [k, rows, _] = tensor.dims.as_slice() else {
+            return Err(invalid());
+        };
+        if tensor.ty != part.ty {
+            return Err(invalid());
+        }
+        Ok(ExpertProjection {
+            ty: QuantType::from_gguf(part.ty).ok_or_else(invalid)?,
+            weights: self.part(index)?,
+            k: usize::try_from(*k).map_err(|_| invalid())?,
+            rows: usize::try_from(*rows).map_err(|_| invalid())?,
+            slots: self.ready.len(),
+        })
     }
 
     pub(in super::super::super) fn part(

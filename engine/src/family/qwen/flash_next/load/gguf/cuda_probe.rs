@@ -313,6 +313,7 @@ fn disk_bank_read_failure_poisons_policy_and_device() {
     assert!(state.is_poisoned());
     assert!(state.begin_pass(0, &[256]).is_err());
     assert!(bank.part(0).is_err());
+    assert!(bank.projection(Role::ExpertGate).is_err());
     assert!(
         bank.step_disk(&stream, &model, &mut state, 0, &[0])
             .is_err()
@@ -788,10 +789,22 @@ fn full_expert_device_stacks_match_host() {
     let ids = ctx.allocate(4).unwrap();
     ids.write_at(&stream, 0, &i32::from(slot).to_ne_bytes())
         .unwrap();
+    assert!(
+        bank.projection(crate::family::recipe::Role::Router)
+            .is_err()
+    );
     let mut checked = 0;
     for (tensor, expert) in projection_samples(&model).filter(|(_, expert)| expert.is_some()) {
-        let k = tensor.dims[0] as usize;
-        let rows = tensor.dims[1] as usize;
+        let Slot::Layer(role) = tensor.role else {
+            panic!("expert role")
+        };
+        let projection = bank.projection(role).unwrap();
+        let k = projection.k;
+        let rows = projection.rows;
+        assert_eq!(
+            (k, rows, projection.slots),
+            (tensor.dims[0] as usize, tensor.dims[1] as usize, 2)
+        );
         assert_eq!(rows % 4, 0);
         let input: Vec<f32> = (0..k).map(|n| if n % 5 < 2 { -1.0 } else { 1.0 }).collect();
         let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -813,8 +826,8 @@ fn full_expert_device_stacks_match_host() {
         ctx.matvec_expert(
             &stream,
             ExpertMatvecCall {
-                ty: QuantType::from_gguf(tensor.ty).unwrap(),
-                w_stack: bank.part(checked).unwrap(),
+                ty: projection.ty,
+                w_stack: projection.weights,
                 ids: ids.range(0, 4).unwrap(),
                 x_q8: q.range(0, qbytes).unwrap(),
                 x_per_slot: false,
@@ -822,7 +835,7 @@ fn full_expert_device_stacks_match_host() {
                 y_slot_stride: rows,
                 k,
                 rows,
-                n_expert: 2,
+                n_expert: projection.slots,
                 n_used: 1,
                 glu_gate: None,
             },
