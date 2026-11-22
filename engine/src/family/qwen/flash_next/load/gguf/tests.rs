@@ -387,6 +387,34 @@ fn expert_reader_selects_layer_role_and_expert_without_touching_other_rows() {
 }
 
 #[test]
+fn expert_reader_uses_each_layers_mixed_quantization_and_role() {
+    let (written, model) = open(&Spec {
+        shards: 4,
+        ..Spec::default()
+    });
+    let roles = [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown];
+    for (layer, &(gate_ty, down_ty)) in REAL_EXPERT_TYPES.iter().enumerate() {
+        for (index, role) in roles.iter().copied().enumerate() {
+            let entry = model.map().get(role, Some(layer)).unwrap();
+            assert_eq!(entry.ty, if index == 2 { down_ty } else { gate_ty });
+            let [k, rows, experts] = entry.dims[..] else {
+                panic!("expected expert stack")
+            };
+            let stride = (k / entry.ty.block_elems() * entry.ty.block_bytes()) as usize;
+            let payload = vec![1 + ((layer * 3 + index) % 254) as u8; stride];
+            let expert = experts - 1;
+            let row = rows - 1;
+            written.patch(&entry.name, (expert * rows + row) * stride as u64, &payload);
+            let mut output = vec![0; stride];
+            model
+                .read_expert_rows(layer, role, expert, row..row + 1, &mut output)
+                .unwrap();
+            assert_eq!(output, payload, "layer {layer} role {role:?}");
+        }
+    }
+}
+
+#[test]
 fn expert_row_spans_check_bounds_alignment_and_overflow() {
     let (_written, model) = open(&Spec::default());
     let mut stack = model
