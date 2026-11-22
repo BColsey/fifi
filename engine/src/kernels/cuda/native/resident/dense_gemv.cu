@@ -174,6 +174,59 @@ __global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a, Index index) 
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
 }
 
+constexpr int kInklingGateWidth = 2304;
+
+// One lane owns each eight-value IQ2 group. Transpose each activation block
+// once per CTA so the eight inner FMA steps read shared memory without bank
+// conflicts. Weight values stay F32; only the dot-product reduction order changes.
+template <int Type, int Bytes>
+__global__ void inkling_iq2_gate_gemv(const float *x, const uint8_t *gate, float *y,
+                                      DeviceSelectedWeights index) {
+    constexpr int cols = kInklingGateWidth, rows = kInklingGateWidth, blocks = cols / 256;
+    __shared__ float staged[cols];
+    const int tid = threadIdx.x;
+    for (int col = tid; col < cols; col += kWarps * 32) {
+        staged[(col / 256) * 256 + (col % 8) * 32 + (col % 256) / 8] = x[col];
+    }
+    __syncthreads();
+
+    const int lane = tid & 31;
+    const int row = blockIdx.x * kWarps + (tid >> 5);
+    const auto *w = gate + index.offset(blockIdx.y) + size_t(row) * blocks * Bytes;
+    float sum = 0;
+    for (int block = 0; block < blocks; ++block) {
+        const auto *b = w + block * Bytes;
+        const auto group = fifi_gguf::iq2_group<Type>(b, lane / 4, lane % 4, fifi_gguf::half_value(b));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            sum = fmaf(fifi_gguf::grid_value(group.grid, j, group.scale, group.signs),
+                       staged[block * 256 + j * 32 + lane], sum);
+        }
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) y[size_t(blockIdx.y) * rows + row] = sum;
+}
+
+bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights gate,
+                             cudaStream_t stream, Failure &failure) {
+    if (a.hidden != kInklingGateWidth || 2 * a.middle != kInklingGateWidth || a.count != 8) return false;
+    const dim3 grid(kInklingGateWidth / kWarps, a.count);
+    switch (a.gate_dtype - fifi_gguf::kDtypeBase) {
+#define LAUNCH_GATE(id, bytes) \
+    case id: \
+        inkling_iq2_gate_gemv<id, bytes><<<grid, kWarps * 32, 0, stream>>>( \
+            a.x, static_cast<const uint8_t *>(a.gate), a.scratch, gate); \
+        break;
+        LAUNCH_GATE(16, 66)
+        LAUNCH_GATE(17, 74)
+        LAUNCH_GATE(22, 82)
+#undef LAUNCH_GATE
+    default: return false;
+    }
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    return true;
+}
+
 size_t weight_row_bytes(int dtype, int cols) {
     switch (dtype) {
     case kDtypeF16:
@@ -343,11 +396,20 @@ __global__ void sum_moe(inference_cuda_gguf_moe_args a, const float *down) {
 
 template <bool DevicePicks = false, typename Index>
 void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selected_down,
-                cudaStream_t stream, Failure &failure) {
+                cudaStream_t stream, Failure &failure, int *grouped_iq2_gate) {
     float *middle = a.scratch + size_t(a.count) * 2 * a.middle;
     float *down = middle + size_t(a.count) * a.middle;
-    launch_packed({a.gate, a.x, a.scratch, a.count, 2 * a.middle, a.hidden,
-                   0, 2 * a.middle, a.gate_dtype}, stream, failure, gate);
+    bool grouped = false;
+    if constexpr (DevicePicks) {
+        if (grouped_iq2_gate && *grouped_iq2_gate == 1) {
+            grouped = launch_inkling_iq2_gate(a, gate, stream, failure);
+        }
+    }
+    if (grouped_iq2_gate) *grouped_iq2_gate = grouped;
+    if (!grouped) {
+        launch_packed({a.gate, a.x, a.scratch, a.count, 2 * a.middle, a.hidden,
+                       0, 2 * a.middle, a.gate_dtype}, stream, failure, gate);
+    }
     if (!failure.ok()) return;
 
     constexpr int threads = 256;
@@ -391,7 +453,8 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
 
 extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                                const inference_cuda_gguf_moe_matrices *matrices,
-                                               void *stream, int *out_stage) {
+                                               void *stream, int *out_stage,
+                                               int *grouped_iq2_gate) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         MoeSizes sizes;
@@ -405,18 +468,18 @@ extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args
                 gate.matrices[slot] = matrices->gate[slot];
                 down.matrices[slot] = matrices->down[slot];
             }
-            launch_moe(*args, gate, down, (cudaStream_t)stream, failure);
+            launch_moe(*args, gate, down, (cudaStream_t)stream, failure, grouped_iq2_gate);
         } else if (args->device_ids) {
             const auto experts = unsigned(args->experts);
             const DeviceSelectedWeights gate{sizes.gate_stride, args->device_ids, experts};
             const DeviceSelectedWeights down{sizes.down_stride, args->device_ids, experts};
-            launch_moe<true>(*args, gate, down, (cudaStream_t)stream, failure);
+            launch_moe<true>(*args, gate, down, (cudaStream_t)stream, failure, grouped_iq2_gate);
         } else {
             SelectedWeights gate = {sizes.gate_stride, {}};
             for (int slot = 0; slot < args->count; ++slot) gate.ids[slot] = args->picks[slot].expert;
             SelectedWeights down = gate;
             down.stride = sizes.down_stride;
-            launch_moe(*args, gate, down, (cudaStream_t)stream, failure);
+            launch_moe(*args, gate, down, (cudaStream_t)stream, failure, grouped_iq2_gate);
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

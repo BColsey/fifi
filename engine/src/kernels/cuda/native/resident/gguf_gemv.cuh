@@ -70,6 +70,33 @@ __device__ __forceinline__ float iq1_value(unsigned index, int lane, float scale
     return scale * (float(code - 1) + (negative_delta ? -0.125f : 0.125f));
 }
 
+struct Iq2Group {
+    uint64_t grid;
+    float scale;
+    unsigned signs;
+};
+
+// Eight adjacent values share the codebook entry, scale, and sign mask.
+template <int Type>
+__device__ __forceinline__ Iq2Group iq2_group(const uint8_t *b, int row, int segment, float d) {
+    if constexpr (Type == 16) {
+        const unsigned a = read32(b + 6 + 8 * row);
+        const float scale = d * (0.5f + float(a >> 28)) * 0.25f;
+        return {iq2xxs_grid[b[2 + 8 * row + segment]], scale,
+                ksigns_iq2xs[(a >> (7 * segment)) & 127]};
+    } else if constexpr (Type == 17) {
+        const unsigned code = read16(b + 2 + 2 * (4 * row + segment));
+        const float scale = d * (0.5f + float(nibble(b[66 + row], segment / 2))) * 0.25f;
+        return {iq2xs_grid[code & 511], scale, ksigns_iq2xs[code >> 9]};
+    } else {
+        static_assert(Type == 22, "not an IQ2 grid type");
+        const unsigned hi = (unsigned(b[66 + row]) << (8 - 2 * segment)) & 768;
+        const unsigned code = b[2 + 4 * row + segment] | hi;
+        const float scale = d * (0.5f + float(nibble(b[74 + row], segment / 2))) * 0.25f;
+        return {iq2s_grid[code], scale, b[34 + 4 * row + segment]};
+    }
+}
+
 template <int Type>
 __device__ __forceinline__ float decode(const uint8_t *b, int i) {
     if constexpr (Type == 8) {
@@ -140,19 +167,9 @@ __device__ __forceinline__ float decode(const uint8_t *b, int i) {
     } else {
         const int row = i / 32, segment = (i % 32) / 8, lane = i % 8;
         const float d = half_value(b);
-        if constexpr (Type == 16) {
-            const unsigned a = read32(b + 6 + 8 * row);
-            const float scale = d * (0.5f + float(a >> 28)) * 0.25f;
-            return grid_value(iq2xxs_grid[b[2 + 8 * row + segment]], lane, scale, ksigns_iq2xs[(a >> (7 * segment)) & 127]);
-        } else if constexpr (Type == 17) {
-            const unsigned code = read16(b + 2 + 2 * (4 * row + segment));
-            const float scale = d * (0.5f + float(nibble(b[66 + row], segment / 2))) * 0.25f;
-            return grid_value(iq2xs_grid[code & 511], lane, scale, ksigns_iq2xs[code >> 9]);
-        } else if constexpr (Type == 22) {
-            const unsigned hi = (unsigned(b[66 + row]) << (8 - 2 * segment)) & 768;
-            const unsigned code = b[2 + 4 * row + segment] | hi;
-            const float scale = d * (0.5f + float(nibble(b[74 + row], segment / 2))) * 0.25f;
-            return grid_value(iq2s_grid[code], lane, scale, b[34 + 4 * row + segment]);
+        if constexpr (Type == 16 || Type == 17 || Type == 22) {
+            const auto group = iq2_group<Type>(b, row, segment, d);
+            return grid_value(group.grid, lane, group.scale, group.signs);
         } else if constexpr (Type == 18) {
             const unsigned a = read32(b + 66 + 4 * row);
             const float scale = d * (0.5f + float(a >> 28)) * 0.5f;

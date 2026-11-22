@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Once, OnceLock},
+};
 
 use super::{ExpertLayer, GgufCuda, bad};
 use crate::{
@@ -238,7 +241,8 @@ impl GgufCuda {
                             scale: route.scale,
                         },
                     )?;
-                    self.context.gguf_moe(
+                    static IQ2_GATE: OnceLock<bool> = OnceLock::new();
+                    let grouped = self.context.gguf_moe_with_iq2_gate(
                         stream,
                         GgufMoeCall {
                             shape: moe.shape,
@@ -255,7 +259,17 @@ impl GgufCuda {
                             scratch,
                             y,
                         },
-                    )
+                        *IQ2_GATE.get_or_init(|| {
+                            std::env::var("FIFI_INKLING_CUDA_IQ2_GATE").as_deref() == Ok("1")
+                        }),
+                    )?;
+                    if grouped {
+                        static NOTICE: Once = Once::new();
+                        NOTICE.call_once(|| {
+                            eprintln!("Inkling CUDA used grouped IQ2 expert gate GEMV");
+                        });
+                    }
+                    Ok(())
                 },
             )
             .map(Some)

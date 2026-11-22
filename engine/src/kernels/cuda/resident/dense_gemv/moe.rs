@@ -59,9 +59,21 @@ impl CudaContext {
         stream: &DeviceStream,
         call: GgufMoeCall<'_>,
     ) -> Result<(), EngError> {
+        self.gguf_moe_with_iq2_gate(stream, call, false).map(|_| ())
+    }
+
+    /// Requests the Inkling-specific IQ2 gate schedule; reports whether it was queued.
+    pub(crate) fn gguf_moe_with_iq2_gate(
+        &self,
+        stream: &DeviceStream,
+        call: GgufMoeCall<'_>,
+        grouped_iq2_gate: bool,
+    ) -> Result<bool, EngError> {
         self.ensure_usable()?;
         let raw = self.plan_gguf_moe(&call)?;
-        self.launch_on(stream, |stream_raw| launch_gguf_moe(stream_raw, raw))
+        self.launch_on(stream, |stream_raw| {
+            launch_gguf_moe(stream_raw, raw, grouped_iq2_gate)
+        })
     }
 
     fn plan_gguf_moe<'a>(&self, c: &GgufMoeCall<'a>) -> Result<GgufMoeRaw<'a>, EngError> {

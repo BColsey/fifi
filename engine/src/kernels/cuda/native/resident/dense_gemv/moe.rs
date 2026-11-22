@@ -134,13 +134,15 @@ unsafe extern "C" {
         matrices: *const MoeMatrices,
         stream: *mut c_void,
         out_stage: *mut c_int,
+        grouped_iq2_gate: *mut c_int,
     ) -> c_int;
 }
 
 pub(in crate::kernels::cuda) fn launch_gguf_moe(
     stream: &RawStream,
     call: GgufMoeRaw<'_>,
-) -> Result<(), DeviceFailure> {
+    grouped_iq2_gate: bool,
+) -> Result<bool, DeviceFailure> {
     let mut picks = [GgufMoePick::default(); MAX_GGUF_MOE_PICKS];
     let (count, device_ids, device_weights, [gate_scales, down_scales]) = match call.picks {
         GgufMoeRawPicks::Host(host) => {
@@ -204,7 +206,15 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     let matrices = matrices
         .as_ref()
         .map_or(std::ptr::null(), std::ptr::from_ref);
-    let status =
-        unsafe { inference_cuda_gguf_moe_launch(&args, matrices, stream.0.as_ptr(), &mut stage) };
-    checked(status, stage)
+    let mut grouped = c_int::from(grouped_iq2_gate);
+    let request = if grouped_iq2_gate {
+        &raw mut grouped
+    } else {
+        std::ptr::null_mut()
+    };
+    let status = unsafe {
+        inference_cuda_gguf_moe_launch(&args, matrices, stream.0.as_ptr(), &mut stage, request)
+    };
+    checked(status, stage)?;
+    Ok(grouped == 1)
 }

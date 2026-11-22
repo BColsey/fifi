@@ -84,9 +84,11 @@ typedef struct inference_cuda_gguf_moe_matrices {
     const void *down[INFERENCE_CUDA_GGUF_MOE_MAX_PICKS];
 } inference_cuda_gguf_moe_matrices;
 
+/* Optional in/out opt-in for the Inkling IQ2 gate: 1 requests it; on success
+ * this reports whether it was enqueued. NULL always uses the baseline. */
 int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                   const inference_cuda_gguf_moe_matrices *matrices,
-                                  void *stream, int *out_stage);
+                                  void *stream, int *out_stage, int *grouped_iq2_gate);
 
 #ifdef __cplusplus
 }
