@@ -426,6 +426,50 @@ fn projection_model() -> GgufModel {
 }
 
 #[test]
+#[ignore = "needs complete expert samples and a sparse negative fixture"]
+fn full_expert_fixture_integrity() {
+    use super::expert_layout::ExpertLayout;
+    use sha2::{Digest, Sha256};
+    let hashes = [
+        "3da6977d2c06568b213e1e79fd49f3de3816c594c7b6f0928cbc4f74eed6d13b",
+        "923942e4b406fc5602397c2444bc2fbb961e1e79d64ddb2469a3e0da99249e32",
+        "f3564536713b47dd71045f35e7129099fc843b239628f2a053f6b2e9f1af8a61",
+    ];
+    for (key, expected_match) in [
+        ("FIFI_FLASH_EXPERT_FIXTURE", true),
+        ("FIFI_FLASH_GGUF_PROJECTION_FIXTURE", false),
+    ] {
+        let path = std::env::var_os(key).unwrap();
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let layout = ExpertLayout::for_layer(&model, 0).unwrap();
+        let mut record = vec![0; layout.bytes];
+        layout.read(&model, 0, 256, &mut record).unwrap();
+        let valid = layout.parts.iter().zip(hashes).all(|(part, hash)| {
+            format!("{:x}", Sha256::digest(&record[part.bytes.clone()])) == hash
+        });
+        assert_eq!(valid, expected_match, "{key}");
+    }
+}
+
+#[test]
+#[ignore = "emits a complete expert sample plan from pinned GGUF headers"]
+fn write_full_expert_sample_plan() {
+    let model = projection_model();
+    let samples: Vec<_> = projection_samples(&model).filter_map(|(tensor, expert)| {
+        let expert = expert?;
+        let (begin, bytes) = tensor.row_span(Some(expert), 0..tensor.dims[1]).unwrap();
+        let stored = model.weights.header().tensor(&tensor.name).unwrap();
+        Some(serde_json::json!({"name": tensor.name, "shard": stored.shard(),
+            "start": stored.abs_offset().checked_add(begin).unwrap(), "bytes": bytes, "expert": expert}))
+    }).collect();
+    assert_eq!(samples.len(), 3);
+    let path = std::env::var_os("FIFI_FLASH_EXPERT_PLAN").expect("set expert plan output path");
+    std::fs::write(path, serde_json::to_vec_pretty(&samples).unwrap()).unwrap();
+}
+
+#[test]
 #[ignore = "emits a sample plan from a complete or header-only split set; no CUDA device needed"]
 fn write_mapped_projection_sample_plan() {
     let model = projection_model();
