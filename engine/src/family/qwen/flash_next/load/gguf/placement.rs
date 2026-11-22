@@ -11,7 +11,7 @@ use super::{
 use crate::{
     EngError,
     family::{
-        expert_bank::layer_stream::{LayerExperts, StreamBudget, StreamPlan},
+        expert_bank::layer_stream::{Home, LayerExperts, StreamBudget, StreamPlan},
         recipe::Role as Wanted,
     },
     weights::GgufType,
@@ -92,12 +92,37 @@ fn expert_part(entry: &Mapped) -> Option<usize> {
     }
 }
 
+/// Card bytes the transport allocates per staging slot for the layers `plan` streams: one buffer
+/// per distinct (stack, size, type, shape), because a staged stack is a native weight over a
+/// buffer of exactly its size. A mixed-quant file has several, so this can exceed the plan's
+/// charge of one largest layer per slot.
+pub(in crate::family::qwen::flash_next) fn staging_bytes_per_slot(
+    stacks: &[LayerStacks],
+    plan: &StreamPlan,
+) -> u64 {
+    let mut keys: Vec<(usize, u64, GgufType, usize, usize)> = Vec::new();
+    for (layer, facts) in stacks.iter().enumerate() {
+        if plan.home(layer) == Home::Card {
+            continue;
+        }
+        for (stack, fact) in facts.stacks.iter().enumerate() {
+            let key = (stack, fact.bytes, fact.ty, fact.k, fact.rows);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.iter().map(|key| key.1).sum()
+}
+
 /// The plan: where every layer's experts live, from the card and host bytes the memory plan
-/// left for the routed experts.
+/// left for the routed experts. The staging the transport really allocates is charged: when the
+/// layers that stream need more than the plan's one-largest-layer figure, the card budget loses
+/// the difference and the placement is made again.
 pub(in crate::family::qwen::flash_next) fn stream_plan(
     stacks: &[LayerStacks],
     experts: usize,
-    budget: StreamBudget,
+    mut budget: StreamBudget,
 ) -> Result<StreamPlan, EngError> {
     let layers = stacks
         .iter()
@@ -108,9 +133,16 @@ pub(in crate::family::qwen::flash_next) fn stream_plan(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    StreamPlan::choose(&layers, budget)
+    for _ in 0..8 {
+        let plan = StreamPlan::choose(&layers, budget)?;
+        let real = staging_bytes_per_slot(stacks, &plan) * plan.staging_slots() as u64;
+        if real <= plan.staging_bytes() {
+            return Ok(plan);
+        }
+        budget.card_bytes = budget.card_bytes.saturating_sub(real - plan.staging_bytes());
+    }
+    Err(refuse("the staging of the streamed layers does not settle against the card budget"))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -179,6 +211,11 @@ mod tests {
         let homes = |home: Home| (0..48).filter(|&layer| plan.home(layer) == home).count();
         assert!(homes(Home::Card) > 0 && homes(Home::Pinned) > 0 && homes(Home::Disk) > 0);
         assert!(plan.resident_bytes() + plan.staging_bytes() <= total / 3);
+        // The staging the transport allocates is within what the plan charged.
+        assert!(
+            super::staging_bytes_per_slot(&stacks, &plan) * plan.staging_slots() as u64
+                <= plan.staging_bytes()
+        );
         // A card that holds everything streams nothing.
         let all = stream_plan(
             &stacks,
