@@ -19,7 +19,6 @@ pub(crate) const FAMILY: &str = "gemma4";
 
 pub(crate) use config::Gemma4Options;
 pub use config::{check_bolt_config, check_humanizer_config};
-#[cfg(feature = "native-cuda")]
 pub(crate) use gguf::open_bolt_weights;
 #[cfg(feature = "native-cuda")]
 pub(crate) use gguf::{HumanizerFile, open_humanizer_weights};

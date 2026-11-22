@@ -2299,7 +2299,7 @@ mod tests {
                 vocabulary_gguf(model).expect("scan").as_deref(),
                 Some(expected.as_path())
             );
-            crate::tokenizer::bundle::TokenizerBundle::load_observed(model)
+            crate::tokenizer::TokenizerBundle::load_observed(model)
                 .expect("serve builds the tokenizer from the same source");
             let report =
                 super::preflight(model, model, &Candidate::default(), &cuda_facts(22 << 30))
