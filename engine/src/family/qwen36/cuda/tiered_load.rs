@@ -27,7 +27,7 @@ use crate::family::tier_budget::{ExpertSize, VramBudget, plan_vram};
 use crate::kernels::cuda::{CudaContext, ExpertBank, ExpertBankGeometry};
 use crate::kernels::expert_cpu::ExpertShape;
 use crate::kernels::expert_cpu_q8k::DotBackend;
-use crate::weights::GgufHeader;
+use crate::weights::{GgufExpertIndex, GgufHeader, GgufType, LocatorError};
 
 /// The expert kernel of the tier's CPU pool: the per-32 group grid of the device path, not llama.cpp's
 /// Q8_K. Gate (b) failed with Q8_K at 80 percent CPU-served picks (p95 0.686 against the bound 0.651) and
@@ -59,12 +59,50 @@ pub(super) fn names_without_experts<'n>(names: &[&'n str]) -> Vec<&'n str> {
         .collect()
 }
 
-pub(super) fn geometry_of(dims: &StepDims) -> ExpertBankGeometry {
+/// The bank geometry of one layer whose stacks the file stores in `quant`.
+pub(super) fn geometry_of(dims: &StepDims, quant: [GgufType; 3]) -> ExpertBankGeometry {
     ExpertBankGeometry {
         hidden: dims.shape.hidden,
         inter: dims.shape.moe.inter,
         top_k: dims.shape.moe.top_k,
+        quant,
     }
+}
+
+/// The record types of the gate, up and down stacks of every layer, read from the header through
+/// the shared expert index; a type without a native kernel is refused with the tensor named.
+pub(super) fn expert_quant(
+    header: &GgufHeader,
+    dims: &StepDims,
+) -> Result<Vec<[GgufType; 3]>, EngError> {
+    let (layers, moe) = (dims.shape.kinds.len(), &dims.shape.moe);
+    let shape = (dims.shape.hidden, moe.inter);
+    let refuse = |error: LocatorError| EngError::Checkpoint(format!("tiered: {error:?}"));
+    let index = GgufExpertIndex::new(
+        header,
+        &[header.file_len()],
+        &ExpertTensorNames::standard(),
+        layers,
+        moe.experts,
+        shape,
+        None,
+    )
+    .map_err(refuse)?;
+    index
+        .require_native_rows(shape.0, shape.1)
+        .map_err(refuse)?;
+    (0..layers)
+        .map(|layer| index.three_types(layer).map_err(refuse))
+        .collect()
+}
+
+/// The geometry that sizes the plan: the layer whose three records are largest, so the bank and
+/// staging budgets hold for every layer of a file that mixes types.
+pub(super) fn planning_geometry(
+    dims: &StepDims,
+    quants: &[[GgufType; 3]],
+) -> Result<ExpertBankGeometry, EngError> {
+    ExpertBankGeometry::widest(geometry_of(dims, [GgufType::Q4K; 3]), quants)
 }
 
 /// The device bytes of one expert slot in one layer's bank.
@@ -181,6 +219,15 @@ pub(super) fn build_tiered(
         std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
     ) {
         require_q4k_shexp(header, layers).map_err(|error| checkpoint(format!("{error:?}")))?;
+        // The chunk facts assert Q4_K routed stacks as well; another type decodes per token.
+        let uniform = locator
+            .uniform_quant()
+            .map_err(|error| checkpoint(format!("{error:?}")))?;
+        if uniform != Some([GgufType::Q4K; 3]) {
+            return Err(checkpoint(
+                "the chunked tiered prefill reads Q4_K experts in every layer".to_owned(),
+            ));
+        }
     }
     let mapped = MappedFile::open(gguf, header.file_len())
         .map_err(|error| checkpoint(format!("mapping {}: {error}", gguf.display())))?;
@@ -211,13 +258,16 @@ pub(super) fn build_tiered(
     if let Some(guess) = guess {
         host.set_guess(guess, moe.top_k);
     }
-    let geometry = geometry_of(dims);
-    let banks = (0..layers)
-        .map(|_| ExpertBank::new(ctx, geometry, slots))
+    let quants = expert_quant(header, dims)?;
+    let geometry = planning_geometry(dims, &quants)?;
+    let banks = quants
+        .iter()
+        .map(|quant| ExpertBank::new(ctx, geometry_of(dims, *quant), slots))
         .collect::<Result<Vec<_>, _>>()?;
-    // The staging bank follows the banks: same free pool, one shared bank for every
-    // layer. A cap below top_k cannot even build a bank geometry, so it stays None.
-    let cold = if cold_cap >= geometry.top_k {
+    // The staging bank follows the banks: same free pool, one shared bank for every layer, so
+    // it exists only when every layer stores its experts in the same types. A cap below top_k
+    // cannot even build a bank geometry, so it stays None.
+    let cold = if cold_cap >= geometry.top_k && quants.iter().all(|quant| *quant == quants[0]) {
         Some(ColdStaging::new(ctx, geometry, cold_cap)?)
     } else {
         None
@@ -235,12 +285,20 @@ pub(super) fn attach_tiered_parts(
     plan: &TieredPlan,
 ) -> Result<usize, EngError> {
     let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
-    let (geometry, layers) = (geometry_of(dims), dims.shape.kinds.len());
+    let layers = dims.shape.kinds.len();
+    let quants = expert_quant(source.0, dims)?;
+    let geometry = planning_geometry(dims, &quants)?;
+    // Staging exists only when every layer shares its types (see `build_tiered`).
+    let shared_types = quants.iter().all(|quant| *quant == quants[0]);
     let planned = match plan.slots {
         SlotRequest::Fit => geometry.top_k,
         SlotRequest::Exactly(count) => count,
     };
-    let cold_cap = cold_cap_for(free, geometry, layers, planned, ADMISSION_RESERVE);
+    let cold_cap = if shared_types {
+        cold_cap_for(free, geometry, layers, planned, ADMISSION_RESERVE)
+    } else {
+        0
+    };
     // Charge the staging the plan is about to allocate, so the reserve the banks leave
     // behind still covers the loader's headroom after the staging exists.
     let cold_bytes = if cold_cap >= geometry.top_k {
@@ -395,7 +453,7 @@ mod tests {
     #[test]
     fn the_bank_geometry_comes_from_the_step_dims() {
         let dims = dims();
-        let geometry = geometry_of(&dims);
+        let geometry = geometry_of(&dims, [GgufType::Q4K; 3]);
         assert_eq!(geometry.hidden, dims.shape.hidden);
         assert_eq!(geometry.inter, dims.shape.moe.inter);
         assert_eq!(geometry.top_k, dims.shape.moe.top_k);
@@ -404,16 +462,8 @@ mod tests {
     #[test]
     fn auto_slots_fit_whole_layer_sets_above_the_reserve_up_to_the_model_limit() {
         for geometry in [
-            ExpertBankGeometry {
-                hidden: 2048,
-                inter: 512,
-                top_k: 8,
-            },
-            ExpertBankGeometry {
-                hidden: 1024,
-                inter: 256,
-                top_k: 4,
-            },
+            ExpertBankGeometry::q4k(2048, 512, 8),
+            ExpertBankGeometry::q4k(1024, 256, 4),
         ] {
             for layers in [12, 40] {
                 let minimum = geometry.top_k;
@@ -477,7 +527,7 @@ mod tests {
 
     #[test]
     fn a_plan_that_does_not_fit_is_refused_naming_the_budget() {
-        let geometry = geometry_of(&dims());
+        let geometry = geometry_of(&dims(), [GgufType::Q4K; 3]);
         let top_k = geometry.top_k as u64;
         let slot_set = ExpertBank::bytes_for(geometry, geometry.top_k).unwrap() / top_k * 40;
         let plan = SlotRequest::Exactly;

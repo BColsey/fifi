@@ -2,7 +2,7 @@
 //!
 //! WHAT: [`ExpertLocator`] turns one parsed [`GgufHeader`] into the absolute
 //! byte ranges of single experts inside the three stacked per-layer expert
-//! tensors of a Q4_K GGUF conversion, into pool jobs over any shared region
+//! tensors of a GGUF conversion, into pool jobs over any shared region
 //! holding the whole file, and into the per-expert byte count the budget
 //! planners need. The placement and its validation are the shared
 //! [`GgufExpertIndex`] (`weights::gguf_experts`); this module adds the Q4_K
@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::cpu_pool::{ExpertJob, MappedRegion};
-use crate::kernels::expert_cpu::{ExpertShape, Q4K_BLOCK_VALUES};
+use crate::kernels::expert_cpu::ExpertShape;
 pub use crate::weights::{ExpertTensorNames, LocatorError};
 use crate::weights::{GgufExpertIndex, GgufHeader, GgufType};
 
@@ -90,14 +90,9 @@ impl ExpertLocator {
                 "locator: layers {layers} and experts {experts} must both be nonzero"
             )));
         }
-        if shape.hidden == 0
-            || shape.inter == 0
-            || !shape.hidden.is_multiple_of(Q4K_BLOCK_VALUES)
-            || !shape.inter.is_multiple_of(Q4K_BLOCK_VALUES)
-        {
+        if shape.hidden == 0 || shape.inter == 0 {
             return Err(LocatorError::ShapeMismatch(format!(
-                "locator: expert shape {}x{} must have nonzero extents that are multiples \
-                 of {Q4K_BLOCK_VALUES}",
+                "locator: expert shape {}x{} must have nonzero extents",
                 shape.hidden, shape.inter
             )));
         }
@@ -133,9 +128,12 @@ impl ExpertLocator {
             layers,
             experts,
             (shape.hidden, shape.inter),
-            Some(&[GgufType::Q4K]),
+            None,
         )?;
-        let expert_bytes = index.record_bytes(0)?;
+        // Every stack takes the type the file stores it in, whatever it is, as long as a native
+        // kernel reads it and the row length is whole blocks of it.
+        index.require_native_rows(shape.hidden, shape.inter)?;
+        let expert_bytes = index.max_record_bytes()?;
         Ok(ExpertLocator {
             index,
             expert_bytes,
@@ -152,6 +150,16 @@ impl ExpertLocator {
     /// The expert count per layer; valid expert indices are `0..experts()`.
     pub fn experts(&self) -> usize {
         self.index.experts()
+    }
+
+    /// The file's record types of the gate, up and down stacks of `layer`.
+    pub fn quant(&self, layer: usize) -> Result<[GgufType; 3], LocatorError> {
+        self.index.three_types(layer)
+    }
+
+    /// The types every layer shares, `None` when layers differ.
+    pub fn uniform_quant(&self) -> Result<Option<[GgufType; 3]>, LocatorError> {
+        self.index.uniform_types()
     }
 
     /// The expert shape every indexed tensor was validated against.
@@ -197,6 +205,7 @@ impl ExpertLocator {
         let ranges = self.ranges(layer, expert)?;
         Ok(ExpertJob {
             region,
+            quant: self.quant(layer)?,
             gate: ranges.gate,
             up: ranges.up,
             down: ranges.down,
@@ -716,14 +725,18 @@ pub(crate) mod tests {
             other => panic!("expected MissingTensor, got {other:?}"),
         }
 
-        // A gate stored as Q8_0.
+        // A gate stored in a type without a native kernel (F16); a gate in any native type, Q8_0
+        // included, is indexed.
         let mut table = fresh(0x2BAD_C0DE_0000_0006);
-        table[0].type_id = 8; // Q8_0
+        table[0].type_id = 1; // F16
         table[0].payload = vec![0; derived_len(&table[0].dims, table[0].type_id)];
         match locate(&build(table)) {
             Err(LocatorError::BadTensor { name, why }) => {
                 assert_eq!(name, "blk.0.ffn_gate_exps.weight");
-                assert!(why.contains("Q8_0") && why.contains("Q4_K"), "{why}")
+                assert!(
+                    why.contains("F16") && why.contains("no native layout"),
+                    "{why}"
+                )
             }
             other => panic!("expected BadTensor, got {other:?}"),
         }

@@ -34,7 +34,10 @@ use super::{
     rules::QwenRules,
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
-    tiered_load::{attach_tiered_parts, bank_slot_bytes, geometry_of, names_without_experts},
+    tiered_load::{
+        attach_tiered_parts, bank_slot_bytes, expert_quant, names_without_experts,
+        planning_geometry,
+    },
 };
 use crate::family::decode_step::shard::ShardTable;
 use crate::family::decode_step::state_layout::{KvPool, StateLayout};
@@ -1300,7 +1303,7 @@ fn lower_rung(
     let resident_names = names_without_experts(&names);
     let tensors = native_load_bytes(&model.weights, &names)?;
     let resident = native_load_bytes(&model.weights, &resident_names)?;
-    let geometry = geometry_of(&dims);
+    let geometry = planning_geometry(&dims, &expert_quant(model.weights.header(), &dims)?)?;
     // The card and the host of this decision, read together.
     let facts = Facts::read_with_card("q36 cuda tiered", "Qwen36", || {
         let card = projector.memory_info()?;

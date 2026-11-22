@@ -27,10 +27,12 @@ use crate::kernels::expert_cpu::{
     ExpertCpuError, ExpertScratch, ExpertShape, ExpertSlices, Q4K_BLOCK_BYTES, Q4K_BLOCK_VALUES,
     expert_forward,
 };
+use crate::kernels::expert_cpu_any::{ExpertScratchAny, expert_forward_typed, expert_slice_bytes};
 use crate::kernels::expert_cpu_q8g::{
     ExpertScratchQ8g, expert_act_half_q8g, expert_down_half_q8g, expert_forward_q8g,
 };
 use crate::kernels::expert_cpu_q8k::{DotBackend, ExpertScratchQ8k, expert_forward_q8k};
+use crate::weights::GgufType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpertKernel {
@@ -168,11 +170,14 @@ impl<T: AsRef<[u8]> + Send + Sync + 'static> MappedRegion for T {
 /// against its shape before any work starts.
 pub struct ExpertJob {
     pub region: Arc<dyn MappedRegion>,
-    /// Gate projection bytes: `inter` rows over `hidden` inputs, Q4_K blocks.
+    /// The file's record types of the gate, up and down slices. Q4_K throughout runs the pool's
+    /// own kernel; any other mix runs the decoding kernel of `expert_cpu_any`.
+    pub quant: [GgufType; 3],
+    /// Gate projection bytes: `inter` rows over `hidden` inputs.
     pub gate: Range<usize>,
-    /// Up projection bytes: `inter` rows over `hidden` inputs, Q4_K blocks.
+    /// Up projection bytes: `inter` rows over `hidden` inputs.
     pub up: Range<usize>,
-    /// Down projection bytes: `hidden` rows over `inter` inputs, Q4_K blocks.
+    /// Down projection bytes: `hidden` rows over `inter` inputs.
     pub down: Range<usize>,
     /// Router weight; the layer sum scales this expert's output by it.
     pub weight: f32,
@@ -310,6 +315,8 @@ fn wait_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
 }
 
 fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
+    // The decoding kernel's buffers, built on the first job that needs them.
+    let mut any_scratch: Option<ExpertScratchAny> = None;
     loop {
         let item = {
             let mut queue = lock(&shared.queue);
@@ -350,7 +357,19 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
                 };
                 let mut out = vec![0.0f32; shape.hidden];
                 match catch_unwind(AssertUnwindSafe(|| {
-                    worker.compute(shape, &slices, &item.2, &mut out)
+                    if job.quant == [GgufType::Q4K; 3] {
+                        worker.compute(shape, &slices, &item.2, &mut out)
+                    } else {
+                        let raw = [slices.gate, slices.up, slices.down];
+                        expert_forward_typed(
+                            shape,
+                            job.quant,
+                            raw,
+                            &item.2,
+                            &mut any_scratch,
+                            &mut out,
+                        )
+                    }
                 })) {
                     Ok(Ok(())) => {
                         let _ = item.3.send(JobOutcome::Done(item.0, out));
@@ -673,13 +692,15 @@ impl CpuPool {
                 self.shape.hidden
             )));
         }
-        // Saturating like the kernel's clamp: a nonsense shape cannot fake a length.
-        let side =
-            self.shape.inter.saturating_mul(self.shape.hidden) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
-        let down =
-            self.shape.hidden.saturating_mul(self.shape.inter) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
         for (j, job) in jobs.iter().enumerate() {
             let bytes = job.region.bytes();
+            // Each slice is sized by its own type; a type off the block grid has no length.
+            let [side, side_up, down] =
+                expert_slice_bytes(self.shape, job.quant).ok_or_else(|| {
+                    PoolError::BadInput(format!(
+                        "job {j}: the expert shape is off the block grid of its types"
+                    ))
+                })?;
             let check = |name: &str, range: &Range<usize>, want: usize| -> Result<(), PoolError> {
                 let (start, end) = (range.start, range.end);
                 if start > end || end > bytes.len() || end - start != want {
@@ -693,7 +714,7 @@ impl CpuPool {
                 }
             };
             check("gate", &job.gate, side)?;
-            check("up", &job.up, side)?;
+            check("up", &job.up, side_up)?;
             check("down", &job.down, down)?;
             if !job.weight.is_finite() {
                 return Err(PoolError::BadInput(format!(
@@ -1122,6 +1143,7 @@ mod tests {
     };
     use crate::kernels::expert_cpu_q8g::{ExpertScratchQ8g, expert_forward_q8g};
     use crate::kernels::expert_cpu_q8k::{DotBackend, ExpertScratchQ8k, expert_forward_q8k};
+    use crate::weights::GgufType;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1191,6 +1213,7 @@ mod tests {
         for (j, &weight) in weights.iter().enumerate() {
             let at = j * stride;
             jobs.push(ExpertJob {
+                quant: [GgufType::Q4K; 3],
                 region: region.clone(),
                 gate: at..at + side,
                 up: at + side..at + 2 * side,
@@ -1429,11 +1452,15 @@ mod tests {
         let pool = CpuPool::new(4, shape).unwrap();
         let jobs = jobs_over(&region, shape, &weights);
         let err = pool.run_layer(jobs, &hidden, LONG).unwrap_err();
-        let PoolError::Expert { job, error } = err else {
-            panic!("expected Expert, got {err:?}")
+        // The pool sizes each slice by its type before queueing, so the off-grid shape is
+        // refused at the lowest job before any worker runs.
+        let PoolError::BadInput(message) = err else {
+            panic!("expected BadInput, got {err:?}")
         };
-        assert_eq!(job, 0);
-        assert!(matches!(error, ExpertCpuError::BadShape(_)), "{error:?}");
+        assert!(
+            message.starts_with("job 0:") && message.contains("block grid"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1623,11 +1650,15 @@ mod tests {
         let err = pool
             .run_layer(jobs, &vec![0.25f32; 2048], LONG)
             .unwrap_err();
-        let PoolError::Expert { job, error } = err else {
-            panic!("expected Expert, got {err:?}")
+        // The pool sizes each slice by its type before queueing, so the off-grid shape is
+        // refused at the lowest job before any worker runs.
+        let PoolError::BadInput(message) = err else {
+            panic!("expected BadInput, got {err:?}")
         };
-        assert_eq!(job, 0);
-        assert!(matches!(error, ExpertCpuError::BadShape(_)), "{error:?}");
+        assert!(
+            message.starts_with("job 0:") && message.contains("block grid"),
+            "{message}"
+        );
         let (region, hidden, weights) = setup(&mut Lcg(0x6A7E_D8C0_0000_000A), 8, -0.3, 0.3);
         let (pool, gate) = CpuPool::new_gated_kernel(4, REAL, kernel);
         let first = pool.run_layer(jobs_over(&region, REAL, &weights), &hidden, SHORT);

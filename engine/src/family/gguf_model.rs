@@ -23,6 +23,8 @@ mod tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) use inventory::Role;
 pub use inventory::TensorPath;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) use inventory::is_dense_projection_name;
 
 /// `general.architecture` of the llama.cpp conversion of Qwen3.6-35B-A3B.
 const ARCHITECTURE: &str = "qwen35moe";

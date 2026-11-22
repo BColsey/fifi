@@ -22,6 +22,7 @@ mod exl3_cpu_avx2;
 mod exl3_cpu_avx512;
 mod exl3_cpu_pool;
 pub mod expert_cpu;
+pub mod expert_cpu_any;
 pub mod expert_cpu_avx2;
 pub mod expert_cpu_q8g;
 pub mod expert_cpu_q8k;

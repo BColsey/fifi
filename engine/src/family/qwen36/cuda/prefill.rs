@@ -1032,11 +1032,12 @@ fn model_facts_with(
                 ],
             ),
             None => {
-                // The tiered facts restate what the locator proved at attach:
-                // ExpertLocator::new refused every routed tensor that is not Q4_K
-                // or does not hold exactly [hidden, inter, experts] / [inter,
-                // hidden, experts] for these dims, so the values below are facts,
-                // not guesses read off the model config.
+                // The tiered facts restate what the attach proved: the locator
+                // holds exactly [hidden, inter, experts] / [inter, hidden,
+                // experts] for these dims, and the chunk arm is only enabled
+                // once every routed stack and shared expert was checked Q4_K
+                // (`attach_tiered_parts`), so the values below are facts, not
+                // guesses read off the model config.
                 let (e, i, h) = (
                     dims.shape.moe.experts,
                     dims.shape.moe.inter,

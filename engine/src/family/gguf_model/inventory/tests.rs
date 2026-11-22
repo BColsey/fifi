@@ -425,20 +425,20 @@ fn a_wider_kv_group_changes_only_the_kv_projection_dims() {
 }
 
 #[test]
-fn tiled_roles_allow_only_the_native_types_and_f32_roles_only_f32() {
+fn tiled_roles_allow_the_native_types_dense_roles_also_plain_floats_and_f32_roles_only_f32() {
     let inventory = Inventory::for_spec(&TWO_LAYER_SPEC)
         .unwrap_or_else(|error| panic!("two-layer inventory: {error:?}"));
     for tensor in inventory.tensors() {
         match tensor.path() {
             TensorPath::DeviceTiled => {
-                // Every quantized role takes exactly the types the native kernels read.
-                let want: Vec<GgufType> = (0..64)
-                    .filter_map(|id| GgufType::from_id(id).ok())
-                    .filter(|ty| ty.has_native_kernel())
-                    .collect();
+                // A routed expert stack takes exactly the types the native kernels read; every
+                // other quantized role also takes the plain float types the load encodes.
+                let mut want = GgufType::native_types();
+                if !tensor.name.contains("_exps") {
+                    want.extend([GgufType::F32, GgufType::F16, GgufType::Bf16]);
+                }
                 let mut got = tensor.allowed_types().to_vec();
                 got.sort_by_key(|ty| ty.id());
-                let mut want = want;
                 want.sort_by_key(|ty| ty.id());
                 assert_eq!(got, want, "tensor {}", tensor.name);
             }
@@ -449,9 +449,10 @@ fn tiled_roles_allow_only_the_native_types_and_f32_roles_only_f32() {
                 tensor.name
             ),
         }
-        assert!(
-            !tensor.allowed_types().contains(&GgufType::F16),
-            "tensor {} must not allow F16",
+        assert_eq!(
+            tensor.allowed_types().contains(&GgufType::F16),
+            tensor.path() == TensorPath::DeviceTiled && !tensor.name.contains("_exps"),
+            "tensor {} F16 admission",
             tensor.name
         );
     }
@@ -568,4 +569,30 @@ fn a_delta_net_layer_without_a_linear_block_is_rejected() {
             "family two-layer-test has DeltaNet layers but no linear attention block".to_owned()
         )
     );
+}
+
+#[test]
+fn dense_projection_names_follow_the_shared_naming_and_leave_the_f32_roles_out() {
+    use super::super::is_dense_projection_name as dense;
+    for name in [
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.39.ssm_alpha.weight",
+        "blk.3.ssm_beta.weight",
+        "blk.7.ffn_down_shexp.weight",
+    ] {
+        assert!(dense(name), "{name}");
+    }
+    for name in [
+        "output_norm.weight",
+        "blk.0.ffn_gate_inp.weight",
+        "blk.0.ssm_conv1d.weight",
+        "blk.0.ffn_gate_exps.weight",
+        "blk.x.attn_q.weight",
+        "blk.0.attn_norm.weight",
+        "attn_q.weight",
+    ] {
+        assert!(!dense(name), "{name}");
+    }
 }

@@ -2,7 +2,7 @@
 //!
 //! Pure data derived from a `FamilySpec`. This module never opens or reads a file.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use crate::{
     EngError,
@@ -81,32 +81,18 @@ const DELTA_ROLES: [Role; 9] = [
     Role::SsmDtBias,
     Role::SsmNorm,
 ];
-// The vendored projector tiles Q4_K, Q6_K and Q8_0; F16 is allowed nowhere: a tiled
-// tensor in it has no tile kernel, and every other tensor is uploaded as raw F32.
 // Every quantized role (dense projections, routed experts, the embedding) takes every type the
 // native kernels read (`GgufType::has_native_kernel`): the decode matvec, the expert matvec,
 // the prefill GEMMs and the embedding gather all dispatch on the type, so no role has a list of
-// its own. The order is the order the refusal text names them in.
-const NATIVE_TYPES: [GgufType; 18] = [
-    GgufType::Q4K,
-    GgufType::Q5K,
-    GgufType::Q40,
-    GgufType::Q6K,
-    GgufType::Q80,
-    GgufType::Q50,
-    GgufType::Q3K,
-    GgufType::Iq4Nl,
-    GgufType::Iq4Xs,
-    GgufType::Iq2Xxs,
-    GgufType::Iq2Xs,
-    GgufType::Iq2S,
-    GgufType::Iq3Xxs,
-    GgufType::Iq3S,
-    GgufType::Iq1S,
-    GgufType::Iq1M,
-    GgufType::Q20,
-    GgufType::Q2K,
-];
+// its own. A dense role also takes the plain float types, which the load encodes to Q8_0 blocks
+// (`weights::plain_float_as_q8_0`); the routed expert stacks do not, their tiers read the
+// file's own records. The order is the order the refusal text names them in.
+static NATIVE_TYPES: LazyLock<Vec<GgufType>> = LazyLock::new(GgufType::native_types);
+static DENSE_TYPES: LazyLock<Vec<GgufType>> = LazyLock::new(|| {
+    let mut types = GgufType::native_types();
+    types.extend([GgufType::F32, GgufType::F16, GgufType::Bf16]);
+    types
+});
 const RAW_TYPES: [GgufType; 1] = [GgufType::F32];
 impl Role {
     /// The GGUF name of the tensor of this role: `blk.N.` and the suffix for a layer's role, the
@@ -175,9 +161,17 @@ impl Role {
         }
     }
 
+    fn is_expert_stack(self) -> bool {
+        matches!(
+            self,
+            Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps
+        )
+    }
+
     fn allowed_types(self) -> &'static [GgufType] {
         match self.path() {
-            TensorPath::DeviceTiled => &NATIVE_TYPES,
+            TensorPath::DeviceTiled if self.is_expert_stack() => NATIVE_TYPES.as_slice(),
+            TensorPath::DeviceTiled => DENSE_TYPES.as_slice(),
             TensorPath::DeviceF32 => &RAW_TYPES,
         }
     }
@@ -338,6 +332,29 @@ fn expected(
     let name = role.tensor_name(layer);
     let dims = role.dims(spec)?;
     Ok(ExpectedTensor { name, role, dims })
+}
+
+/// Whether `name` is a dense projection of the shared tensor naming (`blk.N.attn_q.weight`,
+/// `token_embd.weight`, ...): the roles whose file type may be a plain float, which the load
+/// encodes to Q8_0. Routed expert stacks and the F32 roles (norms, router, conv, decay) are not.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn is_dense_projection_name(name: &str) -> bool {
+    let dense = |role: &&Role| role.path() == TensorPath::DeviceTiled && !role.is_expert_stack();
+    match name
+        .strip_prefix("blk.")
+        .and_then(|after| after.split_once('.'))
+    {
+        Some((index, rest)) if index.bytes().all(|b| b.is_ascii_digit()) => FULL_ROLES
+            .iter()
+            .chain(&DELTA_ROLES)
+            .chain(&COMMON_ROLES)
+            .filter(dense)
+            .any(|role| role.suffix() == rest),
+        Some(_) => false,
+        None => [Role::TokenEmbd, Role::Output]
+            .iter()
+            .any(|role| role.suffix() == name),
+    }
 }
 
 #[cfg(test)]

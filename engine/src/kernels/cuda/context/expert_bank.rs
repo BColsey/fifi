@@ -1,7 +1,8 @@
 //! The per-layer expert bank of the tiered decode.
 //!
 //! WHAT: an [`ExpertBank`] is three zero-initialised native-layout weights (gate, up, down)
-//! of `slots` Q4_K experts each, the stack the existing `matvec_expert` launches read with
+//! of `slots` experts each (the file's own record type per stack), the stack the existing
+//! `matvec_expert` launches read with
 //! `n_expert = slots` and the slot index as the expert id. [`ExpertBank::fill`] copies one
 //! expert's three slices into a slot with blocking writes. WHY: the tiered step keeps only the
 //! hot experts of a layer in VRAM; the existing launches stay untouched, so the bank has to
@@ -31,6 +32,9 @@ pub(crate) struct ExpertBankGeometry {
     pub(crate) inter: usize,
     /// Experts picked per token and layer (1 to 8).
     pub(crate) top_k: usize,
+    /// The file's record type of the gate, up and down stacks of this layer. The three need not
+    /// agree: a file may keep a layer's down projection in a wider type than its gate and up.
+    pub(crate) quant: [GgufType; 3],
 }
 
 /// Three native stacks of `slots` experts and the geometry they were built for.
@@ -47,20 +51,64 @@ fn refuse(what: String) -> EngError {
 }
 
 impl ExpertBankGeometry {
-    /// Bytes of one expert's gate (or up) slice and of its down slice: `inter` rows of
-    /// `hidden` values, and `hidden` rows of `inter` values, in Q4_K blocks.
-    fn slice_bytes(&self) -> Result<(usize, usize), EngError> {
-        let bytes = |rows: usize, k: usize| {
-            QuantType::Q4K.weight_bytes(rows, k).ok_or_else(|| {
-                refuse(format!(
-                    "{rows} rows of {k} values overflow or are off the block grid"
-                ))
-            })
+    /// A geometry whose three stacks are all Q4_K.
+    #[cfg(test)]
+    pub(crate) const fn q4k(hidden: usize, inter: usize, top_k: usize) -> Self {
+        Self {
+            hidden,
+            inter,
+            top_k,
+            quant: [GgufType::Q4K; 3],
+        }
+    }
+
+    /// `base` with the types of the layer whose three records are largest among `quants`: the
+    /// geometry that sizes a plan for a file whose layers mix types.
+    pub(crate) fn widest(base: Self, quants: &[[GgufType; 3]]) -> Result<Self, EngError> {
+        let mut best: Option<(usize, Self)> = None;
+        for quant in quants {
+            let geometry = Self {
+                quant: *quant,
+                ..base
+            };
+            let bytes = geometry.slice_bytes()?.into_iter().sum::<usize>();
+            if best.is_none_or(|(most, _)| bytes > most) {
+                best = Some((bytes, geometry));
+            }
+        }
+        best.map(|(_, geometry)| geometry)
+            .ok_or_else(|| refuse("the model has no layers".to_owned()))
+    }
+
+    /// The kernel type of the stack `which` (0 gate, 1 up, 2 down), refused when the file's type
+    /// has no native kernel.
+    fn stack_type(&self, which: usize) -> Result<QuantType, EngError> {
+        let ty = self.quant[which];
+        QuantType::from_gguf(ty).ok_or_else(|| {
+            refuse(format!(
+                "the expert type {} has no native kernel",
+                ty.name()
+            ))
+        })
+    }
+
+    /// Bytes of one expert's gate, up and down slices: `inter` rows of `hidden` values for the
+    /// first two and `hidden` rows of `inter` values for the third, in each stack's own blocks.
+    pub(crate) fn slice_bytes(&self) -> Result<[usize; 3], EngError> {
+        let bytes = |which: usize, rows: usize, k: usize| {
+            self.stack_type(which)?
+                .weight_bytes(rows, k)
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "{rows} rows of {k} values overflow or are off the block grid"
+                    ))
+                })
         };
-        Ok((
-            bytes(self.inter, self.hidden)?,
-            bytes(self.hidden, self.inter)?,
-        ))
+        Ok([
+            bytes(0, self.inter, self.hidden)?,
+            bytes(1, self.inter, self.hidden)?,
+            bytes(2, self.hidden, self.inter)?,
+        ])
     }
 
     /// The refusals shared by sizing and building, before anything is allocated.
@@ -99,9 +147,9 @@ impl ExpertBank {
     /// admission can size a bank before allocating it.
     pub(crate) fn bytes_for(geometry: ExpertBankGeometry, slots: usize) -> Result<u64, EngError> {
         geometry.check(slots)?;
-        let (gate_up, down) = geometry.slice_bytes()?;
-        let total = gate_up
-            .checked_mul(2)
+        let [gate, up, down] = geometry.slice_bytes()?;
+        let total = gate
+            .checked_add(up)
             .and_then(|both| both.checked_add(down))
             .and_then(|three| three.checked_mul(slots))
             .ok_or_else(|| refuse(format!("{slots} slots overflow the byte count")))?;
@@ -117,32 +165,34 @@ impl ExpertBank {
         slots: usize,
     ) -> Result<Self, EngError> {
         Self::bytes_for(geometry, slots)?;
-        let stack = |name: &str, rows: usize, k: usize| -> Result<NativeWeight, EngError> {
-            let n_rows = rows
-                .checked_mul(slots)
-                .ok_or_else(|| refuse(format!("{slots} slots of {rows} rows overflow")))?;
-            let source_len = QuantType::Q4K
-                .weight_bytes(n_rows, k)
-                .ok_or_else(|| refuse(format!("{n_rows} rows of {k} values overflow")))?;
-            let tensor = QuantTensor {
-                name,
-                ty: GgufType::Q4K,
-                n_rows,
-                k,
-                source_len,
+        let stack =
+            |name: &str, which: usize, rows: usize, k: usize| -> Result<NativeWeight, EngError> {
+                let n_rows = rows
+                    .checked_mul(slots)
+                    .ok_or_else(|| refuse(format!("{slots} slots of {rows} rows overflow")))?;
+                let source_len = geometry
+                    .stack_type(which)?
+                    .weight_bytes(n_rows, k)
+                    .ok_or_else(|| refuse(format!("{n_rows} rows of {k} values overflow")))?;
+                let tensor = QuantTensor {
+                    name,
+                    ty: geometry.quant[which],
+                    n_rows,
+                    k,
+                    source_len,
+                };
+                let mut zeros = |_offset: usize, out: &mut [u8]| {
+                    out.fill(0);
+                    Ok(())
+                };
+                Ok(ctx
+                    .upload_native(tensor, ZERO_CHUNK_BYTES, &mut zeros)?
+                    .with_experts(Some(slots)))
             };
-            let mut zeros = |_offset: usize, out: &mut [u8]| {
-                out.fill(0);
-                Ok(())
-            };
-            Ok(ctx
-                .upload_native(tensor, ZERO_CHUNK_BYTES, &mut zeros)?
-                .with_experts(Some(slots)))
-        };
         Ok(Self {
-            gate: stack("expert bank gate", geometry.inter, geometry.hidden)?,
-            up: stack("expert bank up", geometry.inter, geometry.hidden)?,
-            down: stack("expert bank down", geometry.hidden, geometry.inter)?,
+            gate: stack("expert bank gate", 0, geometry.inter, geometry.hidden)?,
+            up: stack("expert bank up", 1, geometry.inter, geometry.hidden)?,
+            down: stack("expert bank down", 2, geometry.hidden, geometry.inter)?,
             slots,
             geometry,
         })
@@ -175,7 +225,7 @@ impl ExpertBank {
         &self.down
     }
 
-    pub(crate) fn slice_bytes(&self) -> Result<(usize, usize), EngError> {
+    pub(crate) fn slice_bytes(&self) -> Result<[usize; 3], EngError> {
         self.geometry.slice_bytes()
     }
 
@@ -191,13 +241,13 @@ impl ExpertBank {
         up: &[u8],
         down: &[u8],
     ) -> Result<(), EngError> {
-        let (gate_up_bytes, down_bytes) = self.slice_bytes()?;
+        let [gate_bytes, up_bytes, down_bytes] = self.slice_bytes()?;
         if slot >= self.slots {
             return Err(refuse(format!("slot {slot} is outside 0..{}", self.slots)));
         }
         for (what, got, want) in [
-            ("gate", gate.len(), gate_up_bytes),
-            ("up", up.len(), gate_up_bytes),
+            ("gate", gate.len(), gate_bytes),
+            ("up", up.len(), up_bytes),
             ("down", down.len(), down_bytes),
         ] {
             if got != want {
@@ -208,10 +258,8 @@ impl ExpertBank {
         }
         self.gate
             .buffer()
-            .write_at(stream, slot * gate_up_bytes, gate)?;
-        self.up
-            .buffer()
-            .write_at(stream, slot * gate_up_bytes, up)?;
+            .write_at(stream, slot * gate_bytes, gate)?;
+        self.up.buffer().write_at(stream, slot * up_bytes, up)?;
         self.down.buffer().write_at(stream, slot * down_bytes, down)
     }
 }
@@ -225,11 +273,7 @@ mod tests {
     use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
     use crate::kernels::cuda::testkit;
 
-    const REAL: ExpertBankGeometry = ExpertBankGeometry {
-        hidden: 2048,
-        inter: 512,
-        top_k: 8,
-    };
+    const REAL: ExpertBankGeometry = ExpertBankGeometry::q4k(2048, 512, 8);
     const SLICE: usize = 512 * 8 * 144; // 589,824 bytes: gate, up and down are all this size
 
     /// The run report counts `FILL_WRITES` blocking writes per fill; the constant must be what
@@ -256,7 +300,7 @@ mod tests {
 
     #[test]
     fn bank_sizes_follow_the_geometry() {
-        assert_eq!(REAL.slice_bytes().unwrap(), (SLICE, SLICE));
+        assert_eq!(REAL.slice_bytes().unwrap(), [SLICE; 3]);
         assert_eq!(
             ExpertBank::bytes_for(REAL, 8).unwrap(),
             3 * 8 * SLICE as u64
@@ -265,14 +309,19 @@ mod tests {
             ExpertBank::bytes_for(REAL, 61).unwrap(),
             3 * 61 * SLICE as u64
         );
-        let wide = ExpertBankGeometry {
-            hidden: 2048,
-            inter: 1024,
-            top_k: 4,
-        };
+        let wide = ExpertBankGeometry::q4k(2048, 1024, 4);
         assert_eq!(
             wide.slice_bytes().unwrap(),
-            (1024 * 8 * 144, 2048 * 4 * 144)
+            [1024 * 8 * 144, 1024 * 8 * 144, 2048 * 4 * 144]
+        );
+        // Each stack sizes by its own type: a Q6_K down beside Q5_K gate and up.
+        let mixed = ExpertBankGeometry {
+            quant: [GgufType::Q5K, GgufType::Q5K, GgufType::Q6K],
+            ..wide
+        };
+        assert_eq!(
+            mixed.slice_bytes().unwrap(),
+            [1024 * 8 * 176, 1024 * 8 * 176, 2048 * 4 * 210]
         );
         // An absurd slot count is a typed refusal, never a wrapped size.
         assert!(ExpertBank::bytes_for(REAL, usize::MAX / 2).is_err());

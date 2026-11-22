@@ -65,11 +65,7 @@ fn full_bank(
     s: &Sources,
     (slot_of, slots): (&[i32], usize),
 ) -> Result<ExpertBank, EngError> {
-    let geometry = ExpertBankGeometry {
-        hidden: DIMS.hidden,
-        inter: DIMS.inter,
-        top_k: DIMS.top_k,
-    };
+    let geometry = ExpertBankGeometry::q4k(DIMS.hidden, DIMS.inter, DIMS.top_k);
     let bank = ExpertBank::new(ctx, geometry, slots)?;
     for (expert, &slot) in slot_of.iter().enumerate() {
         let Ok(slot) = usize::try_from(slot) else {
@@ -366,6 +362,7 @@ impl TieredLayerHost for Mixed {
                     slot_ids.push(0);
                     device_weights.push(0.0);
                     jobs.push(ExpertJob {
+                        quant: [crate::weights::GgufType::Q4K; 3],
                         region: Arc::clone(&self.region),
                         gate: e * SLICE..(e + 1) * SLICE,
                         up: stack + e * SLICE..stack + (e + 1) * SLICE,
@@ -760,11 +757,7 @@ fn bank_fill_writes_the_slices_the_ranges_name_into_the_slot_and_refuses_the_res
     let (stacks, refusals) = {
         let ctx = CudaContext::new()?;
         let stream = ctx.stream()?;
-        let geometry = ExpertBankGeometry {
-            hidden: DIMS.hidden,
-            inter: DIMS.inter,
-            top_k: DIMS.top_k,
-        };
+        let geometry = ExpertBankGeometry::q4k(DIMS.hidden, DIMS.inter, DIMS.top_k);
         let banks = [ExpertBank::new(&ctx, geometry, DIMS.n_expert)?];
         let mut fill = BankFill {
             banks: &banks,

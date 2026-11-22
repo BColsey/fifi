@@ -43,12 +43,12 @@ use self::load_policy::{LoadPolicy, evict_model, recover_files, retry_on_oom};
 use super::Projector;
 use crate::{
     EngError,
-    family::gguf_model::GgufModel,
+    family::gguf_model::{GgufModel, is_dense_projection_name},
     kernels::cuda::{
         self, Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
         QuantTensor, TiledWeight, WorkspaceShape, plan,
     },
-    weights::{GgufTensor, GgufType, GgufWeights},
+    weights::{GgufTensor, GgufType, GgufWeights, is_plain_float},
 };
 
 /// Device memory that a load keeps free beside its weights, in bytes.
@@ -1181,6 +1181,7 @@ pub(crate) mod exl3_jobs;
 mod load_policy;
 #[cfg(test)]
 mod model_tests;
+mod plain_float;
 
 fn admit_mapped_experts(host_bytes: u64, available: u64) -> Result<(), EngError> {
     let needed = host_bytes
@@ -1602,6 +1603,12 @@ fn upload_fused_inproj(
     })
 }
 
+/// Whether a tensor of type `ty` named `name` is a dense projection stored as a plain float,
+/// which the native layout loads as Q8_0 blocks.
+fn dense_plain_float(ty: GgufType, name: &str) -> bool {
+    is_plain_float(ty) && is_dense_projection_name(name)
+}
+
 fn upload(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
@@ -1627,6 +1634,9 @@ fn upload(
                 ty: GgufType::F32,
                 buffer: knobs.context.upload(&bytes)?,
             })
+        }
+        (ty, WeightLayout::Native) if dense_plain_float(ty, name) => {
+            plain_float::upload_as_q8_0(knobs, weights, tensor, slice)
         }
         (ty @ (GgufType::F32 | GgufType::F16), _) => {
             let (_, bytes) = weights.read_tensor(name)?;

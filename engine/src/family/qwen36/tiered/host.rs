@@ -626,6 +626,16 @@ impl TieredHost {
         if misses.is_empty() {
             return Ok(None);
         }
+        // The grouped chunk kernel reads Q4_K slices only.
+        if self.locator.quant(layer).map_err(HostError::Locator)?
+            != [crate::weights::GgufType::Q4K; 3]
+        {
+            return Err(HostError::Pool(super::cpu_pool::PoolError::BadInput(
+                format!(
+                    "the chunked CPU pass of layer {layer} reads Q4_K experts; the file stores another type"
+                ),
+            )));
+        }
         let jobs: Vec<GroupedExpertJob> = misses
             .iter()
             .map(|group| {
@@ -787,7 +797,10 @@ impl TieredHost {
             && max_jobs.is_none_or(|limit| jobs.len() <= limit)
             && !jobs.is_empty()
             && self.pool.threads() >= 2
-            && matches!(self.pool.kernel(), super::cpu_pool::ExpertKernel::Q8g(_));
+            && matches!(self.pool.kernel(), super::cpu_pool::ExpertKernel::Q8g(_))
+            && jobs
+                .iter()
+                .all(|job| job.quant == [crate::weights::GgufType::Q4K; 3]);
         if !split {
             return whole(jobs, &self.pool);
         }

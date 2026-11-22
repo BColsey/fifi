@@ -12,6 +12,7 @@ pub mod exl3;
 pub(crate) mod expert_store;
 mod gguf;
 mod gguf_dequant;
+mod gguf_encode;
 pub(crate) mod gguf_experts;
 mod gguf_split;
 mod gguf_tables;
@@ -58,6 +59,7 @@ pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,
 };
+pub use gguf_encode::{encode_q8_0, is_plain_float, plain_float_as_q8_0};
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };

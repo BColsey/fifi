@@ -270,7 +270,25 @@ fn a_wrong_dim_fails_the_open_naming_the_tensor_and_both_shapes() {
 }
 
 #[test]
-fn an_f16_tensor_fails_the_open_naming_the_tensor_and_type() {
+fn an_f16_expert_stack_fails_the_open_naming_the_tensor_and_type() {
+    let spec = TWO_LAYER_SPEC;
+    let kvs = metadata("qwen35moe", spec_counts(&spec));
+    let mut tensors = file_tensors(&spec);
+    replace(
+        &mut tensors,
+        "blk.1.ffn_gate_exps.weight",
+        GgufType::F16,
+        vec![512, 256, 8],
+    );
+    let message = rejection(open(&kvs, &tensors, &spec));
+    assert_eq!(
+        message,
+        "gguf model: tensor blk.1.ffn_gate_exps.weight has type F16, expected one of Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q2_0"
+    );
+}
+
+#[test]
+fn an_f16_dense_projection_opens() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);
@@ -280,11 +298,7 @@ fn an_f16_tensor_fails_the_open_naming_the_tensor_and_type() {
         GgufType::F16,
         vec![512, 256],
     );
-    let message = rejection(open(&kvs, &tensors, &spec));
-    assert_eq!(
-        message,
-        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, Q5_0, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
-    );
+    open(&kvs, &tensors, &spec).expect("a dense role may carry a plain float type");
 }
 
 #[test]

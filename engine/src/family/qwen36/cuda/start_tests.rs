@@ -519,12 +519,13 @@ fn cuda_settings(object: &str) -> Q36Settings {
 #[test]
 fn auto_tiered_start_uses_the_space_left_by_the_requested_context() {
     use super::tiered_load::{admit_banks, geometry_of};
+    use crate::weights::GgufType;
     let settings = cuda_settings(r#"{"capture":false,"tiered":{"slots":"auto"}}"#);
     let request = tiered_plan_of(&settings).unwrap().slots;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap();
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
     let dims = StepDims::new(&shape, &inventory).unwrap();
-    let geometry = geometry_of(&dims);
+    let geometry = geometry_of(&dims, [GgufType::Q4K; 3]);
     let layers = dims.shape.kinds.len();
     let reserve = 1 << 30;
     let after_fixed = 10_u64 << 30;

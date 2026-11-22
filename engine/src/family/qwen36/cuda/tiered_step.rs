@@ -68,8 +68,7 @@ impl ColdStaging {
         cap: usize,
     ) -> Result<Self, EngError> {
         let bank = ExpertBank::new(ctx, geometry, cap)?;
-        let (gate_up, down) = bank.slice_bytes()?;
-        let slot_bytes = gate_up.max(down) * Self::BATCH;
+        let slot_bytes = bank.slice_bytes()?.into_iter().max().unwrap_or(0) * Self::BATCH;
         let mut ring = Vec::with_capacity(COLD_RING_DEPTH);
         for _ in 0..COLD_RING_DEPTH {
             ring.push(RingSlot {
@@ -114,16 +113,16 @@ impl ColdStaging {
         }
         let bytes = region.bytes();
         let ColdStaging { bank, cap, ring } = self;
-        let (gate_up, down) = bank.slice_bytes()?;
+        let [gate_bytes, up_bytes, down_bytes] = bank.slice_bytes()?;
         type ColdStack<'a> = (
             &'a DeviceBuffer,
             usize,
             fn(&ChunkColdStage) -> &Range<usize>,
         );
         let stacks: [ColdStack<'_>; 3] = [
-            (bank.gate().buffer(), gate_up, |c| &c.gate),
-            (bank.up().buffer(), gate_up, |c| &c.up),
-            (bank.down().buffer(), down, |c| &c.down),
+            (bank.gate().buffer(), gate_bytes, |c| &c.gate),
+            (bank.up().buffer(), up_bytes, |c| &c.up),
+            (bank.down().buffer(), down_bytes, |c| &c.down),
         ];
         let mut at = 0usize;
         for (stack, slice_bytes, range_of) in stacks {

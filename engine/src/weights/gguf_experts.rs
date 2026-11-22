@@ -393,6 +393,48 @@ impl GgufExpertIndex {
         self.layers.len()
     }
 
+    /// The record types of the gate, up and down stacks of `layer`.
+    pub fn three_types(&self, layer: usize) -> Result<[GgufType; 3], LocatorError> {
+        let slices = self.slices(layer, 0)?;
+        let [gate, up, down] = slices.three()?;
+        Ok([gate.ty, up.ty, down.ty])
+    }
+
+    /// The types every layer shares, `None` when layers differ.
+    pub fn uniform_types(&self) -> Result<Option<[GgufType; 3]>, LocatorError> {
+        let first = self.three_types(0)?;
+        for layer in 1..self.layers.len() {
+            if self.three_types(layer)? != first {
+                return Ok(None);
+            }
+        }
+        Ok(Some(first))
+    }
+
+    /// Refuses a stack whose type has no native kernel or whose row length (`hidden` for gate
+    /// and up, `inter` for down) is not whole blocks of its type, naming the tensor.
+    pub fn require_native_rows(&self, hidden: usize, inter: usize) -> Result<(), LocatorError> {
+        for layer in 0..self.layers.len() {
+            let slices = self.slices(layer, 0)?;
+            let [gate, up, down] = slices.three()?;
+            for (slice, row_len) in [(gate, hidden), (up, hidden), (down, inter)] {
+                let ty = slice.ty;
+                let block =
+                    usize::try_from(ty.block_elems()).map_err(|_| LocatorError::Overflow)?;
+                if !ty.has_native_kernel() || !row_len.is_multiple_of(block) {
+                    return Err(LocatorError::BadTensor {
+                        name: slice.name.to_owned(),
+                        why: format!(
+                            "type {} with rows of {row_len} values has no native layout",
+                            ty.name()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn experts(&self) -> usize {
         self.experts
     }
@@ -984,5 +1026,63 @@ mod tests {
                 expert: 0
             }
         );
+    }
+
+    /// A record is sized by the block layout of its own type, not by a Q4_K assumption: the
+    /// per-expert slice of 256 rows of 512 values is `131072 / block_values * block_bytes`.
+    #[test]
+    fn record_sizes_follow_the_block_layout_of_each_type() {
+        const SHAPE: (usize, usize) = (512, 256);
+        let cases = [
+            (GgufType::Q5K, 90_112u64),
+            (GgufType::Q6K, 107_520),
+            (GgufType::Q80, 139_264),
+            (GgufType::Iq4Xs, 69_632),
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tensors: Vec<T> = cases
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, &(ty, per))| {
+                ["gate", "up", "down"].into_iter().map(move |name| {
+                    let dims = if name == "down" {
+                        vec![SHAPE.1 as u64, SHAPE.0 as u64, EXPERTS as u64]
+                    } else {
+                        vec![SHAPE.0 as u64, SHAPE.1 as u64, EXPERTS as u64]
+                    };
+                    T {
+                        name: format!("blk.{layer}.ffn_{name}_exps.weight"),
+                        dims,
+                        ty,
+                        payload: vec![0u8; per as usize * EXPERTS],
+                    }
+                })
+            })
+            .collect();
+        let path = dir.path().join("m.gguf");
+        write(&path, &[], &tensors);
+        let weights = GgufWeights::open_any_type(&path, LIMITS, None).expect("open");
+        let len = std::fs::metadata(&path).expect("stat").len();
+        let index = GgufExpertIndex::new(
+            weights.header(),
+            &[len],
+            &ExpertTensorNames::standard(),
+            cases.len(),
+            EXPERTS,
+            SHAPE,
+            None,
+        )
+        .expect("every type with a native kernel is indexed");
+        for (layer, &(ty, per)) in cases.iter().enumerate() {
+            assert_eq!(index.record_bytes(layer).unwrap(), 3 * per, "{}", ty.name());
+            assert_eq!(index.three_types(layer).unwrap(), [ty; 3]);
+            let slices = index.slices(layer, 1).unwrap();
+            assert_eq!(slices.up.file_range.end - slices.up.file_range.start, per);
+        }
+        assert_eq!(index.max_record_bytes().unwrap(), 3 * 139_264);
+        index
+            .require_native_rows(SHAPE.0, SHAPE.1)
+            .expect("whole blocks");
+        assert_eq!(index.uniform_types().unwrap(), None);
     }
 }
