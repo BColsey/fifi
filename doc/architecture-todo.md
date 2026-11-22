@@ -6,6 +6,6 @@ Scope: GGUF serving only. Share decisions that must agree across serving and dia
 - [x] **Share Bolt checkpoint identity between boot and preflight.** Simplified startup already calls preflight. The check distinguishes a compatible identity from tensor validation, memory fit, and qualification.
 - [x] **Use configured Qwen GGUF options in support-bundle preflight.** Use the loader's settings resolver for context, KV, and content-pin syntax. The loader still verifies the digest and decides memory admission.
 - [x] **Test scheduler invariants across single and batched workers.** Check that final-prefill cancellation publishes no tokens and a memory denial restarts with the request's own saved prefix.
-- [ ] **Make diagnostic file selection match startup.** Accept an explicitly selected `.gguf` file without inspecting sibling weight files. For directory inputs, make the estimate identify and size the selected GGUF rather than the directory inventory.
+- [x] **Make Qwen CUDA diagnostic file selection match startup.** Accept an explicit `.gguf` without inspecting unrelated weights. The weight check names the selected checkpoint, and estimates use its byte count, including split shards.
 
 See [model support](reference/models.md) and [diagnostic commands](how-to/diagnostics.md).
