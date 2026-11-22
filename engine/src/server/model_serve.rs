@@ -159,7 +159,7 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     let tokenizer_dir = args
         .tokenizer_dir
         .clone()
-        .unwrap_or_else(|| crate::family::gguf_select::directory_of(&args.model_dir));
+        .unwrap_or_else(|| default_tokenizer_dir(&args.model_dir));
     let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
         .map_err(|error| StartupError(describe_error(&error)))?;
 

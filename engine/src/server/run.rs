@@ -18,10 +18,11 @@ use super::wire::state_name;
 use crate::EngError;
 use crate::family::flint;
 use crate::family::gemma::gemma4;
+use crate::family::inkling2_mini;
 use crate::family::nemotron::nemotron35::factory as nemotron_factory;
 use crate::family::qwen::flash_next::factory;
 use crate::family::qwen::qwen36::factory as q36_factory;
-use crate::family::sampler::SamplingDefaults;
+use crate::family::sampler::{LoadedDefaults, SamplingDefaults};
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
 use crate::storage_guard;
 use crate::tokenizer::TokenizerBundle;
@@ -161,10 +162,6 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     // After every builder: the hub's download events land in the
     // monitor's ring from the first job on.
     state.wire_hub_events();
-    state.record_event(&format!(
-        "server started with {} engines",
-        state.engines().len()
-    ));
     let state = Arc::new(state);
     // One boot line for the warm-turn flip: the effective state and how to
     // roll it back. The polarity comes from the SAME function the request
@@ -305,6 +302,19 @@ pub(crate) fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
         .ok();
 }
 
+fn load_sampling_defaults(
+    config: &EngineConfig,
+) -> Result<(LoadedDefaults, std::path::PathBuf), EngError> {
+    let directory = if config.family == inkling2_mini::FAMILY {
+        // The publisher pin includes generation_config.json in the tokenizer bundle.
+        storage_guard::require_local(&config.tokenizer_dir, "Inkling tokenizer")?;
+        config.tokenizer_dir.clone()
+    } else {
+        crate::family::gguf_select::directory_of(&config.model_dir)
+    };
+    Ok((SamplingDefaults::from_model_dir(&directory)?, directory))
+}
+
 /// Starts every engine of the configuration. A failure names the engine. Every entry carries the
 /// `prefix_reuse` flag of the configuration file to the chat handler and to the Q36 engine
 /// start, whose session-cap rule reads it (`family::qwen::qwen36::settings::check_prefix_reuse_cap`),
@@ -312,22 +322,23 @@ pub(crate) fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    if crate::family::mlx_budget::enabled()
-        && file
-            .engines
-            .iter()
-            .filter(|entry| {
-                FAMILY_STARTERS
-                    .iter()
-                    .any(|&(family, _, metal)| metal && family == entry.family)
-            })
-            .count()
-            > 1
+    if crate::family::mlx_budget::enabled_with_default(file.engines.iter().any(|entry| {
+        entry.family == inkling2_mini::FAMILY && inkling2_mini::factory::check_backend().is_ok()
+    })) && file
+        .engines
+        .iter()
+        .filter(|entry| {
+            FAMILY_STARTERS
+                .iter()
+                .any(|&(family, _, metal)| metal && family == entry.family)
+        })
+        .count()
+        > 1
     {
         return Err(StartupError(
-            "FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB requires one MLX model per \
-             server; either variable alone activates automatic sizing, and Metal reports one \
-             shared working set"
+            "Automatic MLX sizing requires one MLX model per server. Metal reports one shared \
+             working set. FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB activates automatic \
+             sizing, and the opt-in Inkling backend uses it by default."
                 .into(),
         ));
     }
@@ -374,21 +385,13 @@ pub(crate) fn start_one(
             describe(&error)
         ))
     })?;
-    // A model path may name one `.gguf` file.
-    let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-    // A path to one weights file names no side files: another model's `generation_config.json`
-    // in the same directory is not this model's.
-    let loaded = if crate::family::gguf_select::is_gguf_file(&config.model_dir) {
-        SamplingDefaults::of_lone_file()
-    } else {
-        SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
-            StartupError(format!(
-                "engine {} failed to start: {}",
-                config.id,
-                describe(&error)
-            ))
-        })?
-    };
+    let (loaded, defaults_directory) = load_sampling_defaults(config).map_err(|error| {
+        StartupError(format!(
+            "engine {} failed to start: {}",
+            config.id,
+            describe(&error)
+        ))
+    })?;
     // Resolve the flag once, before anything consumes it: Flint's env
     // opt-in is checked first (it only reads the engine's own options),
     // then the family-aware decision covers the ready note, the starter
@@ -451,7 +454,7 @@ pub(crate) fn start_one(
     // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
     // the template already wins over anything set here.
     apply_replay_overrides(&config.id, &mut bundle, config)?;
-    let generation = model_directory.join("generation_config.json");
+    let generation = defaults_directory.join("generation_config.json");
     // The label comes from the loader result, not from a second `exists` call, so the file
     // cannot change between the read and the log line.
     eprintln!(
@@ -513,6 +516,7 @@ fn check_family_backend(config: &EngineConfig) -> Result<(), EngError> {
             &config.model_dir,
             &crate::capability::probe::CompiledBackends::of_this_build(),
         ),
+        inkling2_mini::FAMILY => inkling2_mini::factory::check_backend(),
         _ => Ok(()),
     }
 }
@@ -554,6 +558,25 @@ fn start_flint(
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
         effective,
+    })
+}
+
+fn start_inkling(
+    config: &EngineConfig,
+    _prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    let (engine, bundle, context_limit) = inkling2_mini::factory::start_engine(
+        &config.model_dir,
+        &config.tokenizer_dir,
+        config.context_limit,
+        ready_note,
+    )?;
+    Ok(StartedEngine {
+        engine,
+        bundle: Arc::new(bundle),
+        context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -703,6 +726,7 @@ fn start_gemma4(
 // set it counts can never drift from this dispatch table.
 const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (flint::FAMILY, start_flint, true),
+    (inkling2_mini::FAMILY, start_inkling, true),
     (factory::FAMILY, start_flash, true),
     (q36_factory::FAMILY, start_q36, true),
     (q36_factory::DENSE_FAMILY, start_q36, true),
@@ -733,12 +757,12 @@ pub(crate) fn holds_memory_until_restart(family: &str) -> bool {
 /// load) because its snapshots are not qualified yet.
 fn entry_prefix_reuse(engine: &EngineConfig, file_flag: Option<bool>, flint_opt_in: bool) -> bool {
     let flag = file_flag.unwrap_or_else(|| default_prefix_reuse(engine));
-    flag && (engine.family != flint::FAMILY || flint_opt_in)
+    flag && engine.family != inkling2_mini::FAMILY
+        && (engine.family != flint::FAMILY || flint_opt_in)
 }
 
 /// The unset-key default: on only where reuse is qualified - the Flash-Next
-/// CUDA resume, the Qwen3.6 CUDA serve (the 2026-11-13 qualification) and the Bolt
-/// serve (its host-copy store, funded from the host memory at start) -
+/// CUDA resume and the Qwen3.6 CUDA serve (the 2026-11-13 qualification) -
 /// and only on the CUDA build; every other family and every other build
 /// keeps the stock full prefill, because the boundary marking alone splits
 /// the prefill and changes greedy text (measured on Flash-Next: same prompt,
@@ -770,9 +794,6 @@ pub(crate) fn default_prefix_reuse_with(
     }
     match engine.family.as_str() {
         factory::FAMILY => true,
-        // Bolt's store is host memory sized by the start: a host that cannot fund one entry
-        // turns it off at start and says so.
-        gemma4::FAMILY => true,
         q36_factory::FAMILY => {
             let tiered = engine.qwen36.as_ref().is_some_and(|o| o.tiered.is_some());
             !(tiered || p2p_env == Some(std::ffi::OsStr::new("1")))
@@ -1024,6 +1045,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inkling_sampling_defaults_follow_the_pinned_tokenizer_directory() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("generation_config.json"),
+            r#"{"temperature":0.25}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tokenizer.path().join("generation_config.json"),
+            r#"{"temperature":1.0}"#,
+        )
+        .unwrap();
+        let mut config = engine_config("inkling", None);
+        config.model_dir = model.path().to_owned();
+        config.tokenizer_dir = tokenizer.path().to_owned();
+        config.family = crate::family::inkling2_mini::FAMILY.into();
+        let load = |config: &EngineConfig| {
+            super::load_sampling_defaults(config)
+                .unwrap()
+                .0
+                .values
+                .temperature
+        };
+        assert_eq!(load(&config), 1.0);
+        config.family = "fake".into();
+        assert_eq!(load(&config), 0.25);
+    }
+
     /// A tokenizer dir carrying the PINNED qwen template, so an entry's
     /// bundle resolves replay by the template default and the config
     /// opt-out is distinguishable from the default.
@@ -1132,7 +1183,7 @@ mod tests {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         {
             match family {
-                factory::FAMILY | crate::family::gemma::gemma4::FAMILY => true,
+                factory::FAMILY => true,
                 q36_factory::FAMILY => {
                     let tiered = q36.as_ref().is_some_and(|o| o.tiered.is_some());
                     !tiered && !p2p
@@ -1817,6 +1868,7 @@ mod tests {
             metal,
             vec![
                 crate::family::flint::FAMILY,
+                crate::family::inkling2_mini::FAMILY,
                 crate::family::qwen::flash_next::factory::FAMILY,
                 crate::family::qwen::qwen36::factory::FAMILY,
                 crate::family::qwen::qwen36::factory::DENSE_FAMILY,

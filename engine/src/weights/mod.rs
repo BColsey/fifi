@@ -61,8 +61,8 @@ pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,
 };
-pub use gguf_encode::{encode_plain_float_rows, encode_q8_0, is_plain_float, q8_0_len};
 pub(crate) use gguf_dequant::{dot_q6_k, dot_q8_0};
+pub use gguf_encode::{encode_plain_float_rows, encode_q8_0, is_plain_float, q8_0_len};
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };
@@ -72,6 +72,7 @@ pub(crate) use gguf_split::write_two_shard_set;
 pub(crate) use gguf_split::{ShardName, shard_name_of};
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
+pub(crate) use shard::read_stored_header;
 pub use shard::{HeaderEntry, ShardHeader};
 pub use tiered::{LoadLimits, ShardIo, TieredWeights};
 
