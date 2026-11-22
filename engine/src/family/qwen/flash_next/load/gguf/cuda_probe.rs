@@ -103,6 +103,17 @@ fn mapped_blocks(
     expert: Option<u64>,
     rows: Range<u64>,
 ) -> Result<Vec<u8>, EngError> {
+    let (begin, bytes) = mapped_span(tensor, expert, rows)?;
+    let mut blocks = vec![0; bytes];
+    model.weights.read_range(&tensor.name, begin, &mut blocks)?;
+    Ok(blocks)
+}
+
+fn mapped_span(
+    tensor: &Mapped,
+    expert: Option<u64>,
+    rows: Range<u64>,
+) -> Result<(u64, usize), EngError> {
     let invalid = || EngError::BadRequest(format!("invalid row slice for {}", tensor.name));
     let (k, outputs, expert) = match (tensor.dims.as_slice(), expert) {
         ([k, outputs], None) => (*k, *outputs, 0),
@@ -130,9 +141,7 @@ fn mapped_blocks(
         })
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(invalid)?;
-    let mut blocks = vec![0; bytes];
-    model.weights.read_range(&tensor.name, begin, &mut blocks)?;
-    Ok(blocks)
+    Ok((begin, bytes))
 }
 
 #[test]
@@ -179,27 +188,64 @@ fn reads_only_the_mapped_rows_from_the_expected_split_shard() {
     assert!(mapped_blocks(&model, stack, Some(stack.dims[2]), 2..3).is_err());
 }
 
+fn projection_samples(model: &GgufModel) -> impl Iterator<Item = (&Mapped, Option<u64>)> {
+    model.map.entries().iter().filter_map(|t| {
+        (t.layer == Some(0)
+            && QuantType::from_gguf(t.ty).is_some()
+            && matches!(t.dims.len(), 2 | 3)
+            && t.dims[1] >= 4)
+            .then(|| (t, t.dims.get(2).map(|n| n / 2)))
+    })
+}
+
+fn projection_model() -> GgufModel {
+    let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE")
+        .or_else(|| std::env::var_os("FIFI_FLASH_GGUF"))
+        .expect("set FIFI_FLASH_GGUF or the projection-only fixture path");
+    GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .expect("Flash-Next GGUF")
+}
+
 #[test]
-#[ignore = "needs the pinned Flash-Next GGUF and an admitted CUDA device"]
+#[ignore = "emits a sample plan from a complete or header-only split set; no CUDA device needed"]
+fn write_mapped_projection_sample_plan() {
+    let model = projection_model();
+    let samples: Vec<_> = projection_samples(&model)
+        .map(|(tensor, expert)| {
+            let (begin, bytes) = mapped_span(tensor, expert, 1..4).unwrap();
+            let stored = model.weights.header().tensor(&tensor.name).unwrap();
+            serde_json::json!({
+                "name": tensor.name,
+                "shard": stored.shard(),
+                "start": stored.abs_offset().checked_add(begin).unwrap(),
+                "bytes": bytes,
+            })
+        })
+        .collect();
+    assert!(!samples.is_empty());
+    let path = std::env::var_os("FIFI_FLASH_GGUF_SAMPLE_PLAN").expect("set plan output path");
+    std::fs::write(path, serde_json::to_vec_pretty(&samples).unwrap()).expect("write plan");
+}
+
+#[test]
+#[ignore = "needs pinned Flash-Next projection samples and an admitted CUDA device"]
 fn mapped_checkpoint_projections_match_host_dots() {
     use crate::weights::dequantize;
-    let path =
-        std::env::var_os("FIFI_FLASH_GGUF").expect("set FIFI_FLASH_GGUF to the verified pack");
-    let model = GgufModel::open(std::path::Path::new(&path))
-        .unwrap()
-        .expect("Flash-Next GGUF");
+    let model = projection_model();
     let ctx = CudaContext::new().expect("CUDA device");
     let stream = ctx.stream().expect("stream");
     let mut checked = 0;
-    for t in model.map.entries().iter().filter(|t| t.layer == Some(0)) {
-        if QuantType::from_gguf(t.ty).is_none() || !matches!(t.dims.len(), 2 | 3) || t.dims[1] < 4 {
-            continue;
-        }
-        let expert = t.dims.get(2).map(|n| n / 2);
+    for (t, expert) in projection_samples(&model) {
         let x: Vec<_> = (0..t.dims[0])
             .map(|n| if n % 5 < 2 { -1.0 } else { 1.0 })
             .collect();
         let blocks = mapped_blocks(&model, t, expert, 1..4).expect("mapped rows");
+        assert!(
+            blocks.iter().any(|&byte| byte != 0),
+            "missing sample for {}",
+            t.name
+        );
         let weights = dequantize(t.ty, &blocks).expect("host weights");
         let actual = project(&ctx, &stream, t.ty, &blocks, &x).expect("native projection");
         assert_eq!(actual.len(), 3);
