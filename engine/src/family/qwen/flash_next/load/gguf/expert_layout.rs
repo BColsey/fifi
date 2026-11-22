@@ -165,6 +165,33 @@ impl ExpertDeviceStacks {
         })
     }
 
+    /// Initialize slots from one GGUF layer, in caller-specified order. The caller must
+    /// admit both the device allocation and one host record before calling this function.
+    pub(in super::super::super) fn from_model(
+        ctx: &crate::kernels::cuda::CudaContext,
+        stream: &crate::kernels::cuda::DeviceStream,
+        model: &GgufModel,
+        layer: usize,
+        experts: &[u32],
+    ) -> Result<Self, EngError> {
+        let invalid = || EngError::BadRequest("invalid GGUF initial expert list".into());
+        let count = model.config().dims.experts;
+        let mut unique = std::collections::BTreeSet::new();
+        if experts.is_empty() || experts.iter().any(|&id| id >= count || !unique.insert(id)) {
+            return Err(invalid());
+        }
+        let layout = ExpertLayout::for_layer(model, layer)?;
+        let mut device = Self::new(ctx, layout, experts.len())?;
+        let mut record = vec![0; device.layout.bytes];
+        for (slot, &expert) in experts.iter().enumerate() {
+            device
+                .layout
+                .read(model, layer, u64::from(expert), &mut record)?;
+            device.upload(stream, slot, &record)?;
+        }
+        Ok(device)
+    }
+
     /// An upload error invalidates that slot, including when the copy failed partway.
     pub(in super::super::super) fn upload(
         &mut self,

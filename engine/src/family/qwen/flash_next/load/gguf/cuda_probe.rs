@@ -272,14 +272,18 @@ fn split_gguf_expert_fixture_builds_valid_q8_records() {
 #[test]
 #[ignore = "requires admitted CUDA device; synthetic split GGUF full expert"]
 fn split_gguf_expert_upload_and_indexed_matvec() {
+    use super::expert_layout::ExpertDeviceStacks;
     use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
-    let (_file, model, layout, stacks, record) = split_expert_fixture();
+    let (_file, model, layout, _stacks, _record) = split_expert_fixture();
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    let bank = ctx.allocate(stacks.bytes).unwrap();
-    stacks
-        .upload_record(&layout, 1, &record, &bank, &stream)
-        .unwrap();
+    assert!(ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[]).is_err());
+    assert!(ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[1, 1]).is_err());
+    assert!(
+        ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[model.config().dims.experts])
+            .is_err()
+    );
+    let bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
     let ids = ctx.allocate(4).unwrap();
     ids.write_at(&stream, 0, &1i32.to_ne_bytes()).unwrap();
     for (i, part) in layout.parts.iter().enumerate() {
@@ -305,12 +309,11 @@ fn split_gguf_expert_upload_and_indexed_matvec() {
         )
         .unwrap();
         let y = ctx.allocate(rows * 4).unwrap();
-        let range = &stacks.parts[i];
         ctx.matvec_expert(
             &stream,
             ExpertMatvecCall {
                 ty: QuantType::Q80,
-                w_stack: bank.range(range.start, range.len()).unwrap(),
+                w_stack: bank.part(i).unwrap(),
                 ids: ids.range(0, 4).unwrap(),
                 x_q8: q.range(0, qbytes).unwrap(),
                 x_per_slot: false,
