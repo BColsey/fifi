@@ -823,6 +823,23 @@ fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
     );
 }
 
+/// Measurement probe only: max chunk of synthetic sparse rows, not an admission test.
+#[test]
+#[ignore = "allocates a maximum-size synthetic token-feed chunk for memory measurement"]
+fn gguf_token_feed_max_chunk_memory_probe() {
+    use super::super::super::cuda::driver::TokenFeeds;
+    use super::token_feed::GgufTokenFeeds;
+    let (_written, model) = open(&Spec::default());
+    let rows = model.ngram().unwrap();
+    let mut feed = GgufTokenFeeds::new(&model, &rows, 8).unwrap();
+    let tokens = vec![1; super::super::super::settings::MAX_PREFILL_CHUNK as usize];
+    let starts = feed.begin_chunk(&tokens, false).unwrap();
+    assert_eq!(starts.len(), tokens.len());
+    let update = feed.ple_update(tokens[0], &starts[0].stream).unwrap();
+    assert_eq!(update.len(), starts[0].stream.len());
+    std::hint::black_box((&starts, &feed));
+}
+
 #[test]
 fn gguf_ple_projector_fixture_worker_buffer_bounds() {
     use crate::family::recipe::Role;
