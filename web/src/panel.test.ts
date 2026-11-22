@@ -4,6 +4,7 @@ import {
   applyProbe,
   engineErrorLines,
   engineStageLine,
+  liveSpeeds,
   pollPlan,
   prefixHitRate,
   refreshRecentRows,
@@ -65,6 +66,34 @@ test("recovery: when the route answers again the rows return", async () => {
   ok(back.recent !== null && back.recent[0]!.decode_tokens_per_second === 2);
 });
 
+test("active rows: empty on older builds, carried when present, null when unreachable", async () => {
+  const older = await refreshRecentRows(4000, { fetch: answers, now: frozenClock });
+  deepStrictEqual(older.active, [], "a build without the field reports none, not null");
+  const carries = await refreshRecentRows(4000, {
+    fetch: (signal: AbortSignal) => {
+      ok(signal.aborted === false, "the fetch sees a live signal first");
+      return Promise.resolve({
+        requests: [row(2)],
+        active: [
+          {
+            request_id: "chatcmpl-1",
+            model: "m",
+            engine: "e1",
+            phase: "decode" as const,
+            prompt_tokens: 10,
+            completion_tokens: 3,
+            started_at_ms: 12345,
+          },
+        ],
+      });
+    },
+    now: frozenClock,
+  });
+  ok(carries.active?.[0]?.phase === "decode", "the in-flight row rides along");
+  const offline = await refreshRecentRows(4000, { fetch: rejects, now: frozenClock });
+  strictEqual(offline.active, null, "unreachable is null, like recent");
+});
+
 test("a hung route is cut by the abort and reported as unreachable", async () => {
   // No real timer: the test aborts the injected signal itself, which is
   // the only thing that can end the hung fetch.
@@ -86,6 +115,25 @@ test("a hung route is cut by the abort and reported as unreachable", async () =>
   strictEqual(next.recentError, "network");
 });
 
+test("live per-request speeds come from consecutive active snapshots", () => {
+  const previous = {
+    "c1": { tokens: 100, at: 10_000 },
+    "c2": { tokens: 50, at: 10_000 },
+  };
+  const rows = [
+    { request_id: "c1", model: "m", phase: "decode" as const, prompt_tokens: 10, completion_tokens: 160, started_at_ms: 0 },
+    { request_id: "c2", model: "m", phase: "decode" as const, prompt_tokens: 10, completion_tokens: 50, started_at_ms: 0 },
+    { request_id: "c3", model: "m", phase: "queued" as const, prompt_tokens: 10, completion_tokens: 0, started_at_ms: 20_000 },
+  ];
+  const live = liveSpeeds(previous, rows, 15_000);
+  strictEqual(live.speeds["c1"], 12, "100 tokens over 5 s");
+  strictEqual(live.speeds["c2"], 0, "no new tokens: a measured zero, not unknown");
+  strictEqual(live.speeds["c3"], undefined, "first sighting: speed arrives next poll");
+  strictEqual(live.totalPerSecond, 12);
+  deepStrictEqual(live.next["c1"], { tokens: 160, at: 15_000 });
+  deepStrictEqual(liveSpeeds({}, rows, 15_000).speeds, {});
+});
+
 test("a failed probe fully replaces the panel: no last-good ok survives a fresh timestamp", () => {
   const wasHealthy = applyProbe({
     healthOk: true,
@@ -97,6 +145,7 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
     systemError: null,
     recent: [row(1)],
     recentError: null,
+    active: [],
   });
   ok(wasHealthy.healthOk && wasHealthy.readyOk && wasHealthy.recent !== null);
   const now = applyProbe({
@@ -109,6 +158,7 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
     systemError: null,
     recent: null,
     recentError: null,
+    active: null,
   });
   strictEqual(now.healthOk, false, "health is down, not the last good value");
   strictEqual(now.readyOk, false, "readiness is down, not the last good value");

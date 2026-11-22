@@ -11,14 +11,19 @@ test("prune drops points older than the window and caps the count", () => {
 });
 
 test("history round-trips through storage JSON", () => {
-  const history = { decode: [{ t: 100, v: 12.5 }], ttft: [{ t: 100, v: null }] };
+  const history = { decode: [{ t: 100, v: 12.5 }], ttft: [{ t: 100, v: null }], prefill: [{ t: 100, v: 8000 }] };
   deepStrictEqual(parseHistory(serialize(history), 200), history);
 });
 
+test("storage written before the prefill trend parses with an empty prefill", () => {
+  const stored = serialize({ decode: [{ t: 100, v: 1 }], ttft: [] });
+  deepStrictEqual(parseHistory(stored, 200).prefill, []);
+});
+
 test("corrupt storage yields empty history, never a throw", () => {
-  deepStrictEqual(parseHistory("not json", 0), { decode: [], ttft: [] });
-  deepStrictEqual(parseHistory('{"decode": "nope"}', 0), { decode: [], ttft: [] });
-  deepStrictEqual(parseHistory(null, 0), { decode: [], ttft: [] });
+  deepStrictEqual(parseHistory("not json", 0), { decode: [], ttft: [], prefill: [] });
+  deepStrictEqual(parseHistory('{"decode": "nope"}', 0), { decode: [], ttft: [], prefill: [] });
+  deepStrictEqual(parseHistory(null, 0), { decode: [], ttft: [], prefill: [] });
 });
 
 test("append adds and prunes in one step", () => {

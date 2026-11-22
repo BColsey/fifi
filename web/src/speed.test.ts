@@ -12,7 +12,18 @@ function row(overrides: Partial<SpeedRow>): SpeedRow {
 }
 
 test("an empty ring has no medians and no finished count", () => {
-  deepStrictEqual(speedSummary([]), { decodePerSecond: null, firstTokenMs: null, okCount: 0 });
+  deepStrictEqual(speedSummary([]), { decodePerSecond: null, firstTokenMs: null, prefillPerSecond: null, okCount: 0 });
+});
+
+test("prefill rate is the tokens actually read over the prefill span, median over ok rows", () => {
+  const summary = speedSummary([
+    row({ prompt_tokens: 1000, reused_tokens: 400, prefill_ms: 300 }),
+    row({ prompt_tokens: 2000, reused_tokens: 0, prefill_ms: 500 }),
+    row({ prompt_tokens: 999, prefill_ms: null }),
+    row({ outcome: "error", prompt_tokens: 500, prefill_ms: 100 }),
+  ]);
+  // 600 tok / 0.3 s = 2000; 2000 tok / 0.5 s = 4000; median of the two ok rows with spans is 2000.
+  strictEqual(summary.prefillPerSecond, 2000);
 });
 
 test("medians ignore ok rows without the value", () => {

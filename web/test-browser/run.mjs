@@ -14,6 +14,7 @@ import { stopChild } from "./cleanup.mjs";
 const PORT = 4319;
 const BASE = `http://127.0.0.1:${PORT}`;
 const failures = [];
+const requests = new Set();
 const check = (name, ok, detail = "") => {
   console.log((ok ? "PASS " : "FAIL ") + name + (detail ? " :: " + detail : ""));
   if (!ok) failures.push(name);
@@ -25,6 +26,10 @@ if (spawnSync("chromium", ["--version"], { stdio: "ignore" }).status !== 0) {
 }
 
 const now = Date.now();
+const ACTIVE = {
+  request_id: "r-live", model: "fake", engine: "e1", session: "web-live", phase: "decode",
+  prompt_tokens: 50, completion_tokens: 7, started_at_ms: now,
+};
 const ROW = {
   model: "fake", engine: "e1", session: "web-test", started_at_ms: now, stream: true,
   status: 200, outcome: "ok", error_code: null, finish_reason: "stop",
@@ -36,7 +41,22 @@ const stub = (url) => {
   if (url.includes("/v1/models")) return { body: { object: "list", data: [{ id: "fake", object: "model", created: 1700000000, owned_by: "fifi", engines: [{ id: "e1", state: "ready", cache: { kv_bytes: 1024, prefix_hits: 3, prefix_misses: 1 } }] }] } };
   if (url.includes("/v1/system")) return { body: { version: "test", backends_compiled: [], host: { cpu_threads: 8, mem_total_bytes: 8589934592, mem_available_bytes: 4294967296 }, engines: [{ id: "e1", model: "fake", state: "ready", queued: 1, context_limit: 4096, settings: [] }] } };
   if (url.includes("/v1/telemetry")) return { body: { gpus: [{ index: 0, name: "Test GPU", util_percent: 42, mem_used_bytes: 1073741824, mem_total_bytes: 8589934592, temp_c: 50, power_w: 100 }], source: "nvidia-smi", error: null } };
-  if (url.includes("/v1/recent-requests")) return { body: { requests: [ROW] } };
+  if (url.includes("/v1/recent-requests")) return { body: { requests: [ROW], active: [ACTIVE] } };
+  if (url.includes("/v1/engines")) return { body: { engines: [] } };
+  if (url.includes("/v1/hf/cache")) return { body: { hub_dir: "/demo/cache", models: [] } };
+  if (url.includes("/v1/hf/downloads")) return { body: { downloads: [
+    { id: 1, repo: "org/finished", revision: "main", state: "done" },
+    { id: 2, repo: "org/active", revision: "main", state: "downloading" },
+  ] } };
+  if (url.includes("/v1/hf/search")) return { body: { results: URL.parse(url)?.searchParams.get("gguf") === "true"
+    ? [
+      { id: "org/model-gguf", likes: 8, downloads: 12, gated: true, pipeline_tag: "text-generation" },
+      { id: "org/open-gguf", likes: 4, downloads: 9, gated: false },
+    ] : [] } };
+  if (url.includes("/v1/hf/tree")) return { body: {
+    revision: "main", commit: "a".repeat(40), total_bytes: 10 * 2 ** 30,
+    files: [{ path: "model-Q4_K_M.gguf", size: 4 * 2 ** 30 }, { path: "model-Q8_0.gguf", size: 6 * 2 ** 30 }],
+  } };
   return null;
 };
 const SSE = [
@@ -95,6 +115,7 @@ try {
     }
     if (msg.method === "Fetch.requestPaused" && (msg.sessionId === sessionId || msg.params)) {
       const { requestId, request } = msg.params;
+      requests.add(request.url);
       const respond = (status, type, body) => ws.send(JSON.stringify({
         id: ++nextId + 100000, method: "Fetch.fulfillRequest", sessionId,
         params: { requestId, responseCode: status, responseHeaders: [{ name: "Content-Type", value: type }], body: Buffer.from(body).toString("base64") },
@@ -121,8 +142,10 @@ try {
   await waitFor(() => evaluate("!!document.querySelector('#composer-input')"), "composer");
 
   // Streaming markdown: code box, highlight spans, copy button.
-  await waitFor(() => evaluate("!!document.querySelector('.attach-btn')"), "chat view ready");
-  await evaluate("(() => { const i = document.querySelector('#composer-input'); i.focus(); i.value = 'hello'; i.dispatchEvent(new Event('input', {bubbles: true})); document.querySelector('#send-button').click(); return true; })()");
+  await waitFor(() => evaluate("document.querySelector('#model-picker').value === 'fake' && !document.querySelector('#model-picker').disabled"), "chat model ready");
+  await evaluate("(() => { const i = document.querySelector('#composer-input'); i.focus(); i.value = 'hello'; i.dispatchEvent(new Event('input', {bubbles: true})); return true; })()");
+  await waitFor(() => evaluate("!document.querySelector('#send-button').disabled"), "chat send ready");
+  await evaluate("document.querySelector('#send-button').click(); true");
   await waitFor(() => evaluate("!!document.querySelector('.code-block')"), "code box");
   check("streaming code box renders", true);
   check("syntax highlight spans", await evaluate("document.querySelectorAll('.code-block .tok-keyword').length >= 1"));
@@ -135,23 +158,92 @@ try {
   check("large paste chip", await evaluate("document.querySelectorAll('.paste-chip').length === 1"));
   check("textarea not flooded", await evaluate("document.querySelector('#composer-input').value === ''"));
 
-  // Monitor: cards, rates, GPU, detail drawer.
+  // Monitor: hero band, active lanes, rates, GPU, detail drawer.
   await evaluate("location.hash = '#monitor'; true");
-  await waitFor(() => evaluate("document.querySelectorAll('.stat-card').length === 4"), "stat cards");
-  check("monitor stat cards", true);
+  await waitFor(() => evaluate("!!document.querySelector('.monitor-hero')"), "hero band");
+  check("hero band shows in-flight count and GPU load", await evaluate(`(() => {
+    const hero = document.querySelector(".monitor-hero").textContent;
+    return hero.includes("in flight") && hero.includes("waiting") && hero.includes("GPU load");
+  })()`));
+  const liveLane = await waitFor(async () => {
+    const t = await evaluate(`(() => {
+      const row = [...document.querySelectorAll("#view-monitor tr")].find(tr => tr.textContent.includes("web-live"));
+      return row ? row.textContent : null;
+    })()`);
+    return t && t.includes("decode") ? t : null;
+  }, "active board lane");
+  check("active board lane shows phase, session and context use", liveLane.includes("decode") && liveLane.includes("web-live") && liveLane.includes("%"));
   const mtext = await waitFor(async () => {
     const t = await evaluate("document.querySelector('#view-monitor').textContent");
     return t.includes("Session · web-test") ? t : null;
   }, "rates card with session group");
   check("rates groups render", mtext.includes("Session · web-test"), mtext.slice(0, 200));
-  check("GPU card renders", mtext.includes("Test GPU"));
+  check("GPU table renders", mtext.includes("Test GPU"));
 
-  await waitFor(() => evaluate("!!document.querySelector('.req-row-clickable')"), "request row");
-  await evaluate("document.querySelector('.req-row-clickable').click(); true");
-  await waitFor(() => evaluate("document.querySelector('#view-monitor').textContent.includes('Request detail')"), "detail drawer");
-  check("request detail drawer", true);
+  await waitFor(() => evaluate("!!document.querySelector('.req-inspect')"), "request row");
+  await evaluate("document.querySelector('.req-inspect').click(); true");
+  await waitFor(() => evaluate("document.querySelector('#monitor-request-detail').open"), "detail drawer");
+  check("request detail drawer shows request facts", await evaluate("document.querySelector('#monitor-request-detail').textContent.includes('Prompt tokens')"));
+
+  // Discovery: a search with no results can be retried with a format filter.
+  await evaluate('location.hash = "#models"; true');
+  await waitFor(() => evaluate('!document.querySelector("#view-models").hidden'), "Models view");
+  await waitFor(() => evaluate('document.querySelector(".models-capacity").innerText.includes("7.0 GiB")'), "server capacity");
+  check("local status is visible without opening a disclosure", await evaluate(`(() => {
+    const headings = [...document.querySelectorAll(".models-local h2")];
+    return ["Server capacity", "Engines", "Local cache"].every(label =>
+      headings.some(heading => heading.textContent === label && heading.getClientRects().length > 0));
+  })()`));
+  await waitFor(() => evaluate('document.querySelector(".models-download-launcher").textContent.includes("1 active")'), "active download badge");
+  await evaluate('document.querySelector(".models-download-launcher").click(); true');
+  check("download drawer clears finished entries and keeps active entries", await evaluate(`(() => {
+    const drawer = document.querySelector("#models-downloads");
+    if (!drawer.open || !drawer.textContent.includes("org/finished")) return false;
+    [...drawer.querySelectorAll("button")].find(button => button.textContent === "Clear finished").click();
+    const cleared = !drawer.textContent.includes("org/finished") && drawer.textContent.includes("org/active");
+    drawer.querySelector('[aria-label="Close downloads"]').click();
+    return cleared && !drawer.open;
+  })()`));
+  await evaluate(`(() => {
+    const form = document.querySelector('#view-models form');
+    form.querySelector("input").value = "test";
+    form.requestSubmit();
+    return true;
+  })()`);
+  await waitFor(() => evaluate('document.querySelector("#view-models").textContent.includes("No models match your search.")'), "empty search");
+  await evaluate(`(() => {
+    const form = document.querySelector('#view-models form');
+    form.querySelector("select").value = "gguf";
+    form.requestSubmit();
+    return true;
+  })()`);
+  await waitFor(() => evaluate('document.querySelector("#view-models").textContent.includes("Access required")'), "gated result");
+  check("filtered search shows gated repository without a Download button", await evaluate(`(() => {
+    const result = document.querySelector('#view-models a[href="https://huggingface.co/org/model-gguf"]');
+    return !!result && !result.closest("article").querySelector("button");
+  })()`));
+  check("download is available before opening comparison", await evaluate(`(() => {
+    const download = document.querySelector('#view-models button[aria-label="Download full revision for org/open-gguf"]');
+    const details = document.getElementById("models-fit-1");
+    return download?.getClientRects().length > 0 && details?.hidden;
+  })()`));
+  await evaluate(`document.querySelector('button[aria-controls="models-fit-1"]').click(); true`);
+  await waitFor(() => evaluate('document.querySelector("#view-models").textContent.includes("Recommended starting point")'), "quant recommendation");
+  check("model fit contrasts recommended GGUF with the full download", await evaluate(`(() => {
+    const view = document.querySelector("#view-models");
+    return view.textContent.includes("VRAM only")
+      && view.textContent.includes("SSD streaming candidate")
+      && view.textContent.includes("Download full revision · 10.0 GiB")
+      && [...view.querySelectorAll("a")].some(link => link.href.endsWith("/model-Q4_K_M.gguf"));
+  })()`));
 } catch (err) {
   check("browser run completed", false, String(err).slice(0, 300));
+  if (sessionId !== null) {
+    try {
+      console.log("Requests:", [...requests]);
+      console.log("Page:", await evaluate("document.body.innerText.slice(-800)"));
+    } catch { /* the browser may have already exited */ }
+  }
 } finally {
   try { ws?.close(); } catch {}
   await Promise.all([stopChild(chrome, { processGroup: true }), stopChild(vite)]);

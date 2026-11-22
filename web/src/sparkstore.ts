@@ -13,6 +13,8 @@ export interface SparkPoint {
 export interface SparkHistory {
   decode: SparkPoint[];
   ttft: SparkPoint[];
+  /** Prefill-rate trend; absent in storage written before it existed. */
+  prefill?: SparkPoint[];
 }
 
 export const HISTORY_WINDOW_MS = 60 * 60 * 1000;
@@ -34,10 +36,10 @@ export function serialize(history: SparkHistory): string {
 
 /** Parse stored history; any corrupt shape yields empty history. */
 export function parseHistory(raw: string | null, now: number): SparkHistory {
-  if (raw === null) return { decode: [], ttft: [] };
+  if (raw === null) return { decode: [], ttft: [], prefill: [] };
   try {
     const data: unknown = JSON.parse(raw);
-    if (typeof data !== "object" || data === null) return { decode: [], ttft: [] };
+    if (typeof data !== "object" || data === null) return { decode: [], ttft: [], prefill: [] };
     const read = (value: unknown): SparkPoint[] => {
       if (!Array.isArray(value)) return [];
       const points: SparkPoint[] = [];
@@ -50,10 +52,10 @@ export function parseHistory(raw: string | null, now: number): SparkHistory {
       }
       return prune(points, now);
     };
-    const obj = data as { decode?: unknown; ttft?: unknown };
-    return { decode: read(obj.decode), ttft: read(obj.ttft) };
+    const obj = data as { decode?: unknown; ttft?: unknown; prefill?: unknown };
+    return { decode: read(obj.decode), ttft: read(obj.ttft), prefill: read(obj.prefill) };
   } catch {
-    return { decode: [], ttft: [] };
+    return { decode: [], ttft: [], prefill: [] };
   }
 }
 

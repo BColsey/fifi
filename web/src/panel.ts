@@ -3,7 +3,7 @@
  * return.
  */
 
-import { ApiError, listRecentRequests, type Engine, type Model, type RecentRequest, type SystemInfo } from "./api.js";
+import { ApiError, listRecentRequests, type ActiveRequest, type Engine, type Model, type RecentRequest, type SystemInfo } from "./api.js";
 
 /** The full panel state the view renders (re-exported as MonitorData). */
 export interface PanelData {
@@ -16,19 +16,23 @@ export interface PanelData {
   systemError: string | null;
   recent: RecentRequest[] | null;
   recentError: string | null;
+  active: ActiveRequest[] | null;
   checkedAt: number;
 }
 
 export interface PanelState {
   recent: RecentRequest[] | null;
   recentError: string | null;
+  /** In-flight rows: null with `recent` null (unreachable), empty when
+   * the build predates the field or nothing is running. */
+  active: ActiveRequest[] | null;
   checkedAt: number;
 }
 
 /** Injected seams so the tests need no global fetch mock and no wall
  * clock: the ring fetch, the clock, and the abort timer. */
 export interface RecentDeps {
-  fetch?: (signal: AbortSignal) => Promise<{ requests: RecentRequest[] }>;
+  fetch?: (signal: AbortSignal) => Promise<{ requests: RecentRequest[]; active?: ActiveRequest[] }>;
   now?: () => number;
   timeout?: (ms: number) => AbortSignal;
 }
@@ -42,12 +46,55 @@ export async function refreshRecentRows(timeoutMs = 4000, deps: RecentDeps = {})
   const timeout = deps.timeout ?? AbortSignal.timeout;
   let recent: RecentRequest[] | null = null;
   let recentError: string | null = null;
+  let active: ActiveRequest[] | null = null;
   try {
-    recent = (await fetchRing(timeout(timeoutMs))).requests;
+    const body = await fetchRing(timeout(timeoutMs));
+    recent = body.requests;
+    active = body.active ?? [];
   } catch (err) {
     recentError = err instanceof ApiError ? err.code : "network";
   }
-  return { recent, recentError, checkedAt: now() };
+  return { recent, recentError, active, checkedAt: now() };
+}
+
+/** One snapshot of the active board's token counts: request id →
+ * tokens committed and when they were seen. The view keeps the last
+ * snapshot so consecutive polls yield live per-request speeds. */
+export type ActiveSnapshot = Record<string, { tokens: number; at: number }>;
+
+export interface LiveSpeeds {
+  /** Tokens per second per request id, between the two snapshots; a
+   * request seen for the first time has no speed yet. */
+  speeds: Record<string, number>;
+  /** The snapshot to carry into the next poll. */
+  next: ActiveSnapshot;
+  /** Sum of the measured per-request speeds: the engine's throughput
+   * right now, across every in-flight decode. */
+  totalPerSecond: number;
+}
+
+/** Live per-request decode speed from two consecutive active-board
+ * readings. A poll that lands between two of the page's own refreshes
+ * simply yields no speed for a new row; the next one will. */
+export function liveSpeeds(
+  previous: ActiveSnapshot,
+  rows: readonly ActiveRequest[],
+  now: number
+): LiveSpeeds {
+  const speeds: Record<string, number> = {};
+  const next: ActiveSnapshot = {};
+  let totalPerSecond = 0;
+  for (const row of rows) {
+    next[row.request_id] = { tokens: row.completion_tokens, at: now };
+    const before = previous[row.request_id];
+    if (before === undefined || now <= before.at || row.completion_tokens < before.tokens) {
+      continue;
+    }
+    const perSecond = ((row.completion_tokens - before.tokens) / (now - before.at)) * 1000;
+    speeds[row.request_id] = perSecond;
+    totalPerSecond += perSecond;
+  }
+  return { speeds, next, totalPerSecond };
 }
 
 /** Null `recent` rows mean the server was unreachable — the sweep
@@ -62,6 +109,7 @@ export interface ProbeOutcome {
   systemError: string | null;
   recent: RecentRequest[] | null;
   recentError: string | null;
+  active: ActiveRequest[] | null;
 }
 
 /** The merge: a probe FULLY REPLACES the panel data and stamps

@@ -5,6 +5,7 @@ import {
   getSystem,
   getTelemetry,
   listModels,
+  type ActiveRequest,
   type Model,
   type RecentRequest,
   type SystemInfo,
@@ -15,6 +16,7 @@ import {
   applyProbe,
   engineErrorLines,
   engineStageLine,
+  liveSpeeds,
   prefixHitRate,
   refreshRecentRows,
   requestTotals,
@@ -22,18 +24,18 @@ import {
   sparkArea,
   sparkPath,
   systemEngineFor,
+  type ActiveSnapshot,
   type PanelData,
 } from "./panel";
 import { groupSpeed, speedSummary } from "./speed";
 import { appendPoint, HISTORY_KEY, parseHistory, serialize, values, type SparkPoint } from "./sparkstore";
-import { downloadText } from "./copy";
+import { copyText, downloadText, flashCopied } from "./copy";
 
 export type MonitorData = PanelData;
 
 const HISTORY_CAP = 24;
 
 export class MonitorView {
-  private readonly section: HTMLElement;
   /** Set while any refresh is in flight; a second call returns the last
    * data instead of stacking fetches (N3). */
   private refreshing = false;
@@ -47,6 +49,7 @@ export class MonitorView {
     systemError: null,
     recent: null,
     recentError: null,
+    active: null,
     checkedAt: 0,
   };
   /** Client-side sparkline history: medians from each sweep, oldest
@@ -54,22 +57,44 @@ export class MonitorView {
    * here, one point per poll, exactly like Strata's history ring. */
   private decodeHistory: (number | null)[] = [];
   private ttftHistory: (number | null)[] = [];
+  private prefillHistory: (number | null)[] = [];
   private decodePoints: SparkPoint[] = [];
   private ttftPoints: SparkPoint[] = [];
-  /** The request shown in the detail drawer, when one is selected. */
-  private selectedRequest: RecentRequest | null = null;
+  private prefillPoints: SparkPoint[] = [];
+  /** The last active-board snapshot and the live speeds derived from it:
+   * per-request decode rates between consecutive polls, plus their sum. */
+  private activeSnapshot: ActiveSnapshot = {};
+  private activeSpeeds: Record<string, number> = {};
+  private activeTotalPerSecond = 0;
+  private readonly scroll = document.createElement("div");
+  private readonly requestDrawer = document.createElement("dialog");
+  private requestKey: string | null = null;
   /** GPU telemetry from /v1/telemetry; null when unprobed or down. */
   private telemetry: TelemetryInfo | null = null;
   private telemetryError: string | null = null;
 
   constructor(section: HTMLElement) {
-    this.section = section;
+    this.scroll.className = "panel-scroll";
+    this.requestDrawer.className = "side-drawer monitor-request-drawer";
+    this.requestDrawer.id = "monitor-request-detail";
+    this.requestDrawer.setAttribute("aria-labelledby", "monitor-request-title");
+    this.requestDrawer.addEventListener("close", () => {
+      const key = this.requestKey;
+      this.requestKey = null;
+      if (section.hidden) return;
+      const trigger = Array.from(this.scroll.querySelectorAll<HTMLButtonElement>(".req-inspect"))
+        .find((button) => button.dataset.request === key);
+      (trigger ?? this.scroll.querySelector<HTMLButtonElement>(".monitor-refresh"))?.focus();
+    });
+    section.replaceChildren(this.scroll, this.requestDrawer);
     try {
       const stored = parseHistory(window.localStorage.getItem(HISTORY_KEY), Date.now());
       this.decodePoints = stored.decode;
       this.ttftPoints = stored.ttft;
+      this.prefillPoints = stored.prefill ?? [];
       this.decodeHistory = values(stored.decode);
       this.ttftHistory = values(stored.ttft);
+      this.prefillHistory = values(this.prefillPoints);
     } catch {
       // Storage unavailable (private mode, quota): history stays in memory.
     }
@@ -138,7 +163,7 @@ export class MonitorView {
     // no last-good field.
     const panel = healthOk
       ? await refreshRecentRows()
-      : { recent: null, recentError: null };
+      : { recent: null, recentError: null, active: null };
     if (healthOk) {
       try {
         this.telemetry = await getTelemetry(AbortSignal.timeout(4000));
@@ -161,19 +186,32 @@ export class MonitorView {
       systemError,
       recent: panel.recent,
       recentError: panel.recentError,
+      active: panel.active,
     });
+    if (this.data.active !== null) {
+      const live = liveSpeeds(this.activeSnapshot, this.data.active, this.data.checkedAt);
+      this.activeSnapshot = live.next;
+      this.activeSpeeds = live.speeds;
+      this.activeTotalPerSecond = live.totalPerSecond;
+    } else {
+      this.activeSnapshot = {};
+      this.activeSpeeds = {};
+      this.activeTotalPerSecond = 0;
+    }
     if (this.data.recent !== null) {
       const speed = speedSummary(this.data.recent);
       this.decodeHistory = [...this.decodeHistory, speed.decodePerSecond].slice(-HISTORY_CAP);
       this.ttftHistory = [...this.ttftHistory, speed.firstTokenMs].slice(-HISTORY_CAP);
       this.decodePoints = appendPoint(this.decodePoints, this.data.checkedAt, speed.decodePerSecond);
       this.ttftPoints = appendPoint(this.ttftPoints, this.data.checkedAt, speed.firstTokenMs);
+      this.prefillPoints = appendPoint(this.prefillPoints, this.data.checkedAt, speed.prefillPerSecond);
       this.decodeHistory = values(this.decodePoints);
       this.ttftHistory = values(this.ttftPoints);
+      this.prefillHistory = values(this.prefillPoints);
       try {
         window.localStorage.setItem(
           HISTORY_KEY,
-          serialize({ decode: this.decodePoints, ttft: this.ttftPoints })
+          serialize({ decode: this.decodePoints, ttft: this.ttftPoints, prefill: this.prefillPoints })
         );
       } catch {
         // Persistence is best-effort; the in-memory trend still works.
@@ -183,10 +221,14 @@ export class MonitorView {
     return this.data;
   }
 
+  closeRequestDetail(): void {
+    if (this.requestDrawer.open) this.requestDrawer.close();
+  }
+
   private card(title: string, sub?: string): { card: HTMLElement; body: HTMLElement } {
-    const card = document.createElement("div");
-    card.className = "card";
-    const h3 = document.createElement("h3");
+    const card = document.createElement("section");
+    card.className = "monitor-section";
+    const h3 = document.createElement("h2");
     h3.textContent = title;
     card.append(h3);
     if (sub !== undefined) {
@@ -260,46 +302,83 @@ export class MonitorView {
     body.append(svg);
   }
 
-  private statCard(parent: HTMLElement, label: string, value: string, sub: string, state?: string): void {
-    const card = document.createElement("div");
-    card.className = "stat-card";
-    const labelEl = document.createElement("div");
-    labelEl.className = "stat-label";
-    if (state !== undefined) {
-      const dot = document.createElement("span");
-      dot.className = "stat-dot s-" + state;
-      dot.setAttribute("aria-hidden", "true");
-      labelEl.append(dot);
+  /** The hero band: one line of engine-wide figures, big numerals with
+   * small labels, hairline-separated — in flight, waiting, live total
+   * throughput, the finished-request median, and the hardware load. */
+  private renderOverview(): HTMLElement {
+    const band = document.createElement("div");
+    band.className = "monitor-hero";
+    const engines = this.data.system?.engines;
+    const queue = engines?.some((engine) => engine.queued === undefined)
+      ? null
+      : engines?.reduce((sum, engine) => sum + (engine.queued ?? 0), 0) ?? null;
+    const decode = this.data.recent === null ? null : speedSummary(this.data.recent).decodePerSecond;
+    const gpus = this.telemetry?.gpus ?? [];
+    const memory = gpus.filter((gpu) => gpu.mem_used_bytes !== null && (gpu.mem_total_bytes ?? 0) > 0);
+    const used = memory.reduce((sum, gpu) => sum + (gpu.mem_used_bytes ?? 0), 0);
+    const total = memory.reduce((sum, gpu) => sum + (gpu.mem_total_bytes ?? 0), 0);
+    const reporting = gpus.filter((gpu) => gpu.util_percent !== null);
+    const load = reporting.length === 0
+      ? null
+      : reporting.reduce((sum, gpu) => sum + (gpu.util_percent ?? 0), 0) / reporting.length;
+    let serverStatus = "Checking…";
+    let serverState = "offline";
+    if (this.data.checkedAt !== 0) {
+      serverStatus = "No answer";
+      if (this.data.healthOk) {
+        serverStatus = this.data.readyOk ? "Ready" : "Not ready";
+        serverState = this.data.readyOk ? "ready" : "busy";
+      }
     }
-    labelEl.append(document.createTextNode(label));
-    const valueEl = document.createElement("div");
-    valueEl.className = "stat-value";
-    valueEl.textContent = value;
-    const subEl = document.createElement("div");
-    subEl.className = "stat-sub";
-    subEl.textContent = sub;
-    card.append(labelEl, valueEl, subEl);
-    parent.append(card);
+    const status = document.createElement("span");
+    status.className = "hero-status";
+    const dot = document.createElement("span");
+    dot.className = "stat-dot s-" + serverState;
+    dot.setAttribute("aria-hidden", "true");
+    status.append(dot, document.createTextNode(serverStatus + (this.data.notReadyCode ? " · " + this.data.notReadyCode : "")));
+    band.append(status);
+    const inFlight = this.data.active;
+    const figs: Array<[string, string]> = [
+      [inFlight === null ? "—" : String(inFlight.length), "in flight"],
+      [queue === null ? "—" : String(queue), "waiting"],
+      [inFlight === null || inFlight.length === 0 ? "—" : this.activeTotalPerSecond.toFixed(1), "tok/s now · all requests"],
+      [decode === null ? "—" : decode.toFixed(1), "tok/s median · finished"],
+      [load === null ? "—" : Math.round(load) + "%", "GPU load · " + (total === 0 ? "no data" : formatBytes(used) + " / " + formatBytes(total))],
+    ];
+    const host = this.data.system?.host;
+    const ramUsed = typeof host?.mem_total_bytes === "number" && typeof host?.mem_available_bytes === "number"
+      ? host.mem_total_bytes - host.mem_available_bytes
+      : null;
+    if (ramUsed !== null && typeof host?.mem_total_bytes === "number") {
+      figs.push([formatBytes(ramUsed), "RAM · of " + formatBytes(host.mem_total_bytes)]);
+    }
+    for (const [value, label] of figs) {
+      const fig = document.createElement("div");
+      fig.className = "hero-fig";
+      const num = document.createElement("span");
+      num.className = "hero-num";
+      num.textContent = value;
+      const text = document.createElement("span");
+      text.className = "hero-label";
+      text.textContent = label;
+      fig.append(num, text);
+      band.append(fig);
+    }
+    return band;
   }
 
   private render(): void {
-    this.section.textContent = "";
-    const scroll = document.createElement("div");
-    scroll.className = "panel-scroll";
     const column = document.createElement("div");
-    column.className = "panel-column panel-wide";
+    column.className = "panel-column monitor-column";
     const head = document.createElement("div");
-    head.className = "panel-head";
+    head.className = "panel-head monitor-head";
     const h2 = document.createElement("h2");
-    h2.textContent = "Monitor";
+    h2.textContent = "Server overview";
     const live = document.createElement("span");
-    live.className = "live-badge" + (this.data.healthOk ? " live-on" : "");
-    live.textContent =
-      this.data.checkedAt === 0
-        ? "Not checked yet"
-        : (this.data.healthOk ? "Live" : "No answer") + " · " + formatClock(this.data.checkedAt) + " · refreshes every 5 s";
+    live.className = "live-badge";
+    live.textContent = this.data.checkedAt ? `Checked ${formatClock(this.data.checkedAt)}` : "Not checked yet";
     const refresh = document.createElement("button");
-    refresh.className = "btn";
+    refresh.className = "btn monitor-refresh";
     refresh.type = "button";
     refresh.textContent = "Refresh";
     refresh.addEventListener("click", () => void this.refresh());
@@ -310,7 +389,7 @@ export class MonitorView {
       const alert = document.createElement("div");
       alert.className = "monitor-alert";
       alert.setAttribute("role", "status");
-      alert.textContent = "Server not answering. Check that enginesrv is running, then Refresh.";
+      alert.textContent = "Server not answering. Check that enginesrv is running, then select Refresh.";
       column.append(alert);
     }
 
@@ -331,59 +410,29 @@ export class MonitorView {
       column.append(alert);
     }
 
-    column.append(this.renderOverview());
-    const row = document.createElement("div");
-    row.className = "monitor-grid";
-    row.append(this.renderSpeedCard(), this.renderSystemCard());
-    column.append(row);
-    column.append(this.renderRatesCard());
-    column.append(this.renderGpuCard());
-    column.append(this.renderEnginesCard());
-    column.append(this.renderRequestsCard());
+    column.append(this.renderOverview(), this.renderActiveCard(), this.renderRequestsCard());
+    const metrics = document.createElement("div");
+    metrics.className = "monitor-grid";
+    metrics.append(this.renderSpeedCard(), this.renderGpuCard());
+    column.append(metrics, this.renderRatesCard());
+    const system = document.createElement("div");
+    system.className = "monitor-grid";
+    system.append(this.renderSystemCard(), this.renderEnginesCard());
+    column.append(system);
 
-    scroll.append(column);
-    this.section.append(scroll);
+    const focused = document.activeElement;
+    const requestKey = focused instanceof HTMLButtonElement ? focused.dataset.request : undefined;
+    const keepRefresh = this.scroll.contains(focused) && focused?.classList.contains("monitor-refresh");
+    this.scroll.replaceChildren(column);
+    if (requestKey !== undefined) {
+      const request = Array.from(column.querySelectorAll<HTMLButtonElement>(".req-inspect"))
+        .find((button) => button.dataset.request === requestKey);
+      (request ?? refresh).focus({ preventScroll: true });
+    } else if (keepRefresh) {
+      refresh.focus({ preventScroll: true });
+    }
   }
 
-  private renderOverview(): HTMLElement {
-    const grid = document.createElement("div");
-    grid.className = "stat-grid";
-    const engines = (this.data.models ?? []).flatMap((m) => m.engines ?? []);
-    const readyCount = engines.filter((e) => e.state === "ready" || e.state === "busy").length;
-    const busyCount = engines.filter((e) => e.state === "busy").length;
-    const totals = this.data.recent === null ? null : requestTotals(this.data.recent);
-    this.statCard(
-      grid,
-      "Server",
-      this.data.healthOk ? "Running" : "No answer",
-      this.data.checkedAt === 0 ? "Not checked yet" : "Checked " + formatClock(this.data.checkedAt),
-      this.data.healthOk ? "ready" : "offline"
-    );
-    this.statCard(
-      grid,
-      "Readiness",
-      this.data.readyOk ? "Ready" : this.data.notReadyCode ?? "Not ready",
-      this.data.readyOk ? "An engine accepts requests" : "No engine accepts requests yet",
-      this.data.readyOk ? "ready" : "busy"
-    );
-    this.statCard(
-      grid,
-      "Engines",
-      engines.length === 0 ? "—" : readyCount + " / " + engines.length + " ready",
-      busyCount > 0 ? busyCount + " busy now" : engines.length === 0 ? "No model list yet" : "None busy",
-      busyCount > 0 ? "busy" : "ready"
-    );
-    this.statCard(
-      grid,
-      "Requests kept",
-      totals === null ? "—" : String(totals.total),
-      totals === null
-        ? "No answer from the server yet"
-        : totals.ok + " ok · " + totals.errors + " errors · " + totals.cancelled + " stopped",
-      totals !== null && totals.errors > 0 ? "error" : "ready"
-    );
-    return grid;
-  }
 
   private renderSpeedCard(): HTMLElement {
     const { card, body } = this.card("Live speed", "Medians over finished requests in the retained ring.");
@@ -404,28 +453,27 @@ export class MonitorView {
     const totals = requestTotals(this.data.recent);
     const big = document.createElement("div");
     big.className = "speed-big";
-    const decode = document.createElement("div");
-    const decodeValue = document.createElement("div");
-    decodeValue.className = "speed-value";
-    decodeValue.textContent = speed.decodePerSecond === null ? "—" : speed.decodePerSecond.toFixed(1);
-    const decodeLabel = document.createElement("div");
-    decodeLabel.className = "stat-sub";
-    decodeLabel.textContent = "tok/s decode (median)";
-    decode.append(decodeValue, decodeLabel);
-    const ttft = document.createElement("div");
-    const ttftValue = document.createElement("div");
-    ttftValue.className = "speed-value";
-    ttftValue.textContent = speed.firstTokenMs === null ? "—" : Math.round(speed.firstTokenMs) + " ms";
-    const ttftLabel = document.createElement("div");
-    ttftLabel.className = "stat-sub";
-    ttftLabel.textContent = "First token (median)";
-    ttft.append(ttftValue, ttftLabel);
-    big.append(decode, ttft);
+    for (const figure of [
+      [speed.decodePerSecond === null ? "—" : speed.decodePerSecond.toFixed(1), "tok/s decode (median)"],
+      [speed.prefillPerSecond === null ? "—" : Math.round(speed.prefillPerSecond).toLocaleString(), "tok/s prefill (median)"],
+      [speed.firstTokenMs === null ? "—" : Math.round(speed.firstTokenMs) + " ms", "First token (median)"],
+    ] as Array<[string, string]>) {
+      const cell = document.createElement("div");
+      const value = document.createElement("div");
+      value.className = "speed-value";
+      value.textContent = figure[0];
+      const label = document.createElement("div");
+      label.className = "stat-sub";
+      label.textContent = figure[1];
+      cell.append(value, label);
+      big.append(cell);
+    }
     body.append(big);
     this.spark(body, this.decodeHistory, "Decode speed trend");
+    this.spark(body, this.prefillHistory, "Prefill speed trend");
     const sparkLabel = document.createElement("div");
     sparkLabel.className = "stat-sub";
-    sparkLabel.textContent = "Decode trend · one point per refresh · TTFT median now " +
+    sparkLabel.textContent = "Trends · one point per refresh · TTFT median now " +
       (speed.firstTokenMs === null ? "—" : Math.round(speed.firstTokenMs) + " ms");
     body.append(sparkLabel);
     this.fact(body, "Finished ok", String(totals.ok) + " of " + totals.total);
@@ -613,8 +661,109 @@ export class MonitorView {
     return card;
   }
 
+  /** The serving engine's context limit for an active row, matched by
+   * engine id first, then by model — the system route carries both. */
+  private contextLimitOf(row: ActiveRequest): number | null {
+    const engines = this.data.system?.engines ?? [];
+    const engine = engines.find((e) => e.id === row.engine) ?? engines.find((e) => e.model === row.model);
+    return engine?.context_limit ?? null;
+  }
+
+  /** One in-flight row: the phase chip, the numbers the board carries,
+   * and the live decode speed derived from the previous poll. Elapsed
+   * comes from the row's own start time, so it ticks with the poll. */
+  private activeRow(row: ActiveRequest): HTMLTableRowElement {
+    const tr = document.createElement("tr");
+    const phase = document.createElement("td");
+    const chip = document.createElement("span");
+    chip.className = "state-chip s-" + row.phase;
+    chip.textContent = row.phase;
+    phase.append(chip);
+    const model = document.createElement("td");
+    const name = document.createElement("div");
+    name.textContent = row.model;
+    const engineSub = document.createElement("div");
+    engineSub.className = "stat-sub";
+    engineSub.textContent = row.engine ?? "—";
+    model.append(name, engineSub);
+    const session = document.createElement("td");
+    session.textContent = row.session ?? "—";
+    const elapsedMs = Math.max(0, Date.now() - row.started_at_ms);
+    const limit = this.contextLimitOf(row);
+    const used = row.prompt_tokens + row.completion_tokens;
+    const context = document.createElement("td");
+    if (limit !== null && limit > 0) {
+      context.className = "num";
+      context.title = used.toLocaleString() + " of " + limit.toLocaleString() + " tokens · prompt " + row.prompt_tokens.toLocaleString();
+      context.textContent = Math.round((used / limit) * 100) + "%";
+    } else {
+      context.textContent = "—";
+    }
+    tr.append(phase, model, session, context);
+    const speed = this.activeSpeeds[row.request_id];
+    const cells: Array<[string, boolean]> = [
+      [String(row.completion_tokens), true],
+      [speed === undefined ? "—" : speed.toFixed(1), true],
+      [elapsedMs >= 60_000
+        ? Math.floor(elapsedMs / 60_000) + " m " + String(Math.floor((elapsedMs % 60_000) / 1000)).padStart(2, "0") + " s"
+        : (elapsedMs / 1000).toFixed(1) + " s", true],
+    ];
+    for (const [text, numeric] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (numeric) td.className = "num";
+      tr.append(td);
+    }
+    return tr;
+  }
+
+  private renderActiveCard(): HTMLElement {
+    const { card, body } = this.card("Active now", "In-flight requests from queue to finish · tok/s is measured between refreshes · prompt tokens in the context tooltip.");
+    if (this.data.recentError !== null && this.data.active === null) {
+      this.hint(
+        body,
+        this.data.recentError === "unauthorized"
+          ? "Set the API key in About to see requests."
+          : "The recent-requests route failed: " + this.data.recentError
+      );
+      return card;
+    }
+    const active = this.data.active ?? [];
+    if (active.length === 0) {
+      this.hint(body, "No requests running. The next one appears here from queue to finish.");
+      return card;
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "req-table-wrap";
+    const table = document.createElement("table");
+    table.className = "req-table";
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const [label, numeric] of [
+      ["Phase", false],
+      ["Model", false],
+      ["Session", false],
+      ["Context", true],
+      ["Out", true],
+      ["tok/s", true],
+      ["Elapsed", true],
+    ] as Array<[string, boolean]>) {
+      const th = document.createElement("th");
+      th.textContent = label;
+      if (numeric) th.className = "num";
+      headRow.append(th);
+    }
+    thead.append(headRow);
+    const tbody = document.createElement("tbody");
+    for (const row of active) tbody.append(this.activeRow(row));
+    table.append(thead, tbody);
+    wrap.append(table);
+    body.append(wrap);
+    return card;
+  }
+
   private renderRequestsCard(): HTMLElement {
-    const { card, body } = this.card("Recent requests", "Newest first. The server keeps the last 64; prompt and reply text are never shown.");
+    const { card, body } = this.card("Recent requests", "Newest first · Up to 12 shown · Inspect any row for timings and token counts.");
     if (this.data.recentError !== null) {
       this.hint(
         body,
@@ -642,13 +791,9 @@ export class MonitorView {
       ["Time", false],
       ["Model", false],
       ["Result", false],
-      ["Prompt", true],
-      ["Reused", true],
-      ["Output", true],
       ["Queue", true],
-      ["Prefill", true],
       ["First token", true],
-      ["Speed", true],
+      ["Decode", true],
     ] as Array<[string, boolean]>) {
       const th = document.createElement("th");
       th.textContent = label;
@@ -672,9 +817,6 @@ export class MonitorView {
       downloadText("recent-requests.jsonl", rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "application/json");
     });
     body.append(exportBtn);
-    if (this.selectedRequest !== null) {
-      body.append(this.requestDetail(this.selectedRequest));
-    }
     const totals = requestTotals(this.data.recent);
     const foot = document.createElement("p");
     foot.className = "req-totals";
@@ -686,38 +828,32 @@ export class MonitorView {
     return card;
   }
 
-  private requestDetail(row: RecentRequest): HTMLElement {
-    const detail = document.createElement("div");
-    detail.className = "request-detail";
-    const head = document.createElement("div");
-    head.className = "code-head";
-    const title = document.createElement("span");
-    title.className = "code-lang";
+  private openRequestDetail(row: RecentRequest, key: string): void {
+    this.requestKey = key;
+    const head = document.createElement("header");
+    head.className = "side-drawer-head";
+    const title = document.createElement("h2");
+    title.id = "monitor-request-title";
     title.textContent = "Request detail";
     const close = document.createElement("button");
     close.type = "button";
-    close.className = "code-copy";
+    close.className = "btn";
     close.textContent = "Close";
-    close.addEventListener("click", () => {
-      this.selectedRequest = null;
-      this.render();
-    });
-    const copyJson = document.createElement("button");
-    copyJson.type = "button";
-    copyJson.className = "code-copy";
-    copyJson.textContent = "Copy JSON";
-    copyJson.addEventListener("click", () => {
-      void navigator.clipboard?.writeText(JSON.stringify(row, null, 2)).catch(() => undefined);
-      copyJson.textContent = "Copied";
-      window.setTimeout(() => (copyJson.textContent = "Copy JSON"), 1500);
-    });
-    head.append(title, copyJson, close);
-    detail.append(head);
+    close.autofocus = true;
+    close.addEventListener("click", () => this.closeRequestDetail());
+    head.append(title, close);
+    const host = document.createElement("div");
+    host.className = "monitor-detail-body";
     const dl = document.createElement("dl");
     dl.className = "fact-grid";
-    detail.append(dl);
-    const host = document.createElement("div");
-    host.append(dl);
+    const copyJson = document.createElement("button");
+    copyJson.type = "button";
+    copyJson.className = "btn";
+    copyJson.textContent = "Copy JSON";
+    copyJson.addEventListener("click", () => {
+      void copyText(JSON.stringify(row, null, 2), this.requestDrawer).then((ok) => flashCopied(copyJson, ok));
+    });
+    host.append(dl, copyJson);
     const facts: Array<[string, string]> = [
       ["Time", row.started_at_ms === undefined ? "—" : new Date(row.started_at_ms).toLocaleString()],
       ["Model", row.model],
@@ -741,30 +877,35 @@ export class MonitorView {
       dd.textContent = value;
       dl.append(dt, dd);
     }
-    detail.append(host);
-    return detail;
+    this.requestDrawer.replaceChildren(head, host);
+    this.requestDrawer.showModal();
   }
 
   private requestRow(row: RecentRequest): HTMLTableRowElement {
     const tr = document.createElement("tr");
-    tr.tabIndex = 0;
     tr.className = "req-row-clickable";
-    tr.setAttribute("aria-label", "Show request detail");
-    const open = (): void => {
-      this.selectedRequest = row;
-      this.render();
-    };
-    tr.addEventListener("click", open);
-    tr.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") open();
-    });
+    const key = JSON.stringify(row);
+    tr.addEventListener("click", () => this.openRequestDetail(row, key));
     const time = document.createElement("td");
     time.className = "num";
     time.textContent = row.started_at_ms === undefined ? "—" : formatClock(row.started_at_ms);
     tr.append(time);
     const model = document.createElement("td");
-    model.className = "mono req-model";
-    model.textContent = row.model + (row.engine ? " · " + row.engine : "") + (row.stream ? " · stream" : "");
+    model.className = "req-model";
+    const inspect = document.createElement("button");
+    inspect.type = "button";
+    inspect.className = "req-inspect";
+    inspect.textContent = row.model;
+    inspect.dataset.request = key;
+    inspect.setAttribute("aria-label", `Show request detail for ${row.model}`);
+    inspect.setAttribute("aria-haspopup", "dialog");
+    model.append(inspect);
+    if (row.engine) {
+      const engine = document.createElement("span");
+      engine.className = "req-status";
+      engine.textContent = row.engine;
+      model.append(engine);
+    }
     const result = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = "outcome-badge o-" + row.outcome;
@@ -785,11 +926,7 @@ export class MonitorView {
     }
     tr.append(model, result);
     const cells: Array<[string, string]> = [
-      [formatTokens(row.prompt_tokens), "num"],
-      [formatTokens(row.reused_tokens), "num"],
-      [formatTokens(row.completion_tokens), "num"],
-      [row.queue_wait_ms === null || row.queue_wait_ms === undefined ? "—" : Math.round(row.queue_wait_ms) + " ms", "num"],
-      [row.prefill_ms === null || row.prefill_ms === undefined ? "—" : Math.round(row.prefill_ms) + " ms", "num"],
+      [row.queue_wait_ms == null ? "—" : `${Math.round(row.queue_wait_ms)} ms`, "num"],
       [row.time_to_first_token_ms === null ? "—" : Math.round(row.time_to_first_token_ms) + " ms", "num"],
       [row.decode_tokens_per_second === null ? "—" : row.decode_tokens_per_second.toFixed(1) + " tok/s", "num"],
     ];

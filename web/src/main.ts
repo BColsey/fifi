@@ -421,7 +421,9 @@ function main(): void {
     const drawerButton = document.getElementById("drawer-button");
     if (drawerButton !== null) drawerButton.hidden = name !== "chat";
     if (name === "monitor") void monitor.refresh();
+    else monitor.closeRequestDetail();
     if (name === "models") void modelsView.refresh();
+    else modelsView.closeDownloads();
     if (name === "about") about.updateModels(models);
     if (name === "chat") el<HTMLTextAreaElement>("composer-input").focus();
   }

@@ -1,39 +1,127 @@
-/**
- * The Models view: search the Hugging Face hub, download into the
- * hub cache, and serve or stop engines at runtime — the GUI side of
- * /v1/hf/* and /v1/engines. Every fetch goes through api.ts.
- */
-
 import {
-  type EngineSummary, type HubCache, type HubDownloadJob, type HubSearchRow,
-  addEngine, cancelHubDownload, listEngines, listHubCache, listHubDownloads,
+  type EngineSummary, type HubCache, type HubDownloadJob, type HubSearchRow, type HubTree, type ResourceEstimate,
+  addEngine, cancelHubDownload, getHubTree, getSystem, getTelemetry, listEngines, listHubCache, listHubDownloads,
   removeEngine, searchHubModels, startHubDownload,
 } from "./api.js";
-import { formatBytes } from "./format.js";
+import { formatBytes, formatDate, formatTokens } from "./format.js";
+import { assessFit, ggufVariants, type Fit, type FitBudget } from "./model-fit.js";
 
-/** One card with a title, built once, filled by render passes. */
-function card(title: string): { root: HTMLDivElement; body: HTMLDivElement } {
-  const root = document.createElement("div");
-  root.className = "card";
-  const h3 = document.createElement("h3");
-  h3.textContent = title;
-  const body = document.createElement("div");
-  root.append(h3, body);
+const GiB = 2 ** 30;
+const tierLabels: Record<Fit, string> = {
+  gpu: "VRAM only",
+  ram: "VRAM → RAM streaming",
+  ssd: "VRAM → RAM → SSD streaming candidate",
+  "disk-unknown": "SSD streaming candidate · free space unknown",
+  "too-large": "Not enough SSD space",
+  unknown: "Not enough data to estimate fit",
+};
+
+function available(bytes?: number): string {
+  return bytes === undefined ? "unknown" : formatBytes(bytes);
+}
+
+async function getFitBudget(signal: AbortSignal): Promise<FitBudget> {
+  const [system, telemetry] = await Promise.all([
+    getSystem(signal).catch(() => undefined), getTelemetry(signal).catch(() => undefined),
+  ]);
+  const ram = system?.host?.mem_available_bytes;
+  let vram: number | undefined;
+  for (const gpu of telemetry?.gpus ?? []) {
+    if (gpu.mem_total_bytes == null || gpu.mem_used_bytes == null) continue;
+    const free = gpu.mem_total_bytes - gpu.mem_used_bytes;
+    if (free >= 0 && (vram === undefined || free > vram)) vram = free;
+  }
+  return { vram, ram: typeof ram === "number" ? ram : undefined };
+}
+
+function el<K extends keyof HTMLElementTagNameMap>(
+  tag: K, text = "", className = "",
+): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  node.className = className;
+  return node;
+}
+
+function button(text: string, action: (button: HTMLButtonElement) => void, label = text): HTMLButtonElement {
+  const node = el("button", text, "btn");
+  node.type = "button";
+  node.setAttribute("aria-label", label);
+  node.addEventListener("click", () => action(node));
+  return node;
+}
+
+function card(title: string, description?: string): { root: HTMLElement; body: HTMLDivElement } {
+  const root = el("section", "", "card models-card");
+  const body = el("div");
+  root.append(el("h2", title));
+  if (description) root.append(el("p", description, "models-muted"));
+  root.append(body);
   return { root, body };
 }
 
-function line(text: string): HTMLParagraphElement {
-  const p = document.createElement("p");
-  p.textContent = text;
-  return p;
+function capacityStrip(budget: FitBudget | null): HTMLDListElement {
+  const strip = el("dl", "", "models-capacity");
+  const entries = [
+    ["Free VRAM", budget ? available(budget.vram) : "…"],
+    ["Available RAM", budget ? available(budget.ram) : "…"],
+    ["SSD", "Not reported"],
+  ];
+  for (const [label, amount] of entries) {
+    const cell = el("div", "", "models-capacity-cell");
+    cell.append(el("dt", label), el("dd", amount));
+    strip.append(cell);
+  }
+  return strip;
+}
+
+function badge(text: string, tone = ""): HTMLSpanElement {
+  return el("span", text, `models-badge ${tone}`);
+}
+
+function row(title: string | HTMLElement, detail: string, status?: HTMLElement): HTMLElement {
+  const node = el("article", "", "models-row");
+  const heading = el("h3");
+  heading.append(title);
+  const head = el("div", "", "models-row-head");
+  head.append(heading);
+  if (status) head.append(status);
+  node.append(head, el("p", detail, "models-muted"));
+  return node;
+}
+
+function empty(text: string): HTMLElement {
+  return el("p", text, "models-empty");
+}
+
+function estimateDetails(est: ResourceEstimate): HTMLElement {
+  const details = el("details", "", "models-details");
+  const summary = el("summary", est.planned ? "Resource estimate" : "Resource estimate · weights only");
+  const facts = el("dl", "", "models-resources");
+  for (const [label, bytes] of [
+    ["GPU VRAM", est.vram_bytes], ["Host RAM", est.ram_bytes], ["Disk", est.disk_bytes],
+  ] as const) {
+    const item = el("div");
+    item.append(el("dt", label), el("dd", formatBytes(bytes)));
+    facts.append(item);
+  }
+  details.append(summary, facts, el("p", est.basis, "models-muted"), el("p", est.mode, "models-muted"));
+  return details;
 }
 
 export function statusOf(job: HubDownloadJob): string {
   switch (job.state) {
-    case "downloading":
-      return `${job.files_done ?? 0}/${job.files_total ?? "?"} files, ` +
-        `${formatBytes(job.bytes ?? 0)} of ${formatBytes(job.bytes_total ?? 0)}` +
-        (job.current_file === undefined ? "" : ` — ${job.current_file}`);
+    case "downloading": {
+      const parts: string[] = [];
+      if (job.files_total !== undefined) parts.push(`${job.files_done ?? 0}/${job.files_total} files`);
+      if (job.bytes_total !== undefined) {
+        parts.push(`${formatBytes(job.bytes ?? 0)} of ${formatBytes(job.bytes_total)}`);
+      } else if (job.bytes !== undefined) {
+        parts.push(`${formatBytes(job.bytes)} received`);
+      }
+      const progress = parts.join(", ") || "Preparing download";
+      return job.current_file ? `${progress} — ${job.current_file}` : progress;
+    }
     case "failed":
       return job.detail ?? "failed";
     default:
@@ -71,124 +159,208 @@ export function snapshotStatus(snapshot: {
   return `serves as ${snapshot.families.join(", ")}`;
 }
 
-/** The one-line resource ladder for a model the user is looking
- * at: the weights one engine loads, then the tier note. */
-export function estimateLine(est: {
-  vram_bytes: number;
-  ram_bytes: number;
-  disk_bytes: number;
-  mode: string;
-  planned?: boolean;
-}): string {
-  const weightsOnly = est.planned === false ? " (weights only; cache and working set not added)" : "";
-  return `${formatBytes(est.vram_bytes)} resident on GPU, or streamed from RAM/disk — picked automatically${weightsOnly}`;
-}
-
 export class ModelsView {
-  private readonly searchBody: HTMLDivElement;
-  private readonly downloadsBody: HTMLDivElement;
-  private readonly cacheBody: HTMLDivElement;
-  private readonly enginesBody: HTMLDivElement;
-  private readonly queryInput: HTMLInputElement;
-  private readonly ggufBox: HTMLInputElement;
-  private readonly exl3Box: HTMLInputElement;
-  private results: HubSearchRow[] = [];
-  private searchError: string | null = null;
-  private downloads: HubDownloadJob[] = [];
-  private cache: HubCache | null = null;
-  private cacheError: string | null = null;
+  private readonly discovery = card("Find a model", "Search Hugging Face by model name or owner/repository.");
+  private readonly library = card("Local cache");
+  private readonly serving = card("Engines");
+  private readonly queryInput = el("input", "", "text-field");
+  private readonly format = el("select", "", "text-field");
+  private readonly feedback = el("p", "", "models-feedback");
+  private readonly searchStatus = el("p", "", "models-muted models-search-status");
+  private readonly results = el("div", "", "models-results");
+  private readonly capacity = el("div");
+  private readonly downloadDrawer = el("dialog", "", "side-drawer models-download-drawer");
+  private readonly downloadList = el("div", "", "models-download-list");
+  private readonly downloadFeedback = el("p", "", "models-feedback");
+  private readonly downloadLauncher = button("Downloads", () => this.openDownloads());
+  private readonly closeDownloadButton = button("Close", () => this.closeDownloads(), "Close downloads");
+  private readonly clearFinishedButton = button("Clear finished", () => this.clearFinishedDownloads());
+  // The server owns downloads and files. Clearing affects this page's list only.
+  private readonly clearedDownloads = new Set<number>();
+  private budgetRead: Promise<FitBudget> | null = null;
   private engines: EngineSummary[] = [];
-  private enginesError: string | null = null;
-  private note: string | null = null;
+  private downloads: HubDownloadJob[] = [];
+  private searchController: AbortController | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private refreshing = false;
+  private refreshAgain = false;
 
   constructor(section: HTMLElement) {
-    section.replaceChildren();
+    const hardware = card("Server capacity");
+    this.capacity.replaceChildren(capacityStrip(null));
+    hardware.body.append(this.capacity);
 
-    const search = card("Hub search");
-    const form = document.createElement("form");
-    this.queryInput = document.createElement("input");
+    this.feedback.setAttribute("role", "status");
+    this.searchStatus.setAttribute("role", "status");
+    this.buildSearch();
+    this.buildDownloads();
+    this.discovery.root.prepend(this.downloadLauncher);
+    for (const section of [this.library, this.serving]) {
+      section.body.append(empty("Loading…"));
+    }
+    const local = el("aside", "", "models-local");
+    local.setAttribute("aria-label", "Local model status");
+    local.append(hardware.root, this.serving.root, this.library.root,
+      button("Refresh local status", () => {
+        void this.readBudget();
+        void this.refresh(true);
+      }),
+    );
+
+    const content = el("div", "", "models-content");
+    content.append(this.discovery.root, local);
+    section.replaceChildren(content, this.downloadDrawer);
+  }
+
+  private buildDownloads(): void {
+    const title = el("h2", "Downloads");
+    title.id = "models-download-title";
+    this.downloadDrawer.id = "models-downloads";
+    this.downloadDrawer.setAttribute("aria-labelledby", title.id);
+    this.downloadLauncher.classList.add("models-download-launcher");
+    this.downloadLauncher.setAttribute("aria-haspopup", "dialog");
+    this.downloadLauncher.setAttribute("aria-controls", this.downloadDrawer.id);
+    this.downloadDrawer.addEventListener("close", () => this.downloadLauncher.focus({ preventScroll: true }));
+    this.closeDownloadButton.autofocus = true;
+    const head = el("header", "", "side-drawer-head");
+    head.append(title, this.closeDownloadButton);
+    const tools = el("div", "", "models-download-tools");
+    const hint = el("p", "Clearing the list keeps active downloads and cached files.", "models-muted");
+    tools.append(this.clearFinishedButton, hint, this.downloadFeedback);
+    this.downloadFeedback.setAttribute("role", "status");
+    this.clearFinishedButton.disabled = true;
+    this.downloadList.append(empty("Loading…"));
+    this.downloadDrawer.append(head, tools, this.downloadList);
+  }
+
+  private openDownloads(): void {
+    if (this.downloadDrawer.open) return;
+    this.downloadFeedback.textContent = "";
+    this.downloadDrawer.showModal();
+    void this.refresh();
+  }
+
+  closeDownloads(): void {
+    if (this.downloadDrawer.open) this.downloadDrawer.close();
+  }
+
+  private clearFinishedDownloads(): void {
+    for (const job of this.downloads) {
+      if (job.state !== "downloading") this.clearedDownloads.add(job.id);
+    }
+    this.closeDownloadButton.focus();
+    this.replaceRows(this.downloadList, this.downloadRows());
+    this.downloadFeedback.textContent = "Finished downloads cleared from this view.";
+  }
+
+  private downloadRows(): HTMLElement[] {
+    const activeCount = this.downloads.filter((job) => job.state === "downloading").length;
+    const label = activeCount ? `Downloads · ${activeCount} active` : "Downloads";
+    this.downloadLauncher.textContent = label;
+    this.downloadLauncher.setAttribute("aria-label", label);
+    const visible = this.downloads.filter((job) => job.state === "downloading" || !this.clearedDownloads.has(job.id));
+    this.clearFinishedButton.disabled = visible.length === activeCount;
+    visible.sort((a, b) => Number(b.state === "downloading") - Number(a.state === "downloading") || b.id - a.id);
+    return visible.length ? visible.map((job) => this.downloadRow(job)) : [empty("No downloads to show.")];
+  }
+
+  private buildSearch(): void {
+    const form = el("form", "", "models-search");
+    form.setAttribute("role", "search");
     this.queryInput.type = "search";
-    this.queryInput.placeholder = "org/repo or free text";
-    this.queryInput.setAttribute("aria-label", "Search the hub");
-    this.ggufBox = document.createElement("input");
-    this.ggufBox.type = "checkbox";
-    const ggufLabel = document.createElement("label");
-    ggufLabel.append(this.ggufBox, document.createTextNode(" GGUF"));
-    this.exl3Box = document.createElement("input");
-    this.exl3Box.type = "checkbox";
-    const exl3Label = document.createElement("label");
-    exl3Label.append(this.exl3Box, document.createTextNode(" EXL3"));
-    const button = document.createElement("button");
-    button.type = "submit";
-    button.textContent = "Search";
-    form.append(this.queryInput, ggufLabel, exl3Label, button);
+    this.queryInput.placeholder = "e.g. Qwen 3.6 or owner/repository";
+    this.queryInput.setAttribute("aria-label", "Search Hugging Face");
+    this.queryInput.required = true;
+    this.format.setAttribute("aria-label", "Model format");
+    for (const [label, value] of [["All formats", ""], ["GGUF", "gguf"], ["EXL3", "exl3"]]) {
+      this.format.add(new Option(label, value));
+    }
+    const search = el("button", "Search", "btn btn-primary");
+    search.type = "submit";
+    form.append(this.queryInput, this.format, search);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.search();
     });
-    this.searchBody = document.createElement("div");
-    search.root.append(form, this.searchBody);
-
-    this.downloadsBody = card("Downloads").body;
-    this.cacheBody = card("Local hub cache").root;
-    this.enginesBody = card("Engines").root;
-    this.noteBody = document.createElement("div");
-    this.noteBody.className = "card";
-    this.noteBody.setAttribute("role", "status");
-
-    section.append(
-      search.root,
-      this.downloadsBody.parentElement as HTMLElement,
-      this.noteBody,
-      this.cacheBody,
-      this.enginesBody,
-    );
-    this.render();
+    this.discovery.body.append(form, this.feedback, this.searchStatus, this.results);
   }
 
-  private readonly noteBody: HTMLDivElement;
-
-  private say(text: string | null): void {
-    if (text === this.note) return;
-    this.note = text;
-    this.noteBody.replaceChildren();
-    if (text !== null) this.noteBody.append(line(text));
+  private readBudget(): Promise<FitBudget> {
+    const request = getFitBudget(AbortSignal.timeout(4_000));
+    this.budgetRead = request;
+    void request.then((budget) => {
+      if (this.budgetRead === request) this.capacity.replaceChildren(capacityStrip(budget));
+    });
+    return request;
   }
 
-  /** A second refresh while one is in flight returns instead of
-   * stacking fetches or letting a slow pass overwrite a fresh one
-   * (MonitorView's N3 rule, applied to this poll too). */
-  private refreshing = false;
-
-  async refresh(): Promise<void> {
-    if (this.refreshing) return;
+  async refresh(afterAction = false): Promise<void> {
+    if (this.budgetRead === null) void this.readBudget();
+    if (this.refreshing) {
+      this.refreshAgain ||= afterAction;
+      return;
+    }
     this.refreshing = true;
     try {
-      const signal = AbortSignal.timeout(4_000);
-      const [engines, cache, downloads] = await Promise.all([
-        listEngines(signal), listHubCache(signal), listHubDownloads(signal),
+      // Read the cache after the queue so a newly finished job is visible in both.
+      await Promise.all([
+        this.refreshPanel(this.serving.body, listEngines(AbortSignal.timeout(4_000)), ({ engines }) => {
+          this.engines = engines;
+          return engines.length ? engines.map((engine) => this.engineRow(engine)) : [empty("No engines running.")];
+        }),
+        this.refreshPanel(this.downloadList, listHubDownloads(AbortSignal.timeout(4_000)), ({ downloads }) => {
+          this.downloads = downloads;
+          const finished = new Set(downloads.filter((job) => job.state !== "downloading").map((job) => job.id));
+          for (const id of this.clearedDownloads) {
+            if (!finished.has(id)) this.clearedDownloads.delete(id);
+          }
+          return this.downloadRows();
+        }).then(() => this.refreshPanel(
+          this.library.body, listHubCache(AbortSignal.timeout(4_000)), (cache) => this.cacheRows(cache),
+        )),
       ]);
-      this.engines = engines.engines;
-      this.enginesError = null;
-      this.cache = cache;
-      this.cacheError = null;
-      this.downloads = downloads.downloads;
-    } catch (err) {
-      this.enginesError = this.cacheError = err instanceof Error ? err.message : String(err);
     } finally {
       this.refreshing = false;
+      this.schedulePoll();
+      if (this.refreshAgain) {
+        this.refreshAgain = false;
+        void this.refresh();
+      }
     }
-    this.render();
-    this.schedulePoll();
   }
 
-  /** While a job is active the view polls itself every 2 s; the
-   * timer dies when the view is idle so the page costs nothing. */
+  private async refreshPanel<T>(
+    target: HTMLElement, request: Promise<T>, render: (value: T) => HTMLElement[],
+  ): Promise<void> {
+    try {
+      const data = await request;
+      const key = JSON.stringify(data);
+      if (target.dataset.state === key) return;
+      const rows = render(data);
+      target.dataset.state = key;
+      this.replaceRows(target, rows);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (target.dataset.state === message) return;
+      target.dataset.state = message;
+      target.replaceChildren(empty(message));
+    }
+  }
+
+  private replaceRows(target: HTMLElement, rows: HTMLElement[]): void {
+    const focus = target.contains(document.activeElement) ? document.activeElement?.getAttribute("aria-label") : null;
+    const open = new Set(Array.from(target.querySelectorAll<HTMLDetailsElement>("details[data-key][open]"), (d) => d.dataset.key));
+    target.replaceChildren(...rows);
+    for (const details of Array.from(target.querySelectorAll<HTMLDetailsElement>("details[data-key]"))) {
+      details.open = open.has(details.dataset.key);
+    }
+    if (focus) Array.from(target.querySelectorAll("button"))
+      .find((control) => control.getAttribute("aria-label") === focus)?.focus({ preventScroll: true });
+  }
+
   private schedulePoll(): void {
-    const active = this.downloads.some(
-      (job) => job.state === "downloading",
-    );
+    const active = this.downloads.some((job) => job.state === "downloading")
+      || this.engines.some((engine) => engine.state === "loading");
     if (active && this.pollTimer === null) {
       this.pollTimer = setInterval(() => void this.refresh(), 2_000);
     } else if (!active && this.pollTimer !== null) {
@@ -198,220 +370,265 @@ export class ModelsView {
   }
 
   private async search(): Promise<void> {
-    const q = this.queryInput.value.trim();
-    if (q === "") return;
+    const query = this.queryInput.value.trim();
+    if (!query) return;
+    this.searchController?.abort();
+    const controller = new AbortController();
+    this.searchController = controller;
+    this.searchStatus.textContent = "Searching Hugging Face…";
+    this.results.replaceChildren();
     try {
-      const found = await searchHubModels(q, {
-        gguf: this.ggufBox.checked, exl3: this.exl3Box.checked,
+      const { results } = await searchHubModels(query, {
+        gguf: this.format.value === "gguf", exl3: this.format.value === "exl3",
+      }, AbortSignal.any([controller.signal, AbortSignal.timeout(8_000)]));
+      if (controller.signal.aborted) return;
+      this.searchStatus.textContent = results.length
+        ? `${results.length} ${results.length === 1 ? "result" : "results"}`
+        : "No models match your search.";
+      this.results.replaceChildren(...results.map((model, index) => this.resultRow(model, index)));
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        this.searchStatus.textContent = err instanceof Error ? err.message : "Search failed.";
+      }
+    }
+  }
+
+  private resultRow(model: HubSearchRow, index: number): HTMLElement {
+    const link = el("a", model.id);
+    const repoPath = model.id.split("/").map(encodeURIComponent).join("/");
+    link.href = `https://huggingface.co/${repoPath}`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    const updated = Date.parse(model.last_modified ?? "");
+    const stats = [
+      model.pipeline_tag,
+      `${formatTokens(model.downloads)} downloads`,
+      `${formatTokens(model.likes)} likes`,
+      Number.isFinite(updated) ? `Updated ${formatDate(updated)}` : "",
+    ].filter(Boolean).join(" · ");
+    const node = row(link, stats, model.gated ? badge("Access required", "models-warning") : undefined);
+    node.classList.add("models-result");
+    if (model.gated) {
+      node.append(el("p", "Request access on Hugging Face and download with the HF CLI.", "models-muted"));
+      return node;
+    }
+    const content = el("div", "", "models-fit");
+    content.id = `models-fit-${index}`;
+    content.hidden = true;
+    const download = button("Download full revision", (control) => void this.act(control, async () => {
+      if (this.downloads.some((job) => job.repo === model.id && job.state === "downloading")) {
+        return `${model.id} is already downloading.`;
+      }
+      const { id } = await startHubDownload(model.id);
+      this.clearedDownloads.delete(id);
+      return `Download started for ${model.id}.`;
+    }, this.feedback, () => {
+      if (control.closest<HTMLElement>("#view-models")?.hidden === false) this.openDownloads();
+    }), `Download full revision for ${model.id}`);
+    const compare = button("Compare sizes & fit", (control) => {
+      content.hidden = !content.hidden;
+      control.setAttribute("aria-expanded", String(!content.hidden));
+      if (content.hidden || content.childElementCount) return;
+      void this.compareModel(content, model.id, (tree) => {
+        download.textContent = `Download full revision · ${formatBytes(tree.total_bytes)}`;
       });
-      this.results = found.results;
-      this.searchError = null;
-    } catch (err) {
-      this.results = [];
-      this.searchError = err instanceof Error ? err.message : String(err);
-    }
-    this.renderSearch();
+    });
+    compare.setAttribute("aria-controls", content.id);
+    compare.setAttribute("aria-expanded", "false");
+    const actions = el("div", "", "models-actions");
+    actions.append(compare, download);
+    node.append(actions, content);
+    return node;
   }
 
-  private async download(repo: string): Promise<void> {
-    const running = this.downloads.some(
-      (job) =>
-        job.repo === repo &&
-        (job.state === "downloading"),
+  private async compareModel(
+    content: HTMLElement, repo: string, onLoaded: (tree: HubTree) => void,
+  ): Promise<void> {
+    const status = el("p", "Checking model files and server memory…", "models-muted");
+    status.setAttribute("role", "status");
+    content.append(status);
+    try {
+      const signal = AbortSignal.timeout(22_000);
+      const [tree, budget] = await Promise.all([getHubTree(repo, signal), this.readBudget()]);
+      onLoaded(tree);
+      content.replaceChildren(this.fitPanel(repo, tree, budget));
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : "Could not load model files.";
+      content.append(button("Retry comparison", () => {
+        content.replaceChildren();
+        void this.compareModel(content, repo, onLoaded);
+      }));
+    }
+  }
+
+  private fitPanel(repo: string, tree: HubTree, budget: FitBudget): HTMLElement {
+    const panel = el("div", "", "models-fit-content");
+    const disk = el("input", "", "text-field");
+    disk.type = "number";
+    disk.min = "0";
+    disk.step = "any";
+    disk.placeholder = "e.g. 64";
+    const diskLabel = el("label", "Free SSD space (GiB)");
+    diskLabel.append(disk);
+    const targets = el("div", "", "models-fit-targets");
+    targets.append(
+      el("span", `${available(budget.vram)} free VRAM (best single GPU)`),
+      el("span", `${available(budget.ram)} available RAM`),
+      diskLabel,
     );
-    if (running) {
-      this.say(`${repo} is already downloading.`);
-      return;
+    const variants = ggufVariants(tree.files);
+    const hasGguf = tree.files.some((file) => /\.gguf$/i.test(file.path));
+    if (!hasGguf && tree.estimate.vram_bytes > 0) {
+      variants.push({ name: "Checkpoint weights", files: [], bytes: tree.estimate.vram_bytes });
     }
+    const estimates = el("div");
+    const downloadNote = el("p", "", "models-muted");
+    const render = (): void => {
+      const ssd = disk.validity.valid && Number.isFinite(disk.valueAsNumber) ? disk.valueAsNumber * GiB : undefined;
+      const fits = variants.map((variant) => ({ ...variant, fit: assessFit(variant.bytes, { ...budget, ssd }) }));
+      const largestFirst = fits.slice().reverse();
+      const pick = largestFirst.find((variant) => variant.fit === "gpu")
+        ?? largestFirst.find((variant) => variant.fit === "ram");
+      const rows = fits.map((variant) => {
+        const item = el("div", "", "models-fit-option");
+        const heading = el("div", "", "models-fit-row");
+        const name = el("strong", variant.name);
+        const size = el("span", formatBytes(variant.bytes), "models-fit-size");
+        heading.append(name, size, badge(tierLabels[variant.fit], variant === pick ? "models-ready" : ""));
+        item.append(heading);
+        if (variant === pick) item.append(badge("Recommended starting point", "models-ready"));
+        item.append(el("p", `Target ${formatBytes(Math.ceil(variant.bytes / 0.85))} free VRAM or available RAM.`, "models-muted"));
+        if (variant.files.length) item.append(this.quantFiles(repo, tree.commit, variant.files));
+        return item;
+      });
+      estimates.replaceChildren(...(rows.length ? rows : [empty("No complete weight variant found in this revision.")]));
+      const total = formatBytes(tree.total_bytes);
+      downloadNote.textContent = ssd !== undefined && ssd < tree.total_bytes
+        ? `Full revision: ${total}. That exceeds the free space you entered.`
+        : `Full revision: ${total}. The server downloads every file in the revision.`;
+    };
+    panel.append(
+      targets,
+      el("p", "The recommendation prefers the largest variant in the fastest memory tier. These weights-only estimates leave 15% memory headroom. Fifi checks backend support, context and cache at load time. Streaming tiers still need GPU working space.", "models-muted"),
+      estimates,
+      downloadNote,
+    );
+    disk.addEventListener("input", render);
+    render();
+    return panel;
+  }
+
+  private quantFiles(repo: string, commit: string, files: string[]): HTMLElement {
+    const details = el("details", "", "models-details");
+    const revision = /^[a-f\d]{40}$/i.test(commit) ? commit : undefined;
+    if (!revision) {
+      details.append(el("summary", "Show filenames"));
+      for (const file of files) details.append(el("code", file));
+      return details;
+    }
+    details.append(el("summary", files.length === 1 ? "Open exact GGUF file on Hugging Face" : `Open all ${files.length} shard links on Hugging Face`));
+    const repoPath = repo.split("/").map(encodeURIComponent).join("/");
+    for (const file of files) {
+      const link = el("a", file);
+      link.href = `https://huggingface.co/${repoPath}/blob/${revision}/${file.split("/").map(encodeURIComponent).join("/")}`;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      details.append(link);
+    }
+    return details;
+  }
+
+  private downloadRow(job: HubDownloadJob): HTMLElement {
+    const states = { downloading: "Downloading", done: "Complete", failed: "Failed", cancelled: "Cancelled" };
+    const detail = job.state === "downloading" || job.state === "failed" ? statusOf(job) : `Revision: ${job.revision}`;
+    const node = row(job.repo, detail, badge(states[job.state], job.state === "done" ? "models-ready" : ""));
+    if (job.state === "downloading") {
+      const progress = el("progress");
+      progress.setAttribute("aria-label", `Download progress for ${job.repo}`);
+      if (job.bytes_total && job.bytes !== undefined) {
+        progress.max = job.bytes_total;
+        progress.value = job.bytes;
+      }
+      node.append(progress, button("Cancel", (control) => void this.act(control, async () => {
+        await cancelHubDownload(job.id);
+        return `Cancellation requested for ${job.repo}.`;
+      }, this.downloadFeedback), `Cancel download of ${job.repo}`));
+    }
+    if (job.estimate) {
+      const estimate = estimateDetails(job.estimate);
+      estimate.dataset.key = String(job.id);
+      node.append(estimate);
+    }
+    return node;
+  }
+
+  private cacheRows(cache: HubCache): HTMLElement[] {
+    if (!Array.isArray(cache.models)) {
+      return [empty((cache as { error?: string }).error ?? "Cache scan failed.")];
+    }
+    if (!cache.models.length) return [empty("No models cached. Download one from a search result.")];
+    const items = cache.models.map((model) => {
+      const node = row(model.repo, `${formatBytes(model.bytes)} on disk`);
+      for (const snapshot of model.snapshots) {
+        const item = el("div", "", "models-snapshot");
+        const refs = model.refs.filter((ref) => ref.commit === snapshot.commit).map((ref) => ref.name);
+        const revision = el("code", [...refs, snapshot.commit.slice(0, 8)].join(" · "), "mono");
+        revision.title = snapshot.commit;
+        let state = "Incomplete";
+        if (snapshot.complete) state = snapshot.servable ? "Ready to serve" : "Unsupported";
+        item.append(revision, badge(state, snapshot.complete && snapshot.servable ? "models-ready" : "models-warning"),
+          el("p", snapshotStatus(snapshot), "models-muted"));
+        if (snapshot.complete && snapshot.servable) {
+          item.append(button("Serve", (control) => void this.act(control, async () => {
+            const engine = await addEngine({ model_dir: snapshot.path });
+            return `Started engine ${engine.id} for ${engine.model}. See Engines for its status.`;
+          }), `Serve ${model.repo} at ${snapshot.commit.slice(0, 8)}`));
+        }
+        if (snapshot.estimate) {
+          const estimate = estimateDetails(snapshot.estimate);
+          estimate.dataset.key = snapshot.path;
+          item.append(estimate);
+        }
+        node.append(item);
+      }
+      return node;
+    });
+    const location = el("details", "", "models-details models-cache-location");
+    location.dataset.key = "cache-path";
+    location.append(el("summary", "Cache location"), el("code", cache.hub_dir, "mono"));
+    return [...items, location];
+  }
+
+  private engineRow(engine: EngineSummary): HTMLElement {
+    const label = { loading: "Loading", ready: "Ready", busy: "Busy", error: "Error", stopped: "Stopped", "native-failed": "Failed" }[engine.state];
+    const node = row(engine.model, `${engine.id} · ${formatTokens(engine.context_limit)} token context · ${engine.runtime_added ? "Runtime" : "Server config"}`,
+      badge(label, engine.state === "ready" ? "models-ready" : ""));
+    if (engine.error ?? engine.load_stage) {
+      node.append(el("p", engine.error?.message ?? engine.load_stage, "models-muted"));
+    }
+    if (engine.runtime_added && engine.state !== "stopped") {
+      node.append(button("Stop", (control) => {
+        if (!window.confirm(stopQuestion(engine.id, engine.memory_held_until_restart))) return;
+        void this.act(control, async () => stoppedLine(engine.id, await removeEngine(engine.id)));
+      }, `Stop engine ${engine.id}`));
+    }
+    return node;
+  }
+
+  private async act(
+    control: HTMLButtonElement, run: () => Promise<string>, feedback = this.feedback,
+    onSuccess?: () => void,
+  ): Promise<void> {
+    control.disabled = true;
+    feedback.textContent = "Working…";
     try {
-      await startHubDownload(repo);
-      this.say(`Download of ${repo} started.`);
-      await this.refresh();
+      feedback.textContent = await run();
+      onSuccess?.();
+      await this.refresh(true);
     } catch (err) {
-      this.say(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  private async serve(modelDir: string): Promise<void> {
-    try {
-      const added = await addEngine({ model_dir: modelDir });
-      this.say(`Engine ${added.id} is loading ${added.model}.`);
-      await this.refresh();
-    } catch (err) {
-      this.say(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  private async stop(id: string): Promise<void> {
-    const held = this.engines.find((engine) => engine.id === id)?.memory_held_until_restart === true;
-    if (!window.confirm(stopQuestion(id, held))) return;
-    try {
-      const result = await removeEngine(id);
-      this.say(stoppedLine(id, result));
-      await this.refresh();
-    } catch (err) {
-      this.say(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  private renderSearch(): void {
-    this.searchBody.replaceChildren();
-    if (this.searchError !== null) this.searchBody.append(line(this.searchError));
-    if (this.results.length === 0) return;
-    const table = document.createElement("table");
-    const head = document.createElement("tr");
-    for (const text of ["Repo", "Downloads", "Likes", ""]) {
-      const th = document.createElement("th");
-      th.textContent = text;
-      head.append(th);
-    }
-    table.append(head);
-    for (const row of this.results) {
-      const tr = document.createElement("tr");
-      const name = document.createElement("td");
-      name.textContent = row.gated ? `${row.id} (gated)` : row.id;
-      const downloads = document.createElement("td");
-      downloads.textContent = String(row.downloads);
-      const likes = document.createElement("td");
-      likes.textContent = String(row.likes);
-      const action = document.createElement("td");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = "Download";
-      button.disabled = row.gated;
-      button.title = row.gated
-        ? "Gated repo: download with hf or huggingface-cli and a token."
-        : "Download into the hub cache.";
-      button.addEventListener("click", () => void this.download(row.id));
-      action.append(button);
-      tr.append(name, downloads, likes, action);
-      table.append(tr);
-    }
-    this.searchBody.append(table);
-  }
-
-  private render(): void {
-    this.renderSearch();
-    this.say(this.note);
-
-    const downloadsCard = this.downloadsBody.parentElement as HTMLElement;
-    downloadsCard.hidden = this.downloads.length === 0;
-    this.downloadsBody.replaceChildren();
-    if (this.downloads.length > 0) {
-      const table = document.createElement("table");
-      for (const job of [...this.downloads].sort((a, b) => a.id - b.id)) {
-        const tr = document.createElement("tr");
-        const repo = document.createElement("td");
-        repo.textContent = job.repo;
-        const status = document.createElement("td");
-        status.textContent = statusOf(job);
-        const needs = document.createElement("td");
-        if (job.estimate !== undefined) {
-          needs.textContent = estimateLine(job.estimate);
-          needs.title = job.estimate.mode;
-        }
-        const action = document.createElement("td");
-        if (job.state === "downloading") {
-          const cancel = document.createElement("button");
-          cancel.type = "button";
-          cancel.textContent = "Cancel";
-          cancel.addEventListener("click", () => void cancelHubDownload(job.id)
-            .then(() => this.refresh())
-            .catch((err: unknown) =>
-              this.say(err instanceof Error ? err.message : String(err))));
-          action.append(cancel);
-        }
-        tr.append(repo, status, needs, action);
-        table.append(tr);
-      }
-      this.downloadsBody.append(table);
-    }
-
-    this.cacheBody.replaceChildren();
-    if (this.cacheError !== null) {
-      this.cacheBody.append(line(this.cacheError));
-    } else if (this.cache !== null && Array.isArray(this.cache.models)) {
-      const h3 = document.createElement("h3");
-      h3.textContent = "Local hub cache";
-      const dir = line(`Cache: ${this.cache.hub_dir}`);
-      this.cacheBody.append(h3, dir);
-      if (this.cache.models.length === 0) {
-        this.cacheBody.append(line("No models cached yet."));
-      }
-      for (const model of this.cache.models) {
-        const heading = document.createElement("p");
-        heading.textContent = `${model.repo} — ${formatBytes(model.bytes)}`;
-        this.cacheBody.append(heading);
-        for (const snapshot of model.snapshots) {
-          const row = document.createElement("p");
-          if (snapshot.estimate !== undefined) {
-            const est = document.createElement("small");
-            est.textContent = estimateLine(snapshot.estimate);
-            est.title = `${snapshot.estimate.basis} — ${snapshot.estimate.mode}`;
-            row.append(est, document.createElement("br"));
-          }
-          row.append(
-            document.createTextNode(
-              `${snapshot.commit.slice(0, 8)} — ${snapshotStatus(snapshot)} `,
-            ),
-          );
-          if (snapshot.servable) {
-            const serve = document.createElement("button");
-            serve.type = "button";
-            serve.textContent = "Serve";
-            serve.title = `Start an engine on exactly this snapshot (${snapshot.commit}).`;
-            serve.addEventListener("click", () => void this.serve(snapshot.path));
-            row.append(serve);
-          }
-          this.cacheBody.append(row);
-        }
-      }
-    } else if (this.cache !== null) {
-      // A scan failure answers 200 with {"error"} and no models
-      // array; without this arm the render above would not run and
-      // the failure would be invisible.
-      this.cacheBody.append(
-        line((this.cache as { error?: string }).error ?? "cache scan failed"),
-      );
-    }
-
-    this.enginesBody.replaceChildren();
-    const enginesH3 = document.createElement("h3");
-    enginesH3.textContent = "Engines";
-    this.enginesBody.append(enginesH3);
-    if (this.enginesError !== null) {
-      this.enginesBody.append(line(this.enginesError));
-    } else if (this.engines.length === 0) {
-      this.enginesBody.append(line("No engines running."));
-    } else {
-      const table = document.createElement("table");
-      for (const engine of this.engines) {
-        const tr = document.createElement("tr");
-        const id = document.createElement("td");
-        id.textContent = engine.runtime_added ? `${engine.id} *` : engine.id;
-        const state = document.createElement("td");
-        state.textContent = engine.state === "loading" && engine.load_stage !== undefined
-          ? `loading (${engine.load_stage})`
-          : engine.error !== undefined
-            ? `${engine.state}: ${engine.error.message}`
-            : engine.state;
-        const model = document.createElement("td");
-        model.textContent = engine.model;
-        const action = document.createElement("td");
-        if (engine.runtime_added) {
-          const stop = document.createElement("button");
-          stop.type = "button";
-          stop.textContent = "Stop";
-          stop.addEventListener("click", () => void this.stop(engine.id));
-          action.append(stop);
-        }
-        tr.append(id, state, model, action);
-        table.append(tr);
-      }
-      this.enginesBody.append(
-        table,
-        line("* added at runtime; only those can be stopped here."),
-      );
+      feedback.textContent = err instanceof Error ? err.message : String(err);
+    } finally {
+      control.disabled = false;
     }
   }
 }

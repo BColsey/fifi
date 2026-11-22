@@ -7,11 +7,16 @@ export interface SpeedRow {
   outcome: "ok" | "error" | "cancelled";
   decode_tokens_per_second: number | null;
   time_to_first_token_ms: number | null;
+  prompt_tokens?: number;
+  reused_tokens?: number;
+  prefill_ms?: number | null;
 }
 
 export interface SpeedSummary {
   decodePerSecond: number | null;
   firstTokenMs: number | null;
+  /** Median measured prefill rate: (prompt − reused) over prefill_ms. */
+  prefillPerSecond: number | null;
   okCount: number;
 }
 
@@ -20,6 +25,18 @@ function median(values: number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.floor((sorted.length - 1) / 2)] ?? null;
+}
+
+/** The measured prefill rate of one row: the tokens the engine actually
+ * read (prompt minus the prefix it reused) over the prefill span. */
+function prefillRate(row: SpeedRow): number | null {
+  const prefill = row.prefill_ms;
+  const prompt = row.prompt_tokens;
+  const reused = row.reused_tokens ?? 0;
+  if (prefill === null || prefill === undefined || prefill <= 0 || prompt === undefined) {
+    return null;
+  }
+  return (prompt - reused) / (prefill / 1000);
 }
 
 export function speedSummary(rows: SpeedRow[]): SpeedSummary {
@@ -34,6 +51,11 @@ export function speedSummary(rows: SpeedRow[]): SpeedSummary {
       ok
         .map((row) => row.time_to_first_token_ms)
         .filter((value): value is number => value !== null)
+    ),
+    prefillPerSecond: median(
+      ok
+        .map(prefillRate)
+        .filter((value): value is number => value !== null && value > 0)
     ),
     okCount: ok.length,
   };
@@ -70,19 +92,10 @@ export function groupSpeed(rows: readonly GroupRow[], keyOf: (row: GroupRow) => 
   return [...groups.entries()]
     .map(([key, list]) => {
       const base = speedSummary(list);
-      const ok = list.filter((row) => row.outcome === "ok");
-      const prefillRates = ok
-        .map((row) =>
-          row.prefill_ms !== null && row.prefill_ms !== undefined && row.prefill_ms > 0
-            ? (row.prompt_tokens - row.reused_tokens) / (row.prefill_ms / 1000)
-            : null
-        )
-        .filter((value): value is number => value !== null && value > 0);
       return {
         key,
         total: list.length,
         ...base,
-        prefillPerSecond: median(prefillRates),
         queueWaitMs: median(
           list
             .map((row) => row.queue_wait_ms ?? null)

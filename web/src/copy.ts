@@ -1,7 +1,7 @@
 /** Copy with a fallback: the async clipboard needs a secure context,
  * and fifi is often opened over LAN http, where only the legacy path
  * works. Returns false when neither path copied. */
-export async function copyText(text: string): Promise<boolean> {
+export async function copyText(text: string, host: HTMLElement = document.body): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
@@ -13,11 +13,15 @@ export async function copyText(text: string): Promise<boolean> {
     ta.value = text;
     ta.style.position = "fixed";
     ta.style.opacity = "0";
-    document.body.append(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    ta.remove();
-    return ok;
+    host.append(ta);
+    const focused = document.activeElement;
+    try {
+      ta.select();
+      return document.execCommand("copy");
+    } finally {
+      ta.remove();
+      if (focused instanceof HTMLElement) focused.focus();
+    }
   } catch {
     return false;
   }

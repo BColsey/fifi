@@ -314,8 +314,30 @@ export interface RecentRequest {
   decode_tokens_per_second: number | null;
 }
 
+/** One in-flight request of the active board (see reqlog ACTIVE_KEYS):
+ * counts, names, and clocks only — never prompt text. The row lives
+ * from admission to the written log line. */
+export interface ActiveRequest {
+  request_id: string;
+  model: string;
+  /** The engine that took the job; null before routing. */
+  engine?: string | null;
+  /** The named chat session the request carried; null when none. */
+  session?: string | null;
+  /** queued until the engine thread takes the job, prefill until its
+   * first batch, decode after. */
+  phase: "queued" | "prefill" | "decode";
+  prompt_tokens: number;
+  /** Tokens the decode batches committed so far. */
+  completion_tokens: number;
+  /** Epoch milliseconds; the panel derives elapsed time from it. */
+  started_at_ms: number;
+}
+
 export interface RecentRequestBody {
   requests: RecentRequest[];
+  /** In-flight rows; older builds omit the array. */
+  active?: ActiveRequest[];
 }
 
 /** The server extension behind the GUI's live speed panel. */
@@ -666,6 +688,18 @@ export function searchHubModels(
   if (opts.exl3 === true) params.set("exl3", "true");
   if (opts.limit !== undefined) params.set("limit", String(opts.limit));
   return getJson<{ results: HubSearchRow[] }>(`/v1/hf/search?${params}`, true, signal);
+}
+
+export interface HubTree {
+  revision: string;
+  commit: string;
+  total_bytes: number;
+  estimate: ResourceEstimate;
+  files: { path: string; size: number }[];
+}
+
+export function getHubTree(repo: string, signal?: AbortSignal): Promise<HubTree> {
+  return getJson<HubTree>(`/v1/hf/tree?${new URLSearchParams({ repo })}`, true, signal);
 }
 
 export function listHubCache(signal?: AbortSignal): Promise<HubCache> {

@@ -1,7 +1,32 @@
 import { test } from "node:test";
 import { strictEqual } from "node:assert";
-import { statusOf, estimateLine, stopQuestion, stoppedLine, snapshotStatus } from "./models.js";
+import { statusOf, stopQuestion, stoppedLine, snapshotStatus } from "./models.js";
 import { searchHubModels, startHubDownload, type HubDownloadJob } from "./api.js";
+import { assessFit, ggufVariants } from "./model-fit.js";
+
+test("GGUF size counts only the complete shard set for each quant", () => {
+  const variants = ggufVariants([
+    { path: "Q4/model-Q4_K_M-00001-of-00002.gguf", size: 12 },
+    { path: "Q4/model-Q4_K_M-00002-of-00002.gguf", size: 8 },
+    { path: "model-Q6_K.gguf", size: 27 },
+    { path: "model-Q8_0-00001-of-00003.gguf", size: 13 },
+    { path: "mmproj-F16.gguf", size: 2 },
+  ]);
+  strictEqual(variants.map(({ bytes }) => bytes).join(","), "20,27");
+  strictEqual(variants[0]?.files.length, 2);
+});
+
+test("fit prefers the fastest tier with headroom without adding VRAM to RAM", () => {
+  const hardware = { vram: 24, ram: 32, ssd: 64 };
+  strictEqual(assessFit(20, hardware), "gpu");
+  strictEqual(assessFit(27, hardware), "ram");
+  strictEqual(assessFit(35, hardware), "ssd");
+  strictEqual(assessFit(65, hardware), "too-large");
+  strictEqual(assessFit(35, { ...hardware, ssd: undefined }), "disk-unknown");
+  strictEqual(assessFit(20, { ...hardware, vram: undefined }), "unknown");
+  strictEqual(assessFit(20, { ...hardware, ssd: 19 }), "too-large");
+  strictEqual(assessFit(0, hardware), "unknown");
+});
 
 function job(overrides: Partial<HubDownloadJob>): HubDownloadJob {
   return { id: 1, repo: "org/name", revision: "main", state: "downloading", ...overrides };
@@ -73,17 +98,9 @@ test("a download starts as a POST with the repo only", async () => {
   }
 });
 
-test("estimateLine states the tier ladder from the pack size", () => {
-  const line = estimateLine({
-    vram_bytes: 5_000_000_000,
-    ram_bytes: 5_000_000_000,
-    disk_bytes: 5_000_000_000,
-    mode: "auto: Fifi picks GPU-resident, host-streamed, or disk-streamed",
-  });
-  strictEqual(
-    line,
-    "4.7 GiB resident on GPU, or streamed from RAM/disk — picked automatically",
-  );
+test("an unavailable download size does not display a zero-byte total", () => {
+  strictEqual(statusOf(job({ bytes: 1024 })), "1 KiB received");
+  strictEqual(statusOf(job({ current_file: "config.json" })), "Preparing download — config.json");
 });
 
 test("a stop says when the card memory stays held until the server restarts", () => {
