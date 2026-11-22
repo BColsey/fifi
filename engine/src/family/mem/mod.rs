@@ -32,6 +32,21 @@ pub(crate) use unified::*;
 
 pub(crate) use device::DEVICE;
 
+/// The host memory a stored prefix may still take, read now: the bytes the OS can hand out
+/// without paging on a Mac (free, inactive and purgeable pages), the host budget elsewhere.
+/// `None` when the host cannot be read.
+pub(crate) fn tier_available_bytes(label: &'static str) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = label;
+        unified::available_memory_bytes()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        HostFacts::read(label, label).ok().map(|host| host.budget())
+    }
+}
+
 #[allow(unused_imports, reason = "the name a caller matches a provenance on")]
 pub(crate) use host::{HostFacts, Provenance};
 

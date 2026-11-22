@@ -21,7 +21,7 @@
 //! charges it once with its entry.
 
 mod snapshot_io;
-pub(in crate::family::qwen36::resident) use snapshot_io::object_bytes;
+pub(in crate::family::qwen36::resident) use snapshot_io::{LoadShape, object_bytes};
 
 use super::attn::{KvCache, growth_bytes};
 use super::kv_plan::{KV_STEP, next_capacity, session_bytes};
@@ -283,7 +283,7 @@ fn check_saved_layer(
 /// A restore rewinds compatible live state or adopts the saved buffers.
 /// Its own growth permit charges fixed DeltaNet bytes plus a bounded page-table allowance.
 /// The snapshot holds no logits.
-pub(super) struct ResidentSnapshot {
+pub(crate) struct ResidentSnapshot {
     /// Every layer state shared (Delta tensors AND the attention caches' capacity buffers,
     /// zero-copy handles): an adoption restore takes them wholesale, so a snapshot of one
     /// conversation restores into another whose state was reset.

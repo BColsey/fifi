@@ -35,6 +35,7 @@
 use super::prefill_plan::DEPTH_ANCHORS;
 use super::prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes, stored_prefix_report};
 use super::step::{ChunkVerdict, QwenResidentStep};
+use crate::family::kv_disk::DiskOwner;
 use crate::{
     EngError,
     family::{
@@ -304,7 +305,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
         self.complete_prefix_save()?;
         let began = Instant::now();
         self.prefix.set_shadow_enabled(shadow_block_lcp_enabled());
-        self.promote_from_disk(prompt);
+        self.promote_from_disk((), prompt);
         let mut slot = std::mem::take(&mut self.prefix);
         let covered = st.restore_prefix(
             &mut slot,

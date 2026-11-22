@@ -21,14 +21,22 @@
 
 mod config;
 mod host_store;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+mod rows;
 mod slab;
 mod tier;
 
 pub(crate) use config::{KV_CACHE_DEFAULT_ON, KvCacheOptions, KvCacheSettings};
+#[cfg(test)]
+pub(crate) use host_store::object_per_part;
 pub(crate) use host_store::{
-    HostFamily, HostStoreDisk, SnapshotView, object_per_part, place_in_vec, plan_tier,
-    restore_tier, vec_landing,
+    DiskOwner, DiskParts, HostFamily, HostStoreDisk, SnapshotView, VecFamily, plan_tier,
 };
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use rows::{cut_rows, pad_rows};
 pub(crate) use slab::{ObjectRole, Put, Run, SlabLayout};
 pub(crate) use tier::{
     DiskTier, Held, Hit, PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, SlotBytes,

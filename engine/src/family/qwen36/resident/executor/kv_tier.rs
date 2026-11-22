@@ -5,18 +5,17 @@
 //! and how a verified read becomes a snapshot again. The policy (when to write, how long a stop
 //! may wait, how a damaged entry falls back) is the tier's.
 
-use super::{PrefillPath, Q36Executor, Q36Session, Result};
+use super::{PrefillPath, Q36Executor, Result};
 use crate::{
     EngError,
     family::{
         kv_disk::{
-            DiskTier, FamilyContract, HostFamily, HostStoreDisk, LoadIdentity, PUMP_IDLE_BYTES,
-            SlabLayout, SnapshotView, object_per_part, place_in_vec, plan_tier, restore_tier,
-            vec_landing,
+            DiskOwner, DiskParts, FamilyContract, HostStoreDisk, LoadIdentity, SlotBytes,
+            SnapshotView, VecFamily, plan_tier,
         },
         qwen36::{
             resident::{
-                state::{ResidentSnapshot, ResidentState, object_bytes},
+                state::{LoadShape, ResidentSnapshot, object_bytes},
                 weights::ResidentWeights,
             },
             settings::{Q36Settings, tokenizer_pin_for_spec},
@@ -24,7 +23,7 @@ use crate::{
         session::PrefixIdentity,
     },
     kernels::MlxKernels,
-    sched::{SessionBudget, job::PrefixTier},
+    sched::SessionBudget,
     weights::sha256_hex,
 };
 use std::{cell::RefCell, rc::Rc};
@@ -47,33 +46,50 @@ const CONTRACT: FamilyContract = FamilyContract {
 
 /// The model as the host-store adapter sees it. A snapshot's host copy is read from the device
 /// when a write is queued, and a disk read is turned back into device arrays.
-pub(super) struct MlxFamily<'a> {
+pub(crate) struct MlxFamily<'a> {
     pub(super) kernels: RefCell<&'a mut MlxKernels>,
     pub(super) weights: &'a ResidentWeights,
-    /// What a disk read needs to become a snapshot; absent when only writes are in play.
-    pub(super) restore: Option<Restore<'a>>,
-    pub(super) context_limit: usize,
-}
-
-pub(super) struct Restore<'a> {
-    pub(super) state: &'a ResidentState,
     pub(super) budget: &'a mut SessionBudget,
+    pub(super) context_limit: usize,
+    /// What a disk read needs of the session it restores into; absent when only writes are in
+    /// play.
+    pub(super) restore: Option<Restore>,
     /// The bytes the saved prefixes may hold beyond the live session, when a device budget sets
     /// them, and what the store holds now.
     pub(super) room: Option<u64>,
     pub(super) held: u64,
+    /// The device budget the engine runs under, when it has one: what a stored entry may take of
+    /// the host is what that budget leaves beside the memory the engine holds.
+    pub(super) cap: Option<u64>,
 }
 
-impl HostFamily for MlxFamily<'_> {
+/// What a restore takes from the session it restores into.
+#[derive(Clone, Copy)]
+pub(crate) struct Restore {
+    pub(super) shape: LoadShape,
+    /// What the session's own state charges the budget; the rest is what the store holds.
+    pub(super) charged: u64,
+}
+
+impl VecFamily for MlxFamily<'_> {
     type Snapshot = ResidentSnapshot;
     type Path = PrefillPath;
-    type Landing = Vec<u8>;
+    const LABEL: &'static str = TIER_LABEL;
 
-    fn prepare(&self, snapshot: &ResidentSnapshot) -> Result<()> {
-        snapshot.make_host_copy(&mut self.kernels.borrow_mut(), self.weights)
+    fn longest_entry(&self) -> usize {
+        self.context_limit.saturating_sub(1)
     }
 
-    fn view(&self, snapshot: &ResidentSnapshot) -> Option<SnapshotView> {
+    fn part_bytes(&self, positions: usize) -> Result<Vec<usize>> {
+        object_bytes(self.weights, positions)
+    }
+
+    fn prepare_slot(&self, snapshot: &ResidentSnapshot) -> Result<Option<Rc<dyn SlotBytes>>> {
+        let copy = snapshot.make_host_copy(&mut self.kernels.borrow_mut(), self.weights)?;
+        Ok(Some(copy))
+    }
+
+    fn view_of(&self, snapshot: &ResidentSnapshot) -> Option<SnapshotView> {
         let positions = snapshot.pos() as usize;
         let bytes = object_bytes(self.weights, positions)
             .ok()?
@@ -91,45 +107,33 @@ impl HostFamily for MlxFamily<'_> {
         })
     }
 
-    fn layout(&self, positions: usize) -> Result<SlabLayout> {
-        if positions >= self.context_limit {
-            return Err(EngError::ContextLimit(format!(
-                "a kv disk entry of {positions} positions does not fit the {} position context",
-                self.context_limit
-            )));
-        }
-        Ok(object_per_part(&object_bytes(self.weights, positions)?))
+    fn available_bytes(&self) -> Option<u64> {
+        let system = crate::family::mem::tier_available_bytes(Self::LABEL);
+        let Some(cap) = self.cap else {
+            return system;
+        };
+        let active = self.kernels.borrow().memory_stats().ok()?.active;
+        system.map(|bytes| bytes.min(cap.saturating_sub(active)))
     }
 
-    fn begin_landing(
-        &mut self,
-        _tier: &mut DiskTier,
-        positions: usize,
-        layout: &SlabLayout,
-    ) -> Result<Vec<u8>> {
+    fn room_for(&self, positions: usize) -> Result<()> {
         let restore = self
             .restore
-            .as_ref()
             .ok_or_else(|| EngError::MemoryPlan("no session to restore into".into()))?;
-        if let Some(room) = restore.room {
-            let need = restore.state.loaded_charge(self.weights, positions)?;
-            if restore.held.saturating_add(need) > room {
+        if let Some(room) = self.room {
+            let need = restore.shape.loaded_charge(self.weights, positions)?;
+            if self.held.saturating_add(need) > room {
                 return Err(EngError::MemoryPlan(
                     "a stored prefix would take memory the prefill piece needs".into(),
                 ));
             }
         }
-        vec_landing(TIER_LABEL, layout)
+        Ok(())
     }
 
-    fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<()> {
-        place_in_vec(landing, slab, part)
-    }
-
-    fn finish_landing(&mut self, landing: Vec<u8>, positions: usize) -> Result<ResidentSnapshot> {
+    fn finish(&mut self, landing: Vec<u8>, positions: usize) -> Result<ResidentSnapshot> {
         let restore = self
             .restore
-            .as_mut()
             .ok_or_else(|| EngError::MemoryPlan("no session to restore into".into()))?;
         let mut at = 0;
         let mut parts: Vec<&[u8]> = Vec::new();
@@ -140,10 +144,10 @@ impl HostFamily for MlxFamily<'_> {
             parts.push(part);
             at += bytes;
         }
-        restore.state.snapshot_from_objects(
+        restore.shape.snapshot_from_objects(
             self.kernels.get_mut(),
             self.weights,
-            restore.budget,
+            self.budget,
             positions,
             &parts,
         )
@@ -151,7 +155,7 @@ impl HostFamily for MlxFamily<'_> {
 }
 
 /// What names this load to an entry kept outside the process.
-fn load_identity(
+pub(super) fn load_identity(
     identity: &PrefixIdentity,
     weights: &ResidentWeights,
     path: PrefillPath,
@@ -186,7 +190,11 @@ fn load_identity(
 fn prefix_identity(settings: &Q36Settings) -> Result<PrefixIdentity> {
     let pin = tokenizer_pin_for_spec(&settings.spec)?;
     Ok(PrefixIdentity {
-        weights: sha256_hex(&crate::weights::pack_digest(&settings.artifact)?).into(),
+        weights: sha256_hex(&crate::weights::pack_digest(
+            &settings.artifact,
+            crate::weights::Hidden::Skipped,
+        )?)
+        .into(),
         tokenizer: sha256_hex(&pin.tokenizer_json).into(),
         template: sha256_hex(&pin.chat_template_jinja).into(),
     })
@@ -221,76 +229,47 @@ impl Q36Executor {
         );
         Ok(())
     }
+}
 
-    /// Runs `work` on the disk tier with the model as the family and the host store.
-    fn with_disk(
-        &mut self,
-        restore: Option<(&ResidentState, u64)>,
-        work: impl FnOnce(
-            &mut HostStoreDisk,
-            &mut MlxFamily<'_>,
-            &mut super::PrefixSlot<ResidentSnapshot, PrefillPath>,
-        ),
-    ) {
-        let Some(disk) = self.disk.as_mut() else {
-            return;
-        };
+impl DiskOwner for Q36Executor {
+    type Snapshot = ResidentSnapshot;
+    type Path = PrefillPath;
+    type Family<'a> = MlxFamily<'a>;
+    type Restore = Restore;
+
+    fn disk_ref(&self) -> Option<&HostStoreDisk> {
+        self.disk.as_ref()
+    }
+
+    fn disk_mut(&mut self) -> Option<&mut HostStoreDisk> {
+        self.disk.as_mut()
+    }
+
+    /// A restore carries the growth rules of the session it restores into, and the store's bytes
+    /// are what the session budget holds beyond that session's own charge.
+    fn disk_parts(&mut self, restore: Option<Restore>) -> Option<DiskParts<'_, MlxFamily<'_>>> {
+        let disk = self.disk.as_mut()?;
         let decoder = &mut self.decoder;
-        let held = restore.map_or(0, |(_, charged)| {
-            decoder.budget.used().saturating_sub(charged)
+        let held = restore.map_or(0, |restore| {
+            decoder.budget.used().saturating_sub(restore.charged)
         });
-        let mut family = MlxFamily {
-            kernels: RefCell::new(&mut decoder.kernels),
-            weights: &decoder.weights,
-            restore: restore.map(|(state, _)| Restore {
-                state,
+        Some(DiskParts {
+            disk,
+            family: MlxFamily {
+                kernels: RefCell::new(&mut decoder.kernels),
+                weights: &decoder.weights,
                 budget: &mut decoder.budget,
+                context_limit: self.context_limit,
+                restore,
                 room: self.prefix_room,
                 held,
-            }),
-            context_limit: self.context_limit,
-        };
-        work(disk, &mut family, &mut self.prefix);
+                cap: self.tier_cap,
+            },
+            store: &mut self.prefix,
+        })
     }
 
-    /// After a save: queues the entries the next saves would push out, when the host's memory is
-    /// short. With memory to spare the disk is not touched.
-    pub(super) fn spill_after_save(&mut self) {
-        self.with_disk(None, |disk, family, prefix| {
-            disk.spill_after_save(family, prefix)
-        });
-    }
-
-    /// Before a restore: when the disk holds a longer stored prefix of `prompt` than the host
-    /// store does, reads it (verified in full) back onto the device and stores it as an
-    /// ordinary entry, so the restore that follows finds it. A miss changes nothing.
-    pub(super) fn promote_from_disk(&mut self, st: &Q36Session, prompt: &[u32]) {
-        let path = self.prefill_path();
-        let charged = st.state.charged_bytes().unwrap_or(0);
-        self.with_disk(Some((&st.state, charged)), |disk, family, prefix| {
-            disk.promote(family, prefix, &path, prompt)
-        });
-    }
-
-    /// The tier facts of the restore that just covered `covered` tokens.
-    pub(super) fn restore_tier(&mut self, covered: usize) -> PrefixTier {
-        restore_tier(self.disk.as_mut(), covered, None)
-    }
-
-    /// Whether the disk tier has saves the engine thread should advance while it waits.
-    pub(super) fn disk_pending(&self) -> bool {
-        self.disk.as_ref().is_some_and(HostStoreDisk::pending)
-    }
-
-    /// Copies a bounded part of the pending saves to the writer.
-    pub(super) fn pump_disk(&mut self) {
-        self.with_disk(None, |disk, family, _| {
-            disk.pump_with(family, PUMP_IDLE_BYTES)
-        });
-    }
-
-    /// A graceful stop: writes the tips that exist only in host memory, within the tier's bound.
-    pub(super) fn drain_disk(&mut self) {
-        self.with_disk(None, |disk, family, prefix| disk.drain(family, prefix));
+    fn restore_path(&self) -> PrefillPath {
+        self.prefill_path()
     }
 }

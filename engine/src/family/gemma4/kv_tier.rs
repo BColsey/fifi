@@ -7,10 +7,7 @@
 use super::resident::bolt::BoltSnapshot;
 use crate::{
     EngError,
-    family::kv_disk::{
-        DiskTier, FamilyContract, HostFamily, LoadIdentity, SlabLayout, SnapshotView,
-        object_per_part, place_in_vec, vec_landing,
-    },
+    family::kv_disk::{FamilyContract, LoadIdentity, SnapshotView, VecFamily},
 };
 
 /// What the shared tier calls this engine in its log lines.
@@ -31,24 +28,33 @@ const CONTRACT: FamilyContract = FamilyContract {
 
 /// The layout of an entry: one object per physical layer, each the layer's part of the snapshot,
 /// back to back in the order the snapshot stores them.
-pub(super) fn entry_slab(layer_bytes: &[usize]) -> SlabLayout {
-    object_per_part(layer_bytes)
+#[cfg(test)]
+pub(super) fn entry_slab(layer_bytes: &[usize]) -> crate::family::kv_disk::SlabLayout {
+    crate::family::kv_disk::object_per_part(layer_bytes)
 }
 
 /// The Bolt model as the host-store adapter sees it: the bytes of each physical layer's part of
 /// a snapshot of any number of cells.
-pub(super) struct BoltFamily<'a> {
-    pub(super) layer_bytes: &'a dyn Fn(usize) -> Vec<usize>,
+pub(crate) struct BoltFamily<'a> {
+    pub(super) layer_bytes: Box<dyn Fn(usize) -> Vec<usize> + 'a>,
     /// The cells of a session of this load: the longest entry it can hold.
     pub(super) context_cells: usize,
 }
 
-impl HostFamily for BoltFamily<'_> {
+impl VecFamily for BoltFamily<'_> {
     type Snapshot = BoltSnapshot;
     type Path = crate::family::session::PrefixIdentity;
-    type Landing = Vec<u8>;
+    const LABEL: &'static str = TIER_LABEL;
 
-    fn view(&self, snapshot: &BoltSnapshot) -> Option<SnapshotView> {
+    fn longest_entry(&self) -> usize {
+        self.context_cells
+    }
+
+    fn part_bytes(&self, positions: usize) -> Result<Vec<usize>, EngError> {
+        Ok((self.layer_bytes)(positions))
+    }
+
+    fn view_of(&self, snapshot: &BoltSnapshot) -> Option<SnapshotView> {
         Some(SnapshotView {
             positions: snapshot.fed(),
             bytes: snapshot.bytes() as u64,
@@ -56,34 +62,7 @@ impl HostFamily for BoltFamily<'_> {
         })
     }
 
-    fn layout(&self, positions: usize) -> Result<SlabLayout, EngError> {
-        let cells = self.context_cells;
-        if positions > cells {
-            return Err(EngError::ContextLimit(format!(
-                "a kv disk entry of {positions} positions does not fit the {cells} position context"
-            )));
-        }
-        Ok(entry_slab(&(self.layer_bytes)(positions)))
-    }
-
-    fn begin_landing(
-        &mut self,
-        _tier: &mut DiskTier,
-        _positions: usize,
-        layout: &SlabLayout,
-    ) -> Result<Vec<u8>, EngError> {
-        vec_landing(TIER_LABEL, layout)
-    }
-
-    fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<(), EngError> {
-        place_in_vec(landing, slab, part)
-    }
-
-    fn finish_landing(
-        &mut self,
-        landing: Vec<u8>,
-        positions: usize,
-    ) -> Result<BoltSnapshot, EngError> {
+    fn finish(&mut self, landing: Vec<u8>, positions: usize) -> Result<BoltSnapshot, EngError> {
         Ok(BoltSnapshot::from_parts(positions, landing))
     }
 }

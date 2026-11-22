@@ -20,9 +20,9 @@ use crate::{
     family::{
         decode_step::state_layout::StateLayout,
         kv_disk::{
-            DiskTier, FamilyContract, HostFamily, HostStoreDisk, LoadIdentity, PUMP_EMIT_BYTES,
-            PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Resolved, SlabLayout, SlotBytes, SnapshotView,
-            restore_tier,
+            DiskOwner, DiskParts, DiskTier, FamilyContract, HostFamily, HostStoreDisk,
+            LoadIdentity, PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Resolved,
+            SlabLayout, SlotBytes, SnapshotView,
         },
         session::PrefixIdentity,
     },
@@ -56,7 +56,7 @@ impl SlotBytes for RefCell<PinnedBuf> {
 
 /// The Qwen3.6 engine as the host-store adapter sees it: its entries are pinned slots of the
 /// prefix pool, and a disk read lands in a free slot.
-struct QwenFamily<'a> {
+pub(crate) struct QwenFamily<'a> {
     layout: StateLayout,
     /// The pool a disk read takes a slot from; absent when only the saves are in play.
     pool: Option<&'a mut PrefixPinPool>,
@@ -157,6 +157,52 @@ fn load_identity_of(
     }
 }
 
+impl<'s> DiskOwner for QwenResidentStep<'s> {
+    type Snapshot = CudaSavedPrefix;
+    type Path = (CudaPrefillPath, PrefixIdentity);
+    type Family<'a>
+        = QwenFamily<'a>
+    where
+        Self: 'a;
+    type Restore = ();
+
+    fn disk_ref(&self) -> Option<&HostStoreDisk> {
+        self.disk.as_ref()
+    }
+
+    fn disk_mut(&mut self) -> Option<&mut HostStoreDisk> {
+        self.disk.as_mut()
+    }
+
+    /// An entry that reaches storage outside the process names the weights, tokenizer and template
+    /// it was built under; a load that cannot says nothing to the tier. A restore takes a free
+    /// pinned slot from the pool; a write reads the held ones.
+    fn disk_parts(&mut self, restore: Option<()>) -> Option<DiskParts<'_, QwenFamily<'_>>> {
+        if !self.prefix_identity.is_persistable() {
+            return None;
+        }
+        let layout = *self.state.layout();
+        let disk = self.disk.as_mut()?;
+        Some(DiskParts {
+            disk,
+            family: QwenFamily {
+                layout,
+                pool: restore.and(self.prefix_pins.as_mut()),
+                stream: &self.stream,
+                state: &self.state,
+            },
+            store: &mut self.prefix,
+        })
+    }
+
+    fn restore_path(&self) -> Self::Path {
+        (
+            CudaPrefillPath::Steps(self.state.layout().kv.mode),
+            self.prefix_identity.clone(),
+        )
+    }
+}
+
 impl QwenResidentStep<'_> {
     fn load_identity(&self) -> LoadIdentity {
         load_identity_of(&self.prefix_identity, self.state.layout())
@@ -191,26 +237,6 @@ impl QwenResidentStep<'_> {
 
     pub(crate) fn disk_tier_enabled(&self) -> bool {
         self.disk.is_some()
-    }
-
-    /// After a save publishes: when the store holds as many entries as the watermark and the
-    /// host's memory is short, queue the least recently used ones that the next saves would push
-    /// out, so their eviction never waits for a write. With memory to spare, or below the
-    /// watermark, the disk is not touched.
-    pub(super) fn spill_over_watermark(&mut self) {
-        if !self.prefix_identity.is_persistable() {
-            return;
-        }
-        let layout = *self.state.layout();
-        if let Some(disk) = self.disk.as_mut() {
-            let family = QwenFamily {
-                layout,
-                pool: None,
-                stream: &self.stream,
-                state: &self.state,
-            };
-            disk.spill_after_save(&family, &self.prefix);
-        }
     }
 
     /// Before a save takes a slot: when none is free because spills hold them, drops the spills
@@ -252,70 +278,12 @@ impl QwenResidentStep<'_> {
         self.pump_disk(PUMP_IDLE_BYTES);
     }
 
-    /// Whether the disk tier has work the engine thread should advance while idle.
-    pub(crate) fn disk_pending(&self) -> bool {
-        self.disk.as_ref().is_some_and(HostStoreDisk::pending)
-    }
-
-    /// Copies up to `budget` bytes of pending saves to the writer and logs what finished.
-    fn pump_disk(&mut self, budget: usize) {
-        let layout = *self.state.layout();
-        if let Some(disk) = self.disk.as_mut() {
-            let family = QwenFamily {
-                layout,
-                pool: None,
-                stream: &self.stream,
-                state: &self.state,
-            };
-            disk.pump_with(&family, budget);
-        }
-    }
-
-    /// A graceful stop: writes the tips that exist only in memory, newest first, so a restart
-    /// restores them, within the bound the tier derives from their bytes and the write rate; a
-    /// second stop signal ends the wait at once.
-    pub(crate) fn drain_disk(&mut self) {
-        if !self.prefix_identity.is_persistable() {
-            return;
-        }
-        let layout = *self.state.layout();
-        if let Some(disk) = self.disk.as_mut() {
-            let family = QwenFamily {
-                layout,
-                pool: None,
-                stream: &self.stream,
-                state: &self.state,
-            };
-            disk.drain(&family, &self.prefix);
-        }
-    }
-
-    /// Before a restore: when the disk holds a longer stored prefix of `prompt` than pinned
-    /// memory does, reads it (verified in full) into a free pinned slot and stores it as an
-    /// ordinary entry, so the restore that follows finds it. A miss changes nothing.
-    pub(crate) fn promote_from_disk(&mut self, prompt: &[u32]) {
-        let path = (
-            CudaPrefillPath::Steps(self.state.layout().kv.mode),
-            self.prefix_identity.clone(),
-        );
-        let layout = *self.state.layout();
-        if let Some(disk) = self.disk.as_mut() {
-            let mut family = QwenFamily {
-                layout,
-                pool: self.prefix_pins.as_mut(),
-                stream: &self.stream,
-                state: &self.state,
-            };
-            disk.promote(&mut family, &mut self.prefix, &path, prompt);
-        }
-    }
-
     /// The tier facts of the restore that just covered `covered` tokens. A restore served from
     /// pinned memory names its source; one that promoted a disk entry names the disk and what
     /// the read cost.
     pub(super) fn restore_tier(&mut self, covered: usize) -> crate::sched::job::PrefixTier {
         let source = self.restore_source.take();
-        restore_tier(self.disk.as_mut(), covered, source)
+        self.restore_tier_of(covered, source)
     }
 }
 

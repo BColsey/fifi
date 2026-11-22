@@ -69,6 +69,8 @@
 
 mod kv_tier;
 
+use crate::family::kv_disk::{DiskOwner, PUMP_IDLE_BYTES};
+
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
@@ -147,7 +149,7 @@ pub(crate) struct Q36Rules {
 /// restore under `Chunked(n)` matches a full recompute only within the chunk-parity tolerance, and
 /// only the `Steps` path is bitwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrefillPath {
+pub(crate) enum PrefillPath {
     /// One-token steps (the default).
     Steps,
     /// Chunks of this many rows (`plan_prefill`).
@@ -191,6 +193,9 @@ pub(crate) struct Q36Executor {
     /// never takes the memory of the prefill piece. `None` (no device budget) leaves the store
     /// to the session cap alone.
     prefix_room: Option<u64>,
+    /// The device budget the engine runs under, when it has one: it bounds the host memory the
+    /// disk tier lets stored entries take.
+    tier_cap: Option<u64>,
     /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`.
     /// `Miss` until a restore takes an entry, and a reset clears it again, so the report of a job
     /// without a boundary is a miss.
@@ -1121,6 +1126,7 @@ impl Q36Executor {
                 .is_some_and(|value| value == "1"),
             mlx_plan: None,
             prefix_room: None,
+            tier_cap: None,
             prefix_hit: PrefixHit::Miss,
             prefix_uncached: 0,
             prefix_shadow: None,
@@ -1318,6 +1324,7 @@ impl Q36Executor {
         device: Option<DeviceBudget>,
     ) -> Result<()> {
         use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
+        self.tier_cap = device.map(DeviceBudget::bytes);
         let dense_stage = self.decoder.weights.dense_stage_bytes()?;
         let (placement, placement_reason) = if dense_stage != 0 {
             (
@@ -1815,7 +1822,11 @@ impl ExecutorOps for Q36Executor {
     fn restore_prefix(&mut self, st: &mut Q36Session, prompt: &[u32]) -> Result<usize> {
         let path = self.prefill_path();
         // The host store missed or holds a shorter prefix: the disk may hold a longer one.
-        self.promote_from_disk(st, prompt);
+        let restore = kv_tier::Restore {
+            shape: st.state.load_shape(),
+            charged: st.state.charged_bytes().unwrap_or(0),
+        };
+        self.promote_from_disk(restore, prompt);
         let decoder = &mut self.decoder;
         let Q36Session { state, core, .. } = st;
         let covered = core.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
@@ -1828,7 +1839,7 @@ impl ExecutorOps for Q36Executor {
         self.prefix_shadow = self.prefix.shadow_report();
         // Without a disk tier the report keeps its default tier facts.
         self.prefix_tier = if self.disk.is_some() {
-            self.restore_tier(covered)
+            self.restore_tier_of(covered, None)
         } else {
             PrefixTier::default()
         };
@@ -1843,7 +1854,7 @@ impl ExecutorOps for Q36Executor {
     /// Copies a bounded part of the pending saves to the writer: the worker calls it between
     /// jobs.
     fn background_step(&mut self) {
-        self.pump_disk();
+        self.pump_disk(PUMP_IDLE_BYTES);
     }
 
     /// A graceful stop: writes the tips that exist only in host memory, within the tier's bound.
@@ -5919,20 +5930,24 @@ mod tests {
         let snapshot = executor.decoder.snapshot(&session.state).unwrap();
         let positions = snapshot.pos() as usize;
         let context_limit = executor.context_limit;
+        let shape = session.state.load_shape();
         let decoder = &mut executor.decoder;
         let mut family = MlxFamily {
             kernels: std::cell::RefCell::new(&mut decoder.kernels),
             weights: &decoder.weights,
-            restore: Some(Restore {
-                state: &session.state,
-                budget: &mut decoder.budget,
-                room: None,
-                held: 0,
-            }),
+            budget: &mut decoder.budget,
             context_limit,
+            restore: Some(Restore { shape, charged: 0 }),
+            room: None,
+            held: 0,
+            cap: None,
         };
-        family.prepare(&snapshot).unwrap();
-        let view = family.view(&snapshot).unwrap();
+        let copy = family
+            .prepare(&snapshot)
+            .unwrap()
+            .expect("a copy for the write");
+        let mut view = family.view(&snapshot).unwrap();
+        view.slot = copy;
         assert_eq!(view.positions, positions);
         let mut bytes = vec![0u8; view.bytes as usize];
         view.slot.read(0, &mut bytes).unwrap();
@@ -5957,6 +5972,15 @@ mod tests {
                 .unwrap();
         }
         let loaded = family.finish_landing(landing, positions).unwrap();
+        assert!(
+            snapshot.host_copy().get().is_some(),
+            "the copy lives while the write holds its slot"
+        );
+        drop(view);
+        assert!(
+            snapshot.host_copy().get().is_none(),
+            "the copy's memory is back when the write ends"
+        );
         drop(snapshot);
         executor.reset(&mut session).unwrap();
         executor
@@ -6014,6 +6038,87 @@ mod tests {
             .unwrap();
         let pending = session.core.pending().unwrap();
         // One-token steps are the path with bitwise equality.
+        for (n, token) in std::iter::once(pending).chain(FORCED).enumerate() {
+            let row = executor
+                .decoder
+                .step(&mut session.state, token, StepMode::Logits)
+                .unwrap()
+                .logits
+                .unwrap();
+            assert_eq!(bits(&row), bits(&want.rows[n]), "logits row {n}");
+        }
+    }
+
+    /// A prefix spilled to the disk tier is written, the store evicts it for another, and the next
+    /// restore of its prompt reads it back: the tier reports the disk as the source and the
+    /// logits after the suffix equal an uncached run's bit for bit.
+    #[test]
+    fn a_spilled_prefix_is_read_back_from_disk_after_the_store_evicts_it() {
+        use crate::family::kv_disk::{DiskOwner, HostStoreDisk, PUMP_IDLE_BYTES, Resolved};
+        use crate::sched::job::PrefixSource;
+        const KEY_LEN: usize = 1_026;
+        let _serial = crate::native_test_lock();
+        let mut rules = prefix_rules();
+        rules.context_limit = 1_200;
+        rules.session_cap = 100_000_000;
+        let (mut executor, mut session) = build(rules);
+        let prompt = |mul: u32, add: u32| -> Vec<u32> {
+            (0..1_030u32).map(|n| (n * mul + add) % 7 + 1).collect()
+        };
+        let (a, b) = (prompt(1, 0), prompt(3, 2));
+        let want = run_job(&mut executor, &mut session, &a, 6);
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::family::session::PrefixIdentity {
+            weights: "w".into(),
+            tokenizer: "t".into(),
+            template: "p".into(),
+        };
+        let load = super::kv_tier::load_identity(
+            &identity,
+            &executor.decoder.weights,
+            executor.prefill_path(),
+        );
+        let resolved = Resolved {
+            dir: dir.path().join("cache"),
+            quota_bytes: 1 << 30,
+        };
+        executor.disk = HostStoreDisk::open("q36 mlx", &resolved, "test", &load, 1);
+        assert!(executor.disk.is_some(), "the tier opens");
+        for prompt in [&a, &b] {
+            executor.reset(&mut session).unwrap();
+            executor.prefill(&mut session, &prompt[..KEY_LEN]).unwrap();
+            assert!(
+                executor
+                    .save_prefix(&session, &prompt[..KEY_LEN], SaveKind::Tip)
+                    .unwrap(),
+                "the save was refused"
+            );
+            if prompt == &a {
+                // The host is short: the entry the next save pushes out is queued and written.
+                executor.spill_now();
+                let began = std::time::Instant::now();
+                while executor.disk_pending() {
+                    executor.pump_disk(PUMP_IDLE_BYTES);
+                    assert!(began.elapsed().as_secs() < 120, "the writer stalls");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        assert_eq!(
+            executor.prefix.key_len(),
+            Some(KEY_LEN),
+            "the store holds the second prompt only"
+        );
+        executor.reset(&mut session).unwrap();
+        let covered = executor.restore_prefix(&mut session, &a).unwrap();
+        assert_eq!(covered, KEY_LEN, "covered tokens");
+        assert_eq!(
+            executor.prefix_tier.source,
+            PrefixSource::Disk,
+            "the entry came from the disk"
+        );
+        executor.prefill(&mut session, &a[KEY_LEN..]).unwrap();
+        let pending = session.core.pending().unwrap();
         for (n, token) in std::iter::once(pending).chain(FORCED).enumerate() {
             let row = executor
                 .decoder

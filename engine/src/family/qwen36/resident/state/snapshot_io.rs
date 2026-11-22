@@ -19,12 +19,19 @@ use super::{
 };
 use crate::{
     EngError,
-    family::qwen36::settings::{KvDtype, Q8_GROUP},
+    family::{
+        kv_disk::{cut_rows, pad_rows},
+        qwen36::settings::{KvDtype, Q8_GROUP},
+    },
     kernels::MlxKernels,
     sched::SessionBudget,
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
-use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+    sync::atomic::Ordering,
+};
 
 /// The width and element type of each tensor of one attention layer's cache, in the order
 /// `KvCache::tensors` lists them.
@@ -78,18 +85,21 @@ pub(in crate::family::qwen36::resident) fn object_bytes(
         .collect())
 }
 
-/// The host copy of one snapshot: its objects back to back, read from the device when the disk
-/// tier first needs them and kept until the snapshot goes.
+/// The host copy of one snapshot: its objects back to back in one buffer, read from the device
+/// when the disk tier asks for it. The snapshot keeps no strong hold: the copy lives while a
+/// queued write holds it, and its memory is back when the write ends.
 #[derive(Default)]
-pub(in crate::family::qwen36::resident) struct HostCopy(RefCell<Option<Rc<Vec<u8>>>>);
+pub(in crate::family::qwen36::resident) struct HostCopy(RefCell<Weak<Vec<u8>>>);
 
 impl HostCopy {
     pub(in crate::family::qwen36::resident) fn get(&self) -> Option<Rc<Vec<u8>>> {
-        self.0.borrow().clone()
+        self.0.borrow().upgrade()
     }
 
-    pub(in crate::family::qwen36::resident) fn set(&self, bytes: Vec<u8>) {
-        *self.0.borrow_mut() = Some(Rc::new(bytes));
+    fn set(&self, bytes: Vec<u8>) -> Rc<Vec<u8>> {
+        let bytes = Rc::new(bytes);
+        *self.0.borrow_mut() = Rc::downgrade(&bytes);
+        bytes
     }
 }
 
@@ -105,40 +115,43 @@ fn host(tensor: &Tensor) -> Result<&[u8], EngError> {
 }
 
 impl ResidentSnapshot {
-    /// Reads the snapshot back into its host copy unless that exists, and checks it against the
-    /// layout the weights give a snapshot of this length.
+    /// The snapshot's host copy: the one a queued write already holds, or one read back from the
+    /// device now into a single buffer sized by the layout the weights give a snapshot of this
+    /// length. Reads every array back, so it synchronizes.
     pub(in crate::family::qwen36::resident) fn make_host_copy(
         &self,
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
-    ) -> Result<(), EngError> {
-        if self.host.get().is_some() {
-            return Ok(());
+    ) -> Result<Rc<Vec<u8>>, EngError> {
+        if let Some(held) = self.host.get() {
+            return Ok(held);
         }
-        let objects = self.to_objects(kernels)?;
-        let want = object_bytes(weights, self.pos as usize)?;
-        if objects.iter().map(Vec::len).collect::<Vec<_>>() != want {
+        let sizes = object_bytes(weights, self.pos as usize)?;
+        let total: usize = sizes.iter().sum();
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(total).map_err(|_| {
+            EngError::MemoryPlan(format!(
+                "{total} B of a snapshot copy do not fit in host memory"
+            ))
+        })?;
+        self.append_objects(kernels, &mut bytes)?;
+        if bytes.len() != total {
             return Err(EngError::BadRequest(
                 "a snapshot read back does not match the model layout".into(),
             ));
         }
-        self.host.set(objects.concat());
-        Ok(())
+        Ok(self.host.set(bytes))
     }
 
-    /// The host copy, if one was made.
+    /// The host copy a write holds, if there is one.
     pub(in crate::family::qwen36::resident) fn host_copy(&self) -> &HostCopy {
         &self.host
     }
 
-    /// The snapshot as one object per layer. Reads every array back, so it synchronizes.
-    pub(in crate::family::qwen36::resident) fn to_objects(
-        &self,
-        kernels: &mut MlxKernels,
-    ) -> Result<Vec<Vec<u8>>, EngError> {
-        let mut objects = Vec::with_capacity(self.layers.len());
+    /// Appends the snapshot's layers to `out`, one object per layer in model order. Reads every
+    /// array back, so it synchronizes.
+    fn append_objects(&self, kernels: &mut MlxKernels, out: &mut Vec<u8>) -> Result<(), EngError> {
         for layer in &self.layers {
-            let mut bytes = Vec::new();
             match layer {
                 LayerState::Delta { rec, ring } => {
                     for tensor in [rec, ring] {
@@ -148,7 +161,7 @@ impl ResidentSnapshot {
                                 "a DeltaNet state array is not F32".into(),
                             ));
                         }
-                        bytes.extend_from_slice(host(&read)?);
+                        out.extend_from_slice(host(&read)?);
                     }
                 }
                 LayerState::Attn(cache) => {
@@ -159,27 +172,43 @@ impl ResidentSnapshot {
                                 "an attention cache tensor is not [1, heads, cap, width]".into(),
                             ));
                         };
-                        if cache.len > cap as usize {
-                            return Err(EngError::BadRequest(
-                                "an attention cache tensor is shorter than its length".into(),
-                            ));
-                        }
-                        let row = width as usize * read.dtype().byte_width() as usize;
-                        let data = host(&read)?;
-                        for head in 0..heads as usize {
-                            let start = head * cap as usize * row;
-                            bytes.extend_from_slice(&data[start..start + cache.len * row]);
-                        }
+                        cut_rows(
+                            out,
+                            host(&read)?,
+                            heads as usize,
+                            cap as usize,
+                            cache.len,
+                            width as usize * read.dtype().byte_width() as usize,
+                        )?;
                     }
                 }
             }
-            objects.push(bytes);
         }
-        Ok(objects)
+        Ok(())
     }
 }
 
+/// What a snapshot read back from disk needs of the live state it will restore into: how its
+/// attention caches grow and what a position charges.
+#[derive(Clone, Copy)]
+pub(crate) struct LoadShape {
+    kv_step: usize,
+    kv_ceiling: usize,
+    kv_growth_per_layer: u64,
+}
+
 impl ResidentState {
+    /// The growth rules of this state, for a snapshot read back to match them.
+    pub(in crate::family::qwen36::resident) fn load_shape(&self) -> LoadShape {
+        LoadShape {
+            kv_step: self.kv_step,
+            kv_ceiling: self.kv_ceiling,
+            kv_growth_per_layer: self.kv_growth_per_layer,
+        }
+    }
+}
+
+impl LoadShape {
     /// What `snapshot_from_objects` charges the session budget for a snapshot of `positions`
     /// (the fixed DeltaNet bytes, the page-table allowance and the cache bytes), so a caller can
     /// check the room for it before it reads anything.
@@ -265,14 +294,12 @@ impl ResidentState {
                     let mut at = 0usize;
                     for &(width, dtype) in &parts {
                         let row = width as usize * dtype.byte_width() as usize;
-                        let mut padded = vec![0u8; heads * cap * row];
-                        for head in 0..heads {
-                            let from = at + head * positions * row;
-                            let to = head * cap * row;
-                            padded[to..to + positions * row]
-                                .copy_from_slice(&object[from..from + positions * row]);
-                        }
-                        at += heads * positions * row;
+                        let cut = heads * positions * row;
+                        let part = object.get(at..at + cut).ok_or_else(|| {
+                            EngError::BadRequest("a stored snapshot is too short".into())
+                        })?;
+                        let padded = pad_rows(part, heads, positions, cap, row)?;
+                        at += cut;
                         host_tensors.push(Tensor::try_from_host(
                             dtype,
                             vec![1, dim(heads)?, dim(cap)?, width],

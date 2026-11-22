@@ -210,6 +210,44 @@ pub(crate) fn physical_memory_bytes() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// The bytes of this Mac that the OS can hand out without paging: the free, inactive and
+/// purgeable pages of `vm_stat`, read now. `None` when the tool or its output cannot be read.
+#[cfg(target_os = "macos")]
+pub(crate) fn available_memory_bytes() -> Option<u64> {
+    let out = std::process::Command::new("/usr/bin/vm_stat")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    parse_vm_stat(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The available bytes in the text of `vm_stat`: its page size times the free, inactive and
+/// purgeable page counts.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_vm_stat(text: &str) -> Option<u64> {
+    let page_size: u64 = text
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let pages = |name: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))?
+            .trim()
+            .trim_end_matches('.')
+            .parse()
+            .ok()
+    };
+    let available = pages("Pages free")?
+        .checked_add(pages("Pages inactive")?)?
+        .checked_add(pages("Pages purgeable")?)?;
+    available.checked_mul(page_size)
+}
+
 #[cfg(all(not(target_os = "macos"), any(test, target_os = "linux")))]
 pub(crate) fn physical_memory_bytes() -> Option<u64> {
     super::HostFacts::physical_total()
@@ -549,5 +587,38 @@ mod tests {
             }
         }
         assert_eq!(mac(24, None, None).implied_budget(22 * GIB), Some(20 * GIB));
+    }
+}
+
+#[cfg(test)]
+mod vm_stat_tests {
+    use super::parse_vm_stat;
+
+    const SAMPLE: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free:                                  1920791.\n\
+Pages active:                                 109956.\n\
+Pages inactive:                               106344.\n\
+Pages speculative:                              7385.\n\
+Pages throttled:                                   0.\n\
+Pages wired down:                             145145.\n\
+Pages purgeable:                                1244.\n\
+\"Translation faults\":                    27980608462.\n";
+
+    #[test]
+    fn the_available_bytes_are_the_free_inactive_and_purgeable_pages() {
+        assert_eq!(
+            parse_vm_stat(SAMPLE),
+            Some((1_920_791 + 106_344 + 1_244) * 16_384)
+        );
+    }
+
+    #[test]
+    fn a_text_without_the_counts_gives_none() {
+        assert_eq!(parse_vm_stat(""), None);
+        assert_eq!(parse_vm_stat("Pages free: 1.\n"), None);
+        assert_eq!(
+            parse_vm_stat("Mach (page size of 4096 bytes)\nPages free: 1.\n"),
+            None
+        );
     }
 }

@@ -7,6 +7,7 @@ use super::super::{
     },
 };
 use super::QwenResidentStep;
+use crate::family::kv_disk::DiskOwner;
 use crate::family::{executor::ExecutorOps, graph_state::book::Health};
 use crate::{
     EngError,
@@ -358,7 +359,7 @@ impl QwenResidentStep<'_> {
                 "q36 cuda: prefix saved {positions} positions, {charge} B, {:.1} ms, KV copied {copied_kv_bytes} B",
                 began.elapsed().as_secs_f64() * 1000.0
             );
-            self.spill_over_watermark();
+            self.spill_after_save();
         }
         Ok(())
     }

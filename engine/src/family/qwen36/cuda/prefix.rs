@@ -12,7 +12,7 @@ use crate::{
     sched::job::PrefixReport,
 };
 
-pub(super) enum CudaSavedPrefix {
+pub(crate) enum CudaSavedPrefix {
     Pageable(ExportedState),
     Pinned {
         state: PinnedSnapshot,
@@ -72,7 +72,7 @@ pub(super) struct PendingPrefix {
 /// process, one loaded model, where the layout cannot change). Persisting an entry, or a store
 /// shared by several steps, must add the weight layout to what a restore checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CudaPrefillPath {
+pub(crate) enum CudaPrefillPath {
     Steps(KvMode),
     /// Diagnostic identity only. The production chunk path still disables reuse.
     #[cfg(test)]

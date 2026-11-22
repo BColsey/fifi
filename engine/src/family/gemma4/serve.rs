@@ -109,7 +109,10 @@ mod device {
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
-            kv_disk::{self as kv_cache, HostStoreDisk, KvCacheSettings},
+            kv_disk::{
+                self as kv_cache, DiskOwner, DiskParts, HostStoreDisk, KvCacheSettings,
+                PUMP_EMIT_BYTES,
+            },
             seq_plan::{SeqInputs, plan_seqs},
             session::{
                 DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, ShadowLcp,
@@ -385,7 +388,7 @@ mod device {
                         model.snapshot_seq(&st.seq, st.pos)
                     })?;
             if saved {
-                self.with_disk(|disk, family, prefix| disk.spill_after_save(family, prefix));
+                self.spill_after_save();
             }
             Ok(saved)
         }
@@ -398,17 +401,10 @@ mod device {
             st: &mut Self::Session,
             prompt: &[u32],
         ) -> Result<usize, EngError> {
+            // The host store missed or holds a shorter prefix: the disk may hold a longer one.
+            self.promote_from_disk((), prompt);
             let identity = self.identity.clone();
             let model = &self.model;
-            // The host store missed or holds a shorter prefix: the disk may hold a longer one.
-            if let Some(disk) = self.disk.as_mut() {
-                let layer_bytes = |cells| model.snapshot_layer_bytes(cells);
-                let mut family = BoltFamily {
-                    layer_bytes: &layer_bytes,
-                    context_cells: model.cells(),
-                };
-                disk.promote(&mut family, &mut self.prefix, &identity, prompt);
-            }
             let BoltSession { core, pos, seq } = st;
             let covered = core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
                 model.restore_seq(seq, saved)?;
@@ -419,7 +415,7 @@ mod device {
             self.prefix_hit = self.prefix.restored_kind().into();
             self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
             self.prefix_shadow = self.prefix.shadow_report();
-            self.prefix_tier = kv_cache::restore_tier(self.disk.as_mut(), covered, None);
+            self.prefix_tier = self.restore_tier_of(covered, None);
             Ok(covered)
         }
 
@@ -446,41 +442,51 @@ mod device {
 
         /// Whether the disk tier has saves the engine thread should advance while it waits.
         fn background_pending(&self) -> bool {
-            self.disk.as_ref().is_some_and(HostStoreDisk::pending)
+            DiskOwner::disk_pending(self)
         }
 
         /// Copies a bounded part of the pending saves to the writer: a few MiB per call, which a
         /// batching worker makes between ticks and an idle one every 2 ms.
         fn background_step(&mut self) {
-            self.with_disk(|disk, family, _| disk.pump(family));
+            self.pump_disk(PUMP_EMIT_BYTES);
         }
 
         /// A graceful stop: writes the tips that exist only in host memory, within the tier's
         /// bound.
         fn background_drain(&mut self) {
-            self.with_disk(|disk, family, prefix| disk.drain(family, prefix));
+            self.drain_disk();
         }
     }
 
-    impl BoltServe {
-        /// Runs `work` on the disk tier with the family view of the model and the host store.
-        fn with_disk(
-            &mut self,
-            work: impl FnOnce(
-                &mut HostStoreDisk,
-                &BoltFamily<'_>,
-                &mut PrefixStore<BoltSnapshot, PrefixIdentity>,
-            ),
-        ) {
+    impl DiskOwner for BoltServe {
+        type Snapshot = BoltSnapshot;
+        type Path = PrefixIdentity;
+        type Family<'a> = BoltFamily<'a>;
+        type Restore = ();
+
+        fn disk_ref(&self) -> Option<&HostStoreDisk> {
+            self.disk.as_ref()
+        }
+
+        fn disk_mut(&mut self) -> Option<&mut HostStoreDisk> {
+            self.disk.as_mut()
+        }
+
+        fn disk_parts(&mut self, _restore: Option<()>) -> Option<DiskParts<'_, BoltFamily<'_>>> {
             let model = &self.model;
-            if let Some(disk) = self.disk.as_mut() {
-                let layer_bytes = |cells| model.snapshot_layer_bytes(cells);
-                let family = BoltFamily {
-                    layer_bytes: &layer_bytes,
+            let disk = self.disk.as_mut()?;
+            Some(DiskParts {
+                disk,
+                family: BoltFamily {
+                    layer_bytes: Box::new(|cells| model.snapshot_layer_bytes(cells)),
                     context_cells: model.cells(),
-                };
-                work(disk, &family, &mut self.prefix);
-            }
+                },
+                store: &mut self.prefix,
+            })
+        }
+
+        fn restore_path(&self) -> PrefixIdentity {
+            self.identity.clone()
         }
     }
 

@@ -41,12 +41,18 @@ pub(crate) trait HostFamily {
     /// What the disk may take of a snapshot, or `None` for one that cannot be written (an entry
     /// that is not kept in host memory).
     fn view(&self, snapshot: &Self::Snapshot) -> Option<SnapshotView>;
-    /// Readies `snapshot` to be read as a slot, for a family whose host copy is made on demand
-    /// (its state lives in device memory). Called before a snapshot is queued for a write; an
-    /// error leaves it out of the queue. Families whose snapshot is host memory already keep
-    /// the default.
-    fn prepare(&self, _snapshot: &Self::Snapshot) -> Result<(), EngError> {
-        Ok(())
+    /// The slot to read `snapshot` from, for a family whose host copy is made on demand (its
+    /// state lives in device memory): the copy lives while the queued write holds the slot. Called
+    /// before a snapshot is queued for a write; an error leaves it out of the queue. Families
+    /// whose snapshot is host memory already keep the default, and the view's slot serves.
+    fn prepare(&self, _snapshot: &Self::Snapshot) -> Result<Option<Rc<dyn SlotBytes>>, EngError> {
+        Ok(None)
+    }
+    /// The host memory a stored entry may still take, read now; `None` when it cannot be read,
+    /// which counts as short. The default is what the host has free; a family that runs under a
+    /// memory budget of its own bounds it by what the budget has left.
+    fn host_available(&self) -> Option<u64> {
+        crate::family::mem::tier_available_bytes("kv disk")
     }
     /// The layout of an entry of `positions`, or why this load cannot hold one that long.
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError>;
@@ -90,9 +96,7 @@ pub(crate) fn object_per_part(part_bytes: &[usize]) -> SlabLayout {
 /// checked against the host's available memory and the allocation is fallible.
 pub(crate) fn vec_landing(label: &str, layout: &SlabLayout) -> Result<Vec<u8>, EngError> {
     let total = slab_bytes(layout);
-    let available = crate::family::mem::HostFacts::read("a kv disk restore", "a kv disk restore")
-        .ok()
-        .map(|host| host.budget());
+    let available = crate::family::mem::tier_available_bytes("a kv disk restore");
     if available.is_some_and(|available| total as u64 > available) {
         return Err(EngError::MemoryPlan(format!(
             "{label}: the host budget cannot hold {total} B"
@@ -141,11 +145,17 @@ pub(crate) fn held_of<F: HostFamily>(
     snapshot: &F::Snapshot,
     reason: Reason,
 ) -> Option<Held> {
-    if let Err(error) = family.prepare(snapshot) {
-        eprintln!("kv disk: a snapshot could not be prepared for a write: {error:?}");
-        return None;
+    let prepared = match family.prepare(snapshot) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("kv disk: a snapshot could not be prepared for a write: {error:?}");
+            return None;
+        }
+    };
+    let mut view = family.view(snapshot)?;
+    if let Some(slot) = prepared {
+        view.slot = slot;
     }
-    let view = family.view(snapshot)?;
     if view.positions < MIN_POSITIONS || key.len() != view.positions + 1 {
         return None;
     }
@@ -167,19 +177,6 @@ fn slab_bytes(layout: &SlabLayout) -> usize {
         .map(|run| run.slab + run.bytes)
         .max()
         .unwrap_or(0)
-}
-
-/// Whether the host's available memory leaves room for one more entry of `entry_bytes` above the
-/// reserve. Unknown counts as short, so no entry is lost for lack of a look.
-pub(crate) fn host_is_short(label: &'static str, entry_bytes: u64) -> bool {
-    let available = crate::family::mem::HostFacts::read(label, label)
-        .ok()
-        .map(|host| host.budget());
-    host_memory_is_short(
-        available,
-        crate::family::mem::HOST_HEADROOM_BYTES,
-        entry_bytes,
-    )
 }
 
 /// Plans the tier of `family_key`'s engines from the config member, the environment and the build
@@ -289,7 +286,11 @@ impl HostStoreDisk {
 
     /// After a save: [`Self::spill_over_watermark`] with the host's memory read now.
     pub(crate) fn spill_after_save<F: HostFamily>(&mut self, family: &F, store: &Store<F>) {
-        let short = host_is_short(self.label, Self::largest(family, store));
+        let short = host_memory_is_short(
+            family.host_available(),
+            crate::family::mem::HOST_HEADROOM_BYTES,
+            Self::largest(family, store),
+        );
         self.spill_over_watermark(family, store, short);
     }
 
@@ -461,6 +462,179 @@ pub(crate) fn restore_tier(
         source,
         PrefixSource::Pinned,
     )
+}
+
+/// A family whose snapshot is read back into one vector of host memory and cut into one object
+/// per part: the layout (with the context check), the landing and the placing are provided; the
+/// family says how many bytes each part takes, what a snapshot looks like to the writer and what a
+/// filled vector becomes. Every `VecFamily` is a [`HostFamily`].
+pub(crate) trait VecFamily {
+    type Snapshot;
+    type Path: PartialEq + Clone;
+
+    /// What the shared tier calls this engine in its log lines.
+    const LABEL: &'static str;
+
+    /// The longest entry, in positions, a session of this load can hold; a longer one is refused.
+    fn longest_entry(&self) -> usize;
+    /// The bytes of each part (a layer) of an entry of `positions`, in order.
+    fn part_bytes(&self, positions: usize) -> Result<Vec<usize>, EngError>;
+    /// What the disk may take of a snapshot, as [`HostFamily::view`].
+    fn view_of(&self, snapshot: &Self::Snapshot) -> Option<SnapshotView>;
+    /// The snapshot a filled landing becomes.
+    fn finish(&mut self, landing: Vec<u8>, positions: usize) -> Result<Self::Snapshot, EngError>;
+    /// The host memory a stored entry may still take, as [`HostFamily::host_available`].
+    fn available_bytes(&self) -> Option<u64> {
+        crate::family::mem::tier_available_bytes(Self::LABEL)
+    }
+    /// Whether the host has room to hold an entry of `positions` beyond what is stored; a family
+    /// that keeps a budget of its own for stored prefixes checks it here.
+    fn room_for(&self, _positions: usize) -> Result<(), EngError> {
+        Ok(())
+    }
+    /// The slot to read `snapshot` from, as [`HostFamily::prepare`].
+    fn prepare_slot(
+        &self,
+        _snapshot: &Self::Snapshot,
+    ) -> Result<Option<Rc<dyn SlotBytes>>, EngError> {
+        Ok(None)
+    }
+}
+
+impl<T: VecFamily> HostFamily for T {
+    type Snapshot = <T as VecFamily>::Snapshot;
+    type Path = <T as VecFamily>::Path;
+    type Landing = Vec<u8>;
+
+    fn prepare(&self, snapshot: &Self::Snapshot) -> Result<Option<Rc<dyn SlotBytes>>, EngError> {
+        self.prepare_slot(snapshot)
+    }
+
+    fn view(&self, snapshot: &Self::Snapshot) -> Option<SnapshotView> {
+        self.view_of(snapshot)
+    }
+
+    fn host_available(&self) -> Option<u64> {
+        self.available_bytes()
+    }
+
+    fn layout(&self, positions: usize) -> Result<SlabLayout, EngError> {
+        let longest = self.longest_entry();
+        if positions > longest {
+            return Err(EngError::ContextLimit(format!(
+                "a kv disk entry of {positions} positions is longer than the {longest} this load can hold"
+            )));
+        }
+        Ok(object_per_part(&self.part_bytes(positions)?))
+    }
+
+    fn begin_landing(
+        &mut self,
+        _tier: &mut DiskTier,
+        positions: usize,
+        layout: &SlabLayout,
+    ) -> Result<Vec<u8>, EngError> {
+        self.room_for(positions)?;
+        vec_landing(T::LABEL, layout)
+    }
+
+    fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<(), EngError> {
+        place_in_vec(landing, slab, part)
+    }
+
+    fn finish_landing(
+        &mut self,
+        landing: Vec<u8>,
+        positions: usize,
+    ) -> Result<Self::Snapshot, EngError> {
+        self.finish(landing, positions)
+    }
+}
+
+/// The three parts of an engine's disk tier that a call works on at once: the tier, the family
+/// view of the model, and the host store.
+pub(crate) struct DiskParts<'a, F: HostFamily> {
+    pub(crate) disk: &'a mut HostStoreDisk,
+    pub(crate) family: F,
+    pub(crate) store: &'a mut Store<F>,
+}
+
+/// An engine that keeps its saved prefixes in a host store with a [`HostStoreDisk`] behind it. It
+/// says how to take its own parts apart; every call the engine makes on the tier is provided.
+pub(crate) trait DiskOwner {
+    type Snapshot;
+    type Path: PartialEq + Clone;
+    /// The family view of the model, borrowing from the engine for one call.
+    type Family<'a>: HostFamily<Snapshot = Self::Snapshot, Path = Self::Path>
+    where
+        Self: 'a;
+    /// What a restore needs from the session it restores into; nothing for a write.
+    type Restore: Copy;
+
+    fn disk_ref(&self) -> Option<&HostStoreDisk>;
+    fn disk_mut(&mut self) -> Option<&mut HostStoreDisk>;
+    /// The tier, the family and the store, or `None` when the tier is off. A restore passes what
+    /// it needs from the session; a write passes `None`.
+    fn disk_parts(
+        &mut self,
+        restore: Option<Self::Restore>,
+    ) -> Option<DiskParts<'_, Self::Family<'_>>>;
+    /// The store path a restore looks entries up under.
+    fn restore_path(&self) -> Self::Path;
+
+    /// After a save: queues the entries the next saves would push out when the host's memory is
+    /// short. With memory to spare the disk is not touched.
+    fn spill_after_save(&mut self) {
+        if let Some(parts) = self.disk_parts(None) {
+            parts.disk.spill_after_save(&parts.family, parts.store);
+        }
+    }
+
+    /// Test support: queues the entries the next saves would push out as if the host were short.
+    #[cfg(test)]
+    fn spill_now(&mut self) {
+        if let Some(parts) = self.disk_parts(None) {
+            parts
+                .disk
+                .spill_over_watermark(&parts.family, parts.store, true);
+        }
+    }
+
+    /// Before a restore: reads a longer stored prefix of `prompt` than the store holds, when the
+    /// disk has one, into the store as an ordinary entry. A miss changes nothing.
+    fn promote_from_disk(&mut self, restore: Self::Restore, prompt: &[u32]) {
+        let path = self.restore_path();
+        if let Some(mut parts) = self.disk_parts(Some(restore)) {
+            parts
+                .disk
+                .promote(&mut parts.family, parts.store, &path, prompt);
+        }
+    }
+
+    /// Whether the tier has saves the engine thread should advance while it waits.
+    fn disk_pending(&self) -> bool {
+        self.disk_ref().is_some_and(HostStoreDisk::pending)
+    }
+
+    /// Copies up to `budget` bytes of the pending saves to the writer.
+    fn pump_disk(&mut self, budget: usize) {
+        if let Some(parts) = self.disk_parts(None) {
+            parts.disk.pump_with(&parts.family, budget);
+        }
+    }
+
+    /// A graceful stop: writes the tips that exist only in memory, within the tier's bound.
+    fn drain_disk(&mut self) {
+        if let Some(parts) = self.disk_parts(None) {
+            parts.disk.drain(&parts.family, parts.store);
+        }
+    }
+
+    /// The tier facts of the restore that just covered `covered` tokens; `source` names where a
+    /// restore served from memory came from.
+    fn restore_tier_of(&mut self, covered: usize, source: Option<PrefixSource>) -> PrefixTier {
+        restore_tier(self.disk_mut(), covered, source)
+    }
 }
 
 #[cfg(test)]

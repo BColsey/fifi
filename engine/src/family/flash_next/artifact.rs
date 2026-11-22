@@ -54,7 +54,7 @@ pub(crate) fn tokenizer_pin(manifest: &[u8], vocab_size: u32) -> Result<Tokenize
 /// it into a path leaves live save/restore behaviour unchanged; a persisted store refuses entries
 /// another load wrote.
 pub(crate) fn pack_identity(pack: &Path, pin: &TokenizerPin) -> Result<PrefixIdentity, EngError> {
-    let weights = crate::weights::pack_digest(pack)?;
+    let weights = crate::weights::pack_digest(pack, crate::weights::Hidden::Counted)?;
     Ok(PrefixIdentity {
         weights: sha256_hex(&weights).into(),
         tokenizer: sha256_hex(&pin.tokenizer_json).into(),
