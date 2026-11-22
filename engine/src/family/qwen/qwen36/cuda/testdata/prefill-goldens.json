@@ -39,19 +39,6 @@
       "stage_sha256": "b0c6fe8bd0bf787209de4a99585ebbd2a9885fbaa8046e058c82e6bae1048a53",
       "verdict": "Ready { m_sess: 128 }"
     },
-    "exl3-fp16-2048": {
-      "cap": 2048,
-      "commit": "5daa6c939914dd332e69005e5af794171a6fa487",
-      "export_sha256": "342ea7fefc0ba60b96937c9d71dfab713fc4fd6edbf8094abcc14e4a46cd2015",
-      "gpu_cc": 860,
-      "gpu_nsm": 82,
-      "kv": "fp16",
-      "logits_sha256": "05c84cec9c7cebd7ce0f8ce3374f3c6d02c12703f29a512db71a7d23fc593ba0",
-      "pack_sha256": "a09517e90484858c31cc63201f0ae6c0a3ef8df7c7947bdfd798d89a69f5c96a",
-      "prompt_sha256": "b6b3989689d7014994c3e95b9da778930bb6bd06ac373bcb2be50981548aa7bc",
-      "stage_sha256": "c519357d242b9f7b879608272629ba1ed173ed5b682cf292d8f7669ce0b87b81",
-      "verdict": "Ready { m_sess: 2048 }"
-    },
     "exl3-fp16-256": {
       "cap": 256,
       "commit": "5daa6c939914dd332e69005e5af794171a6fa487",

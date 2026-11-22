@@ -5,7 +5,7 @@
 //!
 //! Arms, each its own process, every one captured twice in separate processes before a golden
 //! is accepted:
-//! - `golden_capture_exl3_fp16_arm`: `FIFI_GOLDEN_CAP` one of 128, 256, 512, 1024, 2048 on the
+//! - `golden_capture_exl3_fp16_arm`: `FIFI_GOLDEN_CAP` one of 128, 256, 512, 1024 on the
 //!   EXL3 pack, fp16 KV, the session's own chunk partition (`feed_rows`).
 //! - `golden_capture_exl3_kv8_arm`: `FIFI_GOLDEN_CAP` one of 16, 128, 256, 512, 1024, Int8G32
 //!   with the fixed admission and one `feed_rows_chunked` call per cap-sized piece. At cap 16
