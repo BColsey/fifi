@@ -288,6 +288,9 @@ pub(super) struct TieredRuntime<'w> {
     /// Probe: the per-layer host-phase sums (parse, begin, plan, launch, finish) —
     /// the host-paced phases where the 52%-util decode idles the device.
     probe_phases_ns: [u128; 5],
+    /// Probe: the host wall of `end_token` (policy decision, bank fills, publish), summed
+    /// over the window.
+    probe_end_ns: u128,
     probe_tokens: u64,
     /// Probe: one timing event per layer start, layer 1 on (layer 0's start IS
     /// `probe_start`), for the span-interior split of the device timeline.
@@ -368,6 +371,7 @@ impl<'w> TieredRuntime<'w> {
             probe_end: None,
             probe_waits_ns: 0,
             probe_phases_ns: [0; 5],
+            probe_end_ns: 0,
             probe_tokens: 0,
             probe_layers: Vec::new(),
             probe_report: TokenReport::default(),
@@ -776,6 +780,34 @@ impl<'w> TieredRuntime<'w> {
                     };
                     let [parse, begin, plan, launch, finish] = self.probe_phases_ns;
                     let phase_ms = |ns: u128| ns as f32 / 1e6 / window as f32;
+                    let expert_bytes = self
+                        .banks
+                        .first()
+                        .and_then(|bank| bank.slice_bytes().ok())
+                        .map_or(0, |slices| slices.iter().sum::<usize>());
+                    let moved_mb =
+                        |fills: u32| fills as f32 * expert_bytes as f32 / 1e6 / window as f32;
+                    let end_ms = phase_ms(self.probe_end_ns);
+                    // Bytes the boundary swaps and the guess prefetch moved to the card per token,
+                    // and the rate the boundary achieved over them.
+                    let swap_gbs = if end_ms > 0.0 {
+                        moved_mb(report.swaps) / end_ms
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "tcap-probe-xfer: window {} end_token_ms/tok {:.3} swap_MB/tok {:.2} swap_GBps {:.2} guess_fills/tok {:.2} guess_evicts/tok {:.2} guess_recall {}/{} miss_MB/tok {:.2} expert_bytes {}",
+                        window,
+                        end_ms,
+                        moved_mb(report.swaps),
+                        swap_gbs,
+                        per_token(report.guess_fills),
+                        per_token(report.guess_evicts),
+                        report.guess_hits,
+                        report.guess_samples,
+                        moved_mb(report.cpu_served),
+                        expert_bytes,
+                    );
                     eprintln!(
                         "tcap-probe: token {} device_span_ms {:.2} waits_ms {:.2} sync_share_ms {:.2} layer_ms avg {:.3} min {:.3} max {:.3} hits/tok {:.2} cpu_served/tok {:.2} swaps/tok {:.2} host_ms/tok parse {:.2} begin {:.2} plan {:.2} launch {:.2} finish {:.2}",
                         self.probe_tokens,
@@ -795,6 +827,7 @@ impl<'w> TieredRuntime<'w> {
                         phase_ms(finish),
                     );
                     self.probe_phases_ns = [0; 5];
+                    self.probe_end_ns = 0;
                     self.probe_report_base = self.probe_tokens;
                 }
                 self.probe_waits_ns = 0;
@@ -891,9 +924,11 @@ impl<'w> TieredRuntime<'w> {
             banks: &self.banks,
             stream,
         };
+        let end_t0 = std::time::Instant::now();
         let report = self.host.end_token(&mut fills).map_err(host_error)?;
         self.syncs.writes += report.swaps * ExpertBank::FILL_WRITES;
         if super::moe::tiered::tiered_probe() {
+            self.probe_end_ns += end_t0.elapsed().as_nanos();
             self.probe_report.merge(&report);
         }
         Ok(report)
