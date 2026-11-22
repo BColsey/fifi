@@ -1031,7 +1031,7 @@ mod tests {
         }
         let events = state.events_snapshot();
         assert_eq!(events.len(), 6);
-        for instance in events.chunks_exact(3) {
+        for instance in events.as_chunks::<3>().0 {
             assert_eq!(instance[0].line, "engine repeat registered");
             assert!(instance[1].line.starts_with("engine repeat failed ("));
             assert_eq!(instance[2].line, "engine repeat stopped");
