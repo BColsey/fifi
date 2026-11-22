@@ -44,18 +44,18 @@ fn read(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-/// Element `j` of a row (`salt` 0) or a partial (`salt` 1) of sequence `k`: a finite float in
+/// Element `j` of a row (`kind` 0) or a partial (`kind` 1) of sequence `k`: a finite float in
 /// [1, 2) derived from a hash of `(k, j)`, so a wrong or torn partial equals the expected one only
 /// by a 2^-23 collision per element.
-fn pattern(salt: u64, k: u64, j: usize) -> f32 {
-    let mut x = (k << 24) ^ ((j as u64) << 1) ^ salt;
+fn pattern(kind: u64, k: u64, j: usize) -> f32 {
+    let mut x = (k << 24) ^ ((j as u64) << 1) ^ kind;
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     f32::from_bits(0x3F80_0000 | (x as u32 & 0x007F_FFFF))
 }
 
-fn pattern_vec(salt: u64, k: u64, hidden: usize) -> Vec<f32> {
-    (0..hidden).map(|j| pattern(salt, k, j)).collect()
+fn pattern_vec(kind: u64, k: u64, hidden: usize) -> Vec<f32> {
+    (0..hidden).map(|j| pattern(kind, k, j)).collect()
 }
 
 /// The v1 second-combine arithmetic the kernel must equal bit for bit: `r + (1.0 * p)`, one
