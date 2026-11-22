@@ -942,13 +942,13 @@ mod tests {
         let family = crate::family::qwen::flash_next::factory::FAMILY;
         let supervisor = WorkerSupervisor::with_worker_binary(script.clone());
         supervisor
-            .spawn("flash", bare_config(&args, family), None)
+            .spawn("derived-config", bare_config(&args, family), None)
             .expect("spawn");
         let key = supervisor
             .workers
             .lock()
             .unwrap_or_else(poison)
-            .get("flash")
+            .get("derived-config")
             .map(|worker| worker.key.clone())
             .expect("the worker is listed");
         let engine = testkit::engine(testkit::script("unused"));
@@ -958,14 +958,17 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let config_path = scratch.join(format!("fifi-worker-{}-flash.json", std::process::id()));
+        let config_path = scratch.join(format!(
+            "fifi-worker-{}-derived-config.json",
+            std::process::id()
+        ));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let state = loop {
             let row = supervisor
                 .snapshot()
                 .into_iter()
-                .find(|worker| worker.id == "flash")
+                .find(|worker| worker.id == "derived-config")
                 .expect("the worker is listed");
             if row.status.state != "starting" {
                 break row.status.state;
@@ -996,7 +999,10 @@ mod tests {
         assert!(engine.flash_next.is_none(), "every option at its default");
 
         assert!(config_path.is_file(), "the worker's configuration file");
-        assert_eq!(supervisor.stop("flash").as_deref(), Some("flash"));
+        assert_eq!(
+            supervisor.stop("derived-config").as_deref(),
+            Some("derived-config")
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while config_path.exists() {
             assert!(
@@ -1055,7 +1061,7 @@ mod tests {
         let supervisor = WorkerSupervisor::new();
         let mut pids = Vec::new();
         let mut files = Vec::new();
-        for id in ["one", "two"] {
+        for id in ["stop-all-a", "stop-all-b"] {
             let (worker, config_path, pid) = sleeping_worker(id);
             supervisor
                 .workers
