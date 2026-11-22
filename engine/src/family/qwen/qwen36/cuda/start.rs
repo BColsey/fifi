@@ -1420,16 +1420,16 @@ fn load_need_of<'a>(
 }
 
 /// Whether the step can run the int8 cache: its chunk prefill needs the prefill arena, which the
-/// plan's chunked prefill (the int8 cache's opt-in) provides. The answer is the prefill admission's
-/// own predicate (`needs_arena`), so the card choice never plans a form the step then refuses
-/// ("fixed prefill admission: this step cannot use a chunk arena").
-fn int8_cache_usable(plan: &StartupPlan) -> bool {
-    super::prefill_driver::needs_arena(
-        WeightLayout::Native,
-        KvMode::Int8G32,
-        false,
-        plan.modes.chunked,
-    )
+/// chunked prefill (the int8 cache's own default, switched off by `Q36_CUDA_CHUNK_PREFILL=0`)
+/// provides. The flag is read for the int8 form, not for the plan the config builds, whose form is
+/// still undecided. The answer is the prefill admission's own predicate (`needs_arena`), so the card
+/// choice never plans a form the step then refuses ("fixed prefill admission: this step cannot use
+/// a chunk arena").
+fn int8_cache_usable() -> bool {
+    let chunked = std::env::var_os(CHUNK_PREFILL_VAR)
+        .and_then(|value| chunk_prefill_wanted(KvDtype::Q8, Some(&value)).ok())
+        .unwrap_or(true);
+    super::prefill_driver::needs_arena(WeightLayout::Native, KvMode::Int8G32, false, chunked)
 }
 
 /// Whether the prefill admission keeps a chunk arena for a cache form at a context, from the free
@@ -1508,7 +1508,7 @@ fn card_fit(
         CudaFitAsk {
             free,
             weights,
-            int8_usable: int8_cache_usable(plan),
+            int8_usable: int8_cache_usable(),
             kv: (!settings.kv_auto).then_some(settings.kv),
             context: (!settings.context_auto).then_some(settings.context_limit),
         },
