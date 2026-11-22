@@ -221,11 +221,10 @@ pub(crate) fn preflight_with_q36_options(
     facts: &HardwareFacts,
     q36_options: Option<&Q36Options>,
 ) -> Result<PreflightReport, crate::EngError> {
-    let tokenizer_dir = crate::family::gguf_select::directory_of(tokenizer_dir);
-    let inspection = super::inspect::inspect(model_dir, &tokenizer_dir)?;
+    let inspection = super::inspect::inspect(model_dir, tokenizer_dir)?;
     Ok(evaluate(
         model_dir,
-        &tokenizer_dir,
+        tokenizer_dir,
         &inspection,
         candidate,
         facts,
@@ -2516,6 +2515,8 @@ mod tests {
         let dir = gguf_only_directory();
         let selected = dir.path().join("model.gguf");
         std::fs::write(dir.path().join("a-other.gguf"), b"not a GGUF").expect("write sibling");
+        // A tokenizer file beside the weights belongs to whoever named the directory.
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").expect("write sibling tokenizer");
         let report = super::preflight(
             &selected,
             &selected,
@@ -2524,7 +2525,10 @@ mod tests {
         )
         .expect("report");
         assert_eq!(report.model_dir, selected);
-        assert_eq!(report.tokenizer_dir, dir.path());
+        assert_eq!(
+            report.tokenizer_dir, selected,
+            "the header supplies the tokenizer"
+        );
         assert_eq!(
             report.family.as_deref(),
             Some(crate::family::qwen::qwen36::factory::FAMILY)
