@@ -19,9 +19,11 @@ use crate::{
     EngError,
     family::{
         engine_owner::{EngineOwner, Handle},
+        expert_bank::layer_stream::Home,
+        mem::fill::{self, FreeMarks, LayerTier, TierReceipt},
         exl3_tensors::f32_le_bytes,
         qwen::flash_next::load::gguf::{
-            GgufModel, feeds::gguf_feeds, placement::{ExpertSetup, layer_stacks},
+            GgufModel, feeds::gguf_feeds, placement::{ExpertSetup, LayerStacks, layer_stacks},
             trunk::gguf_trunk,
         },
         project::cuda::{CudaProjector, CudaWeights},
@@ -65,24 +67,9 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
     let stacks = layer_stacks(&model)?;
     let resident = |_layer: usize| matches!(setup, ExpertSetup::Resident);
     let weights = Rc::new(gguf_trunk(&model, &ctx, &resident, chunk_limit)?);
-    let expert_total: u64 = stacks
-        .iter()
-        .flat_map(|layer| layer.stacks.iter().map(|stack| stack.bytes))
-        .sum();
-    let (cache, resident_bytes) = match &setup {
-        ExpertSetup::Resident => (None, expert_total),
-        ExpertSetup::Cached(plan) => {
-            let cache = ExpertCache::new(&model, &stacks, plan, &ctx)?;
-            let held: u64 = stacks
-                .iter()
-                .map(|layer| {
-                    layer.stacks.iter().map(|stack| stack.bytes).sum::<u64>()
-                        / model.config().experts() as u64
-                        * plan.slots as u64
-                })
-                .sum();
-            (Some(cache), held)
-        }
+    let cache = match &setup {
+        ExpertSetup::Resident => None,
+        ExpertSetup::Cached(plan) => Some(ExpertCache::new(&model, &stacks, plan, &ctx)?),
     };
     let config = model.config();
     let layers = config.layers();
@@ -120,26 +107,71 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
         step,
         moe,
     };
+    let ctx_for_receipt = Rc::clone(&ctx);
+    let receipt = memory_receipt(&ctx_for_receipt, &model, &stacks, &setup);
     let owner = EngineOwner::new(run, model, weights, stream, ctx);
-    print_vram_receipt(resident_bytes, expert_total);
-    TokenDriver::new(GgufDevice { owner, reported: StreamTotals::default() }, feeds, shape)
+    eprintln!("{}", fill::report_line("flash-next gguf", receipt));
+    let mut marks = FreeMarks::default();
+    if let Ok(info) = ctx_for_receipt.memory_info()
+        && let Some(line) = marks.record("load", info.free as u64)
+    {
+        eprintln!("flash-next gguf: {line}");
+    }
+    TokenDriver::new(
+        GgufDevice {
+            owner,
+            ctx: ctx_for_receipt,
+            marks,
+            reported: StreamTotals::default(),
+        },
+        feeds,
+        shape,
+    )
 }
 
-/// The one place the start prints what the card holds: the live device bytes after the build and
-/// the share of the routed experts that sit on the card.
-fn print_vram_receipt(resident_bytes: u64, expert_total: u64) {
-    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    eprintln!(
-        "flash-next gguf: card bytes live after the build {:.2} GiB; resident experts {:.2} of {:.2} GiB ({:.1}% of the routed experts)",
-        gib(crate::family::engine_owner::live_device_bytes() as u64),
-        gib(resident_bytes),
-        gib(expert_total),
-        100.0 * resident_bytes as f64 / expert_total.max(1) as f64,
-    );
+/// The shared memory receipt of the start: the card's use, the dense core, the experts on the
+/// card and the bytes pinned or streamed, from this model's own per-layer sizes.
+fn memory_receipt(
+    ctx: &CudaContext,
+    model: &GgufModel,
+    stacks: &[LayerStacks],
+    setup: &ExpertSetup,
+) -> Result<TierReceipt, EngError> {
+    let experts = model.config().experts() as u64;
+    let info = ctx.memory_info()?;
+    let (slots, pinned) = match setup {
+        ExpertSetup::Resident => (experts, 0),
+        ExpertSetup::Cached(plan) => (
+            plan.slots as u64,
+            stacks
+                .iter()
+                .zip(&plan.homes)
+                .filter(|&(_, &home)| home == Home::Pinned)
+                .map(|(layer, _)| layer.stacks.iter().map(|stack| stack.bytes).sum::<u64>())
+                .sum(),
+        ),
+    };
+    let tiers: Vec<LayerTier> = stacks
+        .iter()
+        .map(|layer| LayerTier {
+            slots,
+            slot_bytes: layer.stacks.iter().map(|stack| stack.bytes).sum::<u64>() / experts,
+        })
+        .collect();
+    Ok(TierReceipt::from_layers(
+        (info.total as u64, info.free as u64),
+        model.map().device_bytes(),
+        experts,
+        &tiers,
+        pinned,
+    ))
 }
 
 pub(in crate::family::qwen::flash_next) struct GgufDevice {
     owner: Owner,
+    /// The card context, read for the free VRAM at the marks.
+    ctx: Rc<CudaContext>,
+    marks: FreeMarks,
     /// The staging totals at the last receipt line.
     reported: StreamTotals,
 }
@@ -219,6 +251,12 @@ impl TokenDevice for GgufDevice {
     }
 
     fn check_health(&mut self) -> Result<(), EngError> {
+        let ctx = &self.ctx;
+        if let Some(line) = self.marks.sample("decode", std::time::Instant::now(), || {
+            ctx.memory_info().ok().map(|info| info.free as u64)
+        }) {
+            eprintln!("flash-next gguf: {line}");
+        }
         self.owner.step().step.finish_token()
     }
 
