@@ -798,6 +798,34 @@ mod tests {
         std::fs::write(output, serde_json::to_vec_pretty(&items).unwrap()).unwrap();
     }
 
+    #[test]
+    #[ignore = "emits layer-0 hyper-connection tensor ranges from header-only fixture"]
+    fn hyper_tensor_sample_plan() {
+        let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let items: Vec<_> = [
+            SiteTensor::Norm,
+            SiteTensor::Down,
+            SiteTensor::Up,
+            SiteTensor::Inject,
+        ]
+        .into_iter()
+        .map(|part| {
+            let entry = model
+                .map()
+                .get(Slot::hyper(Site::Mixer, part), Some(0))
+                .unwrap();
+            let tensor = model.weights.header().tensor(&entry.name).unwrap();
+            serde_json::json!({"name": entry.name, "shard": tensor.shard(),
+                    "start": tensor.abs_offset(), "bytes": entry.bytes})
+        })
+        .collect();
+        let output = std::env::var_os("FIFI_FLASH_HYPER_PLAN").unwrap();
+        std::fs::write(output, serde_json::to_vec_pretty(&items).unwrap()).unwrap();
+    }
+
     // SHA-256 of byte ranges retrieved from the pinned publisher revision. These detect
     // fixture corruption or sparse holes; they are not publisher full-shard verification.
     const DELTA_DIGESTS: [&str; 9] = [
@@ -849,6 +877,119 @@ mod tests {
         };
         verify_delta_fixture(&open("FIFI_FLASH_DELTA_FIXTURE")).unwrap();
         assert!(verify_delta_fixture(&open("FIFI_FLASH_GGUF_PROJECTION_FIXTURE")).is_err());
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    #[ignore = "needs pinned hyper and DeltaNet samples and an admitted CUDA device"]
+    fn real_hyper_delta_cpu_cuda_parity() {
+        use super::super::cuda_probe::Projection;
+        use crate::{
+            family::qwen::flash_next::{
+                deltanet::{self, DeltaState},
+                hyper,
+            },
+            kernels::cuda::CudaContext,
+        };
+        let path =
+            std::env::var_os("FIFI_FLASH_HYPER_FIXTURE").expect("set incomplete hyper fixture");
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        verify_delta_fixture(&model).unwrap();
+        let parts = [
+            SiteTensor::Norm,
+            SiteTensor::Down,
+            SiteTensor::Up,
+            SiteTensor::Inject,
+        ];
+        let digests = [
+            "a2be4ca661ebebcffddfa452dab947242d92a1f71f14a5392110be41e55398a3",
+            "7176f94f6d4056b418080ba2cd555e16599ec7f02c4332ec9c9aa0e86d52123a",
+            "9deeb790177bfc2807b361d5372c1eb9ba471b052f6ed7b4e4ab320a1b29d949",
+            "6b720fdc6cd7bdbcf8408b9c26a78c42cf0d605ec9931e1baec010e772f8758b",
+        ];
+        let entries: Vec<_> = parts
+            .into_iter()
+            .zip(digests)
+            .map(|(part, hash)| {
+                let entry = model
+                    .map()
+                    .get(Slot::hyper(Site::Mixer, part), Some(0))
+                    .unwrap();
+                let (_, data) = model.weights.read_tensor(&entry.name).unwrap();
+                assert!(matches_digest(&data, hash), "corrupt tensor {}", entry.name);
+                entry
+            })
+            .collect();
+        let norm = read_floats(&model.weights, entries[0]).unwrap();
+        let down = HostWeight::new(&[entries[1]], Remap::None);
+        let up = HostWeight::new(&[entries[2]], Remap::None);
+        let inject = HostWeight::new(&[entries[3]], Remap::None);
+        let hw = HyperWeights {
+            norm: &norm,
+            down: &down,
+            up: &up,
+            inject: Some(&inject),
+        };
+        let weights = load_delta(&model, 0).unwrap();
+        let shape = model.config().model_shape().unwrap();
+        let ngram = model.ngram().unwrap();
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let launches = std::cell::Cell::new(0);
+        let mut cpu = HostProjector::new(&model.weights, &ngram, 8);
+        let mut gpu = HostProjector::new(&model.weights, &ngram, 8).with_cuda(Projection {
+            ctx: &ctx,
+            stream: &stream,
+            launches: &launches,
+        });
+        let mut states = [DeltaState::new(&shape.delta), DeltaState::new(&shape.delta)];
+        let mut residuals = [
+            delta_input(shape.hyper.width(), 0),
+            delta_input(shape.hyper.width(), 0),
+        ];
+        for token in 0..4 {
+            for (projector, state, residual) in [(&mut cpu, &mut states[0], &mut residuals[0])] {
+                let read = hyper::read(projector, &shape.hyper, &hw, residual).unwrap();
+                let block =
+                    deltanet::step(projector, &shape.delta, &weights.view(), state, &read.mixed)
+                        .unwrap();
+                hyper::apply(&shape.hyper, residual, read.gate.as_ref().unwrap(), &block).unwrap();
+            }
+            let read = hyper::read(&mut gpu, &shape.hyper, &hw, &residuals[1]).unwrap();
+            let block = deltanet::step(
+                &mut gpu,
+                &shape.delta,
+                &weights.view(),
+                &mut states[1],
+                &read.mixed,
+            )
+            .unwrap();
+            hyper::apply(
+                &shape.hyper,
+                &mut residuals[1],
+                read.gate.as_ref().unwrap(),
+                &block,
+            )
+            .unwrap();
+            let norm = residuals[0]
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let err = residuals[0]
+                .iter()
+                .zip(&residuals[1])
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(norm.is_finite() && norm > 0.0 && err.is_finite());
+            eprintln!("step {token} hyper residual relative L2 {}", err / norm);
+            assert!(err / norm < 0.03);
+        }
+        assert!(launches.get() > 0);
+        eprintln!("CUDA projection launches: {}", launches.get());
     }
 
     fn delta_input(hidden: usize, token: usize) -> Vec<f32> {
