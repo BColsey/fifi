@@ -36,7 +36,12 @@ template <class T> struct Device {
     explicit Device(size_t n) { check(cudaMalloc(&p, n * sizeof(T))); }
     Device(const Device &) = delete;
     ~Device() { check(cudaFree(p)); }
-    void upload(const std::vector<T> &v) { check(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); }
+    void upload(const std::vector<T> &v) {
+        check(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+        // Pageable H2D can return before DMA completes. The nonblocking probe
+        // stream does not wait for the default stream, so finish the upload here.
+        check(cudaStreamSynchronize(nullptr));
+    }
     void download(std::vector<T> &v) { check(cudaMemcpy(v.data(), p, v.size() * sizeof(T), cudaMemcpyDeviceToHost)); }
 };
 
