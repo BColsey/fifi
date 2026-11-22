@@ -475,9 +475,20 @@ impl CpuForward {
 
     fn logits_for_head(&self, hidden: &[f32]) -> Result<Vec<f32>, EngError> {
         let _span = self.phase_span(Work::TargetVocab);
+        let cap = self.math.final_logit_softcapping;
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if !self.draft_window_enabled()
+            && let Weights::Gguf(weights) = &self.weights
+            && let Some(cuda) = weights.cuda()
+            && vocab_softcap_enabled()
+            && let Some(logits) =
+                cuda.capped_head(hidden, self.spec.unpadded_vocab_size as usize, cap)?
+        {
+            return Ok(logits);
+        }
         let mut logits = self.project_logits(hidden)?;
         for value in &mut logits {
-            *value = softcap(*value, self.math.final_logit_softcapping);
+            *value = softcap(*value, cap);
         }
         if logits.iter().any(|value| !value.is_finite()) {
             return Err(bad("non-finite native CPU logits"));
@@ -1156,6 +1167,12 @@ pub(super) fn rms_norm(x: &mut [f32], eps: f32) {
 
 pub(super) fn sigmoid(x: f32) -> f32 {
     (1.0 + (-x).exp()).recip()
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn vocab_softcap_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FIFI_INKLING_CUDA_VOCAB_SOFTCAP").as_deref() == Ok("1"))
 }
 
 fn softcap(x: f32, cap: f32) -> f32 {

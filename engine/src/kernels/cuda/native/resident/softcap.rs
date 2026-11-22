@@ -4,7 +4,7 @@
 //! Safety invariants this module relies on:
 //! - RawRange::new proved each range in bounds. This module re-proves that out and x
 //!   hold n floats each at 4-byte alignment, and that out, which the kernel writes,
-//!   shares no byte with x. The C entry repeats the checks on the addresses.
+//!   is either exactly x or disjoint from x. The C entry repeats the address checks.
 //! - Launch-only: a fault surfaces at the next synchronize; allocations stay valid until
 //!   then because inference_cuda_free synchronizes the device first.
 //! - Every call runs under the process dispatch guard on the owning thread
@@ -52,12 +52,13 @@ fn check_softcap(call: &SoftcapRaw<'_>) -> Result<(), DeviceFailure> {
     let bytes = call.n.checked_mul(4).ok_or_else(invalid_argument)?;
     let sized = call.out.bytes >= bytes && call.x.bytes >= bytes;
     let aligned = call.out.offset.is_multiple_of(4) && call.x.offset.is_multiple_of(4);
-    let apart = Span::of(&call.out, bytes).apart(&Span::of(&call.x, bytes));
-    let dims = (32..=4_194_304).contains(&call.n)
-        && call.n.is_multiple_of(32)
+    let in_place = call.out.address() == call.x.address();
+    let placement = in_place || Span::of(&call.out, bytes).apart(&Span::of(&call.x, bytes));
+    let dims = (1..=4_194_304).contains(&call.n)
+        && (in_place || call.n.is_multiple_of(32))
         && call.cap.is_finite()
         && call.cap > 0.0;
-    if !(sized && aligned && apart && dims) {
+    if !(sized && aligned && placement && dims) {
         return Err(invalid_argument());
     }
     Ok(())
@@ -76,7 +77,7 @@ pub(in crate::kernels::cuda) fn softcap_launch(
     };
     let mut stage = STAGE_NONE;
     // SAFETY: check_softcap proved the ranges inside their live allocations, large
-    // enough, aligned, and disjoint in the write direction; the adapter repeats the
+    // enough, aligned, and exactly aliased or disjoint; the adapter repeats the
     // checks on the addresses. The allocations stay valid until the queued launch
     // finishes because inference_cuda_free synchronizes the device first.
     let status = unsafe { softcap_launch_raw(&args, stream.0.as_ptr(), &mut stage) };

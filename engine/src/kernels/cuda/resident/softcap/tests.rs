@@ -77,6 +77,53 @@ fn matches_the_frozen_reference() {
 }
 
 #[test]
+fn in_place_caps_only_the_requested_prefix_and_retains_nonfinite_inputs() {
+    if !testkit::device_present("in-place softcap tail") {
+        return;
+    }
+    let context = CudaContext::new().unwrap();
+    let stream = context.stream().unwrap();
+    let cap = 15.0;
+    let input = [
+        0.0,
+        -0.0,
+        17.0,
+        -37.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1234.0,
+    ];
+    let buffer = testkit::upload_f32(&context, &input);
+    for (offset, bytes, n, cap) in [
+        (0, 24, 7, cap),
+        (0, 32, 0, cap),
+        (1, 28, 7, cap),
+        (0, 32, 7, 0.0),
+    ] {
+        let result =
+            context.softcap_in_place(&stream, buffer.range(offset, bytes).unwrap(), n, cap);
+        assert!(matches!(result, Err(EngError::BadRequest(_))), "{result:?}");
+    }
+    context
+        .softcap_in_place(&stream, buffer.range(0, 32).unwrap(), 7, cap)
+        .unwrap();
+    stream.synchronize().unwrap();
+    let output = testkit::floats(&testkit::read_bytes(&context, &buffer, 32));
+    for (&x, &y) in input[..4].iter().zip(&output[..4]) {
+        let expected = cap * (x / cap).tanh();
+        assert!((expected - y).abs() < 4e-6, "{expected} vs {y}");
+        if x == 0.0 {
+            assert_eq!(y.to_bits(), x.to_bits());
+        }
+    }
+    assert_eq!(output[4], f32::INFINITY);
+    assert_eq!(output[5], f32::NEG_INFINITY);
+    assert!(output[6].is_nan());
+    assert_eq!(output[7], input[7]);
+}
+
+#[test]
 fn refuses_a_cap_that_is_not_above_zero() {
     if !testkit::device_present("softcap cap refusal") {
         return;

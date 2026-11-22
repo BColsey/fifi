@@ -704,6 +704,30 @@ impl GgufCuda {
         )
     }
 
+    pub(in crate::family::inkling2) fn capped_head(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cap: f32,
+    ) -> Result<Option<Vec<f32>>, EngError> {
+        let Some((weight, dtype)) = self.dense.get(crate::family::inkling2::OUTPUT_HEAD) else {
+            return Ok(None);
+        };
+        if weight.shape != [rows, x.len()]
+            || !dtype.is_packed_gguf()
+            || !cap.is_finite()
+            || cap <= 0.0
+        {
+            return Ok(None);
+        }
+        let output = self
+            .step
+            .capped_gguf_head(&self.context, (weight, *dtype), x, cap)?;
+        static USED: std::sync::Once = std::sync::Once::new();
+        USED.call_once(|| eprintln!("Inkling CUDA used resident vocabulary softcap"));
+        Ok(Some(output))
+    }
+
     pub(in crate::family::inkling2) fn batch_prefill_router(&self, layer: u32, name: &str) -> bool {
         // The cold path interleaves route observation with prediction for the
         // next token. Keep its existing ordering.

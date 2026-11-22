@@ -173,6 +173,32 @@ impl DenseStep {
         scale_projection(values, scale)
     }
 
+    pub(super) fn capped_gguf_head(
+        &self,
+        context: &CudaContext,
+        (resident, dtype): (&Resident, DenseDtype),
+        x: &[f32],
+        cap: f32,
+    ) -> Result<Vec<f32>, EngError> {
+        let [rows, cols] = resident.shape;
+        let output = self.range(Slot::Output, 0, rows)?;
+        let w = resident.codes.range(0, resident.codes.bytes())?;
+        self.run(context, &self.stream, x, output, |input| {
+            self.enqueue_gguf_projection(
+                context,
+                &self.stream,
+                DenseGemvCall {
+                    shape: DenseGemvShape::packed(1, rows, cols),
+                    dtype,
+                    w,
+                    x: input,
+                    y: output,
+                },
+            )?;
+            context.softcap_in_place(&self.stream, output, rows, cap)
+        })
+    }
+
     fn enqueue_gguf_projection(
         &self,
         context: &CudaContext,
