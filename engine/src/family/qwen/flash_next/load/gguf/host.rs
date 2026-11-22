@@ -851,6 +851,43 @@ mod tests {
         assert!(verify_delta_fixture(&open("FIFI_FLASH_GGUF_PROJECTION_FIXTURE")).is_err());
     }
 
+    fn delta_input(hidden: usize, token: usize) -> Vec<f32> {
+        (0..hidden)
+            .map(|i| (((i * 37 + token * 23) % 251) as f32 - 125.0) / 125.0)
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs staged real DeltaNet tensors; CPU-only probe"]
+    fn real_delta_cpu_sequence_is_finite() {
+        use crate::family::qwen::flash_next::deltanet::{self, DeltaState};
+        let path = std::env::var_os("FIFI_FLASH_DELTA_FIXTURE").expect("set DeltaNet-only fixture");
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        verify_delta_fixture(&model).unwrap();
+        let weights = load_delta(&model, 0).unwrap();
+        let shape = model.config().model_shape().unwrap();
+        let ngram = model.ngram().unwrap();
+        let mut projector = HostProjector::new(&model.weights, &ngram, 8);
+        let mut state = DeltaState::new(&shape.delta);
+        for token in 0..16 {
+            let x = delta_input(weights.qkv.parts[0].input, token);
+            let output = deltanet::step(
+                &mut projector,
+                &shape.delta,
+                &weights.view(),
+                &mut state,
+                &x,
+            )
+            .unwrap();
+            for values in [output.as_slice(), state.rec(), state.ring()] {
+                assert!(!values.is_empty() && values.iter().all(|v| v.is_finite()));
+                assert!(values.iter().any(|v| *v != 0.0));
+            }
+        }
+    }
+
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
     #[ignore = "needs staged real DeltaNet tensors and an admitted CUDA device"]
@@ -880,29 +917,33 @@ mod tests {
         let mut cpu_state = DeltaState::new(&shape.delta);
         let mut gpu_state = DeltaState::new(&shape.delta);
         let hidden = weights.qkv.parts[0].input;
-        for token in 0..3 {
-            let x: Vec<f32> = (0..hidden)
-                .map(|i| (((i * 37 + token * 23) % 251) as f32 - 125.0) / 125.0)
-                .collect();
+        for token in 0..16 {
+            let x = delta_input(hidden, token);
             let want = deltanet::step(&mut cpu, &shape.delta, &weights.view(), &mut cpu_state, &x)
                 .unwrap();
             let got = deltanet::step(&mut gpu, &shape.delta, &weights.view(), &mut gpu_state, &x)
                 .unwrap();
-            assert_eq!(want.len(), got.len());
-            let norm = want
-                .iter()
-                .map(|v| f64::from(*v).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            let error = want
-                .iter()
-                .zip(&got)
-                .map(|(a, b)| f64::from(a - b).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            assert!(norm.is_finite() && norm > 0.0 && error.is_finite());
-            eprintln!("step {token}: relative L2 {}", error / norm);
-            assert!(error / norm < 0.03);
+            for (name, expected, actual) in [
+                ("output", want.as_slice(), got.as_slice()),
+                ("recurrent", cpu_state.rec(), gpu_state.rec()),
+                ("convolution ring", cpu_state.ring(), gpu_state.ring()),
+            ] {
+                assert_eq!(expected.len(), actual.len());
+                let norm = expected
+                    .iter()
+                    .map(|v| f64::from(*v).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let error = expected
+                    .iter()
+                    .zip(actual)
+                    .map(|(a, b)| f64::from(a - b).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(norm.is_finite() && norm > 0.0 && error.is_finite());
+                eprintln!("step {token} {name}: relative L2 {}", error / norm);
+                assert!(error / norm < 0.03, "step {token} {name}");
+            }
         }
         assert!(launches.get() > 0);
         eprintln!("CUDA projection launches: {}", launches.get());
