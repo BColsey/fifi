@@ -1034,47 +1034,48 @@ fn model_facts_with(
             None => {
                 // The tiered facts restate what the attach proved: the locator
                 // holds exactly [hidden, inter, experts] / [inter, hidden,
-                // experts] for these dims, and the chunk arm is only enabled
-                // once every routed stack and shared expert was checked Q4_K
-                // (`attach_tiered_parts`), so the values below are facts, not
+                // experts] for these dims, so the shapes below are facts, not
                 // guesses read off the model config.
                 let (e, i, h) = (
                     dims.shape.moe.experts,
                     dims.shape.moe.inter,
                     dims.shape.hidden,
                 );
-                let q = Some(QuantType::Q4K);
-                // The shared expert's types come from the loaded weights, whatever the file
-                // stores; a layer without them is "not loaded native" and the check refuses it.
-                let types = shared.get(layer).copied().unwrap_or([None; 3]);
+                // The routed and shared types come from the loaded banks and weights, whatever
+                // the file stores; a layer without them is "not loaded native" and the check
+                // refuses it.
+                let types = shared.get(layer).copied().unwrap_or(TieredTypes {
+                    shared: [None; 3],
+                    routed: [None; 3],
+                });
                 (
                     [
                         StackFacts {
                             role: Role::FfnGateExps,
-                            quant: q,
+                            quant: types.routed[0],
                             experts: Some(e),
                             n_rows: e * i,
                             k: h,
                         },
                         StackFacts {
                             role: Role::FfnUpExps,
-                            quant: q,
+                            quant: types.routed[1],
                             experts: Some(e),
                             n_rows: e * i,
                             k: h,
                         },
                         StackFacts {
                             role: Role::FfnDownExps,
-                            quant: q,
+                            quant: types.routed[2],
                             experts: Some(e),
                             n_rows: e * h,
                             k: i,
                         },
                     ],
                     [
-                        (Role::FfnGateShexp, types[0]),
-                        (Role::FfnUpShexp, types[1]),
-                        (Role::FfnDownShexp, types[2]),
+                        (Role::FfnGateShexp, types.shared[0]),
+                        (Role::FfnUpShexp, types.shared[1]),
+                        (Role::FfnDownShexp, types.shared[2]),
                     ],
                 )
             }
@@ -1099,15 +1100,23 @@ fn model_facts_with(
     })
 }
 
+/// The types a tiered load holds for one layer: the gate, up and down projections of the shared
+/// expert and of the routed banks, as loaded.
+#[derive(Clone, Copy)]
+pub(super) struct TieredTypes {
+    pub(super) shared: [Option<QuantType>; 3],
+    pub(super) routed: [Option<QuantType>; 3],
+}
+
 pub(super) enum ChunkWeights<'a, 'w> {
     /// The file's own blocks: the embedding is a Q4_K table.
     Native {
         mixer: &'a MixerWeights<'w>,
         moe: &'a [MoeLayerWeights<'w>],
         embed: &'w NativeWeight,
-        /// A tiered load keeps the shared expert in its runtime, not in `moe`: the type of its
-        /// gate, up and down projections per layer. Empty for a load that holds `moe`.
-        shared: &'a [[Option<QuantType>; 3]],
+        /// A tiered load keeps the shared expert and the expert banks in its runtime, not in
+        /// `moe`: the types of its projections per layer. Empty for a load that holds `moe`.
+        shared: &'a [TieredTypes],
     },
     /// An EXL3 pack: the embedding is the stored BF16 table.
     Exl3 {
@@ -1324,8 +1333,8 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
         }
     }
 
-    /// The same weights of a tiered load, with the type of each layer's shared projections.
-    pub(super) fn with_shared(mut self, types: &'a [[Option<QuantType>; 3]]) -> Self {
+    /// The same weights of a tiered load, with the types of each layer's projections.
+    pub(super) fn with_shared(mut self, types: &'a [TieredTypes]) -> Self {
         if let Self::Native { shared, .. } = &mut self {
             *shared = types;
         }
@@ -2776,7 +2785,7 @@ fn run_chunk_tiered(
     // a 2.4 MiB one reaches).
     let t2 = std::time::Instant::now();
     let region = runtime.cold_region();
-    runtime.stage_cold(ctx, stream, &cold, &region)?;
+    runtime.stage_cold(layer, ctx, stream, &cold, &region)?;
     mark(Stage::MoeStage)?;
     let t_stage = t2.elapsed();
 
@@ -2786,7 +2795,7 @@ fn run_chunk_tiered(
     // staging stacks.
     let weights = runtime.layer_weights(layer)?;
     let cold_w = if ids.cold.is_some() {
-        Some(runtime.cold_weights()?)
+        Some(runtime.cold_weights(layer)?)
     } else {
         None
     };

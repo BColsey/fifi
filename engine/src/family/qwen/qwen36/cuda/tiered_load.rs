@@ -19,7 +19,7 @@ use super::super::tiered::locator::{ExpertLocator, ExpertTensorNames};
 use super::super::tiered::{PolicyMode, TieredConfig};
 use super::dims::{StepDims, TieredPlan};
 use super::step::QwenResidentStep;
-use super::tiered_step::ColdStaging;
+use super::tiered_step::{ColdSet, ColdStaging};
 use crate::EngError;
 use crate::family::device_budget::KvPlan;
 use crate::family::expert_bank::pinned_region::PinnedRegion;
@@ -190,7 +190,7 @@ pub(super) fn admit_banks(
 pub(super) fn cold_cap_for(
     free: u64,
     geometry: ExpertBankGeometry,
-    layers: usize,
+    (layers, stagings): (usize, usize),
     slots_per_layer: usize,
     reserve: u64,
 ) -> usize {
@@ -202,38 +202,18 @@ pub(super) fn cold_cap_for(
         .unwrap_or(u64::MAX)
         .saturating_mul(u64::try_from(layers).unwrap_or(u64::MAX));
     let spare = free.saturating_sub(reserve).saturating_sub(banks);
-    COLD_TARGET.min(usize::try_from(spare / per_expert.max(1)).unwrap_or(0))
+    // Every distinct type triple holds a staging bank of the same depth.
+    let per_depth = per_expert.saturating_mul(u64::try_from(stagings.max(1)).unwrap_or(1));
+    COLD_TARGET.min(usize::try_from(spare / per_depth.max(1)).unwrap_or(0))
 }
 
-/// Whether the tiered session takes the chunked prefill arm: the chunk arm is on unless
-/// `Q36_TIERED_CHUNK=0`, and a file whose routed stacks are not Q4_K in every layer (the one routed
-/// type this arm reads before the any-type kernels) prefills per token with one notice line. The
-/// shared expert is read in the type the file stores.
-pub(super) fn tiered_chunk_arm(header: &GgufHeader, dims: &StepDims) -> Result<bool, EngError> {
-    if !super::prefill::tiered_chunk_enabled(
+/// Whether the tiered session takes the chunked prefill arm: always, unless `Q36_TIERED_CHUNK=0`.
+/// The arm reads every routed and shared expert in the type its file stores, so no file turns it
+/// off.
+pub(super) fn tiered_chunk_arm() -> bool {
+    super::prefill::tiered_chunk_enabled(
         std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
-    ) {
-        return Ok(false);
-    }
-    let routed = expert_quant(header, dims)?;
-    let unsupported = chunk_arm_refusal(None, &routed);
-    if let Some(why) = &unsupported {
-        eprintln!("q36 cuda: the tiered chunk arm reads Q4_K experts, prefilling per token: {why}");
-    }
-    Ok(unsupported.is_none())
-}
-
-/// Why the chunk arm cannot read a file: its shared experts are not Q4_K (`shared`, the refusal
-/// of the shared-expert check), or some layer stores a routed stack in another type. `None` when
-/// it can.
-fn chunk_arm_refusal(shared: Option<String>, routed: &[[GgufType; 3]]) -> Option<String> {
-    shared.or_else(|| {
-        let q4k = [GgufType::Q4K; 3];
-        routed
-            .iter()
-            .any(|quant| *quant != q4k)
-            .then(|| "the routed experts are not Q4_K in every layer".to_owned())
-    })
+    )
 }
 
 pub(super) fn build_tiered(
@@ -243,7 +223,7 @@ pub(super) fn build_tiered(
     plan: &TieredPlan,
     slots: usize,
     cold_cap: usize,
-) -> Result<(Vec<ExpertBank>, TieredHost, Option<ColdStaging>), EngError> {
+) -> Result<(Vec<ExpertBank>, TieredHost, ColdSet), EngError> {
     let moe = &dims.shape.moe;
     let layers = dims.shape.kinds.len();
     let shape = ExpertShape {
@@ -298,13 +278,27 @@ pub(super) fn build_tiered(
         .iter()
         .map(|quant| ExpertBank::new(ctx, geometry_of(dims, *quant), slots))
         .collect::<Result<Vec<_>, _>>()?;
-    // The staging bank follows the banks: same free pool, one shared bank for every layer, so
-    // it exists only when every layer stores its experts in the same types. A cap below top_k
-    // cannot even build a bank geometry, so it stays None.
-    let cold = if cold_cap >= geometry.top_k && quants.iter().all(|quant| *quant == quants[0]) {
-        Some(ColdStaging::new(ctx, geometry, cold_cap)?)
+    // The staging banks follow the banks: same free pool, one per distinct record-type triple (a
+    // staging bank is typed like the stacks it serves). A cap below top_k cannot even build a
+    // bank geometry, so it builds none.
+    let cold = if cold_cap >= geometry.top_k {
+        let mut stagings = Vec::new();
+        let mut seen: Vec<[GgufType; 3]> = Vec::new();
+        let mut of_layer = Vec::with_capacity(quants.len());
+        for quant in &quants {
+            let index = match seen.iter().position(|known| known == quant) {
+                Some(index) => index,
+                None => {
+                    stagings.push(ColdStaging::new(ctx, geometry_of(dims, *quant), cold_cap)?);
+                    seen.push(*quant);
+                    stagings.len() - 1
+                }
+            };
+            of_layer.push(Some(index));
+        }
+        ColdSet::new(stagings, of_layer)
     } else {
-        None
+        ColdSet::none()
     };
     Ok((banks, host, cold))
 }
@@ -336,24 +330,32 @@ pub(super) fn attach_tiered_parts(
     let layers = dims.shape.kinds.len();
     let quants = expert_quant(source.0, dims)?;
     let geometry = planning_geometry(dims, &quants)?;
-    // Staging exists only when every layer shares its types (see `build_tiered`).
-    let shared_types = quants.iter().all(|quant| *quant == quants[0]);
+    // One staging bank per distinct record-type triple (see `build_tiered`).
+    let mut distinct: Vec<[GgufType; 3]> = Vec::new();
+    for quant in &quants {
+        if !distinct.contains(quant) {
+            distinct.push(*quant);
+        }
+    }
     let planned = match plan.slots {
         SlotRequest::Fit => geometry.top_k,
         SlotRequest::Exactly(count) => count,
     };
-    let cold_cap = if shared_types {
-        cold_cap_for(free, geometry, layers, planned, reserve)
-    } else {
-        0
-    };
+    let cold_cap = cold_cap_for(
+        free,
+        geometry,
+        (layers, distinct.len()),
+        planned,
+        reserve,
+    );
     // Charge the staging the plan is about to allocate, so the reserve the banks leave
     // behind still covers the loader's headroom after the staging exists.
-    let cold_bytes = if cold_cap >= geometry.top_k {
-        ExpertBank::bytes_for(geometry, cold_cap)?
-    } else {
-        0
-    };
+    let mut cold_bytes = 0u64;
+    if cold_cap >= geometry.top_k {
+        for quant in &distinct {
+            cold_bytes += ExpertBank::bytes_for(geometry_of(dims, *quant), cold_cap)?;
+        }
+    }
     let slots = admit_banks(
         free,
         geometry,
@@ -472,19 +474,6 @@ fn build_router_guess(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_chunk_arm_needs_q4k_shared_and_routed_experts_in_every_layer() {
-        use super::{GgufType, chunk_arm_refusal};
-        let q4k = [GgufType::Q4K; 3];
-        let mixed = [GgufType::Q4K, GgufType::Q4K, GgufType::Q6K];
-        assert_eq!(chunk_arm_refusal(None, &[q4k, q4k]), None);
-        let routed = chunk_arm_refusal(None, &[q4k, mixed]).expect("one layer stores a Q6_K down");
-        assert!(routed.contains("not Q4_K in every layer"), "{routed}");
-        let shared = chunk_arm_refusal(Some("shexp is Q8_0".into()), &[q4k]).expect("shared");
-        assert_eq!(shared, "shexp is Q8_0");
-        assert!(chunk_arm_refusal(None, &[[GgufType::Q80; 3]]).is_some());
-    }
-
     use super::*;
     use crate::family::qwen::qwen36::cuda::common_tests::dims;
 

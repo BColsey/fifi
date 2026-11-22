@@ -1398,7 +1398,7 @@ impl<'a> QwenResidentStep<'a> {
         &mut self,
         banks: Vec<ExpertBank>,
         host: TieredHost,
-        cold: Option<super::tiered_step::ColdStaging>,
+        cold: super::tiered_step::ColdSet,
     ) -> Result<(), EngError> {
         let parts = self.tiered_parts.take().ok_or_else(|| {
             EngError::BadRequest(
@@ -1610,11 +1610,11 @@ impl<'a> QwenResidentStep<'a> {
         let m = rows.len();
         let chunk_rows = ChunkRows::new(p0, m, state.layout().kv.capacity, arena.m_sess())?;
         let ids = chunk_ids(rows, widths.verdict)?;
-        let shared_types: Vec<[Option<crate::kernels::cuda::resident::matvec_q::QuantType>; 3]> =
-            self.tiered
-                .as_ref()
-                .map(|runtime| runtime.borrow().shared_quants())
-                .unwrap_or_default();
+        let shared_types: Vec<super::prefill::TieredTypes> = self
+            .tiered
+            .as_ref()
+            .map(|runtime| runtime.borrow().types())
+            .unwrap_or_default();
         let weights = match globals.embed {
             super::resources::GlobalWeight::Native(embed) => {
                 ChunkWeights::new(mixers.weights(), moe, embed).with_shared(&shared_types)

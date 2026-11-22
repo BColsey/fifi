@@ -209,14 +209,16 @@ pub struct DownJob {
     pub act: Arc<[f32]>,
 }
 
-/// One DISTINCT missed expert of one chunk layer: the same three Q4_K slices as
-/// [`ExpertJob`], serving the rows that routed to it. The row indices index the chunk's
+/// One DISTINCT missed expert of one chunk layer: the same three slices as
+/// [`ExpertJob`] in the types its file stores, serving the rows that routed to it. The row indices index the chunk's
 /// shared `[m][hidden]` activation block; `rows.len() == row_weights.len()`.
 pub struct GroupedExpertJob {
     pub region: Arc<dyn MappedRegion>,
     pub gate: Range<usize>,
     pub up: Range<usize>,
     pub down: Range<usize>,
+    /// The file's record type of the gate, up and down slices.
+    pub quant: [GgufType; 3],
     pub rows: Vec<usize>,
     pub row_weights: Vec<f32>,
 }
@@ -438,7 +440,19 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
                     let input = &block[row * shape.hidden..(row + 1) * shape.hidden];
                     let mut out = vec![0.0f32; shape.hidden];
                     match catch_unwind(AssertUnwindSafe(|| {
-                        worker.compute(shape, &slices, input, &mut out)
+                        if job.quant == [GgufType::Q4K; 3] {
+                            worker.compute(shape, &slices, input, &mut out)
+                        } else {
+                            let raw = [slices.gate, slices.up, slices.down];
+                            expert_forward_typed(
+                                shape,
+                                job.quant,
+                                raw,
+                                input,
+                                &mut any_scratch,
+                                &mut out,
+                            )
+                        }
                     })) {
                         Ok(Ok(())) => outs.push((row, out)),
                         Ok(Err(error)) => {
@@ -626,11 +640,14 @@ impl CpuPool {
                 m * self.shape.hidden
             )));
         }
-        let side =
-            self.shape.inter.saturating_mul(self.shape.hidden) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
-        let down =
-            self.shape.hidden.saturating_mul(self.shape.inter) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
         for (j, job) in jobs.iter().enumerate() {
+            // Each slice is sized by its own type; a type off the block grid has no length.
+            let [side, side_up, down] =
+                expert_slice_bytes(self.shape, job.quant).ok_or_else(|| {
+                    PoolError::BadInput(format!(
+                        "grouped job {j}: the expert shape is off the block grid of its types"
+                    ))
+                })?;
             if job.rows.len() != job.row_weights.len() || job.rows.is_empty() {
                 return Err(PoolError::BadInput(format!(
                     "grouped job {j} holds {} rows and {} weights",
@@ -653,7 +670,7 @@ impl CpuPool {
             let bytes = job.region.bytes();
             for (name, range, want) in [
                 ("gate", &job.gate, side),
-                ("up", &job.up, side),
+                ("up", &job.up, side_up),
                 ("down", &job.down, down),
             ] {
                 let (start, end) = (range.start, range.end);
@@ -1937,6 +1954,7 @@ mod tests {
                 gate: j * stride..j * stride + side,
                 up: j * stride + side..j * stride + 2 * side,
                 down: j * stride + 2 * side..j * stride + stride,
+                quant: [GgufType::Q4K; 3],
                 rows: rows.clone(),
                 row_weights: weights.clone(),
             })
@@ -1967,6 +1985,94 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A grouped job over experts the file stores in another type than Q4_K runs the typed CPU
+    /// kernel, sized by its own slices, and the pool's sum equals the typed reference bit for bit.
+    #[test]
+    fn a_grouped_job_in_another_type_equals_the_typed_reference() {
+        use crate::kernels::expert_cpu_any::{
+            ExpertScratchAny, expert_forward_typed, expert_slice_bytes,
+        };
+        let mut rng = Lcg(0x7A11_C0DE_0000_0031);
+        let quant = [GgufType::Q80; 3];
+        let [gate, up, down] = expert_slice_bytes(REAL, quant).expect("the shape is on the grid");
+        let stride = gate + up + down;
+        // Q8_0 blocks: a finite half scale (0.0625) and arbitrary quants.
+        let mut bytes = Vec::with_capacity(2 * stride);
+        let mut at = 0usize;
+        while bytes.len() < 2 * stride {
+            if at.is_multiple_of(34) {
+                bytes.extend_from_slice(&[0x00, 0x2c]);
+                at += 2;
+            } else {
+                bytes.push((rng.f32_between(0.0, 255.0)) as u8);
+                at += 1;
+            }
+        }
+        let region: Arc<dyn MappedRegion> = Arc::new(bytes);
+        let m = 3usize;
+        let block: Vec<f32> = (0..m * REAL.hidden)
+            .map(|_| rng.f32_between(-1.0, 1.0))
+            .collect();
+        let groups = [(vec![0usize, 2], vec![0.5f32, -0.25]), (vec![1, 2], vec![0.75, 0.125])];
+        let jobs: Vec<super::GroupedExpertJob> = groups
+            .iter()
+            .enumerate()
+            .map(|(j, (rows, weights))| super::GroupedExpertJob {
+                region: region.clone(),
+                gate: j * stride..j * stride + gate,
+                up: j * stride + gate..j * stride + gate + up,
+                down: j * stride + gate + up..(j + 1) * stride,
+                quant,
+                rows: rows.clone(),
+                row_weights: weights.clone(),
+            })
+            .collect();
+        let pool = CpuPool::new(3, REAL).unwrap();
+        let got = pool
+            .start_chunk_layer(jobs, &block, m)
+            .unwrap()
+            .unwrap()
+            .finish(LONG)
+            .unwrap();
+        let all = region.bytes();
+        let mut scratch = None::<ExpertScratchAny>;
+        let mut want = vec![0.0f32; m * REAL.hidden];
+        for (j, (rows, weights)) in groups.iter().enumerate() {
+            let base = j * stride;
+            let raw = [
+                &all[base..base + gate],
+                &all[base + gate..base + gate + up],
+                &all[base + gate + up..base + stride],
+            ];
+            for (&row, &weight) in rows.iter().zip(weights) {
+                let act = &block[row * REAL.hidden..(row + 1) * REAL.hidden];
+                let mut fwd = vec![0.0f32; REAL.hidden];
+                expert_forward_typed(REAL, quant, raw, act, &mut scratch, &mut fwd).unwrap();
+                for (acc, value) in want[row * REAL.hidden..(row + 1) * REAL.hidden]
+                    .iter_mut()
+                    .zip(&fwd)
+                {
+                    *acc += weight * value;
+                }
+            }
+        }
+        assert_same_bits(&got, &want);
+        // A slice of the wrong length for its own type is refused, as a Q4_K slice would be.
+        let mut wrong = vec![super::GroupedExpertJob {
+            region: region.clone(),
+            gate: 0..gate + 1,
+            up: gate..gate + up,
+            down: gate + up..stride,
+            quant,
+            rows: vec![0],
+            row_weights: vec![1.0],
+        }];
+        assert!(matches!(
+            pool.start_chunk_layer(std::mem::take(&mut wrong), &block, m),
+            Err(PoolError::BadInput(_))
+        ));
     }
 
     /// M3.1 pin: three grouped jobs over four rows, rows 1 and 3 shared by two

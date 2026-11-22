@@ -2250,8 +2250,8 @@ fn make(
             step.check_krow_arming(settings.speculation.max_rows)?;
             step.enable_krow()?;
         }
-        if let (Some(_), Some((model, _))) = (&tiered, gguf.as_ref()) {
-            step.set_tiered_chunk(tiered_chunk_arm(model.weights.header(), &res.dims)?);
+        if tiered.is_some() && gguf.is_some() {
+            step.set_tiered_chunk(tiered_chunk_arm());
         }
         let mut arena_admitted = None;
         if arena {

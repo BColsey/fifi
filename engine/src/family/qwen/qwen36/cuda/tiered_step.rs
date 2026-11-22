@@ -25,7 +25,7 @@ use super::run_report::HostSyncs;
 use crate::EngError;
 use crate::kernels::cuda::{
     CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
-    ExpertBankGeometry, NativeWeight, PinnedBuf, resident::matvec_q::QuantType,
+    ExpertBankGeometry, NativeWeight, PinnedBuf,
 };
 
 /// The cold staging bank of the chunked tiered prefill: ONE zero-initialised
@@ -175,6 +175,42 @@ impl ColdStaging {
             }
         }
         Ok(())
+    }
+}
+
+/// The cold staging banks of the chunked prefill, one per distinct record-type triple of the
+/// layers: a staging bank is typed like the stacks it serves, so a file that mixes types across
+/// layers gets one bank per triple, each of the same depth.
+#[derive(Default)]
+pub(super) struct ColdSet {
+    stagings: Vec<ColdStaging>,
+    /// The staging of each layer, `None` when admission built none.
+    of_layer: Vec<Option<usize>>,
+}
+
+impl ColdSet {
+    /// No staging: every miss of a chunk goes to the CPU pool.
+    pub(super) fn none() -> Self {
+        Self::default()
+    }
+
+    /// The set over `stagings`, with the staging each layer uses.
+    pub(super) fn new(stagings: Vec<ColdStaging>, of_layer: Vec<Option<usize>>) -> Self {
+        Self {
+            stagings,
+            of_layer,
+        }
+    }
+
+    fn of(&self, layer: usize) -> Option<usize> {
+        self.of_layer.get(layer).copied().flatten()
+    }
+
+    /// The staging depth of `layer` (0 when admission built none).
+    pub(super) fn cap(&self, layer: usize) -> usize {
+        self.of(layer)
+            .and_then(|index| self.stagings.get(index))
+            .map_or(0, ColdStaging::cap)
     }
 }
 
@@ -330,9 +366,9 @@ pub(super) struct TieredRuntime<'w> {
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
-    /// The cold staging bank of the chunked prefill: `None` when admission left no
-    /// spare VRAM for it (the chunk path then keeps the CPU pool for every miss).
-    cold: Option<ColdStaging>,
+    /// The cold staging banks of the chunked prefill: empty when admission left no spare VRAM
+    /// for them (the chunk path then keeps the CPU pool for every miss).
+    cold: ColdSet,
     /// The bank depth (slots per layer) every bank was built with.
     slot_count: usize,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
@@ -463,21 +499,27 @@ impl<'w> TieredRuntime<'w> {
         })
     }
 
-    /// The type of each layer's shared gate, up and down projections as loaded, for the chunk
-    /// path's checks: the shared expert is read in the type its file stores.
-    pub(super) fn shared_quants(&self) -> Vec<[Option<QuantType>; 3]> {
+    /// The types of each layer's shared and routed projections as loaded, for the chunk path's
+    /// checks: every weight is read in the type its file stores.
+    pub(super) fn types(&self) -> Vec<super::prefill::TieredTypes> {
         let of = |weight: &DenseWeight<'_>| match weight {
             DenseWeight::Native(native) => Some(native.quant()),
             _ => None,
         };
         self.parts
             .iter()
-            .map(|part| {
-                [
+            .zip(&self.banks)
+            .map(|(part, bank)| super::prefill::TieredTypes {
+                shared: [
                     of(&part.shared_gate),
                     of(&part.shared_up),
                     of(&part.shared_down),
-                ]
+                ],
+                routed: [
+                    Some(bank.gate().quant()),
+                    Some(bank.up().quant()),
+                    Some(bank.down().quant()),
+                ],
             })
             .collect()
     }
@@ -752,7 +794,7 @@ impl<'w> TieredRuntime<'w> {
         ),
         super::super::tiered::host::HostError,
     > {
-        let allocated = self.cold.as_ref().map_or(0, ColdStaging::cap);
+        let allocated = self.cold.cap(layer);
         // Experiment: trade fewer PCIe expert transfers for more CPU overflow work.
         // The allocation, admission charge and launch bank depth remain unchanged.
         static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -782,11 +824,6 @@ impl<'w> TieredRuntime<'w> {
         self.host.begin_chunk_layer(layer, rows, cap)
     }
 
-    /// The cold staging depth (0 when admission built none).
-    pub(super) fn cold_cap(&self) -> usize {
-        self.cold.as_ref().map_or(0, ColdStaging::cap)
-    }
-
     /// The configured tiered pool timeout, so chunk joins wait the same budget
     /// the decode path does (not a hard-coded wall-clock of their own).
     pub(super) fn pool_timeout(&self) -> std::time::Duration {
@@ -802,12 +839,15 @@ impl<'w> TieredRuntime<'w> {
     /// a no-op without a staging bank or cold experts.
     pub(super) fn stage_cold(
         &mut self,
+        layer: usize,
         ctx: &CudaContext,
         stream: &DeviceStream,
         cold: &[super::super::tiered::host::ChunkColdStage],
         region: &Arc<dyn MappedRegion>,
     ) -> Result<(), EngError> {
-        if let Some(staging) = self.cold.as_mut() {
+        if let Some(index) = self.cold.of(layer)
+            && let Some(staging) = self.cold.stagings.get_mut(index)
+        {
             staging.stage(ctx, stream, cold, region)?;
         }
         Ok(())
@@ -817,10 +857,17 @@ impl<'w> TieredRuntime<'w> {
     /// own in `layer_weights`.
     pub(super) fn cold_weights(
         &self,
+        layer: usize,
     ) -> Result<(&NativeWeight, &NativeWeight, &NativeWeight), EngError> {
-        let staging = self.cold.as_ref().ok_or_else(|| {
-            EngError::BadRequest(String::from("tiered runtime: no cold staging bank"))
-        })?;
+        let staging = self
+            .cold
+            .of(layer)
+            .and_then(|index| self.cold.stagings.get(index))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "tiered runtime: layer {layer} has no cold staging bank"
+                ))
+            })?;
         Ok(staging.weights())
     }
 
