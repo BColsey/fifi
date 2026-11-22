@@ -49,7 +49,7 @@ use super::{
     prefill_adapter::PrefillWaveScope,
     state::FlashGeometry,
     step::{FlashStep, SplitMoeAt},
-    step_plan::StepPlan,
+    step_plan::{StepOptions, StepPlan},
 };
 use crate::family::engine_announce::{Announcement, announce_failure, await_announced};
 use crate::family::expert_bank::{
@@ -731,9 +731,22 @@ fn build_driver_resolving(
     let memory = HostMemory::of(host_admission);
     let host_frame = HostFrame::new(memory, terms);
     let geometry_for_arena = FlashGeometry::new(&model, &kinds)?;
+    // The attention splits the step will launch with: the charge below sizes the same plan.
+    let step_options = StepOptions::for_sm_count(
+        projector
+            .context()
+            .device_attributes()
+            .map_or(0, |attributes| attributes.sm_count),
+    );
     let plan_for = |context: u32| -> Result<FlashLoadPlan, EngError> {
         let prefill_arena_bytes = if rows > 1 {
-            StepPlan::prefill_bytes(true, &geometry_for_arena, rows, context as usize)?
+            StepPlan::prefill_bytes(
+                true,
+                &geometry_for_arena,
+                rows,
+                context as usize,
+                &step_options,
+            )?
         } else {
             0
         };

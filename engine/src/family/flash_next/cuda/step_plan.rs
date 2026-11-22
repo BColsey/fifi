@@ -72,7 +72,8 @@ pub(super) const MAX_STEP_ROWS: usize = MAX_EXL3_ROWS;
 /// Shared by the arena charge, dense job writer and actual prefill Projector.
 pub(super) const PREFILL_TILE_ROWS: usize = 256;
 
-/// Splits of the QSA attention in a decode step unless the options say otherwise. The attended
+/// Splits of the QSA attention in a decode step on the 82-SM card it was tuned on, unless the
+/// options say otherwise. The attended
 /// positions of a token are the selected blocks (2,048 at most) and the open tail; the part
 /// scratch grows linearly with the count (`n_head x splits x 258` f32 per row).
 pub(super) const DEFAULT_QSA_SPLITS: usize = 16;
@@ -82,6 +83,16 @@ pub(super) const DEFAULT_QSA_SPLITS: usize = 16;
 pub(super) struct StepOptions {
     /// `max_splits` of the QSA attention launch, 1 to 128.
     pub(super) qsa_splits: usize,
+}
+
+impl StepOptions {
+    /// The options of a device of `sm_count` multiprocessors: the default split count, scaled so
+    /// the attention fills the multiprocessors as it did on the card it was tuned on.
+    pub(super) fn for_sm_count(sm_count: u32) -> Self {
+        Self {
+            qsa_splits: crate::capability::tuning::attention_splits(DEFAULT_QSA_SPLITS, sm_count),
+        }
+    }
 }
 
 impl Default for StepOptions {
@@ -676,11 +687,12 @@ impl StepPlan {
         geometry: &FlashGeometry,
         rows: usize,
         positions: usize,
+        options: &StepOptions,
     ) -> Result<u64, EngError> {
         if !enabled {
             return Ok(0);
         }
-        let plan = Self::new_prefill(geometry, rows, positions, &StepOptions::default())?;
+        let plan = Self::new_prefill(geometry, rows, positions, options)?;
         u64::try_from(plan.arena_bytes()).map_err(|_| overflow())
     }
 

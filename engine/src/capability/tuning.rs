@@ -200,6 +200,39 @@ fn cpu_isa() -> String {
     }
 }
 
+/// The multiprocessor count the decode attention split counts were measured on (an RTX 3090).
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starts size their attention splits")
+)]
+pub(crate) const SPLIT_TUNED_SM_COUNT: u32 = 82;
+
+/// The kernels' ceiling on the splits of one attention launch.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starts size their attention splits")
+)]
+pub(crate) const SPLIT_CEILING: usize = 128;
+
+/// The splits of a decode attention launch on a device of `sm_count` multiprocessors, from the
+/// count `tuned` on the 82-SM card: the blocks each multiprocessor runs stay what the tuning
+/// measured, so a smaller card does not over-split into partial rows it must combine and a larger
+/// one fills its multiprocessors. The tuned card keeps its count exactly. A device that reports
+/// no count keeps the tuned one. Never below one nor above [`SPLIT_CEILING`].
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starts size their attention splits")
+)]
+pub(crate) fn attention_splits(tuned: usize, sm_count: u32) -> usize {
+    if sm_count == 0 {
+        return tuned.clamp(1, SPLIT_CEILING);
+    }
+    let scaled = (tuned as u64 * u64::from(sm_count)).div_ceil(u64::from(SPLIT_TUNED_SM_COUNT));
+    usize::try_from(scaled)
+        .unwrap_or(SPLIT_CEILING)
+        .clamp(1, SPLIT_CEILING)
+}
+
 /// One decision the family puts to the tuner: named candidates ordered
 /// best-first (the family derives each with its own qualified machinery
 /// and says why in the source string), plus the value the start uses
@@ -673,5 +706,29 @@ mod tests {
         let (qd1, _) = HardwareFacts::drive_probe(&file, 5, 1 << 20, 2 << 20);
         assert!(qd1 <= (2 << 20), "qd1 respects the byte cap: {qd1}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attention_splits_keep_the_tuned_card_and_follow_the_multiprocessor_count() {
+        // The tuned card keeps its counts exactly, whatever they were tuned to.
+        for tuned in [1, 4, 16, 32, 64, 128] {
+            assert_eq!(attention_splits(tuned, SPLIT_TUNED_SM_COUNT), tuned);
+        }
+        // Blocks per multiprocessor stay: a 20-SM laptop card runs a quarter of the splits, a
+        // 170-SM card about twice.
+        assert_eq!(attention_splits(32, 20), 8);
+        assert_eq!(attention_splits(16, 20), 4);
+        assert_eq!(attention_splits(32, 170), 67);
+        assert_eq!(attention_splits(16, 170), 34);
+        // No count reported keeps the tuning; the result stays within the kernels' bounds.
+        assert_eq!(attention_splits(32, 0), 32);
+        assert_eq!(attention_splits(32, 1), 1);
+        assert_eq!(attention_splits(128, 1_000), SPLIT_CEILING);
+        let mut last = 0;
+        for sms in 1..400 {
+            let splits = attention_splits(32, sms);
+            assert!(splits >= last && (1..=SPLIT_CEILING).contains(&splits));
+            last = splits;
+        }
     }
 }

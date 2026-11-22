@@ -101,17 +101,30 @@ impl HostFamily for BoltFamily<'_> {
 }
 
 /// What names a Bolt load to an entry kept outside the process.
+/// The numeric path of a load: whether the attention split is armed and, off the card the count
+/// was tuned on, how many splits. A different count sums the softmax in a different order, so an
+/// entry written under one count is not another's; the tuned card keeps the original name.
+fn numeric_path(attention_splits: Option<usize>) -> String {
+    match attention_splits {
+        None => "bolt-kv8 attention-split false".to_owned(),
+        Some(splits) if splits == super::resident::bolt::ATTN_SPLIT_MAX => {
+            "bolt-kv8 attention-split true".to_owned()
+        }
+        Some(splits) => format!("bolt-kv8 attention-split true splits {splits}"),
+    }
+}
+
 pub(super) fn load_identity(
     weights: &str,
     layer_bytes: &[usize],
-    attention_split: bool,
+    attention_splits: Option<usize>,
 ) -> LoadIdentity {
     let (tokenizer, template) = crate::tokenizer::gemma::pinned_digests();
     LoadIdentity {
         weights: weights.to_owned(),
         tokenizer: crate::weights::sha256_hex(&tokenizer),
         template: crate::weights::sha256_hex(&template),
-        numeric_path: format!("bolt-kv8 attention-split {attention_split}"),
+        numeric_path: numeric_path(attention_splits),
         family: CONTRACT,
         layout: format!(
             "{LAYOUT_TAG}; {} physical layers; bytes per cell by layer {layer_bytes:?}",
@@ -150,16 +163,21 @@ mod tests {
 
     #[test]
     fn the_load_identity_names_the_weights_the_pinned_text_and_the_layout() {
-        let one = load_identity("w1", &[8, 16], true);
+        let one = load_identity("w1", &[8, 16], Some(32));
         assert!(one.is_complete());
-        let other_weights = load_identity("w2", &[8, 16], true);
-        let other_layout = load_identity("w1", &[8, 24], true);
-        let other_split = load_identity("w1", &[8, 16], false);
+        let other_weights = load_identity("w2", &[8, 16], Some(32));
+        let other_layout = load_identity("w1", &[8, 24], Some(32));
+        let other_split = load_identity("w1", &[8, 16], None);
         let namespace = |load: &LoadIdentity| {
             format!("{:?}", (&load.weights, &load.layout, &load.numeric_path))
         };
         assert_ne!(namespace(&one), namespace(&other_weights));
         assert_ne!(namespace(&one), namespace(&other_layout));
         assert_ne!(namespace(&one), namespace(&other_split));
+        // The tuned card keeps the name entries were written under; another count is another
+        // numeric path.
+        assert_eq!(one.numeric_path, "bolt-kv8 attention-split true");
+        let small = load_identity("w1", &[8, 16], Some(8));
+        assert_ne!(namespace(&one), namespace(&small));
     }
 }

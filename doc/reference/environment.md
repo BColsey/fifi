@@ -244,6 +244,7 @@ Nemotron serves greedy requests only on CUDA (sampled requests are refused). The
 | Variable | Default | Accepted values | Meaning |
 | --- | --- | --- | --- |
 | `FIFI_BOLT_ATTN_SPLIT` | on (switch) | `1`, `on`, `0`, `off` | Selects the split decode attention of the Bolt resident step: one partial+combine launch pair per attention instead of the single-pass kernel. The split changes the summation order, matches the f64 reference within its tolerance, and is bit-identical only between its eager and graphed runs (the KV8 combine lift into the shared reducer is the bit-identical piece). Unset arms it (the default since the split landed: the full-attention call is 11.7x faster at 30K depth, and served decode goes from 6.8 to 43 tok/s there, greedy output unchanged over 96 tokens at all four bench depths); `0` or `off` is the rollback to the single-pass summation order. Any other value is refused at load. Read once per process; restart to change. |
+| `FIFI_BOLT_ATTN_SPLITS` | device-derived | `1` to `128` | Overrides the split count of the Bolt decode attention. Unset, the count is 32 scaled by the device query's multiprocessor count over the 82 it was tuned on, so the 82-SM card keeps 32 and a 20-SM card gets 8; a driver that reports no count keeps 32. The count changes the summation order, so a prefix entry written under another count is a different entry. Any other value is refused at load. Read once per process; restart to change. |
 
 ## Tests
 

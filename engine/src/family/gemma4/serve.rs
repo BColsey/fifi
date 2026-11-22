@@ -613,7 +613,7 @@ mod device {
             let load = kv_tier::load_identity(
                 &model.weights_identity,
                 &model.snapshot_layer_bytes(1),
-                bolt::attn_split_wanted()?,
+                bolt::attn_split_wanted()?.then(|| model.attn_splits()),
             );
             let identity = PrefixIdentity {
                 weights: load.weights.as_str().into(),

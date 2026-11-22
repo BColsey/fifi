@@ -105,10 +105,10 @@ const PLE_COMBINED_SCALE: f32 = std::f32::consts::SQRT_2.recip();
 /// the three input cells. The starter admits this against free memory before
 /// loading. `None` on overflow. Mirrors `grow_scratch` so the charge cannot
 /// undercount the prefill working set. The attention split's partial buffer
-/// is charged only when `attn_split_armed` (the split is the default since it
+/// is charged only when the split is armed, at the device's split count (the split is the default since it
 /// landed; the admission must refuse an armed load before allocating), and the wide
 /// prefill attention's only when `wide_prefill` (the device gate passed).
-pub(crate) fn scratch_bytes(attn_split_armed: bool, wide_prefill: bool) -> Option<u64> {
+pub(crate) fn scratch_bytes(attn_splits: Option<usize>, wide_prefill: bool) -> Option<u64> {
     let rows = Bolt::PREFILL_BATCH as u64;
     let growable_f32 = [
         8 * HIDDEN,                 // h[4], nrm, nrm2, proj, down
@@ -134,8 +134,8 @@ pub(crate) fn scratch_bytes(attn_split_armed: bool, wide_prefill: bool) -> Optio
     // ids, pos, kv_len input cells.
     total = total.checked_add(12)?;
     // The split partial buffer, present only when the attention split is armed.
-    if attn_split_armed {
-        total = total.checked_add(attn_part_bytes() as u64)?;
+    if let Some(splits) = attn_splits {
+        total = total.checked_add(attn_part_bytes(splits) as u64)?;
     }
     // The wide prefill attention's partial buffer, present only when the device gate passed.
     // The wide prefill attention's partial buffer, present only when the device gate passed; the
@@ -162,9 +162,10 @@ fn trace_dir() -> Option<&'static str> {
 /// `0` or `off` is the rollback to the single-pass summation order.
 pub(crate) const ATTN_SPLIT_VAR: &str = "FIFI_BOLT_ATTN_SPLIT";
 
-/// Split policy: at most 32 splits over the visible range, at least 128 keys
-/// per split, so a short context keeps one split and a long one fills the
-/// device (8 q heads x 32 splits = 256 blocks on an 82-SM card).
+/// Split policy: at most `splits` over the visible range, at least 128 keys per split, so a short
+/// context keeps one split and a long one fills the device. The count is 32 on the 82-SM card it
+/// was tuned on (8 q heads x 32 splits = 256 blocks) and scales with the device's multiprocessor
+/// count ([`device_attn_splits`]).
 pub(crate) const ATTN_SPLIT_MAX: usize = 32;
 pub(crate) const ATTN_SPLIT_MIN_KEYS: usize = 128;
 
@@ -172,9 +173,37 @@ pub(crate) const ATTN_SPLIT_MIN_KEYS: usize = 128;
 /// the accumulator vector, per (token, q head, split). Sized on the 512-dim
 /// global head and the full prefill batch, because the eager step runs the
 /// same kernels for m = 1..=PREFILL_BATCH; the 256-dim local layers need less.
-pub(crate) const fn attn_part_bytes() -> usize {
-    Bolt::PREFILL_BATCH * HEADS * ATTN_SPLIT_MAX * (2 + GLOBAL_HEAD) * 4
+pub(crate) const fn attn_part_bytes(splits: usize) -> usize {
+    Bolt::PREFILL_BATCH * HEADS * splits * (2 + GLOBAL_HEAD) * 4
 }
+
+/// The split count on `ctx`'s device: the tuned count scaled by the device query's multiprocessor
+/// count. A driver that refuses the query keeps the tuned count.
+///
+/// [`ATTN_SPLITS_VAR`] overrides the count (1 to 128), for a comparison on one binary; a bad value
+/// fails the load.
+fn device_attn_splits(ctx: &CudaContext) -> Result<usize, EngError> {
+    if let Ok(text) = std::env::var(ATTN_SPLITS_VAR) {
+        return match text.trim().parse::<usize>() {
+            Ok(count) if (1..=crate::capability::tuning::SPLIT_CEILING).contains(&count) => {
+                Ok(count)
+            }
+            _ => Err(EngError::BadRequest(format!(
+                "bolt attention splits: {ATTN_SPLITS_VAR} takes 1 to {}, got {text:?}",
+                crate::capability::tuning::SPLIT_CEILING
+            ))),
+        };
+    }
+    Ok(crate::capability::tuning::attention_splits(
+        ATTN_SPLIT_MAX,
+        ctx.device_attributes()
+            .map_or(0, |attributes| attributes.sm_count),
+    ))
+}
+
+/// The environment variable that sets the split count of the decode attention instead of the
+/// device-derived one.
+pub(crate) const ATTN_SPLITS_VAR: &str = "FIFI_BOLT_ATTN_SPLITS";
 
 /// The armed state the environment text selects: unset arms the qualified
 /// split (the default); `0`/`off` disarms it, `1`/`on` arms it, and anything
@@ -384,6 +413,8 @@ pub(crate) struct Scratch {
 pub(crate) struct Bolt {
     /// KV cells per physical layer: the planned context of this load.
     cells: usize,
+    /// The splits of one decode attention launch on this device.
+    attn_splits: usize,
     /// The captured one-token decode body, armed by [`bolt_graph`]. Declared
     /// FIRST so it drops first: fields drop in declaration order, and the
     /// graph must be destroyed before any buffer whose address it baked (a
@@ -430,7 +461,7 @@ fn embed_scale() -> f32 {
 /// testable on the host without a device.
 pub(crate) fn bolt_demand(
     weights_bytes: u64,
-    attn_split_armed: bool,
+    attn_splits: Option<usize>,
     cells: usize,
     wide_prefill: bool,
 ) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
@@ -440,7 +471,7 @@ pub(crate) fn bolt_demand(
         .positions
         .checked_mul(kv.bytes_per_position)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV cache charge overflows".into()))?;
-    let scratch = scratch_bytes(attn_split_armed, wide_prefill)
+    let scratch = scratch_bytes(attn_splits, wide_prefill)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
     Ok(crate::kernels::cuda::plan::Demand {
         tensors: weights_bytes,
@@ -451,10 +482,10 @@ pub(crate) fn bolt_demand(
 }
 
 /// The byte figures of Bolt's per-session cell sizing, planned by the shared card-fit rule.
-fn cell_figures(attn_split_armed: bool, wide_prefill: bool) -> Result<CellFigures, EngError> {
+fn cell_figures(attn_splits: Option<usize>, wide_prefill: bool) -> Result<CellFigures, EngError> {
     CellFigures::checked(
         super::super::budget::bolt_kv_bytes_per_position(),
-        scratch_bytes(attn_split_armed, wide_prefill),
+        scratch_bytes(attn_splits, wide_prefill),
         (
             super::super::budget::BOLT_HEADROOM_BYTES,
             super::super::budget::BOLT_SEQ_FIXED_BYTES,
@@ -507,7 +538,9 @@ pub(crate) fn load_choosing(
     // the other resident executors use. An exact fit of the allocations alone
     // is refused; the shared error names the needed and free bytes.
     let free = ctx.memory_info()?.free as u64;
-    let split = attn_split_wanted()?;
+    let split = attn_split_wanted()?
+        .then(|| device_attn_splits(&ctx))
+        .transpose()?;
     // The wide prefill attention is built wherever the device gate passes and starts as the
     // override or the default says; the admission charges its buffer when it is built.
     let wide_load = WideLoad::read(&ctx, "gemma4 bolt", wide_geometry(MAX_CELLS))?;
@@ -719,6 +752,7 @@ pub(crate) fn load_choosing(
     ];
     // The attention split refuses a bad switch value before any allocation.
     let attn_split = attn_split_wanted()?;
+    let attn_splits = device_attn_splits(&ctx)?;
     let scratch = Scratch {
         h,
         nrm: vector_filled(&ctx, HIDDEN, 0.0)?,
@@ -756,7 +790,7 @@ pub(crate) fn load_choosing(
         ids: zero(&ctx, Bolt::PREFILL_BATCH * 4)?,
         status: zero(&ctx, 4)?,
         attn_part: if attn_split {
-            Some(zero(&ctx, attn_part_bytes())?)
+            Some(zero(&ctx, attn_part_bytes(attn_splits))?)
         } else {
             None
         },
@@ -766,6 +800,7 @@ pub(crate) fn load_choosing(
     let wide_prefill = wide_load.build(&ctx, wide_geometry(cells))?;
     Ok(Bolt {
         cells,
+        attn_splits,
         ctx,
         stream,
         layers,
@@ -793,6 +828,11 @@ impl Bolt {
     /// The KV cells per physical layer this load serves.
     pub(crate) fn cells(&self) -> usize {
         self.cells
+    }
+
+    /// The splits of one decode attention launch on this device.
+    pub(crate) fn attn_splits(&self) -> usize {
+        self.attn_splits
     }
 
     /// Allocates the device state of one more sequence: zeroed KV8 planes for the physical
@@ -1066,7 +1106,7 @@ impl Bolt {
         self.graph = None;
         if on {
             if self.scratch.attn_part.is_none() {
-                self.scratch.attn_part = Some(zero(&self.ctx, attn_part_bytes())?);
+                self.scratch.attn_part = Some(zero(&self.ctx, attn_part_bytes(self.attn_splits))?);
             }
         } else {
             self.scratch.attn_part = None;
@@ -1563,11 +1603,11 @@ impl Bolt {
         let source = layer.kv_source.unwrap_or(index);
         let pos = rows.trace_pos();
         let attn_split = sc.attn_part.as_ref().map(|part| {
-            let bytes = attn_part_bytes();
+            let bytes = attn_part_bytes(self.attn_splits);
             AttnDecodeGemmaSplit {
                 // Sized at load for the full prefill batch; the range cannot fail.
                 part: part.range(0, bytes).expect("partial buffer"),
-                max_splits: ATTN_SPLIT_MAX,
+                max_splits: self.attn_splits,
                 min_keys: ATTN_SPLIT_MIN_KEYS,
             }
         });
@@ -2143,7 +2183,7 @@ mod tests {
         wide: bool,
         sessions: usize,
     ) -> Result<Option<usize>, EngError> {
-        Ok(cell_figures(split, wide)?.plan(free, weights, sessions))
+        Ok(cell_figures(split.then_some(ATTN_SPLIT_MAX), wide)?.plan(free, weights, sessions))
     }
 
     fn cells_for(
@@ -2153,7 +2193,7 @@ mod tests {
         wide: bool,
         sessions: usize,
     ) -> Result<usize, EngError> {
-        Ok(cell_figures(split, wide)?.serve(free, weights, sessions))
+        Ok(cell_figures(split.then_some(ATTN_SPLIT_MAX), wide)?.serve(free, weights, sessions))
     }
 
     #[test]
@@ -2173,18 +2213,21 @@ mod tests {
         // fixed f32 ones + two logits rows (524,800 x 4), growable q8 at eight
         // columns plus the fixed head/qk buffers, plus the 12 input-cell bytes;
         // the armed split adds its partial buffer on top.
-        let disarmed = scratch_bytes(false, false).expect("the disarmed scratch computes");
-        let armed = scratch_bytes(true, false).expect("the armed scratch computes");
+        let disarmed = scratch_bytes(None, false).expect("the disarmed scratch computes");
+        let armed = scratch_bytes(Some(ATTN_SPLIT_MAX), false).expect("the armed scratch computes");
         assert_eq!(disarmed, 5_168_716);
         assert_eq!(armed, 9_379_404);
-        assert_eq!(armed - disarmed, attn_part_bytes() as u64);
+        assert_eq!(armed - disarmed, attn_part_bytes(ATTN_SPLIT_MAX) as u64);
         // The wide prefill attention's partial buffer is charged only where the gate passed.
         let wide = wide_geometry(MAX_CELLS)
             .part_bytes()
             .expect("the wide partial size computes") as u64;
         assert_eq!(wide, 16_842_752);
-        assert_eq!(scratch_bytes(false, true), Some(disarmed + wide));
-        assert_eq!(scratch_bytes(true, true), Some(armed + wide));
+        assert_eq!(scratch_bytes(None, true), Some(disarmed + wide));
+        assert_eq!(
+            scratch_bytes(Some(ATTN_SPLIT_MAX), true),
+            Some(armed + wide)
+        );
     }
 
     #[test]
@@ -2193,8 +2236,8 @@ mod tests {
         // no room for the headroom reserve must be refused by the shared admit;
         // the same demand fits once the reserve is included.
         let weights_bytes = 3_000_000_000u64;
-        let demand =
-            bolt_demand(weights_bytes, true, 32_768, true).expect("the Bolt demand computes");
+        let demand = bolt_demand(weights_bytes, Some(ATTN_SPLIT_MAX), 32_768, true)
+            .expect("the Bolt demand computes");
         assert_eq!(demand.tensors, weights_bytes);
         assert!(demand.kv_cache > 0 && demand.work > 0 && demand.headroom > 0);
         let allocations = demand.tensors + demand.kv_cache + demand.work;
@@ -2263,7 +2306,7 @@ mod tests {
     fn the_planned_cells_are_the_largest_count_the_card_carries() {
         let weights = 7_578_800_000u64;
         let free_for = |cells: usize| {
-            let demand = bolt_demand(weights, true, cells, false).expect("demand");
+            let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false).expect("demand");
             demand.tensors + demand.kv_cache + demand.work + demand.headroom
         };
         // A 3090-sized card holds the model maximum.
@@ -2283,7 +2326,7 @@ mod tests {
         );
         // The count the plan returns passes the shared admission, and a card short of the
         // smallest count plans none.
-        let demand = bolt_demand(weights, true, 40_960, false).expect("demand");
+        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
         assert_eq!(
             plan_cells(free_for(1024) - 1, weights, true, false, 1).expect("plan"),
@@ -2304,7 +2347,7 @@ mod tests {
             CacheForm, CardBytes, ContextLimits, SESSION_PLAN_SLACK_BYTES, plan_card_fit,
         };
         let per_position = crate::family::gemma4::budget::bolt_kv_bytes_per_position().unwrap();
-        let scratch = scratch_bytes(split, wide).unwrap();
+        let scratch = scratch_bytes(split.then_some(ATTN_SPLIT_MAX), wide).unwrap();
         let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
         let unlisted = if extra > 0 {
             SESSION_PLAN_SLACK_BYTES
@@ -2349,7 +2392,7 @@ mod tests {
             for sessions in 1..=Bolt::PREFILL_BATCH {
                 for (split, wide) in [(true, false), (true, true), (false, false)] {
                     let old = reference_cells(free, weights, split, wide, sessions);
-                    let new = cell_figures(split, wide)
+                    let new = cell_figures(split.then_some(ATTN_SPLIT_MAX), wide)
                         .expect("figures")
                         .plan(free, weights, sessions);
                     assert_eq!(
@@ -2367,7 +2410,7 @@ mod tests {
             let one = reference_cells(free, weights, true, wide, 1);
             let all = reference_cells(free, weights, true, wide, 8).unwrap_or(0);
             let old = one.map_or(FALLBACK_CELLS, |one| all.max(one.min(FALLBACK_CELLS)));
-            let now = cell_figures(true, wide)
+            let now = cell_figures(Some(ATTN_SPLIT_MAX), wide)
                 .expect("figures")
                 .serve(free, weights, 8);
             eprintln!("default start, wide {wide}: served {old} cells before, {now} cells now");
@@ -2383,7 +2426,7 @@ mod tests {
             let plain = cells_for(free, weights, true, false, 1).expect("cells");
             let wide = cells_for(free, weights, true, true, 1).expect("cells");
             assert!(wide <= plain, "{free}: {wide} against {plain}");
-            let demand = bolt_demand(weights, true, wide, true).expect("demand");
+            let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), wide, true).expect("demand");
             crate::kernels::cuda::plan::admit(&demand, free)
                 .unwrap_or_else(|error| panic!("{free}: {wide} cells: {error:?}"));
         }
@@ -2394,7 +2437,7 @@ mod tests {
         use crate::family::seq_plan::{SeqInputs, plan_seqs};
         // What the first session holds beyond its admission demand, as measured on the 3090.
         const UNLISTED_BYTES: u64 = 196 << 20;
-        let demand = bolt_demand(weights, true, cells, false).expect("demand");
+        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false).expect("demand");
         let after_first =
             free.saturating_sub(demand.tensors + demand.kv_cache + demand.work + UNLISTED_BYTES);
         let plan = plan_seqs(

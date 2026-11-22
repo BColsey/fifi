@@ -299,7 +299,9 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
     let (ctx, stream) = context();
     let positions = [0usize, 1, 37, 511, 512, 513, 4000, 30_000];
     let rows = positions.len();
-    let part = ctx.upload(&vec![0u8; attn_part_bytes()]).expect("part");
+    let part = ctx
+        .upload(&vec![0u8; attn_part_bytes(ATTN_SPLIT_MAX)])
+        .expect("part");
     for head in [256usize, 512] {
         let global = head == 512;
         let (q_heads, kv_heads) = (8usize, 2usize);
@@ -344,7 +346,9 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
                 .collect();
             let split = |armed: bool| {
                 armed.then(|| AttnDecodeGemmaSplit {
-                    part: part.range(0, attn_part_bytes()).expect("part"),
+                    part: part
+                        .range(0, attn_part_bytes(ATTN_SPLIT_MAX))
+                        .expect("part"),
                     max_splits: ATTN_SPLIT_MAX,
                     min_keys: ATTN_SPLIT_MIN_KEYS,
                 })

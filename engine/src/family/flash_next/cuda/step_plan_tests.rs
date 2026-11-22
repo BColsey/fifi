@@ -33,7 +33,10 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 #[test]
 fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
     let (_, g) = real();
-    assert_eq!(StepPlan::prefill_bytes(false, &g, 0, 0).unwrap(), 0);
+    assert_eq!(
+        StepPlan::prefill_bytes(false, &g, 0, 0, &StepOptions::default()).unwrap(),
+        0
+    );
     // The charge-equality ladder reaches the supported width: the arena a 2,048-row
     // window would reserve is exactly what the device arena plan totals (an
     // under-charge here is the memory defect of a wider window).
@@ -44,12 +47,14 @@ fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
             .unwrap()
             .total;
         assert_eq!(
-            StepPlan::prefill_bytes(true, &g, rows, 32_768).unwrap(),
+            StepPlan::prefill_bytes(true, &g, rows, 32_768, &StepOptions::default()).unwrap(),
             u64::try_from(actual).unwrap()
         );
     }
     // The rows bound of the charge is the runtime ceiling, one above refuses.
-    assert!(StepPlan::prefill_bytes(true, &g, ceiling + 1, 32_768).is_err());
+    assert!(
+        StepPlan::prefill_bytes(true, &g, ceiling + 1, 32_768, &StepOptions::default()).is_err()
+    );
 }
 
 #[test]
@@ -405,7 +410,8 @@ fn a_prefill_arena_that_starves_the_card_refuses_at_plan_time_with_the_bytes() {
     // same helper start.rs feeds the plan), not a stand-in number.
     let (_, g) = real();
     let ceiling = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap();
-    let charge = StepPlan::prefill_bytes(true, &g, ceiling, 32_768).unwrap();
+    let charge =
+        StepPlan::prefill_bytes(true, &g, ceiling, 32_768, &StepOptions::default()).unwrap();
     assert_eq!(
         ceiling, 2_048,
         "the supported window the refusal is computed from"
@@ -435,4 +441,22 @@ fn a_prefill_arena_that_starves_the_card_refuses_at_plan_time_with_the_bytes() {
         "the refusal carries the byte counts (needed {needed}, available {}): {text}",
         base.vram.usable
     );
+}
+
+#[test]
+fn the_qsa_splits_follow_the_device_multiprocessor_count() {
+    // The tuned card keeps the default, so its plan bytes are unchanged.
+    assert_eq!(StepOptions::for_sm_count(82), StepOptions::default());
+    assert_eq!(StepOptions::for_sm_count(0), StepOptions::default());
+    let (_, g) = real();
+    let part = |sm_count: u32| {
+        let plan = StepPlan::new(&g, 1, 32_768, &StepOptions::for_sm_count(sm_count))
+            .expect("the step plan");
+        slot(&plan, Slot::AttnPart).bytes
+    };
+    // A 20-SM card runs a quarter of the splits and holds a quarter of the partial rows.
+    assert_eq!(StepOptions::for_sm_count(20).qsa_splits, 4);
+    assert_eq!(part(20) * 4, part(82));
+    assert_eq!(part(82), 24 * DEFAULT_QSA_SPLITS * 258 * 4);
+    assert!(part(170) > part(82));
 }
