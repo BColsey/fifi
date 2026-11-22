@@ -175,7 +175,69 @@ __global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a, Index index) 
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
 }
 
+// One expert matrix per call. Each warp owns the same weight row and lane
+// columns as gguf_packed_gemv, but reuses each decoded weight in Tile separate
+// F32 accumulators. Do not transpose the lane mapping or split K: the exact
+// packed-GEMV lane FMA sequence and XOR butterfly are the reference.
+template <int Type, int Block, int Bytes, int Tile>
+__global__ void gguf_exact_expert_tile(inference_cuda_dense_gemv_args a) {
+    extern __shared__ float staged[];
+    const int first = blockIdx.y * Tile;
+    const auto *x = static_cast<const float *>(a.x);
+#pragma unroll
+    for (int t = 0; t < Tile; ++t) {
+        // The tail stages a valid row in unused slots; no invalid reads or stores.
+        const auto *in = x + size_t(first + (first + t < a.m ? t : 0)) * a.ld_x;
+        for (int col = threadIdx.x; col < a.cols; col += blockDim.x) {
+            staged[t * a.cols + col] = in[col];
+        }
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (row >= a.rows) return;
+    const int blocks = a.cols / Block;
+    const auto *w = static_cast<const uint8_t *>(a.w) + size_t(row) * blocks * Bytes;
+    float sums[Tile] = {};
+    for (int block = 0; block < blocks; ++block) {
+        const auto *weights = w + block * Bytes;
+#pragma unroll
+        for (int col = lane; col < Block; col += 32) {
+            const float value = fifi_gguf::decode<Type>(weights, col);
+#pragma unroll
+            for (int t = 0; t < Tile; ++t) {
+                sums[t] = fmaf(value, staged[t * a.cols + block * Block + col], sums[t]);
+            }
+        }
+    }
+    auto *y = static_cast<float *>(a.y);
+#pragma unroll
+    for (int t = 0; t < Tile; ++t) {
+        const float sum = warp_sum(sums[t]);
+        if (lane == 0 && first + t < a.m) y[size_t(first + t) * a.ld_y + row] = sum;
+    }
+}
+
 constexpr int kInklingGateWidth = 2304;
+
+// Called only after the ordinary GEMV operand and shape checks.
+constexpr int exact_expert_tile(int type, int m, int rows, int cols) {
+    if (m < 2 || m > 512 || rows > kInklingGateWidth || cols > kInklingGateWidth ||
+        (type != 16 && type != 42)) return 0;
+    // At most 18 KiB of activation staging per CTA.
+    return type == 42 && cols <= kInklingGateWidth / 2 && m >= 4 ? 4 : 2;
+}
+
+static_assert(exact_expert_tile(16, 512, 2304, 2304) == 2 &&
+              exact_expert_tile(42, 5, 2304, 1152) == 4 &&
+              exact_expert_tile(42, 3, 2304, 1152) == 2 &&
+              exact_expert_tile(42, 5, 2304, 1216) == 2);
+static_assert(exact_expert_tile(16, 1, 2304, 2304) == 0 &&
+              exact_expert_tile(16, 513, 2304, 2304) == 0 &&
+              exact_expert_tile(16, 2, 2305, 2304) == 0 &&
+              exact_expert_tile(16, 2, 2304, 2560) == 0 &&
+              exact_expert_tile(8, 2, 2304, 2304) == 0);
 
 // One lane owns each eight-value IQ2 group. Transpose each activation block
 // once per CTA so the eight inner FMA steps read shared memory without bank
@@ -577,6 +639,36 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         } else {
             launch_packed(*args, cuda_stream, failure, SharedWeights{});
         }
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gguf_exact_expert_tile_launch(
+    const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage, int *out_tile) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (out_tile) *out_tile = 0;
+        if (!args || !valid(*args, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const auto &a = *args;
+        const int type = a.weight_dtype - fifi_gguf::kDtypeBase;
+        const int tile = exact_expert_tile(type, a.m, a.rows, a.cols);
+        if (tile == 0) return inference_cuda_dense_gemv_launch(args, stream, out_stage);
+        const dim3 grid((a.rows + kWarps - 1) / kWarps, (a.m + tile - 1) / tile);
+        const size_t shared = size_t(tile) * a.cols * sizeof(float);
+        const auto s = (cudaStream_t)stream;
+        if (type == 16) {
+            gguf_exact_expert_tile<16, 256, 66, 2><<<grid, kWarps * 32, shared, s>>>(a);
+        } else if (tile == 4) {
+            gguf_exact_expert_tile<42, 64, 18, 4><<<grid, kWarps * 32, shared, s>>>(a);
+        } else {
+            gguf_exact_expert_tile<42, 64, 18, 2><<<grid, kWarps * 32, shared, s>>>(a);
+        }
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.ok() && out_tile) *out_tile = tile;
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
