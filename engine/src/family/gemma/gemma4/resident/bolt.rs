@@ -849,6 +849,26 @@ pub(crate) fn load_choosing(
     // allocated beyond its demand is already gone, so the pool is cut to what the card holds now.
     let held = u64::try_from(ctx.memory_info()?.free).unwrap_or(0);
     let pool = cell_figures(split, wide, rows)?.held_pool(pool, held, sessions);
+    // The memory receipt: a report, never a reason to fail a good start.
+    let receipt = ctx.memory_info().map(|info| {
+        let per_position = super::super::budget::bolt_kv_bytes_per_position().unwrap_or(0);
+        let cells = u64::try_from(pool).unwrap_or(0);
+        crate::family::mem::fill::TierReceipt::dense_only(
+            (
+                u64::try_from(info.total).unwrap_or(0),
+                u64::try_from(info.free).unwrap_or(0),
+            ),
+            choice.chosen.bytes,
+            Some(crate::family::mem::fill::CacheFigure {
+                cells,
+                bytes: per_position.saturating_mul(cells),
+            }),
+        )
+    });
+    eprintln!(
+        "{}",
+        crate::family::mem::fill::report_line("bolt cuda", receipt)
+    );
     let draw = crate::family::decode_step::draw::DrawBuffers::new(
         &ctx,
         Bolt::WINDOW_ROWS,
@@ -913,6 +933,19 @@ impl Bolt {
     /// The cells the card carries for every session together.
     pub(crate) fn pool(&self) -> &Arc<CellPool> {
         &self.pool
+    }
+
+    /// The sessions that hold cells of the pool now.
+    pub(crate) fn live_sessions(&self) -> usize {
+        Arc::strong_count(&self.pool).saturating_sub(1)
+    }
+
+    /// The free VRAM now, `None` when the card cannot be read.
+    pub(crate) fn free_vram(&self) -> Option<u64> {
+        self.ctx
+            .memory_info()
+            .ok()
+            .map(|info| u64::try_from(info.free).unwrap_or(0))
     }
 
     /// Allocates the device state of one more sequence: zeroed KV8 planes for the physical

@@ -329,6 +329,18 @@ pub(super) struct RouteScratch {
 }
 
 impl<'w> TieredRuntime<'w> {
+    /// The host bytes this runtime pins: the cold staging ring and the route scratch (the route
+    /// readback and the pool-partial upload buffers). The experts themselves are not pinned.
+    pub(super) fn pinned_bytes(&self) -> u64 {
+        let ring: usize = self
+            .cold
+            .as_ref()
+            .map_or(0, |cold| cold.ring.iter().map(|slot| slot.buf.len()).sum());
+        let route = self.route.pinned.as_ref().map_or(0, PinnedBuf::len)
+            + self.route.partial.as_ref().map_or(0, PinnedBuf::len);
+        u64::try_from(ring + route).unwrap_or(u64::MAX)
+    }
+
     pub(super) fn new(
         parts: Vec<LayerParts<'w>>,
         banks: Vec<ExpertBank>,

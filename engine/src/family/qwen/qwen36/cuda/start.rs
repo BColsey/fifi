@@ -35,8 +35,8 @@ use super::{
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
     tiered_load::{
-        attach_tiered_parts, bank_slot_bytes, expert_quant, names_without_experts,
-        planning_geometry, tiered_chunk_arm,
+        attach_tiered_parts, bank_slot_bytes, expert_quant, layer_slot_bytes,
+        names_without_experts, planning_geometry, tiered_chunk_arm,
     },
 };
 use crate::family::decode_step::shard::ShardTable;
@@ -1501,6 +1501,39 @@ fn weights_leave_the_floor(free: u64, weights: u64, floor: u64) -> bool {
     free >= weights.saturating_add(floor)
 }
 
+/// The memory receipt of a GGUF start, taken once the step and its banks exist: the card used,
+/// the dense core, the share of the routed experts resident and the bytes of each tier, summed
+/// layer by layer (a file that mixes record types has a size per layer). `slots` is the bank
+/// depth of a tiered start, `None` for a start that holds every expert on the card; `pinned` is
+/// what the engine's own host pool pins and `cache` the key-value cache it holds.
+fn memory_receipt(
+    projector: &CudaProjector,
+    model: &GgufModel,
+    dims: &StepDims,
+    (slots, pinned): (Option<usize>, u64),
+    cache: crate::family::mem::fill::CacheFigure,
+) -> Result<crate::family::mem::fill::TierReceipt, EngError> {
+    use crate::family::mem::fill::{LayerTier, TierReceipt};
+    let info = projector.memory_info()?;
+    let card = (
+        u64::try_from(info.total).unwrap_or(0),
+        u64::try_from(info.free).unwrap_or(0),
+    );
+    let names = model.plan().device_names();
+    let dense = native_load_bytes(&model.weights, &names_without_experts(&names))?;
+    let experts = u64::try_from(dims.shape.moe.experts).unwrap_or(0);
+    let quants = expert_quant(model.weights.header(), dims)?;
+    let held = slots.map_or(experts, |slots| u64::try_from(slots).unwrap_or(0));
+    let layers: Vec<LayerTier> = layer_slot_bytes(dims, &quants)?
+        .into_iter()
+        .map(|slot_bytes| LayerTier {
+            slots: held,
+            slot_bytes,
+        })
+        .collect();
+    Ok(TierReceipt::from_layers(card, dense, experts, &layers, pinned).with_cache(cache))
+}
+
 /// The sessions a start asks the lower rung to fund beside its banks: the named count, else the
 /// tiered target. The planner takes what the card funds up to it.
 fn planned_sessions(settings: &Q36Settings) -> usize {
@@ -2150,6 +2183,7 @@ fn make(
             eprintln!("{}", rollback_startup_line(&plan, cover, arena_admitted)?);
         }
     }
+    let mut tiered_slots = None;
     if let Some(plan) = tiered {
         // The banks come last: they take what the weights, the KV cache and the step state left.
         let (model, gguf) = gguf.as_ref().ok_or_else(|| {
@@ -2164,6 +2198,7 @@ fn make(
             // member sized its banks itself and keeps them whole.
             card_short.as_ref().map_or(1, |short| short.sessions),
         )?;
+        tiered_slots = Some(slots);
         if settings.prefix_reuse {
             step.configure_tiered_prefix_store()?;
         }
@@ -2196,6 +2231,28 @@ fn make(
         if settings.capture { "on" } else { "off" },
         projector.context().single_gather_suffix() + &step.shared_in_routed_suffix()
     );
+    // The load's own reading is the first mark; the receipt is a report, never a reason to fail a
+    // start that is otherwise good.
+    step.record_free_vram("load", u64::try_from(after.free).unwrap_or(0));
+    if let Some((model, _)) = gguf.as_ref() {
+        let cache = crate::family::mem::fill::CacheFigure {
+            cells: u64::try_from(options.context_tokens).unwrap_or(0),
+            bytes: kv_cache,
+        };
+        eprintln!(
+            "{}",
+            crate::family::mem::fill::report_line(
+                "q36 cuda",
+                memory_receipt(
+                    projector,
+                    model,
+                    &res.dims,
+                    (tiered_slots, step.tiered_pinned_bytes()),
+                    cache,
+                ),
+            )
+        );
+    }
     Ok((step, DecodeSession::default()))
 }
 

@@ -194,6 +194,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
         let out = st.prefill(self, toks, context_limit);
         self.record_prefill_piece(toks.len(), began);
         self.pump_disk_prefill();
+        self.mark_prefill_vram(toks.len());
         out
     }
 
@@ -217,10 +218,13 @@ impl ExecutorOps for QwenResidentStep<'_> {
         };
         self.log_prefill_job();
         let Some(mut speculator) = self.speculator.take() else {
-            return st.decode(self, generation, &limits);
+            let batch = st.decode(self, generation, &limits);
+            self.mark_free_vram("a decode batch");
+            return batch;
         };
         let batch = speculator.decode(st, self, generation, &limits);
         self.speculator = Some(speculator);
+        self.mark_free_vram("a speculative decode batch");
         batch
     }
 

@@ -14,6 +14,7 @@
 #![allow(dead_code, reason = "the CUDA-build starts read the facts")]
 
 mod device;
+pub(crate) mod fill;
 // The host facts exist on every target: `/proc` and the cgroup tree on Linux, the unified memory
 // of `unified` on a Mac.
 mod host;

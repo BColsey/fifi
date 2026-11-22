@@ -167,6 +167,9 @@ mod device {
         /// but does not retain it, and threading it means widening `bolt::load`'s return; this
         /// seam takes it when that return widens.
         identity: PrefixIdentity,
+        /// The least free VRAM seen while serving, read at the first prefill and decode, at the
+        /// largest prefill piece and when more sessions are live (a throttled reading).
+        marks: crate::family::mem::fill::FreeMarks,
         /// The sessions the engine serves at once; the worker reads it after start.
         max_seqs: usize,
         /// The even share of the pool among the sessions, for the start line: a session holds the
@@ -311,11 +314,19 @@ mod device {
         }
 
         fn new_session(&mut self) -> Result<Self::Session, EngError> {
-            Ok(BoltSession {
+            let session = BoltSession {
                 core: DecodeSession::default(),
                 pos: 0,
                 seq: self.model.new_seq_cells(INITIAL_CELLS)?,
-            })
+            };
+            let (live, model) = (self.model.live_sessions(), &self.model);
+            if let Some(line) = self
+                .marks
+                .sample_sessions(live, std::time::Instant::now(), || model.free_vram())
+            {
+                eprintln!("bolt cuda: {line}");
+            }
+            Ok(session)
         }
 
         /// Sizes the session's cells to the request, leased from the pool: a request that names
@@ -391,7 +402,7 @@ mod device {
                 st.core.history().len() + toks.len() + 1,
             )?;
             let cells = st.seq.cells();
-            st.core.prefill(
+            let out = st.core.prefill(
                 &mut Step {
                     model: &mut self.model,
                     seq: &st.seq,
@@ -399,7 +410,15 @@ mod device {
                 },
                 toks,
                 cells,
-            )
+            );
+            let model = &self.model;
+            if let Some(line) =
+                self.marks
+                    .sample_prefill(toks.len(), std::time::Instant::now(), || model.free_vram())
+            {
+                eprintln!("bolt cuda: {line}");
+            }
+            out
         }
 
         fn decode(
@@ -415,7 +434,7 @@ mod device {
                 sampler_vocab: VOCAB,
                 context_limit: self.model.cells(),
             };
-            st.core.decode(
+            let batch = st.core.decode(
                 &mut Step {
                     model: &mut self.model,
                     seq: &st.seq,
@@ -423,7 +442,17 @@ mod device {
                 },
                 generation,
                 &limits,
-            )
+            );
+            let model = &self.model;
+            if let Some(line) =
+                self.marks
+                    .sample("a decode batch", std::time::Instant::now(), || {
+                        model.free_vram()
+                    })
+            {
+                eprintln!("bolt cuda: {line}");
+            }
+            batch
         }
 
         fn boundary(&mut self, _st: &mut Self::Session) {}
@@ -778,6 +807,7 @@ mod device {
                 identity,
                 max_seqs: plan.seqs,
                 share: even_share(model_pool, plan.seqs),
+                marks: crate::family::mem::fill::FreeMarks::default(),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
@@ -1118,6 +1148,7 @@ mod device {
                 identity: PrefixIdentity::default(),
                 max_seqs: sessions,
                 share: even_share(pool, sessions),
+                marks: crate::family::mem::fill::FreeMarks::default(),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,

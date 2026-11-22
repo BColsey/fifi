@@ -443,6 +443,9 @@ pub(crate) struct QwenResidentStep<'a> {
     tiered_report: TokenReport,
     /// The sessions the card-short planner funded beside the banks; `None` on every other start.
     sessions_funded: Option<usize>,
+    /// The least free VRAM seen while serving: the first prefill, the first decode and every
+    /// later new low, so the headroom constants can be judged against what the engine measured.
+    free_marks: crate::family::mem::fill::FreeMarks,
     globals: GlobalWeights<'a>,
     /// The layout the step runs: the loaded weights' own layout, checked against the options at
     /// construction.
@@ -891,6 +894,7 @@ impl<'a> QwenResidentStep<'a> {
             tiered: None,
             tiered_report: TokenReport::default(),
             sessions_funded: None,
+            free_marks: crate::family::mem::fill::FreeMarks::default(),
             globals: GlobalWeights::new(
                 &res.names,
                 &GlobalSpecs::new(&res.dims),
@@ -1420,6 +1424,63 @@ impl<'a> QwenResidentStep<'a> {
     /// at them.
     pub(crate) fn set_sessions_funded(&mut self, sessions: usize) {
         self.sessions_funded = Some(sessions);
+    }
+
+    /// The free VRAM now, or `None` when the card cannot be read (a read during graph capture
+    /// refuses, and a failed read is not worth failing a token over).
+    fn read_free_vram(context: &CudaContext) -> Option<u64> {
+        context
+            .memory_info()
+            .ok()
+            .map(|info| u64::try_from(info.free).unwrap_or(0))
+    }
+
+    /// Records a reading already in hand (the load's own) as the point `label`.
+    pub(crate) fn record_free_vram(&mut self, label: &str, free: u64) {
+        if let Some(line) = self.free_marks.record(label, free) {
+            eprintln!("q36 cuda: {line}");
+        }
+    }
+
+    /// A throttled reading at `label`: the first time it is reached, then at most every few
+    /// seconds, so a decode loop pays a clock read per token.
+    pub(crate) fn mark_free_vram(&mut self, label: &str) {
+        let context = &self.context;
+        if let Some(line) = self
+            .free_marks
+            .sample(label, std::time::Instant::now(), || {
+                Self::read_free_vram(context)
+            })
+        {
+            eprintln!("q36 cuda: {line}");
+        }
+    }
+
+    /// A reading after a prefill piece of `rows` rows: at once when it is the largest yet.
+    pub(crate) fn mark_prefill_vram(&mut self, rows: usize) {
+        let context = &self.context;
+        if let Some(line) = self
+            .free_marks
+            .sample_prefill(rows, std::time::Instant::now(), || {
+                Self::read_free_vram(context)
+            })
+        {
+            eprintln!("q36 cuda: {line}");
+        }
+    }
+
+    /// The least free VRAM seen while serving.
+    #[allow(dead_code, reason = "the receipt line and the tests read it")]
+    pub(crate) fn free_vram_low(&self) -> Option<u64> {
+        self.free_marks.low()
+    }
+
+    /// The host bytes the tiered runtime pins (the staging ring and the route scratch); zero
+    /// without a tiered runtime.
+    pub(crate) fn tiered_pinned_bytes(&self) -> u64 {
+        self.tiered
+            .as_ref()
+            .map_or(0, |runtime| runtime.borrow().pinned_bytes())
     }
 
     pub(crate) fn last_tiered_report(&self) -> TokenReport {

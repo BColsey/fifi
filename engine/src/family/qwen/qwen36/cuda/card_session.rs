@@ -82,6 +82,8 @@ pub(crate) struct CardSession {
     context_limit: usize,
     fed: usize,
     poisoned: bool,
+    /// The least free VRAM seen on any card while serving (a throttled reading).
+    marks: crate::family::mem::fill::FreeMarks,
     /// The prefix store of the session: one entry is one `ExportedState`
     /// per card (the card's sliced KV planes plus its DeltaNet state), so
     /// an entry's host cost is one replica of cache plus two delta pools.
@@ -278,6 +280,7 @@ impl CardSession {
             context_limit,
             fed: 0,
             poisoned: false,
+            marks: crate::family::mem::fill::FreeMarks::default(),
             skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
                 .is_some_and(|value| value == "1"),
             prefix: PrefixSlot::with_limits(effective_limits),
@@ -671,7 +674,17 @@ impl ExecutorOps for CardSession {
     }
 
     fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<(), EngError> {
-        st.prefill(self, toks, self.context_limit)
+        let out = st.prefill(self, toks, self.context_limit);
+        let stack = self.stack;
+        if let Some(line) = self
+            .marks
+            .sample_prefill(toks.len(), std::time::Instant::now(), || {
+                stack.least_free_vram()
+            })
+        {
+            eprintln!("q36 cuda: {line}");
+        }
+        out
     }
 
     /// Advertise the admitted chunk size only when experimental card chunking is active.
@@ -693,7 +706,17 @@ impl ExecutorOps for CardSession {
             sampler_vocab: self.sampler_vocab,
             context_limit: self.context_limit,
         };
-        st.decode(self, generation, &limits)
+        let batch = st.decode(self, generation, &limits);
+        let stack = self.stack;
+        if let Some(line) = self
+            .marks
+            .sample("a decode batch", std::time::Instant::now(), || {
+                stack.least_free_vram()
+            })
+        {
+            eprintln!("q36 cuda: {line}");
+        }
+        batch
     }
 
     fn boundary(&mut self, _st: &mut DecodeSession) {}

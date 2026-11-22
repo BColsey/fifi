@@ -145,6 +145,9 @@ pub(crate) struct PooledSessions<E: PartHost> {
     /// state outside a session's part) and a start that named no count serves its one session
     /// over the step's own planes instead of refusing. No part is ever built or swapped.
     single: bool,
+    /// The least free VRAM seen when sessions opened: read when more sessions are live than
+    /// before (a throttled reading, nothing on the decode path).
+    marks: crate::family::mem::fill::FreeMarks,
     /// Whether the last session request found the pool empty and said so.
     waiting: std::cell::Cell<bool>,
     /// The ids that end generation, and the sampler's vocabulary: the window's limits.
@@ -195,6 +198,7 @@ impl<E: PartHost> PooledSessions<E> {
                 ceiling,
                 max_seqs: 1,
                 single: true,
+                marks: crate::family::mem::fill::FreeMarks::default(),
                 waiting: std::cell::Cell::new(false),
                 eos: step.eos_ids(),
                 sampler_vocab: step.sampler_vocab(),
@@ -237,6 +241,7 @@ impl<E: PartHost> PooledSessions<E> {
             ceiling,
             max_seqs,
             single: false,
+            marks: crate::family::mem::fill::FreeMarks::default(),
             waiting: std::cell::Cell::new(false),
             eos: step.eos_ids(),
             sampler_vocab: step.sampler_vocab(),
@@ -560,7 +565,7 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         };
         self.waiting.set(false);
         let part = self.step.new_part(cells)?;
-        Ok(PooledSession {
+        let session = PooledSession {
             core: DecodeSession::default(),
             serial: next_serial(),
             slot: Rc::new(SeqSlot {
@@ -569,7 +574,17 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
                     lease,
                 }),
             }),
-        })
+        };
+        // The free VRAM with this many sessions live: one reading when the count is a new most.
+        let live = Arc::strong_count(&self.pool).saturating_sub(1);
+        let step = &self.step;
+        if let Some(line) = self
+            .marks
+            .sample_sessions(live, std::time::Instant::now(), || step.free_device_bytes())
+        {
+            eprintln!("{}: {line}", E::LABEL);
+        }
+        Ok(session)
     }
 
     fn check_prompt(&self, prompt_tokens: usize) -> Result<()> {

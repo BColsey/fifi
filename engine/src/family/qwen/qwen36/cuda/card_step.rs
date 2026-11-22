@@ -115,6 +115,21 @@ pub(crate) struct CardStack {
 }
 
 impl CardStack {
+    /// The least free VRAM over the cards now, `None` when any card cannot be read.
+    pub(crate) fn least_free_vram(&self) -> Option<u64> {
+        self.contexts
+            .iter()
+            .map(|context| {
+                context
+                    .memory_info()
+                    .ok()
+                    .map(|info| u64::try_from(info.free).unwrap_or(0))
+            })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    }
+
     /// Builds the stack for `devices.len()` cards. Card `i` runs on
     /// `devices[i]` (one ordinal per physical card; the same ordinal twice
     /// gives two logical contexts, the rig configuration). The mailbox

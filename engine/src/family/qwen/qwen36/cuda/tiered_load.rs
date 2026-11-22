@@ -105,6 +105,21 @@ pub(super) fn planning_geometry(
     ExpertBankGeometry::widest(geometry_of(dims, [GgufType::Q4K; 3]), quants)
 }
 
+/// The device bytes of one expert record in each layer: a file that mixes record types has a
+/// different size per layer.
+pub(super) fn layer_slot_bytes(
+    dims: &StepDims,
+    quants: &[[GgufType; 3]],
+) -> Result<Vec<u64>, EngError> {
+    quants
+        .iter()
+        .map(|quant| {
+            let geometry = geometry_of(dims, *quant);
+            Ok(ExpertBank::bytes_for(geometry, geometry.top_k)? / geometry.top_k as u64)
+        })
+        .collect()
+}
+
 /// The device bytes of one expert slot in one layer's bank.
 pub(super) fn bank_slot_bytes(geometry: ExpertBankGeometry) -> Result<u64, EngError> {
     let minimum_bank = ExpertBank::bytes_for(geometry, geometry.top_k)?;
