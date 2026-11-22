@@ -70,8 +70,19 @@ pub(super) fn step(
     let z = linear(ctx, &w.z, &normed)?;
     let bb = linear(ctx, &w.b, &normed)?;
     let aa = linear(ctx, &w.a, &normed)?;
+    #[cfg(test)]
+    {
+        super::layer_probe::record_here(ctx, "proj_qkv", &u)?;
+        super::layer_probe::record_here(ctx, "proj_z", &z)?;
+        super::layer_probe::record_here(ctx, "proj_b", &bb)?;
+        super::layer_probe::record_here(ctx, "proj_a", &aa)?;
+    }
     let (o, rec_next, ring_next) = step_projected(ctx, shape, w, rec, ring, [&u, &z, &bb, &aa])?;
+    #[cfg(test)]
+    super::layer_probe::record_here(ctx, "recurrence_out", &o)?;
     let mixed = linear(ctx, &w.out, &o)?;
+    #[cfg(test)]
+    super::layer_probe::record_here(ctx, "proj_out", &mixed)?;
     // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
     let out = ctx
         .kernels

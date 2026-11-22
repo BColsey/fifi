@@ -144,6 +144,8 @@ impl ResidentDecoder<'_> {
         let mut health: Option<ExecutionTensor> = None;
         for (index, layer) in weights.layers.iter().enumerate() {
             let _ = index; // read by the test probe only
+            #[cfg(test)]
+            super::layer_probe::enter(index);
             // The attention arm and the eager DeltaNet arm keep their external input norm (their
             // projections batch over [B, H] here); the compiled DeltaNet arm folds the norm and
             // the residual add into its closure, exactly like the solo step seam.
@@ -237,6 +239,13 @@ impl ResidentDecoder<'_> {
                     let z = super::ops::linear_rows(&mut ctx, &w.z, &normed)?;
                     let b = super::ops::linear_rows(&mut ctx, &w.b, &normed)?;
                     let a = super::ops::linear_rows(&mut ctx, &w.a, &normed)?;
+                    #[cfg(test)]
+                    {
+                        super::layer_probe::record_here(&mut ctx, "proj_qkv", &u)?;
+                        super::layer_probe::record_here(&mut ctx, "proj_z", &z)?;
+                        super::layer_probe::record_here(&mut ctx, "proj_b", &b)?;
+                        super::layer_probe::record_here(&mut ctx, "proj_a", &a)?;
+                    }
                     let (uw, zw, bw, aw) = (u.shape()[1], z.shape()[1], b.shape()[1], a.shape()[1]);
                     let mut o_rows = Vec::with_capacity(rows);
                     for slot in 0..rows {
@@ -267,7 +276,11 @@ impl ResidentDecoder<'_> {
                     }
                     let parts: Vec<&ExecutionTensor> = o_rows.iter().collect();
                     let o_stack = ctx.kernels.concatenate(&parts, 0)?;
+                    #[cfg(test)]
+                    super::layer_probe::record_here(&mut ctx, "recurrence_out", &o_stack)?;
                     let out = super::ops::linear_rows(&mut ctx, &w.out, &o_stack)?;
+                    #[cfg(test)]
+                    super::layer_probe::record_here(&mut ctx, "proj_out", &out)?;
                     ctx.kernels.binary(BinaryOp::Add, &h, &out)?
                 }
             };

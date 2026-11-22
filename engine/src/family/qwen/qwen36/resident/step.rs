@@ -122,6 +122,8 @@ pub(super) fn run(
         trace::begin_step()
     };
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
+        #[cfg(test)]
+        super::layer_probe::enter(index);
         // The folded glue: each block owns its input norm and its output residual add (the
         // compiled closures bake them; the eager arms run the same ops in the same order), so
         // the loop only sequences blocks and keeps the trace hook.

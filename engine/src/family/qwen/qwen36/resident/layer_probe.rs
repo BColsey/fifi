@@ -20,6 +20,21 @@ pub(super) struct Probed {
 
 thread_local! {
     static PROBE: RefCell<Option<Vec<Probed>>> = const { RefCell::new(None) };
+    static LAYER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Names the layer the next sub-operation records belong to.
+pub(super) fn enter(layer: usize) {
+    LAYER.with(|at| at.set(layer));
+}
+
+/// Records `x` under the layer last entered.
+pub(super) fn record_here(
+    ctx: &mut Ctx<'_>,
+    after: &'static str,
+    x: &ExecutionTensor,
+) -> Result<(), EngError> {
+    record(ctx, LAYER.with(std::cell::Cell::get), after, x)
 }
 
 /// Starts recording on this thread.
