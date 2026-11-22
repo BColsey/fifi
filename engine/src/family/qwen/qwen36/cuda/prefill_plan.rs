@@ -886,14 +886,16 @@ mod card_tests {
     #[test]
     #[ignore = "reads the real GGUF headers under $HOME/models and $HOME/.ollama"]
     fn the_default_fit_funds_the_prefill_arena_of_every_local_qwen36_gguf() {
-        use crate::family::qwen36::admission_sketch::{choose_cuda_fit, cuda_kv_per_position};
-        use crate::family::qwen36::settings::KvDtype;
+        use crate::family::qwen::qwen36::admission_sketch::{
+            CudaFitAsk, choose_cuda_fit, cuda_kv_per_position,
+        };
+        use crate::family::qwen::qwen36::settings::KvDtype;
         use crate::weights::{GgufHeader, MetaValue};
         use std::{fs::File, io::BufReader, io::Read, path::PathBuf};
         let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
         let shape = HostShape::from_spec(
             &QWEN3_6_35B_A3B,
-            crate::family::qwen36::cuda::pinned::ROTARY_DIM,
+            crate::family::qwen::qwen36::cuda::pinned::ROTARY_DIM,
         )
         .expect("shape");
         let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");

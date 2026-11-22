@@ -10,7 +10,7 @@
 //! process is refused.
 use crate::family::exl3::layer_table::LayerTable;
 
-use super::super::admission_sketch::choose_cuda_fit;
+use super::super::admission_sketch::{CudaFitAsk, choose_cuda_fit};
 use super::super::card_short::{self, CardFigures, CardShort, CardVerdict};
 use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
@@ -1470,12 +1470,14 @@ fn card_fit(
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
     let Some(fit) = choose_cuda_fit(
         &settings.spec,
-        free,
-        weights,
-        smallest_prefill_bytes(projector)?,
-        int8_cache_usable(plan),
-        (!settings.kv_auto).then_some(settings.kv),
-        (!settings.context_auto).then_some(settings.context_limit),
+        CudaFitAsk {
+            free,
+            weights,
+            arena: smallest_prefill_bytes(projector)?,
+            int8_usable: int8_cache_usable(plan),
+            kv: (!settings.kv_auto).then_some(settings.kv),
+            context: (!settings.context_auto).then_some(settings.context_limit),
+        },
         &load_need_of(settings, plan),
     )?
     else {
@@ -1527,12 +1529,14 @@ fn replan_smaller(
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
     let Some(fit) = choose_cuda_fit(
         &settings.spec,
-        free,
-        weights,
-        smallest_prefill_bytes(projector)?,
-        true,
-        Some(settings.kv),
-        Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
+        CudaFitAsk {
+            free,
+            weights,
+            arena: smallest_prefill_bytes(projector)?,
+            int8_usable: true,
+            kv: Some(settings.kv),
+            context: Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
+        },
         &load_need_of(settings, plan),
     )?
     else {

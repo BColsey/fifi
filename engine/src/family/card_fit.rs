@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn the_arena_is_funded_before_the_context_is_sized() {
-        let bare = card(100);
+        let bare = card(400);
         let with = CardBytes {
             arena: 40 * MIB,
             ..bare

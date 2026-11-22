@@ -242,6 +242,20 @@ pub(crate) type CudaFit =
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) const FP16_SUFFICIENT_CONTEXT: u32 = 131_072;
 
+/// What a start asks the card fit: the card's free bytes before the weights are uploaded, the
+/// weight bytes the load pins, the arena bytes the prefill needs beside them, whether the step can
+/// run the int8 cache, and the cache form and context the config fixed (an absent one is chosen).
+#[derive(Clone, Copy)]
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) struct CudaFitAsk {
+    pub(crate) free: u64,
+    pub(crate) weights: u64,
+    pub(crate) arena: u64,
+    pub(crate) int8_usable: bool,
+    pub(crate) kv: Option<crate::family::qwen::qwen36::settings::KvDtype>,
+    pub(crate) context: Option<u32>,
+}
+
 /// The cache form and context a card carries, from the free bytes before the weights are
 /// uploaded and the weight bytes the load pins. `kv` and `context` name what the config fixed;
 /// an absent one is chosen by the shared card-fit rule (`family::card_fit`), fed with this
@@ -252,14 +266,17 @@ pub(crate) const FP16_SUFFICIENT_CONTEXT: u32 = 131_072;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) fn choose_cuda_fit(
     spec: &crate::family::spec::FamilySpec,
-    free: u64,
-    weights: u64,
-    arena: u64,
-    int8_usable: bool,
-    kv: Option<crate::family::qwen::qwen36::settings::KvDtype>,
-    context: Option<u32>,
+    ask: CudaFitAsk,
     load_need: &dyn Fn(crate::family::qwen::qwen36::settings::KvDtype, u32) -> Option<u64>,
 ) -> Result<Option<CudaFit>, crate::EngError> {
+    let CudaFitAsk {
+        free,
+        weights,
+        arena,
+        int8_usable,
+        kv,
+        context,
+    } = ask;
     use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
     use crate::family::qwen::qwen36::settings::KvDtype;
 
@@ -382,14 +399,12 @@ mod tests {
     fn largest_fitting_cuda_golden_grid() {
         const MIB: u64 = 1 << 20;
         let demand = |context: u32| {
-            Ok(
-                crate::family::qwen::qwen36::admission_sketch::admission_demand(
-                    (u64::from(context) / 1024) * MIB,
-                    0,
-                    0,
-                    0,
-                ),
-            )
+            Ok(crate::family::qwen::qwen36::admission_sketch::admission_demand(
+                (u64::from(context) / 1024) * MIB,
+                0,
+                0,
+                0,
+            ))
         };
         let band = crate::family::qwen::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
         let fixed = 768 * MIB + band; // part+spare+margin+floor+band
@@ -704,20 +719,33 @@ mod tests {
         // that gives int8 its arena is off) gets the longest fp16 context the card holds.
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
         let none = &|_, _| Some(0);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, 0, false, None, None, none)
-            .unwrap()
-            .expect("fits");
+        let fit = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                arena: 0,
+                int8_usable: false,
+                kv: None,
+                context: None,
+            },
+            none,
+        )
+        .unwrap()
+        .expect("fits");
         assert_eq!((fit.form, fit.context), (KvDtype::F32, 100_352));
         // The same card, a named context fp16 cannot hold: fp16's longest, not an int8 start
         // the prefill would refuse.
         let named = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            false,
-            None,
-            Some(262_144),
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                arena: 0,
+                int8_usable: false,
+                kv: None,
+                context: Some(262_144),
+            },
             none,
         )
         .unwrap()
@@ -726,12 +754,14 @@ mod tests {
         // A named int8 cache is the operator's and stays.
         let asked = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            false,
-            Some(KvDtype::Q8),
-            None,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                arena: 0,
+                int8_usable: false,
+                kv: Some(KvDtype::Q8),
+                context: None,
+            },
             none,
         )
         .unwrap()
