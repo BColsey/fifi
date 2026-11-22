@@ -1238,6 +1238,37 @@ fn two_real_expert_slots_match_host() {
         &output[rows * 4..],
         "resident rank remains untouched"
     );
+    use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
+    let residual = ctx.allocate(rows * 4).unwrap();
+    residual.write_at(&stream, 0, &vec![0; rows * 4]).unwrap();
+    let weights = ctx.allocate(8).unwrap();
+    weights
+        .write_at(
+            &stream,
+            0,
+            &[0.25f32.to_ne_bytes(), 0.75f32.to_ne_bytes()].concat(),
+        )
+        .unwrap();
+    let combined = ctx.allocate(rows * 4).unwrap();
+    ctx.moe_combine(
+        &stream,
+        CombineCall {
+            shape: CombineShape {
+                m: 1,
+                n: rows,
+                top_k: 2,
+                ld_down: rows,
+            },
+            res: residual.range(0, rows * 4).unwrap(),
+            down: y.range(0, rows * 8).unwrap(),
+            weights: weights.range(0, 8).unwrap(),
+            shared: None,
+            out: CombineOut::To(combined.range(0, rows * 4).unwrap()),
+        },
+    )
+    .unwrap();
+    let mut combined_bytes = vec![0; rows * 4];
+    combined.read_at(&stream, 0, &mut combined_bytes).unwrap();
     let missing_blocks = mapped_blocks(&model, tensor, Some(257), 0..rows as u64).unwrap();
     let missing = dequantize(tensor.ty, &missing_blocks).unwrap();
     for (index, (hit_row, miss_row)) in resident
@@ -1255,12 +1286,17 @@ fn two_real_expert_slots_match_host() {
             * (0.25 * miss_row.iter().map(|v| v.abs()).sum::<f32>()
                 + 0.75 * hit_row.iter().map(|v| v.abs()).sum::<f32>())
             + 1e-5;
+        let device_combined = f32::from_ne_bytes(combined_bytes[off..off + 4].try_into().unwrap());
         assert!(
             (0.25 * got_miss + 0.75 * got_hit - expected).abs() <= tolerance,
-            "combined gate row {index}"
+            "host combined gate row {index}"
+        );
+        assert!(
+            (device_combined - expected).abs() <= tolerance,
+            "device combined gate row {index}"
         );
     }
-    eprintln!("checked {rows} miss-only gate rows and host-side weighted combination");
+    eprintln!("checked {rows} miss-only gate rows and device weighted gate combination");
     let ids = classify_expert_pair(&ctx, &stream, state.slot_row(0), slots);
     for part in &layout.parts {
         let tensor = model.map().get(part.role, Some(0)).unwrap();
