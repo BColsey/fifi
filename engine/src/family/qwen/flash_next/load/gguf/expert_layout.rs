@@ -146,6 +146,7 @@ pub(in super::super::super) struct ExpertDeviceStacks {
     stacks: ExpertStacks,
     buffer: crate::kernels::cuda::DeviceBuffer,
     ready: Vec<bool>,
+    poisoned: bool,
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -162,6 +163,7 @@ impl ExpertDeviceStacks {
             stacks,
             buffer,
             ready: vec![false; slots],
+            poisoned: false,
         })
     }
 
@@ -203,12 +205,22 @@ impl ExpertDeviceStacks {
         picks: &[i32],
     ) -> Result<crate::family::expert_bank::PassCopies, EngError> {
         use crate::family::expert_bank::{HostMode, NO_PLACE};
+        if self.poisoned || state.is_poisoned() {
+            self.poisoned = true;
+            return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
+        }
         if state.mode() != HostMode::Disk {
             return Err(EngError::BadRequest(
                 "GGUF disk step requires disk mode".into(),
             ));
         }
-        let copies = state.begin_pass(layer, picks)?;
+        let copies = match state.begin_pass(layer, picks) {
+            Ok(copies) => copies,
+            Err(error) => {
+                self.poisoned |= state.is_poisoned();
+                return Err(error);
+            }
+        };
         for op in &copies.ops {
             let result = if op.src_place == NO_PLACE && op.demote.is_none() {
                 self.replace_from_model(
@@ -224,6 +236,7 @@ impl ExpertDeviceStacks {
                 ))
             };
             if let Err(error) = result {
+                self.poisoned = true;
                 state.poison();
                 return Err(error);
             }
@@ -265,6 +278,9 @@ impl ExpertDeviceStacks {
         slot: usize,
         record: &[u8],
     ) -> Result<(), EngError> {
+        if self.poisoned {
+            return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
+        }
         let ready = self
             .ready
             .get_mut(slot)
@@ -280,6 +296,9 @@ impl ExpertDeviceStacks {
         &self,
         index: usize,
     ) -> Result<crate::kernels::cuda::DeviceRange<'_>, EngError> {
+        if self.poisoned {
+            return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
+        }
         if self.ready.iter().any(|ready| !ready) {
             return Err(EngError::BadRequest(
                 "GGUF expert stack has uninitialized slots".into(),

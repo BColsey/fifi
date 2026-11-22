@@ -687,6 +687,13 @@ fn full_expert_device_stacks_match_host() {
     );
     assert!(bad_state.is_poisoned());
     assert!(bad_state.begin_pass(0, &[256]).is_err());
+    assert!(short_bank.part(0).is_err());
+    assert!(short_bank.upload(&stream, 0, &[]).is_err());
+    assert!(
+        short_bank
+            .step_disk(&stream, &model, &mut state(), 0, &[0])
+            .is_err()
+    );
     let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
     let mut state = state();
     let copies = bank
