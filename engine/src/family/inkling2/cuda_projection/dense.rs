@@ -22,6 +22,7 @@ use super::{Resident, bad};
 
 mod attention_prefill;
 mod controlled_attention;
+mod controlled_mlp;
 mod controller_prefill;
 mod draft_head;
 mod local_attention;

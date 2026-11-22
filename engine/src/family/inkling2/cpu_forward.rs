@@ -511,7 +511,7 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
-        let input = self.mlp_input(
+        let residual = self.mlp_residual(
             visit,
             &layer,
             state,
@@ -519,21 +519,79 @@ impl CpuForward {
             bank,
             AttentionInput::Token { decode },
         )?;
-        let mlp = self.moe(physical, &format!("{layer}.mlp"), &input)?;
+        let prefix = format!("{layer}.mlp");
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if decode
+            && !self.draft_window_enabled()
+            && let Some(bank) = bank
+            && let Some(mlp) =
+                self.chained_mlp_experts(physical, &layer, &prefix, &residual, bank)?
+        {
+            return self.finish_layer(&layer, state, stream, mlp);
+        }
+        let input = self.finish_mlp_input(residual, bank, physical, &layer)?;
+        let mlp = self.moe(physical, &prefix, &input)?;
         self.finish_layer(&layer, state, stream, mlp)
     }
 
-    fn mlp_input(
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn chained_mlp_experts(
         &self,
-        visit: LayerVisit,
+        physical: usize,
         layer: &str,
-        state: &mut VisitState,
-        stream: &mut Stream,
-        bank: Option<&MessageBank>,
-        attention: AttentionInput,
-    ) -> Result<Vec<f32>, EngError> {
-        let input = self.mlp_residual(visit, layer, state, stream, bank, attention)?;
-        self.finish_mlp_input(input, bank, visit.weight_layer, layer)
+        prefix: &str,
+        input: &[f32],
+        bank: &MessageBank,
+    ) -> Result<Option<Vec<f32>>, EngError> {
+        use super::cuda_projection::gguf::{
+            ControlledAttentionInput,
+            router::{MlpController, RouteInput},
+        };
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var("FIFI_INKLING_CUDA_CHAIN_MLP_EXPERTS").as_deref() == Ok("1")
+        }) {
+            return Ok(None);
+        }
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        if !weights
+            .cuda()
+            .is_some_and(|cuda| cuda.has_resident_route(physical as u32))
+        {
+            return Ok(None);
+        }
+        let (control, gamma) = {
+            let _span = self.phase_span(Work::Controller);
+            (
+                self.control_input(input, bank, physical, Role::Mlp)?,
+                self.weights
+                    .vec(&format!("{layer}.mlp_norm.weight"), self.hidden())?,
+            )
+        };
+        let names = control_names(layer, Role::Mlp);
+        weights.device_routed_experts(
+            prefix,
+            RouteInput {
+                layer: physical as u32,
+                input,
+                caps: [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
+                scale: self.math.route_scale,
+            },
+            self.phase_profile.as_deref(),
+            Some(MlpController {
+                names: names.each_ref().map(String::as_str),
+                rank: self.spec.core.gate_rank as usize,
+                eps: self.math.rms_norm_eps,
+                input: ControlledAttentionInput {
+                    gate: &control.gate,
+                    input,
+                    message: &control.message,
+                    gamma: &gamma,
+                },
+            }),
+        )
     }
 
     fn mlp_residual(
@@ -816,6 +874,7 @@ impl CpuForward {
                     scale: self.math.route_scale,
                 },
                 self.phase_profile.as_deref(),
+                None,
             )?
         {
             return Ok(out);

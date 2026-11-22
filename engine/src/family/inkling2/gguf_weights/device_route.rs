@@ -2,7 +2,7 @@ use super::GgufTextWeights;
 use crate::{
     EngError,
     family::inkling2::{
-        cuda_projection::gguf::router::RouteInput,
+        cuda_projection::gguf::router::{MlpController, RouteInput},
         phase_profile::{PhaseProfile, Work},
     },
 };
@@ -13,6 +13,7 @@ impl GgufTextWeights {
         prefix: &str,
         route: RouteInput<'_>,
         profile: Option<&PhaseProfile>,
+        control: Option<MlpController<'_>>,
     ) -> Result<Option<Vec<f32>>, EngError> {
         let Some(cuda) = self.cuda.as_ref().filter(|_| self.ram.is_none()) else {
             return Ok(None);
@@ -34,8 +35,12 @@ impl GgufTextWeights {
         };
         // This path measures the router and experts as one resident backend call.
         let _span = profile.and_then(|profile| profile.span(Work::Experts));
-        cuda.routed_expert_group(prefix, route, [gate_dtype, down_dtype], |experts| {
-            self.vec(&format!("{prefix}.gate.bias"), experts)
-        })
+        cuda.routed_expert_group(
+            prefix,
+            route,
+            [gate_dtype, down_dtype],
+            control,
+            |experts| self.vec(&format!("{prefix}.gate.bias"), experts),
+        )
     }
 }

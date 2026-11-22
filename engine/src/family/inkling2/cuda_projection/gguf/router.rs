@@ -3,7 +3,7 @@ use std::{
     sync::{Once, OnceLock},
 };
 
-use super::{ExpertLayer, GgufCuda, bad};
+use super::{ControlledAttentionInput, ExpertLayer, GgufCuda, bad};
 use crate::{
     EngError,
     family::inkling2::{
@@ -26,6 +26,13 @@ pub(in crate::family::inkling2) struct RouteInput<'a> {
     pub(in crate::family::inkling2) input: &'a [f32],
     pub(in crate::family::inkling2) caps: [f32; 2],
     pub(in crate::family::inkling2) scale: f32,
+}
+
+pub(in crate::family::inkling2) struct MlpController<'a> {
+    pub names: [&'a str; 3],
+    pub rank: usize,
+    pub eps: f32,
+    pub input: ControlledAttentionInput<'a>,
 }
 
 pub(super) fn route_shape(spec: &TextSpec) -> RouterShape {
@@ -198,6 +205,7 @@ impl GgufCuda {
         prefix: &str,
         route: RouteInput<'_>,
         dtypes: [DenseDtype; 2],
+        control: Option<MlpController<'_>>,
         bias: impl FnOnce(usize) -> Result<Vec<f32>, EngError>,
     ) -> Result<Option<Vec<f32>>, EngError> {
         let Some((router, DenseDtype::F32)) = self.dense.get(&format!("{prefix}.gate.weight"))
@@ -224,54 +232,74 @@ impl GgufCuda {
         let stacks = self.resident.original_layer(route.layer)?;
         let scales = work.scale_ranges(route.layer)?;
         let scratch = moe.scratch.range(0, moe.scratch.bytes())?;
-        self.step
-            .run_routed_layer(
+        let enqueue = |stream: &DeviceStream, [x, bias, status, y]: [DeviceRange<'_>; 4]| {
+            let [ids, weights] = work.enqueue(
                 &self.context,
-                route.input,
-                &bias,
-                |stream, [x, bias, status, y]| {
-                    let [ids, weights] = work.enqueue(
-                        &self.context,
-                        stream,
-                        RouterInputs {
-                            x,
-                            w,
-                            bias,
-                            status,
-                            scale: route.scale,
-                        },
-                    )?;
-                    static IQ2_GATE: OnceLock<bool> = OnceLock::new();
-                    let grouped = self.context.gguf_moe_with_iq2_gate(
-                        stream,
-                        GgufMoeCall {
-                            shape: moe.shape,
-                            dtypes,
-                            caps: route.caps,
-                            picks: GgufMoePicks::Device {
-                                count: shape.top_k,
-                                ids,
-                                weights,
-                                scales,
-                            },
-                            weights: GgufMoeWeights::Stacks(stacks),
-                            x,
-                            scratch,
-                            y,
-                        },
-                        *IQ2_GATE.get_or_init(|| {
-                            std::env::var("FIFI_INKLING_CUDA_IQ2_GATE").as_deref() == Ok("1")
-                        }),
-                    )?;
-                    if grouped {
-                        static NOTICE: Once = Once::new();
-                        NOTICE.call_once(|| {
-                            eprintln!("Inkling CUDA used grouped IQ2 expert gate GEMV");
-                        });
-                    }
-                    Ok(())
+                stream,
+                RouterInputs {
+                    x,
+                    w,
+                    bias,
+                    status,
+                    scale: route.scale,
                 },
-            )
+            )?;
+            static IQ2_GATE: OnceLock<bool> = OnceLock::new();
+            let grouped = self.context.gguf_moe_with_iq2_gate(
+                stream,
+                GgufMoeCall {
+                    shape: moe.shape,
+                    dtypes,
+                    caps: route.caps,
+                    picks: GgufMoePicks::Device {
+                        count: shape.top_k,
+                        ids,
+                        weights,
+                        scales,
+                    },
+                    weights: GgufMoeWeights::Stacks(stacks),
+                    x,
+                    scratch,
+                    y,
+                },
+                *IQ2_GATE.get_or_init(|| {
+                    std::env::var("FIFI_INKLING_CUDA_IQ2_GATE").as_deref() == Ok("1")
+                }),
+            )?;
+            if grouped {
+                static NOTICE: Once = Once::new();
+                NOTICE.call_once(|| {
+                    eprintln!("Inkling CUDA used grouped IQ2 expert gate GEMV");
+                });
+            }
+            Ok(())
+        };
+        if let Some(control) = control {
+            let Some(weights) = self
+                .controller_weights(
+                    control.names,
+                    2 * shape.hidden,
+                    [control.rank, shape.hidden],
+                )
+                .transpose()?
+            else {
+                return Ok(None);
+            };
+            let output = self.step.run_controlled_routed_layer(
+                &self.context,
+                control.input,
+                &bias,
+                (weights, control.eps),
+                enqueue,
+            )?;
+            if output.is_some() {
+                static USED: Once = Once::new();
+                USED.call_once(|| eprintln!("Inkling CUDA used chained MLP experts"));
+            }
+            return Ok(output);
+        }
+        self.step
+            .run_routed_layer(&self.context, route.input, &bias, enqueue)
             .map(Some)
     }
 }

@@ -16,9 +16,20 @@ impl CudaContext {
         health: DeviceRange<'_>,
         (width, eps): (usize, f32),
     ) -> Result<(), EngError> {
+        self.inkling_controller_norm_roles(stream, workspace, health, ([width, 3], eps))
+    }
+
+    /// Like the Q/K/V entry, but permits a single controlled MLP row.
+    pub(crate) fn inkling_controller_norm_roles(
+        &self,
+        stream: &DeviceStream,
+        workspace: DeviceRange<'_>,
+        health: DeviceRange<'_>,
+        (shape, eps): ([usize; 2], f32),
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let workspace = self.raw_range(&workspace)?;
         let health = self.raw_range(&health)?;
-        self.launch_on(stream, |raw| launch(raw, workspace, health, width, eps))
+        self.launch_on(stream, |raw| launch(raw, workspace, health, shape, eps))
     }
 }

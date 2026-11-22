@@ -1,4 +1,4 @@
-// Three independent cross-pass controller roles, one block per role.
+// Independent cross-pass controller roles, one block per role.
 #include <cuda_runtime.h>
 #include <stdint.h>
 
@@ -10,13 +10,14 @@ constexpr int threads = 256;
 
 __global__ void inkling_controller_norm(float *workspace, float *health, int width, float eps) {
     const int role = blockIdx.x;
+    const int roles = gridDim.x;
     const int lane = threadIdx.x;
     const float *input = workspace + role * 3 * width;
     const float *message = input + width;
     const float *gamma = message + width;
-    const float *gain = workspace + (9 + role * 2) * width;
+    const float *gain = workspace + (3 * roles + role * 2) * width;
     const float *forget = gain + width;
-    float *out = workspace + (15 + role) * width;
+    float *out = workspace + (5 * roles + role) * width;
 
     __shared__ float sums[threads];
     float squares = 0.0f;
@@ -46,18 +47,18 @@ __global__ void inkling_controller_norm(float *workspace, float *health, int wid
 }  // namespace
 
 extern "C" int inference_cuda_inkling_controller_norm(float *workspace, float *health,
-                                                      int width, float eps, void *stream,
+                                                      int width, int roles, float eps, void *stream,
                                                       int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (workspace == nullptr || health == nullptr || stream == nullptr || width < 1 ||
-        width > 4096 || !isfinite(eps) || eps <= 0.0f)
+        width > 4096 || (roles != 1 && roles != 3) || !isfinite(eps) || eps <= 0.0f)
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     const uintptr_t work = (uintptr_t)workspace, status = (uintptr_t)health;
     if (work % 4 != 0 || status % 4 != 0 ||
-        (work <= status ? status - work < 18 * (size_t)width * sizeof(float)
-                        : work - status < 3 * sizeof(float)))
+        (work <= status ? status - work < 6 * (size_t)roles * width * sizeof(float)
+                        : work - status < (size_t)roles * sizeof(float)))
         return INFERENCE_CUDA_INVALID_ARGUMENT;
-    inkling_controller_norm<<<3, threads, 0, (cudaStream_t)stream>>>(workspace, health, width, eps);
+    inkling_controller_norm<<<roles, threads, 0, (cudaStream_t)stream>>>(workspace, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
