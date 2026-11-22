@@ -228,6 +228,35 @@ impl<'a> ExpertProjection<'a> {
     }
 }
 
+fn disk_pass<P: crate::family::expert_bank::SlotPolicy>(
+    state: &mut crate::family::expert_bank::ExpertBankState<P>,
+    layer: usize,
+    picks: &[i32],
+    slots: &mut Vec<u32>,
+    mut replace: impl FnMut(usize, u32) -> Result<(), EngError>,
+) -> Result<crate::family::expert_bank::PassCopies, EngError> {
+    use crate::family::expert_bank::NO_PLACE;
+    let copies = state.begin_pass(layer, picks)?;
+    let mut next = slots.clone();
+    for op in &copies.ops {
+        let slot = usize::from(op.slot);
+        let result = if op.src_place == NO_PLACE && op.demote.is_none() && slot < next.len() {
+            replace(slot, u32::from(op.incoming))
+        } else {
+            Err(EngError::BadRequest(
+                "unexpected GGUF disk copy plan".into(),
+            ))
+        };
+        if let Err(error) = result {
+            state.poison();
+            return Err(error);
+        }
+        next[slot] = u32::from(op.incoming);
+    }
+    *slots = next;
+    Ok(copies)
+}
+
 /// Staged device owner. Every slot must be initialized before exposing any stack,
 /// since indexed kernels may access any slot. Cross-stream ordering is the caller's duty.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -300,7 +329,7 @@ impl<'a> ExpertDeviceStacks<'a> {
         layer: usize,
         picks: &[i32],
     ) -> Result<crate::family::expert_bank::PassCopies, EngError> {
-        use crate::family::expert_bank::{HostMode, NO_PLACE};
+        use crate::family::expert_bank::HostMode;
         if self.poisoned || state.is_poisoned() {
             self.poisoned = true;
             return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
@@ -312,34 +341,13 @@ impl<'a> ExpertDeviceStacks<'a> {
         }
         self.check_source(model, layer)?;
         let mut slots = self.check_state(state)?.to_vec();
-        let copies = match state.begin_pass(layer, picks) {
-            Ok(copies) => copies,
-            Err(error) => {
-                self.poisoned |= state.is_poisoned();
-                return Err(error);
-            }
-        };
-        for op in &copies.ops {
-            let result = if op.src_place == NO_PLACE && op.demote.is_none() {
-                self.replace_from_model(
-                    stream,
-                    model,
-                    layer,
-                    usize::from(op.slot),
-                    u32::from(op.incoming),
-                )
-            } else {
-                Err(EngError::BadRequest(
-                    "unexpected GGUF disk copy plan".into(),
-                ))
-            };
-            if let Err(error) = result {
-                self.poisoned = true;
-                state.poison();
-                return Err(error);
-            }
-            slots[usize::from(op.slot)] = u32::from(op.incoming);
+        let result = disk_pass(state, layer, picks, &mut slots, |slot, expert| {
+            self.replace_from_model(stream, model, layer, slot, expert)
+        });
+        if state.is_poisoned() {
+            self.poisoned = true;
         }
+        let copies = result?;
         self.slot_experts = Some(slots);
         Ok(copies)
     }
@@ -561,5 +569,74 @@ impl ExpertLayout {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod disk_pass_tests {
+    use super::disk_pass;
+    use crate::{
+        EngError,
+        family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
+    };
+
+    fn state() -> ExpertBankState<ReplaceOnMissLru> {
+        let geometry = BankGeometry::new(1, 5, 2, 3, 32).unwrap();
+        let mapping = [0, 1, 2, -1, -1];
+        let policy =
+            ReplaceOnMissLru::from_fill(geometry, &[&mapping], &[vec![0; 5]], None).unwrap();
+        ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap()
+    }
+
+    #[test]
+    fn disk_pass_publishes_after_hit_and_multiple_misses() {
+        let mut state = state();
+        let mut slots = vec![0, 1, 2];
+        let mut contents = slots.clone();
+        let hit = disk_pass(&mut state, 0, &[1, 2], &mut slots, |_, _| {
+            panic!("hit copied")
+        })
+        .unwrap();
+        assert!(hit.ops.is_empty());
+        let mut order = Vec::new();
+        let copies = disk_pass(&mut state, 0, &[3, 4], &mut slots, |slot, expert| {
+            order.push((slot, expert));
+            contents[slot] = expert;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            order,
+            copies
+                .ops
+                .iter()
+                .map(|op| (usize::from(op.slot), u32::from(op.incoming)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(order.len(), 2);
+        assert_eq!(slots, contents);
+        for (slot, expert) in slots.iter().enumerate() {
+            assert_eq!(state.expert_in_slot(0, slot).map(u32::from), Some(*expert));
+        }
+    }
+
+    #[test]
+    fn disk_pass_failure_does_not_publish_and_poisons_state() {
+        let mut state = state();
+        let mut slots = vec![0, 1, 2];
+        let before = slots.clone();
+        let mut calls = 0;
+        let result = disk_pass(&mut state, 0, &[3, 4], &mut slots, |_, _| {
+            calls += 1;
+            if calls == 2 {
+                Err(EngError::BadRequest("injected".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        assert!(state.is_poisoned());
+        assert_eq!(slots, before);
     }
 }
