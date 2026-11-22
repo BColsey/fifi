@@ -71,7 +71,7 @@ pub(crate) const QUOTA_EXPLICIT_MIN_BYTES: u64 = 1 << 30;
 pub(crate) const CHUNK_BYTES: usize = 8 << 20;
 /// Free space the cache filesystem must keep beyond an entry's bytes: a write that would leave
 /// less is skipped, so the cache never takes the last bytes of a shared disk.
-pub(crate) const MIN_FREE_RESERVE: u64 = 512 << 20;
+pub(crate) const MIN_FREE_RESERVE: u64 = crate::family::mem::DEVICE.disk_free_reserve;
 /// The rows the envelope hashes in one block: a property of the envelope, not of a family.
 const BLOCK_ROWS: u64 = 256;
 /// Bytes the start-up probe writes to time the disk.

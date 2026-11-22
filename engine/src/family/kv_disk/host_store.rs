@@ -18,10 +18,6 @@ use crate::{
 };
 use std::{rc::Rc, time::Instant};
 
-/// Host memory the engine leaves to the system before it keeps a copy of its own: what the
-/// start plans of the other stores keep.
-const HOST_RESERVE: u64 = 1 << 30;
-
 /// Lookups one restore may spend on entries that turn out damaged.
 const PROMOTE_ATTEMPTS: usize = 3;
 
@@ -149,7 +145,11 @@ pub(crate) fn host_is_short(label: &'static str, entry_bytes: u64) -> bool {
     let available = crate::family::mem::HostFacts::read(label, label)
         .ok()
         .map(|host| host.budget());
-    host_memory_is_short(available, HOST_RESERVE, entry_bytes)
+    host_memory_is_short(
+        available,
+        crate::family::mem::HOST_HEADROOM_BYTES,
+        entry_bytes,
+    )
 }
 
 /// The disk tier of one engine whose prefixes live in a host store.
