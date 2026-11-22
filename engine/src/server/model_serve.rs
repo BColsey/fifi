@@ -10,8 +10,8 @@
 //! load-time admission ledger, which is authoritative anyway.
 //!
 //! Selection rules: the family comes from `config.json`'s `model_type`
-//! matched against the family specs (or `--family` when there is no
-//! evidence); the weight format is `gguf` when a GGUF is present
+//! or a GGUF architecture (only the latter for a named file). An explicit
+//! `--family` can also select a supported family. The weight format is `gguf` when a GGUF is present
 //! (the qualified default — an EXL3-only directory serves `exl3` with
 //! its experimental acknowledgement printed, never silently). No
 //! experimental feature is armed by this path: every other option is
@@ -22,27 +22,25 @@ use std::path::{Path, PathBuf};
 use crate::capability::probe::{CompiledBackends, HardwareFacts};
 use crate::capability::{Probe, describe_error, inspect, preflight};
 use crate::family::inkling2_mini;
-use crate::server::config::{Config, EngineConfig, StartupError};
+use crate::family::qwen::qwen36::{
+    factory::{DENSE_FAMILY, FAMILY as Q36_FAMILY},
+    settings::Q36Options,
+};
+use crate::family::qwen::sensenova;
+use crate::server::config::{Config, EngineConfig, StartupError, check_sensenova_tokenizer_path};
 
-/// The families `--model` can identify and start. One row per
-/// detectable family; extending to Flint is a row here plus its
-/// loader's own checks staying the authority.
+/// Families detected from `config.json` model types. GGUF-only families are
+/// detected separately from their GGUF architecture metadata.
 pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
-    (
-        crate::family::qwen::qwen36::factory::FAMILY,
-        crate::family::QWEN3_6_35B_A3B.model_types,
-    ),
-    (
-        crate::family::qwen::qwen36::factory::DENSE_FAMILY,
-        crate::family::QWEN3_8_27B_DENSE.model_types,
-    ),
+    (Q36_FAMILY, crate::family::QWEN3_6_35B_A3B.model_types),
+    (DENSE_FAMILY, crate::family::QWEN3_8_27B_DENSE.model_types),
     (inkling2_mini::FAMILY, &[inkling2_mini::MODEL_TYPE]),
 ];
 
 /// Whether a family's engine entry carries the Qwen3.6 options block (the Qwen3.6 families);
 /// every other family starts from a bare entry.
 fn uses_qwen36_options(family: &str) -> bool {
-    DETECTABLE_FAMILIES.iter().any(|(name, _)| *name == family)
+    matches!(family, Q36_FAMILY | DENSE_FAMILY)
 }
 
 /// The families that a GGUF `general.architecture` identifies when the directory has no
@@ -133,7 +131,7 @@ const USAGE: &str = "usage: enginesrv serve [--model <dir|file.gguf|name|org/rep
 pub(crate) struct Discovered {
     pub(crate) family: String,
     pub(crate) weight_format: &'static str,
-    pub(crate) options: crate::family::qwen::qwen36::settings::Q36Options,
+    pub(crate) qwen36: Option<Q36Options>,
     pub(crate) tokenizer_dir: PathBuf,
 }
 
@@ -158,11 +156,10 @@ fn default_tokenizer_dir(model: &Path) -> PathBuf {
 /// Inspect the model path and choose family, format, and options.
 /// Pure filesystem evidence; no preflight, no probing.
 fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
-    let tokenizer_dir = args
-        .tokenizer_dir
-        .clone()
-        .unwrap_or_else(|| default_tokenizer_dir(&args.model_dir));
-    let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
+    let default_tokenizer = default_tokenizer_dir(&args.model_dir);
+    // Discovery does not use tokenizer files. Leave any tokenizer override unread until
+    // the family's options have been checked.
+    let inspection = inspect::inspect(&args.model_dir, &default_tokenizer)
         .map_err(|error| StartupError(describe_error(&error)))?;
 
     let has_gguf = !inspection.gguf_files.is_empty();
@@ -175,41 +172,49 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     }
 
     let family = select_family(args, &inspection)?;
-    if !uses_qwen36_options(&family) {
-        for (flag, given) in [
-            ("--kv", args.kv_dtype.is_some()),
-            ("--context", args.context_limit.is_some()),
-        ] {
-            if given {
-                return Err(StartupError(format!(
-                    "serve --model: {flag} is not an option of the {family} family; write a --config file"
-                )));
-            }
+    if family == sensenova::FAMILY {
+        if let Some(tokenizer) = args.tokenizer_dir.as_deref() {
+            check_sensenova_tokenizer_path(&args.model_dir, tokenizer).map_err(|error| {
+                StartupError(format!("serve --model: --tokenizer-dir: {error}"))
+            })?;
+        }
+        if !inspection
+            .gguf_files
+            .iter()
+            .any(|file| file.architecture.as_deref() == Some(sensenova::ARCHITECTURE))
+        {
+            return Err(StartupError(format!(
+                "serve --model: {} has no GGUF weights with architecture sensenova_loop",
+                args.model_dir.display()
+            )));
         }
     }
+    refuse_non_qwen36_flags(&family, args)?;
     let weight_format = if family == inkling2_mini::FAMILY {
         if !inspection.has_inkling_safetensors() && inspection.inkling_ggufs().next().is_some() {
             "gguf"
         } else {
             "safetensors"
         }
+    } else if family == sensenova::FAMILY {
+        "gguf"
     } else {
         select_weight_format(has_gguf, has_safetensors)
     };
 
-    let options = crate::family::qwen::qwen36::settings::Q36Options {
+    let qwen36 = uses_qwen36_options(&family).then(|| Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
         // they are.
         weight_format: (weight_format != MLX_WEIGHTS).then(|| weight_format.to_string()),
         context_limit: args.context_limit,
         kv_dtype: args.kv_dtype.clone(),
-        ..crate::family::qwen::qwen36::settings::Q36Options::default()
-    };
+        ..Q36Options::default()
+    });
     Ok(Discovered {
         family,
         weight_format,
-        options,
-        tokenizer_dir,
+        qwen36,
+        tokenizer_dir: args.tokenizer_dir.clone().unwrap_or(default_tokenizer),
     })
 }
 
@@ -335,7 +340,13 @@ fn resolve_hub_name(
     // The planner reads the machine once, and only when a choice needs it.
     let facts = std::cell::OnceCell::new();
     let measured = || facts.get_or_init(crate::capability::probe::probe);
-    let accepts = |stub: &Path| discover(&args_for_path(stub)).map(|_| ());
+    let accepts = |stub: &Path| {
+        let mut stub_args = args_for_path(stub);
+        if args.family.as_deref() == Some(sensenova::FAMILY) {
+            stub_args.family.clone_from(&args.family);
+        }
+        discover(&stub_args).map(|_| ())
+    };
     let mut fit = |stub: &Path| planned_fit(stub, measured());
     resolved.model_dir = super::fetch_name::resolve(
         &hub,
@@ -374,6 +385,9 @@ struct Vetted {
     args: ModelServeArgs,
     discovered: Discovered,
     report: preflight::PreflightReport,
+    /// The GGUF SenseNova serves, which is both its weights and its tokenizer; other
+    /// families have none.
+    embedded: Option<PathBuf>,
 }
 
 /// Discovery and the preflight of a serving process: every check that needs no device. CUDA
@@ -392,13 +406,20 @@ fn vet(args: &ModelServeArgs) -> Result<Vetted, StartupError> {
         kv_dtype: args.kv_dtype.clone(),
         prefill_rows: None,
     };
-    let report = preflight::preflight(
-        &args.model_dir,
-        &discovered.tokenizer_dir,
-        &candidate,
-        &facts,
-    )
-    .map_err(|error| StartupError(describe_error(&error)))?;
+    // SenseNova uses the selected GGUF for both weights and tokenizer, even for directory
+    // input with external tokenizer files or other GGUF families beside it.
+    let embedded = if discovered.family == sensenova::FAMILY {
+        Some(
+            sensenova::serve::select_gguf(&args.model_dir)
+                .map_err(|error| StartupError(describe_error(&error)))?,
+        )
+    } else {
+        None
+    };
+    let model_path = embedded.as_deref().unwrap_or(&args.model_dir);
+    let tokenizer_path = embedded.as_deref().unwrap_or(&discovered.tokenizer_dir);
+    let report = preflight::preflight(model_path, tokenizer_path, &candidate, &facts)
+        .map_err(|error| StartupError(describe_error(&error)))?;
     if report.verdict == preflight::Verdict::Unsupported {
         return Err(StartupError(format!(
             "serve --model: this build cannot serve {}:\n{}next: {}",
@@ -411,6 +432,7 @@ fn vet(args: &ModelServeArgs) -> Result<Vetted, StartupError> {
         args: args.clone(),
         discovered,
         report,
+        embedded,
     })
 }
 
@@ -419,6 +441,10 @@ fn vet(args: &ModelServeArgs) -> Result<Vetted, StartupError> {
 /// configuration and any qualification acknowledgement before the
 /// engines start.
 pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
+    // Refused before the resolution: a hub name would download the whole quant first.
+    if args.family.as_deref() == Some(sensenova::FAMILY) {
+        refuse_non_qwen36_flags(sensenova::FAMILY, args)?;
+    }
     // An `org/repo` id names a hub-cache download (the GUI's model
     // page, or `hf download`); a literal existing path always wins.
     let args = resolve_model_dir(args)?;
@@ -426,6 +452,7 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         args,
         discovered,
         report,
+        embedded,
     } = vet(&args)?;
     match report.verdict {
         preflight::Verdict::Experimental => {
@@ -437,20 +464,34 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         _ => eprint!("{}", warned_checks(&report)),
     }
 
-    let backend = crate::family::qwen::qwen36::factory::backend_of_build();
+    let backend = if embedded.is_some() {
+        "cpu"
+    } else {
+        backend_name(crate::family::qwen::qwen36::factory::backend_of_build())
+    };
     eprintln!(
-        "model: {} — family {}, {} weights, backend {}",
+        "model: {} — family {}, {} weights, backend {backend}",
         args.model_dir.display(),
         discovered.family,
         discovered.weight_format,
-        backend_name(backend),
     );
-    eprintln!(
-        "settings: the family defaults for context and KV dtype (override with --context, --kv); memory feasibility is decided at load by the runtime admission ledger — 'enginesrv check {}' prints the full preflight",
-        args.model_dir.display()
-    );
+    if embedded.is_some() {
+        eprintln!(
+            "settings: embedded GGUF tokenizer; context and KV settings are set by the family"
+        );
+    } else if discovered.qwen36.is_some() {
+        eprintln!(
+            "settings: the family defaults for context and KV dtype (override with --context, --kv); memory feasibility is decided at load by the runtime admission ledger — 'enginesrv check {}' prints the full preflight",
+            args.model_dir.display()
+        );
+    }
 
-    Ok(config_from(&discovered, &args))
+    let mut config = config_from(&discovered, &args);
+    if let Some(file) = embedded {
+        config.engines[0].model_dir = file.clone();
+        config.engines[0].tokenizer_dir = file;
+    }
+    Ok(config)
 }
 
 /// Assemble the in-memory `Config` — the document a `--config` file
@@ -463,7 +504,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
     engine.tokenizer_dir = discovered.tokenizer_dir.clone();
     if simplified {
         engine.id = "q36".to_string();
-        engine.qwen36 = Some(discovered.options.clone());
+        engine.qwen36 = discovered.qwen36.clone();
     }
     if inkling {
         engine.id = "inkling".to_string();
@@ -640,12 +681,38 @@ pub(crate) fn estimate_tiers(model_dir: &Path, family: &str) -> Option<TierEstim
     })
 }
 
+/// The flags only the Qwen3.6 options block carries, refused for every other family. Also
+/// called before hub resolution for SenseNova, so an unusable combination fails before a
+/// multi-gigabyte download instead of after it.
+fn refuse_non_qwen36_flags(family: &str, args: &ModelServeArgs) -> Result<(), StartupError> {
+    if uses_qwen36_options(family) {
+        return Ok(());
+    }
+    for (flag, given) in [
+        ("--kv", args.kv_dtype.is_some()),
+        ("--context", args.context_limit.is_some()),
+    ] {
+        if given {
+            let hint = if family == sensenova::FAMILY {
+                ""
+            } else {
+                "; write a --config file"
+            };
+            return Err(StartupError(format!(
+                "serve --model: {flag} is not an option of the {family} family{hint}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn select_family(
     args: &ModelServeArgs,
     inspection: &inspect::ModelInspection,
 ) -> Result<String, StartupError> {
     if let Some(family) = &args.family {
-        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family) {
+        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family) || family == sensenova::FAMILY
+        {
             return Ok(family.clone());
         }
         return Err(StartupError(format!(
@@ -754,6 +821,7 @@ fn detectable_names() -> String {
     DETECTABLE_FAMILIES
         .iter()
         .map(|(name, _)| *name)
+        .chain(std::iter::once(sensenova::FAMILY))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -962,6 +1030,23 @@ mod tests {
     }
 
     #[test]
+    fn a_sensenova_name_refuses_foreign_flags_before_any_download() {
+        let args = ModelServeArgs {
+            model_dir: PathBuf::from("sensenova/SenseNova-Loop-9B-GGUF"),
+            family: Some("sensenova".into()),
+            context_limit: Some(8192),
+            ..ModelServeArgs::default()
+        };
+        let error = super::build_config(&args).expect_err("refused before resolution");
+        assert!(
+            error
+                .to_string()
+                .contains("--context is not an option of the sensenova family"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn parse_args_reads_the_surface_and_refuses_unknowns() {
         let args: Vec<String> = [
             "--model",
@@ -1035,11 +1120,11 @@ mod tests {
         // Only the discovered format is set: context and KV stay the
         // resolver's own defaults — nothing experimental is armed.
         assert_eq!(
-            discovered.options,
-            Q36Options {
+            discovered.qwen36,
+            Some(Q36Options {
                 weight_format: Some("gguf".to_string()),
                 ..Q36Options::default()
-            }
+            })
         );
     }
 
@@ -1059,7 +1144,7 @@ mod tests {
         // A directory of safetensors shards is an MLX pack on an MLX build, which sets no
         // `weight_format` (the MLX arm refuses `exl3`), and an EXL3 pack elsewhere.
         assert_eq!(
-            discovered.options.weight_format.as_deref(),
+            discovered.qwen36.unwrap().weight_format.as_deref(),
             (!super::MLX_BUILD).then_some("exl3")
         );
     }
@@ -1080,8 +1165,9 @@ mod tests {
         args.context_limit = Some(8192);
         args.kv_dtype = Some("q8".to_string());
         let discovered = discover(&args).expect("discovers");
-        assert_eq!(discovered.options.context_limit, Some(8192));
-        assert_eq!(discovered.options.kv_dtype.as_deref(), Some("q8"));
+        let options = discovered.qwen36.expect("qwen36 options");
+        assert_eq!(options.context_limit, Some(8192));
+        assert_eq!(options.kv_dtype.as_deref(), Some("q8"));
     }
 
     #[test]
@@ -1176,7 +1262,7 @@ mod tests {
         let engine = &reread.engines[0];
         assert_eq!(engine.family, "qwen3_6_35b_a3b");
         assert_eq!(engine.model_dir, args.model_dir);
-        assert_eq!(engine.qwen36, Some(discovered.options));
+        assert_eq!(engine.qwen36, discovered.qwen36);
         // No extra fields can hide in the printed document: from_file
         // runs deny_unknown_fields, so the round-trip above is the
         // proof. The key variable is named (as in every config file);
@@ -1442,6 +1528,85 @@ mod tests {
         let whole = discover(&args_for(dir.path())).expect("discovers");
         assert_eq!(whole.family, "qwen3_6_35b_a3b");
         assert_eq!(whole.tokenizer_dir, dir.path());
+    }
+
+    #[test]
+    fn an_experimental_sensenova_file_does_not_change_another_familys_directory() {
+        let dir = directory_of_architecture("qwen35moe");
+        write_architecture(&dir.path().join("a-sensenova.gguf"), "sensenova_loop");
+        assert_eq!(
+            discover(&args_for(dir.path())).unwrap().family,
+            "qwen3_6_35b_a3b"
+        );
+    }
+
+    #[test]
+    fn a_sensenova_file_uses_only_its_own_weights_and_embedded_tokenizer() {
+        let dir = model_dir(Some("qwen3_5_moe"), false, false);
+        write_architecture(&dir.path().join("another.gguf"), "qwen35moe");
+        let model = dir.path().join("sensenova.gguf");
+        std::fs::write(
+            &model,
+            crate::tokenizer::gguf::tests::tiny_gguf("sensenova_loop", "gpt2", "raon"),
+        )
+        .expect("write");
+        std::fs::write(dir.path().join("generation_config.json"), b"not JSON").unwrap();
+        let mut args = args_for(&model);
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("--family sensenova")
+        );
+        args.family = Some("sensenova".to_owned());
+        let config = super::build_config(&args).expect("preflights the selected file");
+        let engine = &config.engines[0];
+        assert_eq!(engine.family, "sensenova");
+        assert_eq!(engine.model_dir, model);
+        assert_eq!(engine.tokenizer_dir, model);
+        assert!(engine.qwen36.is_none());
+
+        let mut directory = args_for(dir.path());
+        directory.family.clone_from(&args.family);
+        let config = super::build_config(&directory).expect("pins the selected SenseNova file");
+        assert_eq!(config.engines[0].model_dir, model);
+        assert_eq!(config.engines[0].tokenizer_dir, model);
+        args.tokenizer_dir = Some(model);
+        assert_eq!(
+            discover(&args).expect("explicit family").family,
+            "sensenova"
+        );
+        args.tokenizer_dir = Some(dir.path().to_path_buf());
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("embedded GGUF tokenizer")
+        );
+        args.tokenizer_dir = None;
+        args.context_limit = Some(1024);
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("--context is not an option")
+        );
+        args.context_limit = None;
+        args.kv_dtype = Some("q8".to_owned());
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("--kv is not an option")
+        );
+        args.kv_dtype = None;
+        args.model_dir = dir.path().join("another.gguf");
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("no GGUF weights with architecture sensenova_loop")
+        );
     }
 
     #[test]

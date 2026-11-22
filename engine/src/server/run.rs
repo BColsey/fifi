@@ -22,6 +22,7 @@ use crate::family::inkling2_mini;
 use crate::family::nemotron::nemotron35::factory as nemotron_factory;
 use crate::family::qwen::flash_next::factory;
 use crate::family::qwen::qwen36::factory as q36_factory;
+use crate::family::qwen::sensenova;
 use crate::family::sampler::{LoadedDefaults, SamplingDefaults};
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
 use crate::storage_guard;
@@ -400,13 +401,24 @@ pub(crate) fn start_one(
             describe(&error)
         ))
     })?;
-    let (loaded, defaults_directory) = load_sampling_defaults(config).map_err(|error| {
-        StartupError(format!(
-            "engine {} failed to start: {}",
-            config.id,
-            describe(&error)
-        ))
-    })?;
+    // SenseNova and explicitly named GGUF files take no neighboring sampling configuration;
+    // the defaults line still names the directory a config file would live in.
+    let (loaded, defaults_directory) = if config.family == sensenova::FAMILY
+        || crate::family::gguf_select::is_gguf_file(&config.model_dir)
+    {
+        (
+            SamplingDefaults::of_lone_file(),
+            crate::family::gguf_select::directory_of(&config.model_dir),
+        )
+    } else {
+        load_sampling_defaults(config).map_err(|error| {
+            StartupError(format!(
+                "engine {} failed to start: {}",
+                config.id,
+                describe(&error)
+            ))
+        })?
+    };
     // Resolve the flag once, before anything consumes it: Flint's env
     // opt-in is checked first (it only reads the engine's own options),
     // then the family-aware decision covers the ready note, the starter
@@ -734,6 +746,20 @@ fn start_gemma4(
     Err(gemma4::serve::cuda_required(&config.model_dir))
 }
 
+fn start_sensenova(
+    config: &EngineConfig,
+    _prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    let started = sensenova::serve::start_engine(&config.model_dir, ready_note)?;
+    Ok(StartedEngine {
+        engine: started.engine,
+        bundle: Arc::new(started.bundle),
+        context_limit: started.context_limit,
+        effective: Vec::new(),
+    })
+}
+
 /// Starter dispatch for recognized families, not a list of usable backends.
 /// The config gate owns the unknown-family rejection text.
 // The third column: the starter builds a Metal-resident executor on a
@@ -747,6 +773,7 @@ const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (q36_factory::DENSE_FAMILY, start_q36, true),
     (nemotron_factory::FAMILY, start_nemotron, false),
     (gemma4::FAMILY, start_gemma4, false),
+    (sensenova::FAMILY, start_sensenova, false),
     (fake::FAMILY, start_fake, false),
 ];
 

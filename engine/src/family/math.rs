@@ -27,6 +27,52 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> Result<f32, EngError> {
     Ok(a.iter().zip(b).map(|(x, y)| x * y).sum())
 }
 
+pub(crate) fn dot64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
+}
+
+/// `x / sqrt(mean(x^2) + eps)`.
+pub(crate) fn rms_unit(x: &[f32], eps: f32) -> Vec<f32> {
+    let mean = x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / x.len().max(1) as f64;
+    let scale = 1.0 / (mean + f64::from(eps)).sqrt();
+    x.iter().map(|v| (f64::from(*v) * scale) as f32).collect()
+}
+
+/// `rms_unit` times `weight`, the weight applied as stored (no `1 +`).
+pub(crate) fn rms_plain(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, EngError> {
+    expect_len(weight, x.len(), "rms norm weight")?;
+    Ok(rms_unit(x, eps)
+        .into_iter()
+        .zip(weight)
+        .map(|(v, w)| v * w)
+        .collect())
+}
+
+/// One gated delta-rule step of one value head. `rec` holds `value_dim` rows of `key_dim` values.
+/// For each row `j`: `S[j] <- decay * S[j]`, `delta = (v[j] - S[j] . k) * beta`, `S[j] <- S[j] + delta * k`,
+/// and the output is `S[j] . q`.
+pub(crate) fn delta_rule(
+    rec: &mut [f32],
+    (q, k, v): (&[f32], &[f32], &[f32]),
+    (decay, beta): (f32, f32),
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(v.len());
+    for (row, value) in rec.chunks_mut(k.len()).zip(v) {
+        for s in row.iter_mut() {
+            *s *= decay;
+        }
+        let delta = (value - dot64(row, k) as f32) * beta;
+        for (s, key) in row.iter_mut().zip(k) {
+            *s += key * delta;
+        }
+        out.push(dot64(row, q) as f32);
+    }
+    out
+}
+
 /// Zero-centered RMS normalization in the oracle operation order.
 pub(crate) fn rms0(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, EngError> {
     if x.is_empty() {

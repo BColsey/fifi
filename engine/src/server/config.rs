@@ -6,6 +6,7 @@ use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
 use crate::family::gemma::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
 use crate::family::inkling2_mini::FAMILY as INKLING_FAMILY;
 use crate::family::qwen::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
+use crate::family::qwen::sensenova::{ARCHITECTURE as SENSENOVA_ARCH, FAMILY as SENSENOVA_FAMILY};
 use crate::family::{
     nemotron::nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
     qwen::qwen36::{
@@ -30,7 +31,7 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// The family names that this build recognizes, including staged backends.
-pub(crate) const FAMILIES: [&str; 8] = [
+pub(crate) const FAMILIES: [&str; 9] = [
     FAKE_FAMILY,
     FLASH_FAMILY,
     Q36_FAMILY,
@@ -39,6 +40,7 @@ pub(crate) const FAMILIES: [&str; 8] = [
     NEMOTRON_FAMILY,
     GEMMA4_FAMILY,
     INKLING_FAMILY,
+    SENSENOVA_FAMILY,
 ];
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
@@ -61,6 +63,7 @@ pub(crate) fn gguf_architecture_note(architecture: &str) -> Option<&'static str>
         }
         "nemotron_h_moe" => "the Nemotron entry needs an options block: write a --config file",
         "raon1" => "Raon's CUDA serving is not on main yet",
+        SENSENOVA_ARCH => "SenseNova CPU serving is experimental; pass --family sensenova",
         "dflash" => "a draft model for speculative decoding, not a model to serve on its own",
         "clip" => {
             "a vision projector (mmproj), not a language model: name the model file beside it"
@@ -161,6 +164,21 @@ pub(crate) struct FakeOptions {
     pub(crate) reply: Option<String>,
     #[serde(default)]
     pub(crate) token_delay_ms: u64,
+}
+
+/// SenseNova always builds the tokenizer from the GGUF it loads. Accept the model path itself
+/// (the normal config convention), or the first shard for a file in a split set.
+pub(crate) fn check_sensenova_tokenizer_path(
+    model: &Path,
+    tokenizer: &Path,
+) -> Result<(), StartupError> {
+    if model == tokenizer || crate::family::gguf_select::first_shard(model) == tokenizer {
+        return Ok(());
+    }
+    Err(StartupError(format!(
+        "the {SENSENOVA_FAMILY} family uses the embedded GGUF tokenizer; use the model path (or the first shard of the model) instead of {}",
+        tokenizer.display()
+    )))
 }
 
 impl EngineConfig {
@@ -351,6 +369,11 @@ impl Config {
                 return Err(StartupError(format!(
                     "engines[{index}] sets flint, which only the {FLINT_FAMILY} family takes"
                 )));
+            }
+            if engine.family == SENSENOVA_FAMILY {
+                check_sensenova_tokenizer_path(&engine.model_dir, &engine.tokenizer_dir).map_err(
+                    |error| StartupError(format!("engines[{index}].tokenizer_dir: {error}")),
+                )?;
             }
             if let Some(options) = &engine.flint {
                 options
@@ -716,6 +739,33 @@ mod tests {
     fn an_empty_model_directory_is_rejected() {
         let text = VALID.replace(r#""model_dir": "m""#, r#""model_dir": """#);
         assert!(message(load(&text)).contains("engines[0].model_dir"));
+    }
+
+    #[test]
+    fn a_sensenova_entry_accepts_only_its_embedded_tokenizer_and_no_options() {
+        let text = VALID
+            .replace(r#""family": "fake""#, r#""family": "sensenova""#)
+            .replace(r#""tokenizer_dir": "t""#, r#""tokenizer_dir": "m""#);
+        assert_eq!(
+            load(&text).expect("valid").engines[0].model_name(),
+            "sensenova"
+        );
+        let external = text.replace(r#""tokenizer_dir": "m""#, r#""tokenizer_dir": "t""#);
+        assert!(message(load(&external)).contains("embedded GGUF tokenizer"));
+        for (member, refusal) in [
+            (r#""context_limit": 99"#, "only the fake family"),
+            (
+                r#""kv_cache": {}"#,
+                "sensenova family does not keep an on-disk prefix cache",
+            ),
+            (r#""qwen36": {}"#, "sets qwen36"),
+        ] {
+            let with_option = text.replace(
+                r#""family": "sensenova""#,
+                &format!(r#""family": "sensenova", {member}"#),
+            );
+            assert!(message(load(&with_option)).contains(refusal), "{member}");
+        }
     }
 
     #[test]

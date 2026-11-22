@@ -354,6 +354,14 @@ fn evaluate(
 
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
+    if family_name == Some(crate::family::qwen::sensenova::FAMILY) {
+        // The general inventory above read every .gguf file in the directory; this family pins
+        // the one it serves (sensenova_checks below), so a sibling file's unreadable header must
+        // not fail a check whose serve path selects first and starts.
+        checks.retain(|check| check.name != "gguf header");
+        sensenova_checks(model_dir, tokenizer_dir, candidate, &mut checks);
+        return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
+    }
     if family_name == Some(crate::family::gemma::gemma4::FAMILY)
         && let Err(error) =
             crate::family::gemma::gemma4::serve::check_backend(model_dir, &facts.backends)
@@ -730,6 +738,57 @@ fn identify_family(
         ),
     ));
     None
+}
+
+fn sensenova_checks(
+    model: &Path,
+    tokenizer: &Path,
+    candidate: &Candidate,
+    checks: &mut Vec<Check>,
+) {
+    use crate::family::qwen::sensenova::serve::select_gguf;
+    use crate::server::config::check_sensenova_tokenizer_path;
+    use crate::tokenizer::gguf::GgufTokenizer;
+
+    checks.retain(|check| check.name != "tokenizer files");
+    if candidate.context_limit.is_some()
+        || candidate.kv_dtype.is_some()
+        || candidate.prefill_rows.is_some()
+    {
+        checks.push(Check::new(
+            "options",
+            CheckStatus::Fail,
+            "SenseNova uses fixed host context, KV storage and prefill width".to_string(),
+        ));
+    }
+    let built = check_sensenova_tokenizer_path(model, tokenizer)
+        .map_err(|error| error.0)
+        .and_then(|()| select_gguf(model).map_err(|error| error.describe()))
+        .and_then(|path| {
+            GgufTokenizer::read_alone(&path)
+                .and_then(|tokenizer| tokenizer.parts())
+                .map(|_| path)
+                .map_err(|error| error.describe())
+        });
+    let outcome = match built {
+        Ok(path) => {
+            checks.push(Check::new(
+                "gguf header",
+                CheckStatus::Pass,
+                format!(
+                    "{} is the one weights file this family reads; other .gguf files in the directory are ignored",
+                    path.display()
+                ),
+            ));
+            Check::new(
+                "tokenizer files",
+                CheckStatus::Pass,
+                format!("the tokenizer is embedded in {}", path.display()),
+            )
+        }
+        Err(error) => Check::new("weights and tokenizer", CheckStatus::Fail, error),
+    };
+    checks.push(outcome);
 }
 
 /// Check embedded tokenizer metadata when side files are missing. An explicit GGUF supplies
@@ -2679,6 +2738,35 @@ mod tests {
                 identity.detail
             );
         }
+    }
+
+    #[test]
+    #[ignore = "needs SENSENOVA_GGUF, the released SenseNova-Loop-9B checkpoint"]
+    fn a_sensenova_check_ignores_unrelated_gguf_files_beside_the_pinned_one() {
+        let path = std::env::var("SENSENOVA_GGUF").expect("set SENSENOVA_GGUF");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&path, dir.path().join("SenseNova-Loop-9B.gguf"))
+            .expect("symlink the checkpoint");
+        std::fs::write(dir.path().join("sibling.gguf"), b"not a GGUF file").expect("sibling");
+        let report = super::preflight(
+            dir.path(),
+            dir.path(),
+            &Candidate {
+                family: Some(crate::family::qwen::sensenova::FAMILY.to_string()),
+                ..Candidate::default()
+            },
+            &cuda_facts(1 << 30),
+        )
+        .expect("preflight runs");
+        assert_eq!(report.verdict, Verdict::Experimental);
+        let headers: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|check| check.name == "gguf header")
+            .collect();
+        assert_eq!(headers.len(), 1, "{:?}", report.checks);
+        assert!(matches!(headers[0].status, CheckStatus::Pass));
+        assert!(headers[0].detail.contains("SenseNova-Loop-9B.gguf"));
     }
 
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {
