@@ -441,6 +441,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The tiered runtime; interior mutability because the token body takes `&self`.
     tiered: Option<std::cell::RefCell<TieredRuntime<'a>>>,
     tiered_report: TokenReport,
+    /// The sessions the card-short planner funded beside the banks; `None` on every other start.
+    sessions_funded: Option<usize>,
     globals: GlobalWeights<'a>,
     /// The layout the step runs: the loaded weights' own layout, checked against the options at
     /// construction.
@@ -888,6 +890,7 @@ impl<'a> QwenResidentStep<'a> {
             tiered_parts,
             tiered: None,
             tiered_report: TokenReport::default(),
+            sessions_funded: None,
             globals: GlobalWeights::new(
                 &res.names,
                 &GlobalSpecs::new(&res.dims),
@@ -1413,6 +1416,12 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     /// The counters of the last token's tiered boundary (all zero on a plain step).
+    /// Records the sessions the planner funded beside the banks: the sessions executor caps itself
+    /// at them.
+    pub(crate) fn set_sessions_funded(&mut self, sessions: usize) {
+        self.sessions_funded = Some(sessions);
+    }
+
     pub(crate) fn last_tiered_report(&self) -> TokenReport {
         self.tiered_report
     }

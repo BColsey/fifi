@@ -303,13 +303,12 @@ pub(super) fn attach_tiered_parts(
     let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
     // The banks leave the loader's headroom and the parts of the sessions beside them, by the
     // same rule the card-short planner used to size the slots.
-    let reserve = ADMISSION_RESERVE.saturating_add(
-        crate::family::card_fit::session_reserve_bytes(
-            step.seq_bytes_at(crate::family::cell_pool::INITIAL_CELLS),
-            sessions,
-        )
-        .unwrap_or(0),
-    );
+    let sessions_reserve = super::super::card_short::tiered_session_reserve(
+        step.seq_bytes_at(crate::family::cell_pool::INITIAL_CELLS),
+        sessions,
+    )
+    .ok_or_else(|| EngError::MemoryPlan("tiered: the sessions' reserve overflows".into()))?;
+    let reserve = ADMISSION_RESERVE.saturating_add(sessions_reserve);
     let layers = dims.shape.kinds.len();
     let quants = expert_quant(source.0, dims)?;
     let geometry = planning_geometry(dims, &quants)?;

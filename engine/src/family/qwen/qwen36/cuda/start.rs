@@ -926,6 +926,15 @@ pub(crate) fn start(
         (None, None)
     };
     let sessions = session_plan(&owned, device_first);
+    // A named tiered member sized its banks itself: nothing is funded for sessions beside them,
+    // so a count above one is refused here, before any weight is read.
+    if let (Some(count), Some(_), true) = (sessions, owned.tiered, owned.max_seqs_set) {
+        return Err(EngError::BadRequest(format!(
+            "engine config: max_seqs {count} with a named tiered member: the member sizes the \
+             banks and funds no sessions beside them; drop the member and the planner funds \
+             them, or drop max_seqs"
+        )));
+    }
     // A start that named a session count asked for sessions: a step that cannot host them refuses.
     let allow_single = !owned.max_seqs_set;
     let engine = if let Some(seqs) = sessions {
@@ -1358,6 +1367,7 @@ fn lower_rung(
         after_load_floor: after_load_floor()?,
         session_part_bytes: session_part_bytes(&dims, settings)?,
         sessions: planned_sessions(settings),
+        sessions_named: settings.max_seqs_set,
         layers: dims.shape.kinds.len(),
         experts: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
@@ -1497,9 +1507,6 @@ fn weights_leave_the_floor(free: u64, weights: u64, floor: u64) -> bool {
     free >= weights.saturating_add(floor)
 }
 
-/// The bytes the weights must leave free once they are loaded: what the load takes beyond the
-/// planned tensors, plus the free-after-load floor the start refuses below. The cache, the work
-/// and the headroom come after that check, so no context changes it.
 /// The sessions a start asks the lower rung to fund beside its banks: the named count, else the
 /// tiered target. The planner takes what the card funds up to it.
 fn planned_sessions(settings: &Q36Settings) -> usize {
@@ -1522,6 +1529,9 @@ fn session_part_bytes(dims: &StepDims, settings: &Q36Settings) -> Result<u64, En
     Ok(u64::try_from(StateLayout::new(dims, &options)?.bytes()?).unwrap_or(u64::MAX))
 }
 
+/// The bytes the weights must leave free once they are loaded: what the load takes beyond the
+/// planned tensors, plus the free-after-load floor the start refuses below. The cache, the work
+/// and the headroom come after that check, so no context changes it.
 fn after_load_floor() -> Result<u64, EngError> {
     let floor = u64::try_from(min_free_after_load()?).unwrap_or(u64::MAX);
     Ok(crate::family::mem::DEVICE
@@ -2073,6 +2083,7 @@ fn make(
             slots, plan.threads, plan.timeout_ms
         );
         if let Some(short) = &card_short {
+            step.set_sessions_funded(short.sessions);
             eprintln!("{}", short.line(slots, options.context_tokens));
             if settings.prefix_reuse {
                 eprintln!(

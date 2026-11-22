@@ -128,18 +128,50 @@ pub(crate) const SESSION_PLAN_SLACK_BYTES: u64 = 256 << 20;
 
 /// The device bytes a plan keeps free beside its load for `sessions` sessions: every session
 /// after the first takes `part_bytes` (its state beyond the cache both consumers size
-/// separately), and a plan that serves more than one keeps [`SESSION_PLAN_SLACK_BYTES`] for what
-/// the first session allocates beyond its listed demand. Nothing for one session. `None` when
-/// the byte count overflows. The one rule the Bolt cell pool and the Qwen3.6 tiered banks both
-/// plan against.
-pub(crate) fn session_reserve_bytes(part_bytes: u64, sessions: usize) -> Option<u64> {
+/// separately), `idle_parts` more parts are built beside the sessions' own (the executor's idle
+/// part, which the step runs while no session does), and a plan that serves more than one keeps
+/// [`SESSION_PLAN_SLACK_BYTES`] for what the first session allocates beyond its listed demand.
+/// `None` when the byte count overflows. The one rule the Bolt cell pool (no idle part) and the
+/// Qwen3.6 tiered banks (one idle part) both plan against.
+pub(crate) fn session_reserve_bytes(
+    part_bytes: u64,
+    sessions: usize,
+    idle_parts: usize,
+) -> Option<u64> {
     let extra = u64::try_from(sessions.max(1) - 1).ok()?;
-    if extra == 0 {
-        return Some(0);
+    let parts = extra.checked_add(u64::try_from(idle_parts).ok()?)?;
+    let slack = if extra == 0 {
+        0
+    } else {
+        SESSION_PLAN_SLACK_BYTES
+    };
+    part_bytes.checked_mul(parts)?.checked_add(slack)
+}
+
+/// The share of the one-session slots the sessions may take from the banks, in percent: a
+/// session is worth its reserve only while the banks keep three quarters of what one session
+/// would have had.
+pub(crate) const SESSION_SLOT_GIVE_UP_PERCENT: usize = 25;
+
+/// How many sessions a card funds beside its banks, at most `target`: the largest count whose
+/// reserve leaves the banks `slots_at(count)` slots, at least their share of the `slots_at(1)`
+/// the one session keeps. `slots_at` answers `None` for a count the card cannot carry at all.
+/// With `exact` the count is the target or nothing (a named `max_seqs`): the card funds it with
+/// whatever slots remain, or the answer is `None` and the caller refuses by name.
+pub(crate) fn funded_sessions(
+    target: usize,
+    exact: bool,
+    slots_at: &dyn Fn(usize) -> Option<usize>,
+) -> Option<usize> {
+    let one = slots_at(1)?;
+    if exact {
+        return slots_at(target.max(1)).map(|_| target.max(1));
     }
-    part_bytes
-        .checked_mul(extra)?
-        .checked_add(SESSION_PLAN_SLACK_BYTES)
+    let keep = one - one * SESSION_SLOT_GIVE_UP_PERCENT / 100;
+    let funded = (2..=target)
+        .rev()
+        .find(|&sessions| slots_at(sessions).is_some_and(|slots| slots >= keep));
+    Some(funded.unwrap_or(1))
 }
 
 /// The most cells a shared pool is planned for: far above any card's reach.
@@ -200,7 +232,7 @@ impl CellFigures {
     /// session is bounded by the model's context, not by this count. `None` when not even one
     /// cell fits.
     pub(crate) fn pool(&self, free: u64, weights: u64, sessions: usize) -> Option<usize> {
-        let reserve = session_reserve_bytes(self.seq_fixed, sessions);
+        let reserve = session_reserve_bytes(self.seq_fixed, sessions, 0);
         let charge = |cells: u32| {
             u64::from(cells)
                 .checked_mul(self.per_position)?
@@ -301,18 +333,43 @@ mod tests {
     }
 
     #[test]
-    fn the_session_reserve_is_the_extra_parts_and_one_slack() {
-        assert_eq!(session_reserve_bytes(1000, 0), Some(0));
-        assert_eq!(session_reserve_bytes(1000, 1), Some(0));
+    fn the_session_reserve_is_the_extra_parts_the_idle_parts_and_one_slack() {
+        // No idle part (Bolt): nothing for one session, extra parts and one slack beyond.
+        assert_eq!(session_reserve_bytes(1000, 0, 0), Some(0));
+        assert_eq!(session_reserve_bytes(1000, 1, 0), Some(0));
         assert_eq!(
-            session_reserve_bytes(1000, 2),
+            session_reserve_bytes(1000, 2, 0),
             Some(1000 + SESSION_PLAN_SLACK_BYTES)
         );
         assert_eq!(
-            session_reserve_bytes(1000, 8),
+            session_reserve_bytes(1000, 8, 0),
             Some(7000 + SESSION_PLAN_SLACK_BYTES)
         );
-        assert_eq!(session_reserve_bytes(u64::MAX, 3), None);
+        // One idle part (the Qwen executor): a lone session still builds it, so it is charged.
+        assert_eq!(session_reserve_bytes(1000, 1, 1), Some(1000));
+        assert_eq!(
+            session_reserve_bytes(1000, 4, 1),
+            Some(4000 + SESSION_PLAN_SLACK_BYTES)
+        );
+        assert_eq!(session_reserve_bytes(u64::MAX, 3, 0), None);
+    }
+
+    #[test]
+    fn sessions_are_funded_until_the_banks_would_lose_a_quarter() {
+        // 200 slots with one session, 2 slots lost to each further one.
+        let slots = |sessions: usize| Some(200 - 2 * (sessions - 1));
+        assert_eq!(funded_sessions(4, false, &slots), Some(4));
+        assert_eq!(funded_sessions(1, false, &slots), Some(1));
+        // 30 slots a session: 200, 170, 140, 110: the share is 150, so two are funded.
+        let heavy = |sessions: usize| Some(200 - 30 * (sessions - 1));
+        assert_eq!(funded_sessions(4, false, &heavy), Some(2));
+        // A card that carries one session only funds one; a card that carries none, none.
+        let one = |sessions: usize| (sessions == 1).then_some(8);
+        assert_eq!(funded_sessions(4, false, &one), Some(1));
+        assert_eq!(funded_sessions(4, false, &|_| None), None);
+        // A named count is funded whole or not at all, whatever the banks lose.
+        assert_eq!(funded_sessions(4, true, &heavy), Some(4));
+        assert_eq!(funded_sessions(4, true, &one), None);
     }
 
     const MIB: u64 = 1 << 20;

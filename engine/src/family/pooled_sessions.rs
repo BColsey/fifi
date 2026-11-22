@@ -59,6 +59,11 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     const LABEL: &'static str;
     /// Whether this step can serve more than one session.
     fn check_sessions(&self) -> Result<()>;
+    /// The sessions the host's planner funded beside its other allocations, when it planned them:
+    /// the executor never admits more. `None` leaves the count to the caller.
+    fn funded_sessions(&self) -> Option<usize> {
+        None
+    }
     /// The cells of the context the step was built for, which become the pool.
     fn context_cells(&self) -> usize;
     /// A zeroed part holding `cells` positions.
@@ -158,6 +163,10 @@ impl<E: PartHost> PooledSessions<E> {
         max_seqs: usize,
         allow_single: bool,
     ) -> Result<(Self, PooledSession<E::Part>)> {
+        // The planner funded a count beside the banks: the executor never admits more.
+        let max_seqs = step
+            .funded_sessions()
+            .map_or(max_seqs, |funded| max_seqs.min(funded.max(1)));
         // A start that named no session count and whose step cannot host sessions serves one
         // session; a named count above one is refused by the step, as it asked for more.
         let single = allow_single && step.check_sessions().is_err();

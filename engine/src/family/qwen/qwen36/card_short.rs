@@ -45,6 +45,9 @@ pub(crate) struct CardFigures {
     pub(crate) session_part_bytes: u64,
     /// The sessions the start would like to serve beside the banks: the most the planner funds.
     pub(crate) sessions: usize,
+    /// Whether the config named the count (`max_seqs`): it is then funded whole or refused by
+    /// name, never lowered.
+    pub(crate) sessions_named: bool,
     /// Layers of the model.
     pub(crate) layers: usize,
     /// Experts per layer.
@@ -84,8 +87,9 @@ pub(crate) struct CardShort {
     pub(crate) from_disk: bool,
     /// The sessions the card funds beside the banks, at most the figures' target.
     pub(crate) sessions: usize,
-    /// The slots per layer the banks gave up to fund those sessions.
-    pub(crate) slots_given_up: usize,
+    /// The slots per layer one session alone would have kept: what the sessions are charged
+    /// against, so the line reports what the banks admitted gave up.
+    pub(crate) slots_one: usize,
     /// The most slots per layer the card carries beside the rest of the load, with the tiered
     /// load's headroom kept free (an upper bound the bank sizing may lower).
     #[cfg_attr(
@@ -97,13 +101,14 @@ pub(crate) struct CardShort {
 
 impl CardShort {
     /// The tail of the start line that says what the sessions cost the banks.
-    fn sessions_note(&self) -> String {
+    fn sessions_note(&self, admitted_slots: usize) -> String {
         if self.sessions <= 1 {
             return String::new();
         }
         format!(
             ", {} sessions funded beside the banks ({} slots/layer given up for them)",
-            self.sessions, self.slots_given_up
+            self.sessions,
+            self.slots_one.saturating_sub(admitted_slots)
         )
     }
 
@@ -125,7 +130,7 @@ impl CardShort {
             self.short_by,
             self.needed,
             self.free,
-            self.sessions_note()
+            self.sessions_note(slots)
         )
     }
 }
@@ -150,8 +155,7 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
     };
     let ladder = |sessions: usize| {
         let reserve =
-            crate::family::card_fit::session_reserve_bytes(figures.session_part_bytes, sessions)
-                .unwrap_or(u64::MAX);
+            tiered_session_reserve(figures.session_part_bytes, sessions).unwrap_or(u64::MAX);
         choose_tier(&TierBudget {
             record_bytes: 0,
             layers: figures.layers,
@@ -176,29 +180,34 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
             }),
         })
     };
-    // One session first: what the card carries without any reserve is the baseline the sessions
-    // are funded against, and the refusal when even that is short.
+    let carried = |choice: &Result<TierChoice, crate::EngError>| match choice {
+        Ok(TierChoice::CardTiered { slots, .. } | TierChoice::CardDisk { slots }) => Some(*slots),
+        _ => None,
+    };
+    // One session first: what the card carries with its idle part and nothing else is the
+    // baseline the sessions are funded against, and the refusal when even that is short.
     let one = ladder(1);
-    let base_slots = match &one {
-        Ok(TierChoice::CardTiered { slots, .. } | TierChoice::CardDisk { slots }) => *slots,
-        _ => 0,
-    };
-    // The most sessions the card funds beside the banks: the largest count whose reserve leaves
-    // the banks at least their share of the one-session slots. The count is what the card funds,
-    // never a constant; the figures' target only caps it.
-    let keep = base_slots - base_slots * SESSION_SLOT_GIVE_UP_PERCENT / 100;
-    let funded = (2..=figures.sessions)
-        .rev()
-        .find_map(|sessions| match ladder(sessions) {
-            Ok(
-                choice @ (TierChoice::CardTiered { slots, .. } | TierChoice::CardDisk { slots }),
-            ) if slots >= keep => Some((sessions, choice)),
-            _ => None,
-        });
-    let (sessions, chosen) = match funded {
-        Some((sessions, choice)) => (sessions, Ok(choice)),
-        None => (1, one),
-    };
+    let slots_one = carried(&one).unwrap_or(0);
+    let slots_at = |sessions: usize| carried(&ladder(sessions));
+    let funded = crate::family::card_fit::funded_sessions(
+        figures.sessions.max(1),
+        figures.sessions_named,
+        &slots_at,
+    );
+    if figures.sessions_named && figures.sessions > 1 && funded.is_none() && slots_one > 0 {
+        return CardVerdict::Refused {
+            line: format!(
+                "q36 cuda: card short by {} bytes (needs {needed} tensors+KV+headroom, has {} \
+                 free): the card funds one session beside the minimum banks, not the {} that \
+                 max_seqs names",
+                needed.saturating_sub(figures.free),
+                figures.free,
+                figures.sessions
+            ),
+        };
+    }
+    let sessions = funded.unwrap_or(1);
+    let chosen = if sessions > 1 { ladder(sessions) } else { one };
     let short = |host_bytes: u64, from_disk: bool, slots: usize| {
         CardVerdict::Short(CardShort {
             short_by: needed.saturating_sub(figures.free),
@@ -207,7 +216,7 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
             host_bytes,
             from_disk,
             sessions,
-            slots_given_up: base_slots.saturating_sub(slots),
+            slots_one,
             slots,
         })
     };
@@ -227,14 +236,20 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
     }
 }
 
-/// The share of the one-session slots the sessions may take from the banks, in percent: a
-/// session is worth its reserve only while the banks keep three quarters of what one session
-/// would have had.
-const SESSION_SLOT_GIVE_UP_PERCENT: usize = 25;
+/// The idle parts the sessions executor builds beside its sessions' own: the part the step runs
+/// while no session does.
+const TIERED_IDLE_PARTS: usize = 1;
 
-/// The sessions a start with no named count asks the planner to fund beside the tiered banks.
-/// A target, not a ceiling: the planner takes what the card funds up to it.
-pub(crate) const TIERED_SESSION_TARGET: usize = 4;
+/// The device bytes a tiered start keeps beside its banks for `sessions` sessions: the planner
+/// sizes the slots against it and the bank attach leaves exactly it, so the two cannot differ.
+pub(crate) fn tiered_session_reserve(part_bytes: u64, sessions: usize) -> Option<u64> {
+    crate::family::card_fit::session_reserve_bytes(part_bytes, sessions, TIERED_IDLE_PARTS)
+}
+
+/// The sessions a start with no named count asks the planner to fund beside the tiered banks:
+/// the count the other arms derive for themselves. A target, not a ceiling: the planner takes
+/// what the card funds up to it.
+pub(crate) const TIERED_SESSION_TARGET: usize = super::settings::AUTO_MAX_SEQS;
 
 /// Whether the config leaves the card-short choice to the engine. A config that names tiered
 /// experts, host-paged KV or more than one device is taken as given and never re-tiered, as is
@@ -283,6 +298,7 @@ mod tests {
             after_load_floor: 0,
             session_part_bytes: 0,
             sessions: 1,
+            sessions_named: false,
             layers: 40,
             experts: 256,
             top_k: 8,
@@ -445,30 +461,74 @@ mod tests {
         for target in 1..=8 {
             match decide(&at(target), 64 * GIB) {
                 CardVerdict::Short(short) => {
-                    seen.push((target, short.sessions, short.slots, short.slots_given_up));
+                    seen.push((target, short.sessions, short.slots, short.slots_one));
                 }
                 other => panic!("target {target}: {other:?}"),
             }
         }
-        eprintln!("target, sessions funded, slots/layer, slots given up: {seen:?}");
         let one = seen[0].2;
-        for &(target, sessions, slots, given_up) in &seen {
-            assert!(sessions >= 1 && sessions <= target, "{seen:?}");
-            assert_eq!(given_up, one - slots, "{seen:?}");
+        for &(target, sessions, slots, slots_one) in &seen {
+            assert!((1..=target).contains(&sessions), "{seen:?}");
+            assert_eq!(
+                slots_one, one,
+                "the baseline is the one-session slots: {seen:?}"
+            );
             assert!(slots * 4 >= one * 3, "a quarter at most: {seen:?}");
         }
         // The slots only shrink as sessions are funded, and one session gives up nothing.
-        assert_eq!(seen[0].3, 0);
-        assert!(seen.windows(2).all(|pair| pair[1].2 <= pair[0].2));
+        assert!(
+            seen.windows(2).all(|pair| pair[1].2 <= pair[0].2),
+            "{seen:?}"
+        );
         // A target of four funds four here: each session costs far less than a quarter.
         assert_eq!(seen[3].1, 4, "{seen:?}");
+        // The line reports what the banks admitted gave up, not what was planned.
         let line = match decide(&at(4), 64 * GIB) {
-            CardVerdict::Short(short) => short.line(seen[3].2, 32_768),
+            CardVerdict::Short(short) => short.line(short.slots - 1, 32_768),
             other => panic!("{other:?}"),
         };
+        let given_up = one - (seen[3].2 - 1);
         assert!(
-            line.contains("4 sessions funded beside the banks"),
+            line.contains(&format!(
+                "4 sessions funded beside the banks ({given_up} slots/layer given up for them)"
+            )),
             "{line}"
+        );
+    }
+
+    /// The planner and the bank attach leave the same reserve for the same inputs: one function.
+    #[test]
+    fn the_planner_reserve_is_the_attach_reserve() {
+        let part = 95u64 << 20;
+        for sessions in 1..=8 {
+            let reserve = tiered_session_reserve(part, sessions).expect("fits u64");
+            // The idle part is charged even for one session; the slack from the second on.
+            let parts = sessions as u64;
+            let slack = if sessions > 1 {
+                crate::family::card_fit::SESSION_PLAN_SLACK_BYTES
+            } else {
+                0
+            };
+            assert_eq!(reserve, part * parts + slack, "{sessions} sessions");
+        }
+        // The slots the ladder gives up are the reserve spread over the layers' slot bytes.
+        let at = |sessions: usize| CardFigures {
+            session_part_bytes: part,
+            sessions,
+            sessions_named: true,
+            ..figures(21_300_000_000)
+        };
+        let slots_of = |sessions: usize| match decide(&at(sessions), 64 * GIB) {
+            CardVerdict::Short(short) => short.slots,
+            other => panic!("{other:?}"),
+        };
+        let per_slot = 1_769_472u64 * 40;
+        let extra =
+            tiered_session_reserve(part, 4).unwrap() - tiered_session_reserve(part, 1).unwrap();
+        let lost = slots_of(1) - slots_of(4);
+        assert!(
+            (lost as u64) * per_slot <= extra + per_slot && (lost as u64 + 1) * per_slot > extra,
+            "{lost} slots lost for {extra} bytes"
         );
     }
 
@@ -476,7 +536,7 @@ mod tests {
     /// banks below a quarter, and never refuses for the sessions it could not fund.
     #[test]
     fn a_card_with_room_for_the_minimum_banks_funds_one_session() {
-        let enough = 3_253_406_976 + 566_231_040;
+        let enough = 3_253_406_976 + 566_231_040 + (95 << 20);
         let tight = CardFigures {
             session_part_bytes: 95 << 20,
             sessions: 4,
@@ -485,11 +545,59 @@ mod tests {
         match decide(&tight, 64 * GIB) {
             CardVerdict::Short(short) => {
                 assert_eq!(short.sessions, 1);
-                assert_eq!(short.slots_given_up, 0);
+                assert_eq!(short.slots, short.slots_one);
                 assert!(!short.line(8, 32_768).contains("sessions funded"));
             }
             other => panic!("expected the lower rung, got {other:?}"),
         }
+    }
+
+    /// A named count is funded whole or refused by name: a card with room for the minimum banks
+    /// and an idle part, but not for three sessions beside them, refuses `max_seqs` of 3.
+    #[test]
+    fn a_named_session_count_the_card_cannot_fund_is_refused_by_name() {
+        let enough = 3_253_406_976 + 566_231_040 + (95 << 20);
+        let named = CardFigures {
+            session_part_bytes: 95 << 20,
+            sessions: 3,
+            sessions_named: true,
+            ..figures(enough)
+        };
+        match decide(&named, 64 * GIB) {
+            CardVerdict::Refused { line } => {
+                assert!(line.contains("funds one session"), "{line}");
+                assert!(line.contains("max_seqs names"), "{line}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let roomy = CardFigures {
+            free: 21_300_000_000,
+            ..named
+        };
+        match decide(&roomy, 64 * GIB) {
+            CardVerdict::Short(short) => assert_eq!(short.sessions, 3),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The idle part is a planner charge: a card that holds the minimum banks but not the idle
+    /// part beside them is refused by the planner, not by a start that dies late.
+    #[test]
+    fn the_idle_part_is_charged_to_the_planner_even_for_one_session() {
+        let minimum = 3_253_406_976 + 566_231_040;
+        let one = |free: u64| CardFigures {
+            session_part_bytes: 95 << 20,
+            sessions: 1,
+            ..figures(free)
+        };
+        assert!(matches!(
+            decide(&one(minimum + (95 << 20)), 64 * GIB),
+            CardVerdict::Short(_)
+        ));
+        assert!(matches!(
+            decide(&one(minimum + (95 << 20) - 1), 64 * GIB),
+            CardVerdict::Refused { .. }
+        ));
     }
 
     #[test]

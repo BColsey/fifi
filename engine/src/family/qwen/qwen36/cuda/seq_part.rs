@@ -39,27 +39,55 @@ impl SeqPart<'_> {
     }
 }
 
+/// The forms a step can run in, as the sessions executor asks about them.
+#[derive(Clone, Copy, Default)]
+struct SessionForms {
+    paged: bool,
+    sparse: bool,
+    tiered: bool,
+    banked: bool,
+    krow: bool,
+    rollback: bool,
+    speculative: bool,
+}
+
+/// The form that keeps state outside the part a session owns, when the step runs one. The
+/// tiered form is not one: its banks, host pool, staging and scratch belong to the step and are
+/// used inside one call, so sessions share them as they share the weights.
+fn session_refusal(forms: SessionForms) -> Option<&'static str> {
+    let _ = forms.tiered;
+    if forms.paged {
+        Some("paged KV")
+    } else if forms.sparse {
+        Some("sparse decode")
+    } else if forms.banked {
+        Some("banked EXL3 experts")
+    } else if forms.krow {
+        Some("the K-row verify window")
+    } else if forms.rollback {
+        Some("device rollback")
+    } else if forms.speculative {
+        Some("speculative decoding")
+    } else {
+        None
+    }
+}
+
 impl<'a> QwenResidentStep<'a> {
     /// Whether this step can serve more than one session: the plain and the tiered resident
     /// step. The tiered runtime (banks, host pool, staging, scratch) is the step's own and is used
     /// inside one call, so sessions share it as they share the weights. The paged, sparse,
     /// banked, K-row, rollback and speculative forms keep state outside the part a session owns.
     pub(crate) fn check_sessions(&self) -> Result<(), EngError> {
-        let refused = if self.res.paged.is_some() {
-            Some("paged KV")
-        } else if self.res.sparse.is_some() {
-            Some("sparse decode")
-        } else if self.exl3_bank.is_some() {
-            Some("banked EXL3 experts")
-        } else if self.res.krow.is_some() || self.krow_wanted {
-            Some("the K-row verify window")
-        } else if self.rollback_wanted || self.rollback.is_some() {
-            Some("device rollback")
-        } else if self.speculator.is_some() {
-            Some("speculative decoding")
-        } else {
-            None
-        };
+        let refused = session_refusal(SessionForms {
+            paged: self.res.paged.is_some(),
+            sparse: self.res.sparse.is_some(),
+            tiered: self.tiered_mode,
+            banked: self.exl3_bank.is_some(),
+            krow: self.res.krow.is_some() || self.krow_wanted,
+            rollback: self.rollback_wanted || self.rollback.is_some(),
+            speculative: self.speculator.is_some(),
+        });
         match refused {
             Some(what) => Err(EngError::BadRequest(format!(
                 "engine config: max_seqs above 1 needs the plain resident step, not {what}"
@@ -160,6 +188,10 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
         QwenResidentStep::check_sessions(self)
     }
 
+    fn funded_sessions(&self) -> Option<usize> {
+        self.sessions_funded
+    }
+
     fn context_cells(&self) -> usize {
         self.seq_cells()
     }
@@ -210,5 +242,78 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
 
     fn embedding_rows(&self) -> usize {
         self.res.dims.shape.vocab
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tiered_step_can_serve_sessions_and_every_form_with_outside_state_cannot() {
+        assert_eq!(session_refusal(SessionForms::default()), None);
+        assert_eq!(
+            session_refusal(SessionForms {
+                tiered: true,
+                ..SessionForms::default()
+            }),
+            None,
+            "the tiered runtime is the step's own"
+        );
+        let refusing = [
+            (
+                SessionForms {
+                    paged: true,
+                    ..SessionForms::default()
+                },
+                "paged KV",
+            ),
+            (
+                SessionForms {
+                    sparse: true,
+                    ..SessionForms::default()
+                },
+                "sparse decode",
+            ),
+            (
+                SessionForms {
+                    banked: true,
+                    ..SessionForms::default()
+                },
+                "banked EXL3 experts",
+            ),
+            (
+                SessionForms {
+                    krow: true,
+                    ..SessionForms::default()
+                },
+                "the K-row verify window",
+            ),
+            (
+                SessionForms {
+                    rollback: true,
+                    ..SessionForms::default()
+                },
+                "device rollback",
+            ),
+            (
+                SessionForms {
+                    speculative: true,
+                    ..SessionForms::default()
+                },
+                "speculative decoding",
+            ),
+        ];
+        for (forms, what) in refusing {
+            assert_eq!(session_refusal(forms), Some(what));
+            // A tiered step that is also one of them is still refused for it.
+            assert_eq!(
+                session_refusal(SessionForms {
+                    tiered: true,
+                    ..forms
+                }),
+                Some(what)
+            );
+        }
     }
 }

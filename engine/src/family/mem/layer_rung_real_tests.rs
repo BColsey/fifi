@@ -183,6 +183,7 @@ fn before_refuses(m: &Loaded, card_free: u64, host_budget: u64) -> bool {
         after_load_floor: 0,
         session_part_bytes: 0,
         sessions: 1,
+        sessions_named: false,
         layers: m.expert_layers,
         experts: m.experts,
         top_k: m.top_k.max(1),
