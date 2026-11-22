@@ -142,6 +142,49 @@ pub(in crate::family::inkling2) struct AttentionControllers<'a> {
 }
 
 impl AttentionControllers<'_> {
+    pub(in crate::family::inkling2) fn grouped_chained_projections<const N: usize>(
+        &self,
+        inputs: &[[ControlledAttentionInput<'_>; 3]],
+        requests: [Option<Projection<'_>>; N],
+        eps: f32,
+    ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
+        let [Some(q), Some(k), Some(v)] = self.weights else {
+            return Ok(None);
+        };
+        let Some(weights) = self
+            .cuda
+            .attention_group([self.shape[1]; 3], requests)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let Some(capacity) = self
+            .cuda
+            .step
+            .controlled_attention_batch_capacity(self.shape, weights)?
+        else {
+            return Ok(None);
+        };
+        if capacity < 2 {
+            return Ok(None);
+        }
+        let mut result = Vec::with_capacity(inputs.len());
+        for chunk in inputs.chunks(capacity) {
+            let values = self
+                .cuda
+                .step
+                .controlled_attention_batch(&self.cuda.context, chunk, [q, k, v], weights, eps)?
+                .ok_or_else(|| bad("admitted CUDA controlled attention batch declined"))?;
+            if values.len() != chunk.len() {
+                return Err(bad(
+                    "CUDA controlled attention batch returned wrong row count",
+                ));
+            }
+            result.extend(values);
+        }
+        Ok(Some(result))
+    }
+
     pub(in crate::family::inkling2) fn chained_projections<const N: usize>(
         &self,
         inputs: [ControlledAttentionInput<'_>; 3],

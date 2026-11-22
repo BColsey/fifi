@@ -283,10 +283,29 @@ impl CpuForward {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let prefix = format!("{layer}.mlp");
-        let mut attention_inputs = self.prompt_attention_inputs(visit, &layer, rows)?;
         let mut projected = None;
         let router = format!("{prefix}.gate.weight");
         let batch_router = weights.batch_prefill_router(physical as u32, &router);
+        let batched_attention = batch_router
+            && !self.draft_window_enabled()
+            && rows.len() > 1
+            && rows.iter().all(|row| row.journal.is_none())
+            && crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled()
+            && weights.resident_attention().is_some();
+        let chained = if batched_attention {
+            self.grouped_chained_attention(
+                visit,
+                &layer,
+                rows.iter().map(|row| (&row.stream, row.bank.as_ref())),
+            )?
+        } else {
+            None
+        };
+        let mut attention_inputs = if chained.is_some() {
+            None
+        } else {
+            self.prompt_attention_inputs(visit, &layer, rows)?
+        };
         // Without the resident batched router, preserve the interleave between
         // per-row prefetch and route observation on cold expert layers.
         let controller = if batch_router
@@ -303,13 +322,16 @@ impl CpuForward {
         } else {
             None
         };
-        let batched = if batch_router
-            && !self.draft_window_enabled()
-            && rows.len() > 1
-            && rows.iter().all(|row| row.journal.is_none())
-            && crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled()
-            && weights.resident_attention().is_some()
-        {
+        let batched = if let Some(projections) = chained {
+            let outputs = self.attention_prefill_batch(&layer, visit, state, projections)?;
+            Some(self.prompt_attention_residuals(
+                visit,
+                &layer,
+                rows,
+                outputs,
+                controller.is_some(),
+            )?)
+        } else if batched_attention {
             if let Some((inputs, batched_controllers)) = attention_inputs.take() {
                 let outputs = match self.attention_prefill_bridge(&layer, visit, state, &inputs)? {
                     Some(outputs) => Some(outputs),

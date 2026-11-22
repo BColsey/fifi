@@ -168,6 +168,77 @@ impl CpuForward {
         run(&controllers, inputs)
     }
 
+    pub(super) fn grouped_chained_attention<'a>(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        rows: impl ExactSizeIterator<Item = (&'a Stream, Option<&'a MessageBank>)>,
+    ) -> Result<Option<Vec<AttentionProjection>>, EngError> {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var("FIFI_INKLING_CUDA_GROUPED_CHAIN_ATTENTION").as_deref() == Ok("1")
+        }) || !controller_batch_enabled()
+            || !multirow_controllers_enabled()
+            || rows.len() < 2
+        {
+            return Ok(None);
+        }
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        let shape = [self.spec.core.gate_rank as usize, self.hidden()];
+        let names = ATTENTION_ROLES.map(|(role, _)| control_names(layer, role));
+        let Some(controllers) =
+            weights.attention_controllers(name_refs(&names), shape, rows.len())?
+        else {
+            return Ok(None);
+        };
+        let rows: Vec<_> = rows.collect();
+        if rows.iter().any(|(_, bank)| bank.is_none()) {
+            return Ok(None);
+        }
+        let _span = self.phase_span(Work::Controller);
+        let prepared = {
+            let _subspan = self.phase_span(Work::AttentionControlPrepare);
+            rows.iter()
+                .map(|(stream, bank)| {
+                    self.prepare_attention_controllers(visit, stream, bank.expect("banks checked"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let local = visit.attention == Attention::Local;
+        let gamma = |i| {
+            self.weights
+                .vec(&attention_norm_name(layer, local, i), shape[1])
+        };
+        let gamma = if local {
+            [Some(gamma(0)?), None, None]
+        } else {
+            [Some(gamma(0)?), Some(gamma(1)?), Some(gamma(2)?)]
+        };
+        let inputs: Vec<_> = prepared
+            .iter()
+            .map(|row| {
+                std::array::from_fn(|i| ControlledAttentionInput {
+                    gate: &row[i].control.gate,
+                    input: &row[i].input,
+                    message: &row[i].control.message,
+                    gamma: gamma[i]
+                        .as_deref()
+                        .unwrap_or_else(|| gamma[0].as_deref().expect("query gamma")),
+                })
+            })
+            .collect();
+        let result = self.attention_requests(layer, visit.attention, |calls| {
+            controllers.grouped_chained_projections(&inputs, calls, self.math.rms_norm_eps)
+        })?;
+        if result.is_some() {
+            static USED: Once = Once::new();
+            USED.call_once(|| eprintln!("Inkling CUDA used grouped chained controller attention"));
+        }
+        Ok(result)
+    }
+
     pub(super) fn grouped_attention_inputs<'a>(
         &self,
         visit: LayerVisit,

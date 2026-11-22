@@ -17,8 +17,45 @@ pub(in crate::family::inkling2) struct ControlledAttentionInput<'a> {
 }
 
 impl DenseStep {
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch_capacity<
+        const N: usize,
+    >(
+        &self,
+        [rank, hidden]: [usize; 2],
+        weights: [Option<ResidentProjection<'_>>; N],
+    ) -> Result<Option<usize>, EngError> {
+        if !(1..=4096).contains(&hidden) || !(1..=4096).contains(&rank) {
+            return Ok(None);
+        }
+        let mut output = 0usize;
+        for p in weights.iter().flatten() {
+            if p.input >= 3 || p.weight.shape[1] != hidden || p.weight.shape[0] == 0 {
+                return Ok(None);
+            }
+            let Some(sum) = output.checked_add(p.weight.shape[0]) else {
+                return Ok(None);
+            };
+            output = sum;
+        }
+        if output == 0 {
+            return Ok(None);
+        }
+        let Some(per_row) = hidden
+            .checked_mul(24)
+            .and_then(|n| rank.checked_mul(3).and_then(|r| n.checked_add(r)))
+            .and_then(|n| n.checked_add(3))
+            .and_then(|n| n.checked_add(output))
+        else {
+            return Ok(None);
+        };
+        let capacity =
+            self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>() / per_row;
+        Ok(Some(
+            capacity.min(DenseGemvShape::MAX_ACTIVATION_ROWS).min(512),
+        ))
+    }
+
     // Staged transaction: the grouped prefill caller is wired separately after quality checks.
-    #[allow(dead_code)]
     pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch<
         const N: usize,
     >(
