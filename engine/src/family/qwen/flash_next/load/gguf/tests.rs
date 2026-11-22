@@ -807,7 +807,7 @@ fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
     let rows = u64::from(ple.ngram - 1) * u64::from(ple.heads_per_ngram);
     let embedding = rows * u64::from(ple.head_dim);
     let stream = u64::from(ple.hidden) * u64::from(ple.branches);
-    let tokens = 4096u64;
+    let tokens = u64::from(super::super::super::settings::MAX_PREFILL_CHUNK);
     let pending = tokens * embedding * 4;
     let starts = tokens * (stream + embedding) * 4;
     let staging = super::super::super::host_plan::HostTerms::DEFAULT
@@ -816,10 +816,10 @@ fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
     assert_eq!((rows, embedding), (16, 2560));
     assert_eq!(
         (pending, starts, staging),
-        (41_943_040, 209_715_200, 85_983_232)
+        (20_971_520, 104_857_600, 85_983_232)
     );
     eprintln!(
-        "4096-token fixture payloads: pending={pending} starts={starts} existing staging={staging}; excludes metadata and other allocations"
+        "{tokens}-token fixture payloads: pending={pending} starts={starts} existing staging={staging}; excludes metadata and other allocations"
     );
 }
 
