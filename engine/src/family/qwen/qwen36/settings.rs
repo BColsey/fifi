@@ -675,7 +675,8 @@ pub(crate) struct TieredSettings {
 
 /// The default CPU worker threads of the tiered member.
 const TIERED_DEFAULT_THREADS: u32 = 6;
-/// The default wait for one layer's CPU experts, in milliseconds.
+/// The default stall window of one layer's CPU experts, in milliseconds: the wait fails only when
+/// no expert job has answered for this long, so a slow disk that keeps answering never trips it.
 const TIERED_DEFAULT_TIMEOUT_MS: u32 = 10_000;
 
 impl TieredSettings {

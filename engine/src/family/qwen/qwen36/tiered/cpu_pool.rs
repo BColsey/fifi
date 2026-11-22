@@ -248,8 +248,8 @@ pub enum PoolError {
     /// [`expert_forward`](crate::kernels::expert_cpu::expert_forward) refused a job;
     /// `job` is the run's lowest failing index, whatever order failures arrived in.
     Expert { job: usize, error: ExpertCpuError },
-    /// `pending` jobs never answered within the timeout; their late results are
-    /// discarded, so the run had no outcome.
+    /// No job answered for the timeout (a stall, not a long run: every answer renews it) and
+    /// `pending` jobs are still out; their late results are discarded, so the run had no outcome.
     Timeout {
         /// Whole milliseconds actually waited before giving up.
         waited_ms: u64,
@@ -258,6 +258,39 @@ pub enum PoolError {
     /// A worker died on a panic, so its job can never answer; the pool keeps serving
     /// with the surviving workers.
     WorkerLost,
+}
+
+/// The watchdog of a join: it fires when no job has answered for `window`, never because a run
+/// as a whole took long. A job that answers resets it, so a cold first token that reads its
+/// pages slowly but keeps finishing jobs never trips it, and a hung worker fails the wait
+/// `window` after the last answer. One rule for every start, named or automatic.
+struct Stall {
+    window: Duration,
+    last: Instant,
+}
+
+impl Stall {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last: Instant::now(),
+        }
+    }
+
+    /// A job answered: the window starts again.
+    fn progress(&mut self) {
+        self.last = Instant::now();
+    }
+
+    /// Time left before the watchdog fires; zero when it has.
+    fn left(&self) -> Duration {
+        (self.last + self.window).saturating_duration_since(Instant::now())
+    }
+
+    /// Whole milliseconds since the last answer.
+    fn quiet_ms(&self) -> u64 {
+        u64::try_from(self.last.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// One job as it travels to a worker: (index, expert, shared row, run sender).
@@ -867,30 +900,32 @@ pub struct PendingSides {
 }
 
 impl PendingSides {
-    /// Waits for every half (at most `timeout` from this call) and returns them in
+    /// Waits for every half (failing only when none answers for `timeout`) and returns them in
     /// job order. A failure fails the run exactly as `PendingLayer::finish` does.
     pub fn finish(self, timeout: Duration) -> Result<Vec<Vec<f32>>, PoolError> {
         let PendingSides { rx, count } = self;
         let mut halves: Vec<Option<Vec<f32>>> = (0..count).map(|_| None).collect();
         let mut first_err: Option<PoolError> = None;
-        let deadline = Instant::now() + timeout;
+        let mut stall = Stall::new(timeout);
         let mut got = 0usize;
         while got < count {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = stall.left();
             if left.is_zero() {
                 return Err(PoolError::Timeout {
-                    waited_ms: timeout.as_millis() as u64,
+                    waited_ms: stall.quiet_ms(),
                     pending: count - got,
                 });
             }
             match rx.recv_timeout(left) {
                 Ok(SideOutcome::Done(at, act)) => {
+                    stall.progress();
                     if at < count && halves[at].is_none() {
                         halves[at] = Some(act);
                         got += 1;
                     }
                 }
                 Ok(SideOutcome::Failed(at, error)) => {
+                    stall.progress();
                     first_err = first_err.or(Some(PoolError::Expert { job: at, error }));
                     got += 1;
                 }
@@ -929,7 +964,7 @@ pub struct PendingChunk {
 }
 
 impl PendingChunk {
-    /// Waits for every grouped job (at most `timeout` from this call) and returns the
+    /// Waits for every grouped job (failing only when none answers for `timeout`) and returns the
     /// dense `[m][hidden]` sum: row `r` accumulates `weight * output` of every expert
     /// that served it, f32 from +0.0. A job's failure fails the chunk exactly as
     /// `PendingLayer::finish` fails a layer.
@@ -950,18 +985,19 @@ impl PendingChunk {
         type Slot = Option<Vec<(usize, Vec<f32>)>>;
         let mut slots: Vec<Slot> = (0..n).map(|_| None).collect();
         let mut first_err: Option<PoolError> = None;
-        let deadline = Instant::now() + timeout;
+        let mut stall = Stall::new(timeout);
         let mut got = 0usize;
         while got < n {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = stall.left();
             if left.is_zero() {
                 return Err(PoolError::Timeout {
-                    waited_ms: timeout.as_millis() as u64,
+                    waited_ms: stall.quiet_ms(),
                     pending: n - got,
                 });
             }
             match rx.recv_timeout(left) {
                 Ok(ChunkJobOutcome::Done(at, rows_out)) => {
+                    stall.progress();
                     if at >= n {
                         return Err(PoolError::BadInput(format!(
                             "a grouped job answered with the out-of-range index {at} of {n}"
@@ -973,6 +1009,7 @@ impl PendingChunk {
                     }
                 }
                 Ok(ChunkJobOutcome::Failed(at, error)) => {
+                    stall.progress();
                     if at >= n {
                         return Err(PoolError::BadInput(format!(
                             "a grouped job failed with the out-of-range index {at} of {n}"
@@ -990,10 +1027,13 @@ impl PendingChunk {
                     return Err(PoolError::WorkerLost);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    return Err(PoolError::Timeout {
-                        waited_ms: timeout.as_millis() as u64,
-                        pending: n - got,
-                    });
+                    // The window may have been renewed by a job that answered meanwhile.
+                    if stall.left().is_zero() {
+                        return Err(PoolError::Timeout {
+                            waited_ms: stall.quiet_ms(),
+                            pending: n - got,
+                        });
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(PoolError::WorkerLost);
@@ -1019,7 +1059,7 @@ impl PendingChunk {
 }
 
 impl PendingLayer {
-    /// Waits for every job (at most `timeout` from this call) and returns the
+    /// Waits for every job (failing only when none answers for `timeout`) and returns the
     /// job-order sum of `weight_j * output_j`, f32 from +0.0, exactly the value
     /// `run_layer` returns. Errors are those of `run_layer`: the lowest failing
     /// job as [`PoolError::Expert`], [`PoolError::Timeout`] (late results are
@@ -1036,25 +1076,26 @@ impl PendingLayer {
         // it). `Lost` or a dead channel: a worker is gone.
         let mut outs: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
         let mut failure: Option<(usize, ExpertCpuError)> = None;
-        let start = Instant::now();
-        let deadline = start + timeout;
+        let mut stall = Stall::new(timeout);
         let mut received = 0usize;
         while received < n {
-            let now = Instant::now();
-            if now >= deadline {
+            let left = stall.left();
+            if left.is_zero() {
                 return Err(PoolError::Timeout {
-                    waited_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    waited_ms: stall.quiet_ms(),
                     pending: n - received,
                 });
             }
-            match rx.recv_timeout(deadline - now) {
+            match rx.recv_timeout(left) {
                 Ok(JobOutcome::Done(index, out)) => {
+                    stall.progress();
                     if let Some(slot) = outs.get_mut(index) {
                         *slot = Some(out);
                         received += 1;
                     }
                 }
                 Ok(JobOutcome::Failed(index, error)) => {
+                    stall.progress();
                     if failure.as_ref().is_none_or(|(i, _)| index < *i) {
                         failure = Some((index, error));
                     }
@@ -1986,5 +2027,114 @@ mod tests {
             .unwrap();
         let got = pending.finish(LONG).unwrap();
         assert!(got.iter().any(|&v| v != 0.0));
+    }
+
+    /// A fake slow source: the answers of a layer arrive one by one, each within the window, the
+    /// whole run far past it, as a cold first token reading its pages does.
+    fn paced_layer(
+        answers: usize,
+        pace: Duration,
+        stall_after: Option<(usize, Duration)>,
+    ) -> super::PendingLayer {
+        use super::{JobOutcome, PendingLayer};
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for index in 0..answers {
+                if let Some((after, hang)) = stall_after
+                    && index == after
+                {
+                    std::thread::sleep(hang);
+                }
+                std::thread::sleep(pace);
+                if tx.send(JobOutcome::Done(index, vec![1.0, 2.0])).is_err() {
+                    return;
+                }
+            }
+        });
+        PendingLayer {
+            rx,
+            weights: vec![1.0; answers],
+            hidden: 2,
+        }
+    }
+
+    #[test]
+    fn a_source_that_keeps_answering_never_trips_the_watchdog() {
+        // Eight answers, 60 ms apart: 480 ms in all against a 150 ms window.
+        let started = Instant::now();
+        let sum = paced_layer(8, Duration::from_millis(60), None)
+            .finish(Duration::from_millis(150))
+            .expect("every answer renews the window");
+        assert!(started.elapsed() > Duration::from_millis(400));
+        assert_eq!(sum, vec![8.0, 16.0]);
+    }
+
+    #[test]
+    fn a_source_that_stops_answering_fails_after_the_window_by_name() {
+        // Two answers, then nothing for 900 ms against a 150 ms window.
+        let started = Instant::now();
+        let err = paced_layer(
+            5,
+            Duration::from_millis(20),
+            Some((2, Duration::from_millis(900))),
+        )
+        .finish(Duration::from_millis(150))
+        .unwrap_err();
+        let PoolError::Timeout { waited_ms, pending } = err else {
+            panic!("expected Timeout, got {err:?}")
+        };
+        assert_eq!(pending, 3);
+        assert!((140..600).contains(&waited_ms), "waited {waited_ms} ms");
+        assert!(started.elapsed() < Duration::from_millis(800));
+    }
+
+    #[test]
+    fn a_slow_chunk_that_keeps_answering_is_served_and_a_stalled_one_fails() {
+        use super::{ChunkJobOutcome, PendingChunk};
+        let chunk = |stall: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for index in 0..6 {
+                    std::thread::sleep(Duration::from_millis(60));
+                    if stall && index == 3 {
+                        std::thread::sleep(Duration::from_millis(900));
+                    }
+                    if tx
+                        .send(ChunkJobOutcome::Done(index, vec![(0, vec![1.0, 1.0])]))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            PendingChunk {
+                rx,
+                row_weights: vec![vec![0.5]; 6],
+                m: 1,
+                hidden: 2,
+            }
+        };
+        let out = chunk(false)
+            .finish(Duration::from_millis(150))
+            .expect("a slow chunk that keeps answering");
+        assert_eq!(out, vec![3.0, 3.0]);
+        let err = chunk(true).finish(Duration::from_millis(150)).unwrap_err();
+        assert!(
+            matches!(err, PoolError::Timeout { pending: 3, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_counts_from_the_last_answer() {
+        let mut stall = super::Stall::new(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!stall.left().is_zero());
+        stall.progress();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!stall.left().is_zero(), "an answer renewed the window");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(stall.left().is_zero());
+        assert!(stall.quiet_ms() >= 100);
     }
 }
