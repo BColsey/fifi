@@ -978,7 +978,9 @@ mod card_tests {
                     continue;
                 }
                 let weights: u64 = header.tensors().iter().map(|t| t.byte_len()).sum();
-                let budget = (free - weights - crate::family::mem::DEVICE.load_unplanned)
+                let budget = free
+                    .saturating_sub(weights)
+                    .saturating_sub(crate::family::mem::DEVICE.load_unplanned)
                     .saturating_sub(1 << 30) as usize;
                 let admits = |kv: KvDtype, context: u32| {
                     let mode = if kv == KvDtype::Q8 {
