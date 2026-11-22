@@ -1432,19 +1432,54 @@ fn int8_cache_usable(plan: &StartupPlan) -> bool {
     )
 }
 
-/// The device bytes of the smallest prefill chunk the ladder admits: its arena and the attention
-/// work buffer. A start needs them beside the weights and the cache whatever its context, so the
-/// card choice funds them first.
-fn smallest_prefill_bytes(projector: &CudaProjector) -> Result<u64, EngError> {
+/// Whether the prefill admission keeps a chunk arena for a cache form at a context, from the free
+/// bytes before the weights are uploaded: the admission's own rule (`smallest_chunk_passes`) over
+/// the state at that context, with what the weight load takes beyond its planned tensor bytes, the
+/// headroom, the decode arena and the device prefix tip charged as the admission charges them.
+fn prefill_admits_of<'a>(
+    projector: &CudaProjector,
+    settings: &'a Q36Settings,
+    plan: &'a StartupPlan,
+    (free, weights): (u64, u64),
+) -> Result<impl Fn(KvDtype, u32) -> bool + 'a, EngError> {
     let dims = StepDims::new(
         &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?,
         &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
     )?;
     let nsm = projector.context().mmq_device_facts()?.nsm;
-    let smallest = super::prefill_plan::chunk_costs(&dims, nsm)?.pop();
-    Ok(smallest.map_or(0, |cost| {
-        (cost.arena + super::prefill_plan::PART_CHARGE) as u64
-    }))
+    let tip = match plan.modes.prefix {
+        PrefixMemory::DeviceTip => {
+            crate::family::qwen::qwen36::settings::delta_state_bytes(&settings.spec)?
+        }
+        _ => 0,
+    };
+    let after_load = free
+        .saturating_sub(weights)
+        .saturating_sub(crate::family::mem::DEVICE.load_unplanned);
+    let budget = after_load.saturating_sub(prefill_headroom(plan.modes.fixed_admission) as u64);
+    Ok(move |kv: KvDtype, context: u32| {
+        // The fixed KV8 admission has its own rule; only the fp16 cache is asked here.
+        let Ok(mode @ KvMode::Fp16) = kv_mode_of(kv, WeightLayout::Native) else {
+            return true;
+        };
+        let Ok(options) = step_options(context, WeightLayout::Native, mode) else {
+            return true;
+        };
+        let Ok(state) = StateLayout::new(&dims, &options).and_then(|layout| layout.bytes()) else {
+            return true;
+        };
+        let decode = KernelScratch::for_dims(&dims, STEP_ROWS, mode)
+            .and_then(|scratch| StepPlan::new(&dims, STEP_ROWS, &options, &scratch))
+            .map_or(0, |step| step.arena_bytes());
+        super::prefill_plan::smallest_chunk_passes(
+            &dims,
+            nsm,
+            usize::try_from(budget).unwrap_or(usize::MAX),
+            (decode, tip as usize),
+            state,
+        )
+        .unwrap_or(true)
+    })
 }
 
 /// The cache form and context of a start that left them to the card, asked before any weight is
@@ -1473,12 +1508,12 @@ fn card_fit(
         CudaFitAsk {
             free,
             weights,
-            arena: smallest_prefill_bytes(projector)?,
             int8_usable: int8_cache_usable(plan),
             kv: (!settings.kv_auto).then_some(settings.kv),
             context: (!settings.context_auto).then_some(settings.context_limit),
         },
         &load_need_of(settings, plan),
+        &prefill_admits_of(projector, settings, plan, (free, weights))?,
     )?
     else {
         return Ok(None);
@@ -1532,12 +1567,12 @@ fn replan_smaller(
         CudaFitAsk {
             free,
             weights,
-            arena: smallest_prefill_bytes(projector)?,
             int8_usable: true,
             kv: Some(settings.kv),
             context: Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
         },
         &load_need_of(settings, plan),
+        &prefill_admits_of(projector, settings, plan, (free, weights))?,
     )?
     else {
         return Ok(None);

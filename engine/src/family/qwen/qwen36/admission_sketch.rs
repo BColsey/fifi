@@ -243,14 +243,13 @@ pub(crate) type CudaFit =
 pub(crate) const FP16_SUFFICIENT_CONTEXT: u32 = 131_072;
 
 /// What a start asks the card fit: the card's free bytes before the weights are uploaded, the
-/// weight bytes the load pins, the arena bytes the prefill needs beside them, whether the step can
+/// weight bytes the load pins, whether the step can
 /// run the int8 cache, and the cache form and context the config fixed (an absent one is chosen).
 #[derive(Clone, Copy)]
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) struct CudaFitAsk {
     pub(crate) free: u64,
     pub(crate) weights: u64,
-    pub(crate) arena: u64,
     pub(crate) int8_usable: bool,
     pub(crate) kv: Option<crate::family::qwen::qwen36::settings::KvDtype>,
     pub(crate) context: Option<u32>,
@@ -268,11 +267,11 @@ pub(crate) fn choose_cuda_fit(
     spec: &crate::family::spec::FamilySpec,
     ask: CudaFitAsk,
     load_need: &dyn Fn(crate::family::qwen::qwen36::settings::KvDtype, u32) -> Option<u64>,
+    prefill_admits: &dyn Fn(crate::family::qwen::qwen36::settings::KvDtype, u32) -> bool,
 ) -> Result<Option<CudaFit>, crate::EngError> {
     let CudaFitAsk {
         free,
         weights,
-        arena,
         int8_usable,
         kv,
         context,
@@ -286,10 +285,18 @@ pub(crate) fn choose_cuda_fit(
     // headroom it keeps) is a floor under the sketch's sum: a plan that passes the sketch and
     // fails the load would send the start down to the tiered rung.
     let fp16 = |context: u32| {
+        // A context whose state leaves the prefill admission no room has no prefill arena: it is
+        // no context (the admission's own arithmetic, asked before the weights are uploaded).
+        if !prefill_admits(KvDtype::F32, context) {
+            return None;
+        }
         let sketch = fp16_demand(context).ok()?.total_after_weights().ok()?;
         Some(sketch.max(load_need(KvDtype::F32, context)?))
     };
     let int8 = |context: u32| {
+        if !prefill_admits(KvDtype::Q8, context) {
+            return None;
+        }
         let sketch = int8_demand(context).ok()?.total_after_weights().ok()?;
         Some(sketch.max(load_need(KvDtype::Q8, context)?))
     };
@@ -317,8 +324,7 @@ pub(crate) fn choose_cuda_fit(
             free,
             weights,
             band: ADMISSION_UNCERTAINTY_BAND_BYTES,
-            // The sketch's flat floor already carries an arena allowance; only the rest is new.
-            arena: arena.saturating_sub(RUNTIME_OVERHEAD_FLOOR_BYTES),
+            arena: 0,
         },
         &named,
         ContextLimits {
@@ -724,12 +730,13 @@ mod tests {
             CudaFitAsk {
                 free,
                 weights: WEIGHTS,
-                arena: 0,
+
                 int8_usable: false,
                 kv: None,
                 context: None,
             },
             none,
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -741,12 +748,13 @@ mod tests {
             CudaFitAsk {
                 free,
                 weights: WEIGHTS,
-                arena: 0,
+
                 int8_usable: false,
                 kv: None,
                 context: Some(262_144),
             },
             none,
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -757,12 +765,13 @@ mod tests {
             CudaFitAsk {
                 free,
                 weights: WEIGHTS,
-                arena: 0,
+
                 int8_usable: false,
                 kv: Some(KvDtype::Q8),
                 context: None,
             },
             none,
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");

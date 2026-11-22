@@ -1,7 +1,7 @@
 //! The pure plan of chunked prefill: the two-term chunk policy and the chunk list, the admission
 //! rule, and the arena tensor list of one chunk.
 //!
-//! Host arithmetic only: no CUDA call. It sits in `family::qwen::qwen36::cuda`, so it compiles with
+//! Host arithmetic only: no CUDA call. It sits in `family::qwen36::cuda`, so it compiles with
 //! that module (`native-cuda` on Linux) and not in the default feature set; it calls the
 //! `kernels::cuda` sizing functions, and `kernels::cuda` never calls back. Every tensor size is
 //! the output of the function that owns the formula (the sister wrappers, `mmq_size`, the
@@ -743,6 +743,31 @@ pub(crate) fn chunk_costs(dims: &StepDims, nsm: usize) -> Result<Vec<ChunkCost>,
     M_LADDER.iter().map(|&m| chunk_cost(dims, m, nsm)).collect()
 }
 
+/// Whether the prefill admission keeps a chunk arena at all for a start whose resident state is
+/// `state` bytes: the smallest rung of the ladder passes the admission's own rule with `budget`
+/// device bytes (free after the weight load, less the headroom), the decode arena, and the
+/// device prefix tip. The card choice asks this before it sizes the context, so it cannot pick a
+/// context whose state leaves the prefill one token per step.
+pub(crate) fn smallest_chunk_passes(
+    dims: &StepDims,
+    nsm: usize,
+    budget: usize,
+    (decode_arena, tip): (usize, usize),
+    state: usize,
+) -> Result<bool, EngError> {
+    let mut admission = Admission::qwen36(budget);
+    admission.decode_arena = decode_arena;
+    if tip > 0 {
+        admission.device_extras.push(Extra {
+            name: "device-prefix-delta",
+            fixed: tip,
+            bytes_per_token: 0,
+        });
+    }
+    let smallest = chunk_costs(dims, nsm)?.pop().ok_or_else(overflow)?;
+    admission.passes(state, &smallest)
+}
+
 #[cfg(test)]
 mod card_tests {
     use super::*;
@@ -881,11 +906,11 @@ mod card_tests {
     }
 
     /// The default start of every local Qwen3.6-architecture GGUF on a free 3090: the context the
-    /// card fit picks with and without funding the prefill arena of the smallest chunk first.
-    /// Reads headers only.
+    /// card fit picks without and with the prefill admission asked first, and the figures the
+    /// admission charges at each. Reads headers only.
     #[test]
     #[ignore = "reads the real GGUF headers under $HOME/models and $HOME/.ollama"]
-    fn the_default_fit_funds_the_prefill_arena_of_every_local_qwen36_gguf() {
+    fn the_default_fit_keeps_a_prefill_arena_for_every_local_qwen36_gguf() {
         use crate::family::qwen::qwen36::admission_sketch::{
             CudaFitAsk, choose_cuda_fit, cuda_kv_per_position,
         };
@@ -899,14 +924,8 @@ mod card_tests {
         )
         .expect("shape");
         let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
-        let arena = chunk_costs(&dims, 82)
-            .expect("costs")
-            .pop()
-            .map_or(0, |cost| (cost.arena + PART_CHARGE) as u64);
-        eprintln!(
-            "smallest chunk arena and part at 82 SMs: {} MiB",
-            arena >> 20
-        );
+        let tip = crate::family::qwen::qwen36::settings::delta_state_bytes(&QWEN3_6_35B_A3B).expect("tip")
+            as usize;
         let home = PathBuf::from(std::env::var("HOME").unwrap());
         let mut files: Vec<PathBuf> = Vec::new();
         for dir in [
@@ -937,7 +956,7 @@ mod card_tests {
                     },
             )
         };
-        for free in [23_416u64 << 20, 24_000 << 20] {
+        for free in [22_820u64 << 20, 23_416 << 20, 24_000 << 20] {
             eprintln!("--- {} MiB free", free >> 20);
             for path in &files {
                 let mut magic = [0u8; 4];
@@ -959,27 +978,52 @@ mod card_tests {
                     continue;
                 }
                 let weights: u64 = header.tensors().iter().map(|t| t.byte_len()).sum();
-                let fit = |arena| {
+                let budget = (free - weights - crate::family::mem::DEVICE.load_unplanned)
+                    .saturating_sub(1 << 30) as usize;
+                let admits = |kv: KvDtype, context: u32| {
+                    let mode = if kv == KvDtype::Q8 {
+                        KvMode::Int8G32
+                    } else {
+                        KvMode::Fp16
+                    };
+                    if mode != KvMode::Fp16 {
+                        return true;
+                    }
+                    let options = StepOptions {
+                        kv_mode: mode,
+                        context_tokens: context as usize,
+                        delta_slots: 1,
+                        forked_experts: false,
+                        tiered: None,
+                        layout: WeightLayout::Native,
+                    };
+                    let state = StateLayout::new(&dims, &options)
+                        .and_then(|layout| layout.bytes())
+                        .expect("state");
+                    smallest_chunk_passes(&dims, 82, budget, (3 << 20, tip), state).expect("passes")
+                };
+                let fit = |admits: &dyn Fn(KvDtype, u32) -> bool| {
                     choose_cuda_fit(
                         &QWEN3_6_35B_A3B,
-                        free,
-                        weights,
-                        arena,
-                        true,
-                        None,
-                        None,
+                        CudaFitAsk {
+                            free,
+                            weights,
+                            int8_usable: true,
+                            kv: None,
+                            context: None,
+                        },
                         &floor,
+                        admits,
                     )
                     .unwrap()
                 };
-                let (before, after) = (fit(0), fit(arena));
+                let (without, with) = (fit(&|_, _| true), fit(&admits));
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 eprintln!(
-                    "{name:60.60} weights {:.2} GiB | without {before:?} | with {after:?}",
+                    "{name:60.60} weights {:.2} GiB | without {without:?} | with {with:?}",
                     weights as f64 / (1u64 << 30) as f64
                 );
-                // Funding the arena never lengthens the context.
-                assert!(after.map_or(0, |f| f.context) <= before.map_or(0, |f| f.context));
+                assert!(with.map_or(0, |f| f.context) <= without.map_or(0, |f| f.context));
             }
         }
     }
