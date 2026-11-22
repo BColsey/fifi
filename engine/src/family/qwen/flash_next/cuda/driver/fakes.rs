@@ -379,11 +379,24 @@ pub(in super::super::super) fn exercise_host_feed<F: TokenFeeds>(
     driver.feed(1).unwrap();
     assert_eq!(driver.fed(), 1);
     assert_eq!(driver.feeds.ple_state().unwrap().0, &[1]);
-    driver.device.fail = Some("write_back");
-    assert!(driver.feed(2).is_err());
+    use super::ResumesState;
+    let saved = driver.save_resume().unwrap();
+    driver.feed(2).unwrap();
+    let (history, ring) = driver.feeds.ple_state().unwrap();
+    let expected = (history.to_vec(), ring.to_vec());
+    driver.restore_resume(&saved).unwrap();
     assert_eq!(driver.fed(), 1);
+    assert_eq!(driver.feeds.ple_state().unwrap().0, &[1]);
+    driver.feed(2).unwrap();
+    assert_eq!(
+        driver.feeds.ple_state().unwrap(),
+        (expected.0.as_slice(), expected.1.as_slice())
+    );
+    driver.device.fail = Some("write_back");
+    assert!(driver.feed(3).is_err());
+    assert_eq!(driver.fed(), 2);
     assert!(
-        driver.feed(2).is_err(),
+        driver.feed(3).is_err(),
         "failed device write poisons the driver"
     );
     driver.reset().unwrap();
