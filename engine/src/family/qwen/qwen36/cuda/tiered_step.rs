@@ -241,6 +241,13 @@ pub(super) struct FillQueue {
     queued: bool,
 }
 
+impl Drop for FillQueue {
+    fn drop(&mut self) {
+        // A copy still reading the host store must finish before the store is released.
+        let _ = self.wait();
+    }
+}
+
 impl FillQueue {
     pub(super) fn new(ctx: &CudaContext) -> Result<Self, EngError> {
         Ok(Self {
@@ -316,12 +323,13 @@ impl BankDevice for BankFill<'_> {
 }
 
 pub(super) struct TieredRuntime<'w> {
+    /// The copy stream the bank fills run on. First, so it drops (and waits its last copy)
+    /// before the host releases the memory those copies read.
+    fills: FillQueue,
     parts: Vec<LayerParts<'w>>,
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
-    /// The copy stream the bank fills run on.
-    fills: FillQueue,
     /// The cold staging bank of the chunked prefill: `None` when admission left no
     /// spare VRAM for it (the chunk path then keeps the CPU pool for every miss).
     cold: Option<ColdStaging>,

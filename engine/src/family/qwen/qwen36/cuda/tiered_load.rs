@@ -22,7 +22,9 @@ use super::step::QwenResidentStep;
 use super::tiered_step::ColdStaging;
 use crate::EngError;
 use crate::family::device_budget::KvPlan;
+use crate::family::expert_bank::pinned_region::PinnedRegion;
 use crate::family::mapped_file::MappedFile;
+use crate::family::mem::HostFacts;
 use crate::family::tier_budget::{ExpertSize, VramBudget, plan_vram};
 use crate::kernels::cuda::{CudaContext, ExpertBank, ExpertBankGeometry};
 use crate::kernels::expert_cpu::ExpertShape;
@@ -261,7 +263,10 @@ pub(super) fn build_tiered(
     .map_err(|error| checkpoint(format!("{error:?}")))?;
     let mapped = MappedFile::open(gguf, header.file_len())
         .map_err(|error| checkpoint(format!("mapping {}: {error}", gguf.display())))?;
-    let region: Arc<dyn MappedRegion> = Arc::new(mapped);
+    let region: Arc<dyn MappedRegion> = match pinned_copy(&mapped) {
+        Some(pinned) => Arc::new(pinned),
+        None => Arc::new(mapped),
+    };
     let pool = tier_pool(plan.threads, shape)
         .map_err(|error| checkpoint(format!("cpu pool: {error:?}")))?;
     let config = TieredConfig {
@@ -366,6 +371,34 @@ pub(super) fn attach_tiered_parts(
         step.preload_tiered()?;
     }
     Ok(slots)
+}
+
+/// A page-locked copy of the checkpoint for the CPU pool and the bank fills to read, when the
+/// host budget admits one; `None` keeps them on the mapping. The line says which one serves.
+fn pinned_copy(mapped: &MappedFile) -> Option<PinnedRegion> {
+    let label = "q36 cuda: tiered expert store";
+    let facts = match HostFacts::read(label, label) {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!(
+                "{label}: the host memory is unreadable ({error:?}); experts stay in the page cache"
+            );
+            return None;
+        }
+    };
+    match PinnedRegion::copy_of(mapped.as_ref(), &facts, label) {
+        Ok(pinned) => {
+            eprintln!(
+                "{label}: {} bytes held in page-locked memory",
+                mapped.as_ref().len()
+            );
+            Some(pinned)
+        }
+        Err(error) => {
+            eprintln!("{label}: experts stay in the page cache ({error:?})");
+            None
+        }
+    }
 }
 
 /// The device bytes kept free beside the banks: the loader's headroom (1 GiB).

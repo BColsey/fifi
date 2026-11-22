@@ -16,6 +16,8 @@ pub(crate) mod layer_stream;
 pub(crate) mod layer_stream_card;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod layer_stream_card_tests;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) mod pinned_region;
 // disk_store is host-only and unwired on purpose until the config keys and
 // the restore path exist; drop this allow when they do.
 #[expect(
