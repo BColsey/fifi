@@ -527,13 +527,15 @@ mod tests {
         let free = free_for(KvDtype::F32, WEIGHTS, MODEL_MAX_CONTEXT);
         let fit = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            None,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: None,
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap();
         assert_eq!(
@@ -550,13 +552,15 @@ mod tests {
         let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
         let fit = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            None,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: None,
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -569,13 +573,15 @@ mod tests {
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
         let fit = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            None,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: None,
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -596,13 +602,15 @@ mod tests {
         // The form is fixed: only that form is weighed, whatever the other would reach.
         let fixed = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            Some(KvDtype::F32),
-            None,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: Some(KvDtype::F32),
+                context: None,
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -610,13 +618,15 @@ mod tests {
         // The context is fixed and fp16 holds it: fp16 serves exactly that context.
         let named = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            Some(65_536),
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: Some(65_536),
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -624,13 +634,15 @@ mod tests {
         // The context is fixed, fp16 cannot hold it and int8 can: int8 serves it.
         let wide = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            Some(180_224),
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: Some(180_224),
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -644,13 +656,15 @@ mod tests {
         let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
         let named = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            Some(262_144),
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: Some(262_144),
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("fits");
@@ -668,13 +682,15 @@ mod tests {
         assert!(!admits_cuda(free, WEIGHTS, &int8_demand, 262_144));
         let named = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            Some(262_144),
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: Some(262_144),
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap()
         .expect("a smaller context fits");
@@ -692,26 +708,30 @@ mod tests {
         let free = free_for(KvDtype::Q8, WEIGHTS, 1024) - 1;
         let fit = choose_cuda_fit(
             &QWEN3_6_35B_A3B,
-            free,
-            WEIGHTS,
-            0,
-            true,
-            None,
-            None,
+            CudaFitAsk {
+                free,
+                weights: WEIGHTS,
+                int8_usable: true,
+                kv: None,
+                context: None,
+            },
             &|_, _| Some(0),
+            &|_, _| true,
         )
         .unwrap();
         assert_eq!(fit, None);
         assert_eq!(
             choose_cuda_fit(
                 &QWEN3_6_35B_A3B,
-                WEIGHTS - 1,
-                WEIGHTS,
-                0,
-                true,
-                None,
-                None,
-                &|_, _| Some(0)
+                CudaFitAsk {
+                    free: WEIGHTS - 1,
+                    weights: WEIGHTS,
+                    int8_usable: true,
+                    kv: None,
+                    context: None
+                },
+                &|_, _| Some(0),
+                &|_, _| true
             )
             .unwrap(),
             None
