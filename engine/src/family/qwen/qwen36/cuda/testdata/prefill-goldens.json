@@ -155,6 +155,19 @@
       "prompt_sha256": "b6b3989689d7014994c3e95b9da778930bb6bd06ac373bcb2be50981548aa7bc",
       "stage_sha256": "a3f3a71fe8bc8f1c76c1da956b2c51214ab7ae2ab84985a9874e0eb254a701e8",
       "verdict": "Ready { m_sess: 1024 }"
+    },
+    "gguf-fp16-2048": {
+      "cap": 2048,
+      "commit": "20f22c7fb32781fa30987ec0d551fc8cef4c7495",
+      "export_sha256": "6d94dcdc18885deb5dbd7b24cb3bb157a3ee1b9fc6959921c19ff1d014231271",
+      "gpu_cc": 860,
+      "gpu_nsm": 82,
+      "kv": "fp16",
+      "logits_sha256": "38ecd19241ca153b97821807775dbabe3bddc715f27661415e98ed67c96be552",
+      "pack_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+      "prompt_sha256": "b6b3989689d7014994c3e95b9da778930bb6bd06ac373bcb2be50981548aa7bc",
+      "stage_sha256": "990e72b0a796202fb59ecbcd1534dba327e7d837279c1a444a2e5c3bd5db59e7",
+      "verdict": "Ready { m_sess: 2048 }"
     }
   },
   "host": {
