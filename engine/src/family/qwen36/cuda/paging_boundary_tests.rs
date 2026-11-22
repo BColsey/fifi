@@ -6,8 +6,8 @@ use super::{
         check, dequantize, floats, inputs, plane, query_and_gate, read, reference, upload,
     },
     paging_store::{PageAttention, PageChunk, PageId, PagedKv},
-    state_layout::{KvPool, Plane},
 };
+use crate::family::decode_step::state_layout::{KvPool, Plane};
 use crate::{
     EngError,
     kernels::cuda::{

@@ -14,11 +14,9 @@
 //! outside the arena; its real size is reported in [`ChunkCost`] beside the flat 64 MiB charge,
 //! which this plan keeps until a decision on the difference.
 
-use super::{
-    dims::{KvMode, StepDims, StepOptions},
-    mixer_geometry::MixerGeometry,
-    state_layout::{KvPool, StateLayout},
-};
+use super::dims::{KvMode, StepDims, StepOptions};
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::state_layout::{KvPool, StateLayout};
 use crate::{
     EngError,
     family::project::cuda::WeightLayout,
@@ -773,12 +771,14 @@ mod card_tests {
         let full_total: usize = plan_arena(&full.iter().map(|(_, t)| *t).collect::<Vec<_>>())
             .expect("full arena")
             .total;
-        let table = super::super::shard::ShardTable::new(&shape, 2, 32).expect("table");
+        let table =
+            crate::family::decode_step::shard::ShardTable::new(&shape, 2, 32).expect("table");
         let mut card_totals = Vec::new();
         for card in 0..2 {
-            let geometry =
-                super::super::mixer_geometry::MixerGeometry::for_card(&dims, &table, card)
-                    .expect("card geometry");
+            let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::for_card(
+                &dims, &table, card,
+            )
+            .expect("card geometry");
             let moe = crate::family::qwen36::host::MoeDims {
                 inter: table.expert_inter(card).expect("inter").len(),
                 shared_inter: table.shared_inter(card).expect("shared").len(),
@@ -823,7 +823,8 @@ mod card_tests {
         )
         .expect("shape");
         let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
-        let table = super::super::shard::ShardTable::new(&shape, 2, 32).expect("table");
+        let table =
+            crate::family::decode_step::shard::ShardTable::new(&shape, 2, 32).expect("table");
         let single = chunk_tensors(&dims, 512, 28).expect("single-device plan");
         let single_delta = single
             .iter()
@@ -832,9 +833,10 @@ mod card_tests {
             .1;
         assert_eq!(single_delta.last, Phase::NormF as usize);
         for card in 0..2 {
-            let geometry =
-                super::super::mixer_geometry::MixerGeometry::for_card(&dims, &table, card)
-                    .expect("card geometry");
+            let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::for_card(
+                &dims, &table, card,
+            )
+            .expect("card geometry");
             let moe = crate::family::qwen36::host::MoeDims {
                 inter: table.expert_inter(card).expect("inter").len(),
                 shared_inter: table.shared_inter(card).expect("shared").len(),

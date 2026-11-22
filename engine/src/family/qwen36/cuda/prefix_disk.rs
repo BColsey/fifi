@@ -13,12 +13,12 @@ use super::super::{
         LAYOUT_TAG, ResidentState,
         pinned::{PinnedLanding, PrefixPinPool},
     },
-    state_layout::StateLayout,
 };
 use super::QwenResidentStep;
 use crate::{
     EngError,
     family::{
+        decode_step::state_layout::StateLayout,
         kv_disk::{
             DiskTier, FamilyContract, HostFamily, HostStoreDisk, LoadIdentity, PUMP_EMIT_BYTES,
             PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Resolved, SlabLayout, SlotBytes, SnapshotView,
@@ -134,7 +134,7 @@ impl HostFamily for QwenFamily<'_> {
 /// so an entry written under one form is never found by a load of the other.
 fn load_identity_of(
     identity: &crate::family::session::PrefixIdentity,
-    layout: &super::super::state_layout::StateLayout,
+    layout: &StateLayout,
 ) -> LoadIdentity {
     let per_token: usize = layout
         .kv
@@ -324,9 +324,9 @@ mod tests {
     use super::super::super::{
         dims::{KvMode, StepDims},
         start::step_options,
-        state_layout::StateLayout,
     };
     use super::*;
+    use crate::family::decode_step::state_layout::StateLayout;
     use crate::family::{
         QWEN3_6_35B_A3B, gguf_model::Inventory, qwen36::host::HostShape, session::PrefixIdentity,
     };

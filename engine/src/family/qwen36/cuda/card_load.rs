@@ -17,9 +17,9 @@
 //! replicated copy, because that is what the card uploads and holds.
 
 use crate::EngError;
+use crate::family::decode_step::shard::{ShardLoad, ShardTable, shard_loads};
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::cuda::placement::plan_type;
-use crate::family::qwen36::cuda::shard::{ShardLoad, ShardTable, shard_loads};
 use crate::kernels::cuda::plan::{TensorSlice, native_device_bytes, plan_slice_rows};
 use crate::weights::GgufType;
 

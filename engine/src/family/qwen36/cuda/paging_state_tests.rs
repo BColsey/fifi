@@ -5,8 +5,8 @@ use super::{
     paging_pipeline_tests::read,
     paging_plan::PagingPlan,
     state::ResidentState,
-    state_layout::{Plane, StateLayout},
 };
+use crate::family::decode_step::state_layout::{Plane, StateLayout};
 use crate::family::graph_state::book::Health;
 use crate::family::state_words::Word;
 use crate::{

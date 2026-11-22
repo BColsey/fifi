@@ -1,10 +1,11 @@
 //! Committed checkpoint payloads and numerical path identity for Qwen CUDA prefix reuse.
 
+use super::dims::KvMode;
 use super::state::{
     export::ExportedState,
     pinned::{PendingPinned, PinnedSnapshot},
 };
-use super::{dims::KvMode, state_layout::StateLayout};
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::{
     EngError,
     family::session::{DecodeSession, PrefixIdentity, PrefixSlot, SaveKind},

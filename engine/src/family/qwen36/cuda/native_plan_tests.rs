@@ -90,9 +90,9 @@ fn device_first_budget_keeps_only_whole_page_groups_on_the_device() {
 #[test]
 fn cached_state_keeps_logical_geometry_and_charges_only_physical_storage() {
     use super::{
-        paging_plan::PagingPlan, paging_store::device_first::DeviceCachePlan,
-        state::PagedStatePlan, state_layout::StateLayout,
+        paging_plan::PagingPlan, paging_store::device_first::DeviceCachePlan, state::PagedStatePlan,
     };
+    use crate::family::decode_step::state_layout::StateLayout;
     let d = dims();
     let opts = StepOptions {
         context_tokens: 1280,

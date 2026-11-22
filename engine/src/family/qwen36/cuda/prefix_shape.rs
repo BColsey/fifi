@@ -1,7 +1,7 @@
 //! Where the bytes of one Qwen3.6 prefix entry sit in a pinned slab: the DeltaNet state, then one
 //! object per attention layer, as the layout the shared disk tier cuts into files. Pure host
 //! arithmetic over a `StateLayout`.
-use super::state_layout::StateLayout;
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::{
     EngError,
     family::kv_disk::{ObjectRole, Run, SlabLayout},

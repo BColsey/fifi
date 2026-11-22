@@ -8,10 +8,10 @@
 //! `[m][rows]`). Stage 1 therefore runs the mixers at one row; a verify window or chunked prefill
 //! needs a matmul with a row stride or one concatenated weight.
 
-use super::dims::StepDims;
-use super::shard::ShardTable;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::project::cuda::WeightLayout;
+use crate::family::step_dims::StepDims;
 use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role},
@@ -19,52 +19,52 @@ use crate::{
 
 /// Columns of `DeltaProj` and the arguments of `gdn_conv` and `gdn_delta`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DeltaGeometry {
-    pub(super) key_heads: usize,
-    pub(super) value_heads: usize,
+pub(in crate::family) struct DeltaGeometry {
+    pub(in crate::family) key_heads: usize,
+    pub(in crate::family) value_heads: usize,
     /// Conv channels = q, k and v columns = rows of `attn_qkv`.
-    pub(super) channels: usize,
-    pub(super) z_rows: usize,
-    pub(super) beta_rows: usize,
-    pub(super) alpha_rows: usize,
-    pub(super) z_off: usize,
-    pub(super) beta_off: usize,
-    pub(super) alpha_off: usize,
+    pub(in crate::family) channels: usize,
+    pub(in crate::family) z_rows: usize,
+    pub(in crate::family) beta_rows: usize,
+    pub(in crate::family) alpha_rows: usize,
+    pub(in crate::family) z_off: usize,
+    pub(in crate::family) beta_off: usize,
+    pub(in crate::family) alpha_off: usize,
     /// Row length of `DeltaProj`.
-    pub(super) ld: usize,
+    pub(in crate::family) ld: usize,
     /// Columns of the delta-rule output = k of the `ssm_out` projection.
-    pub(super) value_width: usize,
+    pub(in crate::family) value_width: usize,
     /// Length of `ssm_norm`.
-    pub(super) value_dim: usize,
+    pub(in crate::family) value_dim: usize,
     /// Taps of the conv weights per channel (the causal conv kernel is fixed at 4).
-    pub(super) conv_kernel: usize,
+    pub(in crate::family) conv_kernel: usize,
 }
 
 /// Columns of `AttnProj` and the arguments of `attn_prep` and `attn_decode`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct AttnGeometry {
-    pub(super) heads_q: usize,
-    pub(super) heads_kv: usize,
-    pub(super) head_dim: usize,
-    pub(super) n_rot: usize,
-    pub(super) rope_base: f32,
-    pub(super) scale: f32,
-    pub(super) q_rows: usize,
-    pub(super) kv_rows: usize,
-    pub(super) k_off: usize,
-    pub(super) v_off: usize,
+pub(in crate::family) struct AttnGeometry {
+    pub(in crate::family) heads_q: usize,
+    pub(in crate::family) heads_kv: usize,
+    pub(in crate::family) head_dim: usize,
+    pub(in crate::family) n_rot: usize,
+    pub(in crate::family) rope_base: f32,
+    pub(in crate::family) scale: f32,
+    pub(in crate::family) q_rows: usize,
+    pub(in crate::family) kv_rows: usize,
+    pub(in crate::family) k_off: usize,
+    pub(in crate::family) v_off: usize,
     /// Row length of `AttnProj`.
-    pub(super) ld: usize,
+    pub(in crate::family) ld: usize,
     /// Columns of the attention output = k of the `attn_output` projection.
-    pub(super) q_width: usize,
+    pub(in crate::family) q_width: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct MixerGeometry {
-    pub(super) hidden: usize,
-    pub(super) eps: f32,
-    pub(super) delta: DeltaGeometry,
-    pub(super) attn: AttnGeometry,
+pub(in crate::family) struct MixerGeometry {
+    pub(in crate::family) hidden: usize,
+    pub(in crate::family) eps: f32,
+    pub(in crate::family) delta: DeltaGeometry,
+    pub(in crate::family) attn: AttnGeometry,
 }
 
 /// Taps of the causal conv kernel (`gdn_conv.h`: weights `[channels][4]`).
@@ -74,13 +74,13 @@ const CONV_TAPS: usize = 4;
 const PLAIN_ROLES: [Role; 2] = [Role::SsmBeta, Role::SsmAlpha];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RawSpec {
-    pub(super) role: Role,
-    pub(super) values: usize,
+pub(in crate::family) struct RawSpec {
+    pub(in crate::family) role: Role,
+    pub(in crate::family) values: usize,
 }
 
 impl MixerGeometry {
-    pub(super) fn new(dims: &StepDims) -> Result<Self, EngError> {
+    pub(in crate::family) fn new(dims: &StepDims) -> Result<Self, EngError> {
         let shape = &dims.shape;
         let (d, a) = (&shape.delta, &shape.attn);
         if d.conv_kernel != CONV_TAPS {
@@ -159,7 +159,7 @@ impl MixerGeometry {
     /// length. The full new K/V row still reappears on every card through
     /// the ring gather, but the append writes only the card's heads into
     /// its sliced cache planes.
-    pub(super) fn for_card(
+    pub(in crate::family) fn for_card(
         dims: &StepDims,
         table: &ShardTable,
         card: usize,
@@ -251,7 +251,7 @@ impl MixerGeometry {
     /// their summed rows under `AttnQkv` - the fused upload of `project::cuda` resolves that
     /// name to the row-concatenated matrix, and the single launch writes the same DeltaProj
     /// columns (contiguous by construction: `ld` is exactly the sum, re-checked here).
-    pub(super) fn dense_specs(
+    pub(in crate::family) fn dense_specs(
         &self,
         layout: WeightLayout,
         kind: AttentionKind,
@@ -269,7 +269,11 @@ impl MixerGeometry {
 
     /// The projections that stay plain F32 matrices beside the EXL3 ones: the pack does not
     /// quantize the 32-row step and decay gates of a DeltaNet layer.
-    pub(super) fn plain_specs(&self, layout: WeightLayout, kind: AttentionKind) -> Vec<DenseSpec> {
+    pub(in crate::family) fn plain_specs(
+        &self,
+        layout: WeightLayout,
+        kind: AttentionKind,
+    ) -> Vec<DenseSpec> {
         if layout != WeightLayout::Exl3 || kind != AttentionKind::DeltaNet {
             return Vec::new();
         }
@@ -290,7 +294,7 @@ impl MixerGeometry {
 
     /// The `dense_specs` twin with an explicit fusion flag, so the CPU tests pin both arms
     /// without touching the environment.
-    pub(super) fn dense_specs_with(
+    pub(in crate::family) fn dense_specs_with(
         &self,
         fuse_inproj: bool,
         kind: AttentionKind,
@@ -329,7 +333,10 @@ impl MixerGeometry {
         }
     }
 
-    pub(super) fn raw_specs(&self, kind: AttentionKind) -> Result<Vec<RawSpec>, EngError> {
+    pub(in crate::family) fn raw_specs(
+        &self,
+        kind: AttentionKind,
+    ) -> Result<Vec<RawSpec>, EngError> {
         let (h, d, a) = (self.hidden, &self.delta, &self.attn);
         let spec = |role, values| RawSpec { role, values };
         let mut specs = vec![spec(Role::AttnNorm, h), spec(Role::PostAttentionNorm, h)];
@@ -359,7 +366,7 @@ fn no_mixer(kind: AttentionKind) -> EngError {
 /// Refuses a NATIVE dense weight that is not the launch's shape: the shape rule of [`check_dense`]
 /// plus the MMVQ row-group rule of `matvec_q` (`ROWS_MULTIPLE`), `rows % 4 == 0` — the native
 /// loader accepts any row count, so the refusal belongs to the step's construction.
-pub(super) fn check_native_dense(
+pub(in crate::family) fn check_native_dense(
     name: &str,
     have: (usize, usize),
     want: &DenseSpec,

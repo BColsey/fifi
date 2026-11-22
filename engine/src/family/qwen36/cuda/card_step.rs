@@ -33,8 +33,8 @@
 )]
 
 use crate::EngError;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::qwen36::cuda::dims::{StepDims, StepOptions};
-use crate::family::qwen36::cuda::shard::ShardTable;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::{KernelScratch, StepPlan};
 use crate::kernels::cuda::peer_ring::{PeerRing, RingMode};
@@ -673,7 +673,7 @@ mod device_tests {
             );
             assert_eq!(
                 states[card].kv_bytes() + states[1 - card].kv_bytes(),
-                crate::family::qwen36::cuda::state_layout::StateLayout::new(&d, &options())
+                crate::family::decode_step::state_layout::StateLayout::new(&d, &options())
                     .expect("full layout")
                     .kv
                     .total,

@@ -17,10 +17,10 @@ use super::prefill_plan::{
     state_bytes,
 };
 use super::start::prefill_start_line;
-use super::state_layout::StateLayout;
 use super::step::{ChunkFacts, ChunkVerdict, chunk_verdict};
 use super::step_plan::{KernelScratch, StepPlan};
 use crate::EngError;
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::project::cuda::WeightLayout;
 

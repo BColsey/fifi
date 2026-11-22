@@ -4,8 +4,8 @@ use super::{
     native_device_rig::{device_present, f16},
     paging_plan::PagingPlan,
     paging_store::{PageAttention, PageChunk, PageId, PagedKv},
-    state_layout::{KvPool, Plane},
 };
+use crate::family::decode_step::state_layout::{KvPool, Plane};
 use crate::{
     EngError,
     kernels::cuda::{

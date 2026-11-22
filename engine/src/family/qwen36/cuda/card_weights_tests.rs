@@ -1,9 +1,9 @@
 //! Host tests of the upload-plan half of the manifest: what one card
 //! names, what it slices, and what it must not name at all.
+use crate::family::decode_step::shard::{ShardLoad, ShardTable};
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::cuda::card_load::card_loads;
 use crate::family::qwen36::cuda::card_weights::card_upload_plan;
-use crate::family::qwen36::cuda::shard::{ShardLoad, ShardTable};
 use crate::family::qwen36::host::HostShape;
 use crate::family::spec::QWEN3_6_35B_A3B;
 use crate::weights::GgufType;

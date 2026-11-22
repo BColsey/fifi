@@ -97,7 +97,6 @@ mod layer_tests;
 #[path = "m3_run.rs"]
 mod m3_run;
 mod mixer;
-pub(in crate::family) mod mixer_geometry;
 mod mixer_ops;
 mod mixer_shapes;
 #[cfg(test)]
@@ -202,7 +201,6 @@ mod section_timing_device_tests;
 mod section_timing_tests;
 #[cfg(test)]
 mod shape_tests;
-mod shard;
 mod sparse_exec;
 #[cfg(test)]
 mod sparse_step_device_tests;
@@ -216,7 +214,6 @@ mod start_pins;
 #[cfg(test)]
 mod start_tests;
 mod state;
-pub(in crate::family) mod state_layout;
 mod step;
 mod step_ops;
 #[cfg(test)]

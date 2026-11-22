@@ -53,7 +53,6 @@ use super::super::{
     mixer_weights::LayerWeights,
     resources::{EmbedWeight, HeadWeight},
     state::{StepField, rollback::SnapPart},
-    state_layout::Plane,
     step_ops::{RowsOp, StepOp, final_resid, resid_in, resid_out, token_ops_rows},
     step_plan::Slot,
     verdict::{FailureAction, action_for},
@@ -62,6 +61,7 @@ use super::{
     Mode, QwenResidentStep,
     krow_graph::{ENTERED_BY_GRAPH, Facts},
 };
+use crate::family::decode_step::state_layout::Plane;
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 #[cfg(test)]
 use crate::family::speculate::d1_oracle::Fault;

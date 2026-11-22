@@ -901,11 +901,11 @@ fn chunk_moe_resident_matches_the_host_reference() {
 // ---- the five-layer rig (real dims) -----------------------------------------------------------
 
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::mixer_geometry::MixerGeometry;
 use super::mixer_weights::LayerWeights;
 use super::prefill::ChunkMoe;
 use super::prefill_plan::Phase;
 use super::state::{ResidentState, StepField};
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Role;
 use crate::family::state_words::Word;
@@ -1456,7 +1456,10 @@ fn chunk_body_maps_faults_into_the_prefill_word() {
         let rig = build_rig()?;
         let mut state = rig_state(&rig, KvMode::Fp16)?;
         for ordinal in 0..state.layout().kv.layers {
-            for plane in [super::state_layout::Plane::K, super::state_layout::Plane::V] {
+            for plane in [
+                crate::family::decode_step::state_layout::Plane::K,
+                crate::family::decode_step::state_layout::Plane::V,
+            ] {
                 let range = state.kv_plane(ordinal, plane)?;
                 ff_fill(&rig.stream, &range, range.bytes())?;
             }
@@ -1495,7 +1498,7 @@ fn chunk_body_maps_faults_into_the_prefill_word() {
         h_view
             .buffer()
             .read_at(&rig.stream, h_view.offset(), &mut h)?;
-        let kv = state.kv_plane(0, super::state_layout::Plane::K)?;
+        let kv = state.kv_plane(0, crate::family::decode_step::state_layout::Plane::K)?;
         let mut kv_bytes = vec![0u8; kv.bytes()];
         kv.buffer()
             .read_at(&rig.stream, kv.offset(), &mut kv_bytes)?;
@@ -1563,7 +1566,10 @@ fn chunk_body_prefix_views_repeat_and_continue() {
         let rig = build_rig()?;
         let mut state = rig_state(&rig, KvMode::Fp16)?;
         for ordinal in 0..state.layout().kv.layers {
-            for plane in [super::state_layout::Plane::K, super::state_layout::Plane::V] {
+            for plane in [
+                crate::family::decode_step::state_layout::Plane::K,
+                crate::family::decode_step::state_layout::Plane::V,
+            ] {
                 let range = state.kv_plane(ordinal, plane)?;
                 ff_fill(&rig.stream, &range, range.bytes())?;
             }
@@ -1607,7 +1613,7 @@ fn chunk_body_prefix_views_repeat_and_continue() {
             h_view
                 .buffer()
                 .read_at(&rig.stream, h_view.offset(), &mut h[..read])?;
-            let kv = state.kv_plane(0, super::state_layout::Plane::K)?;
+            let kv = state.kv_plane(0, crate::family::decode_step::state_layout::Plane::K)?;
             let mut kv_bytes = vec![0u8; kv.bytes()];
             kv.buffer()
                 .read_at(&rig.stream, kv.offset(), &mut kv_bytes)?;
@@ -1642,7 +1648,7 @@ fn chunk_body_prefix_views_repeat_and_continue() {
         // (c) from A's state after (a): M = 126 at p0 = 130 (same open chunk: no reset).
         let c = snapshot(&mut state, 256, 126, 130, false, 0xA_0002)?;
         let kv_all = {
-            let kv = state.kv_plane(0, super::state_layout::Plane::K)?;
+            let kv = state.kv_plane(0, crate::family::decode_step::state_layout::Plane::K)?;
             let mut bytes = vec![0u8; kv.bytes()];
             kv.buffer().read_at(&rig.stream, kv.offset(), &mut bytes)?;
             bytes
@@ -1719,7 +1725,10 @@ fn chunk_body_indexes_state_by_layer_ordinal() {
         let rig = build_rig()?;
         let mut state = rig_state(&rig, KvMode::Fp16)?;
         for ordinal in 0..state.layout().kv.layers {
-            for plane in [super::state_layout::Plane::K, super::state_layout::Plane::V] {
+            for plane in [
+                crate::family::decode_step::state_layout::Plane::K,
+                crate::family::decode_step::state_layout::Plane::V,
+            ] {
                 let range = state.kv_plane(ordinal, plane)?;
                 ff_fill(&rig.stream, &range, range.bytes())?;
             }
@@ -1764,7 +1773,8 @@ fn chunk_body_indexes_state_by_layer_ordinal() {
         }
         let mut kv = Vec::new();
         for ordinal in 0..state.layout().kv.layers {
-            let range = state.kv_plane(ordinal, super::state_layout::Plane::K)?;
+            let range =
+                state.kv_plane(ordinal, crate::family::decode_step::state_layout::Plane::K)?;
             let mut bytes = vec![0u8; range.bytes()];
             range
                 .buffer()
@@ -1781,7 +1791,7 @@ fn chunk_body_indexes_state_by_layer_ordinal() {
     let (delta, kv) = phase().expect("the device phase");
     // The DeltaNet ordinals: each layer state is `rec` then `conv` values.
     let state = common_tests::dims();
-    let layout = crate::family::qwen36::cuda::state_layout::StateLayout::new(
+    let layout = crate::family::decode_step::state_layout::StateLayout::new(
         &state,
         &StepOptions {
             kv_mode: KvMode::Fp16,
@@ -2352,7 +2362,10 @@ fn fused_ab_digest() -> Result<Vec<(String, u64)>, EngError> {
     let rig = build_rig()?;
     let mut state = rig_state(&rig, KvMode::Fp16)?;
     for ordinal in 0..state.layout().kv.layers {
-        for plane in [super::state_layout::Plane::K, super::state_layout::Plane::V] {
+        for plane in [
+            crate::family::decode_step::state_layout::Plane::K,
+            crate::family::decode_step::state_layout::Plane::V,
+        ] {
             let range = state.kv_plane(ordinal, plane)?;
             ff_fill(&rig.stream, &range, range.bytes())?;
         }
@@ -2421,7 +2434,10 @@ fn fused_ab_digest() -> Result<Vec<(String, u64)>, EngError> {
         mix(format!("slot{index:?}{slot:?}"), &bytes);
     }
     for ordinal in 0..state.layout().kv.layers {
-        for plane in [super::state_layout::Plane::K, super::state_layout::Plane::V] {
+        for plane in [
+            crate::family::decode_step::state_layout::Plane::K,
+            crate::family::decode_step::state_layout::Plane::V,
+        ] {
             let range = state.kv_plane(ordinal, plane)?;
             let mut bytes = vec![0u8; range.bytes()];
             range

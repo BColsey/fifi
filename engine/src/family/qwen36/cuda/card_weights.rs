@@ -12,9 +12,9 @@
 //! made is released — no partially usable card survives to a session.
 
 use crate::EngError;
+use crate::family::decode_step::shard::ShardLoad;
 use crate::family::project::cuda::{BorrowedLoader, CudaWeights, LoadOptions, SliceSpec};
 use crate::family::qwen36::cuda::card_load::CardLoad;
-use crate::family::qwen36::cuda::shard::ShardLoad;
 use crate::weights::GgufWeights;
 
 /// One card's upload request: the tensors to name, and which of those to

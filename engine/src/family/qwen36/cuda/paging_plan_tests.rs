@@ -4,8 +4,8 @@ use super::{
     paging_plan::PagingPlan,
     paging_store::PagedKv,
     state::PagedStatePlan,
-    state_layout::StateLayout,
 };
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::family::project::cuda::WeightLayout;
 
 fn options(capacity: usize) -> StepOptions {
@@ -158,7 +158,8 @@ fn backing_multiplication_overflow_is_refused() {
     dims.shape.attn.heads_kv = usize::MAX / 1_000_000;
     dims.shape.attn.head_dim = 128;
     // One group's metadata fits; the aggregate backing does not.
-    super::state_layout::KvPool::q8_staging_layer(&dims, 256).expect("one group fits");
+    crate::family::decode_step::state_layout::KvPool::q8_staging_layer(&dims, 256)
+        .expect("one group fits");
     assert!(matches!(
         PagingPlan::new(&dims, 16_384),
         Err(crate::EngError::MemoryPlan(_))

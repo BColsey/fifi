@@ -74,12 +74,10 @@
 
 use std::fmt;
 
-use super::{
-    dims::{KvMode, StepDims, StepOptions},
-    mixer_geometry::MixerGeometry,
-    shard::ShardTable,
-    state_layout::align_up,
-};
+use super::dims::{KvMode, StepDims, StepOptions};
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::shard::ShardTable;
+use crate::family::decode_step::state_layout::align_up;
 use crate::{
     EngError,
     family::project::cuda::WeightLayout,
@@ -538,7 +536,7 @@ impl StepPlan {
         )?;
         // The fused norm still emits its tiled pack, which the EXL3 projections never read.
         list.add(Slot::XfMoe, list.xf(dims.shape.hidden), ADD_NORM, ADD_NORM)?;
-        let g = super::mixer_geometry::MixerGeometry::new(dims)?;
+        let g = crate::family::decode_step::mixer_geometry::MixerGeometry::new(dims)?;
         let specs = g
             .dense_specs(WeightLayout::Exl3, crate::family::AttentionKind::DeltaNet)?
             .into_iter()
@@ -1073,7 +1071,7 @@ fn list_card_moe(
 /// the rotated inputs, the split-K partial and the sticky arithmetic flag. The sizes are the
 /// largest any projection of the step needs: mixers, grouped expert launches, the head.
 fn list_exl3_scratch(list: &mut SlotList, dims: &StepDims) -> Result<(), EngError> {
-    let geometry = super::mixer_geometry::MixerGeometry::new(dims)?;
+    let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::new(dims)?;
     let (h, e) = (dims.shape.hidden, &dims.shape.moe);
     // A K-row window: the dense, shared-expert and head launches take K rows at once (the shared
     // gate and up as 2K one-row groups), while the routed experts run one chain per row, in

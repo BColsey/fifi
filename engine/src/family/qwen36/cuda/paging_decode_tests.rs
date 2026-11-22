@@ -5,8 +5,8 @@ use super::{
     paging_pipeline_tests::{floats, inputs, plane, read, upload},
     paging_plan::PagingPlan,
     paging_store::{PageId, PageToken, PagedKv},
-    state_layout::Plane,
 };
+use crate::family::decode_step::state_layout::Plane;
 use crate::{
     EngError,
     kernels::cuda::{
@@ -26,7 +26,7 @@ pub(super) fn data<'a>(
     k: &'a DeviceBuffer,
     v: &'a DeviceBuffer,
     out: &'a DeviceBuffer,
-    pool: &super::state_layout::KvPool,
+    pool: &crate::family::decode_step::state_layout::KvPool,
 ) -> Result<Kv8Data<'a>, EngError> {
     Ok(Kv8Data {
         k: k.range(0, k.bytes())?,

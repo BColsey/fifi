@@ -41,7 +41,6 @@ use super::{
     card_expert_timing::{self, RoutedTiming},
     card_step::CardStack,
     dims::{KvMode, StepDims},
-    mixer_geometry::MixerGeometry,
     moe::MoeLayerWeights,
     prefill::ChunkRows,
     prefill::{
@@ -55,6 +54,7 @@ use super::{
     prefill_plan::{ChunkSlot, chunk_tensors_for},
     state::ResidentState,
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::{
     EngError,
     family::qwen36::host::MoeDims as HostMoeDims,
@@ -878,13 +878,13 @@ fn stage_new_rows(
     let row_bytes = planes[0].bytes() / staging.capacity;
     for (codes, scales, out) in [
         (
-            super::state_layout::Plane::K,
-            super::state_layout::Plane::KScales,
+            crate::family::decode_step::state_layout::Plane::K,
+            crate::family::decode_step::state_layout::Plane::KScales,
             planes[0],
         ),
         (
-            super::state_layout::Plane::V,
-            super::state_layout::Plane::VScales,
+            crate::family::decode_step::state_layout::Plane::V,
+            crate::family::decode_step::state_layout::Plane::VScales,
             planes[1],
         ),
     ] {

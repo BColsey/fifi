@@ -1,11 +1,11 @@
 //! Unit tests of the shape builders of the mixer wrappers. CPU only.
 use super::{
     common_tests::dims,
-    mixer_geometry::MixerGeometry,
     mixer_shapes::{attn_decode_shape, attn_prep_shape},
     mixer_shapes::{attn_q8_shape, kv8_shape},
     mixer_shapes::{check_delta_eps, conv_shape, delta_shape},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::kernels::cuda::resident::{attn_prep::SlotMode, kv8_append::Kv8CodeScale};
 
 fn geometry() -> MixerGeometry {

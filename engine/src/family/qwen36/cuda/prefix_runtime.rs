@@ -398,12 +398,12 @@ impl QwenResidentStep<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::decode_step::state_layout::StateLayout;
     use crate::family::{
         project::cuda::WeightLayout,
         qwen36::cuda::{
             common_tests,
             dims::{KvMode, StepOptions},
-            state_layout::StateLayout,
         },
     };
     use std::ffi::OsStr;

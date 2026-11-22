@@ -22,19 +22,19 @@ use crate::family::exl3::layer_table::LayerTable;
 
 use super::{
     dims::KvMode,
-    mixer_geometry::MixerGeometry,
     mixer_ops::{BLOCK_ROWS, BlockOp, CardOp, block_ops, block_ops_card},
     mixer_shapes::{attn_decode_shape, attn_prep_shape, plain_shape},
     mixer_shapes::{attn_q8_shape, check_delta_eps, conv_shape, delta_shape, kv8_shape},
     mixer_weights::{LayerWeights, MixerWeights},
     paging_store::{PageAttention, PageId, PageToken},
     resources::PagedResources,
-    shard::ShardTable,
     sparse_exec::SparseExec,
     state::{ResidentState, StepField},
-    state_layout::Plane,
     step_plan::{Slot, StepPlan},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::shard::ShardTable;
+use crate::family::decode_step::state_layout::Plane;
 use crate::family::state_words::Word;
 use crate::{
     EngError,

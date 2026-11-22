@@ -517,11 +517,11 @@ fn routed_up_view_follows_the_moe_inter() {
 /// field.
 #[test]
 fn prefill_call_shapes_are_the_plan_values() {
-    use super::mixer_geometry::MixerGeometry;
     use super::prefill::{
         attn_proj_cols, chunk_attn_geometry, chunk_attn_shape, chunk_conv_shape, chunk_mmid_shape,
         chunk_prep_shape, chunk_router_shape, chunk_scan_shape, delta_proj_cols, shared_cols,
     };
+    use crate::family::decode_step::mixer_geometry::MixerGeometry;
     use crate::family::gguf_model::Role;
     use crate::kernels::cuda::prefill::attn_prefill::{
         CPF_ATTN_PART_CAP, cpf_attn_launch_plan, cpf_attn_part_bytes,
@@ -665,10 +665,10 @@ fn prefill_call_shapes_are_the_plan_values() {
 /// sizing. The 13b row uses the derived offset, never a literal column.
 #[test]
 fn prefill_stage_needs_fit_the_session_slots() {
-    use super::mixer_geometry::MixerGeometry;
     use super::prefill::{
         attn_proj_cols, chunk_attn_geometry, chunk_conv_shape, delta_proj_cols, routed_up_view,
     };
+    use crate::family::decode_step::mixer_geometry::MixerGeometry;
     use crate::kernels::cuda::prefill::attn_prefill::{
         CPF_ATTN_PART_CAP, cpf_attn_launch_plan, cpf_attn_part_bytes,
     };
@@ -905,8 +905,8 @@ fn bufs_refuse_each_guard() {
 /// The valid 40-layer `ModelFacts` fixture of `model_refuses_each_guard` and
 /// `run_refuses_each_bound`: kinds and roles from the real table and geometry, every weight Native.
 fn model_fixture() -> super::prefill::ModelFacts {
-    use super::mixer_geometry::MixerGeometry;
     use super::prefill::LayerFacts;
+    use crate::family::decode_step::mixer_geometry::MixerGeometry;
     use crate::family::exl3::layer_table::LayerTable;
     use crate::kernels::cuda::prefill::gdn_scan_seq::GDN_SCAN_EPS;
 
@@ -1221,7 +1221,8 @@ fn prefill_stages_pass_the_prefill_word() {
 /// three refusals.
 #[test]
 fn the_exl3_column_layout_is_checked_for_the_column_scatter() {
-    use super::{mixer_geometry::MixerGeometry, prefill::check_exl3_columns};
+    use super::prefill::check_exl3_columns;
+    use crate::family::decode_step::mixer_geometry::MixerGeometry;
     let geometry = MixerGeometry::new(&common_tests::dims()).expect("geometry");
     assert!(check_exl3_columns(&geometry).is_ok());
     let refused = |edit: &dyn Fn(&mut MixerGeometry), what: &str| {

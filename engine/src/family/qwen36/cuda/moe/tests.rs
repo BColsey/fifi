@@ -4,7 +4,6 @@
 
 use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
-use super::super::shard::ShardTable;
 use super::super::step_plan::{KernelScratch, Slot, StepPlan};
 use super::{
     BufferFacts, CardMoeOp, ExpertFacts, MoeDims, MoeOp, OpSlots, PackFacts, PackKind, ProjFacts,
@@ -12,6 +11,7 @@ use super::{
     op_slots,
 };
 use crate::EngError;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::resident::router::{RouterShape, router_logits_bytes};

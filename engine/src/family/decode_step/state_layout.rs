@@ -55,7 +55,7 @@
 //!
 //! Sizing is per component, and the DeltaNet pool is indexed by slot.
 
-use super::dims::{KvMode, StepDims, StepOptions};
+use crate::family::step_dims::{KvMode, StepDims, StepOptions};
 use crate::{
     EngError,
     family::{AttentionKind, kv_format::KvRowShape},
@@ -65,14 +65,14 @@ use crate::{
 /// in the arena planner). The shared words contract owns the constant.
 use crate::family::state_words::STATE_ALIGN;
 /// Values per fp16 scale in the `Int8G32` format.
-pub(super) const KV8_GROUP: usize = 32;
+pub(crate) const KV8_GROUP: usize = 32;
 const HALF: usize = 2;
 
 fn overflow() -> EngError {
     EngError::MemoryPlan("state layout: a size overflows".to_owned())
 }
 
-pub(super) fn align_up(value: usize) -> Option<usize> {
+pub(crate) fn align_up(value: usize) -> Option<usize> {
     value.checked_next_multiple_of(STATE_ALIGN)
 }
 
@@ -102,7 +102,7 @@ pub(crate) struct DeltaPool {
 }
 
 impl DeltaPool {
-    pub(super) fn new(dims: &StepDims, slots: usize) -> Result<Self, EngError> {
+    pub(crate) fn new(dims: &StepDims, slots: usize) -> Result<Self, EngError> {
         let d = &dims.shape.delta;
         let layers = dims.layers_of(AttentionKind::DeltaNet);
         let rec_values = mul(mul(d.value_heads, d.key_dim)?, d.value_dim)?;
@@ -172,14 +172,14 @@ pub(crate) struct KvPool {
 }
 
 impl KvPool {
-    pub(super) fn new(dims: &StepDims, mode: KvMode, capacity: usize) -> Result<Self, EngError> {
+    pub(crate) fn new(dims: &StepDims, mode: KvMode, capacity: usize) -> Result<Self, EngError> {
         Self::new_with_heads(dims, mode, capacity, dims.shape.attn.heads_kv)
     }
 
     /// The sliced form: `kv_heads` K/V heads per plane instead of the full
     /// replicated count (a multi-device card stores and appends only its
     /// own head groups).
-    pub(super) fn new_with_heads(
+    pub(crate) fn new_with_heads(
         dims: &StepDims,
         mode: KvMode,
         capacity: usize,
@@ -227,7 +227,7 @@ impl KvPool {
     }
 
     /// One attention layer's four Q8 planes for a paging staging slot.
-    pub(super) fn q8_staging_layer(dims: &StepDims, capacity: usize) -> Result<Self, EngError> {
+    pub(crate) fn q8_staging_layer(dims: &StepDims, capacity: usize) -> Result<Self, EngError> {
         let mut layout = Self::new(dims, KvMode::Int8G32, capacity)?;
         layout.layers = 1;
         layout.total = layout.layer_stride;
@@ -236,7 +236,7 @@ impl KvPool {
 
     /// The aligned per-layer stride the pool reserves (K/V and scale planes, alignment
     /// rounded); the golden pins this and `total` together.
-    pub(super) fn layer_stride(&self) -> usize {
+    pub(crate) fn layer_stride(&self) -> usize {
         self.layer_stride
     }
 

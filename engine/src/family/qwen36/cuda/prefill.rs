@@ -18,7 +18,6 @@ use super::{
     dims::{KvMode, StepDims},
     exl3_moe::Exl3MoeWeights,
     mixer::tail_extent,
-    mixer_geometry::MixerGeometry,
     mixer_shapes::{attn_q8_shape, kv8_shape},
     mixer_weights::{DenseWeight, LayerWeights, MixerWeights},
     moe::{MoeLayerWeights, StackWeights},
@@ -26,9 +25,10 @@ use super::{
     prefill_plan::{ChunkSlot, EXL3_SLOTS, Phase},
     sparse_exec::SparseExec,
     state::ResidentState,
-    state_layout::Plane,
     tiered_step::TieredRuntime,
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::state_layout::Plane;
 use crate::family::exl3::launch::{Launch, MoeDims};
 use crate::family::exl3::prefill::Exl3Scratch;
 use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu};
@@ -1428,7 +1428,9 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     }
 
     /// The run's attention geometry (the card driver's staging fill).
-    pub(super) fn card_attn_geom(&self) -> &'r super::mixer_geometry::AttnGeometry {
+    pub(super) fn card_attn_geom(
+        &self,
+    ) -> &'r crate::family::decode_step::mixer_geometry::AttnGeometry {
         &self.model.geometry.attn
     }
 
@@ -1441,7 +1443,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     pub(super) fn run_kv_plane(
         &self,
         ordinal: usize,
-        plane: super::state_layout::Plane,
+        plane: crate::family::decode_step::state_layout::Plane,
     ) -> Result<crate::kernels::cuda::DeviceRange<'_>, crate::EngError> {
         self.state.kv_plane(ordinal, plane)
     }

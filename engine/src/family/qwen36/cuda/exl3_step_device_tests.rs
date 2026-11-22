@@ -23,7 +23,6 @@ use super::{
     dims::{KvMode, StepOptions},
     exl3_load::load_exl3_dir,
     exl3_load_device_tests::relative_l2,
-    mixer_geometry::MixerGeometry,
     native_device_rig::device_present,
     resources::{GlobalNames, STEP_ROWS, StepResources},
     rules::QwenRules,
@@ -31,6 +30,7 @@ use super::{
     step::{CaptureConfig, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::{
     EngError,
     family::{

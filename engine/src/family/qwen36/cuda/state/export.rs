@@ -13,10 +13,8 @@
 //! queued on the given stream and waits for that stream only. The caller passes the stream that
 //! runs the step, has joined any other stream into it, and has committed every enqueued step.
 
-use super::{
-    super::state_layout::{KvPool, StateLayout},
-    F32, ResidentState, StateIdentity,
-};
+use super::{F32, ResidentState, StateIdentity};
+use crate::family::decode_step::state_layout::{KvPool, StateLayout};
 use crate::{EngError, kernels::cuda::DeviceStream};
 use std::mem::size_of_val;
 

@@ -1,9 +1,9 @@
 //! Same-entry numerical pin over the stored legacy Int8G32 payload, including its gate.
 use super::*;
 use crate::family::AttentionKind;
-use crate::family::qwen36::cuda::{
-    mixer_geometry::AttnGeometry, prefill_plan::ChunkSlot, state_layout::Plane,
-};
+use crate::family::decode_step::mixer_geometry::AttnGeometry;
+use crate::family::decode_step::state_layout::Plane;
+use crate::family::qwen36::cuda::prefill_plan::ChunkSlot;
 use crate::kernels::attention_reference::oracle::sdpa_f64;
 
 struct Snapshot {

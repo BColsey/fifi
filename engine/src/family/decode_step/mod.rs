@@ -28,12 +28,30 @@ pub(crate) enum ChunkVerdict {
     NoArena,
 }
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "accessors that only the Flash-Next step and the tests reach until the shared resident step replaces both steppers"
+)]
+pub(crate) mod mixer_geometry;
 pub(crate) mod readback;
 #[cfg(test)]
 mod readback_tests;
 pub(crate) mod run_report;
 #[cfg(test)]
 pub(crate) mod run_report_tests;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "accessors that only the Flash-Next step and the tests reach until the shared resident step replaces both steppers"
+)]
+pub(crate) mod shard;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "accessors that only the Flash-Next step and the tests reach until the shared resident step replaces both steppers"
+)]
+pub(crate) mod state_layout;
 pub(crate) mod verdict;
 #[cfg(test)]
 mod verdict_tests;

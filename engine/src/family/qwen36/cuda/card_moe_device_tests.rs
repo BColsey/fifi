@@ -36,8 +36,8 @@ use super::moe::{
     run_moe_block,
 };
 use super::native_device_rig::{Rng, device_present, f32_buf, q4k_rows, q8_1_bytes, zero_buf};
-use super::shard::ShardTable;
 use crate::EngError;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::project::cuda::served_admission;

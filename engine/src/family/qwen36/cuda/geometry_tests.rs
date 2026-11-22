@@ -2,10 +2,10 @@
 use super::{
     common_tests::{dims, plan},
     dims::{KvMode, StepDims, StepOptions},
-    mixer_geometry::MixerGeometry,
-    shard::ShardTable,
     step_plan::{KernelScratch, Phase, Slot, StepPlan},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, gguf_model::Role};

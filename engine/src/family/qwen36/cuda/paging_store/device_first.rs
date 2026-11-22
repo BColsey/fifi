@@ -3,9 +3,9 @@
 use super::super::{
     dims::{KvMode, StepDims},
     paging_plan::{PagingPlan, sized},
-    state_layout::{KvPool, Plane},
 };
 use super::{PageAttention, PageId, PageToken, TransferSlot, backing::SpillBacking};
+use crate::family::decode_step::state_layout::{KvPool, Plane};
 use crate::{
     EngError,
     kernels::cuda::{
@@ -487,13 +487,13 @@ impl DeviceFirstKv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::decode_step::state_layout::{KvPool, Plane};
     use crate::family::qwen36::cuda::{
         common_tests::dims,
         native_device_rig::device_present,
         paging_pipeline_tests::{floats, inputs, plane, read, upload},
         paging_plan::PagingPlan,
         paging_store::{PageId, PageToken, PagedKv},
-        state_layout::{KvPool, Plane},
     };
     use crate::{
         EngError,

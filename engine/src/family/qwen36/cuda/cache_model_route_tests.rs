@@ -17,7 +17,6 @@ use crate::family::state_words::Word;
                     device_first::{CachedAttention, DeviceCachePlan},
                 },
                 state::{PagedStatePlan, ResidentState, StepField},
-                state_layout::{KvPool, Plane, StateLayout},
             },
         },
         kernels::cuda::{
@@ -30,6 +29,7 @@ use crate::family::state_words::Word;
             },
         },
     };
+    use crate::family::decode_step::state_layout::{KvPool, Plane, StateLayout};
 
     struct Observed {
         allocation: bool,

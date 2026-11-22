@@ -7,7 +7,8 @@
 //! no kernel-local E3 bound is transferred to the whole mixed body.
 
 use super::*;
-use crate::family::qwen36::cuda::{prefill_plan::ChunkSlot, state_layout::Plane};
+use crate::family::decode_step::state_layout::Plane;
+use crate::family::qwen36::cuda::prefill_plan::ChunkSlot;
 
 const M: usize = 16;
 const M_SESS: usize = 128;

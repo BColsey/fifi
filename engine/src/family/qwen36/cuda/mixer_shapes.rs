@@ -3,7 +3,8 @@
 //! kernels. The executor calls these and nothing else for the non-slot arguments of the wrapper
 //! calls.
 
-use super::{mixer_geometry::MixerGeometry, mixer_ops::BLOCK_ROWS};
+use super::mixer_ops::BLOCK_ROWS;
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::{
     EngError,
     family::gguf_model::Role,

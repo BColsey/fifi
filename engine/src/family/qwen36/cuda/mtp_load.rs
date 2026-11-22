@@ -7,9 +7,8 @@
 //! embedding table and no output head: the draft step reads the model's.
 use crate::family::exl3::layer_table::LayerTable;
 
-use super::{
-    exl3_moe_source::moe_weights, exl3_source::attention_weights, mixer_geometry::MixerGeometry,
-};
+use super::{exl3_moe_source::moe_weights, exl3_source::attention_weights};
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3::source::{DenseSpec, PackReader};
 use crate::family::exl3_pack::Root;

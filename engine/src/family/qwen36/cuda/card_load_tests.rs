@@ -2,9 +2,9 @@
 //! loader — completeness, exact byte tiling, replication rules, expert
 //! accounting, and the one-card regression — all against the real
 //! Qwen3.6-35B-A3B inventory the shard tests use.
+use crate::family::decode_step::shard::{ShardLoad, ShardTable};
 use crate::family::gguf_model::{Inventory, Role};
 use crate::family::qwen36::cuda::card_load::card_loads;
-use crate::family::qwen36::cuda::shard::{ShardLoad, ShardTable};
 use crate::family::qwen36::host::HostShape;
 use crate::family::spec::QWEN3_6_35B_A3B;
 use crate::kernels::cuda::plan::{assemble_slice, native_device_bytes, plan_slice_rows};

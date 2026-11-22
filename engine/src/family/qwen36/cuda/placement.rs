@@ -11,12 +11,12 @@
 //! measurement.
 
 use super::dims::{KvMode, StepDims};
-use super::state_layout::{DeltaPool, KvPool};
 use crate::EngError;
-use crate::family::gguf_model::{Inventory, Role};
-use crate::family::qwen36::cuda::shard::{
+use crate::family::decode_step::shard::{
     ATTN_Q_PER_KV_HEAD, ShardLoad, ShardRuns, ShardTable, VALUE_BLOCK, shard_loads,
 };
+use crate::family::decode_step::state_layout::{DeltaPool, KvPool};
+use crate::family::gguf_model::{Inventory, Role};
 use crate::family::qwen36::host::HostShape;
 use crate::kernels::cuda::peer::DeviceFacts;
 use crate::weights::GgufType;

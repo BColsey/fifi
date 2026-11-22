@@ -11,11 +11,11 @@ use super::{
 };
 use super::{
     mixer::MixerViews,
-    mixer_geometry::MixerGeometry,
-    shard::ShardTable,
     state::PagedStatePlan,
     step_plan::{KernelScratch, StepPlan},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::exl3::source::DenseSpec;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::attn_decode_q8::{

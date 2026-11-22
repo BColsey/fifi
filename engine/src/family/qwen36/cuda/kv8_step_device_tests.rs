@@ -22,11 +22,11 @@ use super::native_device_rig::{Rng, assert_finite, device_present, f16 as f16_va
 use super::{
     dims::{KvMode, StepOptions},
     state::{ResidentState, StepField},
-    state_layout::Plane,
     step::{CaptureConfig, QwenResidentStep},
     step_plan::{KernelScratch, Slot, StepPlan},
 };
 use crate::EngError;
+use crate::family::decode_step::state_layout::Plane;
 use crate::family::gguf_model::{Role, open_qwen3_6_35b_a3b};
 use crate::family::project::cuda::{
     CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
@@ -488,7 +488,7 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
     let arena = context.arena(&unaliased)?;
     let inventory_value = inventory();
     let table = crate::family::exl3::layer_table::LayerTable::new(&dims, &inventory_value)?;
-    let geometry = super::mixer_geometry::MixerGeometry::new(&dims)?;
+    let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::new(&dims)?;
     let mut state = ResidentState::allocate(&context, &stream, &dims, &options)?;
     state.write_step_params(&stream, &StepParams::new(0, 0)?)?;
     let mut found = None;

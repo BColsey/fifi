@@ -14,9 +14,9 @@ use crate::family::graph_state::book::Health;
 
 use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
-use super::super::state_layout::{KvPool, Plane, StateLayout};
 use super::ResidentState;
 use crate::EngError;
+use crate::family::decode_step::state_layout::{KvPool, Plane, StateLayout};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::state_words::Word;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};

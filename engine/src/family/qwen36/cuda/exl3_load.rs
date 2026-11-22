@@ -17,11 +17,11 @@ use super::{
     dims::StepDims,
     exl3_moe_source::{check_moe_source_geometry, moe_weights, moe_weights_banked},
     exl3_source::{attention_weights, delta_weights},
-    mixer_geometry::MixerGeometry,
     mtp_load::mtp_weights,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3::layer_table::LayerTable;
 use crate::family::exl3::source::PackReader;

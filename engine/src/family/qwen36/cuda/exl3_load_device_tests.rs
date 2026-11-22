@@ -15,11 +15,11 @@ use super::{
     super::exl3_pack::inspect_pack_split,
     common_tests::{dims, inventory},
     exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
-    mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3_pack::{ExpertPart, Root, expert_name_in, layer_name};
 use crate::{

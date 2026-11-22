@@ -18,13 +18,13 @@ use super::{
     dims::{KvMode, StepDims, StepOptions},
     exl3_source,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
-    mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     native_device_rig::{assert_finite, device_present, f32_buf},
     resources::f32_bytes,
     state::{ResidentState, StepField},
     step_plan::{KernelScratch, Slot, StepPlan},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::{
     EngError,
     family::{

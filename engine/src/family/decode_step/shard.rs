@@ -41,9 +41,9 @@
 
 use std::ops::Range;
 
-use super::super::host::HostShape;
 use crate::EngError;
 use crate::family::gguf_model::{Inventory, Role};
+use crate::family::host_shape::HostShape;
 use crate::family::project::cuda::SliceSpec;
 
 /// Values per dealt block of an expert's intermediate width and of a K/V row.

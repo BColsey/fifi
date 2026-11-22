@@ -11,11 +11,11 @@
 
 use super::{
     dims::KvMode,
-    mixer_geometry::MixerGeometry,
     state::StepField,
-    state_layout::Plane,
     step_plan::{Phase, Slot},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::state_layout::Plane;
 use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role, project::cuda::WeightLayout},

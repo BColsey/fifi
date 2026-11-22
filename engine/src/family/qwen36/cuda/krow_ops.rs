@@ -17,11 +17,9 @@
 //! Every copy is a bit-exact word move, so each row's bytes equal the one-row projections writing
 //! the same columns.
 
-use super::{
-    mixer_geometry::MixerGeometry,
-    state_layout::align_up,
-    step_plan::{MAX_STEP_ROWS, Phase, Slot},
-};
+use super::step_plan::{MAX_STEP_ROWS, Phase, Slot};
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::state_layout::align_up;
 use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role},

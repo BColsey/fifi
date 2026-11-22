@@ -4,10 +4,10 @@
 
 use super::dims::{KvMode, StepDims};
 use crate::EngError;
+use crate::family::decode_step::shard::{ShardRuns, ShardTable, VALUE_BLOCK};
 use crate::family::qwen36::cuda::placement::{
     DeviceProfile, PlacementPlan, PlacementPolicy, PlacementRequest, plan_placement,
 };
-use crate::family::qwen36::cuda::shard::{ShardRuns, ShardTable, VALUE_BLOCK};
 use crate::family::qwen36::host::HostShape;
 use crate::family::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::weights::GgufType;
@@ -483,7 +483,7 @@ fn the_real_shape_deals_rows_the_native_matvec_accepts() {
 
 #[test]
 fn long_context_receipt_charges_the_kv_heads_held_by_each_card() {
-    use super::state_layout::KvPool;
+    use crate::family::decode_step::state_layout::KvPool;
 
     let spec = FamilySpec {
         heads_q: 32,

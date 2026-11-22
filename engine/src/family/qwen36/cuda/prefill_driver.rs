@@ -117,7 +117,7 @@ pub(super) fn admit_m_sess(
 pub(super) fn tiered_large_cost(dims: &StepDims, nsm: usize) -> Result<ChunkCost, EngError> {
     let m = 4096;
     super::prefill::kv8_scratch_layout(m, CPF_ATTN_PART_CAP)?;
-    let geometry = super::mixer_geometry::MixerGeometry::new(dims)?;
+    let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::new(dims)?;
     super::prefill::kv8_segment_query_rows(super::prefill::chunk_attn_geometry(&geometry, m), 1)?;
     let tensors: Vec<_> = chunk_tensors(dims, m, nsm)?
         .into_iter()

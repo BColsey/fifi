@@ -32,12 +32,12 @@ use super::{
     prefill_plan::Extra,
     resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes, moe_dims},
     rules::QwenRules,
-    shard::ShardTable,
-    state_layout::{KvPool, StateLayout},
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
     tiered_load::{attach_tiered_parts, bank_slot_bytes, geometry_of, names_without_experts},
 };
+use crate::family::decode_step::shard::ShardTable;
+use crate::family::decode_step::state_layout::{KvPool, StateLayout};
 use crate::family::engine_announce::{Announcement, announce_failure, await_announced};
 use crate::family::exl3_merge_plan::{
     SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
@@ -1944,7 +1944,7 @@ mod chunk_prefill_flag_tests {
 
     #[test]
     fn p2p_kv_charge_matches_the_resident_state_at_128k() {
-        use super::super::state_layout::StateLayout;
+        use crate::family::decode_step::state_layout::StateLayout;
 
         let inventory = super::Inventory::for_spec(&super::QWEN3_6_35B_A3B).unwrap();
         let shape =
@@ -2328,7 +2328,8 @@ mod paged_start_tests {
         let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap();
         let dims = StepDims::new(&shape, &inventory).unwrap();
         let options = step_options(33280, WeightLayout::Native, KvMode::Int8G32).unwrap();
-        let state = super::super::state_layout::StateLayout::new(&dims, &options).unwrap();
+        let state =
+            crate::family::decode_step::state_layout::StateLayout::new(&dims, &options).unwrap();
         let scratch =
             super::super::step_plan::KernelScratch::for_dims(&dims, 1, KvMode::Int8G32).unwrap();
         let step = super::super::step_plan::StepPlan::new(&dims, 1, &options, &scratch).unwrap();

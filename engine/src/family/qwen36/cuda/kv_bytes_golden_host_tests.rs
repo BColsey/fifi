@@ -6,12 +6,12 @@
 //! family's golden file beside the module.
 
 use super::placement::{PlacementPolicy, PlacementRequest};
-use super::shard::ShardTable;
+use crate::family::decode_step::shard::ShardTable;
+use crate::family::decode_step::state_layout::KvPool;
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::cuda::dims::{KvMode, StepDims};
 use crate::family::qwen36::cuda::prefill_plan;
 use crate::family::qwen36::cuda::start;
-use crate::family::qwen36::cuda::state_layout::KvPool;
 use crate::family::qwen36::host::HostShape;
 use crate::family::spec::QWEN3_6_35B_A3B;
 use crate::weights::GgufType;

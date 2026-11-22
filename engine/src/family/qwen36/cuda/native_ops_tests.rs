@@ -3,12 +3,12 @@
 //! checks the Tiled lists have. The construction guards live in `native_guard_tests.rs`. CPU only.
 use super::common_tests::{dims, plan_of};
 use super::dims::{KvMode, StepOptions};
-use super::mixer_geometry::MixerGeometry;
 use super::mixer_ops::{BlockOp, block_ops, block_ops_with};
 use super::state::StepField;
-use super::state_layout::Plane;
 use super::step_plan::{KernelScratch, Phase, Slot, StepPlan};
 use crate::family::AttentionKind;
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::state_layout::Plane;
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
@@ -548,11 +548,11 @@ fn fused_gdn_inproj_spec_is_one_row_wide_entry() {
 #[cfg(test)]
 mod card_ops_tests {
     use super::super::common_tests::dims;
-    use super::super::mixer_geometry::MixerGeometry;
     use super::super::mixer_ops::{BlockOp, CardOp, block_ops, block_ops_card, block_ops_with};
-    use super::super::shard::ShardTable;
     use super::super::step_plan::Slot;
     use crate::family::AttentionKind;
+    use crate::family::decode_step::mixer_geometry::MixerGeometry;
+    use crate::family::decode_step::shard::ShardTable;
     use crate::family::project::cuda::WeightLayout;
     use crate::family::qwen36::cuda::dims::KvMode;
 

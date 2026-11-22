@@ -19,7 +19,7 @@ use crate::family::exl3_pack::{Root, layer_name};
 use crate::family::exl3_tensors::{decay_from_log, permute_blocks, tiled_head_order};
 use crate::family::project::cuda::WeightLayout;
 
-use super::mixer_geometry::{DeltaGeometry, MixerGeometry, RawSpec};
+use crate::family::decode_step::mixer_geometry::{DeltaGeometry, MixerGeometry, RawSpec};
 use crate::family::exl3::source::{DenseSpec, PackReader};
 use crate::{
     EngError,

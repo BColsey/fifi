@@ -27,9 +27,9 @@
 
 use super::dims::StepDims;
 use super::mixer_weights::DenseWeight;
-use super::shard::ShardTable;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
+use crate::family::decode_step::shard::ShardTable;
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::project::cuda::WeightLayout;

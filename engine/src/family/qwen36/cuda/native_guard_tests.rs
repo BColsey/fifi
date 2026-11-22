@@ -2,12 +2,12 @@
 //! accessor's mixed refusal and the rows % 4 / column refusals. CPU only.
 use super::common_tests::dims;
 use super::dims::KvMode;
-use super::mixer_geometry::{MixerGeometry, check_native_dense};
 use super::mixer_ops::{BlockOp, block_ops, block_ops_with, check_native_column};
 use super::step::moe_override_uniform;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
 use crate::family::AttentionKind;
+use crate::family::decode_step::mixer_geometry::{MixerGeometry, check_native_dense};
 use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::{

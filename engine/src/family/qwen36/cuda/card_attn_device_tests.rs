@@ -29,11 +29,11 @@
 //! own kernel slice, and until then the card path refuses to append fp16.
 use super::card_attn::{card_kv_heads, card_prep_shape, card_slice_offset, gathers_clean};
 use super::common_tests::dims;
-use super::mixer_geometry::MixerGeometry;
 use super::multi::{STEP_RING_TIMEOUT, fold_ring_status};
 use super::native_device_rig::device_present;
-use super::shard::ShardTable;
 use crate::EngError;
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::project::cuda::served_admission;
 use crate::kernels::cuda::peer_ring::{PeerRing, STATUS_TIMEOUT};
 use crate::kernels::cuda::resident::attn_prep::{AttnPrepCall, AttnPrepRowsCall, RopeParams};

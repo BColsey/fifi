@@ -6,7 +6,8 @@ mod state_copy;
 use backing::Backing;
 pub(super) use state_copy::HostCharge;
 
-use super::{dims::StepDims, paging_plan::PagingPlan, state_layout::Plane};
+use super::{dims::StepDims, paging_plan::PagingPlan};
+use crate::family::decode_step::state_layout::Plane;
 use crate::{
     EngError,
     kernels::cuda::resident::{

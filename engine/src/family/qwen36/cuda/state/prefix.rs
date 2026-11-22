@@ -1,12 +1,10 @@
 //! Engine prefix payload: resident raw compatibility or charged DeltaNet plus aliased pages.
-use super::super::{
-    paging_store::{HostCharge, PageSnapshot, PagedKv},
-    state_layout::DeltaPool,
-};
+use super::super::paging_store::{HostCharge, PageSnapshot, PagedKv};
 use super::{
     KvStorage, ResidentState, StateIdentity,
     export::{ExportedState, IMPORT_REWRITES_WORDS},
 };
+use crate::family::decode_step::state_layout::DeltaPool;
 use crate::{
     EngError,
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream},

@@ -12,17 +12,17 @@ use crate::family::exl3::layer_table::LayerTable;
 use super::sparse_exec::{SparseConfig, SparseExec, SparseGeometry};
 use super::{
     dims::{KvMode, StepDims, StepOptions},
-    mixer_geometry::{MixerGeometry, check_native_dense},
     mixer_weights::dense_weight,
     moe::{MoeLayerWeights, StackWeights},
     paging_plan::PagingPlan,
     paging_store::device_first::DeviceCachePlan,
-    shard::ShardTable,
     state::PagedStatePlan,
-    state_layout::StateLayout,
     step_plan::{KernelScratch, MAX_STEP_ROWS, StepPlan},
     tiered_step::LayerParts,
 };
+use crate::family::decode_step::mixer_geometry::{MixerGeometry, check_native_dense};
+use crate::family::decode_step::shard::ShardTable;
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::{

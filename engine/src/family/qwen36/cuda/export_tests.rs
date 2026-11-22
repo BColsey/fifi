@@ -10,8 +10,8 @@ use super::{
             host_zeroed, plane_sizes,
         },
     },
-    state_layout::StateLayout,
 };
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::family::graph_state::book::StateBook;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};

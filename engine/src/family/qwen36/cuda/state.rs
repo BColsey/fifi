@@ -26,8 +26,8 @@ use super::{
         PagedKv,
         device_first::{DeviceCachePlan, DeviceFirstKv},
     },
-    state_layout::{Plane, StateLayout},
 };
+use crate::family::decode_step::state_layout::{Plane, StateLayout};
 use crate::family::state_words::Word;
 use crate::{
     EngError,

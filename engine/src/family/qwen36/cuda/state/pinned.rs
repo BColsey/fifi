@@ -1,10 +1,10 @@
 //! Fixed-capacity host backing; only committed ranges are transferred or imported.
-use super::super::state_layout::StateLayout;
 use super::{
     ResidentState, StateIdentity,
     device_tip::{DeviceTip, DeviceTipKey},
     export::IMPORT_REWRITES_WORDS,
 };
+use crate::family::decode_step::state_layout::StateLayout;
 use crate::{
     EngError,
     kernels::cuda::{CudaContext, DeviceEvent, DeviceStream, PinnedBuf},

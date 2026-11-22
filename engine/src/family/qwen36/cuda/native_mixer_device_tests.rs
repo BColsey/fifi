@@ -88,7 +88,7 @@ fn run_block(
         .collect();
     let arena = ctx.arena(&unaliased)?;
     let table = crate::family::exl3::layer_table::LayerTable::new(&dims, &inv)?;
-    let geometry = super::mixer_geometry::MixerGeometry::new(&dims)?;
+    let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::new(&dims)?;
     let mut state = super::state::ResidentState::allocate(ctx, stream, &dims, &options)?;
     state.write_step_params(stream, &StepParams::new(0, 0)?)?;
     let resid_slot = if layer.is_multiple_of(2) {
@@ -324,7 +324,8 @@ fn native_mixer_block_matches_the_tiled_block() {
     let inventory = inventory();
     let table =
         crate::family::exl3::layer_table::LayerTable::new(&dims, &inventory).expect("table");
-    let geometry = super::mixer_geometry::MixerGeometry::new(&dims).expect("geometry");
+    let geometry =
+        crate::family::decode_step::mixer_geometry::MixerGeometry::new(&dims).expect("geometry");
     let mut rng = Rng::new(0x5eed_b10c);
     let resid: Vec<f32> = (0..dims.shape.hidden)
         .map(|_| (rng.below(200) as f32 - 100.0) / 500.0)

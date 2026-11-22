@@ -3,10 +3,10 @@
 use super::common_tests::dims;
 use super::dims::{KvMode, StepOptions};
 use super::mixer::{CardKindOps, MixerViews, tail_extent};
-use super::mixer_geometry::MixerGeometry;
 use super::mixer_ops::CardOp;
-use super::shard::ShardTable;
 use super::step_plan::{KernelScratch, Slot, StepPlan};
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::shard::ShardTable;
 use crate::family::project::cuda::WeightLayout;
 
 #[test]

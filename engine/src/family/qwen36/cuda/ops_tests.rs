@@ -3,11 +3,11 @@
 use super::{
     common_tests::{dims, plan},
     dims::KvMode,
-    mixer_geometry::MixerGeometry,
     mixer_ops::{BlockOp, block_ops},
     state::StepField,
     step_plan::{Phase, Slot},
 };
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, gguf_model::Role};
 

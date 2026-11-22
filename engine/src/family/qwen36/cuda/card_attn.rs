@@ -15,7 +15,7 @@
 use crate::EngError;
 use crate::kernels::cuda::resident::attn_prep::{AttnPrepShape, SlotMode};
 
-use super::mixer_geometry::MixerGeometry;
+use crate::family::decode_step::mixer_geometry::MixerGeometry;
 
 /// The card prep's K/V head count, with the rule that guards it: the shard
 /// table deals K/V rows in 32-row blocks, but the rows kernel's per-head
