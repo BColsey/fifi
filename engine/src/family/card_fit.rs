@@ -126,6 +126,22 @@ pub(crate) fn plan_card_fit<K: Copy>(
 /// planned session count survives them.
 pub(crate) const SESSION_PLAN_SLACK_BYTES: u64 = 256 << 20;
 
+/// The device bytes a plan keeps free beside its load for `sessions` sessions: every session
+/// after the first takes `part_bytes` (its state beyond the cache both consumers size
+/// separately), and a plan that serves more than one keeps [`SESSION_PLAN_SLACK_BYTES`] for what
+/// the first session allocates beyond its listed demand. Nothing for one session. `None` when
+/// the byte count overflows. The one rule the Bolt cell pool and the Qwen3.6 tiered banks both
+/// plan against.
+pub(crate) fn session_reserve_bytes(part_bytes: u64, sessions: usize) -> Option<u64> {
+    let extra = u64::try_from(sessions.max(1) - 1).ok()?;
+    if extra == 0 {
+        return Some(0);
+    }
+    part_bytes
+        .checked_mul(extra)?
+        .checked_add(SESSION_PLAN_SLACK_BYTES)
+}
+
 /// The most cells a shared pool is planned for: far above any card's reach.
 const POOL_CELLS_LIMIT: u32 = 1 << 28;
 
@@ -184,18 +200,12 @@ impl CellFigures {
     /// session is bounded by the model's context, not by this count. `None` when not even one
     /// cell fits.
     pub(crate) fn pool(&self, free: u64, weights: u64, sessions: usize) -> Option<usize> {
-        let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
-        let unlisted = if extra > 0 {
-            SESSION_PLAN_SLACK_BYTES
-        } else {
-            0
-        };
+        let reserve = session_reserve_bytes(self.seq_fixed, sessions);
         let charge = |cells: u32| {
             u64::from(cells)
                 .checked_mul(self.per_position)?
                 .checked_add(self.headroom)?
-                .checked_add(unlisted)?
-                .checked_add(self.seq_fixed.checked_mul(extra)?)
+                .checked_add(reserve?)
         };
         let limits = ContextLimits {
             ceiling: POOL_CELLS_LIMIT,
@@ -288,6 +298,21 @@ mod tests {
         );
         assert_eq!(figures.planned(9, 0, 1, (10_000, 4_000)), (4_000, 4_000));
         assert!(CellFigures::checked(None, Some(0), (0, 0)).is_none());
+    }
+
+    #[test]
+    fn the_session_reserve_is_the_extra_parts_and_one_slack() {
+        assert_eq!(session_reserve_bytes(1000, 0), Some(0));
+        assert_eq!(session_reserve_bytes(1000, 1), Some(0));
+        assert_eq!(
+            session_reserve_bytes(1000, 2),
+            Some(1000 + SESSION_PLAN_SLACK_BYTES)
+        );
+        assert_eq!(
+            session_reserve_bytes(1000, 8),
+            Some(7000 + SESSION_PLAN_SLACK_BYTES)
+        );
+        assert_eq!(session_reserve_bytes(u64::MAX, 3), None);
     }
 
     const MIB: u64 = 1 << 20;
