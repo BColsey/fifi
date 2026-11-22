@@ -17,10 +17,16 @@ pub(super) enum Work {
     TargetVocab,
     DraftVocab,
     Sampling,
+    AttentionControlPrepare,
+    AttentionControlProject,
+    AttentionControlApply,
+    MlpControlPrepare,
+    MlpControlProject,
+    MlpControlApply,
 }
 
 impl Work {
-    const ALL: [(Self, &str); 10] = [
+    const ALL: [(Self, &str); 16] = [
         (Self::CpuAttention, "cpu_attention"),
         (Self::DeviceAttention, "device_attention"),
         (Self::Convolution, "convolution"),
@@ -31,6 +37,12 @@ impl Work {
         (Self::TargetVocab, "target_vocab"),
         (Self::DraftVocab, "draft_vocab"),
         (Self::Sampling, "sampling"),
+        (Self::AttentionControlPrepare, "attn_control_prepare"),
+        (Self::AttentionControlProject, "attn_control_project"),
+        (Self::AttentionControlApply, "attn_control_apply"),
+        (Self::MlpControlPrepare, "mlp_control_prepare"),
+        (Self::MlpControlProject, "mlp_control_project"),
+        (Self::MlpControlApply, "mlp_control_apply"),
     ];
 }
 
@@ -183,6 +195,16 @@ mod tests {
         profile.finish(step, 10, 0);
         let step = profile.begin_prefill(10);
         drop(profile.span(Work::Controller));
+        for phase in [
+            Work::AttentionControlPrepare,
+            Work::AttentionControlProject,
+            Work::AttentionControlApply,
+            Work::MlpControlPrepare,
+            Work::MlpControlProject,
+            Work::MlpControlApply,
+        ] {
+            drop(profile.span(phase));
+        }
         profile.finish(step, 11, 0);
 
         let step = profile.begin_decode(11);
@@ -197,6 +219,16 @@ mod tests {
         assert_eq!(report["prefill"]["committed_rows"], 4);
         assert_eq!(report["prefill"]["work"]["cpu_attention"]["calls"], 2);
         assert_eq!(report["prefill"]["work"]["controller"]["calls"], 1);
+        for name in [
+            "attn_control_prepare",
+            "attn_control_project",
+            "attn_control_apply",
+            "mlp_control_prepare",
+            "mlp_control_project",
+            "mlp_control_apply",
+        ] {
+            assert_eq!(report["prefill"]["work"][name]["calls"], 1);
+        }
         assert_eq!(report["first_decode"]["emitted_tokens"], 4);
         assert_eq!(report["first_decode"]["work"]["target_vocab"]["calls"], 1);
         assert_eq!(report["decode"]["emitted_tokens"], 1);

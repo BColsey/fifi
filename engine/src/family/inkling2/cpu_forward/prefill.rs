@@ -442,22 +442,29 @@ impl CpuForward {
         controller: BatchController<'_>,
     ) -> Result<(), EngError> {
         let _span = self.phase_span(super::Work::Controller);
-        let controls = inputs
-            .iter()
-            .zip(rows)
-            .map(|(input, row)| {
-                let bank = row
-                    .bank
-                    .as_ref()
-                    .ok_or_else(|| bad("Inkling grouped MLP lost a message bank"))?;
-                self.control_input(input, bank, visit.weight_layer, Role::Mlp)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let controls = {
+            let _subspan = self.phase_span(super::Work::MlpControlPrepare);
+            inputs
+                .iter()
+                .zip(rows)
+                .map(|(input, row)| {
+                    let bank = row
+                        .bank
+                        .as_ref()
+                        .ok_or_else(|| bad("Inkling grouped MLP lost a message bank"))?;
+                    self.control_input(input, bank, visit.weight_layer, Role::Mlp)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let gates: Vec<_> = controls
             .iter()
             .map(|control| control.gate.as_slice())
             .collect();
-        let projections = controller.project(&gates, "mlp")?;
+        let projections = {
+            let _subspan = self.phase_span(super::Work::MlpControlProject);
+            controller.project(&gates, "mlp")?
+        };
+        let _subspan = self.phase_span(super::Work::MlpControlApply);
         let norm = format!("{layer}.mlp_norm.weight");
         for ((input, control), projection) in inputs.iter_mut().zip(controls).zip(projections) {
             apply_control(input, control.message, projection);

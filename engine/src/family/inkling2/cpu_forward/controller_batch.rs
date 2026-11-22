@@ -205,21 +205,27 @@ impl CpuForward {
         };
 
         let _span = self.phase_span(Work::Controller);
-        let prepared = rows
-            .map(|(stream, bank)| {
+        let prepared = {
+            let _subspan = self.phase_span(Work::AttentionControlPrepare);
+            rows.map(|(stream, bank)| {
                 let bank =
                     bank.ok_or_else(|| bad("Inkling grouped attention lost a message bank"))?;
                 self.prepare_attention_controllers(visit, stream, bank)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+        };
         let inputs: Vec<_> = prepared
             .iter()
             .map(|row| row.each_ref().map(|item| item.control.gate.as_slice()))
             .collect();
-        let projections = match resident {
-            Some(controllers) => controllers.project(&inputs, multirow)?,
-            None => project_controller_roles(batched, &inputs)?,
+        let projections = {
+            let _subspan = self.phase_span(Work::AttentionControlProject);
+            match resident {
+                Some(controllers) => controllers.project(&inputs, multirow)?,
+                None => project_controller_roles(batched, &inputs)?,
+            }
         };
+        let _subspan = self.phase_span(Work::AttentionControlApply);
         let local = visit.attention == Attention::Local;
         let mut result = Vec::with_capacity(prepared.len());
         for (row, projections) in prepared.into_iter().zip(projections) {
