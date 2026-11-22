@@ -1,5 +1,11 @@
 import type { Model } from "./api";
-import { loadSettings, saveSettings, type ThemeChoice } from "./store";
+import {
+  loadApiKey,
+  loadSettings,
+  saveApiKey,
+  saveSettings,
+  type ThemeChoice,
+} from "./store";
 
 export class AboutView {
   private readonly section: HTMLElement;
@@ -116,7 +122,7 @@ export class AboutView {
     input.id = "about-api-key";
     keyLabel.htmlFor = input.id;
     input.placeholder = "sk-\u2026";
-    input.value = loadSettings().apiKey;
+    input.value = loadApiKey();
     this.keyInput = input;
     const show = document.createElement("button");
     show.className = "btn";
@@ -134,18 +140,16 @@ export class AboutView {
     save.type = "button";
     save.textContent = "Save";
     save.addEventListener("click", () => {
-      const settings = loadSettings();
-      saveSettings({ ...settings, apiKey: input.value.trim() });
+      saveApiKey(input.value.trim());
       reason.hidden = false;
-      reason.textContent = "Key saved.";
+      reason.textContent = "Key set. It lasts until this page reloads.";
     });
     const forget = document.createElement("button");
     forget.className = "btn";
     forget.type = "button";
     forget.textContent = "Forget";
     forget.addEventListener("click", () => {
-      const settings = loadSettings();
-      saveSettings({ ...settings, apiKey: "" });
+      saveApiKey("");
       input.value = "";
       reason.hidden = false;
       reason.textContent = "Key removed.";

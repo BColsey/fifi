@@ -4,7 +4,7 @@
  */
 
 import { SseParser } from "./sse.js";
-import { loadSettings } from "./store.js";
+import { loadApiKey } from "./store.js";
 
 export type EngineState = "loading" | "ready" | "busy" | "error" | "stopped" | "native-failed";
 
@@ -239,7 +239,7 @@ export function describeError(err: ApiError): string {
 }
 
 function authHeaders(): Record<string, string> {
-  const key = loadSettings().apiKey;
+  const key = loadApiKey();
   return key === "" ? {} : { Authorization: "Bearer " + key };
 }
 

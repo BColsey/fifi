@@ -20,14 +20,12 @@ export interface DrawerSettings {
 export type ThemeChoice = "system" | "light" | "dark";
 
 export interface Settings {
-  apiKey: string;
   theme: ThemeChoice;
   model: string;
   drawer: DrawerSettings;
 }
 
 export const defaultSettings: Settings = {
-  apiKey: "",
   theme: "system",
   model: "",
   drawer: {
@@ -47,7 +45,13 @@ export function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (raw === null) return { ...defaultSettings };
-    return coerceSettings(JSON.parse(raw));
+    const stored: unknown = JSON.parse(raw);
+    const settings = coerceSettings(stored);
+    // A key persisted by an earlier build is never read; drop it with the next write.
+    if (objectOf(stored)["apiKey"] !== undefined) {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    }
+    return settings;
   } catch {
     return { ...defaultSettings };
   }
@@ -60,7 +64,6 @@ export function coerceSettings(raw: unknown): Settings {
   const root = objectOf(raw);
   const drawer = objectOf(root["drawer"]);
   return {
-    apiKey: stringOf(root["apiKey"], defaultSettings.apiKey),
     theme: themeOf(root["theme"]),
     model: stringOf(root["model"], defaultSettings.model),
     drawer: {
@@ -136,6 +139,18 @@ export function saveSettings(next: Settings): void {
     const reason = failure instanceof Error ? failure.message : String(failure);
     for (const cb of errorListeners) cb("Could not save settings: " + reason);
   }
+}
+
+/** The API key stays in this module for as long as the page lives. It is never
+ *  written to storage, where any script in the page could read it back. */
+let apiKey = "";
+
+export function loadApiKey(): string {
+  return apiKey;
+}
+
+export function saveApiKey(key: string): void {
+  apiKey = key;
 }
 
 export function onSettingsChange(cb: SettingsListener): void {
