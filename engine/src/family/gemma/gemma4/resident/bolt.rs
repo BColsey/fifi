@@ -3101,9 +3101,15 @@ mod tests {
             &|_| {},
         )
         .expect("load");
-        let steps = 1600usize;
+        // A run under a sanitizer is slow: BOLT_GROW_STEPS shortens it (it must pass one granule).
+        let steps = std::env::var("BOLT_GROW_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1600usize);
         let mut grown = model.new_seq_cells(CELL_GRANULE).expect("small sequence");
-        let full = model.new_seq_cells(2 * CELL_GRANULE).expect("whole run");
+        let full = model
+            .new_seq_cells(steps.next_multiple_of(CELL_GRANULE))
+            .expect("whole run");
         let mut growths = 0;
         for pos in 0..steps {
             let token = 2 + (pos as u32 * 17) % 5000;

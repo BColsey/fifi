@@ -587,3 +587,94 @@ fn a_window_of_sessions_equals_the_solo_runs() {
         assert!(widest >= width.min(2));
     }
 }
+
+/// One word per row: the hash of the logits bits, so a long run keeps no rows.
+fn row_hash(row: &[f32]) -> u64 {
+    row.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+        (h ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// A sequence that grows while it sits in a window of others gives its row and leaves theirs as
+/// they are: three sessions decode together for 1600 positions, one on cells of one granule that
+/// grows through the window (past the sliding window of the local layers), one that stays on its
+/// one granule and leaves the window at 900, one sized for the run from the start. Every row of
+/// every step equals the row of the same session run alone on planes sized for the whole run.
+#[test]
+#[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
+fn a_sequence_grown_inside_a_window_leaves_every_row_as_its_solo_run() {
+    use crate::family::cell_pool::CELL_GRANULE;
+    let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
+    let file = crate::family::gguf_select::GgufFile {
+        path: std::path::PathBuf::from(&path),
+        bytes: std::fs::metadata(&path).expect("the Bolt file").len(),
+    };
+    let mut model = super::bolt::load_choosing(
+        &[file],
+        crate::family::gemma::gemma4::config::MaxSeqs::Count(Bolt::WINDOW_ROWS),
+        &|_| {},
+    )
+    .expect("load");
+    model.reserve_window(3).expect("window buffers");
+    let steps = [1600usize, 900, 1600];
+    let token_of =
+        |slot: usize, pos: usize| 2 + ((pos * (17 + 6 * slot) + slot * 101) % 5000) as u32;
+    // The solo runs, on planes sized for the whole run.
+    let mut solo: Vec<Vec<u64>> = Vec::new();
+    for (slot, &run) in steps.iter().enumerate() {
+        let seq = model
+            .new_seq_cells(2 * CELL_GRANULE)
+            .expect("whole-run sequence");
+        let mut rows = Vec::new();
+        for pos in 0..run {
+            model
+                .decode(&seq, token_of(slot, pos), pos)
+                .expect("solo step");
+            rows.push(row_hash(&model.capped_logits().expect("logits")));
+        }
+        solo.push(rows);
+    }
+    // The window run: slot 0 grows through the window, slot 1 never does, slot 2 never needs to.
+    let mut seqs = [
+        model.new_seq_cells(CELL_GRANULE).expect("small sequence"),
+        model.new_seq_cells(CELL_GRANULE).expect("small sequence"),
+        model
+            .new_seq_cells(2 * CELL_GRANULE)
+            .expect("whole-run sequence"),
+    ];
+    let mut growths = 0;
+    for pos in 0..steps[0] {
+        let live: Vec<usize> = (0..3).filter(|&slot| pos < steps[slot]).collect();
+        for &slot in &live {
+            let before = seqs[slot].cells();
+            model
+                .make_room(&mut seqs[slot], pos, pos + 1)
+                .expect("room");
+            growths += usize::from(seqs[slot].cells() != before);
+        }
+        let refs: Vec<&super::bolt::BoltSeq> = live.iter().map(|&slot| &seqs[slot]).collect();
+        let tokens: Vec<u32> = live.iter().map(|&slot| token_of(slot, pos)).collect();
+        let positions = [pos; 3];
+        let positions = &positions[..live.len()];
+        let rows = model
+            .decode_rows(&refs, &tokens, positions)
+            .expect("window step");
+        for (&slot, row) in live.iter().zip(&rows) {
+            let want = solo[slot].get(pos).copied();
+            assert_eq!(
+                Some(row_hash(row)),
+                want,
+                "slot {slot} position {pos} (window of {}, slot 0 holds {} cells)",
+                live.len(),
+                seqs[0].cells()
+            );
+        }
+    }
+    assert!(growths >= 1, "a sequence grew inside the window");
+    assert!(seqs[0].cells() >= steps[0]);
+    assert_eq!(
+        seqs[1].cells(),
+        CELL_GRANULE,
+        "the other small session never grew"
+    );
+}
