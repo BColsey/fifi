@@ -59,7 +59,12 @@ pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64
     let elements = rows.checked_mul(cols).ok_or_else(overflow)?;
     let tile_bytes = match ty {
         GgufType::F32 => return elements.checked_mul(4).ok_or_else(overflow),
-        GgufType::F16 => return elements.checked_mul(2).ok_or_else(overflow),
+        // A half vector (norm, bias, gate) widens to F32 at upload; a half matrix is the
+        // source size, which is also what a Q8_0 encode of it reads.
+        GgufType::F16 | GgufType::Bf16 if dims.len() == 1 => {
+            return elements.checked_mul(4).ok_or_else(overflow);
+        }
+        GgufType::F16 | GgufType::Bf16 => return elements.checked_mul(2).ok_or_else(overflow),
         GgufType::Q4K => Q4K_TILE_BYTES,
         GgufType::Q6K => Q6K_TILE_BYTES,
         GgufType::Q80 => Q8_0_TILE_BYTES,
@@ -112,7 +117,7 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
 /// F32 and F16 count as in [`device_bytes`]: both layouts load them as raw copies. Any other
 /// type fails with `EngError::Checkpoint` naming the tensor.
 pub(crate) fn native_device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64, EngError> {
-    if matches!(ty, GgufType::F32 | GgufType::F16) {
+    if matches!(ty, GgufType::F32 | GgufType::F16 | GgufType::Bf16) {
         return device_bytes(name, ty, dims);
     }
     let overflow = || EngError::MemoryPlan(format!("tensor {name}: device size overflows u64"));
@@ -139,6 +144,28 @@ pub(crate) fn native_device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Res
         .ok_or_else(overflow)
 }
 
+/// Device bytes of a plain float matrix a native load encodes to Q8_0 blocks: 34 bytes per 32
+/// values of every row. The planner and the encoding upload both size the tensor with this
+/// function, so admission counts what the upload writes. `dims[0]` must be a multiple of 32.
+pub(crate) fn q8_0_encoded_bytes(name: &str, dims: &[u64]) -> Result<u64, EngError> {
+    let overflow = || EngError::MemoryPlan(format!("tensor {name}: device size overflows u64"));
+    let (&cols, rest) = dims
+        .split_first()
+        .ok_or_else(|| EngError::Checkpoint(format!("tensor {name} has no dimensions")))?;
+    if cols == 0 || !cols.is_multiple_of(32) {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {name} has rows of {cols} values; the Q8_0 encode needs a multiple of 32"
+        )));
+    }
+    let rows = rest
+        .iter()
+        .try_fold(1u64, |rows, &dim| rows.checked_mul(dim))
+        .ok_or_else(overflow)?;
+    rows.checked_mul(cols / 32)
+        .and_then(|blocks| blocks.checked_mul(34))
+        .ok_or_else(overflow)
+}
+
 /// One device's slice of a native tensor: the dims it uploads under, its
 /// device bytes, and the source byte segments that assemble it, in upload
 /// order. Segments are relative to the tensor's first data byte.
@@ -155,7 +182,7 @@ pub(crate) struct TensorSlice {
 const fn slice_unit(ty: GgufType) -> Option<(u64, u64)> {
     match ty {
         GgufType::F32 => Some((1, 4)),
-        GgufType::F16 => Some((1, 2)),
+        GgufType::F16 | GgufType::Bf16 => Some((1, 2)),
         _ => native_block(ty),
     }
 }
@@ -416,6 +443,26 @@ mod tests {
     fn dense_tensors_keep_their_file_size() {
         assert_eq!(device_bytes("norm", GgufType::F32, &[5]), Ok(20));
         assert_eq!(device_bytes("table", GgufType::F16, &[3, 7]), Ok(42));
+        // BF16 counts as F16 and a half vector counts as the F32 it widens to.
+        assert_eq!(device_bytes("table", GgufType::Bf16, &[3, 7]), Ok(42));
+        assert_eq!(device_bytes("norm", GgufType::Bf16, &[5]), Ok(20));
+        assert_eq!(device_bytes("norm", GgufType::F16, &[5]), Ok(20));
+    }
+
+    #[test]
+    fn a_bf16_matrix_slices_on_its_two_byte_elements() {
+        let slice = plan_slice("g", GgufType::Bf16, &[64, 4], 0..32, 0..2).expect("slice");
+        assert_eq!(slice.dims, vec![32, 2]);
+        assert_eq!(slice.bytes, 32 * 2 * 2);
+    }
+
+    #[test]
+    fn an_encoded_float_matrix_counts_its_q8_0_blocks() {
+        // 4 rows of 64 values: 2 blocks of 34 bytes per row, whatever the source float type.
+        assert_eq!(q8_0_encoded_bytes("w", &[64, 4]), Ok(4 * 2 * 34));
+        assert_eq!(q8_0_encoded_bytes("w", &[2048, 32]), Ok(32 * 64 * 34));
+        assert!(q8_0_encoded_bytes("w", &[100, 4]).is_err());
+        assert!(q8_0_encoded_bytes("w", &[]).is_err());
     }
 
     #[test]
@@ -467,7 +514,7 @@ mod tests {
 
     #[test]
     fn other_types_fail_the_load_with_checkpoint() {
-        for ty in [GgufType::Q5K, GgufType::Q40, GgufType::Bf16] {
+        for ty in [GgufType::Q5K, GgufType::Q40] {
             assert!(matches!(
                 device_bytes("w", ty, &[256, 8]),
                 Err(EngError::Checkpoint(_))
@@ -583,6 +630,7 @@ mod tests {
         // F32 and F16 count as in the tiled plan: raw copies in both layouts.
         assert_eq!(native_device_bytes("norm", GgufType::F32, &[5]), Ok(20));
         assert_eq!(native_device_bytes("t", GgufType::F16, &[3, 7]), Ok(42));
+        assert_eq!(native_device_bytes("t", GgufType::Bf16, &[3, 7]), Ok(42));
         assert!(matches!(
             native_device_bytes("w", GgufType::F32, &[]),
             Err(EngError::Checkpoint(_))

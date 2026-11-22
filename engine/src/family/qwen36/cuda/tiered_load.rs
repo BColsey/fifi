@@ -188,6 +188,32 @@ pub(super) fn cold_cap_for(
     COLD_TARGET.min(usize::try_from(spare / per_expert.max(1)).unwrap_or(0))
 }
 
+/// Whether the tiered session takes the chunked prefill arm: `Q36_TIERED_CHUNK=1` and a file
+/// whose routed stacks (every layer) and shared experts are Q4_K, the one type that arm reads.
+/// With the variable set and another file the arm stays off and one notice line says why: the
+/// prompt prefills per token, as it does without the variable. The per-token tiered path reads
+/// the shared expert in whatever type the file stores it.
+pub(super) fn tiered_chunk_arm(header: &GgufHeader, dims: &StepDims) -> Result<bool, EngError> {
+    if !super::prefill::tiered_chunk_enabled(
+        std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+    ) {
+        return Ok(false);
+    }
+    let unsupported = require_q4k_shexp(header, dims.shape.kinds.len())
+        .err()
+        .map(|error| format!("{error:?}"))
+        .or_else(|| {
+            let types = expert_quant(header, dims).ok()?;
+            let q4k = [GgufType::Q4K; 3];
+            let mixed = types.iter().any(|quant| *quant != q4k);
+            mixed.then(|| "the routed experts are not Q4_K in every layer".to_owned())
+        });
+    if let Some(why) = &unsupported {
+        eprintln!("q36 cuda: Q36_TIERED_CHUNK=1 ignored, the chunk arm reads Q4_K experts: {why}");
+    }
+    Ok(unsupported.is_none())
+}
+
 pub(super) fn build_tiered(
     ctx: &CudaContext,
     (header, gguf): (&GgufHeader, &Path),
@@ -211,24 +237,6 @@ pub(super) fn build_tiered(
         shape,
     )
     .map_err(|error| checkpoint(format!("{error:?}")))?;
-    // The shexp refusal beside the routed one: the chunk facts assert a Q4_K
-    // shared expert, so a start that asks for the tiered chunk path proves it
-    // before the banks exist. The per-token tiered path reads the shared expert
-    // in whatever type the file stores it (the pinned Q4_K_M file keeps it Q8_0).
-    if super::prefill::tiered_chunk_enabled(
-        std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
-    ) {
-        require_q4k_shexp(header, layers).map_err(|error| checkpoint(format!("{error:?}")))?;
-        // The chunk facts assert Q4_K routed stacks as well; another type decodes per token.
-        let uniform = locator
-            .uniform_quant()
-            .map_err(|error| checkpoint(format!("{error:?}")))?;
-        if uniform != Some([GgufType::Q4K; 3]) {
-            return Err(checkpoint(
-                "the chunked tiered prefill reads Q4_K experts in every layer".to_owned(),
-            ));
-        }
-    }
     let mapped = MappedFile::open(gguf, header.file_len())
         .map_err(|error| checkpoint(format!("mapping {}: {error}", gguf.display())))?;
     let region: Arc<dyn MappedRegion> = Arc::new(mapped);

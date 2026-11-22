@@ -23,8 +23,6 @@ mod tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) use inventory::Role;
 pub use inventory::TensorPath;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) use inventory::is_dense_projection_name;
 
 /// `general.architecture` of the llama.cpp conversion of Qwen3.6-35B-A3B.
 const ARCHITECTURE: &str = "qwen35moe";
@@ -109,6 +107,17 @@ impl ModelPlan {
             .sum()
     }
 
+    /// The dense projections of the family inventory: the tensors a native load encodes to Q8_0
+    /// when the file stores them as F32, F16 or BF16. A family that serves a role raw does not
+    /// list it, so it keeps its raw half.
+    pub fn dense_names(&self) -> Vec<&str> {
+        self.tensors
+            .iter()
+            .filter(|tensor| tensor.dense)
+            .map(|tensor| tensor.name.as_str())
+            .collect()
+    }
+
     /// Names of every tensor of the plan: each one goes to the device.
     pub fn device_names(&self) -> Vec<&str> {
         self.tensors
@@ -123,6 +132,9 @@ struct PlannedTensor {
     name: String,
     path: TensorPath,
     source_bytes: u64,
+    /// A dense projection of the family inventory (not a routed expert stack): the native
+    /// load encodes one the file stores as a plain float to Q8_0.
+    dense: bool,
 }
 
 fn open_with_spec(
@@ -131,7 +143,11 @@ fn open_with_spec(
     spec: &FamilySpec,
 ) -> Result<GgufModel, EngError> {
     let inventory = Inventory::for_spec(spec)?;
-    let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
+    #[cfg_attr(
+        not(feature = "native-cuda"),
+        expect(unused_mut, reason = "only the CUDA load reads the dense set")
+    )]
+    let mut weights = GgufWeights::open(path, LIMITS, header_sha256)?;
     weights.require_single_file("the Qwen3.6 GGUF engine")?;
     let nextn = nextn_layers(weights.header())?;
     check_metadata(weights.header(), spec, nextn)?;
@@ -146,9 +162,12 @@ fn open_with_spec(
     for (expected, tensor) in pairs {
         tensors.push(classify(expected, tensor)?);
     }
+    let plan = ModelPlan { tensors };
+    #[cfg(feature = "native-cuda")]
+    weights.mark_dense(plan.dense_names());
     Ok(GgufModel {
         weights,
-        plan: ModelPlan { tensors },
+        plan,
         path: path.to_path_buf(),
     })
 }
@@ -276,6 +295,7 @@ fn classify(expected: &ExpectedTensor, tensor: &GgufTensor) -> Result<PlannedTen
         name: expected.name.clone(),
         path,
         source_bytes: expected.byte_len(ty)?,
+        dense: expected.is_dense_matrix(),
     })
 }
 

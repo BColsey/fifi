@@ -168,6 +168,11 @@ impl Role {
         )
     }
 
+    /// A dense projection: a quantized matrix that is not a routed expert stack.
+    fn is_dense_matrix(self) -> bool {
+        self.path() == TensorPath::DeviceTiled && !self.is_expert_stack()
+    }
+
     fn allowed_types(self) -> &'static [GgufType] {
         match self.path() {
             TensorPath::DeviceTiled if self.is_expert_stack() => NATIVE_TYPES.as_slice(),
@@ -236,6 +241,10 @@ pub(crate) struct ExpectedTensor {
 impl ExpectedTensor {
     pub(crate) fn path(&self) -> TensorPath {
         self.role.path()
+    }
+
+    pub(crate) fn is_dense_matrix(&self) -> bool {
+        self.role.is_dense_matrix()
     }
 
     pub(crate) fn allowed_types(&self) -> &'static [GgufType] {
@@ -332,29 +341,6 @@ fn expected(
     let name = role.tensor_name(layer);
     let dims = role.dims(spec)?;
     Ok(ExpectedTensor { name, role, dims })
-}
-
-/// Whether `name` is a dense projection of the shared tensor naming (`blk.N.attn_q.weight`,
-/// `token_embd.weight`, ...): the roles whose file type may be a plain float, which the load
-/// encodes to Q8_0. Routed expert stacks and the F32 roles (norms, router, conv, decay) are not.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) fn is_dense_projection_name(name: &str) -> bool {
-    let dense = |role: &&Role| role.path() == TensorPath::DeviceTiled && !role.is_expert_stack();
-    match name
-        .strip_prefix("blk.")
-        .and_then(|after| after.split_once('.'))
-    {
-        Some((index, rest)) if index.bytes().all(|b| b.is_ascii_digit()) => FULL_ROLES
-            .iter()
-            .chain(&DELTA_ROLES)
-            .chain(&COMMON_ROLES)
-            .filter(dense)
-            .any(|role| role.suffix() == rest),
-        Some(_) => false,
-        None => [Role::TokenEmbd, Role::Output]
-            .iter()
-            .any(|role| role.suffix() == name),
-    }
 }
 
 #[cfg(test)]

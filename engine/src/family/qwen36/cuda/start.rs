@@ -36,7 +36,7 @@ use super::{
     step_plan::{KernelScratch, StepPlan},
     tiered_load::{
         attach_tiered_parts, bank_slot_bytes, expert_quant, names_without_experts,
-        planning_geometry,
+        planning_geometry, tiered_chunk_arm,
     },
 };
 use crate::family::decode_step::shard::ShardTable;
@@ -1886,6 +1886,9 @@ fn make(
             step.request_krow_verify();
             step.check_krow_arming(settings.speculation.max_rows)?;
             step.enable_krow()?;
+        }
+        if let (Some(_), Some((model, _))) = (&tiered, gguf.as_ref()) {
+            step.set_tiered_chunk(tiered_chunk_arm(model.weights.header(), &res.dims)?);
         }
         let mut arena_admitted = None;
         if arena {

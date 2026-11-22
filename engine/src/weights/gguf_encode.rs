@@ -13,41 +13,69 @@ pub fn is_plain_float(ty: GgufType) -> bool {
     matches!(ty, GgufType::F32 | GgufType::F16 | GgufType::Bf16)
 }
 
-/// Encodes `values` as Q8_0 blocks, one scale per 32 values (`amax / 127`, stored as f16, the
-/// quotient rounded to the nearest signed byte). The length must be a multiple of 32.
-pub fn encode_q8_0(values: &[f32]) -> Result<Vec<u8>, EngError> {
-    if !values.len().is_multiple_of(Q8_0_VALUES) {
+/// Bytes of the Q8_0 form of `values` float values.
+pub fn q8_0_len(values: usize) -> usize {
+    values / Q8_0_VALUES * Q8_0_BYTES
+}
+
+/// Encodes `values` into `out` as Q8_0 blocks, one scale per 32 values (`amax / 127`, stored as
+/// f16, the quotient rounded to the nearest signed byte). The length must be a multiple of 32
+/// and `out` exactly [`q8_0_len`] of it.
+pub fn encode_q8_0_into(values: &[f32], out: &mut [u8]) -> Result<(), EngError> {
+    if !values.len().is_multiple_of(Q8_0_VALUES) || out.len() != q8_0_len(values.len()) {
         return Err(EngError::Checkpoint(format!(
-            "q8_0 encode: {} values is not a multiple of {Q8_0_VALUES}",
-            values.len()
+            "q8_0 encode: {} values into {} bytes is not whole blocks of {Q8_0_VALUES}",
+            values.len(),
+            out.len()
         )));
     }
-    let mut out = Vec::with_capacity(values.len() / Q8_0_VALUES * Q8_0_BYTES);
-    for block in values.as_chunks::<Q8_0_VALUES>().0 {
+    for (block, bytes) in values
+        .as_chunks::<Q8_0_VALUES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<Q8_0_BYTES>().0)
+    {
         let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         // The scale the device decodes is the stored f16, so quantize against that value.
         let scale = half::f16::from_f32(amax / 127.0);
-        let d = scale.to_f32();
-        let inverse = if d == 0.0 { 0.0 } else { d.recip() };
-        out.extend_from_slice(&scale.to_bits().to_le_bytes());
-        out.extend(
-            block
-                .iter()
-                .map(|v| (v * inverse).round().clamp(-127.0, 127.0) as i8 as u8),
-        );
+        let inverse = if scale.to_f32() == 0.0 {
+            0.0
+        } else {
+            scale.to_f32().recip()
+        };
+        bytes[..2].copy_from_slice(&scale.to_bits().to_le_bytes());
+        for (byte, v) in bytes[2..].iter_mut().zip(block) {
+            *byte = (v * inverse).round().clamp(-127.0, 127.0) as i8 as u8;
+        }
     }
+    Ok(())
+}
+
+/// Encodes `values` as Q8_0 blocks; see [`encode_q8_0_into`].
+pub fn encode_q8_0(values: &[f32]) -> Result<Vec<u8>, EngError> {
+    let mut out = vec![0u8; q8_0_len(values.len())];
+    encode_q8_0_into(values, &mut out)?;
     Ok(out)
 }
 
-/// The Q8_0 bytes of a float tensor of type `ty` read from `source`.
-pub fn plain_float_as_q8_0(ty: GgufType, source: &[u8]) -> Result<Vec<u8>, EngError> {
+/// Encodes whole rows of a float tensor of type `ty` (`src`, in the file's bytes) into `out`,
+/// the Q8_0 form of the same values. The caller hands one run of rows at a time, so a large
+/// matrix never exists in its source, f32 and encoded forms together.
+pub fn encode_plain_float_rows(ty: GgufType, src: &[u8], out: &mut [u8]) -> Result<(), EngError> {
     if !is_plain_float(ty) {
         return Err(EngError::Checkpoint(format!(
             "q8_0 encode: {} is not a plain float type",
             ty.name()
         )));
     }
-    encode_q8_0(&dequantize(ty, source)?)
+    encode_q8_0_into(&dequantize(ty, src)?, out)
+}
+
+/// The Q8_0 bytes of a float tensor of type `ty` read from `source`.
+pub fn plain_float_as_q8_0(ty: GgufType, source: &[u8]) -> Result<Vec<u8>, EngError> {
+    let mut out = vec![0u8; q8_0_len(source.len() / if ty == GgufType::F32 { 4 } else { 2 })];
+    encode_plain_float_rows(ty, source, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]

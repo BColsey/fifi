@@ -572,27 +572,32 @@ fn a_delta_net_layer_without_a_linear_block_is_rejected() {
 }
 
 #[test]
-fn dense_projection_names_follow_the_shared_naming_and_leave_the_f32_roles_out() {
-    use super::super::is_dense_projection_name as dense;
+fn the_plan_lists_the_dense_projections_and_not_the_expert_stacks_or_the_f32_roles() {
+    let inventory = Inventory::for_spec(&TWO_LAYER_SPEC)
+        .unwrap_or_else(|error| panic!("two-layer inventory: {error:?}"));
+    let dense: Vec<&str> = inventory
+        .tensors()
+        .iter()
+        .filter(|tensor| tensor.is_dense_matrix())
+        .map(|tensor| tensor.name.as_str())
+        .collect();
     for name in [
         "token_embd.weight",
         "output.weight",
-        "blk.0.attn_qkv.weight",
-        "blk.39.ssm_alpha.weight",
-        "blk.3.ssm_beta.weight",
-        "blk.7.ffn_down_shexp.weight",
+        "blk.1.attn_q.weight",
+        "blk.0.ssm_alpha.weight",
+        "blk.0.ssm_beta.weight",
+        "blk.1.ffn_down_shexp.weight",
     ] {
-        assert!(dense(name), "{name}");
+        assert!(dense.contains(&name), "{name} is a dense projection");
     }
     for name in [
         "output_norm.weight",
         "blk.0.ffn_gate_inp.weight",
         "blk.0.ssm_conv1d.weight",
         "blk.0.ffn_gate_exps.weight",
-        "blk.x.attn_q.weight",
         "blk.0.attn_norm.weight",
-        "attn_q.weight",
     ] {
-        assert!(!dense(name), "{name}");
+        assert!(!dense.contains(&name), "{name} is not a dense projection");
     }
 }

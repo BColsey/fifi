@@ -43,7 +43,7 @@ use self::load_policy::{LoadPolicy, evict_model, recover_files, retry_on_oom};
 use super::Projector;
 use crate::{
     EngError,
-    family::gguf_model::{GgufModel, is_dense_projection_name},
+    family::gguf_model::GgufModel,
     kernels::cuda::{
         self, Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
         QuantTensor, TiledWeight, WorkspaceShape, plan,
@@ -164,6 +164,9 @@ struct PlannedTensor<'w> {
     bytes: u64,
     slice: Option<plan::TensorSlice>,
     mapped: bool,
+    /// A dense plain-float matrix the native load encodes to Q8_0 (`bytes` counts the encoded
+    /// form).
+    encode: bool,
 }
 
 /// One checkpoint tensor resident on the device.
@@ -1251,6 +1254,13 @@ fn select_host_experts(
     Ok((selected, bytes))
 }
 
+/// `attn_q.weight` of `blk.3.attn_q.weight`; a name without a layer prefix as it is.
+fn role_suffix(name: &str) -> &str {
+    name.strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .map_or(name, |(_, role)| role)
+}
+
 fn load_inner(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
@@ -1325,12 +1335,31 @@ fn load_inner(
             };
             let (tensor, whole_bytes) = planned(weights, name, tensor_layout)?;
             check_sliced_override(name, tensor_layout, slice_specs.contains_key(name))?;
+            // A dense plain-float matrix of a native load is encoded to Q8_0; admission counts
+            // the encoded bytes through the function the upload sizes itself with.
+            let encode = tensor_layout == WeightLayout::Native
+                && is_plain_float(tensor.ggml_type())
+                && weights.is_dense(name);
+            if tensor.ggml_type() == GgufType::Bf16 && tensor.dims().len() > 1 && !encode {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {name} is a BF16 matrix; a load takes it only as a dense projection \
+                     encoded to Q8_0"
+                )));
+            }
+            let admitted = |dims: &[u64], raw: u64| {
+                if encode {
+                    plan::q8_0_encoded_bytes(name, dims)
+                } else {
+                    Ok(raw)
+                }
+            };
             match slice_specs.get(name) {
                 None => Ok(PlannedTensor {
                     tensor,
-                    bytes: whole_bytes,
+                    bytes: admitted(tensor.dims(), whole_bytes)?,
                     slice: None,
                     mapped: false,
+                    encode,
                 }),
                 Some(spec) => {
                     let slice = plan::plan_slice_rows(
@@ -1340,17 +1369,34 @@ fn load_inner(
                         spec.cols.clone(),
                         &spec.rows,
                     )?;
-                    let bytes = slice.bytes;
+                    let bytes = admitted(&slice.dims, slice.bytes)?;
                     Ok(PlannedTensor {
                         tensor,
                         bytes,
                         slice: Some(slice),
                         mapped: false,
+                        encode,
                     })
                 }
             }
         })
         .collect::<Result<Vec<PlannedTensor<'_>>, EngError>>()?;
+    let encoded: Vec<&str> = tensors
+        .iter()
+        .filter(|t| t.encode)
+        .map(|t| t.tensor.name())
+        .collect();
+    if !encoded.is_empty() {
+        let mut roles: Vec<&str> = encoded.iter().map(|name| role_suffix(name)).collect();
+        roles.sort_unstable();
+        roles.dedup();
+        eprintln!(
+            "cuda load: {} dense tensors the file stores as F32/F16/BF16 are encoded to Q8_0 ({}); \
+             no half kernel serves these roles",
+            encoded.len(),
+            roles.join(", ")
+        );
+    }
     let candidates: Vec<_> = tensors
         .iter()
         .map(|t| {
@@ -1518,6 +1564,7 @@ fn transfer(
                         },
                         planned_tensor.slice.as_ref(),
                         planned_tensor.mapped,
+                        planned_tensor.encode,
                     )
                 },
                 || recover_files(weights.files(), policy.retry_pause),
@@ -1630,12 +1677,6 @@ fn upload_fused_inproj(
     })
 }
 
-/// Whether a tensor of type `ty` named `name` is a dense projection stored as a plain float,
-/// which the native layout loads as Q8_0 blocks.
-fn dense_plain_float(ty: GgufType, name: &str) -> bool {
-    is_plain_float(ty) && is_dense_projection_name(name)
-}
-
 fn upload(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
@@ -1643,6 +1684,7 @@ fn upload(
     layout: WeightLayout,
     slice: Option<&plan::TensorSlice>,
     mapped: bool,
+    encode: bool,
 ) -> Result<CudaWeight, EngError> {
     let name = tensor.name();
     match (tensor.ggml_type(), layout) {
@@ -1662,7 +1704,7 @@ fn upload(
                 buffer: knobs.context.upload(&bytes)?,
             })
         }
-        (ty, WeightLayout::Native) if dense_plain_float(ty, name) => {
+        (_, WeightLayout::Native) if encode => {
             plain_float::upload_as_q8_0(knobs, weights, tensor, slice)
         }
         (ty @ (GgufType::F32 | GgufType::F16), _) => {

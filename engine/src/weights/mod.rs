@@ -61,7 +61,9 @@ pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,
 };
-pub use gguf_encode::{encode_q8_0, is_plain_float, plain_float_as_q8_0};
+pub use gguf_encode::{
+    encode_plain_float_rows, encode_q8_0, is_plain_float, plain_float_as_q8_0, q8_0_len,
+};
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };

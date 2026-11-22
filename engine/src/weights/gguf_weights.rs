@@ -53,6 +53,9 @@ pub(crate) struct GgufWeights {
     /// The length of each file when it was opened.
     file_lens: Vec<u64>,
     header: GgufHeader,
+    /// The tensors a family's inventory names as dense projections (see [`Self::mark_dense`]).
+    #[cfg(feature = "native-cuda")]
+    dense: std::collections::HashSet<String>,
 }
 
 impl GgufWeights {
@@ -103,6 +106,8 @@ impl GgufWeights {
                 paths: vec![path.to_path_buf()],
                 file_lens: vec![first_len],
                 header: first,
+                #[cfg(feature = "native-cuda")]
+                dense: Default::default(),
             });
         };
         let name = shard_name_of(path).ok_or_else(|| {
@@ -186,7 +191,25 @@ impl GgufWeights {
             paths,
             file_lens,
             header,
+            #[cfg(feature = "native-cuda")]
+            dense: Default::default(),
         })
+    }
+
+    /// Records the tensors the family's inventory names as dense projections. A native load
+    /// encodes one of these that the file stores as F32, F16 or BF16 to Q8_0 blocks, the form its
+    /// matvec and GEMM read; a tensor not named loads as the file has it. The model opener sets
+    /// this from its plan, so every load of the model's weights, whole, partial or sliced, applies
+    /// the same set and no caller can leave it out.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn mark_dense<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        self.dense = names.into_iter().map(str::to_owned).collect();
+    }
+
+    /// Whether the family's inventory names `name` a dense projection.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn is_dense(&self, name: &str) -> bool {
+        self.dense.contains(name)
     }
 
     /// The shard files in order; one path for a single file.

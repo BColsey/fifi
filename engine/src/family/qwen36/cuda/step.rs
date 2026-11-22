@@ -434,6 +434,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// (slots 40 with preload, measured). A prompt is prefilled one token per step, so a prompt
     /// of n tokens costs n of these steps until a batched tiered prefill exists.
     tiered_mode: bool,
+    /// The tiered session takes the chunked prefill arm (`tiered_load::tiered_chunk_arm`).
+    tiered_chunk: bool,
     /// The router and shared weights of each layer, held until `attach_tiered` builds the runtime.
     tiered_parts: Option<Vec<LayerParts<'a>>>,
     /// The tiered runtime; interior mutability because the token body takes `&self`.
@@ -582,11 +584,7 @@ pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
     if facts.kv_mode == KvMode::Int8G32 && !facts.kv8_chunked_prefill {
         return ChunkVerdict::Kv8;
     }
-    if facts.tiered
-        && !super::prefill::tiered_chunk_enabled(
-            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
-        )
-    {
+    if facts.tiered {
         return ChunkVerdict::Tiered;
     }
     let Some(m_sess) = facts.arena else {
@@ -886,6 +884,7 @@ impl<'a> QwenResidentStep<'a> {
             merge_intent,
             merge_source,
             tiered_mode,
+            tiered_chunk: false,
             tiered_parts,
             tiered: None,
             tiered_report: TokenReport::default(),
@@ -1127,7 +1126,7 @@ impl<'a> QwenResidentStep<'a> {
         if !needs_arena(
             self.layout,
             layout.kv.mode,
-            self.tiered_mode,
+            self.tiered_mode && !self.tiered_chunk,
             self.kv8_chunked_prefill,
         ) {
             if fixed {
@@ -1332,7 +1331,7 @@ impl<'a> QwenResidentStep<'a> {
             layout: self.layout,
             kv_mode: self.state.layout().kv.mode,
             kv8_chunked_prefill: self.kv8_chunked_prefill,
-            tiered: self.tiered_mode,
+            tiered: self.tiered_mode && !self.tiered_chunk,
             m_sess_cap: self.m_sess_cap,
             arena: self.prefill.as_ref().map(PrefillArena::m_sess),
         })
@@ -1430,9 +1429,7 @@ impl<'a> QwenResidentStep<'a> {
         let wide_tiered = self.tiered_mode
             && self.kv8_chunked_prefill
             && self.state.layout().kv.mode == KvMode::Int8G32
-            && super::prefill::tiered_chunk_enabled(
-                std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
-            )
+            && self.tiered_chunk
             && (m_sess == 4096
                 || std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1"));
         let run = |step, rows: &[u32]| match step {
@@ -1553,11 +1550,7 @@ impl<'a> QwenResidentStep<'a> {
             .as_ref()
             .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds));
         // The tiered chunk path stays behind its existing, default-off gate.
-        let tiered_chunk = self.tiered.as_ref().filter(|_| {
-            super::prefill::tiered_chunk_enabled(
-                std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
-            )
-        });
+        let tiered_chunk = self.tiered.as_ref().filter(|_| self.tiered_chunk);
         let mut fam = Q36ChunkFamily::new(
             self.exl3_bank,
             tiered_chunk,
@@ -1634,6 +1627,12 @@ impl<'a> QwenResidentStep<'a> {
             sp.note_prefill(p0, m);
         }
         Ok(())
+    }
+
+    /// Turns the chunked prefill arm of a tiered session on or off; the start sets it before the
+    /// arena is admitted.
+    pub(crate) fn set_tiered_chunk(&mut self, on: bool) {
+        self.tiered_chunk = on;
     }
 
     /// Whether the step runs the tiered MoE path, whose prefix reuse is experimental.

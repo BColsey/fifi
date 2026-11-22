@@ -3490,6 +3490,7 @@ fn plan_of<'a>(
                 bytes,
                 slice: None,
                 mapped: false,
+                encode: false,
             })
         })
         .collect::<Result<Vec<_>, _>>()
