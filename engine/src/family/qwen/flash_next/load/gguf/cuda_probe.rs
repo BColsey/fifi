@@ -1,7 +1,7 @@
 //! Bounded one-row projection probe: native GGUF blocks in, host-visible logits out.
 //! This is a test adapter, not a serving path or a weight placement policy.
 
-use std::ops::Range;
+use std::{cell::Cell, ops::Range};
 
 use super::{GgufModel, tensors::Mapped};
 use crate::{
@@ -16,7 +16,25 @@ use crate::{
     weights::GgufType,
 };
 
-pub(super) fn project(
+pub(super) struct Projection<'a> {
+    pub(super) ctx: &'a CudaContext,
+    pub(super) stream: &'a DeviceStream,
+    pub(super) launches: &'a Cell<usize>,
+}
+
+impl Projection<'_> {
+    pub(super) fn supports(&self, ty: GgufType) -> bool {
+        QuantType::from_gguf(ty).is_some()
+    }
+
+    pub(super) fn run(&self, ty: GgufType, blocks: &[u8], x: &[f32]) -> Result<Vec<f32>, EngError> {
+        let out = project(self.ctx, self.stream, ty, blocks, x)?;
+        self.launches.set(self.launches.get() + 1);
+        Ok(out)
+    }
+}
+
+fn project(
     ctx: &CudaContext,
     stream: &DeviceStream,
     ty: GgufType,
@@ -198,6 +216,58 @@ fn mapped_checkpoint_projections_match_host_dots() {
     }
     assert!(checked > 0, "no native mapped projections were checked");
     eprintln!("Flash-Next layer 0: checked {checked} mapped projections");
+}
+
+/// The token loop and unquantized operators stay on the host; this is not a serving test.
+#[test]
+#[ignore = "requires the complete pinned GGUF and an admitted CUDA device"]
+fn checkpoint_greedy_rows_with_cuda_projections() {
+    use super::host::{HostModel, HostProjector, greedy_rows, greedy_rows_with, greedy_token};
+    let path =
+        std::env::var_os("FIFI_FLASH_GGUF").expect("set FIFI_FLASH_GGUF to the verified pack");
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .expect("Flash-Next GGUF");
+    let host = HostModel::load(&model, model.config().layers()).expect("host model");
+    let prompt = [9707, 11, 1879];
+    let expected = greedy_rows(&model, &host, &prompt, 3, 8).expect("host greedy rows");
+    let ctx = CudaContext::new().expect("CUDA device");
+    let stream = ctx.stream().expect("stream");
+    let ngram = model.ngram().expect("n-gram table");
+    let launches = Cell::new(0);
+    let projector = HostProjector::new(&model.weights, &ngram, 8).with_cuda(Projection {
+        ctx: &ctx,
+        stream: &stream,
+        launches: &launches,
+    });
+    let actual = greedy_rows_with(projector, &host, &prompt, 3).expect("hybrid greedy rows");
+    assert!(launches.get() > 0, "no CUDA projections ran");
+    assert_eq!(actual.len(), expected.len());
+    for (position, (got, want)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(got.len(), want.len());
+        assert_eq!(
+            greedy_token(got).unwrap(),
+            greedy_token(want).unwrap(),
+            "decision {position}"
+        );
+        let (err, norm) = got
+            .iter()
+            .zip(want)
+            .fold((0.0, 0.0), |(err, norm), (&a, &b)| {
+                let (a, b) = (f64::from(a), f64::from(b));
+                (err + (a - b).powi(2), norm + b.powi(2))
+            });
+        let relative_l2 = (err / norm).sqrt();
+        eprintln!(
+            "hybrid decision {position}: relative L2={relative_l2}, CUDA projections={}",
+            launches.get()
+        );
+        // Provisional bring-up threshold, not a model quality criterion.
+        assert!(
+            relative_l2 <= 0.05,
+            "decision {position}: relative L2 {relative_l2}"
+        );
+    }
 }
 
 #[test]

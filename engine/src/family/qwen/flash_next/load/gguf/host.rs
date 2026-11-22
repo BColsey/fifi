@@ -145,6 +145,8 @@ pub(super) struct HostProjector<'a> {
     weights: &'a GgufWeights,
     ngram: &'a GgufNgramRows,
     threads: usize,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    cuda: Option<super::cuda_probe::Projection<'a>>,
 }
 
 impl<'a> HostProjector<'a> {
@@ -153,12 +155,20 @@ impl<'a> HostProjector<'a> {
             weights,
             ngram,
             threads: threads.max(1),
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            cuda: None,
         }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn with_cuda(mut self, cuda: super::cuda_probe::Projection<'a>) -> Self {
+        self.cuda = Some(cuda);
+        self
     }
 
     /// `rows` rows of `part` from row `first` of expert `expert`, dotted with `x`.
     fn matvec_range(
-        &self,
+        weights: &GgufWeights,
         part: &Part,
         base: u64,
         first: usize,
@@ -176,7 +186,7 @@ impl<'a> HostProjector<'a> {
             let rows = per_chunk.min(count - done);
             bytes.resize(rows * row_bytes, 0);
             decoded.resize(rows * part.input, 0f32);
-            self.weights.read_range(
+            weights.read_range(
                 &part.name,
                 base + ((first + done) * row_bytes) as u64,
                 &mut bytes,
@@ -192,7 +202,12 @@ impl<'a> HostProjector<'a> {
         Ok(out)
     }
 
-    fn matvec(&self, part: &Part, expert: Option<u32>, x: &[f32]) -> Result<Vec<f32>, EngError> {
+    fn matvec(
+        &mut self,
+        part: &Part,
+        expert: Option<u32>,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
         if x.len() != part.input {
             return Err(refuse(format!(
                 "{} takes {} inputs, got {}",
@@ -204,14 +219,31 @@ impl<'a> HostProjector<'a> {
         let block = part.ty.block_elems() as usize;
         let row_bytes = (part.input / block * part.ty.block_bytes() as usize) as u64;
         let base = expert.map_or(0, |e| u64::from(e) * part.out as u64 * row_bytes);
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some(cuda) = self.cuda.as_mut()
+            && cuda.supports(part.ty)
+        {
+            let mut out = Vec::with_capacity(part.out);
+            let mut bytes = Vec::new();
+            let chunk_rows = (CHUNK_BYTES as u64 / row_bytes).max(1) as usize;
+            for first in (0..part.out).step_by(chunk_rows) {
+                let count = chunk_rows.min(part.out - first);
+                bytes.resize(count * row_bytes as usize, 0);
+                self.weights
+                    .read_range(&part.name, base + first as u64 * row_bytes, &mut bytes)?;
+                out.extend(cuda.run(part.ty, &bytes, x)?);
+            }
+            return Ok(out);
+        }
         let threads = self.threads.min(part.out.div_ceil(64)).max(1);
         let share = part.out.div_ceil(threads);
+        let weights = self.weights;
         let pieces: Vec<Result<Vec<f32>, EngError>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
                     let first = (t * share).min(part.out);
                     let count = share.min(part.out - first);
-                    scope.spawn(move || self.matvec_range(part, base, first, count, x))
+                    scope.spawn(move || Self::matvec_range(weights, part, base, first, count, x))
                 })
                 .collect();
             handles
@@ -645,13 +677,22 @@ pub(super) fn greedy_rows(
     decisions: usize,
     threads: usize,
 ) -> Result<Vec<Vec<f32>>, EngError> {
+    let ngram = model.ngram()?;
+    let projector = HostProjector::new(&model.weights, &ngram, threads);
+    greedy_rows_with(projector, host, prompt, decisions)
+}
+
+pub(super) fn greedy_rows_with(
+    mut projector: HostProjector<'_>,
+    host: &HostModel,
+    prompt: &[u32],
+    decisions: usize,
+) -> Result<Vec<Vec<f32>>, EngError> {
     use crate::family::qwen::flash_next::step::{ModelState, step};
 
     let Some((&last, prefix)) = prompt.split_last() else {
         return Err(refuse("the greedy oracle needs a nonempty prompt"));
     };
-    let ngram = model.ngram()?;
-    let mut projector = HostProjector::new(&model.weights, &ngram, threads);
     let weights = host.view();
     let mut state = ModelState::new(&host.shape, &weights);
     for &token in prefix {
@@ -712,6 +753,61 @@ pub(super) fn rms_by_layer(run: &HostRun) -> BTreeMap<usize, Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    #[ignore = "needs an admitted CUDA device; synthetic split GGUF"]
+    fn mapped_host_weight_dispatches_to_cuda() {
+        use super::super::{
+            cuda_probe::Projection,
+            testkit::{Spec, write_flash},
+        };
+        use crate::kernels::cuda::CudaContext;
+
+        let pack = write_flash(&Spec {
+            shards: 4,
+            ..Spec::default()
+        });
+        let model = GgufModel::open(&pack.first).unwrap().unwrap();
+        let tensor = model
+            .map
+            .entries()
+            .iter()
+            .find(|t| t.ty == GgufType::Q80 && t.dims.len() == 2)
+            .unwrap();
+        let mut weight = HostWeight::new(&[tensor], Remap::None);
+        let k = weight.parts[0].input;
+        weight.parts[0].out = 3;
+        let mut bytes = Vec::new();
+        for code in [1_i8, -2, 3] {
+            for _ in 0..k / 32 {
+                bytes.extend(0x3800_u16.to_le_bytes());
+                bytes.extend([code as u8; 32]);
+            }
+        }
+        pack.patch(&tensor.name, 0, &bytes);
+        let ngram = model.ngram().unwrap();
+        let x = vec![1.0; k];
+        let expected = HostProjector::new(&model.weights, &ngram, 1)
+            .linear(&weight, &x)
+            .unwrap();
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let launches = std::cell::Cell::new(0);
+        let got = HostProjector::new(&model.weights, &ngram, 1)
+            .with_cuda(Projection {
+                ctx: &ctx,
+                stream: &stream,
+                launches: &launches,
+            })
+            .linear(&weight, &x)
+            .unwrap();
+        assert_eq!(launches.get(), 1);
+        assert_eq!(got.len(), expected.len());
+        for (a, b) in got.into_iter().zip(expected) {
+            assert!((a - b).abs() <= b.abs() * 0.005, "native {a}, host {b}");
+        }
+    }
 
     #[test]
     fn greedy_token_rejects_invalid_rows_and_breaks_ties_by_lowest_id() {
