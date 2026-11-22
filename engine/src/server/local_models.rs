@@ -4,8 +4,8 @@
 //! directory (`~/models`, or `FIFI_MODELS_DIR`), the Ollama store (`OLLAMA_MODELS`, or
 //! `~/.ollama/models`; a tag is `name[:tag]`) and the hub cache. The first store with a match
 //! decides: one match is the model, several are refused with their paths so the user names more
-//! of it. A model in the Ollama store is a blob with no `.gguf` name, so the start reaches it
-//! through a link under the engine's cache directory, never inside a store.
+//! of it. A model in the Ollama store is a blob with no `.gguf` name: it is served by its path, and
+//! the start knows it by the GGUF magic.
 
 use std::path::{Path, PathBuf};
 
@@ -16,8 +16,6 @@ pub(crate) struct Stores {
     pub(crate) models: PathBuf,
     pub(crate) ollama: PathBuf,
     pub(crate) hub: PathBuf,
-    /// Where the links to Ollama blobs go.
-    pub(crate) links: PathBuf,
 }
 
 impl Stores {
@@ -27,12 +25,10 @@ impl Stores {
             Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
             _ => default,
         };
-        let cache = from("XDG_CACHE_HOME", home.join(".cache"));
         Self {
             models: from("FIFI_MODELS_DIR", home.join("models")),
             ollama: from("OLLAMA_MODELS", home.join(".ollama").join("models")),
             hub: super::hf::hub_dir_from_env(),
-            links: cache.join("fifi").join("ollama"),
         }
     }
 }
@@ -119,8 +115,9 @@ fn in_models(root: &Path, query: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// The model layer of the Ollama manifest `name[:tag]`, as a link directory under `links`.
-fn in_ollama(root: &Path, links: &Path, query: &str) -> Result<Vec<PathBuf>, StartupError> {
+/// The model layer of the Ollama manifest `name[:tag]`: its blob, which is a GGUF file with no
+/// extension and is served by its path.
+fn in_ollama(root: &Path, query: &str) -> Result<Vec<PathBuf>, StartupError> {
     let (name, tag) = match query.split_once(':') {
         Some((name, tag)) => (name, Some(tag)),
         None => (query, None),
@@ -172,16 +169,7 @@ fn in_ollama(root: &Path, links: &Path, query: &str) -> Result<Vec<PathBuf>, Sta
     if !blob.is_file() {
         return Ok(Vec::new());
     }
-    let link_dir = links.join(format!("{name}-{tag}"));
-    std::fs::create_dir_all(&link_dir)
-        .map_err(|error| StartupError(format!("serve --model: {}: {error}", link_dir.display())))?;
-    let link = link_dir.join("model.gguf");
-    if std::fs::read_link(&link).ok().as_deref() != Some(blob.as_path()) {
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&blob, &link)
-            .map_err(|error| StartupError(format!("serve --model: {}: {error}", link.display())))?;
-    }
-    Ok(vec![link_dir])
+    Ok(vec![blob])
 }
 
 /// The snapshots of the hub cache whose repository name matches and that hold a GGUF.
@@ -213,10 +201,7 @@ fn in_hub(root: &Path, query: &str) -> Vec<PathBuf> {
 pub(crate) fn resolve(name: &str, stores: &Stores) -> Result<Option<Found>, StartupError> {
     let lookups: [(&'static str, Result<Vec<PathBuf>, StartupError>); 3] = [
         ("the models directory", Ok(in_models(&stores.models, name))),
-        (
-            "the Ollama store",
-            in_ollama(&stores.ollama, &stores.links, name),
-        ),
+        ("the Ollama store", in_ollama(&stores.ollama, name)),
         ("the hub cache", Ok(in_hub(&stores.hub, name))),
     ];
     for (store, found) in lookups {
@@ -256,7 +241,6 @@ mod tests {
             models: root.join("models"),
             ollama: root.join("ollama"),
             hub: root.join("hub"),
-            links: root.join("links"),
         }
     }
 
@@ -294,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ollama_tag_resolves_to_a_link_named_for_gguf_and_the_only_tag_is_the_default() {
+    fn an_ollama_tag_resolves_to_its_blob_and_the_only_tag_is_the_default() {
         let root = tempfile::tempdir().expect("tempdir");
         ollama_model(root.path(), "qwen3.6", "35b-a3b", "abc123");
         for name in ["qwen3.6", "qwen3.6:35b-a3b"] {
@@ -302,11 +286,7 @@ mod tests {
                 .expect("resolves")
                 .expect("found");
             assert_eq!(found.store, "the Ollama store");
-            let link = found.dir.join("model.gguf");
-            assert_eq!(
-                std::fs::read_link(&link).expect("a link"),
-                root.path().join("ollama/blobs/sha256-abc123")
-            );
+            assert_eq!(found.dir, root.path().join("ollama/blobs/sha256-abc123"));
         }
         assert!(
             resolve("qwen3.6:other", &stores(root.path()))

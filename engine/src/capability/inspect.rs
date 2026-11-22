@@ -455,4 +455,61 @@ mod tests {
         let error = crate::capability::describe_error(&inspect(&text, &dir).unwrap_err());
         assert!(error.contains("not a directory or a GGUF file"), "{error}");
     }
+
+    /// `path` as a path relative to the working directory, with `..` steps up to the root.
+    fn relative_to_cwd(path: &std::path::Path) -> PathBuf {
+        let cwd = std::env::current_dir().expect("working directory");
+        let mut relative = PathBuf::new();
+        for _ in 1..cwd.components().count() {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").expect("an absolute path"))
+    }
+
+    #[test]
+    fn a_relative_path_to_a_file_is_inspected_like_the_absolute_one() {
+        let dir = scratch("relative");
+        let file = dir.join("m.gguf");
+        std::fs::write(&file, gguf_bytes(100)).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"gemma4"}"#).unwrap();
+        let relative = relative_to_cwd(&file);
+        assert!(relative.is_relative());
+        let by_relative = inspect(&relative, &relative).unwrap();
+        let by_absolute = inspect(&file, &file).unwrap();
+        assert_eq!(by_relative.gguf_files, by_absolute.gguf_files);
+        assert_eq!(by_relative.weights_path, relative);
+        assert_eq!(by_relative.model_dir, relative.parent().unwrap());
+        // A directory named relatively is counted whole.
+        let whole = inspect(relative.parent().unwrap(), relative.parent().unwrap()).unwrap();
+        assert_eq!(whole.gguf_files.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_gguf_is_a_gguf_whatever_either_name() {
+        let dir = scratch("symlink");
+        let blob = dir.join("blobs").join("sha256-abc");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, gguf_bytes(300)).unwrap();
+        // A link named like a GGUF, and a link with no extension at all.
+        let named = dir.join("model.gguf");
+        let bare = dir.join("latest");
+        std::os::unix::fs::symlink(&blob, &named).unwrap();
+        std::os::unix::fs::symlink(&blob, &bare).unwrap();
+        for link in [&named, &bare] {
+            let report = inspect(link, link).unwrap();
+            assert_eq!(
+                report.gguf_files.len(),
+                1,
+                "{link:?}: {:?}",
+                report.gguf_errors
+            );
+            assert_eq!(report.weight_bytes(), 300, "{link:?}");
+        }
+        // A dangling link is refused by name, not read as an empty model.
+        let gone = dir.join("gone.gguf");
+        std::os::unix::fs::symlink(dir.join("missing"), &gone).unwrap();
+        let error = crate::capability::describe_error(&inspect(&gone, &dir).unwrap_err());
+        assert!(error.contains("dangling symlink"), "{error}");
+    }
 }

@@ -43,10 +43,6 @@ fn uses_qwen36_options(family: &str) -> bool {
     DETECTABLE_FAMILIES.iter().any(|(name, _)| *name == family)
 }
 
-/// The families that a GGUF `general.architecture` identifies when the directory has no
-/// `config.json`.
-const ARCHITECTURE_FAMILIES: &[(&str, &str)] = crate::server::config::GGUF_ARCHITECTURE_FAMILIES;
-
 /// The listen address of a simplified startup, matching the shipped
 /// configurations (loopback; `listen_address` rejects anything else).
 const DEFAULT_LISTEN: &str = "127.0.0.1:18791";
@@ -471,7 +467,7 @@ fn select_family(
     // A directory with no `config.json` model_type is identified by the architecture its weights
     // file declares.
     if matches.is_empty() {
-        matches = ARCHITECTURE_FAMILIES
+        matches = crate::server::config::GGUF_ARCHITECTURE_FAMILIES
             .iter()
             .filter(|(architecture, _)| {
                 inspection
@@ -1106,5 +1102,30 @@ mod tests {
         let whole = discover(&args_for(dir.path())).expect("discovers");
         assert_eq!(whole.family, "qwen3_6_35b_a3b");
         assert_eq!(whole.tokenizer_dir, dir.path());
+    }
+
+    #[test]
+    fn a_relative_path_and_a_symlink_name_the_model_like_its_absolute_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real").join("sha256-0f1e");
+        std::fs::create_dir_all(real.parent().expect("parent")).expect("dirs");
+        write_architecture(&real, "gemma4");
+        let link = dir.path().join("bolt.gguf");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut relative = PathBuf::new();
+        for _ in 1..cwd.components().count() {
+            relative.push("..");
+        }
+        let relative = relative.join(link.strip_prefix("/").expect("absolute"));
+        for path in [&real, &link, &relative] {
+            let discovered = discover(&args_for(path)).expect("discovers");
+            assert_eq!(
+                discovered.family,
+                crate::family::gemma::gemma4::FAMILY,
+                "{path:?}"
+            );
+            assert_eq!(discovered.tokenizer_dir, *path, "{path:?}");
+        }
     }
 }

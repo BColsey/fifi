@@ -41,12 +41,10 @@ pub(crate) const FAMILIES: [&str; 7] = [
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
 
-/// The families that a GGUF `general.architecture` identifies, so a directory holding only the
-/// weights file starts with no `config.json` and no `--family`. One line per architecture: a
-/// family adds its line once a start from a GGUF-only directory serves a chat. Not listed:
-/// Flash-Next `qwen4exp` (its loader stops on quantization kernels that do not exist yet, such as
-/// IQ2_S), Nemotron `nemotron_h_moe` (its entry needs an options block), Raon `raon1` (its CUDA
-/// serving is not on main) and Flint.
+/// The families that a GGUF `general.architecture` identifies, so a model path that holds only
+/// the weights file starts with no `config.json` and no `--family`. One line per architecture: a
+/// family adds its line once a start from a bare GGUF file serves a chat. The architectures that
+/// are left out, and why, are in [`gguf_architecture_note`].
 pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
     ("qwen35moe", crate::family::qwen::qwen36::factory::FAMILY),
     ("gemma4", crate::family::gemma::gemma4::FAMILY),
