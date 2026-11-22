@@ -33,10 +33,11 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::multi_row::{
-    AppendMultiRaw, ConvMultiRaw, DecodeMultiRaw, DeltaMultiRaw, GemmaMultiRaw, KV_ROW_BYTES,
-    KvRowRaw, MULTI_ROW_MAX, PrepMultiRaw, STATE_ENTRY_BYTES, STEP_BYTES,
-    attn_decode_gemma_multi_launch, attn_decode_q8_multi_launch, attn_prep_multi_launch,
-    gdn_conv_multi_launch, gdn_delta_multi_launch, kv8_append_multi_launch,
+    Append16MultiRaw, AppendMultiRaw, ConvMultiRaw, DecodeMultiRaw, DeltaMultiRaw, GemmaMultiRaw,
+    KV_ROW_BYTES, KvRowRaw, MULTI_ROW_MAX, PrepMultiRaw, STATE_ENTRY_BYTES, STEP_BYTES,
+    attn_decode_gemma_multi_launch, attn_decode_multi_launch, attn_decode_q8_multi_launch,
+    attn_prep_multi_launch, gdn_conv_multi_launch, gdn_delta_multi_launch, kv8_append_multi_launch,
+    kv16_append_multi_launch,
 };
 use crate::kernels::cuda::resident::attn_decode::{AttnSpan, AttnSplit};
 use crate::kernels::cuda::resident::attn_decode_gemma::{AttnDecodeGemmaSplit, admit_gemma_heads};
@@ -751,3 +752,183 @@ impl CudaContext {
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;
+
+/// The fp16 append of `rows.len()` rows: `k` and `v` are f32 `[n][n_kv_head][head_dim]`. The planes
+/// of a row are its `k_codes` and `v_codes`, fp16 `[cells][n_kv_head][head_dim]`; its scale planes
+/// are not read.
+pub(crate) struct Append16MultiCall<'b> {
+    pub(crate) n_kv_head: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) cells: usize,
+    pub(crate) k: DeviceRange<'b>,
+    pub(crate) v: DeviceRange<'b>,
+    pub(crate) rows: &'b KvRows<'b>,
+}
+
+/// Bytes of one fp16 plane of a row: `[cells][n_kv_head][head_dim]` halves.
+fn plane16_bytes(cells: usize, n_kv_head: usize, head_dim: usize) -> Result<usize, EngError> {
+    cells
+        .checked_mul(n_kv_head)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| rule("size overflow", "the fp16 plane size overflows"))
+}
+
+/// The fp16 planes of every row hold the geometry at `align` bytes (the decode loads a key as 8
+/// bytes and its single-sequence entry demands 16; the append stores halves and needs 4), and
+/// (when `write`) no plane byte of one row is a plane byte of another row or of the same row's
+/// other plane.
+fn check_planes16(
+    rows: &KvRows<'_>,
+    bytes: usize,
+    align: usize,
+    write: bool,
+) -> Result<(), EngError> {
+    for row in &rows.rows {
+        require_fit("k_codes", &row.k_codes, bytes, align)?;
+        require_fit("v_codes", &row.v_codes, bytes, align)?;
+    }
+    if !write {
+        return Ok(());
+    }
+    let mut claims = Vec::with_capacity(rows.rows.len() * 2);
+    for row in &rows.rows {
+        claims.push(Claim::of("k_codes", &row.k_codes, bytes));
+        claims.push(Claim::of("v_codes", &row.v_codes, bytes));
+    }
+    for (i, claim) in claims.iter().enumerate() {
+        for other in &claims[i + 1..] {
+            require_apart(claim, other)?;
+        }
+    }
+    Ok(())
+}
+
+impl CudaContext {
+    /// The fp16 append of each row of `call.rows`, on `stream`.
+    pub(crate) fn kv16_append_multi(
+        &self,
+        stream: &DeviceStream,
+        call: Append16MultiCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let n = call.rows.len();
+        let geometry_ok = (1..=64).contains(&call.n_kv_head)
+            && (32..=1024).contains(&call.head_dim)
+            && call.head_dim.is_multiple_of(32)
+            && (1..(1 << 30)).contains(&call.cells);
+        if !geometry_ok {
+            return Err(rule(
+                "shape",
+                "kv heads, head_dim or cells are outside the limits",
+            ));
+        }
+        let row_bytes = n * call.n_kv_head * call.head_dim * size_of::<f32>();
+        require_fit("k", &call.k, row_bytes, 4)?;
+        require_fit("v", &call.v, row_bytes, 4)?;
+        let plane = plane16_bytes(call.cells, call.n_kv_head, call.head_dim)?;
+        check_planes16(call.rows, plane, 4, true)?;
+        apart_from_rows(call.rows, "k", &call.k, row_bytes, Some((plane, 0)))?;
+        apart_from_rows(call.rows, "v", &call.v, row_bytes, Some((plane, 0)))?;
+        let raw = Append16MultiRaw {
+            k: self.raw_range(&call.k)?,
+            v: self.raw_range(&call.v)?,
+            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            n,
+            n_kv_head: call.n_kv_head,
+            head_dim: call.head_dim,
+            cells: call.cells,
+        };
+        self.launch_on(stream, move |raw_stream| {
+            kv16_append_multi_launch(raw_stream, raw)
+        })
+    }
+
+    /// The fp16 decode attention of each row of `call.rows`, on `stream`. The call is that of
+    /// [`Self::attn_decode_q8_multi`]; the planes are the fp16 planes of `kv16_append_multi`, and
+    /// the split rule is that of the single-sequence fp16 entry (`min_keys` a multiple of 32).
+    pub(crate) fn attn_decode_multi(
+        &self,
+        stream: &DeviceStream,
+        call: DecodeMultiCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let n = call.rows.len();
+        let shape = &call.shape;
+        same_rows("decode", shape.m, n)?;
+        let shape_ok = shape.n_head == shape.n_kv_head * GROUP
+            && (1..=64).contains(&shape.n_kv_head)
+            && (shape.head_dim == 128 || shape.head_dim == 256)
+            && shape.cells >= 1
+            && shape.cells < (1 << 30)
+            && (1..=128).contains(&call.split.max_splits)
+            && call.split.min_keys >= 32
+            && call.split.min_keys.is_multiple_of(32)
+            && call.split.min_keys <= (1 << 20)
+            && call.scale > 0.0
+            && call.scale < 1e30;
+        let span_ok = call.span.window >= 0
+            && call.span.ring >= 0
+            && (call.span.ring == 0
+                || (call.span.window > 0
+                    && call.span.ring <= shape.cells as i64
+                    && call.span.ring >= call.span.window));
+        if !(shape_ok && span_ok) {
+            return Err(rule(
+                "shape",
+                "the geometry, split plan or span is outside the limits",
+            ));
+        }
+        let f = size_of::<f32>();
+        let width = shape.n_head * shape.head_dim;
+        require_fit("q", &call.q, n * width * f, 16)?;
+        require_fit("out", &call.out, n * width * f, 4)?;
+        let part_bytes =
+            attn_q8_part_bytes(n, shape.n_kv_head, shape.head_dim, call.split.max_splits)?;
+        require_fit("part", &call.part, part_bytes, 16)?;
+        let plane = plane16_bytes(shape.cells, shape.n_kv_head, shape.head_dim)?;
+        check_planes16(call.rows, plane, 16, false)?;
+        let proj_bytes = match &call.proj {
+            Some(proj) => {
+                if shape.ld < shape.n_head * 2 * shape.head_dim {
+                    return Err(rule("shape", "ld does not hold the gate columns"));
+                }
+                let bytes = ((n - 1) * shape.ld + shape.n_head * 2 * shape.head_dim) * f;
+                require_fit("proj", proj, bytes, 4)?;
+                bytes
+            }
+            None => 0,
+        };
+        let out = Claim::of("out", &call.out, n * width * f);
+        let part = Claim::of("part", &call.part, part_bytes);
+        require_apart(&out, &part)?;
+        require_apart(&out, &Claim::of("q", &call.q, n * width * f))?;
+        require_apart(&part, &Claim::of("q", &call.q, n * width * f))?;
+        if let Some(proj) = &call.proj {
+            let claim = Claim::of("proj", proj, proj_bytes);
+            require_apart(&out, &claim)?;
+            require_apart(&part, &claim)?;
+        }
+        let planes = Some((plane, 0));
+        apart_from_rows(call.rows, "out", &call.out, n * width * f, planes)?;
+        apart_from_rows(call.rows, "part", &call.part, part_bytes, planes)?;
+        let raw = DecodeMultiRaw {
+            q: self.raw_range(&call.q)?,
+            proj: call.proj.as_ref().map(|p| self.raw_range(p)).transpose()?,
+            table: self.raw_range(&call.rows.table.range(0, n * KV_ROW_BYTES)?)?,
+            part: self.raw_range(&call.part)?,
+            out: self.raw_range(&call.out)?,
+            n,
+            ld: shape.ld,
+            heads: [shape.n_head, shape.n_kv_head],
+            head_dim: shape.head_dim,
+            cells: shape.cells,
+            split: [call.split.max_splits, call.split.min_keys],
+            span: [call.span.window as usize, call.span.ring as usize],
+            scale: call.scale,
+        };
+        self.launch_on(stream, move |raw_stream| {
+            attn_decode_multi_launch(raw_stream, raw)
+        })
+    }
+}

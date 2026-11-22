@@ -8,10 +8,10 @@
 //! of the same bytes. The timing test prints the kernel time at 1, 4 and 8 rows.
 
 use super::{
-    AppendMultiCall, ConvMultiCall, DecodeGemmaMultiCall, DecodeMultiCall, DeltaMultiCall, KvRow,
-    PrepMultiCall,
+    Append16MultiCall, AppendMultiCall, ConvMultiCall, DecodeGemmaMultiCall, DecodeMultiCall,
+    DeltaMultiCall, KvRow, PrepMultiCall,
 };
-use crate::kernels::cuda::resident::attn_decode::{AttnSpan, AttnSplit};
+use crate::kernels::cuda::resident::attn_decode::{AttnDecodeCall, AttnShape, AttnSpan, AttnSplit};
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
@@ -1647,4 +1647,300 @@ fn kernel_time_at_one_four_and_eight_rows() {
             "rows={n}: us per layer step, one launch vs {n} launches: conv {conv_many:.1} vs {conv_single:.1}, delta {delta_many:.1} vs {delta_single:.1}, decode {decode_many:.1} vs {decode_single:.1}"
         );
     }
+}
+
+// ---- the fp16 cache ----------------------------------------------------------------------------
+
+/// Bytes of one fp16 plane: `[CELLS][N_KV][D]` halves.
+const PLANE16: usize = CELLS * N_KV * D * 2;
+
+/// A row of the fp16 cache: the K and V planes (random halves) and the step block.
+struct Row16Bytes {
+    k: Vec<u8>,
+    v: Vec<u8>,
+    step: Vec<u8>,
+}
+
+fn plane16(rng: &mut Rng) -> Vec<u8> {
+    (0..PLANE16 / 2)
+        .flat_map(|_| testkit::f16_bits((rng.normal() * 0.7) as f32).to_le_bytes())
+        .collect()
+}
+
+fn row16(rng: &mut Rng, pos: i32, kv_len: i32) -> Row16Bytes {
+    let mut step = StepParams::new(1, pos.max(0))
+        .expect("step")
+        .to_bytes()
+        .to_vec();
+    step[4..8].copy_from_slice(&pos.to_le_bytes());
+    step[8..12].copy_from_slice(&kv_len.to_le_bytes());
+    Row16Bytes {
+        k: plane16(rng),
+        v: plane16(rng),
+        step,
+    }
+}
+
+struct Row16Buffers {
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    step: DeviceBuffer,
+}
+
+fn upload_row16(rig: &Rig, row: &Row16Bytes) -> Row16Buffers {
+    Row16Buffers {
+        k: rig.up_bytes(&row.k),
+        v: rig.up_bytes(&row.v),
+        step: rig.up_bytes(&row.step),
+    }
+}
+
+/// The table record of an fp16 row; the scale fields are not read and name the first words of
+/// the planes.
+fn kv_row16(buffers: &Row16Buffers) -> KvRow<'_> {
+    KvRow {
+        k_codes: buffers.k.range(0, PLANE16).unwrap(),
+        k_scales: buffers.k.range(0, 4).unwrap(),
+        v_codes: buffers.v.range(0, PLANE16).unwrap(),
+        v_scales: buffers.v.range(0, 4).unwrap(),
+        step: buffers.step.range(0, STEP_BYTES).unwrap(),
+    }
+}
+
+fn halves(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|&value| testkit::f16_bits(value).to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn the_fp16_append_writes_each_rows_rounded_cell_and_refuses_a_bad_row_alone() {
+    if !testkit::device_present("kv16_append_multi against the rounded rows") {
+        return;
+    }
+    let rig = Rig::new();
+    let positions = [0, 7, 191, CELLS as i32, -1, 100];
+    let n = positions.len();
+    let mut rng = Rng::new(0x6d52_0401);
+    let rows: Vec<Row16Bytes> = positions
+        .iter()
+        .map(|&p| row16(&mut rng, p, p + 1))
+        .collect();
+    let row_floats = N_KV * D;
+    let k = normal(&mut rng, n * row_floats, 1.0);
+    let v = normal(&mut rng, n * row_floats, 1.0);
+    let (k_b, v_b) = (rig.up(&k), rig.up(&v));
+    let bufs: Vec<Row16Buffers> = rows.iter().map(|r| upload_row16(&rig, r)).collect();
+    let table = rig
+        .ctx
+        .kv_rows(&bufs.iter().map(kv_row16).collect::<Vec<_>>())
+        .expect("table");
+    rig.ctx
+        .kv16_append_multi(
+            &rig.stream,
+            Append16MultiCall {
+                n_kv_head: N_KV,
+                head_dim: D,
+                cells: CELLS,
+                k: k_b.range(0, n * row_floats * 4).unwrap(),
+                v: v_b.range(0, n * row_floats * 4).unwrap(),
+                rows: &table,
+            },
+        )
+        .expect("append");
+    for (r, (&pos, row)) in positions.iter().zip(&rows).enumerate() {
+        let (mut k_want, mut v_want) = (row.k.clone(), row.v.clone());
+        let mut status = 0i32;
+        if (0..CELLS as i32).contains(&pos) {
+            let at = pos as usize * row_floats * 2;
+            let src = r * row_floats..(r + 1) * row_floats;
+            k_want[at..at + row_floats * 2].copy_from_slice(&halves(&k[src.clone()]));
+            v_want[at..at + row_floats * 2].copy_from_slice(&halves(&v[src]));
+        } else {
+            status = 4;
+        }
+        assert_eq!(rig.read(&bufs[r].k, PLANE16), k_want, "k plane, row {r}");
+        assert_eq!(rig.read(&bufs[r].v, PLANE16), v_want, "v plane, row {r}");
+        let step = rig.read(&bufs[r].step, STEP_BYTES);
+        assert_eq!(
+            i32::from_le_bytes(step[16..20].try_into().unwrap()),
+            status,
+            "status word, row {r}"
+        );
+    }
+}
+
+fn attn16_shape(m: usize) -> AttnShape {
+    AttnShape {
+        m,
+        n_head: N_HEAD,
+        n_kv_head: N_KV,
+        head_dim: D,
+        cache_rows: CELLS,
+        ld: ATTN_LD,
+    }
+}
+
+/// The fp16 decode of `kv_lens.len()` rows in one launch against the single-sequence entry row by row,
+/// for each span.
+#[test]
+fn fp16_decode_rows_are_the_bytes_of_single_row_launches() {
+    if !testkit::device_present("attn_decode_multi against single-row calls") {
+        return;
+    }
+    let rig = Rig::new();
+    // Every row at a different length, so the split plan differs per row; one is past the cache.
+    let kv_lens = [1, 2, 31, 32, 33, 63, 64, 65, 129, 190, 192, 0, 400];
+    let n = kv_lens.len();
+    let mut rng = Rng::new(0x6d52_0402);
+    let rows: Vec<Row16Bytes> = kv_lens
+        .iter()
+        .map(|&len| row16(&mut rng, (len - 1).max(0), len))
+        .collect();
+    let q = normal(&mut rng, n * N_HEAD * D, 1.0);
+    let proj = normal(&mut rng, n * ATTN_LD, 1.0);
+    let (q_b, proj_b) = (rig.up(&q), rig.up(&proj));
+    let q_row = N_HEAD * D * 4;
+    let split = AttnSplit::STAGE1;
+    let proj_bytes = ((n - 1) * ATTN_LD + N_HEAD * 2 * D) * 4;
+    for (gated, span) in [
+        (true, AttnSpan::FULL),
+        (false, AttnSpan::FULL),
+        (
+            false,
+            AttnSpan {
+                window: 100,
+                ring: 150,
+            },
+        ),
+        (
+            true,
+            AttnSpan {
+                window: 64,
+                ring: 0,
+            },
+        ),
+    ] {
+        let many: Vec<Row16Buffers> = rows.iter().map(|r| upload_row16(&rig, r)).collect();
+        let table = rig
+            .ctx
+            .kv_rows(&many.iter().map(kv_row16).collect::<Vec<_>>())
+            .expect("table");
+        let part_bytes = attn_q8_part_bytes(n, N_KV, D, split.max_splits).unwrap();
+        let (part, out) = (
+            rig.filled(SENTINEL, part_bytes),
+            rig.filled(SENTINEL, n * q_row),
+        );
+        let proj_range = || gated.then(|| proj_b.range(0, proj_bytes).unwrap());
+        rig.ctx
+            .attn_decode_multi(
+                &rig.stream,
+                DecodeMultiCall {
+                    shape: decode_shape(n),
+                    span,
+                    split,
+                    scale: 1.0 / 16.0,
+                    q: q_b.range(0, n * q_row).unwrap(),
+                    proj: proj_range(),
+                    rows: &table,
+                    part: part.range(0, part_bytes).unwrap(),
+                    out: out.range(0, n * q_row).unwrap(),
+                },
+            )
+            .expect("many rows");
+        let many_out = rig.read(&out, n * q_row);
+        for (r, row) in many.iter().enumerate() {
+            let part_1 = attn_q8_part_bytes(1, N_KV, D, split.max_splits).unwrap();
+            let (part, out) = (rig.filled(SENTINEL, part_1), rig.filled(SENTINEL, q_row));
+            rig.ctx
+                .attn_decode(
+                    &rig.stream,
+                    AttnDecodeCall {
+                        shape: attn16_shape(1),
+                        span,
+                        split,
+                        scale: 1.0 / 16.0,
+                        q: q_b.range(r * q_row, q_row).unwrap(),
+                        proj: gated.then(|| proj_b.range(r * ATTN_LD * 4, ATTN_LD * 4).unwrap()),
+                        k_cache: row.k.range(0, PLANE16).unwrap(),
+                        v_cache: row.v.range(0, PLANE16).unwrap(),
+                        kv_len: row.step.range(8, 4).unwrap(),
+                        part: part.range(0, part_1).unwrap(),
+                        out: out.range(0, q_row).unwrap(),
+                    },
+                )
+                .expect("single row");
+            assert_eq!(
+                rig.read(&out, q_row),
+                many_out[r * q_row..(r + 1) * q_row],
+                "fp16 decode out, gate {gated}, span {span:?}, row {r} (kv_len {})",
+                kv_lens[r]
+            );
+        }
+    }
+}
+
+#[test]
+fn the_fp16_decode_refuses_a_plane_that_is_not_16_byte_aligned() {
+    if !testkit::device_present("attn_decode_multi with a misaligned plane") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x6d52_0403);
+    let row = row16(&mut rng, 10, 11);
+    let good = upload_row16(&rig, &row);
+    // The K plane starts 4 bytes into its allocation: the table accepts it, the decode must not.
+    let wide = rig.up_bytes(&[row.k.clone(), vec![0; 16]].concat());
+    let rows = [KvRow {
+        k_codes: wide.range(4, PLANE16).unwrap(),
+        ..kv_row16(&good)
+    }];
+    let table = rig
+        .ctx
+        .kv_rows(&rows)
+        .expect("the table takes 4-byte planes");
+    let q = rig.up(&normal(&mut rng, N_HEAD * D, 1.0));
+    let q_row = N_HEAD * D * 4;
+    let split = AttnSplit::STAGE1;
+    let part_bytes = attn_q8_part_bytes(1, N_KV, D, split.max_splits).unwrap();
+    let (part, out) = (
+        rig.filled(SENTINEL, part_bytes),
+        rig.filled(SENTINEL, q_row),
+    );
+    let call = |table: &super::KvRows<'_>| {
+        rig.ctx.attn_decode_multi(
+            &rig.stream,
+            DecodeMultiCall {
+                shape: decode_shape(1),
+                span: AttnSpan::FULL,
+                split,
+                scale: 1.0 / 16.0,
+                q: q.range(0, q_row).unwrap(),
+                proj: None,
+                rows: table,
+                part: part.range(0, part_bytes).unwrap(),
+                out: out.range(0, q_row).unwrap(),
+            },
+        )
+    };
+    assert!(call(&table).is_err(), "a plane at offset 4 is refused");
+    let aligned = rig.ctx.kv_rows(&[kv_row16(&good)]).expect("table");
+    call(&aligned).expect("a 16-byte aligned plane decodes");
+    // The append stores halves and accepts a 4-byte plane.
+    let k = rig.up(&normal(&mut rng, N_KV * D, 1.0));
+    let v = rig.up(&normal(&mut rng, N_KV * D, 1.0));
+    rig.ctx
+        .kv16_append_multi(
+            &rig.stream,
+            Append16MultiCall {
+                n_kv_head: N_KV,
+                head_dim: D,
+                cells: CELLS,
+                k: k.range(0, N_KV * D * 4).unwrap(),
+                v: v.range(0, N_KV * D * 4).unwrap(),
+                rows: &table,
+            },
+        )
+        .expect("the append takes a 4-byte plane");
 }

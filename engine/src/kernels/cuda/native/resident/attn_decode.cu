@@ -35,6 +35,7 @@
 
 #include "abi.h"
 #include "resident/attn_decode.h"
+#include "resident/multi_row.h"
 #include "device.h"
 
 
@@ -57,7 +58,31 @@ struct Args {
     int window, ring;        // 0: all positions / linear rows; else last `window` positions / cell p % ring
     float scale;
     const float *sinks = nullptr;  // private launch args only; the external ABI is unchanged
+    // The many-rows entry: row t of the launch is one token of its own sequence (m rows, one token
+    // each); rows[t] holds that sequence's fp16 planes (k_codes and v_codes name the K and V planes
+    // [cache_rows][n_kv_head][D]) and its step block. Null for every other launch.
+    const inference_cuda_kv_row *rows = nullptr;
 };
+
+// The planes and the visible-key word of one grid row: the launch's own for a single sequence
+// (token t sees kv_len + t keys), the row table's for the many-rows entry (row t sees the kv_len
+// word of its own step block, 8 bytes in, and nothing else).
+struct RowView {
+    const __half *k_cache;
+    const __half *v_cache;
+    int kv_len;
+};
+
+template <bool kMany>
+__device__ inline RowView row_of(const Args &a, int t) {
+    if constexpr (kMany) {
+        const inference_cuda_kv_row &r = a.rows[t];
+        return {(const __half *)r.k_codes, (const __half *)r.v_codes,
+                *(const int *)((const char *)r.step + INFERENCE_CUDA_STEP_KV_LEN_OFFSET)};
+    } else {
+        return {a.k_cache, a.v_cache, *a.kv_len};
+    }
+}
 
 // Key range plan from the number of keys alone. n_split splits of `chunk` keys (a multiple of the
 // tile) cover n_keys; split s owns [s * chunk, min(n_keys, (s + 1) * chunk)). Only n_active
@@ -72,8 +97,10 @@ __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int 
 
 // kv_len must leave room for the m tokens in a linear cache; a ring takes any positive length.
 // Otherwise both kernels treat the call as invalid.
+template <bool kMany>
 __device__ inline bool kv_ok(const Args &a, int kv_len) {
-    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= a.cache_rows - (a.m - 1));
+    // A many-rows launch appends one token per row, so a linear cache needs no headroom.
+    return kv_len >= 1 && (a.ring > 0 ? kv_len < (1 << 30) : kv_len <= a.cache_rows - (kMany ? 0 : a.m - 1));
 }
 
 // Visible keys of token t: the last min(n_keys, window) positions. first = position of key 0.
@@ -126,7 +153,7 @@ __device__ inline float reduce8(const float (&a)[8], int lane, int &head) {
 }
 
 // 128 registers (launch bound 2 blocks per SM) measured faster than 155 with one block per SM.
-template <int D>
+template <int D, bool kMany = false>
 __global__ void __launch_bounds__(256, 2) attn_part_k(Args a) {
     constexpr int G = kGroup, NCH = D / 128;  // NCH chunks of 4 dims per lane: 8 dims (D 256) or 4 (D 128)
     static_assert(D == 128 || D == 256, "head_dim 128 or 256");
@@ -135,11 +162,12 @@ __global__ void __launch_bounds__(256, 2) attn_part_k(Args a) {
     __shared__ float s_corr[G];
     const int s = blockIdx.x, kvh = blockIdx.y, t = blockIdx.z;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int kv_len = *a.kv_len;
-    if (!kv_ok(a, kv_len)) {
+    const RowView rw = row_of<kMany>(a, t);
+    const int kv_len = rw.kv_len;
+    if (!kv_ok<kMany>(a, kv_len)) {
         return;
     }
-    const int n_keys = kv_len + t;
+    const int n_keys = kMany ? kv_len : kv_len + t;
     int first, count;
     visible(a, n_keys, first, count);
     int chunk, n_active;
@@ -175,7 +203,7 @@ __global__ void __launch_bounds__(256, 2) attn_part_k(Args a) {
         const bool own = tid < D;
         unsigned short vr[kTile];
         const unsigned short *vcol =
-            reinterpret_cast<const unsigned short *>(a.v_cache) + (size_t)kvh * D + tid;
+            reinterpret_cast<const unsigned short *>(rw.v_cache) + (size_t)kvh * D + tid;
 #pragma unroll
         for (int j = 0; j < kTile; ++j) {
             vr[j] = own && j < nvalid ? vcol[(size_t)cache_row(a, first, base + j) * row_stride] : (unsigned short)0;
@@ -185,7 +213,7 @@ __global__ void __launch_bounds__(256, 2) attn_part_k(Args a) {
         for (int i = 0; i < kTile / 8; ++i) {
             const int j = warp + 8 * i;
             if (j < nvalid) {
-                const __half *kr = a.k_cache + (size_t)cache_row(a, first, base + j) * row_stride + (size_t)kvh * D;
+                const __half *kr = rw.k_cache + (size_t)cache_row(a, first, base + j) * row_stride + (size_t)kvh * D;
                 float kf[4 * NCH];
 #pragma unroll
                 for (int c = 0; c < NCH; ++c) {
@@ -268,19 +296,19 @@ __device__ inline size_t gate_index(const Args &a, int t, int h, int d) {
     return row + (size_t)h * 2 * D + D + d;
 }
 
-template <int D>
+template <int D, bool kMany = false>
 __global__ void __launch_bounds__(D) attn_combine_k(Args a) {
     constexpr int G = kGroup;
     __shared__ float s_w[kMaxSplits], s_l[kMaxSplits], s_red[D / 32];
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const int kvh = h / G, g = h % G;
     float *o = a.out + ((size_t)t * a.n_head + h) * D + d;
-    const int kv_len = *a.kv_len;
-    if (!kv_ok(a, kv_len)) {
+    const int kv_len = row_of<kMany>(a, t).kv_len;
+    if (!kv_ok<kMany>(a, kv_len)) {
         *o = __int_as_float(0x7fc00000);  // NaN: the caller's non-finite check ends the job
         return;
     }
-    const int n_keys = kv_len + t;
+    const int n_keys = kMany ? kv_len : kv_len + t;
     int first, count;
     visible(a, n_keys, first, count);
     int chunk, n_active;
@@ -354,13 +382,13 @@ bool valid(const inference_cuda_attn_decode_args *a) {
            aligned_to(a->part, 16) && aligned_to(a->out, 4);
 }
 
-template <int D>
+template <int D, bool kMany = false>
 Failure enqueue(const Args &a, cudaStream_t s) {
     Failure failure;
-    attn_part_k<D><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
+    attn_part_k<D, kMany><<<dim3(a.max_splits, a.n_kv_head, a.m), 256, 0, s>>>(a);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (failure.ok()) {
-        attn_combine_k<D><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
+        attn_combine_k<D, kMany><<<dim3(a.n_head, a.m), D, 0, s>>>(a);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     }
     return failure;
@@ -407,4 +435,65 @@ extern "C" int inference_cuda_attn_decode_sinks_launch(const inference_cuda_attn
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     return launch_decode(in, sinks, stream, out_stage);
+}
+
+// The many-rows entry: n rows, each the single token of a sequence of its own (multi_row.h). The
+// part scratch is laid out as for m = n tokens, row t in the slot token t has in a single launch.
+extern "C" int inference_cuda_attn_decode_multi_launch(
+    const inference_cuda_attn_decode_multi_args *in, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (in == NULL || stream == NULL || in->q == NULL || in->rows == NULL || in->part == NULL ||
+            in->out == NULL || in->n < 1 || in->n > INFERENCE_CUDA_MULTI_ROW_MAX) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        // The shared rules of the single entry, on a stand-in whose kv_len word is any non-null
+        // address and whose planes are placeholders of the right alignment.
+        inference_cuda_attn_decode_args shape = {};
+        shape.q = in->q;
+        shape.proj = in->proj;
+        // Stand-ins for the checks of the single entry: q has its 16-byte alignment, and the row
+        // table stands for the kv_len word.
+        shape.k_cache = shape.v_cache = in->q;
+        shape.kv_len = in->rows;
+        shape.part = in->part;
+        shape.out = in->out;
+        shape.ld = in->ld;
+        shape.m = 1;  // one token per row: no look-ahead headroom
+        shape.n_head = in->n_head;
+        shape.n_kv_head = in->n_kv_head;
+        shape.head_dim = in->head_dim;
+        shape.cache_rows = in->cache_rows;
+        shape.max_splits = in->max_splits;
+        shape.min_keys = in->min_keys;
+        shape.window = in->window;
+        shape.ring = in->ring;
+        shape.scale = in->scale;
+        if (!valid(&shape) || !aligned_to(in->rows, 8)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Args a = {};
+        a.q = (const float *)in->q;
+        a.proj = (const float *)in->proj;
+        a.part = (float *)in->part;
+        a.out = (float *)in->out;
+        a.ld = in->ld;
+        a.m = in->n;
+        a.n_head = in->n_head;
+        a.n_kv_head = in->n_kv_head;
+        a.cache_rows = in->cache_rows;
+        a.max_splits = in->max_splits;
+        a.min_keys = in->min_keys;
+        a.window = in->window;
+        a.ring = in->ring;
+        a.scale = in->scale;
+        a.rows = in->rows;
+        const cudaStream_t s = (cudaStream_t)stream;
+        const Failure failure =
+            in->head_dim == 128 ? enqueue<128, true>(a, s) : enqueue<256, true>(a, s);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
 }
