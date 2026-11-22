@@ -1318,7 +1318,7 @@ mod tests {
         std::fs::write(dir.path().join("generation_config.json"), "not JSON")
             .expect("write malformed sampling defaults");
         let mut config = engine_config("bolt", None);
-        config.family = crate::family::gemma4::FAMILY.into();
+        config.family = crate::family::gemma::gemma4::FAMILY.into();
         config.model_dir = dir.path().to_path_buf();
         config.context_limit = None;
 
