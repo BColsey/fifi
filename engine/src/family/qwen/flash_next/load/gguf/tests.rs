@@ -800,6 +800,15 @@ fn gguf_ple_weights_load_without_transformer_trunk() {
 }
 
 #[test]
+fn gguf_feed_drives_token_driver_with_fake_device() {
+    let (_written, model) = open(&Spec::default());
+    let rows = model.ngram().unwrap();
+    let feed = super::token_feed::GgufTokenFeeds::new(&model, &rows, 2).unwrap();
+    let shape = model.config().model_shape().unwrap();
+    super::super::super::cuda::driver::fakes::exercise_host_feed(feed, &shape);
+}
+
+#[test]
 fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
     let (_written, model) = open(&Spec::default());
     let shape = model.config().model_shape().unwrap();

@@ -359,6 +359,41 @@ pub(in super::super) struct FakeFeeds {
     pub(in super::super) start_width: Option<usize>,
 }
 
+/// Exercise a real host feed through the driver with only the device replaced by a fake.
+pub(in super::super::super) fn exercise_host_feed<F: TokenFeeds>(
+    feeds: F,
+    model: &crate::family::qwen::flash_next::step::ModelShape,
+) {
+    use crate::family::session::TokenStepper;
+    let shape = DriverShape {
+        layers: model.ple_layer + 1,
+        ple_layer: model.ple_layer,
+        positions: 8,
+        start: StartShape {
+            sampler_vocab: model.vocab,
+            stream: model.hyper.width(),
+            ple_embed: model.ple.embed(),
+        },
+    };
+    let mut driver = super::TokenDriver::new(FakeDevice::default(), feeds, shape).unwrap();
+    driver.feed(1).unwrap();
+    assert_eq!(driver.fed(), 1);
+    assert_eq!(driver.feeds.ple_state().unwrap().0, &[1]);
+    driver.device.fail = Some("write_back");
+    assert!(driver.feed(2).is_err());
+    assert_eq!(driver.fed(), 1);
+    assert!(
+        driver.feed(2).is_err(),
+        "failed device write poisons the driver"
+    );
+    driver.reset().unwrap();
+    assert_eq!(driver.fed(), 0);
+    assert!(driver.feeds.ple_state().unwrap().0.is_empty());
+    driver.feed(2).unwrap();
+    assert_eq!(driver.fed(), 1);
+    assert_eq!(driver.feeds.ple_state().unwrap().0, &[2]);
+}
+
 impl TokenFeeds for FakeFeeds {
     fn begin(&mut self, token: u32) -> Result<StartVectors, EngError> {
         if self.fail_begin == Some(token) {
