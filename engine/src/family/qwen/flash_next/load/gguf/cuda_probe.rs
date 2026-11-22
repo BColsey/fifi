@@ -1093,7 +1093,7 @@ fn two_real_expert_slots_match_host() {
     }
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    // Initial zero-valued synthetic holes are not dispatched; only the two verified experts are.
+    // Slot zero is a synthetic zero filler; expert 256 is the real resident hit.
     let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1, 256]).unwrap();
     let experts = model.config().dims.experts as usize;
     let geometry = BankGeometry::new(1, experts, 2, 3, layout.bytes).unwrap();
@@ -1104,7 +1104,59 @@ fn two_real_expert_slots_match_host() {
     let policy =
         ReplaceOnMissLru::from_fill(geometry, &[&mapping], &[vec![0; experts]], None).unwrap();
     let mut state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
-    let _before = classify_expert_pair(&ctx, &stream, state.slot_row(0), [0, 2]);
+    let before = classify_expert_pair(&ctx, &stream, state.slot_row(0), [0, 2]);
+    let gate = bank
+        .projection(&state, crate::family::recipe::Role::ExpertGate)
+        .unwrap();
+    let (k, rows) = (gate.k, gate.rows);
+    let input: Vec<f32> = (0..k).map(|i| if i % 5 < 2 { -1.0 } else { 1.0 }).collect();
+    let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let x = ctx.allocate(bytes.len()).unwrap();
+    x.write_at(&stream, 0, &bytes).unwrap();
+    let qbytes = q8_1_bytes(k, 1).unwrap();
+    let q = ctx.allocate(qbytes).unwrap();
+    ctx.quantize_q8_1(
+        &stream,
+        QuantizeCall {
+            x: x.range(0, bytes.len()).unwrap(),
+            y: q.range(0, qbytes).unwrap(),
+            k,
+            ncols: 1,
+        },
+    )
+    .unwrap();
+    let y = ctx.allocate(rows * 8).unwrap();
+    gate.launch(
+        &ctx,
+        &stream,
+        ExpertProjectionInputs {
+            ids: before.range(0, 8).unwrap(),
+            x_q8: q.range(0, qbytes).unwrap(),
+            x_per_slot: false,
+            output: y.range(0, rows * 8).unwrap(),
+            output_stride: rows,
+            used: 2,
+        },
+    )
+    .unwrap();
+    let mut output = vec![0; rows * 8];
+    y.read_at(&stream, 0, &mut output).unwrap();
+    let tensor = model
+        .map()
+        .get(crate::family::recipe::Role::ExpertGate, Some(0))
+        .unwrap();
+    let blocks = mapped_blocks(&model, tensor, Some(256), 0..rows as u64).unwrap();
+    let resident = dequantize(tensor.ty, &blocks).unwrap();
+    for (index, row) in resident.chunks_exact(k).enumerate() {
+        let filler = f32::from_ne_bytes(output[index * 4..index * 4 + 4].try_into().unwrap());
+        let offset = (rows + index) * 4;
+        let hit = f32::from_ne_bytes(output[offset..offset + 4].try_into().unwrap());
+        let want: f32 = row.iter().zip(&input).map(|(a, b)| a * b).sum();
+        let tolerance = 0.003 * row.iter().map(|v| v.abs()).sum::<f32>() + 1e-5;
+        assert_eq!(filler, 0.0);
+        assert!((hit - want).abs() <= tolerance, "resident gate row {index}");
+    }
+    eprintln!("checked {rows} resident gate rows and zero filler before miss");
     let copies = bank
         .step_disk(&stream, &model, &mut state, 0, &[257, 256])
         .unwrap();
