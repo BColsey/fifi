@@ -608,11 +608,9 @@ mod tests {
         run(5, 200.0, &[100.0, 6.0, 2.0], false).unwrap();
         assert_eq!(run(4, 8.0, &[6.0, 2.0, 40.0], true).unwrap(), [4.0, -2.0]);
         assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
-        assert!(
-            run(POS_MAX as usize + 1, 1.0, &[], true)
-                .unwrap_err()
-                .to_string()
-                .contains("position overflows")
+        assert_eq!(
+            run(POS_MAX as usize + 1, 1.0, &[], true),
+            Err(bad("CUDA relative attention position overflows"))
         );
     }
 }
