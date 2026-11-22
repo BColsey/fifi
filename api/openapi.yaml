@@ -1767,6 +1767,52 @@ components:
                 type:
                   - number
                   - "null"
+    ActiveRequest:
+      type: object
+      required:
+        - request_id
+        - model
+        - phase
+        - prompt_tokens
+        - completion_tokens
+        - started_at_ms
+      description: >-
+        One in-flight request of the active board: counts, names, and
+        clocks only — never prompt text. The row lives from admission to
+        the written log line, so a reader sees queue, prefill, and decode
+        as they happen.
+      properties:
+        request_id:
+          type: string
+        model:
+          type: string
+        engine:
+          type:
+            - string
+            - "null"
+        session:
+          type:
+            - string
+            - "null"
+          description: >-
+            The named chat session the request carried, when it
+            carried one.
+        phase:
+          type: string
+          enum: [queued, prefill, decode]
+          description: >-
+            queued until the engine thread takes the job, prefill until
+            its first batch, decode after.
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+          description: Tokens the decode batches committed so far.
+        started_at_ms:
+          type: integer
+          description: >-
+            Epoch milliseconds of the request's start; the panel derives
+            elapsed time from it.
     RouteTracePacket:
       type: object
       required: [packet, ring_capacity, steps]
@@ -2054,19 +2100,31 @@ paths:
                 allOf:
                   - $ref: "#/components/schemas/ChatCompletionChunk"
                 description: |-
-                  Each event is one data line with a ChatCompletionChunk as JSON, then a blank line:
-                  data: {"id":"...","object":"chat.completion.chunk","created":1700000000,"model":"...","engine":"...","choices":[{"index":0,"delta":{"content":"..."}}]}
-                  The first chunk carries delta.role assistant and empty content.
-                  Think block text arrives in delta.reasoning_content, never in delta.content.
-                  Each completed tool call arrives in delta.tool_calls as two entries (see ToolCallDelta).
+                  Each event is one data line with a ChatCompletionChunk as
+                  JSON,
+                  then a blank line:
+                  data: {"id":"...","object":"chat.completion.chunk",
+                  "created":1700000000,"model":"...","engine":"...",
+                  "choices":[{"index":0,"delta":{"content":"..."}}]}
+                  The first chunk carries delta.role assistant and empty
+                  content.
+                  Think block text arrives in delta.reasoning_content, never in
+                  delta.content.
+                  Each completed tool call arrives in delta.tool_calls as two
+                  entries (see ToolCallDelta).
                   The final chunk has an empty delta, finish_reason, and usage.
                   A successful stream ends with data: [DONE].
-                  After any 15 seconds without an event, the server sends the comment
-                  line ": keep-alive" and a blank line. Clients ignore comment lines.
-                  An error after the response headers sends one event, for example:
+                  After any 15 seconds without an event, the server sends the
+                  comment
+                  line ": keep-alive" and a blank line. Clients ignore comment
+                  lines.
+                  An error after the response headers sends one event, for
+                  example:
                   event: error
-                  data: {"error":{"message":"Model execution failed.","code":"backend_error"}}
-                  Its data matches Error, or BackendError for a backend failure. The
+                  data: {"error":{"message":"Model execution failed.",
+                  "code":"backend_error"}}
+                  Its data matches Error, or BackendError for a backend failure.
+                  The
                   server then closes the stream without a final chunk or [DONE].
         "401":
           $ref: "#/components/responses/Unauthorized"

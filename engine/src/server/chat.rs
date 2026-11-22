@@ -251,8 +251,10 @@ pub(super) fn admit(
         endpoint,
     );
     // The monitor's ring rides the same lines (count_tokens is filtered
-    // out inside the ring, so the count route needs no wiring).
+    // out inside the ring, so the count route needs no wiring); the active
+    // board rides the same lifecycle calls the timings come from.
     log.set_ring(state.recent_ring());
+    log.set_active(state.active_board());
     log.set_engine(&entry.id);
     log.set_cap_source(cap_source);
     if let Some(id) = &session {

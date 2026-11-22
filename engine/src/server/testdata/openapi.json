@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "e82ebb553b99d7cf27e40c5db08bbf3743e16c8cf5f771a51f3b3042bbc968d2",
+ "x-source-sha256": "2b8e531ff6428e14980d583981d71824c01506a65f120ebac8b5751dca4301b4",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -2368,6 +2368,59 @@
      }
     }
    },
+   "ActiveRequest": {
+    "type": "object",
+    "required": [
+     "request_id",
+     "model",
+     "phase",
+     "prompt_tokens",
+     "completion_tokens",
+     "started_at_ms"
+    ],
+    "description": "One in-flight request of the active board: counts, names, and clocks only \u2014 never prompt text. The row lives from admission to the written log line, so a reader sees queue, prefill, and decode as they happen.",
+    "properties": {
+     "request_id": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "engine": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "session": {
+      "type": [
+       "string",
+       "null"
+      ],
+      "description": "The named chat session the request carried, when it carried one."
+     },
+     "phase": {
+      "type": "string",
+      "enum": [
+       "queued",
+       "prefill",
+       "decode"
+      ],
+      "description": "queued until the engine thread takes the job, prefill until its first batch, decode after."
+     },
+     "prompt_tokens": {
+      "type": "integer"
+     },
+     "completion_tokens": {
+      "type": "integer",
+      "description": "Tokens the decode batches committed so far."
+     },
+     "started_at_ms": {
+      "type": "integer",
+      "description": "Epoch milliseconds of the request's start; the panel derives elapsed time from it."
+     }
+    }
+   },
    "RouteTracePacket": {
     "type": "object",
     "required": [
@@ -2756,7 +2809,7 @@
            "$ref": "#/components/schemas/ChatCompletionChunk"
           }
          ],
-         "description": "Each event is one data line with a ChatCompletionChunk as JSON, then a blank line:\ndata: {\"id\":\"...\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"...\",\"engine\":\"...\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...\"}}]}\nThe first chunk carries delta.role assistant and empty content.\nThink block text arrives in delta.reasoning_content, never in delta.content.\nEach completed tool call arrives in delta.tool_calls as two entries (see ToolCallDelta).\nThe final chunk has an empty delta, finish_reason, and usage.\nA successful stream ends with data: [DONE].\nAfter any 15 seconds without an event, the server sends the comment\nline \": keep-alive\" and a blank line. Clients ignore comment lines.\nAn error after the response headers sends one event, for example:\nevent: error\ndata: {\"error\":{\"message\":\"Model execution failed.\",\"code\":\"backend_error\"}}\nIts data matches Error, or BackendError for a backend failure. The\nserver then closes the stream without a final chunk or [DONE]."
+         "description": "Each event is one data line with a ChatCompletionChunk as\nJSON,\nthen a blank line:\ndata: {\"id\":\"...\",\"object\":\"chat.completion.chunk\",\n\"created\":1700000000,\"model\":\"...\",\"engine\":\"...\",\n\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...\"}}]}\nThe first chunk carries delta.role assistant and empty\ncontent.\nThink block text arrives in delta.reasoning_content, never in\ndelta.content.\nEach completed tool call arrives in delta.tool_calls as two\nentries (see ToolCallDelta).\nThe final chunk has an empty delta, finish_reason, and usage.\nA successful stream ends with data: [DONE].\nAfter any 15 seconds without an event, the server sends the\ncomment\nline \": keep-alive\" and a blank line. Clients ignore comment\nlines.\nAn error after the response headers sends one event, for\nexample:\nevent: error\ndata: {\"error\":{\"message\":\"Model execution failed.\",\n\"code\":\"backend_error\"}}\nIts data matches Error, or BackendError for a backend failure.\nThe\nserver then closes the stream without a final chunk or [DONE]."
         }
        }
       }

@@ -354,6 +354,72 @@ const RING_KEYS: [&str; 19] = [
 
 pub(crate) const RING_CAP: usize = 64;
 
+/// The keys an active row exposes: the same ALLOWLIST discipline as the
+/// ring — counts, names, and clocks only, never prompt text. `request_id`
+/// keys the board's rows; the monitor uses it as a stable row id.
+const ACTIVE_KEYS: [&str; 8] = [
+    "request_id",
+    "model",
+    "engine",
+    "session",
+    "phase",
+    "prompt_tokens",
+    "completion_tokens",
+    "started_at_ms",
+];
+
+/// The monitor's active-request board: one row per request between
+/// admission and its written line, fed by the same lifecycle calls the
+/// timings come from (`admit`, `started`, `batch`, `write`). Like the
+/// ring, one per state, so every test server owns its own rows.
+#[derive(Clone, Default)]
+pub(crate) struct ActiveBoard(Arc<Mutex<Vec<Value>>>);
+
+impl ActiveBoard {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces this request's row, or appends it, after reducing it to
+    /// the allowlisted keys (the ring's `push` discipline). A row without
+    /// a request id is skipped: the served routes set one before
+    /// admission, and an id-less row could neither be replaced nor removed.
+    fn upsert(&self, row: &Value) {
+        let Some(id) = row.get("request_id").and_then(Value::as_str) else {
+            return;
+        };
+        let mut filtered = serde_json::Map::new();
+        for key in ACTIVE_KEYS {
+            if let Some(value) = row.get(key) {
+                filtered.insert(key.to_string(), value.clone());
+            }
+        }
+        let row = Value::Object(filtered);
+        let mut board = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match board
+            .iter()
+            .position(|existing| existing.get("request_id").and_then(Value::as_str) == Some(id))
+        {
+            Some(slot) => board[slot] = row.clone(),
+            None => board.push(row.clone()),
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|row| row.get("request_id").and_then(Value::as_str) != Some(id));
+    }
+
+    pub(crate) fn rows_oldest_first(&self) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// The monitor's recent-request ring, owned by `AppState` like the log
 /// sink: every server — and every test server — gets its own, so the
 /// parallel suite never shares rows. It holds the last `RING_CAP`
@@ -505,6 +571,10 @@ pub(crate) struct RequestLog {
     /// The monitor's ring this request's line feeds, when the handler
     /// wired one (the served routes do; a test-built log may skip it).
     ring: Option<RecentRing>,
+    /// The monitor's active board this request mirrors onto, when the
+    /// handler wired one. The row lives from admission to the written
+    /// line, so the panel sees queue, prefill, and decode as they happen.
+    active: Option<ActiveBoard>,
 }
 
 impl RequestLog {
@@ -547,11 +617,16 @@ impl RequestLog {
             endpoint: Some(endpoint),
             digests: None,
             ring: None,
+            active: None,
         }
     }
 
     pub(crate) fn set_ring(&mut self, ring: RecentRing) {
         self.ring = Some(ring);
+    }
+
+    pub(crate) fn set_active(&mut self, board: ActiveBoard) {
+        self.active = Some(board);
     }
 
     pub(crate) fn set_prompt_digests(&mut self, ids: &[u32], lcp_prev_request: u32) {
@@ -564,14 +639,17 @@ impl RequestLog {
 
     pub(crate) fn admit(&mut self) {
         self.admitted = Some((self.clock)());
+        self.push_active();
     }
 
     pub(crate) fn set_engine(&mut self, id: &str) {
         self.engine = Some(id.to_string());
+        self.push_active();
     }
 
     pub(crate) fn set_session(&mut self, id: &str) {
         self.session = Some(id.to_string());
+        self.push_active();
     }
 
     /// Which request field set the output cap. Called by the serving routes
@@ -586,6 +664,7 @@ impl RequestLog {
         if self.started.is_none() {
             self.started = Some((self.clock)());
         }
+        self.push_active();
     }
 
     pub(crate) fn batch(&mut self, tokens: u32) {
@@ -596,6 +675,37 @@ impl RequestLog {
         self.first_batch.get_or_insert((now, tokens));
         self.last_batch = Some(now);
         self.completion_tokens = self.completion_tokens.saturating_add(tokens);
+        self.push_active();
+    }
+
+    /// The request's phase on the active board: queued until the engine
+    /// thread takes the job, prefill until its first batch, decode after.
+    fn phase(&self) -> &'static str {
+        if self.first_batch.is_some() {
+            "decode"
+        } else if self.started.is_some() {
+            "prefill"
+        } else {
+            "queued"
+        }
+    }
+
+    /// Mirrors this request onto the active board, when the handler wired
+    /// one. The row leaves the board when the line is written.
+    fn push_active(&self) {
+        let Some(board) = &self.active else {
+            return;
+        };
+        board.upsert(&json!({
+            "request_id": self.request_id,
+            "model": self.model,
+            "engine": self.engine,
+            "session": self.session,
+            "phase": self.phase(),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "started_at_ms": self.started_at_ms,
+        }));
     }
 
     /// Marks the request as one with a prefix boundary: its line then carries the
@@ -727,6 +837,9 @@ impl RequestLog {
         if let Some(ring) = &self.ring {
             ring.push(&line);
         }
+        if let (Some(board), Some(id)) = (&self.active, self.request_id.as_deref()) {
+            board.remove(id);
+        }
         let mut sink = self.sink.lock().unwrap_or_else(PoisonError::into_inner);
         // A failed write must not fail the request.
         let _ = sink.write_all(line.as_bytes());
@@ -800,8 +913,8 @@ mod tests {
     }
 
     use super::{
-        Entry, Outcome, PromptDigest, RecentRing, RequestLog, default_clock, millis, rate, render,
-        stepped_clock,
+        ACTIVE_KEYS, ActiveBoard, Entry, Outcome, PromptDigest, RecentRing, RequestLog,
+        default_clock, millis, rate, render, stepped_clock,
     };
     use crate::EngError;
     use crate::sched::job::{PrefillBankReport, PrefillPieces, PrefixHit, PrefixReport};
@@ -1064,6 +1177,62 @@ mod tests {
         let state = AppState::new(testkit::API_KEY, vec![entry]).with_request_log(capture.clone());
         let ring = state.recent_ring();
         (router(Arc::new(state)), ring, capture)
+    }
+
+    #[test]
+    fn the_active_board_tracks_phases_and_clears_when_the_line_is_written() {
+        let board = ActiveBoard::new();
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            default_clock(),
+            "active-model",
+            false,
+            12,
+            "POST",
+            "/v1/chat/completions",
+        );
+        log.set_id("chatcmpl-active-1");
+        log.set_active(board.clone());
+        log.set_engine("engine-a");
+        log.set_session("session-a");
+        log.admit();
+        let row = board.rows_oldest_first()[0].clone();
+        assert_eq!(row["phase"], "queued", "admitted, not yet taken");
+        assert_eq!(row["engine"], "engine-a");
+        assert_eq!(row["session"], "session-a");
+        log.started();
+        assert_eq!(board.rows_oldest_first()[0]["phase"], "prefill");
+        log.batch(4);
+        log.batch(2);
+        let row = board.rows_oldest_first()[0].clone();
+        assert_eq!(row["phase"], "decode");
+        assert_eq!(row["completion_tokens"], 6);
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected = ACTIVE_KEYS;
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "the row exposes exactly the allowlisted keys"
+        );
+        log.done(
+            FinishReason::Stop,
+            &Usage::new(12, 6, 0),
+            None,
+            None,
+            PrefillPieces::default(),
+            None,
+        );
+        assert!(
+            board.rows_oldest_first().is_empty(),
+            "the written line removes the row"
+        );
     }
 
     #[tokio::test]

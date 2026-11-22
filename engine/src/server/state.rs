@@ -7,7 +7,7 @@
 //! binding, after which the id binds again on its next request.
 
 use super::error::ServerError;
-use super::reqlog::{RecentRing, Sink, default_sink};
+use super::reqlog::{ActiveBoard, RecentRing, Sink, default_sink};
 use super::sampler_trace::{SamplerTraceRing, TraceMeta};
 use super::wire::{EngineErrorInfo, EngineInfo, Model, ModelList, state_name};
 use crate::EngError;
@@ -104,6 +104,9 @@ pub(crate) struct AppState {
     /// The monitor's recent-request ring, fed by the served routes' log
     /// lines and read by `GET /v1/recent-requests`.
     recent: RecentRing,
+    /// The monitor's active-request board, fed by the same routes'
+    /// lifecycle calls and read by the same route's `active` array.
+    active: ActiveBoard,
     /// Whether the process permits sampler-trace capture: the config's
     /// `sample_trace` setting, checked before a request arms a sampler.
     sample_trace: bool,
@@ -191,6 +194,7 @@ impl AppState {
             log: Box::new(|line| eprintln!("error: {line}")),
             request_log: default_sink(),
             recent: RecentRing::new(),
+            active: ActiveBoard::new(),
             sample_trace: false,
             traces: SamplerTraceRing::default(),
             prompt_memory: Arc::new(Mutex::new(HashMap::new())),
@@ -254,6 +258,11 @@ impl AppState {
     /// server owns its own rows.
     pub(crate) fn recent_ring(&self) -> RecentRing {
         self.recent.clone()
+    }
+
+    /// The monitor's active-request board: one per state, like the ring.
+    pub(crate) fn active_board(&self) -> ActiveBoard {
+        self.active.clone()
     }
 
     #[cfg(test)]

@@ -337,7 +337,10 @@ fn parse_gpu_csv(text: &str) -> Vec<serde_json::Value> {
 }
 
 async fn recent_requests(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({ "requests": state.recent_ring().rows_newest_first() }))
+    Json(json!({
+        "requests": state.recent_ring().rows_newest_first(),
+        "active": state.active_board().rows_oldest_first(),
+    }))
 }
 
 async fn unknown_route() -> ServerError {
@@ -686,6 +689,7 @@ mod tests {
         let body = testkit::json_of(&body);
         assert_schema("RecentRequests", &body);
         assert!(body["requests"].as_array().expect("array").is_empty());
+        assert!(body["active"].as_array().expect("active array").is_empty());
     }
 
     fn web_state() -> (
