@@ -16,7 +16,7 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::resident::relative_attention::{
-    RelativeAttentionRaw, relative_attention_launch,
+    RelativeAttentionRaw, clip_queries, relative_attention_launch,
 };
 
 pub(crate) const HEAD_DIM: usize = 128;
@@ -39,8 +39,9 @@ pub(crate) struct RelativeAttentionTile {
     pub(crate) first: usize,
     pub(crate) count: usize,
     // Byte strides, or zero for packed planes. Output/status are always packed.
-    pub(crate) input_stride: usize,
-    pub(crate) side_stride: usize,
+    pub(crate) input_stride: usize, // K, V, position
+    pub(crate) query_stride: usize, // Q, relative coefficients
+    pub(crate) side_stride: usize,  // sinks, gates
 }
 
 impl RelativeAttentionTile {
@@ -48,11 +49,15 @@ impl RelativeAttentionTile {
         let mut bytes = shape.region_bytes()?;
         if !(2..=QUERY_TILE_LIMIT).contains(&self.count)
             || self.first.checked_add(self.count)? > MAX_WORD
-            || [self.input_stride, self.side_stride]
-                .into_iter()
-                .any(|stride| {
-                    stride != 0 && (!(bytes[0]..=MAX_STRIDE).contains(&stride) || stride % 4 != 0)
-                })
+            || [
+                (self.input_stride, bytes[5]),
+                (self.query_stride, bytes[4]),
+                (self.side_stride, bytes[10]),
+            ]
+            .into_iter()
+            .any(|(stride, width)| {
+                stride != 0 && (!(width..=MAX_STRIDE).contains(&stride) || stride % 4 != 0)
+            })
         {
             return None;
         }
@@ -60,7 +65,8 @@ impl RelativeAttentionTile {
         for (i, width) in bytes.iter_mut().enumerate() {
             let stride = match i {
                 0 | 3 => *width,
-                4..=7 | 11 => self.input_stride.max(*width),
+                4 | 7 => self.query_stride.max(*width),
+                5 | 6 | 11 => self.input_stride.max(*width),
                 9 | 10 => self.side_stride.max(*width),
                 _ => continue, // the two rings and the bias table are not batched
             };
@@ -114,6 +120,50 @@ impl RelativeAttentionShape {
 }
 
 impl CudaContext {
+    /// Clips Q and relative coefficients in the packed prefill sidecar in place.
+    pub(crate) fn relative_attention_clip_queries(
+        &self,
+        stream: &DeviceStream,
+        shape: RelativeAttentionShape,
+        rows: usize,
+        limits: [f32; 2],
+        [side, scales, status]: [DeviceRange<'_>; 3],
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let bad_shape =
+            || EngError::BadRequest("invalid relative attention query clip geometry".into());
+        let [_, _, _, _, q, _, _, rel, _, sink, gate, _] =
+            shape.region_bytes().ok_or_else(bad_shape)?;
+        if !(1..=512).contains(&rows) || !limits.iter().all(|x| x.is_finite() && *x > 0.0) {
+            return Err(bad_shape());
+        }
+        let spans = [
+            (
+                "relative attention sidecar",
+                side,
+                (q + rel + sink + gate) * rows,
+            ),
+            ("relative attention clip scales", scales, q + rel),
+            ("relative attention clip status", status, rows * 4),
+        ];
+        for (i, &(name, range, bytes)) in spans.iter().enumerate() {
+            if range.bytes() != bytes {
+                return Err(bad_shape());
+            }
+            require_fit(name, &range, bytes, 4)?;
+            let claim = Claim::of(name, &range, bytes);
+            for &(other, range, bytes) in &spans[i + 1..] {
+                require_apart(&claim, &Claim::of(other, &range, bytes))?;
+            }
+        }
+        let ranges = [
+            self.raw_range(&side)?,
+            self.raw_range(&scales)?,
+            self.raw_range(&status)?,
+        ];
+        self.launch_on(stream, |raw| clip_queries(raw, ranges, shape, rows, limits))
+    }
+
     /// Queues the relative-attention step in one launch, with no copies or waits.
     /// The device position (`StepParams.pos`) can change between graph replays.
     /// An invalid position writes only the status word, adding

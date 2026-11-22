@@ -31,6 +31,15 @@ pub(in crate::family::inkling2) fn device_side_enabled() -> bool {
     })
 }
 
+/// Extends the ordinary batched relative-attention path; does not enable
+/// batching, grouped controllers, or the resident attention cache on its own.
+pub(in crate::family::inkling2) fn resident_query_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FIFI_INKLING_CUDA_PREFILL_RESIDENT_QUERY").as_deref() == Ok("1")
+    })
+}
+
 pub(in crate::family::inkling2) fn host_reserve() -> u64 {
     if enabled() {
         (2 * ARENA_BYTES) as u64
@@ -73,32 +82,154 @@ impl Workspace {
 }
 
 #[derive(Clone, Copy)]
+pub(in crate::family::inkling2) struct QueryClip<'a> {
+    pub scales: [&'a [f32]; 2],
+    pub limits: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::family::inkling2) struct Sidecar<'a> {
+    pub range: DeviceRange<'a>,
+    pub query: Option<QueryClip<'a>>,
+}
+
+pub(in crate::family::inkling2) fn projection_side(query: bool) -> &'static [usize] {
+    if query { &[0, 3, 4, 5] } else { &[4, 5] }
+}
+
+#[derive(Clone, Copy)]
 struct Layout {
     input: usize,
+    scales: usize,
+    resident: [usize; 6],
     attention: usize,
     output: usize,
     projected: bool,
 }
 
 impl Layout {
-    fn new(shape: RelativeAttentionShape, output_rows: Option<usize>) -> Option<Self> {
+    fn new(
+        shape: RelativeAttentionShape,
+        output_rows: Option<usize>,
+        keep: &[usize],
+    ) -> Option<Self> {
         let [attention, _, _, _, q, k, v, relative, _, sinks, gates, pos] = shape.region_bytes()?;
+        let widths = [q, k, v, relative, sinks, gates];
+        let mut resident = [0; 6];
+        for &i in keep {
+            resident[i] = widths[i];
+        }
         Some(Self {
-            input: [q, k, v, relative, sinks, gates, pos].into_iter().sum(),
+            input: widths.iter().sum::<usize>() + pos - resident.iter().sum::<usize>(),
+            scales: resident[0] + resident[3],
+            resident,
             attention,
             output: output_rows.map_or(Some(attention), |n| n.checked_mul(4))?,
             projected: output_rows.is_some(),
         })
     }
 
-    fn capacity(self) -> usize {
+    fn side_stride(self) -> usize {
+        self.resident.iter().sum()
+    }
+
+    fn row_bytes(self) -> Option<usize> {
         let projected = if self.projected { self.attention } else { 0 };
-        let Some(row_bytes) = (self.input + 4 + projected).checked_add(self.output) else {
+        (self.input + 4 + projected).checked_add(self.output)
+    }
+
+    fn capacity(self, query_tiles: bool) -> usize {
+        let Some(row_bytes) = self.row_bytes() else {
             return 0;
         };
-        QUERY_TILE_LIMIT
+        // Keep the combined tip's batching when resident queries are off.
+        let limit = if query_tiles || self.scales == 0 {
+            QUERY_TILE_LIMIT
+        } else {
+            512 // resident clip launch limit
+        };
+        limit
             .min(DenseGemvShape::MAX_ACTIVATION_ROWS)
-            .min(ARENA_BYTES / row_bytes)
+            .min((ARENA_BYTES - self.scales) / row_bytes)
+    }
+
+    fn row_inputs<'a>(
+        self,
+        work: &'a DeviceBuffer,
+        offsets: [usize; 8],
+        widths: [usize; 6],
+        side: Option<&Sidecar<'a>>,
+        row: usize,
+    ) -> Result<[DeviceRange<'a>; 6], EngError> {
+        let mut side_at = side.map_or(0, |s| s.range.offset()) + row * self.side_stride();
+        let mut next = |i: usize| {
+            if self.resident[i] == 0 {
+                work.range(offsets[i], widths[i])
+            } else {
+                let side = side.ok_or_else(|| bad("missing CUDA attention sidecar"))?;
+                let relative_at = side_at - side.range.offset();
+                if relative_at
+                    .checked_add(widths[i])
+                    .is_none_or(|end| end > side.range.bytes())
+                {
+                    return Err(bad("incorrect CUDA attention sidecar extent"));
+                }
+                let range = side.range.buffer().range(side_at, widths[i]);
+                side_at += self.resident[i];
+                range
+            }
+        };
+        Ok([next(0)?, next(1)?, next(2)?, next(3)?, next(4)?, next(5)?])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resident_query_layout_leaves_only_kv_and_position_in_host_rows() {
+        let shape = RelativeAttentionShape {
+            query_heads: 64,
+            kv_heads: 8,
+            relative_dims: 32,
+            relative_extent: 1024,
+            capacity: 4096,
+        };
+        let words = |n| n * size_of::<f32>();
+        let q = words(64 * 128);
+        let kv = words(8 * 128);
+        let relative = words(64 * 32);
+        let sinks = words(64);
+        let pos = size_of::<i32>();
+        let projected = Some(16384);
+        let host = Layout::new(shape, projected, &[]).unwrap();
+        let side = Layout::new(shape, projected, projection_side(false)).unwrap();
+        let query = Layout::new(shape, projected, projection_side(true)).unwrap();
+        assert_eq!((host.side_stride(), host.scales), (0, 0));
+        assert_eq!((side.side_stride(), side.scales), (sinks + q, 0));
+        assert_eq!(query.resident, [q, 0, 0, relative, sinks, q]);
+        assert_eq!(query.input, 2 * kv + pos);
+        assert_eq!(query.scales, q + relative);
+        assert_eq!(query.input + query.side_stride(), host.input);
+        for layout in [host, side, query] {
+            for tiled in [false, true] {
+                let limit = if tiled || layout.scales == 0 {
+                    QUERY_TILE_LIMIT
+                } else {
+                    512
+                };
+                let capacity = layout.capacity(tiled);
+                let row_bytes = layout.row_bytes().unwrap();
+                assert!(layout.scales + capacity * row_bytes <= ARENA_BYTES);
+                assert!(
+                    capacity == limit.min(DenseGemvShape::MAX_ACTIVATION_ROWS)
+                        || layout.scales + (capacity + 1) * row_bytes > ARENA_BYTES
+                );
+            }
+        }
+        assert!(query.capacity(false) > side.capacity(false));
+        assert!(side.capacity(false) > host.capacity(false));
     }
 }
 
@@ -109,24 +240,41 @@ impl ResidentAttention {
         slot: usize,
         projection: Option<&OutputProjection<'_>>,
     ) -> Result<usize, EngError> {
+        self.prefill_tile(context, slot, projection, &[])
+            .map(|(capacity, _)| capacity)
+    }
+
+    pub(in crate::family::inkling2) fn prefill_tile(
+        &self,
+        context: &CudaContext,
+        slot: usize,
+        projection: Option<&OutputProjection<'_>>,
+        keep: &[usize],
+    ) -> Result<(usize, usize), EngError> {
         if !enabled() {
-            return Ok(0);
+            return Ok((0, 0));
         }
-        let Some(layout) = Layout::new(self.visits[slot].shape, projection.map(|p| p.rows)) else {
-            return Ok(0);
+        let Some(layout) = Layout::new(self.visits[slot].shape, projection.map(|p| p.rows), keep)
+        else {
+            return Ok((0, 0));
         };
         let mut workspace = self.prefill.borrow_mut();
         if workspace.is_none() {
             *workspace = Workspace::allocate(context)?;
         }
-        Ok(workspace.as_ref().map_or(0, |_| layout.capacity()))
+        Ok((
+            workspace
+                .as_ref()
+                .map_or(0, |_| layout.capacity(self.query_tiles)),
+            layout.side_stride(),
+        ))
     }
 
     pub(in crate::family::inkling2) fn step_prefill(
         &self,
         context: &CudaContext,
         slot: usize,
-        inputs: (&[Row<'_>], Option<DeviceRange<'_>>),
+        inputs: (&[Row<'_>], Option<Sidecar<'_>>),
         history: History<'_>,
         projection: Option<&OutputProjection<'_>>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
@@ -137,26 +285,26 @@ impl ResidentAttention {
         &self,
         context: &CudaContext,
         slot: usize,
-        (rows, side): (&[Row<'_>], Option<DeviceRange<'_>>),
+        (rows, side): (&[Row<'_>], Option<Sidecar<'_>>),
         history: History<'_>,
         projection: Option<&OutputProjection<'_>>,
         query_tiles: bool,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let visit = self.visits[slot];
-        let mut layout = Layout::new(visit.shape, projection.map(|p| p.rows))
+        let keep = side
+            .as_ref()
+            .map_or(&[][..], |s| projection_side(s.query.is_some()));
+        let layout = Layout::new(visit.shape, projection.map(|p| p.rows), keep)
             .ok_or_else(|| bad("invalid CUDA relative attention batch layout"))?;
-        let sink_bytes = visit.shape.query_heads * size_of::<f32>();
-        let side_bytes = sink_bytes + layout.attention;
-        if let Some(side) = side {
-            if rows.len().checked_mul(side_bytes) != Some(side.bytes()) {
-                return Err(bad("incorrect CUDA attention sidecar extent"));
-            }
-            layout.input -= side_bytes;
+        if let Some(side) = &side
+            && rows.len().checked_mul(layout.side_stride()) != Some(side.range.bytes())
+        {
+            return Err(bad("incorrect CUDA attention sidecar extent"));
         }
         let count = rows.len();
         let position = history.position;
         if count == 0
-            || count > layout.capacity()
+            || count > layout.capacity(query_tiles)
             || position
                 .checked_add(count - 1)
                 .is_none_or(|last| last > POS_MAX as usize)
@@ -170,8 +318,13 @@ impl ResidentAttention {
                 first: position,
                 count,
                 input_stride: layout.input,
+                query_stride: if layout.scales != 0 {
+                    layout.side_stride()
+                } else {
+                    layout.input
+                },
                 side_stride: if side.is_some() {
-                    side_bytes
+                    layout.side_stride()
                 } else {
                     layout.input
                 },
@@ -195,8 +348,16 @@ impl ResidentAttention {
                 visit.shape,
                 (position + i) as i32,
                 &mut work.encoded,
-                side.is_some(),
+                layout.resident.map(|n| n != 0),
             )?);
+        }
+        if let Some(query) = side.as_ref().and_then(|s| s.query) {
+            for (scale, i) in query.scales.into_iter().zip([0, 3]) {
+                if scale.len() != layout.resident[i] / size_of::<f32>() {
+                    return Err(bad("incorrect CUDA attention query scale extent"));
+                }
+                extend_words(&mut work.encoded, scale);
+            }
         }
         self.invalidate_local_aux(slot);
         let mut state = self.state.borrow_mut();
@@ -237,14 +398,15 @@ impl ResidentAttention {
         visit: Visit,
         layout: Layout,
         work: &mut Workspace,
-        (offsets, side): (&[[usize; 8]], Option<DeviceRange<'_>>),
+        (offsets, side): (&[[usize; 8]], Option<Sidecar<'_>>),
         (projection, tile): (
             Option<&OutputProjection<'_>>,
             Option<(RelativeAttentionTile, [usize; 12])>,
         ),
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let count = offsets.len();
-        let status_at = layout.input * count;
+        let scales_at = layout.input * count;
+        let status_at = scales_at + layout.scales;
         let out_at = status_at + 4 * count;
         let attention_at = if layout.projected {
             out_at + layout.output * count
@@ -257,29 +419,22 @@ impl ResidentAttention {
         let device = &work.device;
         let call = |i: usize, bytes: [usize; 12]| {
             let [out, kc, vc, status, q, k, v, rel, table, sinks, gates, pos] = bytes;
-            let [q_at, k_at, v_at, rel_at, sinks_at, gates_at, pos_at, _] = offsets[i];
-            let (sink_in, gate_in) = if let Some(side) = side {
-                let sink_bytes = visit.shape.query_heads * size_of::<f32>();
-                let at = side.offset() + i * (sink_bytes + layout.attention);
-                (
-                    side.buffer().range(at, sinks)?,
-                    side.buffer().range(at + sink_bytes, gates)?,
-                )
-            } else {
-                (
-                    device.range(sinks_at, sinks)?,
-                    device.range(gates_at, gates)?,
-                )
-            };
+            let [q, k, v, relative, sinks, gates] = layout.row_inputs(
+                device,
+                offsets[i],
+                [q, k, v, rel, sinks, gates],
+                side.as_ref(),
+                i,
+            )?;
             Ok::<_, EngError>(RelativeAttentionCall {
                 shape: visit.shape,
-                q: device.range(q_at, q)?,
-                k: device.range(k_at, k)?,
-                v: device.range(v_at, v)?,
-                relative: device.range(rel_at, rel)?,
-                sinks: sink_in,
-                gates: gate_in,
-                pos: device.range(pos_at, pos)?,
+                q,
+                k,
+                v,
+                relative,
+                sinks,
+                gates,
+                pos: device.range(offsets[i][6], pos)?,
                 status: device.range(status_at + 4 * i, status)?,
                 out: device.range(attention_at + i * layout.attention, out)?,
                 table: self.arena.range(visit.table_at, table)?,
@@ -294,6 +449,23 @@ impl ResidentAttention {
                 0,
                 device.range(0, out_at)?,
             )?;
+            if let Some(side) = &side
+                && let Some(query) = side.query
+            {
+                context.relative_attention_clip_queries(
+                    &self.stream,
+                    visit.shape,
+                    count,
+                    query.limits,
+                    [
+                        side.range,
+                        work.device.range(scales_at, layout.scales)?,
+                        work.device.range(status_at, 4 * count)?,
+                    ],
+                )?;
+            }
+            // Prep ORs into the same status checked by snapshot commit. No
+            // resident sidecar is replayed or re-prepared after enqueue.
             if let Some((tile, bytes)) = tile {
                 context.relative_attention_tile(&self.stream, call(0, bytes)?, tile)?;
             } else {

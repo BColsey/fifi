@@ -476,7 +476,7 @@ impl Row<'_> {
         bytes: &mut Vec<u8>,
     ) -> Result<[usize; 8], EngError> {
         bytes.clear();
-        let offsets = self.append_inputs(shape, position, bytes, false)?;
+        let offsets = self.append_inputs(shape, position, bytes, [false; 6])?;
         bytes.extend_from_slice(&0_u32.to_ne_bytes());
         Ok(offsets)
     }
@@ -486,7 +486,7 @@ impl Row<'_> {
         shape: RelativeAttentionShape,
         position: i32,
         bytes: &mut Vec<u8>,
-        device_side: bool,
+        resident: [bool; 6],
     ) -> Result<[usize; 8], EngError> {
         let slices = [
             self.query,
@@ -498,14 +498,19 @@ impl Row<'_> {
         ];
         let q = shape.query_heads * HEAD_DIM;
         let kv = shape.kv_heads * HEAD_DIM;
-        let sizes = [
+        let mut sizes = [
             q,
             kv,
             kv,
             shape.query_heads * shape.relative_dims,
-            if device_side { 0 } else { shape.query_heads },
-            if device_side { 0 } else { q },
+            shape.query_heads,
+            q,
         ];
+        for (size, resident) in sizes.iter_mut().zip(resident) {
+            if resident {
+                *size = 0;
+            }
+        }
         if slices.each_ref().map(|slice| slice.len()) != sizes {
             return Err(bad("incorrect CUDA relative attention input shape"));
         }
@@ -716,7 +721,7 @@ mod tests {
         let cursor = || attention.state.borrow().next_position[0];
         let batch = |position,
                      rows: &[Row<'_>],
-                     side: Option<DeviceRange<'_>>,
+                     side: Option<prefill::Sidecar<'_>>,
                      values: &VecDeque<_>,
                      tiled| {
             attention.step_prefill_dispatch(
@@ -735,6 +740,10 @@ mod tests {
         let mut staged = Vec::new();
         extend_words(&mut staged, side_rows.as_flattened());
         side.write_at(&stream, 0, &staged).unwrap();
+        let device_side = Some(prefill::Sidecar {
+            range: side_in,
+            query: None,
+        });
         let ring = || {
             let mut bytes = vec![0; 2 * cache_bytes];
             attention
@@ -753,7 +762,7 @@ mod tests {
         let tail_values = [11.0, 10.0, 9.0]
             .map(|v| Arc::new(vec![v; HEAD_DIM]))
             .into();
-        let evaluate = |tiled, side: Option<DeviceRange<'_>>| {
+        let evaluate = |tiled, side: Option<prefill::Sidecar<'_>>| {
             // Manufacture an equal cursor from a different lineage before entering
             // each arm. Invalidate first, as prefix restore does in production.
             run(3, 100.0, &[200.0, 300.0, 400.0], true).unwrap();
@@ -772,10 +781,10 @@ mod tests {
             (bits(outputs), committed, bits(tail), ring())
         };
         let reference = evaluate(false, None);
-        assert_eq!(evaluate(false, Some(side_in)), reference);
+        assert_eq!(evaluate(false, device_side), reference);
         assert_eq!(evaluate(true, None), reference);
-        assert_eq!(evaluate(true, Some(side_in)), reference);
-        assert!(batch(4, &device_rows[..3], Some(side_in), &values, true).is_err());
+        assert_eq!(evaluate(true, device_side), reference);
+        assert!(batch(4, &device_rows[..3], device_side, &values, true).is_err());
         assert_eq!(cursor(), Some(9)); // rejected extent is pre-mutation
 
         // Both rewind and host-ahead cursor gaps must repair before reading.
@@ -797,7 +806,7 @@ mod tests {
         run(3, 6.0, &[2.0, 40.0, 20.0], true).unwrap();
         let snapshot = ring();
         assert_eq!(
-            batch(4, &device_rows, Some(side_in), &values, true),
+            batch(4, &device_rows, device_side, &values, true),
             Err(bad("invalid CUDA relative attention batch state"))
         );
         assert_eq!(cursor(), None);
@@ -817,6 +826,111 @@ mod tests {
             bits(batch(4, &host_rows, None, &values, true).unwrap()),
             reference.0
         );
+
+        let q_scale = std::array::from_fn::<_, HEAD_DIM, _>(|i| (i % 4 + 1) as f32 * 0.25);
+        let rel_scale = [0.75];
+        let query = prefill::QueryClip {
+            scales: [&q_scale, &rel_scale],
+            limits: [1.25, 0.5],
+        };
+        let raw_q = std::array::from_fn::<_, 4, _>(|r| {
+            std::array::from_fn::<_, HEAD_DIM, _>(|i| {
+                ((i * 17 + r * 13) % 29) as f32 * 0.125 - 1.75
+            })
+        });
+        let raw_rel = [[0.25], [2.5], [-1.0], [1.25]];
+        let mut host_q = raw_q;
+        let mut host_rel = raw_rel;
+        for (q, rel) in host_q.iter_mut().zip(&mut host_rel) {
+            for (q, s) in q.iter_mut().zip(q_scale) {
+                *q *= s;
+            }
+            rel[0] *= rel_scale[0];
+            crate::family::inkling2::cpu_attention::clip_rows(q, HEAD_DIM, query.limits[0]);
+            crate::family::inkling2::cpu_attention::clip_rows(rel, 1, query.limits[1]);
+        }
+        let mut packed = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..4 {
+            extend_words(&mut packed, &raw_q[i]);
+            extend_words(&mut packed, &raw_rel[i]);
+            extend_words(&mut packed, &side_rows[i]);
+            extend_words(&mut want, &host_q[i]);
+            extend_words(&mut want, &host_rel[i]);
+            extend_words(&mut want, &side_rows[i]);
+        }
+        // Exercise a borrowed sub-tile that starts at a nonzero byte offset.
+        let start = packed.len() / 4;
+        let resident = ctx.allocate(start + packed.len()).unwrap();
+        resident.write_at(&stream, start, &packed).unwrap();
+        let resident_side = || {
+            Some(prefill::Sidecar {
+                range: resident.range(start, packed.len()).unwrap(),
+                query: Some(query),
+            })
+        };
+        let host_rows = std::array::from_fn::<_, 4, _>(|i| Row {
+            query: &host_q[i],
+            key: &side_rows[i][1..],
+            relative: &host_rel[i],
+            ..host_rows[i]
+        });
+        let device_rows = std::array::from_fn::<_, 4, _>(|i| Row {
+            query: &[],
+            relative: &[],
+            key: host_rows[i].key,
+            ..device_rows[i]
+        });
+        attention.invalidate();
+        let expected = bits(batch(4, &host_rows, None, &values, false).unwrap());
+        let committed = ring();
+        for tiled in [false, true] {
+            attention.invalidate();
+            resident.write_at(&stream, start, &packed).unwrap();
+            assert_eq!(
+                bits(batch(4, &device_rows, resident_side(), &values, tiled).unwrap()),
+                expected
+            );
+            assert_eq!(ring(), committed);
+            assert_eq!(cursor(), Some(8));
+            let mut got = vec![0; want.len()];
+            resident.read_at(&stream, start, &mut got).unwrap();
+            assert_eq!(
+                got, want,
+                "prepared query side is not bitwise equal to host clip"
+            );
+        }
+        // Reject the resident subrange before touching the certified cursor.
+        assert!(batch(4, &device_rows[..3], resident_side(), &values, true).is_err());
+        assert_eq!(cursor(), Some(8));
+        // Raw inf/NaN must be rejected even if clipping or sigmoid masks it.
+        for (word, value) in [
+            (0, f32::INFINITY),
+            (HEAD_DIM, f32::NAN),
+            (HEAD_DIM + 1, f32::INFINITY),
+            (HEAD_DIM + 2, f32::NEG_INFINITY),
+        ] {
+            for tiled in [false, true] {
+                run(3, 6.0, &[2.0, 40.0, 20.0], true).unwrap();
+                let snapshot = ring();
+                resident.write_at(&stream, start, &packed).unwrap();
+                resident
+                    .write_at(
+                        &stream,
+                        start + word * size_of::<f32>(),
+                        &value.to_ne_bytes(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    batch(4, &device_rows, resident_side(), &values, tiled),
+                    Err(bad("invalid CUDA relative attention batch state"))
+                );
+                assert_eq!(cursor(), None);
+                if tiled {
+                    assert_eq!(ring(), snapshot); // prep/health status prevents commit
+                }
+            }
+        }
         assert!(run(5, f32::NAN, &[8.0, 6.0, 2.0], true).is_err());
         assert_eq!(
             run(POS_MAX as usize + 1, 1.0, &[], true),

@@ -7,7 +7,7 @@ use super::{
 use crate::{
     EngError,
     family::inkling2::cuda_projection::q8_row_reuse,
-    kernels::cuda::{CudaContext, resident::inkling_controller::Arithmetic},
+    kernels::cuda::{CudaContext, DeviceRange, resident::inkling_controller::Arithmetic},
 };
 
 #[cfg(test)]
@@ -19,6 +19,9 @@ pub(in crate::family::inkling2) struct ControlledAttentionInput<'a> {
     pub message: &'a [f32],
     pub gamma: &'a [f32],
 }
+
+pub(in crate::family::inkling2::cuda_projection) type ProjectionTile<'a, const N: usize> =
+    (Vec<[Vec<f32>; N]>, Option<DeviceRange<'a>>);
 
 impl DenseStep {
     pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch_capacity<
@@ -68,8 +71,8 @@ impl DenseStep {
         inputs: &[[ControlledAttentionInput<'_>; 3]],
         controllers: [ControllerWeights<'_>; 3],
         weights: [Option<ResidentProjection<'_>>; N],
-        (eps, arithmetic): (f32, Arithmetic),
-    ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
+        (eps, arithmetic, keep): (f32, Arithmetic, &[usize]),
+    ) -> Result<Option<ProjectionTile<'_, N>>, EngError> {
         let Some(first) = inputs.first() else {
             return Ok(None);
         };
@@ -119,7 +122,18 @@ impl DenseStep {
         let upload = range(0, gates + raw)?;
         let workspace = range(norm, 18 * m * hidden)?;
         let health = range(health_at, 3 * m)?;
-        let readback = range(health_at, 3 * m + m * output_width)?;
+        let mut host_widths = widths;
+        let mut side_widths = [0; N];
+        for &i in keep {
+            side_widths[i] = std::mem::take(&mut host_widths[i]);
+        }
+        let ld_host: usize = host_widths.iter().sum();
+        let ld_side: usize = side_widths.iter().sum();
+        let side_at = out_at + m * ld_host;
+        let side = (ld_side != 0)
+            .then(|| range(side_at, m * ld_side))
+            .transpose()?;
+        let readback = range(health_at, 3 * m + m * ld_host)?;
         let mut control = Vec::with_capacity(9);
         for (role, w) in controllers.into_iter().enumerate() {
             let gate = role * m * 2 * hidden;
@@ -136,17 +150,18 @@ impl DenseStep {
             control.push(self.batch_call(w[2], shape, [mid, gain + hidden])?);
         }
         let mut projections = Vec::with_capacity(N);
-        let mut output_offset = 0;
-        for p in weights.into_iter().flatten() {
+        for (i, p) in weights.into_iter().enumerate() {
+            let Some(p) = p else { continue };
             let mut shape = DenseGemvShape::packed(m, p.weight.shape[0], hidden);
-            shape.ld_y = output_width;
+            let (base, widths, stride) = if side_widths[i] > 0 {
+                (side_at, &side_widths, ld_side)
+            } else {
+                (out_at, &host_widths, ld_host)
+            };
+            shape.ld_y = stride;
             let x = gates + 15 * m * hidden + p.input * m * hidden;
-            projections.push(self.batch_call(
-                (p.weight, p.dtype),
-                shape,
-                [x, out_at + output_offset],
-            )?);
-            output_offset += p.weight.shape[0];
+            let y = base + widths[..i].iter().sum::<usize>();
+            projections.push(self.batch_call((p.weight, p.dtype), shape, [x, y])?);
         }
         let mut staged = Vec::with_capacity(12 * m);
         for role in 0..3 {
@@ -172,11 +187,12 @@ impl DenseStep {
         })?;
         self.capture_first_controller_tile(m, hidden)?;
         let mut values = values.into_iter().skip(3 * m);
-        Ok(Some(
-            (0..m)
-                .map(|_| split_projections(&mut values, weights))
-                .collect(),
-        ))
+        let host = (0..m)
+            .map(|_| host_widths.map(|width| values.by_ref().take(width).collect()))
+            .collect();
+        // run_rows fenced the producer; the caller must consume the borrowed tile
+        // before running another dense step that reuses Slot::Output.
+        Ok(Some((host, side)))
     }
 
     fn capture_first_controller_tile(&self, rows: usize, hidden: usize) -> Result<(), EngError> {

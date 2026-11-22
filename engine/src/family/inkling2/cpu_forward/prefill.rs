@@ -4,7 +4,7 @@
 use super::{
     AttentionInput, CpuForward, LayerVisit, MessageBank, MoeRoute, Role, Stream, TapRow,
     VisitState, Weights, add, apply_control, bad, control_names,
-    controller_batch::{controller_batch_enabled, multirow_controllers_enabled},
+    controller_batch::{ChainedAttention, controller_batch_enabled, multirow_controllers_enabled},
     window::PendingRow,
 };
 use crate::{
@@ -298,11 +298,12 @@ impl CpuForward {
                 visit,
                 &layer,
                 rows.iter().map(|row| (&row.stream, row.bank.as_ref())),
+                state,
             )?
         } else {
             None
         };
-        if let Some(values) = chained.as_ref() {
+        if let Some(ChainedAttention::Host(values)) = chained.as_ref() {
             self.diagnose_chained_projections(visit, &layer, rows, weights, values)?;
         }
         let mut attention_inputs = if chained.is_some() {
@@ -326,8 +327,13 @@ impl CpuForward {
         } else {
             None
         };
-        let batched = if let Some(projections) = chained {
-            let outputs = self.attention_prefill_batch(&layer, visit, state, projections)?;
+        let batched = if let Some(chained) = chained {
+            let outputs = match chained {
+                ChainedAttention::Host(p) => {
+                    self.attention_prefill_batch(&layer, visit, state, p)?
+                }
+                ChainedAttention::Resident(outputs) => outputs,
+            };
             Some(self.prompt_attention_residuals(
                 visit,
                 &layer,

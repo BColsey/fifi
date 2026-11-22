@@ -151,30 +151,45 @@ impl AttentionControllers<'_> {
         requests: [Option<Projection<'_>>; N],
         eps: f32,
     ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
+        let mut result = Vec::with_capacity(inputs.len());
+        let admitted = self.grouped_chained_tiles(inputs, requests, (eps, &[]), |host, _| {
+            result.extend(host);
+            Ok(())
+        })?;
+        Ok(admitted.then_some(result))
+    }
+
+    pub(in crate::family::inkling2) fn grouped_chained_tiles<const N: usize>(
+        &self,
+        inputs: &[[ControlledAttentionInput<'_>; 3]],
+        requests: [Option<Projection<'_>>; N],
+        (eps, keep): (f32, &[usize]),
+        mut consume: impl FnMut(Vec<[Vec<f32>; N]>, Option<DeviceRange<'_>>) -> Result<(), EngError>,
+    ) -> Result<bool, EngError> {
         let [Some(q), Some(k), Some(v)] = self.weights else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some(weights) = self
             .cuda
             .attention_group([self.shape[1]; 3], requests)
             .transpose()?
         else {
-            return Ok(None);
+            return Ok(false);
         };
-        let Some(capacity) = self
+        if keep.iter().any(|&i| weights[i].is_none()) {
+            return Ok(false);
+        }
+        let capacity = self
             .cuda
             .step
             .controlled_attention_batch_capacity(self.shape, weights)?
-        else {
-            return Ok(None);
-        };
+            .unwrap_or(0);
         if capacity < 2 {
-            return Ok(None);
+            return Ok(false);
         }
         let arithmetic = grouped_controller_arithmetic::select();
-        let mut result = Vec::with_capacity(inputs.len());
         for chunk in inputs.chunks(capacity) {
-            let values = self
+            let (host, device) = self
                 .cuda
                 .step
                 .controlled_attention_batch(
@@ -182,17 +197,17 @@ impl AttentionControllers<'_> {
                     chunk,
                     [q, k, v],
                     weights,
-                    (eps, arithmetic),
+                    (eps, arithmetic, keep),
                 )?
                 .ok_or_else(|| bad("admitted CUDA controlled attention batch declined"))?;
-            if values.len() != chunk.len() {
+            if host.len() != chunk.len() {
                 return Err(bad(
                     "CUDA controlled attention batch returned wrong row count",
                 ));
             }
-            result.extend(values);
+            consume(host, device)?;
         }
-        Ok(Some(result))
+        Ok(true)
     }
 
     pub(in crate::family::inkling2) fn chained_projections<const N: usize>(

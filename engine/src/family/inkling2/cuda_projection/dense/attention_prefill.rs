@@ -10,8 +10,6 @@ use crate::{
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream},
 };
 
-const SIDE: [usize; 2] = [4, 5];
-
 fn finish_borrowed<T>(
     stream: &DeviceStream,
     work: impl FnOnce() -> Result<T, EngError>,
@@ -38,19 +36,21 @@ impl PrefillProjection<'_> {
     pub(in crate::family::inkling2) fn capacity(
         &self,
         input: [&[f32]; 3],
+        keep: &[usize],
     ) -> Result<usize, EngError> {
         self.step
-            .projection_tile_capacity(&Layout::new(input, self.weights, &SIDE), self.scratch)
+            .projection_tile_capacity(&Layout::new(input, self.weights, keep), self.scratch)
     }
 
     pub(in crate::family::inkling2) fn tile(
         &self,
         inputs: &[[&[f32]; 3]],
+        keep: &[usize],
     ) -> Result<(Vec<[Vec<f32>; 8]>, DeviceRange<'_>), EngError> {
         let first = inputs
             .first()
             .ok_or_else(|| bad("empty Inkling prefill projection tile"))?;
-        let layout = Layout::new(*first, self.weights, &SIDE);
+        let layout = Layout::new(*first, self.weights, keep);
         let (values, side) = self.step.project_group_tile(
             self.context,
             inputs,

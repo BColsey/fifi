@@ -142,21 +142,36 @@ impl CpuForward {
         state: &mut VisitState,
         projected: AttentionProjection,
     ) -> Result<PreparedAttention, EngError> {
+        self.prepare_attention_row(attn, heads, state, projected, false)
+    }
+
+    fn prepare_attention_row(
+        &self,
+        attn: &str,
+        heads: Heads,
+        state: &mut VisitState,
+        projected: AttentionProjection,
+        resident_query: bool,
+    ) -> Result<PreparedAttention, EngError> {
         let [mut q, k, v, mut relative, sinks, gates, k_taps, v_taps] = projected;
-        self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
-        clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
+        if !resident_query {
+            self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
+            clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
+        }
         let mut k = self.attention_plane(attn, "k", [k, k_taps], heads, &mut state.conv.k)?;
         let mut v = self.attention_plane(attn, "v", [v, v_taps], heads, &mut state.conv.v)?;
         clip_rows(&mut k, heads.width, self.math.qk_l2_clip_threshold);
         for head in v.chunks_exact_mut(heads.width) {
             rms_norm(head, self.math.rms_norm_eps);
         }
-        self.scale_channels(&mut relative, &format!("{attn}.rel_l2_clip.scale"))?;
-        clip_rows(
-            &mut relative,
-            self.math.d_rel,
-            self.math.rel_l2_clip_threshold,
-        );
+        if !resident_query {
+            self.scale_channels(&mut relative, &format!("{attn}.rel_l2_clip.scale"))?;
+            clip_rows(
+                &mut relative,
+                self.math.d_rel,
+                self.math.rel_l2_clip_threshold,
+            );
+        }
         Ok(PreparedAttention {
             q,
             k,
@@ -368,13 +383,11 @@ impl CpuForward {
         state: &mut VisitState,
         inputs: &[[Vec<f32>; 3]],
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
-        if !attention::prefill::device_side_enabled() || inputs.len() < 2 {
+        let resident_query = attention::prefill::resident_query_enabled();
+        if (!resident_query && !attention::prefill::device_side_enabled()) || inputs.len() < 2 {
             return Ok(None);
         }
         let Weights::Gguf(weights) = &self.weights else {
-            return Ok(None);
-        };
-        let Some((context, device)) = weights.resident_attention() else {
             return Ok(None);
         };
         let widths = inputs[0].each_ref().map(Vec::len);
@@ -382,6 +395,49 @@ impl CpuForward {
             weights.prefill_projection(widths, calls)
         })?
         else {
+            return Ok(None);
+        };
+        let Some(bridge) = self.prefill_bridge(layer, visit, resident_query)? else {
+            return Ok(None);
+        };
+        let keep = attention::prefill::projection_side(resident_query);
+        let capacity = bridge
+            .capacity
+            .min(projector.capacity(inputs[0].each_ref().map(Vec::as_slice), keep)?);
+        if capacity < 2 {
+            return Ok(None);
+        }
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for tile in inputs.chunks(capacity) {
+            let refs: Vec<_> = tile
+                .iter()
+                .map(|row| row.each_ref().map(Vec::as_slice))
+                .collect();
+            let (host, range) = projector.tile(&refs, keep)?;
+            outputs.extend(bridge.consume(self, state, host, range)?);
+        }
+        if resident_query {
+            note_resident_queries(false);
+        } else {
+            static USED: std::sync::Once = std::sync::Once::new();
+            USED.call_once(|| {
+                eprintln!("Inkling CUDA kept prefill attention sinks and gates resident")
+            });
+        }
+        Ok(Some(outputs))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn prefill_bridge(
+        &self,
+        layer: &str,
+        visit: LayerVisit,
+        resident_query: bool,
+    ) -> Result<Option<PrefillBridge<'_>>, EngError> {
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        let Some((context, device)) = weights.resident_attention() else {
             return Ok(None);
         };
         let heads = self.heads(visit.attention);
@@ -393,49 +449,61 @@ impl CpuForward {
         else {
             return Ok(None);
         };
-        let capacity = device
-            .prefill_capacity(context, visit.state_slot, Some(&projection))?
-            .min(projector.capacity(inputs[0].each_ref().map(Vec::as_slice))?);
+        let (capacity, stride) = device.prefill_tile(
+            context,
+            visit.state_slot,
+            Some(&projection),
+            attention::prefill::projection_side(resident_query),
+        )?;
         if capacity < 2 {
             return Ok(None);
         }
-        let mut outputs = Vec::with_capacity(inputs.len());
-        for tile in inputs.chunks(capacity) {
-            let refs: Vec<_> = tile
-                .iter()
-                .map(|row| row.each_ref().map(Vec::as_slice))
-                .collect();
-            let (host, side) = projector.tile(&refs)?;
-            let prepared = host
-                .into_iter()
-                .map(|p| self.prepare_attention(&prefix, heads, state, p))
-                .collect::<Result<Vec<_>, _>>()?;
-            let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
-            let values = {
-                let _span = self.phase_span(Work::DeviceAttention);
-                // Finish consuming the sidecar before the next tile can overwrite it.
-                device.step_prefill(
-                    context,
-                    visit.state_slot,
-                    (&rows, Some(side)),
-                    attention::History {
-                        position: state.position,
-                        keys: &state.keys,
-                        values: &state.values,
-                    },
-                    Some(&projection),
-                )?
-            };
-            for (prepared, out) in prepared.into_iter().zip(values) {
-                state.push(prepared.k, prepared.v, self.kv_capacity(visit.attention));
-                outputs.push(self.finish_attention(layer, state, &output_name, out, true)?);
-            }
+        let scales = resident_query
+            .then(|| self.prefill_query_scales(&prefix, heads))
+            .transpose()?;
+        Ok(Some(PrefillBridge {
+            context,
+            device,
+            heads,
+            visit,
+            prefix,
+            layer: layer.to_owned(),
+            output_name,
+            projection,
+            capacity,
+            stride,
+            scales,
+        }))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn prefill_query_scales(
+        &self,
+        prefix: &str,
+        heads: Heads,
+    ) -> Result<[std::borrow::Cow<'_, [f32]>; 2], EngError> {
+        Ok([
+            self.weights
+                .vec(&format!("{prefix}.q_l2_clip.scale"), heads.q_channels())?,
+            self.weights.vec(
+                &format!("{prefix}.rel_l2_clip.scale"),
+                heads.query * self.math.d_rel,
+            )?,
+        ])
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn prefill_query_clip<'a>(
+        &self,
+        scales: &'a [std::borrow::Cow<'_, [f32]>; 2],
+    ) -> attention::prefill::QueryClip<'a> {
+        attention::prefill::QueryClip {
+            scales: scales.each_ref().map(AsRef::as_ref),
+            limits: [
+                self.math.qk_l2_clip_threshold,
+                self.math.rel_l2_clip_threshold,
+            ],
         }
-        static USED: std::sync::Once = std::sync::Once::new();
-        USED.call_once(|| {
-            eprintln!("Inkling CUDA kept prefill attention sinks and gates resident")
-        });
-        Ok(Some(outputs))
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -714,7 +782,128 @@ impl VisitState {
     }
 }
 
-fn clip_rows(rows: &mut [f32], width: usize, limit: f32) {
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) struct PrefillBridge<'a> {
+    context: &'a crate::kernels::cuda::CudaContext,
+    device: &'a attention::ResidentAttention,
+    heads: Heads,
+    visit: LayerVisit,
+    prefix: String,
+    layer: String,
+    output_name: String,
+    projection: attention::OutputProjection<'a>,
+    capacity: usize,
+    stride: usize,
+    scales: Option<[std::borrow::Cow<'a, [f32]>; 2]>,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl PrefillBridge<'_> {
+    pub(super) fn consume(
+        &self,
+        forward: &CpuForward,
+        state: &mut VisitState,
+        host: Vec<AttentionProjection>,
+        range: crate::kernels::cuda::DeviceRange<'_>,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let query = self
+            .scales
+            .as_ref()
+            .map(|scales| forward.prefill_query_clip(scales));
+        let stride = self.stride;
+        let count = host.len();
+        if count.checked_mul(stride) != Some(range.bytes()) {
+            return Err(bad(
+                "incorrect Inkling device prefill projection tile extent",
+            ));
+        }
+        let mut host = host.into_iter();
+        let mut output = Vec::with_capacity(count);
+        // Keep the controller's original tile size. An attention sub-tile is
+        // just a contiguous slice of the borrowed sidecar, with no new copy.
+        for first in (0..count).step_by(self.capacity) {
+            let count = (count - first).min(self.capacity);
+            let sub = range
+                .buffer()
+                .range(range.offset() + first * stride, count * stride)?;
+            output.extend(self.consume_rows(
+                forward,
+                state,
+                host.by_ref().take(count),
+                attention::prefill::Sidecar { range: sub, query },
+            )?);
+        }
+        Ok(output)
+    }
+
+    fn consume_rows(
+        &self,
+        forward: &CpuForward,
+        state: &mut VisitState,
+        host: impl Iterator<Item = AttentionProjection>,
+        side: attention::prefill::Sidecar<'_>,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let prepared = host
+            .map(|p| {
+                forward.prepare_attention_row(
+                    &self.prefix,
+                    self.heads,
+                    state,
+                    p,
+                    side.query.is_some(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
+        let values = {
+            let _span = forward.phase_span(Work::DeviceAttention);
+            // Finish consuming the sidecar before the next tile can overwrite it.
+            self.device.step_prefill(
+                self.context,
+                self.visit.state_slot,
+                (&rows, Some(side)),
+                attention::History {
+                    position: state.position,
+                    keys: &state.keys,
+                    values: &state.values,
+                },
+                Some(&self.projection),
+            )?
+        };
+        // The device ring is only a cache: publish the prepared host K/V
+        // after the device status and output have passed validation.
+        prepared
+            .into_iter()
+            .zip(values)
+            .map(|(prepared, out)| {
+                state.push(
+                    prepared.k,
+                    prepared.v,
+                    forward.kv_capacity(self.visit.attention),
+                );
+                forward.finish_attention(&self.layer, state, &self.output_name, out, true)
+            })
+            .collect()
+    }
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) fn note_resident_queries(chained: bool) {
+    static PLAIN: std::sync::Once = std::sync::Once::new();
+    static CHAINED: std::sync::Once = std::sync::Once::new();
+    let (receipt, path) = if chained {
+        (&CHAINED, "chained")
+    } else {
+        (&PLAIN, "plain")
+    };
+    receipt.call_once(|| {
+        eprintln!(
+            "Inkling CUDA kept {path} prefill attention Q, relative, sinks and gates resident"
+        )
+    });
+}
+
+pub(super) fn clip_rows(rows: &mut [f32], width: usize, limit: f32) {
     for row in rows.chunks_exact_mut(width) {
         let scale = (limit / (dot(row, row).sqrt() + 1e-6)).min(1.0);
         for value in row {

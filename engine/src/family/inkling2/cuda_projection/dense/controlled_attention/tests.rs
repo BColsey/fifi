@@ -88,16 +88,49 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
     )
     .unwrap();
     let batch_step = DenseStep::new(&context, &wide).unwrap();
-    let batch = batch_step
+    let (batch, no_side) = batch_step
         .controlled_attention_batch(
             &context,
             &rows,
             controllers,
             weights,
-            (eps, Arithmetic::Generic),
+            (eps, Arithmetic::Generic, &[]),
         )
         .unwrap()
         .unwrap();
+    assert!(no_side.is_none());
+    let (host, side) = batch_step
+        .controlled_attention_batch(
+            &context,
+            &rows,
+            controllers,
+            weights,
+            (eps, Arithmetic::Generic, &[0, 2]),
+        )
+        .unwrap()
+        .unwrap();
+    let side = side.unwrap();
+    let mut bytes = vec![[0u8; 4]; side.bytes() / 4];
+    side.buffer()
+        .read_at(&batch_step.stream, side.offset(), bytes.as_flattened_mut())
+        .unwrap();
+    assert_eq!(
+        bytes
+            .into_iter()
+            .map(f32::from_ne_bytes)
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        batch
+            .iter()
+            .flat_map(|row| row[0].iter().chain(&row[2]))
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    for (p, row) in host.iter().zip(&batch) {
+        assert!(p[0].is_empty() && p[2].is_empty());
+        assert!(p[1].is_empty());
+        assert_eq!(p[3], row[3]);
+    }
     for (row, got) in batch_raw.iter().zip(batch) {
         let want = run(&step, row).unwrap().unwrap();
         for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
@@ -110,7 +143,7 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
             &rows,
             controllers,
             weights,
-            (eps, Arithmetic::CpuParity),
+            (eps, Arithmetic::CpuParity, &[]),
         )
         .unwrap()
         .is_none()
@@ -122,6 +155,19 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
             .is_none()
     );
     raw[1].fill(f32::MAX);
+    let poisoned = make_rows(std::slice::from_ref(&raw), &gates, &messages, &gamma);
+    assert_eq!(
+        batch_step
+            .controlled_attention_batch(
+                &context,
+                &poisoned,
+                controllers,
+                weights,
+                (eps, Arithmetic::Generic, &[0, 2, 3]),
+            )
+            .err(),
+        Some(bad("CUDA projection produced a nonfinite output")),
+    );
     assert_eq!(
         run(&step, &raw).unwrap_err(),
         bad("CUDA projection produced a nonfinite output")

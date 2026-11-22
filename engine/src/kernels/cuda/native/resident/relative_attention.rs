@@ -38,10 +38,66 @@ unsafe extern "C" {
         first: c_int,
         count: c_int,
         input_stride: c_int,
+        query_stride: c_int,
         side_stride: c_int,
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+
+    fn inference_cuda_relative_attention_clip_queries(
+        side: *mut c_void,
+        scales: *mut c_void,
+        status: *mut c_void,
+        rows: c_int,
+        heads: c_int,
+        dims: c_int,
+        q_limit: f32,
+        rel_limit: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+}
+
+pub(in crate::kernels::cuda) fn clip_queries(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 3],
+    shape: RelativeAttentionShape,
+    rows: usize,
+    limits: [f32; 2],
+) -> Result<(), DeviceFailure> {
+    let [_, _, _, _, q, _, _, rel, _, sink, gate, _] =
+        shape.region_bytes().ok_or_else(invalid_argument)?;
+    if !(1..=512).contains(&rows) || !limits.iter().all(|x| x.is_finite() && *x > 0.0) {
+        return Err(invalid_argument());
+    }
+    let bytes = [(q + rel + sink + gate) * rows, q + rel, rows * 4];
+    let spans = ranges.each_ref().map(|r| Span::of(r, r.bytes()));
+    for (i, range) in ranges.iter().enumerate() {
+        if range.bytes() != bytes[i]
+            || !range.offset().is_multiple_of(4)
+            || spans[i + 1..].iter().any(|other| !spans[i].apart(other))
+        {
+            return Err(invalid_argument());
+        }
+    }
+    let [side, scales, status] = ranges.map(|r| r.address());
+    let mut stage = STAGE_NONE;
+    // SAFETY: the shape and three disjoint, aligned spans were checked above.
+    let code = unsafe {
+        inference_cuda_relative_attention_clip_queries(
+            side,
+            scales,
+            status,
+            rows as c_int,
+            shape.query_heads as c_int,
+            shape.relative_dims as c_int,
+            limits[0],
+            limits[1],
+            stream.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(code, stage)
 }
 
 pub(in crate::kernels::cuda) struct RelativeAttentionRaw<'a> {
@@ -88,6 +144,7 @@ pub(in crate::kernels::cuda) fn relative_attention_launch(
                 tile.first as c_int,
                 tile.count as c_int,
                 (tile.input_stride / 4) as c_int,
+                (tile.query_stride / 4) as c_int,
                 (tile.side_stride / 4) as c_int,
                 stream.as_ptr(),
                 &mut stage,

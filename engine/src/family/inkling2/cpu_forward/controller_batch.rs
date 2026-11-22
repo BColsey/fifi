@@ -8,13 +8,19 @@ use super::{
 };
 use crate::EngError;
 use crate::family::inkling2::{
-    cpu_attention::AttentionProjection,
+    cpu_attention::{AttentionProjection, note_resident_queries},
     cuda_projection::gguf::{
-        AttentionControllers, ControlledAttentionInput, LocalDecode, project_controller_roles,
+        AttentionControllers, ControlledAttentionInput, LocalDecode, attention::prefill,
+        project_controller_roles,
     },
 };
 
 type AttentionInputs = [Vec<f32>; 3];
+
+pub(super) enum ChainedAttention {
+    Host(Vec<AttentionProjection>),
+    Resident(Vec<Vec<f32>>),
+}
 
 struct PreparedInput {
     input: Vec<f32>,
@@ -173,7 +179,8 @@ impl CpuForward {
         visit: LayerVisit,
         layer: &str,
         rows: impl ExactSizeIterator<Item = (&'a Stream, Option<&'a MessageBank>)>,
-    ) -> Result<Option<Vec<AttentionProjection>>, EngError> {
+        state: &mut VisitState,
+    ) -> Result<Option<ChainedAttention>, EngError> {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         if !*ENABLED.get_or_init(|| {
             std::env::var("FIFI_INKLING_CUDA_GROUPED_CHAIN_ATTENTION").as_deref() == Ok("1")
@@ -229,9 +236,37 @@ impl CpuForward {
                 })
             })
             .collect();
-        let result = self.attention_requests(layer, visit.attention, |calls| {
-            controllers.grouped_chained_projections(&inputs, calls, self.math.rms_norm_eps)
-        })?;
+        // The projection comparison requires all raw projections on the host.
+        let keep_query = prefill::resident_query_enabled()
+            && std::env::var("FIFI_INKLING_DEBUG_CHAIN_COMPARE").as_deref() != Ok("1");
+        let bridge = keep_query
+            .then(|| self.prefill_bridge(layer, visit, true))
+            .transpose()?
+            .flatten();
+        let result =
+            self.attention_requests(layer, visit.attention, |calls| -> Result<_, EngError> {
+                if let Some(bridge) = &bridge {
+                    let mut output = Vec::with_capacity(inputs.len());
+                    let admitted = controllers.grouped_chained_tiles(
+                        &inputs,
+                        calls,
+                        (self.math.rms_norm_eps, prefill::projection_side(true)),
+                        |host, range| {
+                            let range =
+                                range.ok_or_else(|| bad("missing resident Inkling query tile"))?;
+                            output.extend(bridge.consume(self, state, host, range)?);
+                            Ok(())
+                        },
+                    )?;
+                    if admitted {
+                        note_resident_queries(true);
+                        return Ok(Some(ChainedAttention::Resident(output)));
+                    }
+                }
+                Ok(controllers
+                    .grouped_chained_projections(&inputs, calls, self.math.rms_norm_eps)?
+                    .map(ChainedAttention::Host))
+            })?;
         if result.is_some() {
             static USED: Once = Once::new();
             USED.call_once(|| eprintln!("Inkling CUDA used grouped chained controller attention"));

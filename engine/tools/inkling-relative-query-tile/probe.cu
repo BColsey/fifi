@@ -51,7 +51,7 @@ bool enqueue(Args a, int first, int certified_cursor, int count, bool enabled, c
     if (snapshot::eligible(enabled, certified_cursor, first, count, a.capacity)) {
         int stage;
         cuda(static_cast<cudaError_t>(
-            inference_cuda_relative_attention_tile_launch(&a, first, count, 0, 0, s, &stage)));
+            inference_cuda_relative_attention_tile_launch(&a, first, count, 0, 0, 0, s, &stage)));
         return true;
     }
     for (int i = 0; i < count; ++i) {

@@ -251,15 +251,20 @@ fn query_tile_validates_strided_bounds_and_positions() {
     let tile = RelativeAttentionTile {
         first: POS_MAX as usize - 1,
         count: 2,
-        input_stride: 32_768,
-        side_stride: (SHAPE.query_heads + QUERY) * 4,
+        input_stride: (2 * KV + 1) * 4,
+        query_stride: (2 * QUERY + SHAPE.query_heads * (SHAPE.relative_dims + 1)) * 4,
+        side_stride: (2 * QUERY + SHAPE.query_heads * (SHAPE.relative_dims + 1)) * 4,
     };
     let row = SHAPE.region_bytes().unwrap();
     let extents = tile.region_bytes(SHAPE).unwrap();
     assert_eq!(extents[0], 2 * row[0]);
     assert_eq!(extents[1..3], row[1..3]);
     assert_eq!(extents[3], 8);
-    assert_eq!(extents[4], row[4] + tile.input_stride);
+    assert!(tile.input_stride < row[4]); // host rows carry only K/V/position
+    assert_eq!(extents[4], row[4] + tile.query_stride);
+    assert_eq!(extents[5], row[5] + tile.input_stride);
+    assert_eq!(extents[6], row[6] + tile.input_stride);
+    assert_eq!(extents[7], row[7] + tile.query_stride);
     assert_eq!(extents[8], row[8]);
     assert_eq!(extents[9], row[9] + tile.side_stride);
     assert_eq!(extents[10], row[10] + tile.side_stride);
@@ -277,6 +282,10 @@ fn query_tile_validates_strided_bounds_and_positions() {
         },
         RelativeAttentionTile {
             input_stride: 4,
+            ..tile
+        },
+        RelativeAttentionTile {
+            query_stride: row[4] - 4,
             ..tile
         },
         RelativeAttentionTile {
