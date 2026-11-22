@@ -18,6 +18,9 @@ use crate::{
     },
 };
 
+// The direct packed projection measurements favor GEMV for narrow expert groups.
+const WMMA_MIN_ROWS: [usize; 2] = [16, 32];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Geometry {
     hidden: usize,
@@ -151,6 +154,7 @@ struct Projections<'a> {
     geometry: Geometry,
     caps: [f32; 2],
     dtypes: [DenseDtype; 2],
+    min_wmma_rows: [Option<usize>; 2],
     matrices: BTreeMap<ExpertId, [Matrix<'a>; 2]>,
 }
 
@@ -214,18 +218,24 @@ impl GgufCuda {
             return Ok(None);
         };
         let mut output = Vec::with_capacity(routes.len());
+        let mut wmma = [0; 2];
         for (window, routes) in routes.chunks(scratch.rows).enumerate() {
             let first = window * scratch.rows;
             let plan = RoutedWindow::prepare(&projections, layer, routes, |row, id| {
                 weight(first + row, id)
             })?;
-            output.extend(scratch.execute(cuda, &projections, &plan)?);
+            let (rows, launches) = scratch.execute(cuda, &projections, &plan)?;
+            output.extend(rows);
+            for (total, count) in wmma.iter_mut().zip(launches) {
+                *total += count;
+            }
         }
         if self.prefill_report.is_some() {
             eprintln!(
                 "Inkling CUDA device expert prefill {}",
                 serde_json::json!({"layer": layer, "rows": routes.len(),
-                    "windows": routes.len().div_ceil(scratch.rows)})
+                    "windows": routes.len().div_ceil(scratch.rows),
+                    "wmma_gate_calls": wmma[0], "wmma_down_calls": wmma[1]})
             );
         }
         Ok(Some(output))
@@ -274,6 +284,7 @@ impl GgufCuda {
                 rank,
             },
             dtypes,
+            min_wmma_rows: WMMA_MIN_ROWS.map(|rows| self.device_prefill_wmma.then_some(rows)),
             caps,
             matrices,
         }))
@@ -388,21 +399,22 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
-    ) -> Result<Vec<Vec<f32>>, EngError> {
+    ) -> Result<(Vec<Vec<f32>>, [usize; 2]), EngError> {
         let l = &plan.layout;
         let upload = self.buffer.range(0, l.flag.end)?;
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(&self.stream, &mut self.host, 0, upload)?;
-        let result = self.enqueue(cuda, projections, plan).and_then(|()| {
+        let result = self.enqueue(cuda, projections, plan).and_then(|wmma| {
             // The status word and reduced rows are contiguous; stage them in one copy.
             let readback = self
                 .buffer
                 .range(l.flag.start, l.output.end - l.flag.start)?;
-            cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)
+            cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)?;
+            Ok(wmma)
         });
         // A launch can be refused after the upload has been queued.
         let waited = self.host.synchronize(&self.stream);
-        result?;
+        let wmma = result?;
         waited?;
         let mut flag = [0; 4];
         self.host.read(l.flag.start, &mut flag)?;
@@ -413,10 +425,11 @@ impl Scratch {
         }
         let mut out = vec![[0; 4]; l.output.len() / 4];
         self.host.read(l.output.start, out.as_flattened_mut())?;
-        Ok(out
+        let rows = out
             .chunks_exact(projections.geometry.hidden)
             .map(|row| row.iter().copied().map(f32::from_ne_bytes).collect())
-            .collect())
+            .collect();
+        Ok((rows, wmma))
     }
 
     fn enqueue(
@@ -424,7 +437,7 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
-    ) -> Result<(), EngError> {
+    ) -> Result<[usize; 2], EngError> {
         let l = &plan.layout;
         let shape = projections.geometry;
         let count = plan.rows * shape.rank;
@@ -444,7 +457,7 @@ impl Scratch {
                 source_rows: plan.rows,
             },
         )?;
-        self.project(cuda, projections, plan, 0)?;
+        let gate_wmma = self.project(cuda, projections, plan, 0)?;
         cuda.row_clipped_expert(
             &self.stream,
             ClippedExpertCall {
@@ -459,7 +472,7 @@ impl Scratch {
                 caps: projections.caps,
             },
         )?;
-        self.project(cuda, projections, plan, 1)?;
+        let down_wmma = self.project(cuda, projections, plan, 1)?;
         cuda.row_indexed_rank_sum(
             &self.stream,
             IndexedRankSumCall {
@@ -475,7 +488,8 @@ impl Scratch {
                 },
                 rank: shape.rank,
             },
-        )
+        )?;
+        Ok([gate_wmma, down_wmma])
     }
 
     fn project(
@@ -484,7 +498,7 @@ impl Scratch {
         projections: &Projections<'_>,
         plan: &RoutedWindow,
         stage: usize,
-    ) -> Result<(), EngError> {
+    ) -> Result<usize, EngError> {
         let l = &plan.layout;
         let pair = [(&l.gathered, &l.gate), (&l.middle, &l.down)][stage];
         let calls = plan
@@ -508,7 +522,7 @@ impl Scratch {
                 })
             })
             .collect::<Result<Vec<_>, EngError>>()?;
-        cuda.dense_gemv_group(&self.stream, &calls)
+        cuda.dense_gemv_group_with_wmma(&self.stream, &calls, projections.min_wmma_rows[stage])
     }
 }
 

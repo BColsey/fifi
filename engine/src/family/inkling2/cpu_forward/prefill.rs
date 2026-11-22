@@ -638,3 +638,40 @@ fn grouped_prefill_matches_serial_logits_and_restored_state() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a leased CUDA device, the Inkling GGUF and fixed prompt token IDs"]
+fn device_grouped_prefill_last_logits() {
+    use std::{env, fs, path::Path};
+
+    let checkpoint = env::var_os("FIFI_INKLING_MODEL_DIR").expect("set the Inkling GGUF path");
+    let output = env::var_os("FIFI_INKLING_LOGITS").expect("set the output logits path");
+    let tokens: Vec<u32> = env::var("FIFI_INKLING_TOKEN_IDS")
+        .expect("set comma-separated token IDs")
+        .split(',')
+        .map(|value| value.parse().expect("valid token ID"))
+        .collect();
+    let prefix_rows: usize = env::var("FIFI_INKLING_GROUPED_PREFIX_ROWS")
+        .expect("set the number of grouped input rows before the logits positions")
+        .parse()
+        .expect("valid grouped input size");
+    assert!((2..tokens.len()).contains(&prefix_rows));
+
+    let mut model = CpuForward::open(Path::new(&checkpoint), tokens.len()).unwrap();
+    model.enable_cuda(0).unwrap();
+    assert!(model.supports_grouped_prefill());
+    let (prefix, tail) = tokens.split_at(prefix_rows);
+    model.prefill_grouped(prefix).unwrap();
+    let saved = model.snapshot();
+    let continuation = |model: &mut CpuForward| -> Vec<u8> {
+        tail.iter()
+            .flat_map(|&token| model.token(token, true).unwrap().unwrap())
+            .flat_map(f32::to_le_bytes)
+            .collect()
+    };
+    let logits = continuation(&mut model);
+    model.restore(&saved);
+    let restored = continuation(&mut model);
+    assert_eq!(logits, restored, "restored continuation logits differ");
+    fs::write(output, logits).unwrap();
+}

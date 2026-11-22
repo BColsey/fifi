@@ -48,6 +48,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     batch_streamed: bool,
     prefill_resident: bool,
     device_prefill: Option<RefCell<device_prefill::Workspace>>,
+    device_prefill_wmma: bool,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
     prefill_report: Option<RefCell<PrefillBankReport>>,
@@ -528,6 +529,9 @@ impl GgufCuda {
             batch_streamed,
             prefill_resident,
             device_prefill: device_prefill.then(RefCell::default),
+            device_prefill_wmma: device_prefill
+                && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_WMMA").as_deref()
+                    == Ok("1"),
             resident,
             cache: RefCell::default(),
             prefill_report: profile.then(RefCell::default),

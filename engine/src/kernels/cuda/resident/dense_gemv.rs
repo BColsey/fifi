@@ -103,45 +103,51 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
     ) -> Result<(), EngError> {
-        self.check_launch_stream(stream)?;
-        let planned = calls
-            .iter()
-            .map(|call| self.plan_dense_gemv(call))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.launch_on(stream, |raw_stream| {
-            for call in planned {
-                dense_gemv_launch(raw_stream, call)?;
-            }
-            Ok(())
-        })
+        self.dense_gemv_group_with_wmma(stream, calls, None)
+            .map(|_| ())
     }
 
-    /// Projects a batch with packed weights and F32 buffers. Operand tiles round to F16
-    /// before Tensor Core products with F32 accumulation. Select it explicitly where that
-    /// precision has been qualified. The original dense GEMV remains the exact fallback.
-    #[allow(
-        dead_code,
-        reason = "staged pending full-model quality and dispatch qualification"
-    )]
-    pub(crate) fn gguf_wmma_gemm(
+    /// Queues mixed exact and Tensor Core projections in the supplied order and returns the
+    /// number of Tensor Core launches. An explicit row threshold allows qualified callers to
+    /// round their packed weights and activation tiles to F16 before F32 accumulation.
+    /// Unsupported formats, shapes and devices use the exact GEMV.
+    pub(crate) fn dense_gemv_group_with_wmma(
         &self,
         stream: &DeviceStream,
-        call: DenseGemvCall<'_>,
-    ) -> Result<(), EngError> {
+        calls: &[DenseGemvCall<'_>],
+        min_wmma_rows: Option<usize>,
+    ) -> Result<usize, EngError> {
         self.check_launch_stream(stream)?;
-        let need = typed_wmma_need(call.shape.dims(), call.dtype).ok_or_else(|| {
-            EngError::BadRequest(format!(
-                "GGUF Tensor Core projection cannot use {:?} at {:?}",
-                call.dtype, call.shape
-            ))
-        })?;
-        let raw = self.plan_dense_projection(&call, need)?;
-        if self.mmq_device_facts()?.cc < 700 {
-            return Err(EngError::BadRequest(
-                "GGUF Tensor Core projection needs SM70 or later".into(),
-            ));
-        }
-        self.launch_on(stream, move |stream_raw| gguf_wmma_launch(stream_raw, raw))
+        let min_wmma_rows = match min_wmma_rows {
+            Some(rows) if self.mmq_device_facts()?.cc >= 700 => Some(rows),
+            _ => None,
+        };
+        let planned = calls
+            .iter()
+            .map(|call| {
+                let need = min_wmma_rows
+                    .filter(|&rows| call.shape.m >= rows)
+                    .and_then(|_| typed_wmma_need(call.shape.dims(), call.dtype));
+                match need {
+                    Some(need) => self
+                        .plan_dense_projection(call, need)
+                        .map(|raw| (raw, true)),
+                    None => self.plan_dense_gemv(call).map(|raw| (raw, false)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.launch_on(stream, |raw_stream| {
+            let mut wmma_launches = 0;
+            for (call, wmma) in planned {
+                if wmma {
+                    gguf_wmma_launch(raw_stream, call)?;
+                    wmma_launches += 1;
+                } else {
+                    dense_gemv_launch(raw_stream, call)?;
+                }
+            }
+            Ok(wmma_launches)
+        })
     }
 
     fn plan_dense_gemv<'b>(&self, call: &DenseGemvCall<'b>) -> Result<DenseGemvRaw<'b>, EngError> {
