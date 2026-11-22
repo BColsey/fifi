@@ -409,7 +409,6 @@ pub(crate) fn restore_tier(
     )
 }
 
-/// The tests open a cache, which needs direct I/O: Linux and Android only.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(test)]
 #[path = "host_store_tests.rs"]
 mod tests;

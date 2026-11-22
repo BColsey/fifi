@@ -1181,13 +1181,18 @@ fn open_owned(path: &Path, owner_uid: u32) -> Result<std::fs::File, DiskMiss> {
 /// from rustix, which carries the per-arch Linux tables — the literal values
 /// differ between x86_64 and aarch64.
 fn open_owned_direct(path: &Path, owner_uid: u32) -> Result<std::fs::File, DiskMiss> {
-    // Off Linux the ring falls back to buffered reads, so only `O_NOFOLLOW`
-    // applies.
+    // Off Linux there is no `O_DIRECT`: Apple platforms turn data caching off on the descriptor
+    // after the open (`F_NOCACHE`), and any other platform reads through the page cache, so only
+    // `O_NOFOLLOW` applies to it.
     #[cfg(target_os = "linux")]
     let flags = OFlags::NOFOLLOW | OFlags::DIRECT;
     #[cfg(not(target_os = "linux"))]
     let flags = OFlags::NOFOLLOW;
-    open_owned_with(path, owner_uid, flags)
+    let file = open_owned_with(path, owner_uid, flags)?;
+    #[cfg(target_vendor = "apple")]
+    rustix::fs::fcntl_nocache(&file, true)
+        .map_err(|e| DiskMiss::Refused(format!("turning data caching off: {e}")))?;
+    Ok(file)
 }
 
 fn open_owned_with(path: &Path, owner_uid: u32, flags: OFlags) -> Result<std::fs::File, DiskMiss> {

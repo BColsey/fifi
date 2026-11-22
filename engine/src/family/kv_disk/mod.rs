@@ -508,21 +508,20 @@ fn lock_dir(dir: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Writes `PROBE_BYTES` to a scratch file in `dir` with `O_DIRECT`, syncs it, reads a sector back
-/// the same way, and returns the measured write rate in bytes per second. A directory whose
-/// filesystem refuses direct I/O (some tmpfs, overlay and encrypted home directories) could take
-/// writes and then fail every verified read, filling the quota with entries that never restore,
-/// so the cache stays off there. The rate is what a graceful stop plans its first wait from,
-/// before any entry has been written.
-/// The probe needs `O_DIRECT`, which only Linux and Android have: elsewhere the cache stays off.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// Writes `PROBE_BYTES` to a scratch file in `dir` with uncached I/O (`O_DIRECT` on Linux and
+/// Android, `F_NOCACHE` on Apple platforms), syncs it, reads a sector back the same way, and
+/// returns the measured write rate in bytes per second. A directory whose filesystem refuses
+/// direct I/O (some tmpfs, overlay and encrypted home directories) could take writes and then
+/// fail every verified read, filling the quota with entries that never restore, so the cache
+/// stays off there. The rate is what a graceful stop plans its first wait from, before any entry
+/// has been written. Other platforms have no uncached open here: the cache stays off.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn probe_direct_io(_dir: &Path) -> Result<f64, String> {
-    Err("direct I/O is not available on this platform, which the verified reads need".into())
+    Err("uncached I/O is not available on this platform, which the verified reads need".into())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn probe_direct_io(dir: &Path) -> Result<f64, String> {
-    use rustix::fs::OFlags;
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let sector = SECTOR as usize;
     let path = dir.join(format!(".direct-probe-{}", std::process::id()));
@@ -533,12 +532,17 @@ fn probe_direct_io(dir: &Path) -> Result<f64, String> {
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
-            .custom_flags(OFlags::DIRECT.bits() as i32);
+            .mode(0o600);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32);
         let file = options
             .open(&path)
-            .map_err(|e| io_err("opening a direct-I/O file", e))?;
-        // An O_DIRECT buffer must be sector-aligned.
+            .map_err(|e| io_err("opening an uncached file", e))?;
+        // Apple platforms have no open flag: the descriptor turns data caching off after the open.
+        #[cfg(target_vendor = "apple")]
+        rustix::fs::fcntl_nocache(&file, true)
+            .map_err(|e| io_err("turning data caching off", e))?;
+        // An uncached buffer must be sector-aligned.
         let mut backing = vec![0u8; PROBE_BYTES + sector];
         let skip = (sector - backing.as_ptr() as usize % sector) % sector;
         let buffer = &mut backing[skip..skip + PROBE_BYTES];
@@ -547,16 +551,16 @@ fn probe_direct_io(dir: &Path) -> Result<f64, String> {
         }
         let began = Instant::now();
         file.write_all_at(buffer, 0)
-            .map_err(|e| io_err("a direct-I/O write", e))?;
+            .map_err(|e| io_err("an uncached write", e))?;
         file.sync_all()
             .map_err(|e| io_err("syncing the probe file", e))?;
         let seconds = began.elapsed().as_secs_f64().max(1e-6);
         let expected = buffer[..sector].to_vec();
         buffer[..sector].fill(0);
         file.read_exact_at(&mut buffer[..sector], 0)
-            .map_err(|e| io_err("a direct-I/O read", e))?;
+            .map_err(|e| io_err("an uncached read", e))?;
         if buffer[..sector] != expected[..] {
-            return Err("a direct-I/O read returned other bytes than were written".into());
+            return Err("an uncached read returned other bytes than were written".into());
         }
         Ok((PROBE_BYTES as f64 / seconds).max(WRITE_RATE_FLOOR))
     })();
@@ -1812,6 +1816,5 @@ pub(crate) fn plan(
     }
 }
 
-/// The tests open files for direct I/O, which only Linux and Android have.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(test)]
 mod tests;

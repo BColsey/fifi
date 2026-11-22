@@ -792,9 +792,11 @@ fn read_stage_costs_probe() {
     for round in 0..3 {
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+            .custom_flags(direct_flag())
             .open(&path)
             .unwrap();
+        #[cfg(target_vendor = "apple")]
+        rustix::fs::fcntl_nocache(&file, true).unwrap();
         let slot = cache.rings[0].acquire().unwrap();
         let t = Instant::now();
         let mut at = 0u64;
@@ -1128,4 +1130,17 @@ fn limited_write_child() {
     assert_eq!(cache.entry_count(), 0);
     let staged = std::fs::read_dir(dir.join("staging")).unwrap().count();
     assert_eq!(staged, 0, "the failed save left a staged file");
+}
+
+/// The open flag for uncached reads where the platform has one; Apple platforms turn caching
+/// off on the descriptor instead.
+fn direct_flag() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        rustix::fs::OFlags::DIRECT.bits() as i32
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0
+    }
 }

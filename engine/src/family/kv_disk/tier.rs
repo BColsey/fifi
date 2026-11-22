@@ -726,7 +726,6 @@ fn rewind(copying: &mut Copying, mut bytes: usize) {
     }
 }
 
-/// The tests open a cache, which needs direct I/O: Linux and Android only.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(test)]
 #[path = "tier_tests.rs"]
 mod tests;
