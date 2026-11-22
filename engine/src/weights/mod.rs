@@ -25,12 +25,17 @@ pub(crate) use gguf_tables::KSIGNS_IQ2XS;
 pub(crate) use gguf_tables::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL,
 };
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use gguf_tables::{IQ1S_GRID_U16, inkling_codebook_words};
 /// The same lattice tables and the packed IQ1_S grid for the Metal expert path, which
 /// uploads them once per model.
-#[cfg(all(feature = "native-mlx", not(feature = "native-cuda")))]
+#[cfg(all(
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(feature = "native-cuda")
+))]
 pub(crate) use gguf_tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID};
-#[cfg(feature = "native-mlx")]
-pub(crate) use gguf_tables::{IQ1S_GRID_U16, inkling_codebook_words};
 mod gguf_identity;
 mod gguf_weights;
 mod header;
