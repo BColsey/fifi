@@ -691,7 +691,7 @@ impl HfHub {
     pub(crate) fn tree(&self, repo: &str, revision: &str) -> Result<Tree, String> {
         let info = self.api_get(&format!(
             "/api/models/{}?revision={}",
-            urlencode(repo),
+            urlencode_path(repo),
             urlencode(revision)
         ))?;
         let commit = info
@@ -722,7 +722,7 @@ impl HfHub {
         let listing = self
             .api_get(&format!(
                 "/api/models/{}/tree/{}?recursive=true",
-                urlencode(repo),
+                urlencode_path(repo),
                 urlencode(revision)
             ))
             .map_err(|error| format!("the file sizes could not be read: {error}"))?;

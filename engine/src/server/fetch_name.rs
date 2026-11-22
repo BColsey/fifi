@@ -97,6 +97,15 @@ pub(crate) fn quant_label(path: &str) -> Option<String> {
     from_name(stem).or_else(|| dir.and_then(from_name))
 }
 
+/// A GGUF file that is not the model's own weights: a vision projector, or the multi-token
+/// prediction head some repos ship beside the model (in the root or an `MTP/` directory), whose
+/// header names another architecture.
+fn is_auxiliary(lower_path: &str) -> bool {
+    lower_path
+        .split('/')
+        .any(|part| part.starts_with("mmproj") || part.starts_with("mtp"))
+}
+
 /// The quantizations a listing holds: every complete GGUF set, projector files and empty files
 /// left out, each with its label. A split set counts only when every shard of it is listed; two
 /// sets with one label (two directories) keep the larger.
@@ -105,7 +114,7 @@ pub(crate) fn quants(files: &[HubFile]) -> Vec<Quant> {
     let mut sets: BTreeMap<(String, String, u32), Vec<(u32, HubFile)>> = BTreeMap::new();
     for file in files {
         let lower = file.path.to_ascii_lowercase();
-        if !lower.ends_with(".gguf") || lower.contains("mmproj") || file.size == 0 {
+        if !lower.ends_with(".gguf") || is_auxiliary(&lower) || file.size == 0 {
             continue;
         }
         let (dir, name) = file.path.rsplit_once('/').unwrap_or(("", &file.path));
@@ -527,6 +536,8 @@ mod tests {
             file("model-Q4_K_M.gguf", 400),
             file("model-Q8_0.gguf", 800),
             file("mmproj-M-F16.gguf", 90),
+            file("MTP/mtp-M-F16.gguf", 80),
+            file("mtp-M.gguf", 70),
             file("README.md", 1),
             file("Q6_K/model-Q6_K-00001-of-00002.gguf", 300),
             file("Q6_K/model-Q6_K-00002-of-00002.gguf", 250),

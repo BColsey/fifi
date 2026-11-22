@@ -123,6 +123,10 @@ fn serve(
         );
         let _ = stream.write_all(body);
     };
+    // The real hub answers 400 to an encoded slash in the repo id.
+    if path.contains("%2F") {
+        return reply(&mut stream, "400 Bad Request", "", b"{}", 2);
+    }
     if path.contains("/resolve/") {
         if stall.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
