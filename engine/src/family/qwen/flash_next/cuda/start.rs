@@ -898,7 +898,7 @@ fn build_driver_resolving(
             )));
         }
         TierChoice::Disk => HostPinPlan::new_disk(&geometry, &memory, &terms, ring_bytes)?,
-        TierChoice::CardTiered { .. } => {
+        TierChoice::CardTiered { .. } | TierChoice::CardDisk { .. } => {
             return Err(EngError::MemoryPlan(
                 "the host ladder answered a card tier to a start that passed no card figures"
                     .into(),

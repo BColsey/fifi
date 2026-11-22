@@ -36,6 +36,10 @@ pub(crate) struct CardFigures {
     pub(crate) tiered_headroom: u64,
     /// Device bytes of one expert slot in one layer.
     pub(crate) slot_bytes: u64,
+    /// The bytes the weights must leave free once they are loaded: what the load takes beyond
+    /// the planned tensors plus the free-after-load floor the start refuses below. The cache,
+    /// the work and the headroom come after that check, so it bounds the weights alone.
+    pub(crate) after_load_floor: u64,
     /// Layers of the model.
     pub(crate) layers: usize,
     /// Experts per layer.
@@ -46,10 +50,17 @@ pub(crate) struct CardFigures {
 
 impl CardFigures {
     /// The bytes the device admission compares to the free bytes.
+    ///
+    /// The larger of the load's own sum (tensors, cache, work, headroom) and the weights plus
+    /// the floor the start checks right after the load: a card that holds the first but not the
+    /// second is short, and the lower rung is taken before any weight is uploaded rather than a
+    /// refusal after it.
     pub(crate) fn needed(&self) -> Option<u64> {
-        [self.kv_cache, self.work, self.headroom]
+        let planned = [self.kv_cache, self.work, self.headroom]
             .into_iter()
-            .try_fold(self.tensors, u64::checked_add)
+            .try_fold(self.tensors, u64::checked_add)?;
+        let after_load = self.tensors.checked_add(self.after_load_floor)?;
+        Some(planned.max(after_load))
     }
 }
 
@@ -64,6 +75,8 @@ pub(crate) struct CardShort {
     pub(crate) free: u64,
     /// Bytes of routed experts the host serves.
     pub(crate) host_bytes: u64,
+    /// Whether the host cannot hold those experts, so they are read from the file on a miss.
+    pub(crate) from_disk: bool,
     /// The most slots per layer the card carries beside the rest of the load, with the tiered
     /// load's headroom kept free (an upper bound the bank sizing may lower).
     #[cfg_attr(
@@ -77,11 +90,19 @@ impl CardShort {
     /// The one start line, printed once the banks exist: `slots` is the count the banks hold
     /// and `context` the context limit the start serves.
     pub(crate) fn line(&self, slots: usize, context: usize) -> String {
+        let experts = if self.from_disk {
+            format!(
+                "experts streamed from disk through the page cache (the host cannot hold their \
+                 {} bytes)",
+                self.host_bytes
+            )
+        } else {
+            format!("experts on host ({} bytes)", self.host_bytes)
+        };
         format!(
             "q36 cuda: card short by {} bytes (needs {} tensors+KV+headroom, has {} free): \
-             serving tiered, {slots} slots/layer on card, experts on host ({} bytes), context \
-             {context}",
-            self.short_by, self.needed, self.free, self.host_bytes
+             serving tiered, {slots} slots/layer on card, {experts}, context {context}",
+            self.short_by, self.needed, self.free
         )
     }
 }
@@ -130,6 +151,15 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
             needed,
             free: figures.free,
             host_bytes,
+            from_disk: false,
+            slots,
+        }),
+        Ok(TierChoice::CardDisk { slots }) => CardVerdict::Short(CardShort {
+            short_by: needed.saturating_sub(figures.free),
+            needed,
+            free: figures.free,
+            host_bytes: figures.expert_bytes,
+            from_disk: true,
             slots,
         }),
         Ok(_) => CardVerdict::Fits,
@@ -189,6 +219,7 @@ mod tests {
             headroom: GIB,
             tiered_headroom: GIB,
             slot_bytes: 1_769_472,
+            after_load_floor: 0,
             layers: 40,
             experts: 256,
             top_k: 8,
@@ -266,15 +297,74 @@ mod tests {
     }
 
     #[test]
-    fn a_host_without_room_for_the_experts_names_both_figures() {
+    fn a_host_without_room_for_the_experts_streams_them_from_disk() {
         match decide(&figures(5_805_441_024), 10 * GIB) {
+            CardVerdict::Short(short) => {
+                assert!(short.from_disk);
+                assert_eq!(short.host_bytes, 18_900_000_000);
+                let line = short.line(40, 32_768);
+                assert!(line.contains("streamed from disk"), "{line}");
+                assert!(line.contains("18900000000 bytes"), "{line}");
+            }
+            other => panic!("expected the disk rung, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_host_without_room_for_its_own_overhead_names_both_figures() {
+        match decide(&figures(5_805_441_024), HOST_OVERHEAD_BYTES - 1) {
             CardVerdict::Refused { line } => {
                 assert!(line.contains("card short by 16347965952 bytes"), "{line}");
-                assert!(line.contains("10737418240"), "{line}");
+                assert!(line.contains("1073741823"), "{line}");
                 assert!(line.contains("18900000000 expert bytes"), "{line}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+        assert!(matches!(
+            decide(&figures(5_805_441_024), HOST_OVERHEAD_BYTES),
+            CardVerdict::Short(_)
+        ));
+    }
+
+    /// A card that holds the load's own sum but not the weights plus the floor the start checks
+    /// right after the load is short: the lower rung is taken before any upload, never a refusal
+    /// after it. The measured start (Q4_K_M, 21.6 GB free) planned a 9,216-cell int8 cache and
+    /// the load then refused with 909,967,360 bytes free against the 1 GiB floor.
+    #[test]
+    fn a_card_that_leaves_the_weights_below_the_floor_is_short_at_any_context() {
+        let floor = crate::family::mem::DEVICE.load_unplanned + GIB;
+        let at = |free: u64| CardFigures {
+            after_load_floor: floor,
+            kv_cache: 9_216 * 24_576,
+            headroom: 256 << 20,
+            ..figures(free)
+        };
+        let weights = 20_408_576_512u64;
+        // The floor binds: the weights, the load's unplanned bytes and the floor, not the sum.
+        assert_eq!(at(0).needed(), Some(weights + floor));
+        // Exactly enough carries the whole load; one byte under is short.
+        assert_eq!(decide(&at(weights + floor), 64 * GIB), CardVerdict::Fits);
+        for free in [21_600_468_992, 21_300_000_000] {
+            match decide(&at(free), 64 * GIB) {
+                CardVerdict::Short(short) => {
+                    assert_eq!(short.needed, weights + floor, "{free}");
+                    assert_eq!(short.short_by, weights + floor - free, "{free}");
+                    assert!(!short.from_disk, "{free}");
+                }
+                other => panic!("{free}: expected the lower rung, got {other:?}"),
+            }
+        }
+        // Without the floor term the same card would have been called a fit.
+        assert_eq!(
+            decide(
+                &CardFigures {
+                    after_load_floor: 0,
+                    ..at(21_600_468_992)
+                },
+                64 * GIB
+            ),
+            CardVerdict::Fits
+        );
     }
 
     #[test]

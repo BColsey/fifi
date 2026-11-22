@@ -1358,6 +1358,7 @@ fn lower_rung(
         // headroom, so the ladder promises slots against that one.
         tiered_headroom: prefill_headroom(false) as u64,
         slot_bytes: bank_slot_bytes(geometry)?,
+        after_load_floor: after_load_floor()?,
         layers: dims.shape.kinds.len(),
         experts: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
@@ -1492,6 +1493,21 @@ fn prefill_admits_of<'a>(
     })
 }
 
+/// Whether `free` bytes hold `weights` and still leave `floor` free after the load.
+fn weights_leave_the_floor(free: u64, weights: u64, floor: u64) -> bool {
+    free >= weights.saturating_add(floor)
+}
+
+/// The bytes the weights must leave free once they are loaded: what the load takes beyond the
+/// planned tensors, plus the free-after-load floor the start refuses below. The cache, the work
+/// and the headroom come after that check, so no context changes it.
+fn after_load_floor() -> Result<u64, EngError> {
+    let floor = u64::try_from(min_free_after_load()?).unwrap_or(u64::MAX);
+    Ok(crate::family::mem::DEVICE
+        .load_unplanned
+        .saturating_add(floor))
+}
+
 /// Asks the card fit again with no prefill gate: whether a fit exists at all. A fit that exists
 /// without the gate and not with it means the card holds the weights and a cache but leaves no
 /// room for a prefill arena at any context, which the start refuses by name.
@@ -1532,6 +1548,11 @@ fn card_fit(
     }
     let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    // A card that leaves the weights below the free-after-load floor holds no context: the lower
+    // rung decides, before anything is uploaded (the same figure it is asked with).
+    if !weights_leave_the_floor(free, weights, after_load_floor()?) {
+        return Ok(None);
+    }
     let ask = CudaFitAsk {
         free,
         weights,
@@ -1594,6 +1615,9 @@ fn replan_smaller(
     }
     let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    if !weights_leave_the_floor(free, weights, after_load_floor()?) {
+        return Ok(None);
+    }
     let Some(fit) = choose_cuda_fit(
         &settings.spec,
         CudaFitAsk {
@@ -2077,6 +2101,29 @@ fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Re
         step.enable_disk_tier(&resolved, origin);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod after_load_floor_tests {
+    use super::*;
+
+    /// The measured start: Q4_K_M weights on a card with 21.6 GB free planned a 9,216-cell int8
+    /// cache and the load then refused with 909,967,360 bytes free against the 1 GiB floor. The
+    /// fit now sees that the weights alone leave less than the floor, at that level and one step
+    /// below, and answers the lower rung before any upload.
+    #[test]
+    fn the_weights_alone_below_the_floor_leave_no_context() {
+        let weights = 20_408_576_512u64;
+        let floor = crate::family::mem::DEVICE.load_unplanned + (1 << 30);
+        assert!(!weights_leave_the_floor(21_600_468_992, weights, floor));
+        assert!(!weights_leave_the_floor(21_300_000_000, weights, floor));
+        assert!(weights_leave_the_floor(weights + floor, weights, floor));
+        assert!(!weights_leave_the_floor(
+            weights + floor - 1,
+            weights,
+            floor
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -17,8 +17,11 @@
 //! whole load fits the free device bytes the ladder answers exactly as it
 //! does without one; when it does not, the ladder answers
 //! [`TierChoice::CardTiered`] (the routed experts stay on the host, the
-//! banks take what the card has left) or refuses, naming the side that
-//! cannot carry its share.
+//! banks take what the card has left); when the host cannot hold the
+//! experts either, [`TierChoice::CardDisk`] (the experts are read from the
+//! file on a miss); it refuses, naming the side that cannot carry its
+//! share, only when the card cannot hold the minimum banks or the host
+//! cannot carry its fixed overhead.
 
 // Ungated host code, but until a second family's start calls the ladder only tests do; the
 // flash-next start reaches it through `HostPinPlan::choose_store_tier` on the CUDA path.
@@ -40,6 +43,11 @@ pub(crate) enum TierChoice {
     /// host (`host_bytes` of them) and each layer keeps at most `slots`
     /// experts on the card.
     CardTiered { slots: usize, host_bytes: u64 },
+    /// The card cannot carry the whole load and the host cannot hold the experts either: the
+    /// experts stay in the file, each layer keeps at most `slots` experts on the card, and a
+    /// miss reads the expert through the page cache from disk. Slower than [`Self::CardTiered`],
+    /// never a refusal while the host carries its fixed overhead.
+    CardDisk { slots: usize },
 }
 
 /// The pooled read depth of the staging ring: how many expert records are in
@@ -73,6 +81,11 @@ impl TierChoice {
             Self::CardTiered { .. } => (
                 "card-tiered experts",
                 "experts on the host, the hottest in per-layer slots on the card",
+            ),
+            Self::CardDisk { .. } => (
+                "card-tiered experts streamed from disk",
+                "experts read from the file through the page cache on a miss, the hottest in \
+                 per-layer slots on the card",
             ),
         }
     }
@@ -211,10 +224,19 @@ impl TierBudget {
             .and_then(|need| need.checked_add(self.cache_floor))
             .ok_or_else(overflow)?;
         if host_need > self.available {
+            // The host cannot hold the experts: they are read from the file on a miss, which
+            // needs only the host's fixed overhead and page-cache floor.
+            let streaming_need = self
+                .overhead_bytes
+                .checked_add(self.cache_floor)
+                .ok_or_else(overflow)?;
+            if streaming_need <= self.available {
+                return Ok(TierChoice::CardDisk { slots: carried });
+            }
             return Err(tier_error(format!(
-                "the card is short by {} bytes and the host budget of {} bytes cannot hold the {} \
-                 expert bytes it would serve beside {} of fixed overhead and a {} byte page-cache \
-                 floor",
+                "the card is short by {} bytes and the host budget of {} bytes cannot hold \
+                 the {} expert bytes it would serve, nor stream them from disk beside {} of \
+                 fixed overhead and a {} byte page-cache floor",
                 card.short_by(),
                 self.available,
                 card.expert_bytes,
@@ -450,22 +472,28 @@ mod tests {
     }
 
     #[test]
-    fn a_host_that_cannot_hold_the_experts_refuses_by_name() {
-        // 700 + 50 + 10 = 760 is the host's need; 759 refuses, 760 serves.
+    fn a_host_that_cannot_hold_the_experts_streams_them_from_disk() {
+        // 700 + 50 + 10 = 760 is the host's need to hold the experts: 759 streams them from
+        // the file with the 50 of overhead and 10 of page-cache floor, 760 holds them.
         let mut short = card_budget(500);
         short.available = 759;
-        let error = choose_tier(&short).unwrap_err();
-        let text = error.describe();
-        assert!(text.contains("short by 500 bytes"), "{text}");
-        assert!(text.contains("759"), "{text}");
-        assert!(text.contains("700 expert bytes"), "{text}");
-        assert!(text.contains("50 of fixed overhead"), "{text}");
+        assert_eq!(choose_tier(&short), Ok(TierChoice::CardDisk { slots: 10 }));
         let mut exact = card_budget(500);
         exact.available = 760;
         assert!(matches!(
             choose_tier(&exact),
             Ok(TierChoice::CardTiered { .. })
         ));
+        // The minimum is the fixed overhead and the floor: 60 streams, 59 refuses by name.
+        let mut least = card_budget(500);
+        least.available = 60;
+        assert_eq!(choose_tier(&least), Ok(TierChoice::CardDisk { slots: 10 }));
+        least.available = 59;
+        let text = choose_tier(&least).unwrap_err().describe();
+        assert!(text.contains("short by 500 bytes"), "{text}");
+        assert!(text.contains("59"), "{text}");
+        assert!(text.contains("700 expert bytes"), "{text}");
+        assert!(text.contains("stream them from disk"), "{text}");
     }
 
     #[test]

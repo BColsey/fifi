@@ -135,6 +135,10 @@ pub(crate) struct PooledSessions<E: PartHost> {
     share: usize,
     max_seqs: usize,
     sizing: Sizing,
+    /// Whether the step cannot host more than one session (tiered experts and the like keep
+    /// state outside a session's part) and a start that named no count serves its one session
+    /// over the step's own planes instead of refusing. No part is ever built or swapped.
+    single: bool,
     /// Whether the last session request found the pool empty and said so.
     waiting: std::cell::Cell<bool>,
     /// The ids that end generation, and the sampler's vocabulary: the window's limits.
@@ -154,9 +158,41 @@ impl<E: PartHost> PooledSessions<E> {
         max_seqs: usize,
         sizing: Sizing,
     ) -> Result<(Self, PooledSession<E::Part>)> {
-        step.check_sessions()?;
+        // A start that named no session count and whose step cannot host sessions serves one
+        // session; a named count above one is refused by the step, as it asked for more.
+        let single = sizing == Sizing::WholePool && step.check_sessions().is_err();
+        if !single {
+            step.check_sessions()?;
+        }
         let ceiling = step.context_cells();
         let pool = CellPool::new(ceiling);
+        if single {
+            let lease = pool.lease_for(ceiling, ceiling)?;
+            let slot = Rc::new(SeqSlot {
+                inner: RefCell::new(SlotInner { part: None, lease }),
+            });
+            eprintln!(
+                "{}: sessions: this step serves one session ({} cells); a start that names \
+                 max_seqs above one needs the plain resident step",
+                E::LABEL,
+                pool.total()
+            );
+            let this = Self {
+                idle: None,
+                resident: Some(Rc::clone(&slot)),
+                pool,
+                ceiling,
+                share: ceiling,
+                max_seqs: 1,
+                sizing,
+                single: true,
+                waiting: std::cell::Cell::new(false),
+                eos: step.eos_ids(),
+                sampler_vocab: step.sampler_vocab(),
+                step,
+            };
+            return Ok((this, PooledSession { core, slot }));
+        }
         let initial = INITIAL_CELLS.min(ceiling);
         let share = even_share(ceiling, max_seqs);
         let small = step.part_bytes_at(initial);
@@ -207,6 +243,7 @@ impl<E: PartHost> PooledSessions<E> {
             share,
             max_seqs,
             sizing,
+            single: false,
             waiting: std::cell::Cell::new(false),
             eos: step.eos_ids(),
             sampler_vocab: step.sampler_vocab(),
@@ -262,6 +299,10 @@ impl<E: PartHost> PooledSessions<E> {
         let Some(left) = self.resident.take() else {
             return;
         };
+        if self.single {
+            // The step's own planes are the session's: nothing to swap back.
+            return;
+        }
         let mut idle = self.idle.take().expect("the idle part is present");
         self.step.swap_part(&mut idle);
         left.inner.borrow_mut().part = Some(idle);
@@ -270,6 +311,10 @@ impl<E: PartHost> PooledSessions<E> {
     /// Sizes the session's planes to `cells`: the old planes go to the card before the new ones
     /// are allocated, and the new planes start zeroed with no captured graph.
     fn resize(&mut self, session: &mut PooledSession<E::Part>, cells: usize) -> Result<()> {
+        if self.single {
+            // The one session holds the whole pool, whatever the request.
+            return Ok(());
+        }
         let resident = self
             .resident
             .as_ref()
@@ -322,6 +367,9 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
 
     /// The pool must hold a first lease, and the device must hold the planes with room to spare.
     fn can_admit_session(&self) -> bool {
+        if self.single {
+            return self.orphaned();
+        }
         // A dropped session's cells come back at the next admission.
         if self.pool.free() < INITIAL_CELLS && !self.orphaned() {
             return false;
@@ -343,6 +391,24 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
 
     fn new_session(&mut self) -> Result<PooledSession<E::Part>> {
         self.reclaim();
+        if self.single {
+            // The step runs one session: a dropped one hands its planes to the next.
+            if self.resident.is_some() {
+                return Err(EngError::MemoryPlan(format!(
+                    "{}: this step serves one session and it is busy",
+                    E::LABEL
+                )));
+            }
+            let lease = self.pool.lease_for(self.ceiling, self.ceiling)?;
+            let slot = Rc::new(SeqSlot {
+                inner: RefCell::new(SlotInner { part: None, lease }),
+            });
+            self.resident = Some(Rc::clone(&slot));
+            return Ok(PooledSession {
+                core: DecodeSession::default(),
+                slot,
+            });
+        }
         let cells = INITIAL_CELLS.min(self.ceiling);
         let lease = match self.pool.lease_for(cells, self.ceiling) {
             Ok(lease) => lease,
@@ -733,6 +799,8 @@ mod tests {
 
     /// A host with no device: the step runs one part, and a batched step draws `next_of`.
     struct Fake {
+        /// Whether the step refuses to host sessions, as a tiered-experts step does.
+        refuses: bool,
         running: FakePart,
         /// The cells of the parts of each batched step.
         batches: Vec<Vec<usize>>,
@@ -803,6 +871,11 @@ mod tests {
         const LABEL: &'static str = "fake";
 
         fn check_sessions(&self) -> Result<()> {
+            if self.refuses {
+                return Err(EngError::BadRequest(
+                    "the fake step refuses sessions".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -885,6 +958,7 @@ mod tests {
     fn engine(max_seqs: usize, sizing: Sizing) -> (Engine, Session) {
         PooledSessions::new(
             Fake {
+                refuses: false,
                 running: FakePart {
                     cells: POOL,
                     fed: 0,
@@ -898,6 +972,24 @@ mod tests {
             sizing,
         )
         .expect("sessions")
+    }
+
+    fn refusing(max_seqs: usize, sizing: Sizing) -> Result<(Engine, Session)> {
+        PooledSessions::new(
+            Fake {
+                refuses: true,
+                running: FakePart {
+                    cells: POOL,
+                    fed: 0,
+                },
+                batches: Vec::new(),
+                fail_save_on: None,
+                saves: 0,
+            },
+            DecodeSession::default(),
+            max_seqs,
+            sizing,
+        )
     }
 
     /// A session of the engine that has consumed `prompt`, leaving its last token pending.
@@ -1132,5 +1224,46 @@ mod tests {
                 "{batch:?}"
             );
         }
+    }
+
+    /// A start that named no session count and whose step cannot host sessions (tiered experts)
+    /// serves its one session over the step's own planes: the executor builds, serves one request
+    /// with the whole pool, and says busy to a second one.
+    #[test]
+    fn a_step_that_cannot_host_sessions_serves_one_for_a_start_that_named_no_count() {
+        let (mut sessions, mut first) = refusing(8, Sizing::WholePool).expect("one session");
+        assert_eq!(sessions.max_seqs(), 1);
+        sessions
+            .reset_for_request(&mut first, 100, None, false)
+            .expect("the one session takes the pool");
+        assert_eq!(sessions.step.context_cells(), POOL);
+        assert!(!sessions.can_admit_session());
+        assert!(matches!(
+            sessions.new_session(),
+            Err(EngError::MemoryPlan(_))
+        ));
+    }
+
+    /// The worker drops a session whose setup failed and asks for another: the planes pass on.
+    #[test]
+    fn a_dropped_one_session_hands_its_planes_to_the_next() {
+        let (mut sessions, first) = refusing(8, Sizing::WholePool).expect("one session");
+        drop(first);
+        assert!(sessions.can_admit_session());
+        let mut next = sessions.new_session().expect("the planes pass on");
+        sessions
+            .reset_for_request(&mut next, 100, None, false)
+            .expect("and serve a request");
+        assert_eq!(sessions.step.context_cells(), POOL);
+        assert_eq!(sessions.pool.free(), 0);
+    }
+
+    /// A start that named more than one session asked for what the step cannot do: it is refused.
+    #[test]
+    fn a_named_session_count_on_a_step_that_cannot_host_sessions_is_refused() {
+        assert!(matches!(
+            refusing(4, Sizing::EvenShare),
+            Err(EngError::BadRequest(_))
+        ));
     }
 }
