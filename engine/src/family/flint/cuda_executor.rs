@@ -6,7 +6,7 @@ use super::prefill_order::{
 };
 use super::{
     budget::{
-        ALLOC_CACHE_VAR, FLINT_HEADROOM_BYTES, MODEL_CONTEXT_LIMIT, bank_note,
+        ALLOC_CACHE_VAR, FLINT_HEADROOM_BYTES, MODEL_CONTEXT_LIMIT, budget_note,
         work_reserve_closed_form,
     },
     cpu_moe::{self, CpuMoeConfig},
@@ -782,7 +782,7 @@ impl FlintExecutor {
             },
         );
         if let Some((slots, reason)) = model.banked_experts().zip(model.bank_reason()) {
-            eprintln!("{}", bank_note(options.context_limit, slots, reason));
+            eprintln!("{}", budget_note(options.context_limit, slots, reason));
         }
         if let Some(moe) = cpu_moe::active() {
             eprintln!("{}", moe.describe());
@@ -1296,15 +1296,17 @@ mod resident_advice_tests {
 
     #[test]
     fn the_startup_note_says_why_the_bank_is_on() {
-        let auto = bank_note(131_072, 224, "auto");
+        let auto = budget_note(131_072, 224, "auto");
         assert!(
             auto.contains("context 131072 does not fit with every expert on the GPU"),
             "{auto}"
         );
         assert!(auto.contains("224 of 256 experts per layer"), "{auto}");
         assert!(auto.contains("FIFI_FLINT_CUDA_EXPERT_CACHE=0"), "{auto}");
-        assert!(bank_note(4096, 256 - 8, "forced").contains("CACHE=1 asks for the host buffer"));
-        assert!(bank_note(4096, 192, "override").contains("EXPERT_SLOTS asks for a smaller bank"));
+        assert!(budget_note(4096, 256 - 8, "forced").contains("CACHE=1 asks for the host buffer"));
+        assert!(
+            budget_note(4096, 192, "override").contains("EXPERT_SLOTS asks for a smaller bank")
+        );
     }
 
     #[test]

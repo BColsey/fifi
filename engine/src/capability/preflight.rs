@@ -1704,7 +1704,7 @@ fn flint_estimate(
             name: "expert_placement".to_string(),
             chosen: format!(
                 "bank: {slots} of 256 experts per layer on the GPU, all 256 in pinned host memory ({}{})",
-                budget::bank_note(options.context_limit, slots, reason.as_str()),
+                budget::budget_note(options.context_limit, slots, reason.as_str()),
                 if lowered {
                     "; lowered from 256 so the pinned host store exists"
                 } else {
