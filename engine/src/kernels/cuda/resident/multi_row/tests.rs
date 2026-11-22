@@ -1154,6 +1154,7 @@ fn rows_of_different_cells_are_the_bytes_of_single_row_launches() {
                         cells: CELLS,
                         code_scale: Kv8CodeScale::StoredHalf,
                         ring: 0,
+                        window: 0,
                     },
                     k: k.range(0, n * kv_bytes).unwrap(),
                     v: v.range(0, n * kv_bytes).unwrap(),
@@ -1194,6 +1195,7 @@ fn rows_of_different_cells_are_the_bytes_of_single_row_launches() {
                 cells: cells[r],
                 code_scale: Kv8CodeScale::StoredHalf,
                 ring: 0,
+                window: 0,
             };
             let (codes, scales) = (
                 N_KV * cells[r] * head_dim,

@@ -77,6 +77,28 @@ pub(crate) fn bolt_ring_bytes(rows: usize) -> Option<u64> {
     Some(total)
 }
 
+/// The bytes of a prefix snapshot of `fed` positions: every position of the full-attention layers
+/// and the last `sliding_window` positions of the sliding layers. The budget tests and the
+/// snapshot device test read it; nothing sizes by it at start yet.
+#[cfg(test)]
+pub(crate) fn bolt_snapshot_bytes(fed: usize) -> Option<u64> {
+    let spec = NEMOTRON_BOLT_E4B;
+    let fed = u64::try_from(fed).ok()?;
+    let kept = fed.min(u64::from(spec.sliding_window));
+    let mut total = 0u64;
+    for &kind in physical_kinds() {
+        let positions = if kind == AttentionKind::Full {
+            fed
+        } else {
+            kept
+        };
+        total = total.checked_add(
+            positions.checked_mul(kv8_layer_bytes(spec.heads_kv, layer_head(kind))?)?,
+        )?;
+    }
+    Some(total)
+}
+
 /// The bytes of the sliding layers' kept window in a prefix snapshot: the last `sliding_window`
 /// positions of every sliding layer.
 pub(crate) fn bolt_window_snapshot_bytes() -> Option<u64> {
@@ -214,6 +236,23 @@ mod tests {
         // The one formula: the ring a layer is built with is the one the budget charges.
         let ring = NEMOTRON_BOLT_E4B.kv_ring(AttentionKind::Sliding, 64);
         assert_eq!(ring.cells(usize::MAX), 575);
+    }
+
+    #[test]
+    fn a_snapshot_costs_every_full_position_and_one_window_of_the_sliding_layers() {
+        // Short of the window every layer keeps all its positions.
+        assert_eq!(bolt_snapshot_bytes(100), Some(100 * 30_464));
+        assert_eq!(bolt_snapshot_bytes(512), Some(512 * 30_464));
+        // Past it the sliding layers stop growing: the window plus the full layers' positions.
+        let window = bolt_window_snapshot_bytes().expect("window bytes");
+        for fed in [513usize, 2_000, 32_768] {
+            assert_eq!(
+                bolt_snapshot_bytes(fed),
+                Some(fed as u64 * bolt_kv_bytes_per_position().expect("per position") + window),
+                "fed {fed}"
+            );
+        }
+        assert_eq!(bolt_snapshot_bytes(0), Some(0));
     }
 
     #[test]

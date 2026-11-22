@@ -64,8 +64,9 @@ pub(crate) struct Kv8Shape {
     pub(crate) head_dim: usize,
     pub(crate) cells: usize,
     pub(crate) code_scale: Kv8CodeScale,
-    /// 0: cell = position. R > 0: position p goes to cell p % R (`rows <= R <= cells`), the cache
-    /// of a sliding layer; `pos` is then bounded by the position range, not by `cells`.
+    /// 0: cell = position. R > 0: position p goes to cell p % R, the cache of a sliding layer
+    /// (`window + rows - 1 <= R <= cells` when `window` is known, else `rows <= R <= cells`);
+    /// `pos` is then bounded by the position range, not by `cells`.
     pub(crate) ring: usize,
     /// The positions a query reaches in a ring's layer, 0 when unknown (a linear plane, or a
     /// caller that checks the margin itself). With a window the launch refuses an append wider
@@ -228,7 +229,7 @@ fn check_shape(tag: &str, shape: &Kv8Shape, max_rows: usize) -> Result<Kv8Ints, 
                 "ring is {} with window {} and {rows} rows, not 0 or {} to cells {}",
                 shape.ring,
                 shape.window,
-                shape.window.max(1) + shape.rows - 1,
+                shape.window.max(1).saturating_add(shape.rows) - 1,
                 shape.cells,
                 rows = shape.rows
             ),

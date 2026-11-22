@@ -152,14 +152,15 @@ mod device {
     pub(crate) struct BoltServe {
         model: Bolt,
         eos: Vec<u32>,
-        /// Prefix store with no roots and one entry for each session the host funds. An entry is a copy of the saving
-        /// session's cache cells below its position, held in host memory: a restore writes it
-        /// into any session, so reuse works whatever the number of sessions and whichever
-        /// pooled session serves the next request. Host memory, not a device slab, because the
-        /// device memory belongs to the sessions' planes: an entry is at most one session's
-        /// cache (952 MiB at 32,768 cells, 30,464 bytes a position) and costs a transfer over
-        /// the bus (about 125 MB for a 4,000-token prefix), where recomputing the prefix costs
-        /// its whole prefill.
+        /// Prefix store with no roots and one entry for each session the host funds. An entry is a
+        /// copy of the saving session's cache below its position, held in host memory: every
+        /// position of the full-attention layers and the last window of the sliding layers. A
+        /// restore writes it into any session, so reuse works whatever the number of sessions and
+        /// whichever pooled session serves the next request. Host memory, not a device slab,
+        /// because the device memory belongs to the sessions' planes: an entry is at most one
+        /// session's kept cache (283 MiB at 32,768 positions: 8,704 bytes a position and the
+        /// 10.6 MiB window) and costs a transfer over the bus (about 46 MB for a 4,000-token
+        /// prefix), where recomputing the prefix costs its whole prefill.
         prefix: PrefixStore<BoltSnapshot, PrefixIdentity>,
         /// The load-time identity half of the prefix path: constant for one loaded Bolt, so
         /// live behaviour is unchanged; a persisted or cross-step store refuses entries another

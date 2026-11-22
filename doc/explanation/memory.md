@@ -53,7 +53,7 @@ The engine also wants 1 GiB of free host memory beyond the pool; when that is sh
 
 ## Bolt
 
-Bolt keeps saved prefixes in host memory. A saved prefix is a copy of the cache cells of one session below its position: 30,464 bytes a position, so up to 952 MiB at the 32,768-position context and about 125 MB for a 4,000-token prompt. Restoring one writes it back into whichever session serves the next request.
+Bolt keeps saved prefixes in host memory. A saved prefix is a copy of the cache of one session below its position: the four full-attention layers keep every position (8,704 bytes a position) and the twenty sliding layers keep their last 512 positions (10.6 MiB in all), so a prefix of 32,768 positions takes about 283 MiB and one of 4,000 tokens about 46 MB. Restoring one writes it back into whichever session serves the next request.
 
 Startup keeps one saved prefix for each session the engine serves at once, as many as the host's byte budget for saved prefixes holds. The budget is the machine's memory less the OS floor and less the memory the process already holds; the disk tier writes the oldest saved prefixes to disk when the store grows past it. Every save also checks the memory that is free now: the copy must fit above the OS floor (inside a cgroup limit, within what the cgroup has left), or the save is skipped and the next turn processes its prompt whole. A host that is busy at startup keeps the store and starts saving once the memory frees up; a host that tightens later stops saving.
 

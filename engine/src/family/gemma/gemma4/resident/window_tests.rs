@@ -678,3 +678,75 @@ fn a_sequence_grown_inside_a_window_leaves_every_row_as_its_solo_run() {
         "the other small session never grew"
     );
 }
+
+/// A window of sessions that has gone past the sliding layers' ring gives, at every step and bit
+/// for bit, the logits of the same window of sessions that keep every position in linear planes.
+/// Windows are the default decode at four or more sessions, and the other window test never
+/// writes a ring cell twice: here the prompts run past the ring's 519 cells (fed 700, 530, 900
+/// and 1,100 positions), so every row's append wraps, with windows of four, two and three rows
+/// and sessions that join and leave.
+#[test]
+#[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
+fn a_window_past_the_ring_equals_the_linear_control_window() {
+    let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
+    let file = crate::family::gguf_select::GgufFile {
+        path: std::path::PathBuf::from(&path),
+        bytes: std::fs::metadata(&path).expect("the Bolt file").len(),
+    };
+    let mut model = super::bolt::load_choosing(
+        &[file],
+        crate::family::gemma::gemma4::config::MaxSeqs::Count(4),
+        &|_| {},
+    )
+    .expect("load");
+    model.reserve_window(4).expect("window buffers");
+    let lengths = [700usize, 530, 900, 1_100];
+    let ring: Vec<_> = (0..4)
+        .map(|_| model.new_seq_cells(1_536).expect("ring session"))
+        .collect();
+    model.set_linear_local_layers(true);
+    let linear: Vec<_> = (0..4)
+        .map(|_| model.new_seq_cells(1_536).expect("linear session"))
+        .collect();
+    model.set_linear_local_layers(false);
+    let prompts: Vec<Vec<u32>> = (0..4).map(|slot| prompt_of(slot, lengths[slot])).collect();
+    for slot in 0..4 {
+        prefill(&mut model, &ring[slot], &prompts[slot]);
+        prefill(&mut model, &linear[slot], &prompts[slot]);
+    }
+    let mut token: Vec<u32> = prompts.iter().map(|p| *p.last().expect("prompt")).collect();
+    let mut at: Vec<usize> = prompts.iter().map(|p| p.len() - 1).collect();
+    // Which sessions are live at each step: four for twenty steps, then two, then three.
+    let schedule: Vec<Vec<usize>> = (0..20)
+        .map(|_| vec![0, 1, 2, 3])
+        .chain((0..6).map(|_| vec![0, 2]))
+        .chain((0..6).map(|_| vec![1, 2, 3]))
+        .collect();
+    for (step, live) in schedule.iter().enumerate() {
+        let tokens: Vec<u32> = live.iter().map(|&slot| token[slot]).collect();
+        let positions: Vec<usize> = live.iter().map(|&slot| at[slot]).collect();
+        let ring_refs: Vec<&super::bolt::BoltSeq> = live.iter().map(|&slot| &ring[slot]).collect();
+        let linear_refs: Vec<&super::bolt::BoltSeq> =
+            live.iter().map(|&slot| &linear[slot]).collect();
+        let got = model
+            .decode_rows(&ring_refs, &tokens, &positions)
+            .expect("ring window");
+        let want = model
+            .decode_rows(&linear_refs, &tokens, &positions)
+            .expect("linear window");
+        for (index, &slot) in live.iter().enumerate() {
+            assert_eq!(
+                bits(&got[index]),
+                bits(&want[index]),
+                "step {step} slot {slot} at position {}",
+                at[slot]
+            );
+            token[slot] = argmax(&got[index]);
+            at[slot] += 1;
+        }
+    }
+    assert!(
+        at.iter().all(|&position| position > 519 + 20),
+        "every row wrapped the ring"
+    );
+}

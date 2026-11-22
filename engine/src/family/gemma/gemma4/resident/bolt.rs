@@ -15,8 +15,9 @@
 //! projection and the logit softcap.
 //!
 //! Limits:
-//! - The cache holds the planned number of cells per physical layer (up to the model's 65,536
-//!   maximum positions), chosen from the free card at load.
+//! - The four full-attention layers hold the planned number of cells (up to the model's 65,536
+//!   maximum positions), chosen from the free card at load; each sliding layer holds a ring of
+//!   the window plus one prefill chunk, whatever the context.
 //! - Prefill runs bounded batches through the batched step.
 //! - The per-head RMSNorm runs one batched launch across heads.
 //! - Shared layers rotate one scratch k row, because the rope kernel requires
@@ -290,10 +291,12 @@ pub(crate) struct BoltSeq {
     step: DeviceBuffer,
 }
 
-/// A copy of the cache cells of one sequence below a position, in host memory. The planes of the
-/// 24 physical layers are stored layer by layer, plane by plane (k codes, k scales, v codes,
-/// v scales) and kv head by kv head, each as the cells `0..fed` of that head, so an entry holds
-/// `fed` times the cost of one position. It restores into any sequence.
+/// A copy of the cache of one sequence below a position, in host memory. The planes of the 24
+/// physical layers are stored layer by layer, plane by plane (k codes, k scales, v codes, v
+/// scales) and kv head by kv head, each head's kept positions in position order: `0..fed` for a
+/// full-attention layer, the last window for a sliding layer. An entry holds `fed` times the cost
+/// of one full-attention position plus one window of the sliding layers. It restores into any
+/// sequence, whatever its ring.
 pub(crate) struct BoltSnapshot {
     fed: usize,
     /// Shared so the disk tier can read it in chunks while the store still owns the entry.
@@ -516,8 +519,7 @@ fn cell_figures(splits: Option<usize>, wide: bool, rows: usize) -> Result<CellFi
         (
             super::super::budget::BOLT_HEADROOM_BYTES,
             super::super::budget::BOLT_SEQ_FIXED_BYTES
-                .checked_add(super::super::budget::bolt_ring_bytes(rows).unwrap_or(u64::MAX))
-                .unwrap_or(u64::MAX),
+                .saturating_add(super::super::budget::bolt_ring_bytes(rows).unwrap_or(u64::MAX)),
         ),
     )
     .ok_or_else(|| EngError::MemoryPlan("the Bolt cell figures overflow".into()))
@@ -1235,11 +1237,11 @@ impl Bolt {
             .collect()
     }
 
-    /// Copies the cells `0..fed` of every plane of `seq` into host memory. The copy is what a
-    /// later request restores into any sequence, so it holds at most one sequence's cache
-    /// (`cells` positions) and is allocated only for the cells it covers; a host whose available
-    /// memory (less the OS floor) cannot hold it refuses with a memory-plan error and nothing
-    /// is stored.
+    /// Copies the kept positions of every plane of `seq` into host memory: `0..fed` of a
+    /// full-attention layer, the last window of a sliding layer (read out of its ring cells, in
+    /// position order). The copy is what a later request restores into any sequence, so it is
+    /// allocated only for the positions it covers; a host whose available memory (less the OS
+    /// floor) cannot hold it refuses with a memory-plan error and nothing is stored.
     pub(crate) fn snapshot_seq(&self, seq: &BoltSeq, fed: usize) -> Result<BoltSnapshot, EngError> {
         if fed > seq.cells {
             return Err(EngError::ContextLimit(
@@ -1289,8 +1291,10 @@ impl Bolt {
         Ok(BoltSnapshot::from_parts(fed, data))
     }
 
-    /// Writes a snapshot into `seq`: the cells `0..fed` of every plane. The cells above are left
-    /// as they are, which is safe because the position word bounds every read.
+    /// Writes a snapshot into `seq`: the positions `0..fed` of a full-attention layer and the last
+    /// window of a sliding layer, each into the cell its geometry gives (a ring cell is
+    /// `position % ring`). The cells above are left as they are, which is safe because the
+    /// position word bounds every read.
     pub(crate) fn restore_seq(
         &self,
         seq: &BoltSeq,
@@ -2105,108 +2109,111 @@ impl Bolt {
             };
         // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
         // row sits at cell `first`.
-        let group =
-            |seq: &BoltSeq, row: usize, count: usize, first: usize| -> Result<(), EngError> {
-                let own = seq.kv[source]
-                    .as_ref()
-                    .expect("the shared-KV source layer is physical");
-                // One chunk is appended whole before it is attended, so a sliding layer's ring
-                // must hold the window plus the chunk: a wider chunk would overwrite cells its own
-                // first rows still read. The ring is sized from `rows`, the widest chunk
-                // `prefill_batch` takes, so this refuses a caller that bypassed that limit.
-                if !own.geometry.admits(count) {
-                    return Err(EngError::BadRequest(format!(
-                        "a Bolt append of {count} rows is wider than the sliding ring's margin of {}",
-                        own.geometry.widest_append()
-                    )));
+        let group = |seq: &BoltSeq,
+                     row: usize,
+                     count: usize,
+                     first: usize|
+         -> Result<(), EngError> {
+            let own = seq.kv[source]
+                .as_ref()
+                .expect("the shared-KV source layer is physical");
+            // One chunk is appended whole before it is attended, so a sliding layer's ring
+            // must hold the window plus the chunk: a wider chunk would overwrite cells its own
+            // first rows still read. The ring is sized from `rows`, the widest chunk
+            // `prefill_batch` takes, so this refuses a caller that bypassed that limit.
+            if !own.geometry.admits(count) {
+                return Err(EngError::BadRequest(format!(
+                    "a Bolt append of {count} rows is wider than the sliding ring's margin of {}",
+                    own.geometry.widest_append()
+                )));
+            }
+            let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
+            let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
+            rotate(row, count, seq.pos.range(0, 4)?)?;
+            if physical {
+                let data = Kv8Data {
+                    k: sc.k_normed.buf.range(kat, kbytes)?,
+                    v: sc.v_normed.buf.range(kat, kbytes)?,
+                    k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                    k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                    v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                    v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                };
+                if count == 1 {
+                    // The decode entry: the device pos word is authoritative, so a captured
+                    // replay writes the cell of the step it replays instead of the
+                    // capture-time cell. The status word satisfies the launch contract; the
+                    // caller's host check that `pos + m` leaves the context makes the
+                    // kernel's refuse path unreachable, so the word is never read back.
+                    ctx.kv8_append(
+                        stream,
+                        Kv8Shape {
+                            rows: 1,
+                            ..own.shape
+                        },
+                        data,
+                        seq.pos.range(0, 4)?,
+                        sc.status.range(0, 4)?,
+                    )?;
+                } else {
+                    // The prefill chunk entry takes its position as a host scalar; it is never
+                    // captured (a multi-token step refuses arming), so the baked-scalar hazard
+                    // does not arise.
+                    ctx.kv8_chunk(
+                        stream,
+                        Kv8Shape {
+                            rows: count,
+                            ..own.shape
+                        },
+                        data,
+                        first,
+                    )?;
                 }
-                let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
-                let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
-                rotate(row, count, seq.pos.range(0, 4)?)?;
-                if physical {
-                    let data = Kv8Data {
-                        k: sc.k_normed.buf.range(kat, kbytes)?,
-                        v: sc.v_normed.buf.range(kat, kbytes)?,
-                        k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
-                        k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
-                        v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
-                        v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
-                    };
-                    if count == 1 {
-                        // The decode entry: the device pos word is authoritative, so a captured
-                        // replay writes the cell of the step it replays instead of the
-                        // capture-time cell. The status word satisfies the launch contract; the
-                        // caller's host check that `pos + m` leaves the context makes the
-                        // kernel's refuse path unreachable, so the word is never read back.
-                        ctx.kv8_append(
-                            stream,
-                            Kv8Shape {
-                                rows: 1,
-                                ..own.shape
-                            },
-                            data,
-                            seq.pos.range(0, 4)?,
-                            sc.status.range(0, 4)?,
-                        )?;
-                    } else {
-                        // The prefill chunk entry takes its position as a host scalar; it is never
-                        // captured (a multi-token step refuses arming), so the baked-scalar hazard
-                        // does not arise.
-                        ctx.kv8_chunk(
-                            stream,
-                            Kv8Shape {
-                                rows: count,
-                                ..own.shape
-                            },
-                            data,
-                            first,
-                        )?;
-                    }
-                }
-                self.trace(
-                    pos,
-                    &format!("L{index}_v"),
-                    &sc.v_normed,
-                    (row + count) * kv_rows * 4,
-                );
-                // A prompt chunk of two or more rows on a global layer runs the wide prefill
-                // attention when it is on; a lone row, and so every decode step, keeps the decode
-                // attention.
-                let call = WideCall::new(
-                    [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
-                    sc.q_normed.buf.range(at, bytes)?,
-                    sc.ctx_out.buf.range(at, bytes)?,
-                    count,
-                    first,
-                )
-                .with_cells(own.shape.cells);
-                let take = layer.global && count > 1;
-                if WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
-                    return Ok(());
-                }
-                ctx.attn_decode_gemma(
-                    stream,
-                    AttnDecodeGemmaCall {
-                        out: sc.ctx_out.buf.range(at, bytes)?,
-                        status: None,
-                        q: sc.q_normed.buf.range(at, bytes)?,
-                        k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
-                        k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
-                        v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
-                        v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
-                        kv_len: seq.kv_len.range(0, 4)?,
-                        m: count,
-                        n_q_head: HEADS,
-                        n_kv_head: KV_HEADS,
-                        head_dim: head,
-                        cells: own.shape.cells,
-                        window: if layer.global { 0 } else { self.local_window },
-                        scale: 1.0,
-                        split: attn_split,
-                        ring: own.shape.ring,
-                    },
-                )
-            };
+            }
+            self.trace(
+                pos,
+                &format!("L{index}_v"),
+                &sc.v_normed,
+                (row + count) * kv_rows * 4,
+            );
+            // A prompt chunk of two or more rows on a global layer runs the wide prefill
+            // attention when it is on; a lone row, and so every decode step, keeps the decode
+            // attention.
+            let call = WideCall::new(
+                [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
+                sc.q_normed.buf.range(at, bytes)?,
+                sc.ctx_out.buf.range(at, bytes)?,
+                count,
+                first,
+            )
+            .with_cells(own.shape.cells);
+            let take = layer.global && count > 1;
+            if WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
+                return Ok(());
+            }
+            ctx.attn_decode_gemma(
+                stream,
+                AttnDecodeGemmaCall {
+                    out: sc.ctx_out.buf.range(at, bytes)?,
+                    status: None,
+                    q: sc.q_normed.buf.range(at, bytes)?,
+                    k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                    k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                    v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                    v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                    kv_len: seq.kv_len.range(0, 4)?,
+                    m: count,
+                    n_q_head: HEADS,
+                    n_kv_head: KV_HEADS,
+                    head_dim: head,
+                    cells: own.shape.cells,
+                    window: if layer.global { 0 } else { self.local_window },
+                    scale: 1.0,
+                    split: attn_split,
+                    ring: own.shape.ring,
+                },
+            )
+        };
         match rows {
             Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
             Rows::Window { seqs, tables } => {
@@ -3307,8 +3314,10 @@ mod tests {
         assert!(ring_cells(&linear).iter().all(|&c| c == cells));
         let widths = [
             1usize,
+            4,
             8.min(model.rows),
             3,
+            6,
             5.min(model.rows),
             2,
             7.min(model.rows),
@@ -3386,15 +3395,30 @@ mod tests {
                 snapshot.bytes(),
                 "size at {fed}"
             );
+            // The budget's closed form is the same number: every full-attention position and one
+            // window of the sliding layers.
+            assert_eq!(
+                crate::family::gemma::gemma4::budget::bolt_snapshot_bytes(*fed),
+                Some(snapshot.bytes() as u64),
+                "budget at {fed}"
+            );
             // Past the window the entry stops growing with the prefix on the sliding layers.
-            model.restore_seq(&target, snapshot).expect("restore");
-            // The source continues from its own cells only for the count it is at; rebuild it.
             let probe = model.new_seq_cells(cells).expect("probe");
             for pos in 0..*fed {
                 model
                     .prefill_batch(&probe, &tokens[pos..=pos], pos, false)
                     .expect("refeed");
             }
+            // A fresh session and a grown one take the same entry and continue like the probe: the
+            // grown session moved its rings and re-laid its full-attention planes first.
+            model.restore_seq(&target, snapshot).expect("restore");
+            let mut grown = model.new_seq_cells(CELL_GRANULE).expect("small session");
+            model
+                .make_room(&mut grown, 0, *fed + 8)
+                .expect("room for the entry");
+            model
+                .restore_seq(&grown, snapshot)
+                .expect("restore into a grown session");
             for step in 0..6usize {
                 let token = 5 + step as u32;
                 model.decode(&probe, token, fed + step).expect("probe step");
@@ -3403,6 +3427,8 @@ mod tests {
                     .decode(&target, token, fed + step)
                     .expect("restored step");
                 assert_eq!(a, logit_bits(&model), "fed {fed} step {step}");
+                model.decode(&grown, token, fed + step).expect("grown step");
+                assert_eq!(a, logit_bits(&model), "grown, fed {fed} step {step}");
             }
         }
         // The window caps the sliding layers: a long entry is not larger than a window-long one by
@@ -3423,11 +3449,12 @@ mod tests {
         );
     }
 
-    /// A chunk wider than the ring's margin is refused at the append, never written over the
-    /// cells its own first rows still read.
+    /// The ring a start builds is exactly as wide as the widest chunk a step takes, and its
+    /// admission rule refuses one row more (the append itself is refused by `rope_append_attend`
+    /// and by the kernel launch, tested there).
     #[test]
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
-    fn a_chunk_wider_than_the_rings_margin_is_refused_not_wrapped() {
+    fn the_ring_margin_is_the_widest_chunk_a_step_takes() {
         let model = load_q8();
         let seq = model.new_seq().expect("session");
         let margin = model.local_ring.widest_append();
