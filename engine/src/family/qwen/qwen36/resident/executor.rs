@@ -852,6 +852,14 @@ fn fixed_session_bytes(shape: &HostShape) -> Result<u64> {
     bytes().ok_or_else(|| EngError::MemoryPlan("live DeltaNet state bytes overflow".into()))
 }
 
+/// Whether a start runs its one-row products through the tiled kernel a window of rows takes. A
+/// start that admits more than one session is always a compiled MoE start (`admit`, and the
+/// settings before it, refuse windows without compile and for the dense family), so a row of a
+/// window and the same row alone meet the same kernel.
+fn tiles_one_row_products(shape: &HostShape, rules: &Q36Rules) -> bool {
+    rules.compile && shape.dense_inter.is_none()
+}
+
 /// Checks the rules against the model before any weight is imported.
 fn admit(shape: &HostShape, rules: &Q36Rules) -> Result<()> {
     if shape.dense_inter.is_some() && rules.max_seqs > 1 {
@@ -1070,7 +1078,7 @@ impl Q36Executor {
         // or not, which is also its faster kernel on the 35B model; the dense family and a start
         // without compiled blocks keep the one-row kernels, which are faster there (measured on
         // the Mac). Set before anything traces, since compiled blocks keep the products they traced.
-        kernels.set_row_invariant_products(rules.compile && host.shape().dense_inter.is_none())?;
+        kernels.set_row_invariant_products(tiles_one_row_products(host.shape(), &rules))?;
         kernels.set_program_limit(rules.compile_program_limit)?;
         let fixed_state_bytes = if rules.max_seqs > 1 {
             fixed_session_bytes(host.shape())?
@@ -2132,6 +2140,44 @@ mod tests {
                             assert_eq!(rows[slot].core.pending(), solo[slot].core.pending());
                             assert_eq!(rows[slot].state.pos(), solo[slot].state.pos());
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_start_that_admits_a_window_tiles_the_one_row_products() {
+        let ckpt = tiny::checkpoint(&TINY_GQA);
+        let host = HostWeights::load(&ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap();
+        let moe = host.shape().clone();
+        let mut dense = moe.clone();
+        dense.dense_inter = Some(8);
+        let start = |compile, max_seqs| Q36Rules {
+            compile,
+            max_seqs,
+            session_cap: 1 << 40,
+            ..rules(vec![], VOCAB)
+        };
+        assert!(admit(&moe, &start(true, 2)).is_ok());
+        assert!(
+            admit(&moe, &start(false, 2)).is_err(),
+            "a window needs compile"
+        );
+        assert!(
+            admit(&dense, &start(true, 2)).is_err(),
+            "a window needs MoE routing"
+        );
+        assert!(admit(&dense, &start(false, 2)).is_err());
+        for shape in [&moe, &dense] {
+            for compile in [false, true] {
+                for max_seqs in 2..=8 {
+                    let rules = start(compile, max_seqs);
+                    if admit(shape, &rules).is_ok() {
+                        assert!(
+                            tiles_one_row_products(shape, &rules),
+                            "a start of {max_seqs} sessions admitted without the tiled products"
+                        );
                     }
                 }
             }
