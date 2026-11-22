@@ -84,6 +84,14 @@ pub(in crate::kernels::cuda) mod moe_combine;
 pub(in crate::kernels::cuda) mod multi_row;
 pub(in crate::kernels::cuda) mod pack_rows;
 pub(in crate::kernels::cuda) mod paged_position;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the first caller is the device PLE step of the Flash-Next serve path"
+    )
+)]
+pub(in crate::kernels::cuda) mod ple_block;
 pub(in crate::kernels::cuda) mod qsa_attn;
 pub(in crate::kernels::cuda) mod qsa_index;
 pub(in crate::kernels::cuda) mod qsa_select;

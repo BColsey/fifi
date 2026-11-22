@@ -106,6 +106,14 @@ pub(crate) mod moe_combine;
 pub(crate) mod multi_row;
 pub(crate) mod pack_rows;
 pub(crate) mod paged_position;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the first caller is the device PLE step of the Flash-Next serve path"
+    )
+)]
+pub(crate) mod ple_block;
 pub(crate) mod qsa_attn;
 pub(crate) mod qsa_index;
 pub(crate) mod quantize_q8_1;
