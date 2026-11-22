@@ -772,7 +772,7 @@ impl HfHub {
     /// The local cache as the GUI shows it: every `models--*`
     /// directory with its refs, snapshot paths, blob bytes, and the
     /// family each complete snapshot would start as.
-    pub(crate) fn cache(&self) -> serde_json::Value {
+    pub(crate) fn cache(&self, supervised: bool) -> serde_json::Value {
         let mut models: Vec<serde_json::Value> = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.hub_dir) else {
             return serde_json::json!({ "hub_dir": self.hub_dir.display().to_string(), "models": models });
@@ -799,7 +799,7 @@ impl HfHub {
                 "repo": repo,
                 "bytes": dir_bytes(&dir.join("blobs")),
                 "refs": ref_list(&dir.join("refs")),
-                "snapshots": snapshot_list(&dir),
+                "snapshots": snapshot_list(&dir, supervised),
             }));
         }
         serde_json::json!({
@@ -1638,7 +1638,10 @@ fn links_resolve(dir: &Path) -> bool {
 /// complete, and, when it is, the family `serve --model` would start
 /// it as and the memory the planner estimates for it. A snapshot is
 /// complete when no job is still filling it and every link resolves.
-fn snapshot_list(repo_dir: &Path) -> Vec<serde_json::Value> {
+/// Under `supervised_engines` a Flash-Next pack, which `serve --model`
+/// cannot start, is servable as well; the planner makes no estimate
+/// for it.
+fn snapshot_list(repo_dir: &Path, supervised: bool) -> Vec<serde_json::Value> {
     let Ok(entries) = std::fs::read_dir(repo_dir.join("snapshots")) else {
         return Vec::new();
     };
@@ -1652,6 +1655,11 @@ fn snapshot_list(repo_dir: &Path) -> Vec<serde_json::Value> {
             let complete = !incomplete_marker(repo_dir, &commit).exists() && links_resolve(&path);
             let family = if complete {
                 super::model_serve::servable_family(&path).ok()
+            } else {
+                None
+            };
+            let pack = if complete && supervised && family.is_none() {
+                super::model_serve::flash_next_family(&path)
             } else {
                 None
             };
@@ -1673,8 +1681,8 @@ fn snapshot_list(repo_dir: &Path) -> Vec<serde_json::Value> {
                 "path": path.display().to_string(),
                 "gguf": gguf,
                 "complete": complete,
-                "servable": family.is_some(),
-                "families": family.iter().collect::<Vec<_>>(),
+                "servable": family.is_some() || pack.is_some(),
+                "families": family.as_deref().into_iter().chain(pack).collect::<Vec<_>>(),
             });
             if let Some(estimate) = estimate {
                 row["estimate"] = estimate;
@@ -1760,7 +1768,8 @@ pub(crate) struct SearchParams {
 /// GET /v1/hf/cache — the local hub cache.
 pub(crate) async fn cache(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let hub = Arc::clone(state.hf());
-    let listing = tokio::task::spawn_blocking(move || hub.cache())
+    let supervised = state.supervised_engines();
+    let listing = tokio::task::spawn_blocking(move || hub.cache(supervised))
         .await
         .unwrap_or_else(
             |error| serde_json::json!({ "error": format!("cache scan failed: {error}") }),

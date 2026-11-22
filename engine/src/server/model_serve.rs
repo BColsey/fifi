@@ -469,6 +469,24 @@ pub(crate) fn servable_family(model_dir: &Path) -> Result<String, String> {
     select_family(&ModelServeArgs::default(), &inspection).map_err(|error| error.0)
 }
 
+/// The Flash-Next family when the directory holds one of its packs, else
+/// `None`. To every other test a pack is a Qwen3.8 snapshot, and
+/// `servable_family` finds no family of this build in it: the model type
+/// the spec table gives Flash-Next is what names it.
+pub(crate) fn flash_next_family(model_dir: &Path) -> Option<&'static str> {
+    let inspection = inspect::inspect(model_dir, model_dir).ok()?;
+    let spec = &crate::family::spec::QWEN3_8_FLASH_NEXT;
+    spec.model_types
+        .iter()
+        .any(|claimed| {
+            inspection
+                .config_model_types
+                .iter()
+                .any(|seen| seen == claimed)
+        })
+        .then_some(spec.name)
+}
+
 /// The memory one engine of a downloaded snapshot needs, including the
 /// preflight's closed-form cache and admission terms.
 pub(crate) struct TierEstimate {
@@ -666,7 +684,7 @@ fn warned_checks(report: &preflight::PreflightReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelServeArgs, discover, parse_args};
+    use super::{ModelServeArgs, discover, flash_next_family, parse_args, servable_family};
     use crate::family::qwen::qwen36::settings::Q36Options;
     use crate::server::config::Config;
     use std::path::{Path, PathBuf};
@@ -722,6 +740,24 @@ mod tests {
             model_dir: dir.to_path_buf(),
             ..ModelServeArgs::default()
         }
+    }
+
+    #[test]
+    fn a_flash_next_pack_is_named_by_its_model_type() {
+        let flash = crate::family::spec::QWEN3_8_FLASH_NEXT;
+        for model_type in flash.model_types {
+            let pack = model_dir(Some(model_type), false, true);
+            assert_eq!(flash_next_family(pack.path()), Some(flash.name));
+            // The listing's special case holds only while serve --model
+            // cannot start the pack itself.
+            assert!(servable_family(pack.path()).is_err());
+        }
+        let dense = crate::family::QWEN3_8_27B_DENSE.model_types[0];
+        let dense = model_dir(Some(dense), false, true);
+        assert_eq!(flash_next_family(dense.path()), None);
+        let unnamed = model_dir(None, false, true);
+        assert_eq!(flash_next_family(unnamed.path()), None);
+        assert_eq!(flash_next_family(Path::new("/nonexistent")), None);
     }
 
     #[test]

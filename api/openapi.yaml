@@ -2748,8 +2748,11 @@ paths:
         routes. There family also names a family that serve --model
         cannot derive on its own (qwen3_8_flash_next): the worker then
         starts from the bare entry a configuration file carries, with
-        every option at its default. Without supervised_engines such an
-        add is refused.
+        every option at its default. An add that names no family and
+        whose model_dir holds a Flash-Next pack (config.json model_type
+        qwen4_exp) is served the same way, so the hub cache page can add
+        it by directory alone. Without supervised_engines such an add is
+        refused.
       requestBody:
         required: true
         content:
@@ -2995,8 +2998,13 @@ paths:
                               servable:
                                 type: boolean
                                 description: >-
-                                  Complete, and serve --model would start
-                                  it as a family of this build.
+                                  Complete, and this server can start it:
+                                  serve --model would start it as a family
+                                  of this build, or it is a Flash-Next pack
+                                  (config.json model_type qwen4_exp) and the
+                                  configuration sets supervised_engines.
+                                  families names the family either way; a
+                                  Flash-Next pack carries no estimate.
                               families:
                                 type: array
                                 items:

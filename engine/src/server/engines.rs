@@ -188,6 +188,15 @@ pub(crate) async fn add(
                 .iter()
                 .any(|(name, _)| name == family)
     });
+    // The hub page adds an engine by directory alone, so a pack the request
+    // names no family for is recognised by what it holds. A family the
+    // request does name stands.
+    let bare_family = bare_family.or_else(|| {
+        (body.family.is_none() && state.supervised_engines())
+            .then(|| super::model_serve::flash_next_family(&model_dir))
+            .flatten()
+            .map(str::to_string)
+    });
     let derivation = tokio::task::spawn_blocking(move || {
         let args = crate::server::model_serve::ModelServeArgs {
             model_dir,

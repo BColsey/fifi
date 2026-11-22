@@ -302,7 +302,7 @@ fn a_download_writes_the_hub_layout_with_verified_blobs_and_relative_links() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
     // The cache listing shows the snapshot as complete.
-    let listing = hub.cache();
+    let listing = hub.cache(false);
     let row = &listing["models"][0]["snapshots"][0];
     assert_eq!(row["commit"], COMMIT);
     assert_eq!(row["complete"], true);
@@ -459,7 +459,10 @@ fn a_dangling_or_wrong_sized_link_is_replaced_not_trusted() {
     std::fs::create_dir_all(&snap).expect("snapshot");
     std::os::unix::fs::symlink("../../blobs/gone", snap.join("m.bin")).expect("dangling");
     // The listing already calls the half-filled snapshot incomplete.
-    assert_eq!(hub.cache()["models"][0]["snapshots"][0]["complete"], false);
+    assert_eq!(
+        hub.cache(false)["models"][0]["snapshots"][0]["complete"],
+        false
+    );
     let job = hub.start_download("org/name", "main").expect("admitted");
     assert!(matches!(finished(&job), JobState::Done { .. }));
     assert_eq!(
@@ -625,7 +628,7 @@ fn the_listing_offers_serve_only_for_a_complete_snapshot_of_a_known_family() {
             std::fs::write(repo.join(format!(".fifi-incomplete-{commit}")), b"").expect("marker");
         }
     }
-    let listing = hub.cache();
+    let listing = hub.cache(false);
     let rows = listing["models"][0]["snapshots"]
         .as_array()
         .expect("snapshots");
@@ -646,6 +649,35 @@ fn the_listing_offers_serve_only_for_a_complete_snapshot_of_a_known_family() {
     assert_eq!(partial["complete"], false);
     assert_eq!(partial["servable"], false);
     assert_eq!(partial["families"], serde_json::json!([]));
+}
+
+#[test]
+fn a_flash_next_pack_is_offered_for_serve_under_supervision_alone() {
+    let dir = tempfile::tempdir().expect("hub dir");
+    let hub = HfHub::new(
+        "http://127.0.0.1:9".to_string(),
+        dir.path().to_path_buf(),
+        None,
+    );
+    let flash = crate::family::spec::QWEN3_8_FLASH_NEXT;
+    let model_type = flash.model_types[0];
+    let snap = snapshot(dir.path(), "org/flash");
+    std::fs::create_dir_all(&snap).expect("snapshot");
+    std::fs::write(
+        snap.join("config.json"),
+        format!("{{\"model_type\":\"{model_type}\"}}"),
+    )
+    .expect("config");
+    std::fs::write(snap.join("model.safetensors"), vec![0_u8; 64]).expect("weights");
+    let row = |supervised: bool| hub.cache(supervised)["models"][0]["snapshots"][0].clone();
+    // Without supervision nothing could start it, so the page offers nothing.
+    assert_eq!(row(false)["servable"], false);
+    assert_eq!(row(false)["families"], serde_json::json!([]));
+    let offered = row(true);
+    assert_eq!(offered["complete"], true);
+    assert_eq!(offered["servable"], true);
+    assert_eq!(offered["families"], serde_json::json!([flash.name]));
+    assert!(offered.get("estimate").is_none());
 }
 
 fn derive_fake(
