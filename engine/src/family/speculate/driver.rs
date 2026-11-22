@@ -4,6 +4,8 @@
 //! publishes the same tokens a one-row `decode` loop would, several per call. When there is no
 //! draft, or no room for one, it calls the one-row `decode`, so a stand-down is the plain path.
 
+use std::sync::Arc;
+
 use super::{
     accept::{Accepted, accept_run},
     repeat::RepeatIndex,
@@ -30,18 +32,72 @@ pub(crate) struct Proposal {
     pub(crate) scores: Vec<f32>,
 }
 
+/// The target operations shared by a model-conditioned draft.
+pub(crate) trait DraftOutput {
+    fn embedding(&self, token: u32) -> Result<Vec<f32>>;
+    fn project(&self, hidden: &[f32]) -> Result<Vec<f32>>;
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
+        None
+    }
+}
+
+/// Features of all committed inputs, in position order. The pending token in the
+/// session has not been fed and does not appear in these rows.
+pub(crate) struct TargetConditioning<'a> {
+    pub(crate) features: &'a [Arc<[f32]>],
+    /// Changes whenever the committed stream can diverge at an existing position.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) lineage: &'a Arc<()>,
+    pub(crate) output: &'a dyn DraftOutput,
+}
+
 /// A source of drafts.
 pub(crate) trait Drafter {
     /// Guesses at most `room` tokens that follow the last token of `history`, which is the
     /// pending token. An empty proposal means no guess.
     fn propose(&mut self, history: &[u32], room: usize) -> Result<Proposal>;
 
+    /// Offers a proposal with the target's committed features where available.
+    fn propose_conditioned(
+        &mut self,
+        history: &[u32],
+        room: usize,
+        _target: Option<TargetConditioning<'_>>,
+    ) -> Result<Proposal> {
+        self.propose(history, room)
+    }
+
     /// Learns the verdict of the window that carried the proposal.
     fn observe(&mut self, window: &Window, accepted: &Accepted) -> Result<()>;
 }
 
+impl<T: Drafter + ?Sized> Drafter for Box<T> {
+    fn propose(&mut self, history: &[u32], room: usize) -> Result<Proposal> {
+        (**self).propose(history, room)
+    }
+
+    fn propose_conditioned(
+        &mut self,
+        history: &[u32],
+        room: usize,
+        target: Option<TargetConditioning<'_>>,
+    ) -> Result<Proposal> {
+        (**self).propose_conditioned(history, room, target)
+    }
+
+    fn observe(&mut self, window: &Window, accepted: &Accepted) -> Result<()> {
+        (**self).observe(window, accepted)
+    }
+}
+
 /// The model side of a window.
 pub(crate) trait WindowModel: TokenStepper {
+    fn draft_conditioning(&self) -> Option<TargetConditioning<'_>> {
+        None
+    }
+
     /// Feeds `inputs` as rows after the committed ones and keeps the result of every row. The
     /// rows are not committed: `fed` is unchanged until `commit_window`.
     fn run_window(&mut self, inputs: &[u32]) -> Result<()>;
@@ -133,7 +189,11 @@ impl<D: Drafter> Speculator<D> {
         if room == 0 {
             return self.plain(StandDown::NoRoom, session, model, generation, limits);
         }
-        let mut proposal = self.drafter.propose(session.history(), room)?;
+        let mut proposal = self.drafter.propose_conditioned(
+            session.history(),
+            room,
+            model.draft_conditioning(),
+        )?;
         proposal.tokens.truncate(room);
         proposal.scores.truncate(room);
         if proposal.tokens.is_empty() {

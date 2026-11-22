@@ -15,9 +15,11 @@ use crate::{
         session::{
             DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper, check_prompt,
         },
+        speculate::{driver::Speculator, dspark::DsparkDrafter},
     },
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::{DecodeBatch, TokenizerBundle},
+    weights::dspark_gguf::DsparkGguf,
 };
 
 pub(crate) fn start_engine(
@@ -35,19 +37,60 @@ pub(crate) fn start_engine(
     // Leave cancellation and prefix boundaries with the shared worker.
     let engine = spawn_engine_noted(1, ready_note, move |stages| {
         stages.begin("weights");
-        let forward = CpuForward::open(&model_dir, settings.context as usize)?;
-        let (planned_rows, host_reserve) = settings.host_prefill_plan(&forward, requested_rows)?;
+        let mut forward = CpuForward::open(&model_dir, settings.context as usize)?;
+        let mut settings = settings;
+        let draft_workspace = settings
+            .draft
+            .as_ref()
+            .map_or(0, |draft| draft.workspace_bytes);
+        if let Some(draft) = &mut settings.draft {
+            if draft.width != forward.hidden() || draft.vocab != vocab_size as usize {
+                return Err(super::bad(
+                    "draft hidden width or vocabulary differs from the target",
+                ));
+            }
+            if draft.cuda && backend != TextBackend::Cuda {
+                return Err(super::bad("CUDA DSpark requires a CUDA Inkling target"));
+            }
+            forward.prepare_draft(std::mem::take(&mut draft.taps), draft.max_drafts)?;
+        }
+        let planning_rows = if forward.draft_window_enabled() {
+            1
+        } else {
+            requested_rows
+        };
+        let grouped_verify_requested = backend == TextBackend::Cuda
+            && forward.draft_window_enabled()
+            && std::env::var("FIFI_INKLING_CUDA_GROUPED_VERIFY").as_deref() == Ok("1");
+        let plan = settings.host_prefill_plan(
+            &forward,
+            planning_rows,
+            draft_workspace,
+            grouped_verify_requested,
+        )?;
         let prefix = PrefixStore::with_limits(settings.prefix_limits());
         forward.validate_tokenizer(vocab_size, &eos)?;
-        let forward = match backend {
+        let mut forward = match backend {
             TextBackend::Cpu => forward,
             TextBackend::Cuda => {
                 stages.begin("CUDA projections");
-                cuda_forward(forward, host_reserve)?
+                cuda_forward(forward, plan.host_reserve)?
             }
         };
+        let speculator = settings
+            .draft
+            .take()
+            .map(|draft| start_draft(draft, &forward))
+            .transpose()?;
+        if grouped_verify_requested {
+            let enabled = plan.grouped_verify && enable_grouped_verify(&mut forward);
+            eprintln!(
+                "Inkling CUDA grouped verify {}",
+                serde_json::json!({"enabled": enabled, "host_workspace_admitted": plan.grouped_verify})
+            );
+        }
         let prefill_rows = if supports_grouped_prefill(&forward) {
-            planned_rows
+            plan.prefill_rows
         } else {
             1
         };
@@ -58,7 +101,7 @@ pub(crate) fn start_engine(
                     "requested": requested_rows,
                     "admitted": prefill_rows,
                     "context": settings.context,
-                    "host_reserve_bytes": host_reserve,
+                    "host_reserve_bytes": plan.host_reserve,
                 })
             );
         }
@@ -68,11 +111,45 @@ pub(crate) fn start_engine(
                 eos,
                 prefix,
                 prefill_rows,
+                speculator,
             },
             DecodeSession::default(),
         ))
     })?;
     Ok((engine, bundle))
+}
+
+fn start_draft(
+    draft: InklingDraft,
+    forward: &CpuForward,
+) -> Result<Speculator<DsparkDrafter>, EngError> {
+    let drafter = DsparkDrafter::new(draft.model);
+    let drafter = if draft.cuda {
+        cuda_draft(drafter, forward)?
+    } else {
+        drafter
+    };
+    Ok(Speculator::new(drafter, draft.max_drafts))
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn cuda_draft(mut drafter: DsparkDrafter, forward: &CpuForward) -> Result<DsparkDrafter, EngError> {
+    let cuda = forward
+        .draft_cuda_context()
+        .ok_or_else(|| super::bad("CUDA DSpark requires a GGUF CUDA Inkling target"))?;
+    drafter.enable_cuda(
+        cuda,
+        forward.context,
+        super::cuda_projection::state_headroom,
+    )?;
+    Ok(drafter)
+}
+
+#[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+fn cuda_draft(_: DsparkDrafter, _: &CpuForward) -> Result<DsparkDrafter, EngError> {
+    Err(super::bad(
+        "CUDA DSpark requires a 64-bit Linux build with native-cuda",
+    ))
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -106,6 +183,16 @@ fn prefill_rows(backend: TextBackend) -> Result<usize, EngError> {
 fn supports_grouped_prefill(forward: &CpuForward) -> bool {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     return forward.supports_grouped_prefill();
+    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+    {
+        let _ = forward;
+        false
+    }
+}
+
+fn enable_grouped_verify(forward: &mut CpuForward) -> bool {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    return forward.enable_grouped_verify();
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     {
         let _ = forward;
@@ -148,6 +235,33 @@ impl TokenStepper for CpuForward {
 pub(crate) struct TextSettings {
     pub(crate) context: u32,
     pub(crate) prefix_reuse: bool,
+    pub(crate) draft: Option<InklingDraft>,
+}
+
+pub(crate) struct InklingDraft {
+    pub(super) model: DsparkGguf,
+    pub(super) cuda: bool,
+    pub(super) taps: Vec<usize>,
+    pub(super) max_drafts: usize,
+    pub(super) width: usize,
+    pub(super) vocab: usize,
+    pub(super) workspace_bytes: u64,
+}
+
+struct HostPrefillPlan {
+    prefill_rows: usize,
+    host_reserve: u64,
+    grouped_verify: bool,
+}
+
+impl HostPrefillPlan {
+    fn serial(host_reserve: u64) -> Self {
+        Self {
+            prefill_rows: 1,
+            host_reserve,
+            grouped_verify: false,
+        }
+    }
 }
 
 impl TextSettings {
@@ -169,45 +283,89 @@ impl TextSettings {
         &self,
         forward: &CpuForward,
         requested_rows: usize,
-    ) -> Result<(usize, u64), EngError> {
+        draft_workspace: u64,
+        grouped_verify_requested: bool,
+    ) -> Result<HostPrefillPlan, EngError> {
         let limits = self.prefix_limits();
         // Count every saved state at full size irrespective of shared KV rows.
         let state_bytes = forward
             .host_state_bytes()?
             .checked_mul((1 + limits.roots + limits.entries) as u64)
             .ok_or_else(|| EngError::MemoryPlan("Inkling host state size overflows".into()))?;
+        // The draft proposal finishes before the target opens its verification window.
+        let verify_bytes = forward.window_workspace_bytes()?;
+        let window_bytes = verify_bytes.max(draft_workspace);
+        let host_reserve = state_bytes
+            .checked_add(window_bytes)
+            .ok_or_else(|| EngError::MemoryPlan("Inkling host state size overflows".into()))?;
+        let plan = HostPrefillPlan::serial(host_reserve);
         #[cfg(target_os = "linux")]
         {
             const LABEL: &str = "Inkling text state";
-            let state_needs_admission = self.context > DEFAULT_TEXT_CONTEXT || self.prefix_reuse;
+            let state_needs_admission =
+                self.context > DEFAULT_TEXT_CONTEXT || self.prefix_reuse || window_bytes != 0;
             if state_needs_admission || requested_rows > 1 {
                 let admission =
                     match crate::family::mem::HostFacts::read(LABEL, "Inkling") {
                         Ok(admission) => admission,
                         Err(error) if !state_needs_admission => {
                             eprintln!("Inkling grouped prefill unavailable: {error:?}");
-                            return Ok((1, state_bytes));
+                            return Ok(plan);
                         }
                         Err(error) => return Err(error),
                     };
                 if state_needs_admission {
-                    admission.admit_payload(state_bytes, LABEL)?;
+                    admission.admit_payload(host_reserve, LABEL)?;
                 }
                 #[cfg(feature = "native-cuda")]
-                if requested_rows > 1 {
-                    return Ok(fit_prefill(
-                        requested_rows,
-                        forward.context,
-                        state_bytes,
-                        forward.prefill_workspace_bytes_per_row()?,
-                        admission.payload_spare(),
-                    ));
+                {
+                    let capacity = admission.payload_spare();
+                    if grouped_verify_requested {
+                        let extra = forward.grouped_verify_workspace_bytes()?;
+                        if let Some(host_reserve) = fit_grouped_verify(
+                            state_bytes,
+                            draft_workspace,
+                            verify_bytes,
+                            extra,
+                            capacity,
+                        ) {
+                            return Ok(HostPrefillPlan {
+                                grouped_verify: true,
+                                ..HostPrefillPlan::serial(host_reserve)
+                            });
+                        }
+                    }
+                    if requested_rows > 1 {
+                        let (prefill_rows, host_reserve) = fit_prefill(
+                            requested_rows,
+                            forward.context,
+                            host_reserve,
+                            forward.prefill_workspace_bytes_per_row()?,
+                            capacity,
+                        );
+                        return Ok(HostPrefillPlan {
+                            prefill_rows,
+                            ..HostPrefillPlan::serial(host_reserve)
+                        });
+                    }
                 }
             }
         }
-        let _ = requested_rows;
-        Ok((1, state_bytes))
+        let _ = (requested_rows, grouped_verify_requested);
+        Ok(plan)
     }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn fit_grouped_verify(
+    state: u64,
+    draft: u64,
+    verify: u64,
+    extra: u64,
+    capacity: u64,
+) -> Option<u64> {
+    let reserve = state.checked_add(verify.checked_add(extra)?.max(draft))?;
+    (reserve <= capacity).then_some(reserve)
 }
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
@@ -238,6 +396,17 @@ struct TextExecutor {
     forward: CpuForward,
     eos: Vec<u32>,
     prefill_rows: usize,
+    speculator: Option<Speculator<DsparkDrafter>>,
+}
+
+impl TextExecutor {
+    fn report_speculation(&mut self) {
+        if let Some(speculator) = &mut self.speculator
+            && speculator.stats.used()
+        {
+            eprintln!("inkling: {}", std::mem::take(&mut speculator.stats).line());
+        }
+    }
 }
 
 impl ExecutorOps for TextExecutor {
@@ -270,10 +439,19 @@ impl ExecutorOps for TextExecutor {
             sampler_vocab: self.forward.vocab_size() as usize,
             context_limit: self.forward.context,
         };
-        session.decode(&mut self.forward, generation, &limits)
+        let Some(speculator) = &mut self.speculator else {
+            return session.decode(&mut self.forward, generation, &limits);
+        };
+        let batch = speculator.decode(session, &mut self.forward, generation, &limits);
+        if batch.as_ref().is_ok_and(|batch| batch.finish.is_some()) || batch.is_err() {
+            self.report_speculation();
+        }
+        batch
     }
 
-    fn boundary(&mut self, _session: &mut Self::Session) {}
+    fn boundary(&mut self, _session: &mut Self::Session) {
+        self.report_speculation();
+    }
 
     fn prefill_piece(&self) -> Option<usize> {
         Some(self.prefill_rows)
@@ -321,7 +499,7 @@ impl ExecutorOps for TextExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_prefill;
+    use super::{fit_grouped_verify, fit_prefill};
 
     #[test]
     fn grouped_prefill_fits_requested_width_and_context() {
@@ -334,5 +512,13 @@ mod tests {
         assert_eq!(fit_prefill(512, 768, 200, 80, 2_999), (34, 2_920));
         assert_eq!(fit_prefill(512, 768, 200, 80, 359), (1, 200));
         assert_eq!(fit_prefill(512, 768, 200, 80, 199), (1, 200));
+    }
+
+    #[test]
+    fn grouped_verify_uses_only_the_larger_speculation_workspace() {
+        assert_eq!(fit_grouped_verify(200, 80, 60, 40, 300), Some(300));
+        assert_eq!(fit_grouped_verify(200, 80, 60, 40, 299), None);
+        assert_eq!(fit_grouped_verify(200, 150, 60, 40, 350), Some(350));
+        assert_eq!(fit_grouped_verify(200, 0, u64::MAX, 40, u64::MAX), None);
     }
 }

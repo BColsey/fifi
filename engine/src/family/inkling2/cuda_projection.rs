@@ -17,6 +17,7 @@ use super::{
 };
 use crate::{
     EngError,
+    expert_tier::VRAM_HEADROOM_BYTES,
     kernels::cuda::{
         Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, DeviceRange,
         plan::{Demand, admit},
@@ -30,6 +31,13 @@ pub(super) mod gguf;
 use dense::{DensePlan, DenseStep};
 
 const DEVICE_HEADROOM: u64 = 256 * 1024 * 1024;
+
+/// The portion of the shared reserve still free after committed device state.
+pub(super) fn state_headroom(credited_bytes: u64) -> u64 {
+    VRAM_HEADROOM_BYTES
+        .saturating_sub(credited_bytes)
+        .max(DEVICE_HEADROOM)
+}
 
 pub(super) struct DenseUpload<'a> {
     pub(super) name: &'a str,

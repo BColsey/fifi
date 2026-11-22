@@ -1,6 +1,6 @@
 //! Text execution for Inkling 2 Mini, including CUDA-backed projections.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use serde::Deserialize;
 
@@ -14,6 +14,7 @@ use crate::{EngError, expert_tier::ExpertId};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prefill;
+mod window;
 
 const MIX_EPS: f32 = 1e-6;
 
@@ -59,11 +60,57 @@ pub(super) struct CpuForward {
     position: usize,
     failed: bool,
     eos_token_id: u32,
+    taps: Vec<usize>,
+    features: Vec<Arc<[f32]>>,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    draft_lineage: Arc<()>,
+    window: Option<window::PendingWindow>,
+    window_limit: usize,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    grouped_verify: bool,
 }
 
 pub(super) struct PrefixState {
     position: usize,
     visits: Vec<VisitState>,
+    features: Vec<Arc<[f32]>>,
+}
+
+struct ForwardRow {
+    head_input: Option<Vec<f32>>,
+    features: Option<Arc<[f32]>>,
+}
+
+/// Capture the residual entering each selected execution visit, followed by the
+/// normalized head input when the final position is selected.
+struct TapRow<'a> {
+    pending: &'a [usize],
+    values: Vec<f32>,
+}
+
+impl<'a> TapRow<'a> {
+    fn new(pending: &'a [usize], width: usize) -> Self {
+        Self {
+            pending,
+            values: Vec::with_capacity(pending.len() * width),
+        }
+    }
+
+    fn wants(&self, visit: usize) -> bool {
+        self.pending.first() == Some(&visit)
+    }
+
+    fn capture(&mut self, visit: usize, hidden: &[f32]) {
+        if self.wants(visit) {
+            self.values.extend_from_slice(hidden);
+            self.pending = &self.pending[1..];
+        }
+    }
+
+    fn finish(self) -> Option<Arc<[f32]>> {
+        debug_assert!(self.pending.is_empty());
+        (!self.values.is_empty()).then(|| self.values.into())
+    }
 }
 
 #[derive(Clone)]
@@ -123,6 +170,14 @@ impl CpuForward {
             position: 0,
             failed: false,
             eos_token_id: config.eos_token_id,
+            taps: Vec::new(),
+            features: Vec::new(),
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            draft_lineage: Arc::new(()),
+            window: None,
+            window_limit: 0,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            grouped_verify: false,
         })
     }
 
@@ -132,13 +187,24 @@ impl CpuForward {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn enable_cuda(&mut self, host_reserve: u64) -> Result<(), EngError> {
-        let attention = super::cuda_projection::gguf::attention::Config {
-            context: self.context,
-            relative_dims: self.math.d_rel,
-            relative_extent: self.math.rel_extent,
-        };
+        // Draft windows stage only the authoritative host state.
+        let attention = (!self.draft_window_enabled()).then_some(
+            super::cuda_projection::gguf::attention::Config {
+                context: self.context,
+                relative_dims: self.math.d_rel,
+                relative_extent: self.math.rel_extent,
+            },
+        );
         self.weights
             .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve, attention)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn draft_cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
+        match &self.weights {
+            Weights::Gguf(weights) => weights.cuda_context(),
+            Weights::Native(_) => None,
+        }
     }
 
     pub(super) fn vocab_size(&self) -> u32 {
@@ -154,19 +220,34 @@ impl CpuForward {
         let payload = self.spec.kv_plan(self.context as u32)?.windowed_bytes * 2;
         let row_overhead = payload / 64;
         let convolution_and_deques = self.visits.len() as u64 * 256 * 1024;
-        Ok(payload + row_overhead + convolution_and_deques)
+        let feature_bytes = self
+            .feature_bytes_per_row()
+            .checked_mul(self.context as u64)
+            .ok_or_else(|| {
+                EngError::MemoryPlan("Inkling target feature cache size overflows".into())
+            })?;
+        (payload + row_overhead + convolution_and_deques)
+            .checked_add(feature_bytes)
+            .ok_or_else(|| EngError::MemoryPlan("Inkling host state size overflows".into()))
     }
 
     pub(super) fn snapshot(&self) -> PrefixState {
         PrefixState {
             position: self.position,
             visits: self.state.clone(),
+            features: self.features.clone(),
         }
     }
 
     pub(super) fn restore(&mut self, saved: &PrefixState) {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.invalidate_device_attention();
+        self.window = None;
+        self.features.clone_from(&saved.features);
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if !self.taps.is_empty() {
+            self.draft_lineage = Arc::new(());
+        }
         self.state.clone_from(&saved.visits);
         self.position = saved.position;
         self.failed = false;
@@ -179,6 +260,12 @@ impl CpuForward {
     pub(super) fn reset(&mut self) {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.invalidate_device_attention();
+        self.window = None;
+        self.features.clear();
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if !self.taps.is_empty() {
+            self.draft_lineage = Arc::new(());
+        }
         for slot in &mut self.state {
             *slot = VisitState::default();
         }
@@ -203,6 +290,7 @@ impl CpuForward {
             return Err(bad("token or sequence is outside the Inkling text limits"));
         }
 
+        self.window = None;
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -210,16 +298,52 @@ impl CpuForward {
             .weights
             .cuda_projection()
             .and_then(|cuda| cuda.begin_token().map(|start| (cuda, start)));
-        let stream = self.forward(&mut state, id)?;
-        let logits = collect_logits.then(|| self.logits(&stream)).transpose()?;
+        let row = self.forward_row(&mut state, id, collect_logits)?;
+        let logits = row
+            .head_input
+            .as_deref()
+            .map(|input| self.logits_for_head(input))
+            .transpose()?;
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Some((cuda, start)) = profile {
             cuda.end_token(start, self.position, collect_logits);
         }
         self.position += 1;
         self.state = state;
+        self.features.extend(row.features);
         self.failed = false;
         Ok(logits)
+    }
+
+    fn forward_row(
+        &self,
+        state: &mut [VisitState],
+        id: u32,
+        collect_head_input: bool,
+    ) -> Result<ForwardRow, EngError> {
+        let mut taps = TapRow::new(&self.taps, self.hidden());
+        let stream = self.forward(state, id, &mut taps)?;
+        self.finish_row(&stream, taps, collect_head_input)
+    }
+
+    fn finish_row(
+        &self,
+        stream: &Stream,
+        mut taps: TapRow<'_>,
+        collect_head_input: bool,
+    ) -> Result<ForwardRow, EngError> {
+        let end = self.visits.len();
+        let head_input = if collect_head_input || taps.wants(end) {
+            let hidden = self.final_hidden(stream)?;
+            taps.capture(end, &hidden);
+            collect_head_input.then_some(hidden)
+        } else {
+            None
+        };
+        Ok(ForwardRow {
+            head_input,
+            features: taps.finish(),
+        })
     }
 
     fn embed(&self, id: u32) -> Result<Stream, EngError> {
@@ -233,12 +357,23 @@ impl CpuForward {
         })
     }
 
-    fn forward(&self, state: &mut [VisitState], id: u32) -> Result<Stream, EngError> {
+    fn forward(
+        &self,
+        state: &mut [VisitState],
+        id: u32,
+        taps: &mut TapRow<'_>,
+    ) -> Result<Stream, EngError> {
         let mut stream = self.embed(id)?;
         let core = &self.spec.core;
         let width = core.core_end - core.core_start;
 
-        self.run_visits(&self.visits[..core.core_start], state, &mut stream, None)?;
+        self.run_visits(
+            &self.visits[..core.core_start],
+            state,
+            &mut stream,
+            None,
+            taps,
+        )?;
         let prelude = stream.clone();
         let mut bank = None;
         for pass in 0..core.num_passes {
@@ -254,24 +389,33 @@ impl CpuForward {
                 state,
                 &mut stream,
                 bank.as_ref(),
+                taps,
             )?;
         }
         let suffix = core.core_start + core.num_passes * width;
-        self.run_visits(&self.visits[suffix..], state, &mut stream, None)?;
+        self.run_visits(&self.visits[suffix..], state, &mut stream, None, taps)?;
         Ok(stream)
     }
 
-    fn logits(&self, stream: &Stream) -> Result<Vec<f32>, EngError> {
+    fn final_hidden(&self, stream: &Stream) -> Result<Vec<f32>, EngError> {
         let query = self
             .weights
             .vec("model.llm.attn_res.output_query", self.hidden())?;
         let mut last = stream.mix(0, &query);
         self.norm(&mut last, "model.llm.norm.weight")?;
-        let mut logits = self.weights.project(
+        Ok(last)
+    }
+
+    fn project_logits(&self, hidden: &[f32]) -> Result<Vec<f32>, EngError> {
+        self.weights.project(
             "model.llm.unembed.weight",
-            &last,
+            hidden,
             self.spec.unpadded_vocab_size as usize,
-        )?;
+        )
+    }
+
+    fn logits_for_head(&self, hidden: &[f32]) -> Result<Vec<f32>, EngError> {
+        let mut logits = self.project_logits(hidden)?;
         for value in &mut logits {
             *value = softcap(*value, self.math.final_logit_softcapping);
         }
@@ -287,8 +431,10 @@ impl CpuForward {
         state: &mut [VisitState],
         stream: &mut Stream,
         bank: Option<&MessageBank>,
+        taps: &mut TapRow<'_>,
     ) -> Result<(), EngError> {
         for &visit in visits {
+            taps.capture(visit.state_slot, &stream.current);
             self.layer(visit, &mut state[visit.state_slot], stream, bank)?;
         }
         Ok(())

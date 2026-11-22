@@ -155,6 +155,15 @@ struct Projections<'a> {
 }
 
 impl GgufCuda {
+    pub(in crate::family::inkling2) fn supports_grouped_verify(&self, layers: usize) -> bool {
+        self.device_prefill.is_some()
+            && self.moe_scratch.is_some()
+            && !self
+                .step
+                .uses_q8_activations(DenseDtype::PackedGguf(crate::weights::GgufType::Q80))
+            && self.resident.placement().full_layers().len() == layers
+    }
+
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
         self.has_stream_banks()
             || (self.device_prefill.is_some()

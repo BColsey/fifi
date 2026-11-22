@@ -14,12 +14,16 @@ mod cpu_weights;
 ))]
 mod cuda_projection;
 #[cfg(target_pointer_width = "64")]
+mod dspark;
+#[cfg(target_pointer_width = "64")]
 mod gguf_weights;
 #[cfg(target_pointer_width = "64")]
 mod serve;
 
 #[cfg(target_pointer_width = "64")]
 pub(crate) use cpu_forward::{inspect_cpu_config, inspect_gguf_config};
+#[cfg(target_pointer_width = "64")]
+pub(crate) use dspark::configured_draft;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use gguf_weights::{GgufPlan, gguf_path};
 #[cfg(target_pointer_width = "64")]

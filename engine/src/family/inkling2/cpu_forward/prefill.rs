@@ -1,29 +1,33 @@
-//! Layer-major prompt prefill. Each visit advances its own causal state in token
+//! Visit-major text execution. Each visit advances its own causal state in token
 //! order, then computes the routed expert outputs using the shared CUDA banks.
 
-use super::{CpuForward, LayerVisit, MessageBank, MoeRoute, Stream, VisitState, Weights, add, bad};
+use super::{
+    CpuForward, LayerVisit, MessageBank, MoeRoute, Stream, TapRow, VisitState, Weights, add, bad,
+    window::PendingRow,
+};
 use crate::{
     EngError,
     family::inkling2::{
-        cuda_projection::gguf::streaming::PrefillRoute, gguf_weights::GgufTextWeights,
+        cpu_attention::{AttentionUndo, VisitUndo},
+        cuda_projection::gguf::streaming::PrefillRoute,
+        gguf_weights::GgufTextWeights,
     },
 };
 
-struct PromptRow {
+struct PromptRow<'a> {
     stream: Stream,
     prelude: Option<Stream>,
     bank: Option<MessageBank>,
+    journal: Option<VerifyRow<'a>>,
 }
 
-impl PromptRow {
-    fn new(stream: Stream) -> Self {
-        Self {
-            stream,
-            prelude: None,
-            bank: None,
-        }
-    }
+struct VerifyRow<'a> {
+    taps: TapRow<'a>,
+    attention: Option<AttentionUndo>,
+    undo: Vec<VisitUndo>,
+}
 
+impl PromptRow<'_> {
     fn begin_pass(&mut self, pass: usize) -> Result<(), EngError> {
         if pass == 0 {
             self.prelude = Some(self.stream.clone());
@@ -48,7 +52,25 @@ struct MlpRow {
 
 impl CpuForward {
     pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
-        matches!(&self.weights, Weights::Gguf(weights) if weights.supports_grouped_prefill())
+        !self.draft_window_enabled()
+            && matches!(&self.weights, Weights::Gguf(weights) if weights.supports_grouped_prefill())
+    }
+
+    pub(in crate::family::inkling2) fn enable_grouped_verify(&mut self) -> bool {
+        self.grouped_verify = self.draft_window_enabled()
+            && matches!(&self.weights, Weights::Gguf(weights)
+                if weights.supports_grouped_verify(self.spec.stored_layers()));
+        self.grouped_verify
+    }
+
+    pub(in crate::family::inkling2) fn grouped_verify_workspace_bytes(
+        &self,
+    ) -> Result<u64, EngError> {
+        self.prefill_workspace_bytes_per_row()?
+            .checked_mul(self.window_limit.min(self.context) as u64)
+            .ok_or_else(|| {
+                EngError::MemoryPlan("Inkling grouped verify workspace overflows".into())
+            })
     }
 
     pub(in crate::family::inkling2) fn prefill_workspace_bytes_per_row(
@@ -98,7 +120,7 @@ impl CpuForward {
         let numeric_bytes =
             (stream_values + projection_values + 2 * experts) * size_of::<f32>() as u128;
         // Include row handles and reserve room for geometrically grown lane lists.
-        let row_metadata = (size_of::<PromptRow>()
+        let row_metadata = (size_of::<PromptRow<'_>>()
             + size_of::<MlpRow>()
             + size_of::<PrefillRoute<'_>>()
             + size_of::<Vec<f32>>()) as u128;
@@ -117,9 +139,9 @@ impl CpuForward {
         &mut self,
         tokens: &[u32],
     ) -> Result<(), EngError> {
-        let Weights::Gguf(weights) = &self.weights else {
-            return Err(bad("grouped prefill needs CUDA GGUF weights"));
-        };
+        if self.draft_window_enabled() {
+            return Err(bad("Inkling speculation requires token-major prefill"));
+        }
         if self.failed {
             return Err(bad(
                 "a previous Inkling forward invalidated the sequence state",
@@ -137,10 +159,52 @@ impl CpuForward {
         }
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);
+        self.run_grouped_rows(&mut state, tokens, false)?;
+        self.state = state;
+        self.position += tokens.len();
+        self.failed = false;
+        Ok(())
+    }
+
+    pub(super) fn grouped_verify_rows(
+        &self,
+        state: &mut [VisitState],
+        tokens: &[u32],
+    ) -> Result<Vec<PendingRow>, EngError> {
+        self.run_grouped_rows(state, tokens, true)?
+            .into_iter()
+            .map(|row| {
+                let journal = row.journal.expect("grouped verify row has a journal");
+                let forward = self.finish_row(&row.stream, journal.taps, true)?;
+                PendingRow::new(journal.undo, forward)
+            })
+            .collect()
+    }
+
+    fn run_grouped_rows(
+        &self,
+        state: &mut [VisitState],
+        tokens: &[u32],
+        verify: bool,
+    ) -> Result<Vec<PromptRow<'_>>, EngError> {
+        let Weights::Gguf(weights) = &self.weights else {
+            return Err(bad("grouped execution needs CUDA GGUF weights"));
+        };
         let mut rows = tokens
             .iter()
-            .map(|&id| self.embed(id).map(PromptRow::new))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&id| {
+                Ok(PromptRow {
+                    stream: self.embed(id)?,
+                    prelude: None,
+                    bank: None,
+                    journal: verify.then(|| VerifyRow {
+                        taps: TapRow::new(&self.taps, self.hidden()),
+                        attention: None,
+                        undo: Vec::with_capacity(self.visits.len()),
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
         let core = &self.spec.core;
         let width = core.core_end - core.core_start;
         let end = core.core_start + width * core.num_passes;
@@ -160,17 +224,14 @@ impl CpuForward {
             }
             self.prompt_visit(visit, &mut state[slot], &mut rows, weights)?;
         }
-        self.state = state;
-        self.position += tokens.len();
-        self.failed = false;
-        Ok(())
+        Ok(rows)
     }
 
     fn prompt_visit(
         &self,
         visit: LayerVisit,
         state: &mut VisitState,
-        rows: &mut [PromptRow],
+        rows: &mut [PromptRow<'_>],
         weights: &GgufTextWeights,
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
@@ -181,6 +242,11 @@ impl CpuForward {
             .into_iter()
             .flatten();
         let inputs = rows.iter_mut().map(|row| {
+            if let Some(journal) = &mut row.journal {
+                journal.taps.capture(visit.state_slot, &row.stream.current);
+                journal.attention =
+                    Some(state.checkpoint_attention(self.kv_capacity(visit.attention)));
+            }
             self.mlp_input(
                 visit,
                 &layer,
@@ -207,8 +273,16 @@ impl CpuForward {
                 })
                 .collect::<Result<_, EngError>>()?
         };
-        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp)?;
+        let verify = rows[0].journal.is_some();
+        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp, verify)?;
         for (row, output) in rows.iter_mut().zip(outputs) {
+            if let Some(journal) = &mut row.journal {
+                let attention = journal
+                    .attention
+                    .take()
+                    .expect("grouped attention already ran");
+                journal.undo.push(attention.with_mlp(state));
+            }
             self.finish_layer(&layer, state, &mut row.stream, output)?;
         }
         Ok(())
@@ -240,7 +314,7 @@ impl CpuForward {
         &self,
         visit: LayerVisit,
         layer: &str,
-        rows: &[PromptRow],
+        rows: &[PromptRow<'_>],
         weights: &GgufTextWeights,
     ) -> Result<Option<Vec<super::super::cpu_attention::AttentionProjection>>, EngError> {
         if !prefill_projection_batch_enabled() {
@@ -259,6 +333,7 @@ impl CpuForward {
         layer: usize,
         prefix: &str,
         mlp: &[MlpRow],
+        verify: bool,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let routes: Vec<_> = mlp
             .iter()
@@ -281,9 +356,15 @@ impl CpuForward {
         )? {
             return Ok(output);
         }
-        let batch = weights.prefill_experts(names, layer as u32, &routes, |gate, up| {
-            self.math.expert_activation(gate, up)
-        })?;
+        // Verification uses the same device activation and rank reduction as the
+        // scalar expert group. Its fallback must preserve that arithmetic.
+        let batch = if verify {
+            None
+        } else {
+            weights.prefill_experts(names, layer as u32, &routes, |gate, up| {
+                self.math.expert_activation(gate, up)
+            })?
+        };
         let Some(batch) = batch else {
             return mlp
                 .iter()

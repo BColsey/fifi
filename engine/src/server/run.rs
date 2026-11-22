@@ -778,6 +778,7 @@ fn start_inkling2(
             inkling2::TextSettings {
                 context: context_limit,
                 prefix_reuse,
+                draft: inkling2::configured_draft(context_limit as usize)?,
             },
             ready_note,
         )?;

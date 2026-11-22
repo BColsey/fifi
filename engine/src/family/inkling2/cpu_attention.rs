@@ -13,6 +13,7 @@ use super::{cpu_weights::Weights, cuda_projection::gguf::attention};
 pub(super) type AttentionProjection = [Vec<f32>; 8];
 
 #[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct CausalConv(VecDeque<Vec<f32>>);
 
 impl CausalConv {
@@ -53,16 +54,45 @@ struct DynamicTaps {
 }
 
 #[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct VisitConvs {
+    k: CausalConv,
+    v: CausalConv,
+    attn: CausalConv,
+    mlp: CausalConv,
+}
+
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(super) struct VisitState {
     // KV rows are immutable after append, so prefix snapshots share their storage.
     keys: VecDeque<Arc<Vec<f32>>>,
     values: VecDeque<Arc<Vec<f32>>>,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     position: usize,
-    k_conv: CausalConv,
-    v_conv: CausalConv,
-    attn_conv: CausalConv,
-    mlp_conv: CausalConv,
+    conv: VisitConvs,
+}
+
+/// The parts of one visit overwritten by one forward row.
+pub(super) struct VisitUndo {
+    attention: AttentionUndo,
+    mlp: CausalConv,
+}
+
+pub(super) struct AttentionUndo {
+    evicted: Option<[Arc<Vec<f32>>; 2]>,
+    k: CausalConv,
+    v: CausalConv,
+    attn: CausalConv,
+}
+
+impl AttentionUndo {
+    pub(super) fn with_mlp(self, state: &VisitState) -> VisitUndo {
+        VisitUndo {
+            attention: self,
+            mlp: state.conv.mlp.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -95,8 +125,8 @@ impl CpuForward {
         self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
         clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
 
-        let mut k = self.attention_plane(&attn, "k", [k, k_taps], heads, &mut state.k_conv)?;
-        let mut v = self.attention_plane(&attn, "v", [v, v_taps], heads, &mut state.v_conv)?;
+        let mut k = self.attention_plane(&attn, "k", [k, k_taps], heads, &mut state.conv.k)?;
+        let mut v = self.attention_plane(&attn, "v", [v, v_taps], heads, &mut state.conv.v)?;
         clip_rows(&mut k, heads.width, self.math.qk_l2_clip_threshold);
         for head in v.chunks_exact_mut(heads.width) {
             rms_norm(head, self.math.rms_norm_eps);
@@ -134,14 +164,7 @@ impl CpuForward {
         };
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
         let device_output = None;
-        state.push(
-            k,
-            v,
-            match visit.attention {
-                Attention::Local => self.spec.sliding_window_size as usize,
-                Attention::Global => self.context,
-            },
-        );
+        state.push(k, v, self.kv_capacity(visit.attention));
 
         let out = if let Some(out) = device_output {
             out
@@ -162,7 +185,7 @@ impl CpuForward {
         self.output_conv(
             raw,
             &format!("{layer}.attn_sconv.weight"),
-            &mut state.attn_conv,
+            &mut state.conv.attn,
         )
     }
 
@@ -172,6 +195,13 @@ impl CpuForward {
             && let Some((_, attention)) = weights.resident_attention()
         {
             attention.invalidate();
+        }
+    }
+
+    pub(super) fn kv_capacity(&self, attention: Attention) -> usize {
+        match attention {
+            Attention::Local => self.spec.sliding_window_size as usize,
+            Attention::Global => self.context,
         }
     }
 
@@ -365,12 +395,58 @@ impl CpuForward {
         self.output_conv(
             input,
             &format!("{layer}.mlp_sconv.weight"),
-            &mut state.mlp_conv,
+            &mut state.conv.mlp,
         )
     }
 }
 
 impl VisitState {
+    pub(super) fn checkpoint(&self, capacity: usize) -> VisitUndo {
+        self.checkpoint_attention(capacity).with_mlp(self)
+    }
+
+    pub(super) fn checkpoint_attention(&self, capacity: usize) -> AttentionUndo {
+        let evicted = if self.keys.len() == capacity {
+            self.keys
+                .back()
+                .zip(self.values.back())
+                .map(|(key, value)| [Arc::clone(key), Arc::clone(value)])
+        } else {
+            None
+        };
+        AttentionUndo {
+            evicted,
+            k: self.conv.k.clone(),
+            v: self.conv.v.clone(),
+            attn: self.conv.attn.clone(),
+        }
+    }
+
+    pub(super) fn rewind(&mut self, undo: VisitUndo) {
+        let AttentionUndo {
+            evicted,
+            k,
+            v,
+            attn,
+        } = undo.attention;
+        self.keys.pop_front();
+        self.values.pop_front();
+        if let Some([key, value]) = evicted {
+            self.keys.push_back(key);
+            self.values.push_back(value);
+        }
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        {
+            self.position -= 1;
+        }
+        self.conv = VisitConvs {
+            k,
+            v,
+            attn,
+            mlp: undo.mlp,
+        };
+    }
+
     fn push(&mut self, key: Vec<f32>, value: Vec<f32>, length: usize) {
         self.keys.push_front(Arc::new(key));
         self.values.push_front(Arc::new(value));
@@ -411,4 +487,42 @@ fn causal_conv_uses_per_visit_history_and_native_tap_order() {
     full.apply(vec![4.0], &[3.0, 2.0], 2, dynamic(vec![1.0, 2.0]));
     let actual = full.apply(vec![5.0], &[3.0, 2.0], 2, dynamic(vec![1.0, 2.0]));
     assert!((actual[0] - 41.0 / 5.0_f32.sqrt()).abs() < 2e-6);
+}
+
+#[test]
+fn rewind_restores_both_evicted_kv_planes_and_every_convolution() {
+    fn advance(visit: &mut VisitState, value: f32, limit: usize) {
+        let convs = &mut visit.conv;
+        for (phase, conv) in [&mut convs.k, &mut convs.v, &mut convs.attn, &mut convs.mlp]
+            .into_iter()
+            .enumerate()
+        {
+            conv.apply(vec![value + phase as f32], &[0.1; 3], 3, None);
+        }
+        visit.push(vec![value], vec![-value], limit);
+    }
+
+    let mut visits = [VisitState::default(), VisitState::default()];
+    let limits = [2, 5];
+    for (index, (visit, limit)) in visits.iter_mut().zip(limits).enumerate() {
+        for row in 0..3 {
+            advance(visit, (index * 10 + row) as f32, limit);
+        }
+    }
+    let committed = visits.clone();
+    let mut journal = Vec::new();
+    for row in 3..6 {
+        let mut undo = Vec::new();
+        for (index, (visit, limit)) in visits.iter_mut().zip(limits).enumerate() {
+            undo.push(visit.checkpoint(limit));
+            advance(visit, (index * 10 + row) as f32, limit);
+        }
+        journal.push(undo);
+    }
+    for undo in journal.into_iter().rev() {
+        for (visit, undo) in visits.iter_mut().zip(undo) {
+            visit.rewind(undo);
+        }
+    }
+    assert_eq!(visits, committed);
 }

@@ -140,6 +140,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/pack_rows.cu",
     "src/kernels/cuda/native/resident/dense_gemv.cu",
     "src/kernels/cuda/native/resident/relative_attention.cu",
+    "src/kernels/cuda/native/resident/draft_attention_bf16.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -215,6 +216,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/attn_decode_q8.h",
     "src/kernels/cuda/native/resident/attn_prep.h",
     "src/kernels/cuda/native/resident/attn_split_reduce.cuh",
+    "src/kernels/cuda/native/resident/draft_attention_bf16.h",
     "src/kernels/cuda/native/resident/embed.h",
     "src/kernels/cuda/native/resident/embed_bf16.h",
     "src/kernels/cuda/native/resident/exl3.h",

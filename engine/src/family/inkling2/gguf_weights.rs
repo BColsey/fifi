@@ -539,13 +539,30 @@ pub(super) struct GgufTextWeights {
 
 impl GgufTextWeights {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
+        self.cuda.as_ref().map(GgufCuda::context)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn enable_cuda(
         &mut self,
         spec: &TextSpec,
         eps: f32,
         host_reserve: u64,
-        attention: attention::Config,
+        attention: Option<attention::Config>,
     ) -> Result<(), EngError> {
+        let resident_attention = if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref()
+            == Ok("1")
+        {
+            Some(attention.ok_or_else(|| {
+                    EngError::BadRequest(
+                        "Inkling speculation requires host attention. Unset FIFI_INKLING_CUDA_RESIDENT_ATTENTION"
+                            .into(),
+                    )
+                })?)
+        } else {
+            None
+        };
         let packed = std::env::var("FIFI_INKLING_CUDA_PACKED_GGUF").as_deref() == Ok("1");
         let group_projections =
             std::env::var("FIFI_INKLING_CUDA_GROUP_PROJECTIONS").as_deref() == Ok("1");
@@ -604,17 +621,14 @@ impl GgufTextWeights {
         let stream = packed
             || tiered
             || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
-        let resident_attention =
-            if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref() == Ok("1") {
-                if packed {
-                    attention::Plan::new(self, spec, attention)?
-                } else {
-                    eprintln!("Inkling CUDA relative attention requires packed GGUF weights");
-                    None
-                }
-            } else {
+        let resident_attention = match resident_attention {
+            Some(config) if packed => attention::Plan::new(self, spec, config)?,
+            Some(_) => {
+                eprintln!("Inkling CUDA relative attention requires packed GGUF weights");
                 None
-            };
+            }
+            None => None,
+        };
         let mut cuda = GgufCuda::load(
             uploads,
             spec,

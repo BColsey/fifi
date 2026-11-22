@@ -91,6 +91,12 @@ impl GgufTextWeights {
             .is_some_and(|cuda| cuda.supports_grouped_prefill())
     }
 
+    pub(in crate::family::inkling2) fn supports_grouped_verify(&self, layers: usize) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(|cuda| cuda.supports_grouped_verify(layers))
+    }
+
     pub(in crate::family::inkling2) fn batch_prefill_router(&self, layer: u32, name: &str) -> bool {
         self.cuda
             .as_ref()

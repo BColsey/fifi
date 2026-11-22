@@ -136,6 +136,10 @@ pub(in crate::family::inkling2) struct ExpertView<'a> {
 }
 
 impl GgufCuda {
+    pub(in crate::family::inkling2) fn context(&self) -> &CudaContext {
+        &self.context
+    }
+
     pub(in crate::family::inkling2) fn resident_attention(
         &self,
     ) -> Option<(&CudaContext, &attention::ResidentAttention)> {

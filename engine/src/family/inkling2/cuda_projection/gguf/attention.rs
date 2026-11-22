@@ -15,7 +15,9 @@ use crate::{
     },
 };
 
-use super::{DEVICE_HEADROOM, bad};
+#[cfg(test)]
+use super::DEVICE_HEADROOM;
+use super::{super::state_headroom, bad};
 
 #[derive(Clone, Copy)]
 pub(in crate::family::inkling2) struct Config {
@@ -151,7 +153,7 @@ impl Plan {
             .ok_or_else(|| bad("CUDA relative attention arena overflows"))?;
         let before = context.memory_info()?.free as u64;
         let proposed_credit = if charge_reserve { bytes as u64 } else { 0 };
-        let spare = before.saturating_sub(reserve_floor(proposed_credit));
+        let spare = before.saturating_sub(state_headroom(proposed_credit));
         if before < VRAM_HEADROOM_BYTES || bytes as u64 > spare {
             eprintln!(
                 "Inkling CUDA relative attention not admitted: needs {bytes} bytes, {spare} available"
@@ -164,7 +166,7 @@ impl Plan {
         // Only this allocation's requested bytes count against the reserve.
         // CUDA padding still consumes the physical free-memory margin.
         let credit = device_bytes.min(proposed_credit);
-        let projection_headroom = reserve_floor(credit);
+        let projection_headroom = state_headroom(credit);
         if after < projection_headroom {
             eprintln!(
                 "Inkling CUDA relative attention not admitted after device allocation rounding"
@@ -203,12 +205,6 @@ impl Plan {
             }),
         }))
     }
-}
-
-fn reserve_floor(credit: u64) -> u64 {
-    VRAM_HEADROOM_BYTES
-        .saturating_sub(credit)
-        .max(DEVICE_HEADROOM)
 }
 
 fn shape(spec: &TextSpec, config: Config, visit: LayerVisit) -> Option<RelativeAttentionShape> {
@@ -428,9 +424,9 @@ mod tests {
 
     #[test]
     fn arena_credit_preserves_workspace_headroom() {
-        assert_eq!(reserve_floor(0), VRAM_HEADROOM_BYTES);
-        assert_eq!(reserve_floor(32 << 20), VRAM_HEADROOM_BYTES - (32 << 20));
-        assert_eq!(reserve_floor(VRAM_HEADROOM_BYTES), DEVICE_HEADROOM);
+        assert_eq!(state_headroom(0), VRAM_HEADROOM_BYTES);
+        assert_eq!(state_headroom(32 << 20), VRAM_HEADROOM_BYTES - (32 << 20));
+        assert_eq!(state_headroom(VRAM_HEADROOM_BYTES), DEVICE_HEADROOM);
     }
 
     #[test]

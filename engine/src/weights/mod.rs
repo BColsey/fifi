@@ -1,4 +1,5 @@
 mod acquire;
+pub(crate) mod dspark_gguf;
 #[cfg(all(
     feature = "native-fault-qualification",
     target_os = "macos",
