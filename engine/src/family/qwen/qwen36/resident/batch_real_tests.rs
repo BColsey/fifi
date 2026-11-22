@@ -458,3 +458,122 @@ fn real_weights_bf16_teacher_forced_distinct_prompts() {
 fn real_weights_compiled_device_identity_vs_off() {
     real_identity(true);
 }
+
+/// The first layer where a row of a window differs from the same state's one-row step, on the real
+/// checkpoint: two references (the compiled one-row step the engine serves with, and the uncompiled
+/// one), one window of 2 and one of 4 rows, every mixer and block output compared bit for bit.
+#[test]
+#[ignore = "real weights: Q36_CKPT_DIR required; names the first layer where a window row differs"]
+fn real_weights_first_layer_where_a_window_row_differs_from_solo() {
+    use super::super::layer_probe;
+    use super::super::weights::RMixer;
+    let _serial = crate::native_test_lock();
+    let dir = super::super::real::env_path("Q36_CKPT_DIR");
+    let bytes = std::fs::read(dir.join("tokenizer.json")).unwrap();
+    let tokenizer = crate::tokenizer::Tokenizer::from_bytes(&bytes).unwrap();
+    let prompts: Vec<_> = (0..4)
+        .map(|slot| {
+            let text = format!(
+                "Prompt {slot}. {}",
+                "Explain how ownership keeps Rust references valid. ".repeat(slot + 1)
+            );
+            tokenizer.encode(&text).unwrap()
+        })
+        .collect();
+    let real = super::super::real::open(&dir);
+    let host = HostWeights::load(
+        &real.ckpt,
+        &crate::family::spec::QWEN3_6_35B_A3B,
+        &real.config,
+    )
+    .unwrap();
+    let mut decoder = ResidentDecoder::new_with_activation(
+        MlxKernels::try_new().unwrap(),
+        &real.ckpt,
+        host,
+        512,
+        Activation::Bf16,
+    )
+    .unwrap();
+    decoder.routing = Routing::Device;
+    for rows in [2usize, 4] {
+        decoder.set_compile(false).unwrap();
+        let (mut off, mut window_states, tokens) = paired_states(&mut decoder, &prompts[..rows]);
+        let (mut on, _, _) = paired_states(&mut decoder, &prompts[..rows]);
+        decoder.set_compile(true).unwrap();
+        // Warm the one-row compiled blocks off the record.
+        let mut warm = decoder.zero_state().unwrap();
+        decoder
+            .prefill(&mut warm, &prompts[0], StepMode::Generate)
+            .unwrap();
+        decoder
+            .step(&mut warm, tokens[0], StepMode::Logits)
+            .unwrap();
+        let mut solo_probes = Vec::new();
+        for (name, states, compiled) in [("compiled", &mut on, true), ("off", &mut off, false)] {
+            decoder.set_compile(compiled).unwrap();
+            let mut per_state = Vec::new();
+            for (state, &token) in states.iter_mut().zip(&tokens) {
+                layer_probe::start();
+                decoder.step(state, token, StepMode::Logits).unwrap();
+                per_state.push(layer_probe::take());
+            }
+            solo_probes.push((name, per_state));
+        }
+        decoder.set_compile(true).unwrap();
+        // Switching compile off and on drops the prepared windows, so prepare after the last switch.
+        decoder.prepare_compiled_rows(&[rows]).unwrap();
+        let mut window: Vec<_> = window_states.iter_mut().collect();
+        let before = super::BATCH_CALLS.with(std::cell::Cell::get);
+        layer_probe::start();
+        decoder
+            .decode_rows(&mut window, &tokens, StepMode::Logits)
+            .unwrap();
+        let rows_probe = layer_probe::take();
+        assert_eq!(
+            super::BATCH_CALLS.with(std::cell::Cell::get),
+            before + 1,
+            "the rows ran as one window"
+        );
+        for (name, per_state) in &solo_probes {
+            let mut first: Option<String> = None;
+            let mut differing = 0usize;
+            for (slot, solo) in per_state.iter().enumerate() {
+                assert_eq!(solo.len(), rows_probe.len(), "{name}: one entry per block");
+                for (one, many) in solo.iter().zip(&rows_probe) {
+                    assert_eq!((one.layer, one.after), (many.layer, many.after));
+                    let width = one.values.len();
+                    let row = &many.values[slot * width..(slot + 1) * width];
+                    let equal = one
+                        .values
+                        .iter()
+                        .zip(row)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    if !equal {
+                        differing += 1;
+                        let worst = one
+                            .values
+                            .iter()
+                            .zip(row)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        if first.is_none() {
+                            let kind = match decoder.weights.layers[one.layer].mixer {
+                                RMixer::Delta(_) => "deltanet",
+                                RMixer::Attn(_) => "attention",
+                            };
+                            first = Some(format!(
+                                "slot {slot} layer {} ({kind}) after the {}: max abs diff {worst}",
+                                one.layer, one.after
+                            ));
+                        }
+                    }
+                }
+            }
+            println!(
+                "LAYER_PROBE window={rows} reference={name} differing_outputs={differing} first={}",
+                first.unwrap_or_else(|| "none: every output equal".into())
+            );
+        }
+    }
+}

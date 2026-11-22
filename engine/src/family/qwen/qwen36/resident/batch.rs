@@ -142,7 +142,8 @@ impl ResidentDecoder<'_> {
         check_dtype("embedding stack", &h, ctx.consts.act)?;
         let mut nexts: Vec<Vec<LayerState>> = (0..rows).map(|_| Vec::new()).collect();
         let mut health: Option<ExecutionTensor> = None;
-        for layer in weights.layers.iter() {
+        for (index, layer) in weights.layers.iter().enumerate() {
+            let _ = index; // read by the test probe only
             // The attention arm and the eager DeltaNet arm keep their external input norm (their
             // projections batch over [B, H] here); the compiled DeltaNet arm folds the norm and
             // the residual add into its closure, exactly like the solo step seam.
@@ -272,6 +273,8 @@ impl ResidentDecoder<'_> {
             };
             // Every arm returns the residual sum already: `mixed_stack` IS `mid`.
             let mid = mixed_stack;
+            #[cfg(test)]
+            super::layer_probe::record(&mut ctx, index, "mixer", &mid)?;
             // The FFN blocks fold the post norm and the output residual add: the compiled
             // closure bakes them, the eager arms run the same ops here.
             let h_next = match (&layer.feed_forward, compiled_rows) {
@@ -313,6 +316,8 @@ impl ResidentDecoder<'_> {
                 }
             };
             h = h_next;
+            #[cfg(test)]
+            super::layer_probe::record(&mut ctx, index, "block", &h)?;
             check_dtype("layer output", &h, ctx.consts.act)?;
         }
         // ONE head over all B rows: final norm, one lm_head matmul, one argmax.

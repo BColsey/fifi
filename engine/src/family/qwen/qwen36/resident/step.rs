@@ -149,6 +149,8 @@ pub(super) fn run(
         layers.push(next);
         // `mixed` is the residual sum already: the mixer folded the `h + mixed` add.
         let mid = mixed;
+        #[cfg(test)]
+        super::layer_probe::record(&mut ctx, index, "mixer", &mid)?;
         if let Some(trace_step) = trace_step {
             trace::hidden(&mut ctx, index, trace_step, &mid)?;
         }
@@ -194,6 +196,8 @@ pub(super) fn run(
         };
         // `routed` is the next residual stream already: the FFN folded the `mid + routed` add.
         h = routed;
+        #[cfg(test)]
+        super::layer_probe::record(&mut ctx, index, "block", &h)?;
         // MLX promotes mixed operands, so a stray F32 operand would turn BF16 activations back to
         // F32 without an error. The check keeps a BF16 run honest.
         check_dtype("layer output", &h, ctx.consts.act)?;

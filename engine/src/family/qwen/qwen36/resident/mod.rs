@@ -102,6 +102,13 @@ pub(super) mod executor;
 /// rewrite.
 #[cfg(test)]
 mod graph_count;
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod layer_probe;
 #[cfg(test)]
 mod load_timing;
 /// The long-context gate of the 8-bit KV cache. `cfg(test)` like `decode_timing`: the prompt
