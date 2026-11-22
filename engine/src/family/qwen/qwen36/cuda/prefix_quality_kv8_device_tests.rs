@@ -2,9 +2,7 @@
 use super::*;
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::qwen::qwen36::cuda::{
-    prefill_driver::pieces_of,
-    prefill_plan::Extra,
-    state::pinned::PinnedSnapshot,
+    prefill_driver::pieces_of, prefill_plan::Extra, state::pinned::PinnedSnapshot,
 };
 
 const ROWS: usize = 512;
