@@ -15,6 +15,7 @@
 //! `OpenSenseNova/llama.cpp@24ea7bb7` (`src/models/sensenova-loop.cpp`,
 //! `qwen35.cpp`, `delta-net-base.cpp`, `ggml` rope/YaRN).
 
+pub(crate) mod cuda;
 pub(crate) mod serve;
 mod step;
 #[cfg(test)]
