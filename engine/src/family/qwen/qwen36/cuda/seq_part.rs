@@ -236,6 +236,10 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
         self.complete_prefix_save()
     }
 
+    fn discard_save(&mut self) {
+        self.drop_pending_prefix();
+    }
+
     fn eos_ids(&self) -> std::sync::Arc<[u32]> {
         std::sync::Arc::clone(&self.rules.eos)
     }

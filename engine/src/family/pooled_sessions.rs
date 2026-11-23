@@ -90,6 +90,8 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     fn free_device_bytes(&self) -> Option<u64>;
     /// Finishes a save staged for the part that is about to leave.
     fn finish_save(&mut self) -> Result<()>;
+    /// Discards a staged save without publishing it when its owner's part is retired.
+    fn discard_save(&mut self);
     /// Runs before a session's decode: the host's per-job bookkeeping that its own `decode` does.
     fn before_decode(&mut self) {}
     /// Every id that ends generation: the host's shared handle.
@@ -303,10 +305,10 @@ impl<E: PartHost> PooledSessions<E> {
     fn reclaim(&mut self) {
         if self.orphaned() {
             // A save the dropped session staged that cannot finish is lost with it; its planes
-            // and cells go back all the same.
-            if self.deactivate().is_err() {
-                self.force_deactivate();
-            }
+            // and cells go back all the same. Discard it, do not publish: the entry would
+            // name a session nothing can restore.
+            self.step.discard_save();
+            self.force_deactivate();
         }
     }
 
@@ -975,6 +977,8 @@ mod tests {
         fail_grow: bool,
         /// A save is staged and not finished.
         staged: bool,
+        /// How many staged saves were discarded instead of finished.
+        discards: usize,
         /// The cells of the part each save and each restore ran over.
         saved: Vec<usize>,
         restored: Vec<usize>,
@@ -995,6 +999,7 @@ mod tests {
                 saves: 0,
                 fail_grow: false,
                 staged: false,
+                discards: 0,
                 saved: Vec::new(),
                 restored: Vec::new(),
                 free_bytes: None,
@@ -1136,6 +1141,13 @@ mod tests {
             Ok(())
         }
 
+        fn discard_save(&mut self) {
+            if self.staged {
+                self.discards += 1;
+                self.staged = false;
+            }
+        }
+
         fn eos_ids(&self) -> Arc<[u32]> {
             Arc::from(vec![EOS])
         }
@@ -1247,6 +1259,31 @@ mod tests {
         sessions
             .reset_for_request(&mut second, 100_000, None, false)
             .expect("and holds the same prompt");
+    }
+
+    #[test]
+    fn a_dropped_session_discards_its_staged_save_instead_of_publishing_it() {
+        let (mut sessions, mut first) = engine(8);
+        sessions
+            .reset_for_request(&mut first, 4, None, false)
+            .expect("the first request holds its prompt");
+        assert!(
+            sessions
+                .save_prefix(&first, &[7, 7], crate::family::session::SaveKind::Tip)
+                .expect("the save is staged over the resident part")
+        );
+        drop(first);
+        let mut second = sessions
+            .new_session()
+            .expect("the next request is admitted over the reclaimed part");
+        sessions
+            .reset_for_request(&mut second, 4, None, false)
+            .expect("and holds the same prompt");
+        assert_eq!(
+            (sessions.step.discards, sessions.step.staged),
+            (1, false),
+            "the orphan's staged save was discarded, not left for a later finish"
+        );
     }
 
     #[test]
