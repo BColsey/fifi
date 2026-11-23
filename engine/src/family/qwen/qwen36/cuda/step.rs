@@ -431,8 +431,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of each
     /// token syncs with the host: about 0.8 ms per token over the plain step when every expert is
     /// resident (3090, 256 slots, measured), and about 18 ms per step with most picks on the CPU
-    /// (slots 40 with preload, measured). A prompt is prefilled one token per step, so a prompt
-    /// of n tokens costs n of these steps until a batched tiered prefill exists.
+    /// (slots 40 with preload, measured). A prompt takes the chunked tiered prefill by default
+    /// (`Q36_TIERED_CHUNK`); `0` keeps one token per step.
     tiered_mode: bool,
     /// The tiered session takes the chunked prefill arm (`tiered_load::tiered_chunk_arm`).
     tiered_chunk: bool,
