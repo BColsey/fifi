@@ -127,12 +127,19 @@ impl PrefillConv {
 
     /// Borrows only complete, status-validated convolved rows. The caller must
     /// finish consuming the plane before publishing the raw history tail.
-    #[allow(dead_code, reason = "the resident depth consumer is wired separately")]
     pub(in crate::family::inkling2) fn convolved_plane(&self) -> Result<DeviceRange<'_>, EngError> {
         if self.written != self.rows {
             return Err(bad("incomplete CUDA prefill convolution visit"));
         }
         self.convolved.range(0, self.convolved.bytes())
+    }
+
+    /// Full chronological raw plane, excluding the fixed history prefix.
+    /// The caller must finish writing and checking every expert window first.
+    pub(in crate::family::inkling2) fn expert_destination(
+        &self,
+    ) -> Result<DeviceRange<'_>, EngError> {
+        Ok(self.destination(self.rows, false)?.raw)
     }
 
     fn destination(
@@ -464,6 +471,44 @@ impl ResidentAttention {
         )?;
         conv.written += rows.len();
         Ok(output)
+    }
+
+    /// Consume a checked, fully written raw expert plane. Publish nothing on failure.
+    pub(in crate::family::inkling2) fn finish_prefill_expert_conv(
+        &self,
+        context: &CudaContext,
+        conv: &mut PrefillConv,
+        status: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let destination = conv.destination(conv.rows, false)?;
+        let convolution = destination
+            .convolution
+            .expect("prefill convolution destination");
+        let [past, weight, output] = convolution.planes;
+        let mut health = vec![0; conv.rows * 4];
+        if status.bytes() != health.len() {
+            return Err(bad("incorrect CUDA expert convolution status extent"));
+        }
+        status
+            .buffer()
+            .write_at(&self.stream, status.offset(), &health)?;
+        context.inkling_output_conv(
+            &self.stream,
+            [destination.raw, past, weight, output, status],
+            OutputConvShape {
+                rows: conv.rows,
+                width: conv.stride / 4,
+                history: convolution.history,
+            },
+        )?;
+        status
+            .buffer()
+            .read_at(&self.stream, status.offset(), &mut health)?;
+        if health.iter().any(|&byte| byte != 0) {
+            return Err(bad("non-finite CUDA Inkling expert convolution"));
+        }
+        conv.written = conv.rows;
+        Ok(())
     }
 
     pub(in crate::family::inkling2) fn prefill_conv_tail(

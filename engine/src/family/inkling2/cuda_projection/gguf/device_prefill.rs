@@ -340,7 +340,7 @@ impl GgufCuda {
         &self,
         source: &mut impl ExpertPayloadSource,
         layer: u32,
-        batch: ExpertPrefillRows<'_>,
+        (batch, destination): (ExpertPrefillRows<'_>, Option<DeviceRange<'_>>),
         dtypes: [DenseDtype; 2],
         caps: [f32; 2],
         weight: impl Fn(usize, usize) -> f32,
@@ -351,6 +351,14 @@ impl GgufCuda {
         let Some((routes, hidden, retained)) = batch.prepare() else {
             return Ok(None);
         };
+        if let Some(out) = destination
+            && (!admits_router_input(routes.len(), hidden, out.bytes())
+                || !out.offset().is_multiple_of(4))
+        {
+            return Err(bad(
+                "incorrect CUDA expert output destination extent or alignment",
+            ));
+        }
         let rank = routes.ids().next().map_or(0, <[usize]>::len);
         if !self.valid_device_prefill(routes.len(), rank, dtypes, caps)
             || routes.ids().any(|ids| ids.len() != rank)
@@ -373,7 +381,11 @@ impl GgufCuda {
         let Some(scratch) = workspace.fit(cuda, routes.len(), projections.geometry)? else {
             return Ok(None);
         };
-        let mut output = Vec::with_capacity(routes.len());
+        let mut output = Vec::with_capacity(if destination.is_some() {
+            0
+        } else {
+            routes.len()
+        });
         let mut counts = [DenseGemvGroupCounts::default(); 2];
         let mut grouped_slots = [0; 2];
         for first in (0..routes.len()).step_by(scratch.rows) {
@@ -389,7 +401,10 @@ impl GgufCuda {
                 retained.is_some(),
                 |row, id| weight(first + row, id),
             )?;
-            let (rows, launches) = scratch.execute(cuda, &projections, &plan, input)?;
+            let target = destination
+                .map(|out| out.slice(first * hidden * 4, routes.len() * hidden * 4))
+                .transpose()?;
+            let (rows, launches) = scratch.execute(cuda, &projections, &plan, (input, target))?;
             output.extend(rows);
             for (total, count) in counts.iter_mut().zip(launches) {
                 total.wmma += count.wmma;
@@ -405,6 +420,7 @@ impl GgufCuda {
                 serde_json::json!({"layer": layer, "rows": routes.len(),
                     "windows": routes.len().div_ceil(scratch.rows),
                     "router_input_h2d_bytes_saved": retained.map_or(0, |input| input.bytes()),
+                    "expert_output_d2h_bytes_avoided": destination.map_or(0, |out| out.bytes()),
                     "wmma_gate_calls": counts[0].wmma, "wmma_down_calls": counts[1].wmma,
                     "grouped_dq_gate_slots": grouped_slots[0], "grouped_dq_down_slots": grouped_slots[1],
                     "exact_tile_gate_calls": counts[0].exact_tiles,
@@ -668,19 +684,22 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
-        retained: Option<DeviceRange<'_>>,
+        operands: (Option<DeviceRange<'_>>, Option<DeviceRange<'_>>),
     ) -> Result<(Vec<Vec<f32>>, [DenseGemvGroupCounts; 2]), EngError> {
         let l = &plan.layout;
         let upload = self.buffer.range(0, l.flag.end)?;
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(&self.stream, &mut self.host, 0, upload)?;
         let result = self
-            .enqueue(cuda, projections, plan, retained)
+            .enqueue(cuda, projections, plan, operands)
             .and_then(|counts| {
-                // The status word and reduced rows are contiguous; stage them in one copy.
-                let readback = self
-                    .buffer
-                    .range(l.flag.start, l.output.end - l.flag.start)?;
+                // With a device destination, only status crosses the host boundary.
+                let end = if operands.1.is_some() {
+                    l.flag.end
+                } else {
+                    l.output.end
+                };
+                let readback = self.buffer.range(l.flag.start, end - l.flag.start)?;
                 cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)?;
                 Ok(counts)
             });
@@ -694,6 +713,9 @@ impl Scratch {
             return Err(bad(
                 "CUDA expert prefill produced a nonfinite output or invalid route",
             ));
+        }
+        if operands.1.is_some() {
+            return Ok((Vec::new(), counts));
         }
         let mut out = vec![[0; 4]; l.output.len() / 4];
         self.host.read(l.output.start, out.as_flattened_mut())?;
@@ -709,7 +731,7 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
-        retained: Option<DeviceRange<'_>>,
+        (retained, output): (Option<DeviceRange<'_>>, Option<DeviceRange<'_>>),
     ) -> Result<[DenseGemvGroupCounts; 2], EngError> {
         let l = &plan.layout;
         let shape = projections.geometry;
@@ -756,7 +778,10 @@ impl Scratch {
                 inverse_ids: range(&l.inverse_ids)?,
                 scales: range(&l.down_scales)?,
                 weights: range(&l.weights)?,
-                out: range(&l.output)?,
+                out: match output {
+                    Some(range) => range,
+                    None => range(&l.output)?,
+                },
                 flag,
                 shape: RowShape {
                     rows: plan.rows,

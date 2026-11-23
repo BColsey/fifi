@@ -722,7 +722,7 @@ impl CpuForward {
         if let Some(output) = weights.prefill_device_experts(
             names,
             layer as u32,
-            batch,
+            (batch, None),
             [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
             |row, id| mlp[row].route.weight(id, self.math.route_scale),
         )? {
@@ -923,9 +923,26 @@ fn device_grouped_prefill_last_logits() {
     let (prefix, tail) = tokens.split_at(prefix_rows);
     model.prefill_grouped(prefix).unwrap();
     let saved = model.snapshot();
+    let trace = env::var("FIFI_INKLING_TEST_VISIT_FINGERPRINT").as_deref() == Ok("1");
+    if trace {
+        eprintln!(
+            "Inkling first visit prefill state {:016x}",
+            model.state[0].parity_fingerprint()
+        );
+    }
     let continuation = |model: &mut CpuForward| -> Vec<u8> {
         tail.iter()
-            .flat_map(|&token| model.token(token, true).unwrap().unwrap())
+            .enumerate()
+            .flat_map(|(i, &token)| {
+                let logits = model.token(token, true).unwrap().unwrap();
+                if trace && i == 0 {
+                    eprintln!(
+                        "Inkling first visit first-decode state {:016x}",
+                        model.state[0].parity_fingerprint()
+                    );
+                }
+                logits
+            })
             .flat_map(f32::to_le_bytes)
             .collect()
     };

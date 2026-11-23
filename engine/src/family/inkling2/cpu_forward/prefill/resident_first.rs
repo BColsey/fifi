@@ -10,12 +10,13 @@ use crate::{
     family::inkling2::cuda_projection::gguf::attention::prefill,
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
-        resident::inkling_local_prep::DepthShape,
+        resident::{inkling_local_prep::DepthShape, row_add::RowAddCall},
     },
 };
 use std::sync::{Once, OnceLock};
 
 const ENABLED: &str = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_FIRST_VISIT";
+const EXPERT_CONV: &str = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_EXPERT_CONV";
 
 struct Scratch {
     shape: DepthShape,
@@ -99,12 +100,40 @@ impl Scratch {
         Ok(expert_input)
     }
 
-    fn materialize(&self) -> Result<Vec<u8>, EngError> {
+    fn status(&self) -> Result<DeviceRange<'_>, EngError> {
         let [p, q, _, o] = self.shape.words().unwrap();
-        let mut raw = vec![0; o * 4];
         self.device
-            .read_at(&self.stream, (p + 2 * q) * 4, &mut raw)?;
-        Ok(raw)
+            .range((p + 2 * q + 3 * o) * 4, self.shape.rows * 4)
+    }
+
+    fn materialize(
+        &self,
+        update: Option<(&CudaContext, DeviceRange<'_>)>,
+    ) -> Result<Vec<u8>, EngError> {
+        let [p, q, _, o] = self.shape.words().unwrap();
+        let raw = self.device.range((p + 2 * q) * 4, o * 4)?;
+        let result = if let Some((ctx, convolved)) = update {
+            // The mix is dead after MLP norm; reuse that plane for the residual sum.
+            let out = self.device.range(raw.offset() + raw.bytes(), raw.bytes())?;
+            ctx.row_add(
+                &self.stream,
+                RowAddCall {
+                    out,
+                    x: raw,
+                    y: convolved,
+                    n: o,
+                    flag: None,
+                    fused: false,
+                },
+            )?;
+            out
+        } else {
+            raw
+        };
+        let mut host = vec![0; result.bytes()];
+        self.device
+            .read_at(&self.stream, result.offset(), &mut host)?;
+        Ok(host)
     }
 }
 
@@ -144,7 +173,7 @@ impl CpuForward {
         {
             return Ok(false);
         }
-        let Some((ctx, _)) = weights.resident_attention() else {
+        let Some((ctx, attention)) = weights.resident_attention() else {
             return Ok(false);
         };
         let Some(bridge) = self.prefill_bridge(layer, visit, prefill::resident_query_enabled())?
@@ -156,7 +185,13 @@ impl CpuForward {
             width,
             depth: 2,
         };
-        if shape.words().is_none() {
+        let Some([_, _, _, plane]) = shape.words() else {
+            return Ok(false);
+        };
+        static DEVICE_CONV: OnceLock<bool> = OnceLock::new();
+        let device_conv =
+            *DEVICE_CONV.get_or_init(|| std::env::var(EXPERT_CONV).as_deref() == Ok("1"));
+        if device_conv && !plane.is_multiple_of(32) {
             return Ok(false);
         }
         let mut scratch = match Scratch::allocate(ctx, shape) {
@@ -166,6 +201,14 @@ impl CpuForward {
         };
         let Some(mut conv) = bridge.admit_conv(self, state, rows.len())? else {
             return Ok(false);
+        };
+        let mut mlp_conv = if device_conv {
+            let Some(conv) = bridge.admit_mlp_conv(self, state, rows.len())? else {
+                return Ok(false);
+            };
+            Some(conv)
+        } else {
+            None
         };
         if !weights.admit_resident_prefill_experts(
             names,
@@ -214,11 +257,17 @@ impl CpuForward {
                 .prefill_device_experts(
                     names,
                     0,
-                    ExpertPrefillRows::Resident {
-                        ids: &ids,
-                        hidden: width,
-                        activations,
-                    },
+                    (
+                        ExpertPrefillRows::Resident {
+                            ids: &ids,
+                            hidden: width,
+                            activations,
+                        },
+                        mlp_conv
+                            .as_ref()
+                            .map(|conv| conv.expert_destination())
+                            .transpose()?,
+                    ),
                     caps,
                     |row, id| routes[row].weight(id, self.math.route_scale),
                 )?
@@ -227,12 +276,19 @@ impl CpuForward {
                 })?
         };
         bridge.publish_conv_tail(state, conv)?;
-        let raw = scratch.materialize()?;
-        for ((row, raw_row), output) in rows
-            .iter_mut()
-            .zip(raw.chunks_exact(4 * width))
-            .zip(outputs)
-        {
+        let raw = if let Some(mut conv) = mlp_conv {
+            attention.finish_prefill_expert_conv(ctx, &mut conv, scratch.status()?)?;
+            let raw = scratch.materialize(Some((ctx, conv.convolved_plane()?)))?;
+            bridge.publish_mlp_conv_tail(state, conv)?;
+            static USED_CONV: Once = Once::new();
+            USED_CONV
+                .call_once(|| eprintln!("Inkling CUDA used resident expert output convolution"));
+            raw
+        } else {
+            scratch.materialize(None)?
+        };
+        let mut outputs = outputs.into_iter();
+        for (row, raw_row) in rows.iter_mut().zip(raw.chunks_exact(4 * width)) {
             row.taps.capture(visit.state_slot, row.stream.current());
             row.stream.seal(
                 raw_row
@@ -240,7 +296,12 @@ impl CpuForward {
                     .map(|x| f32::from_ne_bytes(x.try_into().unwrap()))
                     .collect(),
             );
-            self.finish_layer(layer, state, &mut row.stream, output)?;
+            if !device_conv {
+                let output = outputs
+                    .next()
+                    .ok_or_else(|| bad("missing CUDA expert output row"))?;
+                self.finish_layer(layer, state, &mut row.stream, output)?;
+            }
         }
         static USED: Once = Once::new();
         USED.call_once(|| eprintln!("Inkling CUDA used resident prefill first visit"));

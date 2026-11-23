@@ -731,6 +731,29 @@ impl VisitState {
         self.position
     }
 
+    #[cfg(test)]
+    pub(super) fn parity_fingerprint(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hash = DefaultHasher::new();
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.position.hash(&mut hash);
+        fn plane<'a>(rows: impl ExactSizeIterator<Item = &'a Vec<f32>>, hash: &mut DefaultHasher) {
+            rows.len().hash(hash);
+            for row in rows {
+                row.len().hash(hash);
+                for &value in row {
+                    value.to_bits().hash(hash);
+                }
+            }
+        }
+        plane(self.keys.iter().map(Arc::as_ref), &mut hash);
+        plane(self.values.iter().map(Arc::as_ref), &mut hash);
+        for conv in [&self.conv.k, &self.conv.v, &self.conv.attn, &self.conv.mlp] {
+            plane(conv.0.iter(), &mut hash);
+        }
+        hash.finish()
+    }
+
     pub(super) fn checkpoint(&self, capacity: usize) -> VisitUndo {
         self.checkpoint_attention(capacity).with_mlp(self)
     }
@@ -825,6 +848,29 @@ impl PrefillBridge<'_> {
             .vec(&format!("{}.attn_sconv.weight", self.layer), width * 4)?;
         self.device
             .admit_prefill_conv(self.context, [rows, width], &state.conv.attn.0, &filter)
+    }
+
+    pub(super) fn admit_mlp_conv(
+        &self,
+        forward: &CpuForward,
+        state: &VisitState,
+        rows: usize,
+    ) -> Result<Option<attention::prefill::PrefillConv>, EngError> {
+        let width = forward.hidden();
+        let filter = forward
+            .weights
+            .vec(&format!("{}.mlp_sconv.weight", self.layer), width * 4)?;
+        self.device
+            .admit_prefill_conv(self.context, [rows, width], &state.conv.mlp.0, &filter)
+    }
+
+    pub(super) fn publish_mlp_conv_tail(
+        &self,
+        state: &mut VisitState,
+        conv: attention::prefill::PrefillConv,
+    ) -> Result<(), EngError> {
+        state.conv.mlp.0 = self.device.prefill_conv_tail(conv)?;
+        Ok(())
     }
 
     pub(super) fn publish_conv_tail(

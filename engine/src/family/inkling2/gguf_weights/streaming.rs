@@ -196,7 +196,7 @@ impl GgufTextWeights {
         &self,
         names: [&str; 2],
         layer: u32,
-        rows: ExpertPrefillRows<'_>,
+        operands: (ExpertPrefillRows<'_>, Option<DeviceRange<'_>>),
         caps: [f32; 2],
         route_weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
@@ -210,7 +210,7 @@ impl GgufTextWeights {
         let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
             return Ok(None);
         };
-        cuda.prefill_device_experts(&mut source, layer, rows, dtypes, caps, route_weight)
+        cuda.prefill_device_experts(&mut source, layer, operands, dtypes, caps, route_weight)
     }
 
     pub(in crate::family::inkling2) fn prefill_bank_report(
