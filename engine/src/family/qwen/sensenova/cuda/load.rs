@@ -12,7 +12,6 @@
 //! token is gathered on the host, and the card spends its bytes on `output.weight`
 //! (≈0.5 GB Q4_K_M) which every step needs.
 
-use super::super::weights::LoopShape;
 use super::super::{LoopPlan, PHYSICAL_LAYERS};
 
 /// Every tensor the device holds, in load order: the root head, then each physical
@@ -116,21 +115,6 @@ mod tests {
 
     #[test]
     fn template_covers_every_physical_layer_once() {
-        let shape = LoopShape {
-            hidden: 4096,
-            feed_forward: 12_288,
-            heads_q: 16,
-            heads_kv: 4,
-            head_dim: 256,
-            delta_key_heads: 16,
-            delta_key_dim: 128,
-            delta_value_heads: 32,
-            delta_value_dim: 128,
-            conv_kernel: 4,
-            vocab: 248_320,
-            context: 524_288,
-            eps: 1e-6,
-        };
         let plan = pinned_plan();
         let names = tensor_names(&plan);
         // No tensor twice (a revisited block's tensors appear under one stem only).

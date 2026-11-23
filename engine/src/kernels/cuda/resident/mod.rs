@@ -81,6 +81,7 @@ pub(crate) mod add_rmsnorm_q8;
 pub(crate) mod argmax_rows;
 pub(crate) mod attn_decode;
 pub(crate) mod attn_decode_gemma;
+pub(crate) mod attn_decode_loop;
 pub(crate) mod attn_decode_q8;
 pub(crate) mod attn_prep;
 pub(crate) mod block_ops;

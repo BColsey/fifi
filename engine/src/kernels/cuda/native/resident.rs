@@ -54,6 +54,7 @@ pub(in crate::kernels::cuda) mod add_rmsnorm_q8;
 pub(in crate::kernels::cuda) mod argmax_rows;
 pub(in crate::kernels::cuda) mod attn_decode;
 pub(in crate::kernels::cuda) mod attn_decode_gemma;
+pub(in crate::kernels::cuda) mod attn_decode_loop;
 pub(in crate::kernels::cuda) mod attn_decode_q8;
 pub(in crate::kernels::cuda) mod attn_prep;
 pub(in crate::kernels::cuda) mod block_ops;
