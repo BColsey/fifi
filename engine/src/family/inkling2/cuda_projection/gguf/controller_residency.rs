@@ -5,10 +5,9 @@ use super::{
     device_prefill, projection_bytes, upload_projections,
 };
 
+use crate::family::mem::DEVICE;
+
 const MAX_CHARGE: u64 = 64 << 20;
-// Cover lazy attention/controller staging and driver rounding for the first and
-// replacement expert prefill arena. Individual allocations still check live VRAM.
-const LAZY_MARGIN: u64 = 32 << 20;
 
 pub(super) fn enabled() -> bool {
     std::env::var("FIFI_INKLING_CUDA_RESIDENT_CONTROLLERS").as_deref() == Ok("1")
@@ -79,7 +78,7 @@ fn is_missing_controller(group: &[GgufDenseUpload<'_>], dense: &Projections) -> 
 pub(super) fn workspace_floor(expert_workspace: u64) -> Option<u64> {
     expert_workspace
         .checked_mul(2)?
-        .checked_add(DEVICE_HEADROOM + LAZY_MARGIN)
+        .checked_add(DEVICE_HEADROOM + DEVICE.inkling_controller_margin)
 }
 
 fn minimum_free(before: u64, original_floor: u64, expert_workspace: u64) -> Option<u64> {
