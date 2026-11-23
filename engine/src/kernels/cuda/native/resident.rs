@@ -1144,6 +1144,7 @@ fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
     let norm = ROWS_HEAD_DIM * 4;
     let q = mul(mul(mul(m, heads)?, ROWS_HEAD_DIM)?, 4)?;
     let rows = mul(mul(mul(m, kv)?, ROWS_HEAD_DIM)?, 4)?;
+    let inv_freq = mul(cvt(io.ints.n_rot)? / 2, 4)?;
     let fits = |range: &RawRange<'_>, bytes: usize, align: usize| {
         range.bytes >= bytes && range.offset.is_multiple_of(align)
     };
@@ -1158,7 +1159,7 @@ fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
         && io
             .inv_freq
             .as_ref()
-            .is_none_or(|range| fits(range, mul(cvt(io.ints.n_rot)? / 2, 4)?, 4)))
+            .is_none_or(|range| fits(range, inv_freq, 4)))
     {
         return Err(invalid_argument());
     }
@@ -1175,7 +1176,7 @@ fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
         Span::of(&io.pos, 4),
     ];
     if let Some(range) = &io.inv_freq {
-        let span = Span::of(range, mul(cvt(io.ints.n_rot)? / 2, 4)?);
+        let span = Span::of(range, inv_freq);
         // A read may overlap another read; only the written extents must stay apart.
         if !written.iter().all(|other| span.apart(other)) {
             return Err(invalid_argument());
