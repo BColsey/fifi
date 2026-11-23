@@ -2226,7 +2226,7 @@ fn chunk_moe_tiered_arm_fails_clean_on_empty_banks() {
             scratch,
             host,
             super::tiered_step::FillQueue::new(&ctx)?,
-            None,
+            super::tiered_step::ColdSet::none(),
         )?;
         // A valid MoeChunkIo over small buffers, all NaN-prefilled.
         let m = 4usize;

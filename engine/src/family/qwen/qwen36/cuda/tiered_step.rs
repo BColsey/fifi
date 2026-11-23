@@ -430,8 +430,10 @@ impl<'w> TieredRuntime<'w> {
     pub(super) fn pinned_bytes(&self) -> u64 {
         let ring: usize = self
             .cold
-            .as_ref()
-            .map_or(0, |cold| cold.ring.iter().map(|slot| slot.buf.len()).sum());
+            .stagings
+            .iter()
+            .map(|cold| cold.ring.iter().map(|slot| slot.buf.len()).sum::<usize>())
+            .sum();
         let route = self.route.pinned.as_ref().map_or(0, PinnedBuf::len)
             + self.route.partial.as_ref().map_or(0, PinnedBuf::len);
         u64::try_from(ring + route).unwrap_or(u64::MAX)
@@ -443,7 +445,7 @@ impl<'w> TieredRuntime<'w> {
         scratch: TieredScratch,
         host: TieredHost,
         fills: FillQueue,
-        cold: Option<ColdStaging>,
+        cold: ColdSet,
     ) -> Result<Self, EngError> {
         if parts.len() != banks.len() {
             return Err(EngError::BadRequest(format!(
