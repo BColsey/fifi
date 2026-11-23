@@ -77,7 +77,7 @@ impl DenseStep {
         inputs: &[[ControlledAttentionInput<'_>; 3]],
         controllers: [ControllerWeights<'_>; 3],
         weights: [Option<ResidentProjection<'_>>; N],
-        (eps, arithmetic, keep): (f32, Arithmetic, &[usize]),
+        (eps, arithmetic, keep, scales): (f32, Arithmetic, &[usize], Option<&[[[f32; 2]; 3]]>),
     ) -> Result<Option<ProjectionTile<'_, N>>, EngError> {
         let Some(first) = inputs.first() else {
             return Ok(None);
@@ -93,15 +93,18 @@ impl DenseStep {
         {
             return Ok(None);
         }
-        if controllers.iter().any(|w| {
-            w.map(|(x, _)| x.shape) != [[rank, 2 * hidden], [hidden, rank], [hidden, rank]]
-        }) || inputs.iter().flatten().any(|r| {
-            r.gate.len() != 2 * hidden
-                || [r.input.len(), r.message.len(), r.gamma.len()] != [hidden; 3]
-        }) || weights
-            .iter()
-            .flatten()
-            .any(|p| p.input >= 3 || p.weight.shape[1] != hidden)
+        if scales.is_some_and(|s| s.len() != m)
+            || controllers.iter().any(|w| {
+                w.map(|(x, _)| x.shape) != [[rank, 2 * hidden], [hidden, rank], [hidden, rank]]
+            })
+            || inputs.iter().flatten().any(|r| {
+                r.gate.len() != 2 * hidden
+                    || [r.input.len(), r.message.len(), r.gamma.len()] != [hidden; 3]
+            })
+            || weights
+                .iter()
+                .flatten()
+                .any(|p| p.input >= 3 || p.weight.shape[1] != hidden)
         {
             return Err(bad("invalid batched CUDA controlled attention shape"));
         }
@@ -124,7 +127,14 @@ impl DenseStep {
         let health_at = reduced + 3 * m * rank;
         let out_at = health_at + 3 * m;
         let range = |offset, len| self.range(Slot::Output, offset, len);
-        let upload = range(0, gates + raw)?;
+        // Use the start of the gain scratch for scales; the first kernel reads
+        // them before any controller GEMV writes coefficients into that region.
+        let scale_words = 6 * m;
+        let upload = if scales.is_some() {
+            range(gates, raw + scale_words)?
+        } else {
+            range(0, gates + raw)?
+        };
         let workspace = range(norm, 18 * m * hidden)?;
         let health = range(health_at, 3 * m)?;
         let mut host_widths = widths;
@@ -169,9 +179,11 @@ impl DenseStep {
             projections.push(self.batch_call((p.weight, p.dtype), shape, [x, y])?);
         }
         let mut staged = Vec::with_capacity(12 * m);
-        for role in 0..3 {
-            for row in inputs {
-                staged.push(row[role].gate);
+        if scales.is_none() {
+            for role in 0..3 {
+                for row in inputs {
+                    staged.push(row[role].gate);
+                }
             }
         }
         for role in 0..3 {
@@ -179,7 +191,18 @@ impl DenseStep {
                 staged.extend([row[role].input, row[role].message, row[role].gamma]);
             }
         }
+        if let Some(scales) = scales {
+            for role in 0..3 {
+                staged.extend(scales.iter().map(|row| row[role].as_slice()));
+            }
+        }
+        let rebuild = scales
+            .map(|_| range(0, gates + raw + scale_words))
+            .transpose()?;
         let values = self.run_rows(context, &self.stream, &staged, [upload, readback], || {
+            if let Some(workspace) = rebuild {
+                context.inkling_rebuild_gates(&self.stream, workspace, [hidden, 3 * m])?;
+            }
             context.dense_gemv_group(&self.stream, &control)?;
             context.inkling_controller_norm_with_arithmetic(
                 &self.stream,

@@ -815,6 +815,17 @@ impl CpuForward {
         physical: usize,
         role: Role,
     ) -> Result<ControlInput, EngError> {
+        self.control_input_with_scales(input, bank, physical, role)
+            .map(|(control, _)| control)
+    }
+
+    fn control_input_with_scales(
+        &self,
+        input: &[f32],
+        bank: &MessageBank,
+        physical: usize,
+        role: Role,
+    ) -> Result<(ControlInput, [f32; 2]), EngError> {
         let (kind, offset) = match role {
             Role::Query => ("cross_pass_queries", 0),
             Role::Key => ("cross_pass_kv_queries", 0),
@@ -830,10 +841,12 @@ impl CpuForward {
         let message = bank.stream.mix(bank.first_block, &query);
         let mut gate = input.to_vec();
         gate.extend_from_slice(&message);
-        for half in gate.chunks_exact_mut(self.hidden()) {
-            rms_norm(half, MIX_EPS);
-        }
-        Ok(ControlInput { gate, message })
+        let (left, right) = gate.split_at_mut(self.hidden());
+        let scales = [
+            rms_norm_with_scale(left, MIX_EPS),
+            rms_norm_with_scale(right, MIX_EPS),
+        ];
+        Ok((ControlInput { gate, message }, scales))
     }
 
     fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {
@@ -1169,10 +1182,15 @@ pub(super) fn dot(x: &[f32], y: &[f32]) -> f32 {
 }
 
 pub(super) fn rms_norm(x: &mut [f32], eps: f32) {
+    rms_norm_with_scale(x, eps);
+}
+
+fn rms_norm_with_scale(x: &mut [f32], eps: f32) -> f32 {
     let scale = (dot(x, x) / x.len() as f32 + eps).sqrt().recip();
     for value in x {
         *value *= scale;
     }
+    scale
 }
 
 pub(super) fn sigmoid(x: f32) -> f32 {

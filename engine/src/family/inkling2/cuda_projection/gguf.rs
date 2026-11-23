@@ -155,10 +155,11 @@ impl AttentionControllers<'_> {
         eps: f32,
     ) -> Result<Option<Vec<[Vec<f32>; N]>>, EngError> {
         let mut result = Vec::with_capacity(inputs.len());
-        let admitted = self.grouped_chained_tiles(inputs, requests, (eps, &[]), |host, _| {
-            result.extend(host);
-            Ok(())
-        })?;
+        let admitted =
+            self.grouped_chained_tiles(inputs, requests, (eps, &[], None), |host, _| {
+                result.extend(host);
+                Ok(())
+            })?;
         Ok(admitted.then_some(result))
     }
 
@@ -166,7 +167,7 @@ impl AttentionControllers<'_> {
         &self,
         inputs: &[[ControlledAttentionInput<'_>; 3]],
         requests: [Option<Projection<'_>>; N],
-        (eps, keep): (f32, &[usize]),
+        (eps, keep, scales): (f32, &[usize], Option<&[[[f32; 2]; 3]]>),
         mut consume: impl FnMut(Vec<[Vec<f32>; N]>, Option<DeviceRange<'_>>) -> Result<(), EngError>,
     ) -> Result<bool, EngError> {
         let [Some(q), Some(k), Some(v)] = self.weights else {
@@ -186,15 +187,20 @@ impl AttentionControllers<'_> {
         if capacity < 2 {
             return Ok(false);
         }
+        if scales.is_some_and(|s| s.len() != inputs.len()) {
+            return Err(bad("invalid Inkling controller gate scale row count"));
+        }
         let arithmetic = grouped_controller_arithmetic::select();
-        for chunk in inputs.chunks(capacity) {
+        for (index, chunk) in inputs.chunks(capacity).enumerate() {
+            let first = index * capacity;
+            let tile_scales = scales.map(|s| &s[first..first + chunk.len()]);
             let (host, device) = step
                 .controlled_attention_batch(
                     &self.cuda.context,
                     chunk,
                     [q, k, v],
                     weights,
-                    (eps, arithmetic, keep),
+                    (eps, arithmetic, keep, tile_scales),
                 )?
                 .ok_or_else(|| bad("admitted CUDA controlled attention batch declined"))?;
             if host.len() != chunk.len() {
@@ -209,7 +215,8 @@ impl AttentionControllers<'_> {
                 "Inkling CUDA grouped query tiles {}",
                 serde_json::json!({"rows": inputs.len(), "tile_rows": capacity,
                     "tiles": inputs.len().div_ceil(capacity),
-                    "wide": !std::ptr::eq(step, &self.cuda.step)})
+                    "wide": !std::ptr::eq(step, &self.cuda.step),
+                    "gate_upload_bytes_saved": scales.map_or(0, |s| s.len() * 6 * (self.shape[1] - 1) * 4)})
             );
         }
         Ok(true)

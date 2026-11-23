@@ -25,6 +25,7 @@ pub(super) enum ChainedAttention {
 struct PreparedInput {
     input: Vec<f32>,
     control: ControlInput,
+    gate_scales: [f32; 2],
 }
 
 impl CpuForward {
@@ -246,11 +247,26 @@ impl CpuForward {
         let result =
             self.attention_requests(layer, visit.attention, |calls| -> Result<_, EngError> {
                 if let Some(bridge) = &bridge {
+                    static REBUILD: OnceLock<bool> = OnceLock::new();
+                    let rebuild = *REBUILD.get_or_init(|| {
+                        std::env::var("FIFI_INKLING_CUDA_PREFILL_REBUILD_GATES").as_deref()
+                            == Ok("1")
+                    });
+                    let scales: Option<Vec<_>> = rebuild.then(|| {
+                        prepared
+                            .iter()
+                            .map(|row| row.each_ref().map(|role| role.gate_scales))
+                            .collect()
+                    });
                     let mut output = Vec::with_capacity(inputs.len());
                     let admitted = controllers.grouped_chained_tiles(
                         &inputs,
                         calls,
-                        (self.math.rms_norm_eps, prefill::projection_side(true)),
+                        (
+                            self.math.rms_norm_eps,
+                            prefill::projection_side(true),
+                            scales.as_deref(),
+                        ),
                         |host, range| {
                             let range =
                                 range.ok_or_else(|| bad("missing resident Inkling query tile"))?;
@@ -446,9 +462,17 @@ impl CpuForward {
                 Some(input) => input.clone(),
                 None => self.attention_input(visit, stream, index)?,
             };
-            let control =
-                self.control_input(&input, bank, visit.weight_layer, ATTENTION_ROLES[index].0)?;
-            Ok::<_, EngError>(PreparedInput { input, control })
+            let (control, gate_scales) = self.control_input_with_scales(
+                &input,
+                bank,
+                visit.weight_layer,
+                ATTENTION_ROLES[index].0,
+            )?;
+            Ok::<_, EngError>(PreparedInput {
+                input,
+                control,
+                gate_scales,
+            })
         });
         Ok([q?, k?, v?])
     }

@@ -8,6 +8,16 @@
 namespace {
 constexpr int threads = 256;
 
+// Packed [gate outputs | raw triples | scale pairs], all in role order.
+__global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
+    const int role = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 2 * width) return;
+    const float *raw = workspace + 2 * roles * width + role * 3 * width;
+    const float *scales = workspace + 5 * roles * width + 2 * role;
+    workspace[role * 2 * width + i] = __fmul_rn(raw[i], scales[i >= width]);
+}
+
 __global__ void inkling_controller_norm(float *workspace, float *health, int width, float eps) {
     const int role = blockIdx.x;
     const int roles = gridDim.x;
@@ -96,6 +106,20 @@ __global__ void inkling_controller_norm_cpu_parity(float *workspace, float *heal
     if (lane == 0) health[role] = failed ? __int_as_float(0x7fc00000) : 0.0f;
 }
 }  // namespace
+
+extern "C" int inference_cuda_inkling_rebuild_gates(float *workspace, int width, int roles,
+                                                    void *stream, int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    if (!workspace || !stream || uintptr_t(workspace) % alignof(float) ||
+        width < 1 || width > 4096 || roles < 1 || roles > 1536)
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    const dim3 grid((2 * width + threads - 1) / threads, roles);
+    inkling_rebuild_gates<<<grid, threads, 0, (cudaStream_t)stream>>>(workspace, width, roles);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return int(failure.err);
+}
 
 extern "C" int inference_cuda_inkling_controller_norm(float *workspace, float *health,
                                                       int width, int roles, float eps, int cpu_parity,

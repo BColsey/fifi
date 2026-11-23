@@ -94,7 +94,7 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
             &rows,
             controllers,
             weights,
-            (eps, Arithmetic::Generic, &[]),
+            (eps, Arithmetic::Generic, &[], None),
         )
         .unwrap()
         .unwrap();
@@ -105,7 +105,7 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
             &rows,
             controllers,
             weights,
-            (eps, Arithmetic::Generic, &[0, 2]),
+            (eps, Arithmetic::Generic, &[0, 2], None),
         )
         .unwrap()
         .unwrap();
@@ -143,7 +143,7 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
             &rows,
             controllers,
             weights,
-            (eps, Arithmetic::CpuParity, &[]),
+            (eps, Arithmetic::CpuParity, &[], None),
         )
         .unwrap()
         .is_none()
@@ -151,7 +151,34 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
     let long_raw: Vec<_> = (0..9)
         .map(|row| std::array::from_fn(|i| fixture(hidden, 2 + 5 * row + 7 * i)))
         .collect();
-    let long = make_rows(&long_raw, &gates, &messages, &gamma);
+    let scales: Vec<_> = (0..9)
+        .map(|row| {
+            std::array::from_fn(|role| {
+                [
+                    (row + role + 1) as f32 * 0.125,
+                    (2 * row + role + 1) as f32 * 0.25,
+                ]
+            })
+        })
+        .collect();
+    let long_gates: Vec<[Vec<f32>; 3]> = long_raw
+        .iter()
+        .zip(&scales)
+        .map(|(rows, scales)| {
+            std::array::from_fn(|role| {
+                rows[role]
+                    .iter()
+                    .map(|x| x * scales[role][0])
+                    .chain(messages[role].iter().map(|x| x * scales[role][1]))
+                    .collect()
+            })
+        })
+        .collect();
+    let long: Vec<_> = long_raw
+        .iter()
+        .zip(&long_gates)
+        .flat_map(|(raw, gates)| make_rows(std::slice::from_ref(raw), gates, &messages, &gamma))
+        .collect();
     let wide = DensePlan::new(
         [
             8 * DenseStep::controlled_attention_row_words([rank, hidden], 36).unwrap(),
@@ -162,7 +189,7 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
     )
     .unwrap();
     let eight = DenseStep::new(&context, &wide).unwrap();
-    let compare = |step: &DenseStep, width| {
+    let compare = |step: &DenseStep, width, rebuild: bool| {
         assert_eq!(
             step.controlled_attention_batch_capacity([rank, hidden], weights)
                 .unwrap(),
@@ -170,14 +197,19 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
         );
         let mut host_bits = Vec::new();
         let mut side_bytes = Vec::new();
-        for chunk in long.chunks(width) {
+        for (chunk, scale_rows) in long.chunks(width).zip(scales.chunks(width)) {
             let (host, side) = step
                 .controlled_attention_batch(
                     &context,
                     chunk,
                     controllers,
                     weights,
-                    (eps, Arithmetic::CpuParity, &[0, 2]),
+                    (
+                        eps,
+                        Arithmetic::CpuParity,
+                        &[0, 2],
+                        rebuild.then_some(scale_rows),
+                    ),
                 )
                 .unwrap()
                 .unwrap();
@@ -194,7 +226,34 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
         assert_eq!(side_bytes.len(), 9 * 24 * 4);
         (host_bits, side_bytes)
     };
-    assert_eq!(compare(&batch_step, 3), compare(&eight, 8));
+    let expected = compare(&batch_step, 3, false);
+    assert_eq!(expected, compare(&eight, 8, false));
+    assert_eq!(expected, compare(&batch_step, 3, true));
+    assert_eq!(expected, compare(&eight, 8, true));
+    assert!(
+        eight
+            .controlled_attention_batch(
+                &context,
+                &long[..1],
+                controllers,
+                weights,
+                (eps, Arithmetic::CpuParity, &[], Some(&[])),
+            )
+            .is_err()
+    );
+    let poisoned_scales = [[[f32::NAN, 1.0]; 3]];
+    assert_eq!(
+        eight
+            .controlled_attention_batch(
+                &context,
+                &long[..1],
+                controllers,
+                weights,
+                (eps, Arithmetic::CpuParity, &[], Some(&poisoned_scales)),
+            )
+            .err(),
+        Some(bad("CUDA projection requires finite input"))
+    );
     let small = DensePlan::new([24 * hidden - 32, 2 * hidden], hidden, rank).unwrap();
     assert!(
         run(&DenseStep::new(&context, &small).unwrap(), &raw)
@@ -210,7 +269,7 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
                 &poisoned,
                 controllers,
                 weights,
-                (eps, Arithmetic::Generic, &[0, 2, 3]),
+                (eps, Arithmetic::Generic, &[0, 2, 3], None),
             )
             .err(),
         Some(bad("CUDA projection produced a nonfinite output")),

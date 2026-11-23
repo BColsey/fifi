@@ -7,9 +7,22 @@ use crate::EngError;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
 pub(crate) use super::super::native::resident::inkling_controller::Arithmetic;
-use super::super::native::resident::inkling_controller::launch;
+use super::super::native::resident::inkling_controller::{launch, rebuild_gates};
 
 impl CudaContext {
+    /// Rebuild gates from the host's exact RMS scales. The workspace is packed
+    /// as gate outputs, [input, message, gamma] triples, then scale pairs.
+    pub(crate) fn inkling_rebuild_gates(
+        &self,
+        stream: &DeviceStream,
+        workspace: DeviceRange<'_>,
+        shape: [usize; 2],
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let workspace = self.raw_range(&workspace)?;
+        self.launch_on(stream, |raw| rebuild_gates(raw, workspace, shape))
+    }
+
     /// The workspace packs three [input, message, gamma] triples, three
     /// [gain, forget] pairs and three normalized output rows, in that order.
     /// Health is three floats: zero on success or NaN on invalid arithmetic.

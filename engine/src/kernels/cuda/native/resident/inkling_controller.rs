@@ -12,6 +12,14 @@ pub(crate) enum Arithmetic {
 }
 
 unsafe extern "C" {
+    fn inference_cuda_inkling_rebuild_gates(
+        workspace: *mut c_void,
+        width: c_int,
+        roles: c_int,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
     fn inference_cuda_inkling_controller_norm(
         workspace: *mut c_void,
         health: *mut c_void,
@@ -22,6 +30,32 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+}
+
+pub(in crate::kernels::cuda) fn rebuild_gates(
+    stream: &RawStream,
+    workspace: RawRange<'_>,
+    [width, roles]: [usize; 2],
+) -> Result<(), DeviceFailure> {
+    if !(1..=4096).contains(&width)
+        || !(1..=1536).contains(&roles)
+        || workspace.bytes() < roles * (5 * width + 2) * size_of::<f32>()
+        || !workspace.offset.is_multiple_of(4)
+    {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: the aligned range contains disjoint output, raw and scale segments.
+    let status = unsafe {
+        inference_cuda_inkling_rebuild_gates(
+            workspace.address(),
+            width as c_int,
+            roles as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
 }
 
 pub(in crate::kernels::cuda) fn launch(
