@@ -908,7 +908,7 @@ impl PrefillBridge<'_> {
                     (&rows, Some(side)),
                     history,
                     &self.projection,
-                    conv,
+                    (conv, true),
                 )?
             } else {
                 self.device.step_prefill(

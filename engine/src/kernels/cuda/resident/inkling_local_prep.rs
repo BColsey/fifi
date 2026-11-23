@@ -1,7 +1,11 @@
 //! Prepare one local Inkling attention row before resident relative attention.
 
 use crate::EngError;
-use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, PinnedBuf, native::resident};
+use crate::kernels::cuda::{
+    CudaContext, DeviceRange, DeviceStream, PinnedBuf,
+    context::{Claim, require_apart, require_fit},
+    native::resident,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrepShape {
@@ -85,6 +89,46 @@ impl DepthShape {
 }
 
 impl CudaContext {
+    /// Form the next raw residual and its normalized scoring plane from
+    /// `[prior, convolved_attention, next_raw, next_normalized]` on one stream.
+    /// At a block boundary the caller retains the sealed prior separately.
+    #[allow(dead_code, reason = "the grouped resident visit is wired separately")]
+    pub(crate) fn inkling_depth_current(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 4],
+        [rows, width]: [usize; 2],
+        boundary: bool,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let [plane, ..] = (DepthShape {
+            rows,
+            width,
+            depth: 1,
+        })
+        .words()
+        .ok_or_else(|| EngError::BadRequest("invalid Inkling current depth shape".into()))?;
+        let bytes = plane * size_of::<f32>();
+        let names = ["prior", "attention", "raw", "normalized"];
+        for (i, (name, range)) in names.into_iter().zip(&ranges).enumerate() {
+            if range.bytes() != bytes {
+                return Err(EngError::BadRequest(format!(
+                    "wrong Inkling current depth {name} extent"
+                )));
+            }
+            require_fit(name, range, bytes, align_of::<f32>())?;
+            let claim = Claim::of(name, range, bytes);
+            for (prev, range) in names.into_iter().zip(&ranges[..i]) {
+                require_apart(&claim, &Claim::of(prev, range, bytes))?;
+            }
+        }
+        let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
+        let ranges = [a?, b?, c?, d?];
+        self.launch_on(stream, |stream| {
+            resident::inkling_local_prep::depth_current(stream, ranges, [rows, width], boundary)
+        })
+    }
+
     /// Keep normalized depth planes and the mixed output on device. The compact
     /// round trip preserves host `f32::exp` rounding without moving hidden rows.
     /// `planes` are in scoring order (newest sealed to oldest, then current).

@@ -110,6 +110,34 @@ __global__ void inkling_output_conv(const float *raw, const float *past, const f
     const int invalid = __syncthreads_or(bad);
     if (threadIdx.x == 0 && invalid) atomicOr(status + row, 1u);
 }
+// One CTA per token, with ordered accumulation matching Rust's depth RMSNorm.
+// The raw result feeds the residual stream; the normalized plane feeds depth.
+__global__ void inkling_depth_current(const float *prior, const float *attention,
+    float *raw, float *normalized, int width, bool boundary) {
+    const int offset = blockIdx.x * width;
+    const int lane = threadIdx.x;
+    __shared__ float scale;
+    for (int i = lane; i < width; i += blockDim.x) {
+        const int at = offset + i;
+        const float out = attention[at];
+        raw[at] = boundary ? out : __fadd_rn(prior[at], __fmul_rn(out, 1.f));
+    }
+    __syncthreads();
+    if (lane == 0) {
+        float squares = -0.f;
+        for (int i = 0; i < width; ++i) {
+            const float value = raw[offset + i];
+            squares = __fadd_rn(squares, __fmul_rn(value, value));
+        }
+        // Poison the depth score on overflow instead of silently normalizing to zero.
+        const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(squares, float(width)), 1.e-6f));
+        scale = isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
+    }
+    __syncthreads();
+    for (int i = lane; i < width; i += blockDim.x)
+        normalized[offset + i] = __fmul_rn(raw[offset + i], scale);
+}
+
 // Planes are normalized and packed in the CPU traversal order: most recent
 // sealed block first and current last. Each dot accumulates in scalar order.
 __global__ void inkling_depth_scores(const float *planes, const float *query,
@@ -139,6 +167,17 @@ __global__ void inkling_depth_mix(const float *planes, const float *weights,
     output[row * width + k] = __fdiv_rn(sum, mass);
 }
 } // namespace
+
+extern "C" int inference_cuda_inkling_depth_current(void *const *p, int rows, int width,
+    int boundary, void *stream, int *out_stage) {
+    inkling_depth_current<<<rows, 128, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, boundary != 0);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
 
 extern "C" int inference_cuda_inkling_depth_mix(void *const *p, int rows, int width,
     int depth, float scale, int scores_only, void *stream, int *out_stage) {

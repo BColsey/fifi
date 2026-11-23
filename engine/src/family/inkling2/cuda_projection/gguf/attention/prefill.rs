@@ -125,7 +125,21 @@ pub(in crate::family::inkling2) struct PrefillConv {
 impl PrefillConv {
     const PAST: usize = PrepShape::TAPS - 1;
 
-    fn destination(&self, count: usize) -> Result<ResidentOutput<'_>, EngError> {
+    /// Borrows only complete, status-validated convolved rows. The caller must
+    /// finish consuming the plane before publishing the raw history tail.
+    #[allow(dead_code, reason = "the resident depth consumer is wired separately")]
+    pub(in crate::family::inkling2) fn convolved_plane(&self) -> Result<DeviceRange<'_>, EngError> {
+        if self.written != self.rows {
+            return Err(bad("incomplete CUDA prefill convolution visit"));
+        }
+        self.convolved.range(0, self.convolved.bytes())
+    }
+
+    fn destination(
+        &self,
+        count: usize,
+        read_convolved: bool,
+    ) -> Result<ResidentOutput<'_>, EngError> {
         if count == 0 || count > self.rows - self.written {
             return Err(bad("CUDA prefill convolution exceeds admitted rows"));
         }
@@ -143,8 +157,7 @@ impl PrefillConv {
                     self.convolved
                         .range(self.written * self.stride, count * self.stride)?,
                 ],
-                // Until depth mixing consumes the full convolved plane.
-                read_convolved: true,
+                read_convolved,
             }),
         })
     }
@@ -438,9 +451,9 @@ impl ResidentAttention {
         (rows, side): (&[Row<'_>], Option<Sidecar<'_>>),
         history: History<'_>,
         projection: &OutputProjection<'_>,
-        conv: &mut PrefillConv,
+        (conv, read_convolved): (&mut PrefillConv, bool),
     ) -> Result<Vec<Vec<f32>>, EngError> {
-        let destination = conv.destination(rows.len())?;
+        let destination = conv.destination(rows.len(), read_convolved)?;
         let output = self.step_prefill_to(
             context,
             slot,
