@@ -1421,6 +1421,196 @@ fn gguf_prefill_gemm_matches_the_cpu_reference() {
     }
 }
 
+/// Exercise the window decoder directly, without changing the production GEMM dispatch.
+#[test]
+#[ignore = "device: needs the card"]
+fn gguf_window_gemm_q80_q6k_matches_fp16_reference() {
+    assert!(testkit::device_present(
+        "gguf_window_gemm_q80_q6k_matches_fp16_reference"
+    ));
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    for (ty, gt) in [
+        (QuantType::Q80, GgufType::Q80),
+        (QuantType::Q6K, GgufType::Q6K),
+    ] {
+        let shapes = [(64, 5, 1), (256, 17, 3), (2560, 70, 3)];
+        let mut tested = 0;
+        for (i, &(k, rows, ncols)) in shapes.iter().enumerate() {
+            if !block_ok(ty, k) {
+                continue;
+            }
+            tested += 1;
+            let mut rng = testkit::Rng::new(0xd8_0000 + gt.id() as u64 * 100 + i as u64);
+            let w_bytes = random_blocks(ty, rows * (k / ty.block_size()), &mut rng, 0.0005, 0.01);
+            let w = testkit::upload_bytes(&ctx, &w_bytes);
+            let x: Vec<f32> = (0..ncols * k).map(|_| rng.normal() as f32 * 0.5).collect();
+            let (x_bytes, x_back) = f16_rows(&x);
+            let x_dev = testkit::upload_bytes(&ctx, &x_bytes);
+            let y_bytes = rows * ncols * 4;
+            let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+            ctx.gemm_dq_codebook(
+                &stream,
+                ty,
+                GemmDqTypedCall {
+                    w: w.range(0, w_bytes.len()).expect("w"),
+                    x: x_dev.range(0, x_bytes.len()).expect("x"),
+                    y: y.range(0, y_bytes).expect("y"),
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride: k,
+                    y_col_stride: rows,
+                    x_f32: false,
+                },
+            )
+            .expect("window gemm");
+            stream.synchronize().expect("drain");
+            let got = read_f32(&ctx, &y, rows * ncols);
+            let weights: Vec<f64> = dequantize(gt, &w_bytes)
+                .expect("oracle dequant")
+                .iter()
+                .map(|&v| f64::from(testkit::f16_to_f32(testkit::f16_bits(v))))
+                .collect();
+            for col in 0..ncols {
+                for row in 0..rows {
+                    let (mut dot, mut abs) = (0.0f64, 0.0f64);
+                    for j in 0..k {
+                        let term = weights[row * k + j] * x_back[col * k + j];
+                        dot += term;
+                        abs += term.abs();
+                    }
+                    let error = (f64::from(got[col * rows + row]) - dot).abs();
+                    let tolerance = k as f64 * 2f64.powi(-24) * abs;
+                    assert!(
+                        error <= tolerance,
+                        "{ty:?} k {k} rows {rows} ncols {ncols} col {col} row {row}: error {error:e}, tolerance {tolerance:e}"
+                    );
+                }
+            }
+        }
+        assert!(tested > 0, "no valid shapes for {ty:?}");
+        eprintln!("window gemm {ty:?}: {tested} shapes checked");
+    }
+}
+
+/// Invalid calls must be rejected before launching the window decoder.
+#[test]
+#[ignore = "device: needs the card"]
+fn gguf_window_gemm_rejects_invalid_calls() {
+    assert!(testkit::device_present(
+        "gguf_window_gemm_rejects_invalid_calls"
+    ));
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let buf = testkit::upload_filled(&ctx, 0, 8192);
+    for ty in [QuantType::Q80, QuantType::Q6K] {
+        let k = 256usize;
+        let wb = ty.weight_bytes(1, k).expect("weight size");
+        // Separate, aligned valid ranges, except for the fault named by each case.
+        for case in 0..10 {
+            let (w_off, w_len) = if case == 0 { (0, wb - 1) } else { (0, wb) };
+            let (x_off, x_len) = if case == 1 { (2048, 511) } else { (2048, 512) };
+            let (y_off, y_len) = match case {
+                2 => (4096, 3),
+                3 => (0, 4),
+                4 => (2048, 4),
+                5 => (4097, 4),
+                _ => (4096, 4),
+            };
+            let result = ctx.gemm_dq_codebook(
+                &stream,
+                ty,
+                GemmDqTypedCall {
+                    w: buf.range(w_off, w_len).expect("w range"),
+                    x: buf.range(x_off, x_len).expect("x range"),
+                    y: buf.range(y_off, y_len).expect("y range"),
+                    k: if case == 6 {
+                        0
+                    } else if case == 7 {
+                        255
+                    } else {
+                        k
+                    },
+                    rows: if case == 8 { 0 } else { 1 },
+                    ncols: if case == 9 { 0 } else { 1 },
+                    x_col_stride: k,
+                    y_col_stride: 1,
+                    x_f32: false,
+                },
+            );
+            assert!(result.is_err(), "{ty:?} accepted invalid case {case}");
+        }
+    }
+}
+
+/// The window GEMM launch keeps its arguments through graph capture and replay.
+#[test]
+#[ignore = "device: needs the card"]
+fn gguf_window_gemm_q80_q6k_capture_matches_eager() {
+    assert!(testkit::device_present(
+        "gguf_window_gemm_q80_q6k_capture_matches_eager"
+    ));
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols) = (256usize, 17usize, 3usize);
+    for ty in [QuantType::Q80, QuantType::Q6K] {
+        let mut rng = testkit::Rng::new(0x91aa + ty.block_bytes() as u64);
+        let bytes = random_blocks(ty, rows * (k / ty.block_size()), &mut rng, 0.0005, 0.01);
+        let w = testkit::upload_bytes(&ctx, &bytes);
+        let xvalues: Vec<f32> = (0..k * ncols).map(|_| rng.normal() as f32 * 0.5).collect();
+        let xbytes: Vec<u8> = xvalues.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let x = testkit::upload_bytes(&ctx, &xbytes);
+        let ybytes = rows * ncols * 4;
+        let launch = |y: &DeviceBuffer| {
+            ctx.gemm_dq_codebook(
+                &stream,
+                ty,
+                GemmDqTypedCall {
+                    w: w.range(0, bytes.len())?,
+                    x: x.range(0, xbytes.len())?,
+                    y: y.range(0, ybytes)?,
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride: k,
+                    y_col_stride: rows,
+                    x_f32: true,
+                },
+            )
+        };
+        let eager_y = testkit::upload_filled(&ctx, 0xaa, ybytes);
+        launch(&eager_y).expect("eager");
+        stream.synchronize().expect("drain eager");
+        let eager = testkit::read_bytes(&ctx, &eager_y, ybytes);
+        let capture_y = testkit::upload_filled(&ctx, 0xaa, ybytes);
+        let (graph, ()) = ctx
+            .capture(
+                &stream,
+                CapturePlan {
+                    pins: &[],
+                    holds: Vec::new(),
+                },
+                || launch(&capture_y),
+            )
+            .expect("capture");
+        assert_eq!(graph.nodes(), 1);
+        for replay in 0..3 {
+            capture_y
+                .write_at(&stream, 0, &vec![0xaa; ybytes])
+                .expect("reset output");
+            graph.launch(&stream).expect("replay");
+            stream.synchronize().expect("drain replay");
+            assert_eq!(
+                testkit::read_bytes(&ctx, &capture_y, ybytes),
+                eager,
+                "{ty:?} replay {replay}"
+            );
+        }
+        eprintln!("window gemm {ty:?}: 3 graph replays match eager");
+    }
+}
+
 /// The prefill GEMM throughput of every dense type at one prefill-sized shape, beside the Q5_K
 /// arm of the same kernel as the reference point (its decoder is the longest-serving one).
 #[test]

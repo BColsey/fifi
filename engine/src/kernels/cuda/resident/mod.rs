@@ -93,6 +93,7 @@ pub(crate) mod gdn_conv;
 pub(crate) mod gdn_delta;
 pub(crate) mod gelu_ffn;
 pub(crate) mod gemma_matvec;
+pub(crate) mod head_tile;
 pub(crate) mod hyper;
 pub(crate) mod kv8_append;
 pub(crate) mod kv_f16_append;
@@ -107,6 +108,8 @@ pub(crate) mod moe_combine;
 pub(crate) mod multi_row;
 pub(crate) mod pack_rows;
 pub(crate) mod paged_position;
+#[cfg(test)]
+pub(crate) mod q6_f32;
 pub(crate) mod qsa_attn;
 pub(crate) mod qsa_index;
 pub(crate) mod quantize_q8_1;

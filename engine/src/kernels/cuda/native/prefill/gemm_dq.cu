@@ -405,6 +405,8 @@ int with_decoder(int type, F &&f) {
     case kQ4_0: return f(DecoderTag<Q40Decoder>());
     case kQ3K: return f(DecoderTag<Q3kDecoder>());
     case kQ5K: return f(DecoderTag<Q5kDecoder>());
+    case kQ8_0: return f(DecoderTag<WindowDecoder<Q8_0>>());
+    case kQ6K: return f(DecoderTag<WindowDecoder<Q6K>>());
     case kIq2Xxs: return f(DecoderTag<WindowDecoder<Iq2Xxs>>());
     case kIq2Xs: return f(DecoderTag<WindowDecoder<Iq2Xs>>());
     case kIq2S: return f(DecoderTag<WindowDecoder<Iq2S>>());

@@ -188,6 +188,9 @@ impl<'a> HostProjector<'a> {
         #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
         if let Some(cuda) = self.cuda.as_mut()
             && cuda.supports(part.ty)
+            && !(part.ty == GgufType::Q80 && std::env::var_os("FIFI_FLASH_GGUF_HOST_Q80").is_some())
+            && !(part.ty == GgufType::Q6K && std::env::var_os("FIFI_FLASH_GGUF_HOST_Q6K").is_some())
+            && !(expert.is_some() && std::env::var_os("FIFI_FLASH_GGUF_HOST_EXPERTS").is_some())
         {
             let mut out = Vec::with_capacity(part.out);
             let mut bytes = Vec::new();
@@ -197,8 +200,48 @@ impl<'a> HostProjector<'a> {
                 bytes.resize(count * row_bytes as usize, 0);
                 self.weights
                     .read_range(&part.name, base + first as u64 * row_bytes, &mut bytes)?;
-                out.extend(cuda.run(part.ty, &bytes, x)?);
+                let expert_f16 = expert.is_some()
+                    && matches!(part.ty, GgufType::Iq2S | GgufType::Iq4Nl)
+                    && std::env::var_os("FIFI_FLASH_GGUF_EXPERT_F16").is_some();
+                let trunk_f16 = expert.is_none()
+                    && matches!(part.ty, GgufType::Q80 | GgufType::Q6K)
+                    && std::env::var_os("FIFI_FLASH_GGUF_TRUNK_F16").is_some();
+                let use_f16 = expert_f16 || trunk_f16;
+                out.extend(if use_f16 {
+                    cuda.run_f16(part.ty, &bytes, x)?
+                } else {
+                    cuda.run(part.ty, &bytes, x)?
+                });
             }
+            if std::env::var_os("FIFI_FLASH_GGUF_TRACE_PROJECTIONS").is_some() {
+                let reference = Self::matvec_range(self.weights, part, base, 0, part.out, x)?;
+                let (error, norm) =
+                    out.iter()
+                        .zip(&reference)
+                        .fold((0.0_f64, 0.0_f64), |(e, n), (&a, &b)| {
+                            (
+                                e + (f64::from(a) - f64::from(b)).powi(2),
+                                n + f64::from(b).powi(2),
+                            )
+                        });
+                let rel = if norm == 0.0 {
+                    if error == 0.0 { 0.0 } else { f64::INFINITY }
+                } else {
+                    (error / norm).sqrt()
+                };
+                eprintln!(
+                    "projection trace: name={} expert={expert:?} type={:?} rows={} relative_l2={rel}",
+                    part.name, part.ty, part.out
+                );
+                if !rel.is_finite() || rel > 0.05 {
+                    return Err(refuse(format!(
+                        "projection trace exceeded 0.05 relative L2: {} expert={expert:?} type={:?} relative_l2={rel}",
+                        part.name, part.ty
+                    )));
+                }
+            }
+            #[cfg(test)]
+            capture_layer(part, expert, x, &out);
             return Ok(out);
         }
         let threads = self.threads.min(part.out.div_ceil(64)).max(1);
@@ -221,8 +264,75 @@ impl<'a> HostProjector<'a> {
         for piece in pieces {
             out.extend(piece?);
         }
+        #[cfg(test)]
+        capture_layer(part, expert, x, &out);
         Ok(out)
     }
+}
+
+#[cfg(test)]
+fn capture_layer(part: &Part, expert: Option<u32>, x: &[f32], out: &[f32]) {
+    let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_LAYER0_CAPTURE") else {
+        return;
+    };
+    let wanted = if let Ok(value) = std::env::var("FIFI_FLASH_GGUF_CAPTURE_PREFIX") {
+        let count: usize = value.parse().expect("capture prefix must be an integer");
+        part.name
+            .strip_prefix("blk.")
+            .and_then(|name| name.split_once('.'))
+            .and_then(|(layer, _)| layer.parse::<usize>().ok())
+            .is_some_and(|layer| layer < count)
+    } else {
+        let layer = std::env::var("FIFI_FLASH_GGUF_CAPTURE_LAYER")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("capture layer must be an integer")
+            })
+            .unwrap_or(0);
+        part.name.starts_with(&format!("blk.{layer}."))
+    };
+    if !wanted {
+        return;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open layer-zero capture");
+    serde_json::to_writer(&mut file, &serde_json::json!({"name": part.name, "expert": expert, "type": format!("{:?}", part.ty), "input": x, "output": out})).expect("write layer-zero capture");
+    std::io::Write::write_all(&mut file, b"\n").expect("finish layer-zero record");
+}
+
+/// Marks token boundaries for opt-in prefix or exact-layer captures.
+/// The driver must create a new, empty file before the first token.
+#[cfg(test)]
+pub(super) fn capture_token_boundary(position: usize, token: u32) {
+    if std::env::var("FIFI_FLASH_GGUF_CAPTURE_PREFIX").is_err()
+        && std::env::var_os("FIFI_FLASH_GGUF_CAPTURE_MARK_TOKENS").is_none()
+    {
+        return;
+    }
+    let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_LAYER0_CAPTURE") else {
+        return;
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open prefix capture");
+    if position == 0 {
+        assert_eq!(
+            file.metadata().expect("capture metadata").len(),
+            0,
+            "prefix capture must start empty"
+        );
+    }
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({"position": position, "token": token}),
+    )
+    .expect("write capture token boundary");
+    std::io::Write::write_all(&mut file, b"\n").expect("finish capture token boundary");
 }
 
 impl Projector for HostProjector<'_> {
@@ -265,6 +375,12 @@ impl Projector for HostProjector<'_> {
     ) -> Result<Vec<f32>, EngError> {
         if expert as usize >= stack.experts {
             return Err(refuse(format!("expert {expert} of {}", stack.experts)));
+        }
+        #[cfg(test)]
+        if std::env::var_os("FIFI_FLASH_GGUF_TRACE_ROUTES").is_some()
+            && stack.parts[0].name.contains("ffn_gate_exps")
+        {
+            eprintln!("expert route: name={} expert={expert}", stack.parts[0].name);
         }
         self.matvec(&stack.parts[0], Some(expert), x)
     }

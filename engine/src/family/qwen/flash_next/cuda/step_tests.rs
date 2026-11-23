@@ -21,6 +21,11 @@
 //!
 //! Needs a GPU, `--test-threads=1` and (for the full window) several GiB; ignored by default.
 
+#[path = "step_tests/qsa_input_projection_probe.rs"]
+mod qsa_input_projection_probe;
+#[path = "step_tests/shared_projection_probe.rs"]
+mod shared_projection_probe;
+
 use crate::family::exl3::launch::Launch;
 use std::{collections::HashMap, path::Path, time::Duration};
 
@@ -64,6 +69,1351 @@ use crate::{
     },
     weights::exl3::{COMPONENT_SUFFIXES, Checkpoint, Matrix},
 };
+
+#[test]
+fn native_decode_test_arena_payload_is_below_one_gib() {
+    use super::{
+        state::StatePlan,
+        state_tests::real,
+        step_plan::{StepOptions, StepPlan},
+    };
+    use crate::family::qwen::flash_next::moe::context_budget::KvFormat;
+    let (_, g) = real();
+    let state = StatePlan::new(&g, 1, KvFormat::F16).unwrap();
+    let base = StepPlan::new(&g, 1, 1, &StepOptions::for_sm_count(82)).unwrap();
+    let native = base.clone().with_gguf_decode_q8(256).unwrap();
+    let payload = state.arena_bytes() + base.arena_bytes() + native.arena_bytes() + g.hidden * 4;
+    eprintln!("native decode test overlapping arena payload {payload} bytes");
+    assert!(payload < (1usize << 30));
+}
+
+#[test]
+#[ignore = "synthetic CUDA microbenchmark; requires an admitted device"]
+fn gguf_qsa_group_quantize_microbenchmark() {
+    use crate::kernels::cuda::{
+        CudaContext,
+        resident::quantize_q8_1::{QuantizeCall, q8_1_bytes},
+    };
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let uploaded =
+        crate::family::qwen::flash_next::load::gguf::tests::synthetic_qsa_trunk(&ctx, &stream);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 6144, 3..4).unwrap();
+    let x = ctx.allocate(2560 * 4).unwrap();
+    x.write_at(
+        &stream,
+        0,
+        &(0..2560)
+            .flat_map(|_| 1f32.to_ne_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let q8 = ctx.allocate(q8_1_bytes(2560, 1).unwrap()).unwrap();
+    let row = ctx.allocate(1024 * 4).unwrap();
+    let kname = layer_name(3, "self_attn.k_proj");
+    let vname = layer_name(3, "self_attn.v_proj");
+    let quantize = || {
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x.range(0, 2560 * 4)?,
+                y: q8.range(0, q8.bytes())?,
+                k: 2560,
+                ncols: 1,
+            },
+        )
+    };
+    let group = || {
+        step.project_group(
+            &[(&kname, 0, 512), (&vname, 512, 512)],
+            x.range(0, 2560 * 4)?,
+            &row.range(0, 1024 * 4)?,
+            1,
+        )
+    };
+    for _ in 0..20 {
+        quantize().unwrap();
+        group().unwrap();
+    }
+    stream.synchronize().unwrap();
+    let start = ctx.event_timing().unwrap();
+    let end = ctx.event_timing().unwrap();
+    const N: usize = 400;
+    stream.record_timing(&start).unwrap();
+    for _ in 0..N {
+        quantize().unwrap();
+    }
+    stream.record_timing(&end).unwrap();
+    stream.synchronize().unwrap();
+    let quant_us = start.elapsed_ms_since(&end).unwrap() * 1000.0 / N as f32;
+    stream.record_timing(&start).unwrap();
+    for _ in 0..N {
+        group().unwrap();
+    }
+    stream.record_timing(&end).unwrap();
+    stream.synchronize().unwrap();
+    let group_us = start.elapsed_ms_since(&end).unwrap() * 1000.0 / N as f32;
+    let mut values = vec![0u8; 1024 * 4];
+    row.read_at(&stream, 0, &mut values).unwrap();
+    for (i, b) in values.chunks_exact(4).enumerate() {
+        let expected = if i < 512 { 5120.0 } else { 7680.0 };
+        let actual = f32::from_ne_bytes(b.try_into().unwrap());
+        assert!((actual - expected).abs() < 2.0, "{i}: {actual}");
+    }
+    assert!(quant_us.is_finite() && quant_us > 0.0 && group_us.is_finite() && group_us > 0.0);
+    eprintln!(
+        "synthetic Q8_0 k=2560 n=512+512 rows=1 iterations={N}: quantize_us={quant_us:.3} grouped_us={group_us:.3} (equal-width group shares quantization); not full-model timing"
+    );
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn gguf_qsa_mixer_tracks_synthetic_token_history() {
+    use crate::kernels::cuda::{CudaContext, resident::step_params::StepParams};
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let uploaded =
+        crate::family::qwen::flash_next::load::gguf::tests::synthetic_qsa_trunk(&ctx, &stream);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 5, 6144, 3..4).unwrap();
+    let mut sum = 0.0f32;
+    for (pos, scale) in [1.0f32, 0.5, 0.25, 0.125, 0.0625].into_iter().enumerate() {
+        step.begin_token().unwrap();
+        let (words, at) = step.words_buffer().unwrap();
+        words
+            .write_at(
+                &stream,
+                at,
+                &StepParams::new(1, pos as i32).unwrap().to_bytes(),
+            )
+            .unwrap();
+        let mixed = step.slot(Slot::Mixed(Site::Attn)).unwrap();
+        let input: Vec<u8> = (0..2560).flat_map(|_| scale.to_ne_bytes()).collect();
+        mixed
+            .buffer()
+            .write_at(&stream, mixed.offset(), &input)
+            .unwrap();
+        step.mixer(3, pos, 1).unwrap();
+        let output = step
+            .read_f32(step.slot(Slot::BlockOut(Site::Attn)).unwrap(), 2560)
+            .unwrap();
+        let (status, flag) = step.health().unwrap();
+        assert_eq!((status, flag), (0, 0));
+        sum += scale;
+        // All query/key norm gammas are zero, so all attended values have equal scores.
+        let expected = 4.0 * 6144.0 * 7680.0 * sum / (pos + 1) as f32;
+        for value in output {
+            assert!(
+                (value - expected).abs() / expected < 0.01,
+                "pos={pos}: {value} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device and CPU host reference"]
+fn gguf_qsa_mixer_matches_synthetic_host_history() {
+    use crate::kernels::cuda::{CudaContext, resident::step_params::StepParams};
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let inputs: Vec<Vec<f32>> = [1.0f32, 0.5, 0.25, 0.125, 0.0625]
+        .into_iter()
+        .map(|scale| {
+            (0..2560)
+                .map(|i| scale * (1 + i % 7) as f32 / 7.0)
+                .collect()
+        })
+        .collect();
+    let (uploaded, reference) =
+        crate::family::qwen::flash_next::load::gguf::tests::synthetic_qsa_host_reference(
+            &ctx, &stream, &inputs,
+        );
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 5, 6144, 3..4).unwrap();
+    for (pos, (input, want)) in inputs.iter().zip(&reference).enumerate() {
+        step.begin_token().unwrap();
+        let (words, at) = step.words_buffer().unwrap();
+        words
+            .write_at(
+                &stream,
+                at,
+                &StepParams::new(1, pos as i32).unwrap().to_bytes(),
+            )
+            .unwrap();
+        let mixed = step.slot(Slot::Mixed(Site::Attn)).unwrap();
+        mixed
+            .buffer()
+            .write_at(
+                &stream,
+                mixed.offset(),
+                &input
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        step.mixer(3, pos, 1).unwrap();
+        let got = step
+            .read_f32(step.slot(Slot::BlockOut(Site::Attn)).unwrap(), 2560)
+            .unwrap();
+        assert_eq!(step.health().unwrap(), (0, 0));
+        let error = relative_l2(&got, want);
+        eprintln!("synthetic GGUF QSA position {pos}: relative L2 {error:.6}");
+        assert!(error < 0.03, "position {pos}: relative L2 {error}");
+    }
+}
+
+#[test]
+#[ignore = "requires the verified pinned GGUF, first-token host capture and an admitted CUDA device"]
+fn gguf_shared_expert_matches_pinned_host() {
+    use crate::kernels::cuda::CudaContext;
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let (uploaded, input, want) =
+        crate::family::qwen::flash_next::load::gguf::tests::pinned_shared_host_reference(&ctx);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 6144, 0..1).unwrap();
+    assert!(step.gguf_shared_expert(1).is_err());
+    let mixed = step.slot(Slot::Mixed(Site::Mlp)).unwrap();
+    mixed
+        .buffer()
+        .write_at(
+            &stream,
+            mixed.offset(),
+            &input
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    step.gguf_shared_expert(0).unwrap();
+    let shared = want[0].len();
+    let gu = step
+        .read_f32(step.slot(Slot::SharedGu).unwrap(), 2 * shared)
+        .unwrap();
+    let act = step
+        .read_f32(step.slot(Slot::SharedAct).unwrap(), shared)
+        .unwrap();
+    let out = step
+        .read_f32(step.slot(Slot::SharedOut).unwrap(), want[3].len())
+        .unwrap();
+    let errors = [
+        relative_l2(&gu[..shared], &want[0]),
+        relative_l2(&gu[shared..], &want[1]),
+        relative_l2(&act, &want[2]),
+        relative_l2(&out, &want[3]),
+    ];
+    eprintln!(
+        "pinned GGUF shared expert relative L2 gate={:.6} up={:.6} act={:.6} down={:.6}",
+        errors[0], errors[1], errors[2], errors[3]
+    );
+    assert!(gu.iter().chain(&act).chain(&out).all(|v| v.is_finite()));
+    assert!(
+        errors.iter().all(|e| *e < 0.05),
+        "shared expert relative L2 {errors:?}"
+    );
+    assert_eq!(step.health().unwrap(), (0, 0));
+}
+
+#[test]
+#[ignore = "requires the verified pinned GGUF, first-token host capture and an admitted CUDA device"]
+fn gguf_hyper_sites_match_pinned_host() {
+    use crate::{family::recipe::Site as GgufSite, kernels::cuda::CudaContext};
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    for (gguf_site, step_site, prefix) in [
+        (
+            GgufSite::Mixer,
+            Site::Attn,
+            layer_name(0, "attn_hyper_connection"),
+        ),
+        (
+            GgufSite::Ffn,
+            Site::Mlp,
+            layer_name(0, "mlp_hyper_connection"),
+        ),
+        (GgufSite::Head, Site::Final, MIXER.to_owned()),
+    ] {
+        let (uploaded, input, host) =
+            crate::family::qwen::flash_next::load::gguf::tests::pinned_hyper_host_reference(
+                &ctx, &stream, gguf_site,
+            );
+        let weights = CudaWeights::from_weights(uploaded).unwrap();
+        let (model, kinds) = model_shape(config).unwrap();
+        let step =
+            FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 6144, 0..1)
+                .unwrap();
+        let state = step.slot(Slot::Stream).unwrap();
+        state
+            .buffer()
+            .write_at(
+                &stream,
+                state.offset(),
+                &input
+                    .iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        step.hyper_read(step_site, &prefix, 1).unwrap();
+        let mixed = step
+            .read_f32(step.slot(Slot::Mixed(step_site)).unwrap(), host.mixed.len())
+            .unwrap();
+        let mixed_error = relative_l2(&mixed, &host.mixed);
+        assert!(mixed.iter().all(|v| v.is_finite()));
+        assert!(
+            mixed_error < 0.003,
+            "{gguf_site:?} mixed relative L2 {mixed_error}"
+        );
+        if let Some(want) = host.gate {
+            let gate = step
+                .read_f32(step.slot(Slot::Gate(step_site)).unwrap(), want.len())
+                .unwrap();
+            let gate_error = relative_l2(&gate, &want);
+            assert!(gate.iter().all(|v| v.is_finite()));
+            assert!(
+                gate_error < 0.003,
+                "{gguf_site:?} gate relative L2 {gate_error}"
+            );
+            eprintln!(
+                "pinned GGUF hyper {gguf_site:?}: mixed relative L2 {mixed_error:.8}, gate relative L2 {gate_error:.8}"
+            );
+        } else {
+            assert_eq!(gguf_site, GgufSite::Head);
+            eprintln!(
+                "pinned GGUF hyper {gguf_site:?}: mixed relative L2 {mixed_error:.8}, no inject gate"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the verified pinned GGUF, first-token host capture and an admitted CUDA device"]
+fn gguf_hyper_delta_matches_pinned_first_token() {
+    use crate::{
+        family::recipe::Site as GgufSite,
+        kernels::cuda::{CudaContext, resident::step_params::StepParams},
+    };
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let (mut uploaded, mut host_stream, hyper_read) =
+        crate::family::qwen::flash_next::load::gguf::tests::pinned_hyper_host_reference(
+            &ctx,
+            &stream,
+            GgufSite::Mixer,
+        );
+    let initial = host_stream.clone();
+    let (delta_weights, host_block, _, _) =
+        crate::family::qwen::flash_next::load::gguf::tests::pinned_delta_host_reference(
+            &ctx,
+            &stream,
+            std::slice::from_ref(&hyper_read.mixed),
+        );
+    uploaded.extend(delta_weights);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    hyper::apply(
+        &model.hyper,
+        &mut host_stream,
+        hyper_read.gate.as_ref().unwrap(),
+        &host_block[0],
+    )
+    .unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 6144, 0..1).unwrap();
+    step.begin_token().unwrap();
+    let (words, at) = step.words_buffer().unwrap();
+    words
+        .write_at(&stream, at, &StepParams::new(1, 0).unwrap().to_bytes())
+        .unwrap();
+    let state = step.slot(Slot::Stream).unwrap();
+    state
+        .buffer()
+        .write_at(
+            &stream,
+            state.offset(),
+            &initial
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    step.hyper_read(Site::Attn, &layer_name(0, "attn_hyper_connection"), 1)
+        .unwrap();
+    let mixed = step
+        .read_f32(
+            step.slot(Slot::Mixed(Site::Attn)).unwrap(),
+            hyper_read.mixed.len(),
+        )
+        .unwrap();
+    step.mixer(0, 0, 1).unwrap();
+    let block = step
+        .read_f32(
+            step.slot(Slot::BlockOut(Site::Attn)).unwrap(),
+            host_block[0].len(),
+        )
+        .unwrap();
+    step.hyper_apply(Site::Attn, 1).unwrap();
+    let residual = step
+        .read_f32(step.slot(Slot::Stream).unwrap(), host_stream.len())
+        .unwrap();
+    assert_eq!(step.health().unwrap(), (0, 0));
+    let (mixed_error, block_error, residual_error) = (
+        relative_l2(&mixed, &hyper_read.mixed),
+        relative_l2(&block, &host_block[0]),
+        relative_l2(&residual, &host_stream),
+    );
+    eprintln!(
+        "pinned token 9707 layer-0 hyper+DeltaNet: mixed relative L2 {mixed_error:.8}, block relative L2 {block_error:.8}, residual relative L2 {residual_error:.8}"
+    );
+    assert!(mixed_error < 0.003);
+    assert!(block_error < 0.03);
+    assert!(residual_error < 0.03);
+}
+
+#[test]
+#[ignore = "requires the verified pinned GGUF, first-token host capture and an admitted CUDA device"]
+fn gguf_first_layer_moe_matches_pinned_host() {
+    use crate::family::qwen::flash_next::load::gguf::tests::{
+        pinned_delta_host_reference, pinned_hyper_host_reference, pinned_router_host_reference,
+        pinned_shared_host_reference,
+    };
+    use crate::{
+        family::recipe::Site as GgufSite,
+        kernels::cuda::{CudaContext, resident::step_params::StepParams},
+    };
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let (mut uploaded, initial, attn_host) =
+        pinned_hyper_host_reference(&ctx, &stream, GgufSite::Mixer);
+    let (delta, _, _, _) =
+        pinned_delta_host_reference(&ctx, &stream, std::slice::from_ref(&attn_host.mixed));
+    let (ffn_hyper, _, _) = pinned_hyper_host_reference(&ctx, &stream, GgufSite::Ffn);
+    let (shared, host_input, host_shared) = pinned_shared_host_reference(&ctx);
+    let mut router = pinned_router_host_reference(&ctx, &stream, &host_input);
+    uploaded.extend(delta);
+    uploaded.extend(ffn_hyper);
+    uploaded.extend(shared);
+    uploaded.append(&mut router.weights);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 6144, 0..1).unwrap();
+    step.begin_token().unwrap();
+    let (words, at) = step.words_buffer().unwrap();
+    words
+        .write_at(&stream, at, &StepParams::new(1, 0).unwrap().to_bytes())
+        .unwrap();
+    let state = step.slot(Slot::Stream).unwrap();
+    state
+        .buffer()
+        .write_at(
+            &stream,
+            state.offset(),
+            &initial
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    step.hyper_read(Site::Attn, &layer_name(0, "attn_hyper_connection"), 1)
+        .unwrap();
+    step.mixer(0, 0, 1).unwrap();
+    step.hyper_apply(Site::Attn, 1).unwrap();
+    step.hyper_read(Site::Mlp, &layer_name(0, "mlp_hyper_connection"), 1)
+        .unwrap();
+    let mixed = step
+        .read_f32(step.slot(Slot::Mixed(Site::Mlp)).unwrap(), host_input.len())
+        .unwrap();
+    let input_error = relative_l2(&mixed, &host_input);
+    let gpu_gate = check_composed_router(&step, 0, &router, true);
+    step.gguf_shared_expert(0).unwrap();
+    let out = step
+        .read_f32(step.slot(Slot::SharedOut).unwrap(), host_shared[3].len())
+        .unwrap();
+    let output_error = relative_l2(&out, &host_shared[3]);
+    let gated: Vec<_> = out.iter().map(|x| x * gpu_gate).collect();
+    let host_gated: Vec<_> = host_shared[3]
+        .iter()
+        .map(|x| x * router.shared_gate)
+        .collect();
+    let gated_error = relative_l2(&gated, &host_gated);
+    eprintln!(
+        "pinned token 9707 layer-0 composed FFN input relative L2 {input_error:.6}, shared output {output_error:.6}, gated output {gated_error:.6}"
+    );
+    assert!(input_error < 0.03 && output_error < 0.05 && gated_error < 0.05);
+    // This test drives disk refills from the GPU classifier's log; it is not the production executor.
+    use crate::family::qwen::flash_next::load::gguf::routed_probe;
+    let capture = std::env::var_os("FIFI_FLASH_GGUF_HOST_CAPTURE").expect("set host capture");
+    for initial_misses in [0, 2, 10] {
+        let (routed_error, total_error) = routed_probe::run(
+            &ctx,
+            &stream,
+            routed_probe::Inputs {
+                layer: 0,
+                host_capture: std::path::Path::new(&capture),
+                x: step.slot(Slot::Mixed(Site::Mlp)).unwrap(),
+                route_ids: step.slot(Slot::TopkId).unwrap(),
+                route_weights: step.slot(Slot::TopkWeight).unwrap(),
+                initial_misses,
+                diagnose_route_mismatch: false,
+                shared_gate: step.slot(Slot::SharedGate).unwrap(),
+                shared_out: step.slot(Slot::SharedOut).unwrap(),
+                block_out: step.slot(Slot::BlockOut(Site::Mlp)).unwrap(),
+            },
+            &router,
+        );
+        assert!(routed_error < 0.05 && total_error < 0.05);
+    }
+    step.hyper_apply(Site::Mlp, 1).unwrap();
+    let path = std::env::var_os("FIFI_FLASH_GGUF_HOST_LAYERS")
+        .expect("set the verified host layer capture");
+    let host_layers: Vec<Vec<Vec<f32>>> =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let host_layer = &host_layers[0][0];
+    let layer = step
+        .read_f32(step.slot(Slot::Stream).unwrap(), host_layer.len())
+        .unwrap();
+    let layer_error = relative_l2(&layer, host_layer);
+    eprintln!("pinned token 9707 full layer-0 residual relative L2 {layer_error:.6}");
+    assert!(layer_error < 0.03);
+    assert_eq!(step.health().unwrap(), (0, 0));
+}
+
+mod gguf_full_probe;
+#[path = "step_tests/gguf_head_probe.rs"]
+mod gguf_head_probe;
+#[path = "step_tests/gguf_prefix_probe.rs"]
+mod gguf_prefix_probe;
+
+fn assert_pinned_file(path: &std::ffi::OsStr, expected: &str) {
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()));
+    assert_eq!(got, expected, "unexpected pinned artifact {:?}", path);
+}
+
+/// The actual layer-0 device residual crosses the existing host PLE boundary, then returns
+/// to the device for layer 1. This is a staged test, not a device-resident PLE or executor.
+#[test]
+#[ignore = "requires pinned checkpoint, layer-0/1 host captures and an admitted CUDA device"]
+fn gguf_two_layers_with_ple_match_pinned_host() {
+    use crate::family::qwen::flash_next::{
+        cuda::driver::TokenFeeds,
+        load::gguf::{
+            GgufModel, routed_probe,
+            tests::{
+                pinned_delta_host_reference, pinned_hyper_host_reference,
+                pinned_router_host_reference, pinned_router_host_reference_at,
+                pinned_shared_host_reference, pinned_shared_host_reference_at,
+            },
+            token_feed::GgufTokenFeeds,
+        },
+    };
+    use crate::{
+        family::recipe::Site as GgufSite,
+        kernels::cuda::{CudaContext, resident::step_params::StepParams},
+    };
+    let path = std::env::var_os("FIFI_FLASH_GGUF").expect("set verified checkpoint");
+    let capture0 = std::env::var_os("FIFI_FLASH_GGUF_HOST_CAPTURE").expect("set layer-0 capture");
+    let capture1 =
+        std::env::var_os("FIFI_FLASH_GGUF_HOST_CAPTURE_LAYER1").expect("set layer-1 capture");
+    let layers_path =
+        std::env::var_os("FIFI_FLASH_GGUF_HOST_LAYERS").expect("set verified host layers");
+    // These receipts identify the pinned token-9707 oracle and the small first shard; the
+    // other full checkpoint shards must still be independently verified before this test.
+    for (path, digest) in [
+        (
+            &path,
+            "9d5644b371ffac921427c8021cc7242dab8e3ba37d7b48d1e79fe3770fbf9915",
+        ),
+        (
+            &capture0,
+            "b0873cedfb9733049335904d64635d20b155e68614de0166a287333f5b5640e6",
+        ),
+        (
+            &capture1,
+            "32f7f3ac5de6366f4f5b14b825963eb5ca1332790d1727d8bdd5c13b63264e35",
+        ),
+        (
+            &layers_path,
+            "62fdd25ecb4f3e14f2f4417de026421e6e6557c972eadee3e779e9cc6656bace",
+        ),
+    ] {
+        assert_pinned_file(path, digest);
+    }
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let ngram = model.ngram().unwrap();
+    let mut feed = GgufTokenFeeds::new(&model, &ngram, 8).unwrap();
+    let start = feed.begin(9707).unwrap();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let (mut uploaded, initial, host_attn) =
+        pinned_hyper_host_reference(&ctx, &stream, GgufSite::Mixer);
+    assert_eq!(start.stream, initial);
+    uploaded.extend(pinned_delta_host_reference(&ctx, &stream, &[host_attn.mixed]).0);
+    uploaded.extend(pinned_hyper_host_reference(&ctx, &stream, GgufSite::Ffn).0);
+    let (shared0, input0, shared_host0) = pinned_shared_host_reference(&ctx);
+    let mut router0 = pinned_router_host_reference(&ctx, &stream, &input0);
+    uploaded.extend(shared0);
+    uploaded.append(&mut router0.weights);
+    uploaded.extend(
+        model
+            .upload_hyper(GgufSite::Mixer, Some(1), &ctx, &stream)
+            .unwrap(),
+    );
+    uploaded.extend(model.upload_delta_trunk(1, &ctx, &stream).unwrap());
+    uploaded.extend(
+        model
+            .upload_hyper(GgufSite::Ffn, Some(1), &ctx, &stream)
+            .unwrap(),
+    );
+    let (shared1, input1, shared_host1) =
+        pinned_shared_host_reference_at(&ctx, 1, std::path::Path::new(&capture1));
+    let mut router1 = pinned_router_host_reference_at(&ctx, &stream, &input1, 1);
+    uploaded.extend(shared1);
+    uploaded.append(&mut router1.weights);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let shape = model.config().model_shape().unwrap();
+    assert_eq!(shape.ple_layer, 1);
+    assert!(model.config().kinds()[..2].iter().all(|&qsa| !qsa));
+    let max_k = model.map().max_quantized_input_width().unwrap();
+    eprintln!("pinned GGUF metadata-derived maximum native projection width={max_k}");
+    let step = FlashStep::new_gguf_decode(
+        &ctx,
+        &stream,
+        &weights,
+        shape,
+        model.config().kinds(),
+        1,
+        max_k,
+        0..2,
+    )
+    .unwrap();
+    step.begin_token().unwrap();
+    let (words, at) = step.words_buffer().unwrap();
+    words
+        .write_at(&stream, at, &StepParams::new(1, 0).unwrap().to_bytes())
+        .unwrap();
+    let state = step.slot(Slot::Stream).unwrap();
+    state
+        .buffer()
+        .write_at(
+            &stream,
+            state.offset(),
+            &initial
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let host_layers: Vec<Vec<Vec<f32>>> =
+        serde_json::from_slice(&std::fs::read(layers_path).unwrap()).unwrap();
+    for (layer, host_input, host_shared, router, capture) in [
+        (0, &input0, &shared_host0, &router0, &capture0),
+        (1, &input1, &shared_host1, &router1, &capture1),
+    ] {
+        if layer == shape.ple_layer {
+            let mut residual = step.read_f32(state, initial.len()).unwrap();
+            let update = feed.ple_update(9707, &residual).unwrap();
+            assert_eq!(update.len(), residual.len());
+            for (x, delta) in residual.iter_mut().zip(update) {
+                *x += delta;
+            }
+            state
+                .buffer()
+                .write_at(
+                    &stream,
+                    state.offset(),
+                    &residual
+                        .iter()
+                        .flat_map(|x| x.to_ne_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+        }
+        step.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"), 1)
+            .unwrap();
+        step.mixer(layer, 0, 1).unwrap();
+        step.hyper_apply(Site::Attn, 1).unwrap();
+        step.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"), 1)
+            .unwrap();
+        let mixed = step
+            .read_f32(step.slot(Slot::Mixed(Site::Mlp)).unwrap(), host_input.len())
+            .unwrap();
+        let input_error = relative_l2(&mixed, host_input);
+        check_composed_router(&step, layer, router, layer == 0);
+        step.gguf_shared_expert(layer).unwrap();
+        let shared = step
+            .read_f32(step.slot(Slot::SharedOut).unwrap(), host_shared[3].len())
+            .unwrap();
+        let shared_error = relative_l2(&shared, &host_shared[3]);
+        let misses: &[usize] = if layer == 0 { &[0] } else { &[0, 2, 10] };
+        let mut errors = (0.0, 0.0);
+        for &initial_misses in misses {
+            errors = routed_probe::run(
+                &ctx,
+                &stream,
+                routed_probe::Inputs {
+                    layer,
+                    host_capture: std::path::Path::new(capture),
+                    x: step.slot(Slot::Mixed(Site::Mlp)).unwrap(),
+                    route_ids: step.slot(Slot::TopkId).unwrap(),
+                    route_weights: step.slot(Slot::TopkWeight).unwrap(),
+                    initial_misses,
+                    diagnose_route_mismatch: false,
+                    shared_gate: step.slot(Slot::SharedGate).unwrap(),
+                    shared_out: step.slot(Slot::SharedOut).unwrap(),
+                    block_out: step.slot(Slot::BlockOut(Site::Mlp)).unwrap(),
+                },
+                router,
+            );
+            assert!(errors.0 < 0.08 && errors.1 < 0.08);
+        }
+        let (routed_error, total_error) = errors;
+        step.hyper_apply(Site::Mlp, 1).unwrap();
+        let residual = step.read_f32(state, host_layers[0][layer].len()).unwrap();
+        let residual_error = relative_l2(&residual, &host_layers[0][layer]);
+        eprintln!(
+            "pinned token 9707 two-layer probe: layer={layer} ffn_input={input_error:.6} shared={shared_error:.6} routed={routed_error:.6} combined={total_error:.6} residual={residual_error:.6}"
+        );
+        assert!(
+            input_error < 0.05
+                && shared_error < 0.08
+                && routed_error < 0.08
+                && total_error < 0.08
+                && residual_error < 0.05
+        );
+    }
+    assert_eq!(step.health().unwrap(), (0, 0));
+}
+
+fn check_composed_router(
+    step: &FlashStep<'_>,
+    layer: usize,
+    want: &crate::family::qwen::flash_next::load::gguf::tests::PinnedRouterReference,
+    exact_order: bool,
+) -> f32 {
+    let (gate, matched) = measure_composed_router(step, layer, want, exact_order);
+    assert!(matched, "GPU and host expert routes differ");
+    gate
+}
+
+fn measure_composed_router(
+    step: &FlashStep<'_>,
+    layer: usize,
+    want: &crate::family::qwen::flash_next::load::gguf::tests::PinnedRouterReference,
+    exact_order: bool,
+) -> (f32, bool) {
+    use crate::kernels::cuda::resident::router::{
+        RouterCall, RouterOut, RouterShape, RouterWeights,
+    };
+    let g = &step.geometry;
+    step.ctx
+        .router(
+            step.stream,
+            RouterCall {
+                shape: RouterShape {
+                    m: 1,
+                    hidden: g.hidden,
+                    n_expert: g.experts,
+                    top_k: g.top_k,
+                },
+                x: step.slot(Slot::Mixed(Site::Mlp)).unwrap(),
+                weights: RouterWeights {
+                    w: step.float(&layer_name(layer, "mlp.gate.weight")).unwrap(),
+                    w_shared: Some(
+                        step.float(&layer_name(layer, "mlp.shared_expert_gate.weight"))
+                            .unwrap(),
+                    ),
+                },
+                logits: step.slot(Slot::RouterLogits).unwrap(),
+                out: RouterOut {
+                    ids: step.slot(Slot::TopkId).unwrap(),
+                    weights: step.slot(Slot::TopkWeight).unwrap(),
+                    shared_gate: Some(step.slot(Slot::SharedGate).unwrap()),
+                    status: step.status_word().unwrap(),
+                },
+            },
+        )
+        .unwrap();
+    let logits = step
+        .read_f32(step.slot(Slot::RouterLogits).unwrap(), g.experts)
+        .unwrap();
+    let route_weights = step
+        .read_f32(step.slot(Slot::TopkWeight).unwrap(), g.top_k)
+        .unwrap();
+    let gate = step
+        .read_f32(step.slot(Slot::SharedGate).unwrap(), 1)
+        .unwrap()[0];
+    let ids = step.slot(Slot::TopkId).unwrap();
+    let mut bytes = vec![0; g.top_k * 4];
+    ids.buffer()
+        .read_at(step.stream, ids.offset(), &mut bytes)
+        .unwrap();
+    let ids: Vec<i32> = bytes
+        .chunks_exact(4)
+        .map(|x| i32::from_ne_bytes(x.try_into().unwrap()))
+        .collect();
+    let expected_ids: Vec<i32> = want.route.iter().map(|(id, _)| *id as i32).collect();
+    let logit_error = relative_l2(&logits, &want.logits);
+    eprintln!(
+        "composed router layer={layer}: logits relative L2 {logit_error:.6}, ids GPU={ids:?} host={expected_ids:?}, gate GPU={gate:.6} host={:.6}",
+        want.shared_gate
+    );
+    assert!(ids.iter().all(|id| *id >= 0 && (*id as usize) < g.experts));
+    let mut actual = ids.clone();
+    let mut expected = expected_ids.clone();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    let sets_match = actual == expected;
+    if !sets_match {
+        for id in actual
+            .iter()
+            .chain(&expected)
+            .filter(|id| !actual.contains(id) || !expected.contains(id))
+        {
+            let index = *id as usize;
+            eprintln!(
+                "route boundary expert={id}: gpu_logit={:.9} host_logit={:.9} delta={:.9}",
+                logits[index],
+                want.logits[index],
+                logits[index] - want.logits[index]
+            );
+        }
+    }
+    let common_weights_ok = route_weights.iter().zip(&ids).all(|(got, id)| {
+        want.route
+            .iter()
+            .find(|(expert, _)| *expert as i32 == *id)
+            .is_none_or(|(_, expected)| (got - expected).abs() < 0.02)
+    });
+    let numerical_ok =
+        logit_error < 0.03 && common_weights_ok && (gate - want.shared_gate).abs() < 0.02;
+    if sets_match {
+        assert!(numerical_ok, "router numerical tolerance failed");
+    } else {
+        eprintln!("route diagnostic numerical tolerances satisfied={numerical_ok}");
+    }
+    (gate, sets_match && (!exact_order || ids == expected_ids))
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device and CPU host reference"]
+fn gguf_delta_mixer_matches_synthetic_host_history() {
+    check_delta_mixer(crate::weights::GgufType::Q80, false);
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device and CPU host reference"]
+fn gguf_delta_q6_mixer_matches_synthetic_host_history() {
+    check_delta_mixer(crate::weights::GgufType::Q6K, false);
+}
+
+#[test]
+#[ignore = "requires the verified pinned GGUF, layer-0 host capture and an admitted CUDA device"]
+fn gguf_delta_mixer_matches_pinned_host_history() {
+    check_delta_mixer(crate::weights::GgufType::Q6K, true);
+}
+
+fn check_delta_mixer(out_ty: crate::weights::GgufType, pinned: bool) {
+    use crate::kernels::cuda::{CudaContext, resident::step_params::StepParams};
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let inputs: Vec<Vec<f32>> = if pinned {
+        let path = std::env::var_os("FIFI_FLASH_GGUF_HOST_CAPTURE").expect("set the host capture");
+        let capture = std::fs::read_to_string(path).unwrap();
+        let input: Vec<f32> = capture
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["name"] == "blk.0.attn_qkv.weight")
+            .map(|row| serde_json::from_value(row["input"].clone()).unwrap())
+            .expect("layer-0 DeltaNet input in host capture");
+        assert_eq!(input.len(), 2560);
+        (0..3)
+            .map(|token| {
+                input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| {
+                        x * (1.0 + token as f32 * 0.01) + token as f32 * (i % 7) as f32 * 0.0001
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        (0..3)
+            .map(|token| {
+                (0..2560)
+                    .map(|i| 0.03 + ((i * (token + 1) + token * 7) % 19) as f32 * 0.002)
+                    .collect()
+            })
+            .collect()
+    };
+    let (uploaded, reference, host_rec, host_ring) = if pinned {
+        crate::family::qwen::flash_next::load::gguf::tests::pinned_delta_host_reference(
+            &ctx, &stream, &inputs,
+        )
+    } else {
+        crate::family::qwen::flash_next::load::gguf::tests::synthetic_delta_host_reference(
+            &ctx, &stream, &inputs, out_ty,
+        )
+    };
+    assert!(reference.iter().flatten().all(|v| v.is_finite()));
+    assert!(reference.iter().flatten().any(|v| v.abs() > 1e-6));
+    assert!(host_rec.iter().any(|v| v.abs() > 1e-6));
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step = FlashStep::new_gguf_decode(
+        &ctx,
+        &stream,
+        &weights,
+        model,
+        &kinds,
+        inputs.len(),
+        6144,
+        0..1,
+    )
+    .unwrap();
+    for (pos, (input, want)) in inputs.iter().zip(&reference).enumerate() {
+        step.begin_token().unwrap();
+        let (words, at) = step.words_buffer().unwrap();
+        words
+            .write_at(
+                &stream,
+                at,
+                &StepParams::new(1, pos as i32).unwrap().to_bytes(),
+            )
+            .unwrap();
+        let mixed = step.slot(Slot::Mixed(Site::Attn)).unwrap();
+        mixed
+            .buffer()
+            .write_at(
+                &stream,
+                mixed.offset(),
+                &input
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        step.mixer(0, pos, 1).unwrap();
+        let got = step
+            .read_f32(step.slot(Slot::BlockOut(Site::Attn)).unwrap(), want.len())
+            .unwrap();
+        assert_eq!(step.health().unwrap(), (0, 0));
+        let error = relative_l2(&got, want);
+        eprintln!(
+            "GGUF DeltaNet pinned={pinned} {out_ty:?} position {pos}: output relative L2 {error:.6}"
+        );
+        assert!(error < 0.03, "position {pos}: relative L2 {error}");
+        if out_ty == crate::weights::GgufType::Q6K && pos + 1 == inputs.len() {
+            // Negative control: the raw Q6_K matrix expects tiled, not grouped, heads.
+            let wrong_out = ctx.allocate(want.len() * 4).unwrap();
+            step.project(
+                &layer_name(0, "linear_attn.out_proj"),
+                step.slot(Slot::DeltaCore).unwrap(),
+                wrong_out.range(0, want.len() * 4).unwrap(),
+                1,
+            )
+            .unwrap();
+            let wrong = step
+                .read_f32(wrong_out.range(0, want.len() * 4).unwrap(), want.len())
+                .unwrap();
+            let wrong_error = relative_l2(&wrong, want);
+            eprintln!(
+                "GGUF DeltaNet pinned={pinned} Q6_K identity-layout negative-control relative L2 {wrong_error:.6}"
+            );
+            assert!(
+                wrong_error > error * 2.0 + 0.001,
+                "fixture did not distinguish missing head tile: {wrong_error} vs {error}"
+            );
+        }
+    }
+    let rec = step
+        .read_f32(
+            step.state_slot(StateSlot::DeltaRec(0)).unwrap(),
+            host_rec.len(),
+        )
+        .unwrap();
+    let ring = step
+        .read_f32(
+            step.state_slot(StateSlot::DeltaConv(0)).unwrap(),
+            host_ring.len(),
+        )
+        .unwrap();
+    let channels = step.geometry.delta.conv_dim;
+    let taps = host_ring.len() / channels;
+    let mut planar = vec![0.0; host_ring.len()];
+    for channel in 0..channels {
+        for tap in 0..taps {
+            planar[tap * channels + channel] = host_ring[channel * taps + tap];
+        }
+    }
+    let (rec_error, ring_error) = (relative_l2(&rec, &host_rec), relative_l2(&ring, &planar));
+    eprintln!(
+        "GGUF DeltaNet pinned={pinned} final state relative L2 rec={rec_error:.6} ring={ring_error:.6}"
+    );
+    assert!(rec_error < 0.03, "recurrent state relative L2 {rec_error}");
+    assert!(
+        ring_error < 0.03,
+        "convolution ring relative L2 {ring_error}"
+    );
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn gguf_qsa_trunk_upload_projects_synthetic_weights() {
+    use crate::kernels::cuda::CudaContext;
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let uploaded =
+        crate::family::qwen::flash_next::load::gguf::tests::synthetic_qsa_trunk(&ctx, &stream);
+    assert_eq!(uploaded.len(), 9);
+    let weights = CudaWeights::from_native(uploaded).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 6144, 0..1).unwrap();
+    let x = ctx.allocate(2560 * 4).unwrap();
+    x.write_at(
+        &stream,
+        0,
+        &(0..2560)
+            .flat_map(|_| 1f32.to_ne_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let name = |suffix| layer_name(3, suffix);
+    let qname = name("self_attn.q_proj");
+    let kname = name("self_attn.k_proj");
+    let vname = name("self_attn.v_proj");
+    let width = |name: &str| match weights.get(name).unwrap() {
+        CudaWeight::Native { weight, .. } => weight.n_rows(),
+        _ => panic!("native weight expected"),
+    };
+    let (q, k, v) = (width(&qname), width(&kname), width(&vname));
+    assert_eq!(k, v);
+    let out = ctx.allocate((q.max(k + v).max(640)) * 4).unwrap();
+    for (name, cols, indexer) in [
+        (&qname, q, false),
+        (&name("self_attn.indexer.index_qk_proj"), 640, true),
+    ] {
+        step.project(
+            name,
+            x.range(0, 2560 * 4).unwrap(),
+            out.range(0, cols * 4).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut values = vec![1u8; cols * 4];
+        out.read_at(&stream, 0, &mut values).unwrap();
+        for (i, bytes) in values.chunks_exact(4).enumerate() {
+            let actual = f32::from_ne_bytes(bytes.try_into().unwrap());
+            let expected = if !indexer || i < 512 { 2560.0 } else { 5120.0 };
+            assert!((actual - expected).abs() < 1.0, "row {i}: {actual}");
+        }
+    }
+    step.project_group(
+        &[(&kname, 0, k), (&vname, k, v)],
+        x.range(0, 2560 * 4).unwrap(),
+        &out.range(0, (k + v) * 4).unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut values = vec![1u8; (k + v) * 4];
+    out.read_at(&stream, 0, &mut values).unwrap();
+    for (i, bytes) in values.chunks_exact(4).enumerate() {
+        let actual = f32::from_ne_bytes(bytes.try_into().unwrap());
+        let expected = if i < k { 5120.0 } else { 7680.0 };
+        assert!((actual - expected).abs() < 2.0, "row {i}: {actual}");
+    }
+    let oname = name("self_attn.o_proj");
+    let CudaWeight::Native { weight: o, .. } = weights.get(&oname).unwrap() else {
+        panic!("native output projection expected")
+    };
+    let ox = ctx.allocate(o.k() * 4).unwrap();
+    ox.write_at(
+        &stream,
+        0,
+        &(0..o.k())
+            .flat_map(|_| 1f32.to_ne_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    step.project(
+        &oname,
+        ox.range(0, o.k() * 4).unwrap(),
+        out.range(0, o.n_rows() * 4).unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut values = vec![0u8; o.n_rows() * 4];
+    out.read_at(&stream, 0, &mut values).unwrap();
+    for bytes in values.chunks_exact(4) {
+        let actual = f32::from_ne_bytes(bytes.try_into().unwrap());
+        assert!((actual - (4 * o.k()) as f32).abs() < 4.0, "{actual}");
+    }
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn gguf_head_loader_projects_logits() {
+    use crate::kernels::cuda::CudaContext;
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let head = || crate::family::qwen::flash_next::load::gguf::tests::synthetic_native_head(&ctx);
+    assert!(CudaWeights::from_native(vec![]).is_err());
+    assert!(CudaWeights::from_native(vec![head(), head()]).is_err());
+    let raw = || CudaWeight::Raw {
+        name: "aux".into(),
+        ty: crate::weights::GgufType::F32,
+        buffer: ctx.allocate(4).unwrap(),
+    };
+    assert!(CudaWeights::from_native(vec![raw()]).is_err());
+    let indexer =
+        crate::family::qwen::flash_next::load::gguf::tests::synthetic_indexer(&ctx, &stream);
+    let weights = CudaWeights::from_native(vec![head(), raw(), indexer]).unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let (model, kinds) = model_shape(config).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 256, 0..1).unwrap();
+    let input = ctx.allocate(1024).unwrap();
+    let x: Vec<u8> = (0..256).flat_map(|_| 1f32.to_ne_bytes()).collect();
+    input.write_at(&stream, 0, &x).unwrap();
+    let output = ctx.allocate(16).unwrap();
+    step.project(
+        "lm_head",
+        input.range(0, 1024).unwrap(),
+        output.range(0, 16).unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut got = [0u8; 16];
+    output.read_at(&stream, 0, &mut got).unwrap();
+    for bytes in got.chunks_exact(4) {
+        let value = f32::from_ne_bytes(bytes.try_into().unwrap());
+        assert!((value - 256.0).abs() < 0.5, "{value}");
+    }
+    let index_in = ctx.allocate(2560 * 4).unwrap();
+    index_in
+        .write_at(
+            &stream,
+            0,
+            &(0..2560)
+                .flat_map(|_| 1f32.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let index_out = ctx.allocate(640 * 4).unwrap();
+    step.project(
+        &layer_name(3, "self_attn.indexer.index_qk_proj"),
+        index_in.range(0, 2560 * 4).unwrap(),
+        index_out.range(0, 640 * 4).unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut result = vec![0u8; 640 * 4];
+    index_out.read_at(&stream, 0, &mut result).unwrap();
+    for (i, bytes) in result.chunks_exact(4).enumerate() {
+        let value = f32::from_ne_bytes(bytes.try_into().unwrap());
+        let expected = if i < 512 { 2560.0 } else { 5120.0 };
+        assert!((value - expected).abs() < 1.0, "{i}: {value}");
+    }
+    let group = ctx.allocate(32).unwrap();
+    group.write_at(&stream, 0, &[0x55; 32]).unwrap();
+    let row = group.range(0, 32).unwrap();
+    let x = input.range(0, 1024).unwrap();
+    assert!(
+        step.project_group(&[("lm_head", 0, 4), ("lm_head", 4, 3)], x, &row, 1)
+            .is_err()
+    );
+    assert!(
+        step.project_group(&[("lm_head", 0, 4), ("lm_head", 2, 4)], x, &row, 1)
+            .is_err()
+    );
+    assert!(
+        step.project_group(
+            &[("lm_head", 0, 4), ("lm_head", 4, 4)],
+            x,
+            &group.range(0, 16).unwrap(),
+            1
+        )
+        .is_err()
+    );
+    assert!(
+        step.project_group(
+            &[("lm_head", 0, 4), ("lm_head", 4, 4)],
+            x,
+            &input.range(0, 32).unwrap(),
+            1
+        )
+        .is_err()
+    );
+    let mut input_after = vec![0u8; 1024];
+    input.read_at(&stream, 0, &mut input_after).unwrap();
+    assert_eq!(
+        input_after,
+        (0..256)
+            .flat_map(|_| 1f32.to_ne_bytes())
+            .collect::<Vec<_>>()
+    );
+    let mut grouped = [0u8; 32];
+    group.read_at(&stream, 0, &mut grouped).unwrap();
+    assert_eq!(grouped, [0x55; 32]);
+    step.project_group(&[("lm_head", 0, 4), ("lm_head", 4, 4)], x, &row, 1)
+        .unwrap();
+    group.read_at(&stream, 0, &mut grouped).unwrap();
+    for bytes in grouped.chunks_exact(4) {
+        let value = f32::from_ne_bytes(bytes.try_into().unwrap());
+        assert!((value - 256.0).abs() < 0.5, "{value}");
+    }
+}
+
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn native_decode_projection_uses_supplied_scratch() {
+    use super::step::{NativeProjection, project_native};
+    use crate::kernels::cuda::{
+        CudaContext, NativeWeight,
+        resident::{matvec_q::QuantType, quantize_q8_1::q8_1_bytes},
+    };
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut blocks = Vec::new();
+    for _ in 0..32 {
+        blocks.extend_from_slice(&0x3c00u16.to_le_bytes());
+        blocks.extend_from_slice(&[1u8; 32]);
+    }
+    let w = ctx.allocate(blocks.len()).unwrap();
+    w.write_at(&stream, 0, &blocks).unwrap();
+    let weight = NativeWeight::from_buffer(w, QuantType::Q80, 256, 4, None).unwrap();
+    let input = ctx.allocate(1024).unwrap();
+    let x: Vec<u8> = (0..256).flat_map(|_| 1f32.to_ne_bytes()).collect();
+    input.write_at(&stream, 0, &x).unwrap();
+    let n = q8_1_bytes(256, 1).unwrap();
+    let scratch = ctx.allocate(n).unwrap();
+    let output = ctx.allocate(16).unwrap();
+    scratch.write_at(&stream, 0, &vec![0x55; n]).unwrap();
+    assert!(
+        project_native(
+            &ctx,
+            &stream,
+            NativeProjection {
+                weight: &weight,
+                input: input.range(0, 1024).unwrap(),
+                output: output.range(0, 16).unwrap(),
+                scratch: weight.buffer().range(0, n).unwrap(),
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        project_native(
+            &ctx,
+            &stream,
+            NativeProjection {
+                weight: &weight,
+                input: input.range(0, 1024).unwrap(),
+                output: output.range(0, 4).unwrap(),
+                scratch: scratch.range(0, n).unwrap(),
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        project_native(
+            &ctx,
+            &stream,
+            NativeProjection {
+                weight: &weight,
+                input: input.range(0, 1024).unwrap(),
+                output: weight.buffer().range(blocks.len() - 16, 16).unwrap(),
+                scratch: scratch.range(0, n).unwrap(),
+            }
+        )
+        .is_err()
+    );
+    let mut unchanged = vec![0; n];
+    scratch.read_at(&stream, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, vec![0x55; n]);
+    let mut weight_after = vec![0; blocks.len()];
+    weight
+        .buffer()
+        .read_at(&stream, 0, &mut weight_after)
+        .unwrap();
+    assert_eq!(weight_after, blocks);
+    project_native(
+        &ctx,
+        &stream,
+        NativeProjection {
+            weight: &weight,
+            input: input.range(0, 1024).unwrap(),
+            output: output.range(0, 16).unwrap(),
+            scratch: scratch.range(0, n).unwrap(),
+        },
+    )
+    .unwrap();
+    let mut got = [0u8; 16];
+    output.read_at(&stream, 0, &mut got).unwrap();
+    for bytes in got.chunks_exact(4) {
+        let value = f32::from_ne_bytes(bytes.try_into().unwrap());
+        assert!((value - 256.0).abs() < 0.5, "{value}");
+    }
+    let weights = CudaWeights::from_weights(vec![CudaWeight::Native {
+        name: "native".into(),
+        weight,
+    }])
+    .unwrap();
+    let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    let step = FlashStep::new(&ctx, &stream, &weights, config, 1, 1, 0..1).unwrap();
+    assert!(
+        step.project(
+            "native",
+            input.range(0, 1024).unwrap(),
+            output.range(0, 16).unwrap(),
+            1
+        )
+        .is_err()
+    );
+    let (model, kinds) = model_shape(config).unwrap();
+    let admitted = super::gguf_decode_arena_bytes(&model, &kinds, 1, ctx.sm_count(), 256).unwrap();
+    let step =
+        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 1, 256, 0..1).unwrap();
+    assert_eq!(step.scratch_bytes_for_test() as u64, admitted);
+    output.write_at(&stream, 0, &[0; 16]).unwrap();
+    step.project(
+        "native",
+        input.range(0, 1024).unwrap(),
+        output.range(0, 16).unwrap(),
+        1,
+    )
+    .unwrap();
+    output.read_at(&stream, 0, &mut got).unwrap();
+    for bytes in got.chunks_exact(4) {
+        let value = f32::from_ne_bytes(bytes.try_into().unwrap());
+        assert!((value - 256.0).abs() < 0.5, "{value}");
+    }
+}
 
 #[test]
 #[ignore = "needs CUDA and FIFI_FLASH_NEXT_EXL3_PACK layer-3 trunk"]

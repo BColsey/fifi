@@ -141,6 +141,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/qsa_select.cu",
     "src/kernels/cuda/native/resident/pack_rows.cu",
     "src/kernels/cuda/native/resident/dense_gemv.cu",
+    "src/kernels/cuda/native/resident/head_tile.cu",
+    "src/kernels/cuda/native/resident/q6_f32.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -229,6 +231,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/gdn_mutants.h",
     "src/kernels/cuda/native/resident/gguf_decode.cuh",
     "src/kernels/cuda/native/resident/graph.h",
+    "src/kernels/cuda/native/resident/head_tile.h",
     "src/kernels/cuda/native/resident/kv8_append.h",
     "src/kernels/cuda/native/resident/kv_f16_append.h",
     "src/kernels/cuda/native/resident/kv_f16_rows.h",
@@ -245,6 +248,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/moe_combine.h",
     "src/kernels/cuda/native/resident/pack_rows.h",
     "src/kernels/cuda/native/resident/paged_position.h",
+    "src/kernels/cuda/native/resident/q6_f32.h",
     "src/kernels/cuda/native/resident/quantize_q8_1.h",
     "src/kernels/cuda/native/resident/row_add.h",
     "src/kernels/cuda/native/resident/sample.h",

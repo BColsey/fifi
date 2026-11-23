@@ -762,6 +762,27 @@ impl TensorMap {
         self.entries.iter().map(Mapped::device_bytes).sum()
     }
 
+    /// Maximum input width of mapped quantized device matrices and routed expert stacks.
+    /// This bounds one serialized native activation row, not concurrent or prefill scratch.
+    /// Returns zero when no mapped quantized projection needs a native kernel.
+    pub(in super::super::super) fn max_quantized_input_width(&self) -> Result<usize, EngError> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.needs_kernel() && !is_float(entry.ty))
+            .try_fold(0usize, |max, entry| {
+                let k = entry
+                    .dims
+                    .first()
+                    .copied()
+                    .and_then(|k| usize::try_from(k).ok())
+                    .filter(|k| *k != 0 && k.is_multiple_of(32))
+                    .ok_or_else(|| {
+                        mismatch(format!("{} has an invalid native input width", entry.name))
+                    })?;
+                Ok(max.max(k))
+            })
+    }
+
     /// The tensor types that matrices of the model have and `supported` does not accept,
     /// each with its tensor count, bytes and first tensor, in order of first appearance.
     pub(in super::super::super) fn kernel_gaps(
@@ -795,6 +816,52 @@ impl TensorMap {
 /// of the shared native list has both (`GgufType::has_native_kernel`).
 pub(in super::super::super) fn has_decode_kernel(_place: Place, ty: GgufType) -> bool {
     ty.has_native_kernel()
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    fn entry(place: Place, form: Form, ty: GgufType, k: u64) -> Mapped {
+        Mapped {
+            role: Global::Embedding.into(),
+            layer: None,
+            name: "test".into(),
+            ty,
+            dims: vec![k, 4],
+            bytes: 0,
+            shard: 0,
+            place,
+            form,
+            convention: Convention::AsStored,
+        }
+    }
+
+    fn map(entries: Vec<Mapped>) -> TensorMap {
+        TensorMap {
+            entries,
+            unmapped: vec![],
+            total: 0,
+            mapped_names: 0,
+        }
+    }
+
+    #[test]
+    fn width_includes_experts_and_excludes_host_and_float_weights() {
+        let entries = vec![
+            entry(Place::Device, Form::Blocks, GgufType::Q80, 256),
+            entry(Place::Experts, Form::None, GgufType::Q80, 1024),
+            entry(Place::Host, Form::None, GgufType::Q80, 4096),
+            entry(Place::Device, Form::Blocks, GgufType::F32, 2048),
+        ];
+        assert_eq!(map(entries).max_quantized_input_width().unwrap(), 1024);
+        assert_eq!(map(vec![]).max_quantized_input_width().unwrap(), 0);
+        assert!(
+            map(vec![entry(Place::Device, Form::Blocks, GgufType::Q80, 33)])
+                .max_quantized_input_width()
+                .is_err()
+        );
+    }
 }
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]

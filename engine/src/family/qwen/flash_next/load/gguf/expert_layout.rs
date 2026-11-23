@@ -200,7 +200,7 @@ pub(in super::super::super) struct ExpertProjectionInputs<'a> {
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 impl<'a> ExpertProjection<'a> {
-    /// Queue the native indexed matvec; normal stream and input-lifetime rules apply.
+    /// Queue native indexed matvec chunks; normal stream and input-lifetime rules apply.
     pub(in super::super::super) fn launch(
         self,
         ctx: &crate::kernels::cuda::CudaContext,
@@ -208,7 +208,7 @@ impl<'a> ExpertProjection<'a> {
         inputs: ExpertProjectionInputs<'a>,
     ) -> Result<(), EngError> {
         use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
-        ctx.matvec_expert(
+        ctx.matvec_expert_chunks(
             stream,
             ExpertMatvecCall {
                 ty: self.ty,
@@ -329,6 +329,19 @@ impl<'a> ExpertDeviceStacks<'a> {
         layer: usize,
         picks: &[i32],
     ) -> Result<crate::family::expert_bank::PassCopies, EngError> {
+        self.step_disk_with(model, state, layer, picks, |bank, slot, expert| {
+            bank.replace_from_model(stream, model, layer, slot, expert)
+        })
+    }
+
+    fn step_disk_with<P: crate::family::expert_bank::SlotPolicy>(
+        &mut self,
+        model: &GgufModel,
+        state: &mut crate::family::expert_bank::ExpertBankState<P>,
+        layer: usize,
+        picks: &[i32],
+        mut replace: impl FnMut(&mut Self, usize, u32) -> Result<(), EngError>,
+    ) -> Result<crate::family::expert_bank::PassCopies, EngError> {
         use crate::family::expert_bank::HostMode;
         if self.poisoned || state.is_poisoned() {
             self.poisoned = true;
@@ -342,7 +355,7 @@ impl<'a> ExpertDeviceStacks<'a> {
         self.check_source(model, layer)?;
         let mut slots = self.check_state(state)?.to_vec();
         let result = disk_pass(state, layer, picks, &mut slots, |slot, expert| {
-            self.replace_from_model(stream, model, layer, slot, expert)
+            replace(self, slot, expert)
         });
         if state.is_poisoned() {
             self.poisoned = true;
@@ -409,6 +422,43 @@ impl<'a> ExpertDeviceStacks<'a> {
         *ready = false;
         self.stacks
             .upload_record(&self.layout, slot, record, &self.buffer, stream)?;
+        *ready = true;
+        Ok(())
+    }
+
+    /// One reusable pinned record feeds all three ordered copies; do not publish the slot
+    /// until the stream fence has completed. PinnedBuf retains pending DMA on error.
+    fn upload_pinned(
+        &mut self,
+        ctx: &crate::kernels::cuda::CudaContext,
+        stream: &crate::kernels::cuda::DeviceStream,
+        slot: usize,
+        record: &mut crate::kernels::cuda::PinnedBuf,
+    ) -> Result<(), EngError> {
+        if self.poisoned {
+            return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
+        }
+        let destinations = self.stacks.copy_ranges(
+            &self.layout,
+            slot,
+            record.host_view()?,
+            self.buffer.bytes(),
+        )?;
+        let ready = self
+            .ready
+            .get_mut(slot)
+            .ok_or_else(|| EngError::BadRequest("invalid GGUF device expert slot".into()))?;
+        *ready = false;
+        self.slot_experts = None;
+        for (part, dest) in self.layout.parts.iter().zip(destinations) {
+            ctx.copy_from_pinned(
+                stream,
+                record,
+                part.bytes.start,
+                self.buffer.range(dest.start, dest.len())?,
+            )?;
+        }
+        record.synchronize(stream)?;
         *ready = true;
         Ok(())
     }
@@ -492,6 +542,69 @@ impl<'a> ExpertDeviceStacks<'a> {
             .get(index)
             .ok_or_else(|| EngError::BadRequest("invalid GGUF expert stack part".into()))?;
         self.buffer.range(range.start, range.len())
+    }
+}
+
+/// Explicit opt-in for the staged GGUF disk bank. One record is read directly into
+/// page-locked memory, reused only after its three device copies finish. The caller must
+/// admit `layout.bytes` of pinned host memory in addition to the device stacks.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in super::super::super) struct PinnedDiskRefill<'a> {
+    ctx: &'a crate::kernels::cuda::CudaContext,
+    stream: &'a crate::kernels::cuda::DeviceStream,
+    model: &'a GgufModel,
+    layer: usize,
+    layout: ExpertLayout,
+    record: crate::kernels::cuda::PinnedBuf,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl<'a> PinnedDiskRefill<'a> {
+    pub(in super::super::super) fn new(
+        ctx: &'a crate::kernels::cuda::CudaContext,
+        stream: &'a crate::kernels::cuda::DeviceStream,
+        model: &'a GgufModel,
+        layer: usize,
+    ) -> Result<Self, EngError> {
+        let layout = ExpertLayout::for_layer(model, layer)?;
+        let mut record = ctx.pinned_buf(layout.bytes)?;
+        // Reject a foreign stream before policy can advance, and begin with no in-flight DMA.
+        record.synchronize(stream)?;
+        Ok(Self {
+            ctx,
+            stream,
+            model,
+            layer,
+            layout,
+            record,
+        })
+    }
+
+    pub(in super::super::super) fn step<P: crate::family::expert_bank::SlotPolicy>(
+        &mut self,
+        bank: &mut ExpertDeviceStacks<'_>,
+        state: &mut crate::family::expert_bank::ExpertBankState<P>,
+        picks: &[i32],
+    ) -> Result<crate::family::expert_bank::PassCopies, EngError> {
+        if bank.layout != self.layout {
+            return Err(EngError::BadRequest(
+                "GGUF pinned refill layout mismatch".into(),
+            ));
+        }
+        // Reject foreign owners even on a hit-only pass, before policy state advances.
+        self.ctx.owned(&bank.buffer)?;
+        let (model, layer) = (self.model, self.layer);
+        bank.step_disk_with(model, state, layer, picks, |bank, slot, expert| {
+            if slot >= bank.ready.len() || expert >= model.config().dims.experts {
+                return Err(EngError::BadRequest(
+                    "invalid GGUF expert replacement".into(),
+                ));
+            }
+            self.record.fill(self.layout.bytes, |record| {
+                self.layout.read(model, layer, u64::from(expert), record)
+            })?;
+            bank.upload_pinned(self.ctx, self.stream, slot, &mut self.record)
+        })
     }
 }
 

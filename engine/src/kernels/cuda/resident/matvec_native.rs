@@ -11,7 +11,10 @@ use crate::kernels::cuda::NativeWeight;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
-use crate::kernels::cuda::resident::{matvec_q::MatvecCall, quantize_q8_1::q8_1_bytes};
+use crate::kernels::cuda::resident::{
+    matvec_q::MatvecCall,
+    quantize_q8_1::{QuantizeCall, q8_1_bytes},
+};
 
 /// Activation columns one matvec launch takes.
 pub(crate) const MATVEC_COLUMNS: usize = 8;
@@ -19,6 +22,51 @@ pub(crate) const MATVEC_COLUMNS: usize = 8;
 const F32: usize = size_of::<f32>();
 
 impl CudaContext {
+    /// Check both launches and scratch/weight separation before a native one-row projection.
+    pub(crate) fn validate_native_projection(
+        &self,
+        weight: &NativeWeight,
+        input: DeviceRange<'_>,
+        scratch: DeviceRange<'_>,
+        output: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let w = weight.buffer().range(0, weight.buffer().bytes())?;
+        let k = weight.k();
+        self.plan_quantize(&QuantizeCall {
+            x: input,
+            y: scratch,
+            k,
+            ncols: 1,
+        })?;
+        self.plan_matvec(
+            &MatvecCall {
+                ty: weight.quant(),
+                w,
+                x_q8: scratch,
+                y: output,
+                k,
+                rows: weight.n_rows(),
+                ncols: 1,
+            },
+            false,
+        )?;
+        let bytes = q8_1_bytes(k, 1).ok_or_else(|| overflow("a q8_1 row"))?;
+        let output_bytes = weight
+            .n_rows()
+            .checked_mul(F32)
+            .ok_or_else(|| overflow("output"))?;
+        require_apart(
+            &Claim::of("scratch", &scratch, bytes),
+            &Claim::of("w", &w, w.bytes()),
+        )?;
+        require_apart(
+            &Claim::of("y", &output, output_bytes),
+            &Claim::of("w", &w, w.bytes()),
+        )?;
+        Ok(())
+    }
+
     /// `ncols` rows of `x_q8` (each a q8_1 row of `weight.k()` values, back to back) through
     /// `weight` into `y`, `rows` floats per activation row.
     pub(crate) fn matvec_native(

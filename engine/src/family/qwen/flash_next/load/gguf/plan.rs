@@ -145,6 +145,31 @@ impl GgufModel {
         })
     }
 
+    /// Stage a decode-only load plan after reserving the complete aligned GGUF step arena.
+    /// Rebuild per context; this is not a prefill plan or production executor admission.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(in super::super::super) fn load_plan_with_decode_arena(
+        &self,
+        card: Card,
+        positions: usize,
+        sm_count: u32,
+    ) -> Result<(FlashLoadPlan, u64), EngError> {
+        let shape = self.config.model_shape()?;
+        let max_k = self.map.max_quantized_input_width()?;
+        let bytes = super::super::super::cuda::gguf_decode_arena_bytes(
+            &shape,
+            self.config.kinds(),
+            positions,
+            sm_count,
+            max_k,
+        )?;
+        let free_vram = card
+            .free_vram
+            .checked_sub(bytes)
+            .ok_or_else(|| refuse("decode arena exceeds free VRAM"))?;
+        Ok((self.load_plan(Card { free_vram, ..card })?, bytes))
+    }
+
     /// The load plan on `card`. The disk tier is offered (the staging ring is charged), so a
     /// host that cannot pin the cold experts plans the tier that reads them from the files.
     pub(in super::super::super) fn load_plan(&self, card: Card) -> Result<FlashLoadPlan, EngError> {

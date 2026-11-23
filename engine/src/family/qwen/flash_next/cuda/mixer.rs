@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     EngError,
-    family::{AttentionKind, exl3_pack::layer_name},
+    family::{AttentionKind, exl3_pack::layer_name, project::cuda::CudaWeight},
     kernels::cuda::{
         DeviceRange,
         prefill::gdn_scan_seq::{
@@ -34,6 +34,7 @@ use crate::{
         resident::{
             attn_prep::{AttnPrepCall, AttnPrepShape, RopeParams, SlotMode},
             gdn_conv::{ConvCall, ConvShape, conv_bytes},
+            head_tile::{HeadTileCall, HeadTileShape},
             qsa_attn::{QsaAttnCall, QsaAttnShape},
             qsa_index::{QsaIndexCall, QsaIndexer, QsaPosition, QsaScoreCall, QsaSelectCall},
             router::RouterShape,
@@ -178,9 +179,38 @@ impl FlashStep<'_> {
             GdnForm::FLASH_NEXT,
         )?;
 
+        let out_name = at("linear_attn.out_proj");
+        let projection_input = match self.weights.get(&out_name) {
+            Some(CudaWeight::Native { weight, .. })
+                if !delta.value_dim.is_multiple_of(weight.quant().block_size()) =>
+            {
+                // The GGUF uploader leaves such blocks in tiled order: reordering their
+                // heads as bytes would split a shared quantization scale.
+                if m != 1 {
+                    return Err(refuse(
+                        "GGUF DeltaNet head tiling supports decode only".into(),
+                    ));
+                }
+                let tiled = self.slot(Slot::GgufDeltaTile)?;
+                self.ctx.head_tile(
+                    self.stream,
+                    HeadTileCall {
+                        src: head(&core, need.o_out)?,
+                        dst: head(&tiled, need.o_out)?,
+                        shape: HeadTileShape {
+                            key_heads: delta.key_heads,
+                            value_heads: delta.value_heads,
+                            head_dim: delta.value_dim,
+                        },
+                    },
+                )?;
+                tiled
+            }
+            _ => core,
+        };
         self.project(
-            &at("linear_attn.out_proj"),
-            core,
+            &out_name,
+            projection_input,
             self.slot(Slot::BlockOut(Site::Attn))?,
             m,
         )

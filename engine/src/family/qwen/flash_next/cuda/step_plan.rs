@@ -178,6 +178,8 @@ pub(super) enum Slot {
     Exl3Jobs,
     /// One padded Q8_1 activation row for a staged GGUF decode projection.
     GgufDecodeQ8,
+    /// One tiled f32 value-head row for GGUF DeltaNet output projection.
+    GgufDeltaTile,
     /// f32 `[rows][vocab]`.
     Logits,
     ArgmaxPart,
@@ -674,6 +676,44 @@ impl StepPlan {
         plan.slots = list.slots;
         plan.arena = plan_arena(&plan.arena_tensors())?;
         Ok(plan)
+    }
+
+    /// The aligned arena of a single-row GGUF owner. A zero width means no mapped native
+    /// projections; it does not imply that other GGUF formats can already execute.
+    pub(super) fn gguf_decode(
+        geometry: &FlashGeometry,
+        positions: usize,
+        options: &StepOptions,
+        max_k: usize,
+    ) -> Result<Self, EngError> {
+        let plan = Self::new(geometry, 1, positions, options)?;
+        if max_k == 0 {
+            Ok(plan)
+        } else {
+            plan.with_gguf_decode_q8(max_k)?
+                .with_gguf_delta_tile(geometry.delta.value_width())
+        }
+    }
+
+    /// Add a row for the DeltaNet output activation's grouped-to-tiled permutation.
+    pub(super) fn with_gguf_delta_tile(mut self, width: usize) -> Result<Self, EngError> {
+        let bytes = width
+            .checked_mul(F32)
+            .filter(|&n| n > 0)
+            .ok_or_else(overflow)?;
+        if self.rows != 1 || self.index(Slot::GgufDeltaTile).is_some() {
+            return Err(refuse(
+                "GGUF DeltaNet tile needs one row and one slot".into(),
+            ));
+        }
+        self.slots.push(PlannedSlot {
+            slot: Slot::GgufDeltaTile,
+            bytes,
+            first: at(Phase::DeltaRule),
+            last: at(Phase::MixerOut),
+        });
+        self.arena = plan_arena(&self.arena_tensors())?;
+        Ok(self)
     }
 
     /// Add scratch for one serialized GGUF decode projection. This does not enable GGUF

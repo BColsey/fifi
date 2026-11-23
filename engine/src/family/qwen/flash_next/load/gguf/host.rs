@@ -185,6 +185,25 @@ fn load_delta(model: &GgufModel, index: usize) -> Result<HDelta, EngError> {
     })
 }
 
+/// Run a synthetic DeltaNet sequence with the host's own GGUF layout conversion and state.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) fn delta_reference(
+    model: &GgufModel,
+    inputs: &[Vec<f32>],
+) -> Result<(Vec<Vec<f32>>, Vec<f32>, Vec<f32>), EngError> {
+    use crate::family::qwen::flash_next::deltanet::{self, DeltaState};
+    let shape = model.config().model_shape()?.delta;
+    let weights = load_delta(model, 0)?;
+    let ngram = model.ngram()?;
+    let mut projector = HostProjector::new(&model.weights, &ngram, 1);
+    let mut state = DeltaState::new(&shape);
+    let outputs = inputs
+        .iter()
+        .map(|x| deltanet::step(&mut projector, &shape, &weights.view(), &mut state, x))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((outputs, state.rec().to_vec(), state.ring().to_vec()))
+}
+
 impl HostModel {
     /// Reads the first `layers` layers (the PLE layer must be among them), the embedding, the
     /// final mixer and the output head. The result runs the step on a truncated model.
@@ -335,14 +354,27 @@ pub(super) fn run(
     threads: usize,
 ) -> Result<HostRun, EngError> {
     let ngram = model.ngram()?;
-    let mut projector = HostProjector::new(&model.weights, &ngram, threads);
+    let projector = HostProjector::new(&model.weights, &ngram, threads);
+    run_with(projector, host, tokens)
+}
+
+/// Runs a recorded forward with the supplied GGUF projector.
+pub(super) fn run_with(
+    mut projector: HostProjector<'_>,
+    host: &HostModel,
+    tokens: &[u32],
+) -> Result<HostRun, EngError> {
     let weights = host.view();
     let mut state = crate::family::qwen::flash_next::step::ModelState::new(&host.shape, &weights);
     let mut run = HostRun {
         layer_out: Vec::new(),
         logits: Vec::new(),
     };
-    for &token in tokens {
+    for (position, &token) in tokens.iter().enumerate() {
+        if std::env::var_os("FIFI_FLASH_GGUF_STATEFUL_TRACE").is_some() {
+            eprintln!("stateful host token: position={position} token={token}");
+        }
+        super::projector::capture_token_boundary(position, token);
         let output = crate::family::qwen::flash_next::step::step(
             &mut projector,
             &host.shape,

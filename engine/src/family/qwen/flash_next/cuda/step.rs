@@ -70,12 +70,13 @@ use crate::{
         },
     },
     kernels::cuda::{
-        CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
+        CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight,
         resident::{
             exl3::Exl3Job,
             hyper::{
                 HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
             },
+            quantize_q8_1::QuantizeCall,
             step_params::{OFFSET_POS, OFFSET_STATUS},
         },
     },
@@ -86,6 +87,99 @@ pub(super) const F32: usize = size_of::<f32>();
 
 pub(super) fn refuse(detail: String) -> EngError {
     EngError::BadRequest(format!("Flash-Next step: {detail}"))
+}
+
+/// One staged native GGUF decode projection with caller-owned, stream-ordered scratch.
+pub(super) struct NativeProjection<'a> {
+    pub(super) weight: &'a NativeWeight,
+    pub(super) input: DeviceRange<'a>,
+    pub(super) output: DeviceRange<'a>,
+    pub(super) scratch: DeviceRange<'a>,
+}
+
+pub(super) fn project_native(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    call: NativeProjection<'_>,
+) -> Result<(), EngError> {
+    if call.weight.experts().is_some() {
+        return Err(refuse(
+            "native projection requires a matrix, not an expert stack".into(),
+        ));
+    }
+    ctx.validate_native_projection(call.weight, call.input, call.scratch, call.output)?;
+    ctx.quantize_q8_1(
+        stream,
+        QuantizeCall {
+            x: call.input,
+            y: call.scratch,
+            k: call.weight.k(),
+            ncols: 1,
+        },
+    )?;
+    ctx.matvec_native(stream, call.weight, call.scratch, call.output, 1)
+}
+
+/// Test-only experiment: retain the native Q6_K weights and use the existing dequantizing
+/// tensor-core GEMM, which rounds activations and decoded weights to FP16 rather than Q8_1.
+#[cfg(test)]
+pub(super) fn project_q6_f16(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    call: NativeProjection<'_>,
+) -> Result<(), EngError> {
+    use crate::kernels::cuda::{prefill::gemm_dq::GemmDqTypedCall, resident::matvec_q::QuantType};
+    if call.weight.quant() != QuantType::Q6K || call.weight.experts().is_some() {
+        return Err(refuse(
+            "FP16 DeltaNet experiment requires a Q6_K matrix".into(),
+        ));
+    }
+    ctx.gemm_dq_codebook(
+        stream,
+        QuantType::Q6K,
+        GemmDqTypedCall {
+            w: call
+                .weight
+                .buffer()
+                .range(0, call.weight.buffer().bytes())?,
+            x: call.input,
+            y: call.output,
+            k: call.weight.k(),
+            rows: call.weight.n_rows(),
+            ncols: 1,
+            x_col_stride: 0,
+            y_col_stride: 0,
+            x_f32: true,
+        },
+    )
+}
+
+/// Test-only native Q6_K projection using F32 activations and accumulation.
+#[cfg(test)]
+pub(super) fn project_q6_f32(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    call: NativeProjection<'_>,
+) -> Result<(), EngError> {
+    use crate::kernels::cuda::resident::{matvec_q::QuantType, q6_f32::Q6F32Call};
+    if call.weight.quant() != QuantType::Q6K || call.weight.experts().is_some() {
+        return Err(refuse(
+            "F32 native projection experiment requires a Q6_K matrix".into(),
+        ));
+    }
+    ctx.q6_f32(
+        stream,
+        Q6F32Call {
+            w: call
+                .weight
+                .buffer()
+                .range(0, call.weight.buffer().bytes())?,
+            x: call.input,
+            y: call.output,
+            rows: call.weight.n_rows(),
+            k: call.weight.k(),
+        },
+    )
 }
 
 /// The pack name of the hyper-connection mixer that feeds `lm_head`.
@@ -178,7 +272,60 @@ impl<'a> FlashStep<'a> {
         shared_prefill: bool,
     ) -> Result<Self, EngError> {
         let (model, kinds) = model_shape(model_config)?;
-        let geometry = FlashGeometry::new(&model, &kinds)?;
+        Self::build_shape(
+            ctx,
+            stream,
+            weights,
+            model,
+            &kinds,
+            positions,
+            rows,
+            layers,
+            shared_prefill,
+            None,
+        )
+    }
+
+    /// Construct a single-token GGUF decode owner with its exact scratch plan.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn new_gguf_decode(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model: ModelShape,
+        kinds: &[bool],
+        positions: usize,
+        max_k: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::build_shape(
+            ctx,
+            stream,
+            weights,
+            model,
+            kinds,
+            positions,
+            1,
+            layers,
+            false,
+            Some(max_k),
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn build_shape(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model: ModelShape,
+        kinds: &[bool],
+        positions: usize,
+        rows: usize,
+        layers: std::ops::Range<usize>,
+        shared_prefill: bool,
+        gguf_max_k: Option<usize>,
+    ) -> Result<Self, EngError> {
+        let geometry = FlashGeometry::new(&model, kinds)?;
         if layers.start >= layers.end || layers.end > geometry.layers.len() {
             return Err(refuse(format!(
                 "layers {layers:?} are outside the model's {}",
@@ -187,7 +334,9 @@ impl<'a> FlashStep<'a> {
         }
         let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
         let options = StepOptions::for_sm_count(ctx.sm_count());
-        let step_plan = if shared_prefill {
+        let step_plan = if let Some(max_k) = gguf_max_k {
+            StepPlan::gguf_decode(&geometry, positions, &options, max_k)?
+        } else if shared_prefill {
             StepPlan::new_prefill(&geometry, rows, positions, &options)?
         } else {
             StepPlan::new(&geometry, rows, positions, &options)?
@@ -219,6 +368,11 @@ impl<'a> FlashStep<'a> {
         };
         step.reset()?;
         Ok(step)
+    }
+
+    #[cfg(test)]
+    pub(super) fn scratch_bytes_for_test(&self) -> usize {
+        self.scratch.bytes()
     }
 
     /// Zeroes the persistent state (the recurrent states, the rings, the caches) and clears the
@@ -471,6 +625,75 @@ impl<'a> FlashStep<'a> {
         m: usize,
     ) -> Result<(), EngError> {
         self.check_rows(m)?;
+        if let Some(CudaWeight::Native { weight, .. }) = self.weights.get(prefix) {
+            if m != 1 || self.shared_prefill() {
+                return Err(refuse(format!(
+                    "{prefix}: native projection supports decode only"
+                )));
+            }
+            let call = NativeProjection {
+                weight,
+                input: x,
+                output: out,
+                scratch: self.slot(Slot::GgufDecodeQ8)?,
+            };
+            #[cfg(test)]
+            if (prefix.ends_with("linear_attn.in_proj_qkv")
+                || prefix.ends_with("linear_attn.in_proj_z"))
+                && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_DELTA_IN").is_some()
+            {
+                use crate::kernels::cuda::resident::matvec_q::QuantType;
+                match weight.quant() {
+                    QuantType::Q6K => {
+                        eprintln!("GGUF test-only Delta input: {prefix} Q6_K F32");
+                        return project_q6_f32(self.ctx, self.stream, call);
+                    }
+                    QuantType::Q80 => {
+                        eprintln!("GGUF test-only Delta input: {prefix} Q8_0 native Q8 fallback");
+                    }
+                    _ => {
+                        return Err(refuse(format!(
+                            "{prefix}: unsupported Delta input probe type"
+                        )));
+                    }
+                }
+            }
+            #[cfg(test)]
+            if prefix.ends_with("linear_attn.out_proj") {
+                let f16 = std::env::var_os("FIFI_FLASH_GGUF_TEST_F16_DELTA_OUT").is_some();
+                let f32 = std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_DELTA_OUT").is_some();
+                if f16 && f32 {
+                    return Err(refuse(
+                        "select only one DeltaNet precision experiment".into(),
+                    ));
+                }
+                if f16 {
+                    return project_q6_f16(self.ctx, self.stream, call);
+                }
+                if f32 {
+                    return project_q6_f32(self.ctx, self.stream, call);
+                }
+            }
+            #[cfg(test)]
+            if prefix.ends_with("self_attn.o_proj")
+                && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_QSA_OUT").is_some()
+            {
+                eprintln!("GGUF test-only QSA output: {prefix} Q6_K F32");
+                return project_q6_f32(self.ctx, self.stream, call);
+            }
+            #[cfg(test)]
+            if prefix.ends_with("self_attn.q_proj")
+                && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_QSA_IN").is_some()
+            {
+                return project_q6_f32(self.ctx, self.stream, call);
+            }
+            return project_native(self.ctx, self.stream, call);
+        }
+        if prefix.ends_with("self_attn.indexer.index_qk_proj")
+            && self.step_plan.index(Slot::GgufDecodeQ8).is_some()
+        {
+            return self.project_gguf_indexer(prefix, x, out, m);
+        }
         let weight = self.exl3(prefix)?;
         if self.shared_prefill() {
             let launch = Launch {
@@ -498,6 +721,55 @@ impl<'a> FlashStep<'a> {
         // contiguous single-row call cannot express.
         let [_, n] = weight.shape;
         self.exl3_jobs(prefix, x, out, n, 0, m)
+    }
+
+    /// GGUF stores the QSA indexer's query and key as one uploaded half matrix.
+    fn project_gguf_indexer(
+        &self,
+        prefix: &str,
+        x: DeviceRange<'_>,
+        out: DeviceRange<'_>,
+        m: usize,
+    ) -> Result<(), EngError> {
+        use crate::kernels::cuda::resident::dense_gemv::{
+            DenseDtype, DenseGemvCall, DenseGemvShape,
+        };
+        if m != 1 || self.shared_prefill() {
+            return Err(refuse(format!(
+                "{prefix}: GGUF indexer supports decode only"
+            )));
+        }
+        let Some(CudaWeight::Raw { ty, buffer, .. }) = self.weights.get(prefix) else {
+            return Err(refuse(format!("{prefix}: missing GGUF indexer matrix")));
+        };
+        let dtype = match ty {
+            GgufType::F16 => DenseDtype::F16,
+            GgufType::Bf16 => DenseDtype::Bf16,
+            other => {
+                return Err(refuse(format!(
+                    "{prefix}: unsupported indexer type {other:?}"
+                )));
+            }
+        };
+        let rows = self.geometry.qsa.idx_proj();
+        let cols = self.geometry.hidden;
+        let bytes = rows
+            .checked_mul(cols)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| refuse(format!("{prefix}: indexer shape overflows")))?;
+        if buffer.bytes() != bytes {
+            return Err(refuse(format!("{prefix}: indexer matrix has wrong size")));
+        }
+        self.ctx.dense_gemv(
+            self.stream,
+            DenseGemvCall {
+                shape: DenseGemvShape::packed(1, rows, cols),
+                dtype,
+                w: buffer.range(0, bytes)?,
+                x,
+                y: out,
+            },
+        )
     }
 
     /// The projection of `m` rows into `n` floats at column `col_off` of a `ld`-wide row
@@ -578,6 +850,109 @@ impl<'a> FlashStep<'a> {
         row: &DeviceRange<'_>,
         m: usize,
     ) -> Result<(), EngError> {
+        let native_count = parts
+            .iter()
+            .filter(|(prefix, _, _)| {
+                matches!(self.weights.get(prefix), Some(CudaWeight::Native { .. }))
+            })
+            .count();
+        if native_count != 0 {
+            if native_count != parts.len() {
+                return Err(refuse("mixed native and EXL3 projection group".into()));
+            }
+            self.check_rows(m)?;
+            if m != 1 || self.shared_prefill() {
+                return Err(refuse(
+                    "native projection group supports decode only".into(),
+                ));
+            }
+            let scratch = self.slot(Slot::GgufDecodeQ8)?;
+            // Every member reads x again after the previous output is written.
+            if std::ptr::eq(row.buffer(), x.buffer())
+                && row.offset() < x.offset() + x.bytes()
+                && x.offset() < row.offset() + row.bytes()
+            {
+                return Err(refuse("native group row overlaps its input".into()));
+            }
+            let mut calls = Vec::with_capacity(parts.len());
+            for (index, (prefix, col, n)) in parts.iter().enumerate() {
+                let Some(CudaWeight::Native { weight, .. }) = self.weights.get(prefix) else {
+                    unreachable!();
+                };
+                if weight.experts().is_some() || weight.n_rows() != *n {
+                    return Err(refuse(format!(
+                        "{prefix}: invalid native group matrix width or experts"
+                    )));
+                }
+                let end = col
+                    .checked_add(*n)
+                    .and_then(|v| v.checked_mul(F32))
+                    .ok_or_else(|| refuse("native group output range overflows".into()))?;
+                if end > row.bytes() || std::ptr::eq(row.buffer(), weight.buffer()) {
+                    return Err(refuse(
+                        "native group output lies outside its row or aliases a weight".into(),
+                    ));
+                }
+                if parts[..index].iter().any(|(_, other_col, other_n)| {
+                    col.checked_add(*n).is_none_or(|end| {
+                        other_col
+                            .checked_add(*other_n)
+                            .is_none_or(|other_end| *col < other_end && *other_col < end)
+                    })
+                }) {
+                    return Err(refuse("native group outputs overlap".into()));
+                }
+                let output = Self::columns(row, *col, *n)?;
+                self.ctx
+                    .validate_native_projection(weight, x, scratch, output)?;
+                calls.push(NativeProjection {
+                    weight,
+                    input: x,
+                    output,
+                    scratch,
+                });
+            }
+            #[cfg(test)]
+            if parts.len() == 2
+                && parts[0].0.ends_with("self_attn.k_proj")
+                && parts[1].0.ends_with("self_attn.v_proj")
+                && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_QSA_IN").is_some()
+            {
+                use crate::kernels::cuda::resident::matvec_q::QuantType;
+                if calls
+                    .iter()
+                    .any(|call| call.weight.quant() != QuantType::Q6K)
+                {
+                    return Err(refuse("QSA input precision probe requires Q6_K K/V".into()));
+                }
+                for call in calls {
+                    project_q6_f32(self.ctx, self.stream, call)?;
+                }
+                return Ok(());
+            }
+            let k = calls[0].weight.k();
+            if calls.iter().all(|call| call.weight.k() == k) {
+                // The whole group reads the same row; one quantization serves every matvec.
+                self.ctx.quantize_q8_1(
+                    self.stream,
+                    QuantizeCall {
+                        x,
+                        y: scratch,
+                        k,
+                        ncols: 1,
+                    },
+                )?;
+                for call in calls {
+                    self.ctx
+                        .matvec_native(self.stream, call.weight, scratch, call.output, 1)?;
+                }
+            } else {
+                for call in calls {
+                    project_native(self.ctx, self.stream, call)?;
+                }
+            }
+            return Ok(());
+        }
         let (xh, z, flag) = (
             self.slot(Slot::Exl3Xh)?,
             self.slot(Slot::Exl3Z)?,

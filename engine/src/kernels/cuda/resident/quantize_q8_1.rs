@@ -26,6 +26,8 @@ use crate::kernels::cuda::native::resident::quantize_q8_1::{QuantizeRaw, quantiz
 
 /// Values per row are padded up to this (the vendored `MATRIX_ROW_PADDING`).
 pub(crate) const MATRIX_ROW_PADDING: usize = 512;
+/// Maximum rows per launch, matching the native entry's `ncols` guard.
+pub(crate) const MAX_ROWS: usize = 8;
 
 pub(crate) struct QuantizeCall<'b> {
     pub(crate) x: DeviceRange<'b>,
@@ -57,7 +59,64 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| quantize_q8_1_launch(stream_raw, &raw))
     }
 
-    fn plan_quantize<'b>(&self, call: &QuantizeCall<'b>) -> Result<QuantizeRaw<'b>, EngError> {
+    /// Quantize an arbitrary positive number of rows as ordered native-size launches.
+    /// The whole input and output are checked for overlap before any launch, including
+    /// cross-chunk overlap. The original single-launch interface keeps its eight-row limit.
+    #[cfg_attr(not(test), allow(dead_code, reason = "staged for GGUF routed decode"))]
+    pub(crate) fn quantize_q8_1_rows(
+        &self,
+        stream: &DeviceStream,
+        call: QuantizeCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        self.raw_range(&call.x)?;
+        self.raw_range(&call.y)?;
+        if call.k == 0 || !call.k.is_multiple_of(32) || call.ncols == 0 {
+            return Err(EngError::BadRequest(
+                "invalid CUDA quantize row geometry".into(),
+            ));
+        }
+        let (x_need, y_need) = quantize_needs(call.k, call.ncols)
+            .ok_or_else(|| EngError::BadRequest("the CUDA quantize size overflows".into()))?;
+        require_fit("x", &call.x, x_need, 4)?;
+        require_fit("y", &call.y, y_need, 4)?;
+        require_apart(
+            &Claim::of("y", &call.y, y_need),
+            &Claim::of("x", &call.x, x_need),
+        )?;
+        let x_row = call
+            .k
+            .checked_mul(4)
+            .ok_or_else(|| EngError::BadRequest("the CUDA quantize size overflows".into()))?;
+        let y_row = q8_1_bytes(call.k, 1)
+            .ok_or_else(|| EngError::BadRequest("the CUDA quantize size overflows".into()))?;
+        let mut plans = Vec::new();
+        for first in (0..call.ncols).step_by(MAX_ROWS) {
+            let rows = (call.ncols - first).min(MAX_ROWS);
+            let chunk = QuantizeCall {
+                x: call
+                    .x
+                    .buffer()
+                    .range(call.x.offset() + first * x_row, rows * x_row)?,
+                y: call
+                    .y
+                    .buffer()
+                    .range(call.y.offset() + first * y_row, rows * y_row)?,
+                k: call.k,
+                ncols: rows,
+            };
+            plans.push(self.plan_quantize(&chunk)?);
+        }
+        for raw in &plans {
+            self.launch_on(stream, |stream_raw| quantize_q8_1_launch(stream_raw, raw))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn plan_quantize<'b>(
+        &self,
+        call: &QuantizeCall<'b>,
+    ) -> Result<QuantizeRaw<'b>, EngError> {
         let (x_raw, y_raw) = (self.raw_range(&call.x)?, self.raw_range(&call.y)?);
         if call.k == 0 || !call.k.is_multiple_of(32) {
             return Err(EngError::BadRequest(format!(
@@ -65,9 +124,9 @@ impl CudaContext {
                 call.k
             )));
         }
-        if !(1..=8).contains(&call.ncols) {
+        if !(1..=MAX_ROWS).contains(&call.ncols) {
             return Err(EngError::BadRequest(format!(
-                "the CUDA quantize takes 1 to 8 rows, got {}",
+                "the CUDA quantize takes 1 to {MAX_ROWS} rows, got {}",
                 call.ncols
             )));
         }

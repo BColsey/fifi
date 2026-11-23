@@ -35,6 +35,58 @@ impl Projection<'_> {
         self.launches.set(self.launches.get() + 1);
         Ok(out)
     }
+
+    pub(super) fn run_f16(
+        &self,
+        ty: GgufType,
+        blocks: &[u8],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
+        let bad = || {
+            EngError::BadRequest(
+                "Flash-Next FP16 diagnostic projection: invalid weight rows".into(),
+            )
+        };
+        let ty = QuantType::from_gguf(ty).ok_or_else(bad)?;
+        let row_bytes = ty
+            .weight_bytes(1, x.len())
+            .filter(|&n| n > 0)
+            .ok_or_else(bad)?;
+        if blocks.is_empty() || !blocks.len().is_multiple_of(row_bytes) {
+            return Err(bad());
+        }
+        let rows = blocks.len() / row_bytes;
+        let xbytes: Vec<u8> = x.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let w = self.ctx.allocate(blocks.len())?;
+        let input = self.ctx.allocate(xbytes.len())?;
+        let output = self.ctx.allocate(rows * 4)?;
+        w.write_at(self.stream, 0, blocks)?;
+        input.write_at(self.stream, 0, &xbytes)?;
+        let call = GemmDqTypedCall {
+            w: w.range(0, blocks.len())?,
+            x: input.range(0, xbytes.len())?,
+            y: output.range(0, rows * 4)?,
+            k: x.len(),
+            rows,
+            ncols: 1,
+            x_col_stride: 0,
+            y_col_stride: 0,
+            x_f32: true,
+        };
+        if matches!(ty, QuantType::Q80 | QuantType::Q6K) {
+            self.ctx.gemm_dq_codebook(self.stream, ty, call)?;
+        } else {
+            self.ctx.gemm_dq(self.stream, ty, call)?;
+        }
+        let mut bytes = vec![0_u8; rows * 4];
+        output.read_at(self.stream, 0, &mut bytes)?;
+        self.launches.set(self.launches.get() + 1);
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .collect())
+    }
 }
 
 fn project(
@@ -267,6 +319,253 @@ fn split_gguf_expert_fixture_builds_valid_q8_records() {
             assert!(block[2..].iter().all(|v| *v == (i + 1) as u8));
         }
     }
+}
+
+#[test]
+#[ignore = "requires admitted CUDA device; synthetic split GGUF"]
+fn persistent_routed_synthetic_hits_eviction_and_poison() {
+    use super::routed::PersistentRouted;
+    use crate::family::{
+        exl3::{
+            launch::{MoeDims, RouteBufs},
+            moe::{Exl3MoeBufs, Scratch},
+        },
+        recipe::Role,
+    };
+    let (file, model, layout, _, _) = split_expert_fixture();
+    let shape = model.config().model_shape().unwrap();
+    let dims = MoeDims {
+        rows: 1,
+        hidden: shape.hyper.hidden(),
+        n_expert: shape.moe.experts(),
+        top_k: shape.moe.top_k(),
+        inter: shape.moe.inter(),
+        shared_inter: shape.moe.shared_inter(),
+    };
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let zeros = |n| ctx.upload(&vec![0; n]).unwrap();
+    let resid = zeros(dims.hidden * 4);
+    let x = zeros(dims.hidden * 4);
+    let out = zeros(dims.hidden * 4);
+    let ids = zeros(dims.top_k * 4);
+    let weights = ctx
+        .upload(
+            &(0..dims.top_k)
+                .flat_map(|_| (1.0f32 / dims.top_k as f32).to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let shared_gate = ctx.upload(&0.5f32.to_ne_bytes()).unwrap();
+    let shared = ctx
+        .upload(
+            &(0..dims.hidden)
+                .flat_map(|i| ((i % 11) as f32 * 0.125).to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let gu = zeros(dims.top_k * 2 * dims.inter * 4);
+    let act = zeros(dims.top_k * dims.inter * 4);
+    let down = zeros(dims.top_k * dims.hidden * 4);
+    let dummy = zeros(4);
+    fn range(b: &crate::kernels::cuda::DeviceBuffer) -> crate::kernels::cuda::DeviceRange<'_> {
+        b.range(0, b.bytes()).unwrap()
+    }
+    let bufs = Exl3MoeBufs {
+        route: RouteBufs {
+            resid_in: range(&resid),
+            resid_out: range(&out),
+            norm_row: range(&x),
+            logits: range(&dummy),
+            ids: range(&ids),
+            weights: range(&weights),
+            shared_gate: range(&shared_gate),
+            status: range(&dummy),
+        },
+        expert_gu: range(&gu),
+        expert_act: range(&act),
+        expert_down: range(&down),
+        shared_gu: range(&dummy),
+        shared_act: range(&dummy),
+        shared_out: range(&shared),
+        scratch: Scratch {
+            xh: range(&dummy),
+            z: range(&dummy),
+            flag: range(&dummy),
+        },
+    };
+    let mut bank = PersistentRouted::new(&ctx, &stream, &model, 0..1, dims.top_k + 1).unwrap();
+    let write_ids = |values: &[i32]| {
+        ids.write_at(
+            &stream,
+            0,
+            &values
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let original: Vec<i32> = (1..=dims.top_k as i32).collect();
+    write_ids(&original);
+    let first = bank.run(0, &bufs, &dims).unwrap();
+    assert_eq!((first.hits, first.ops.len()), (dims.top_k, 0));
+    let mut changed = original.clone();
+    changed[0] = dims.top_k as i32 + 1;
+    write_ids(&changed);
+    let evict = bank.run(0, &bufs, &dims).unwrap();
+    assert_eq!((evict.hits, evict.ops.len()), (dims.top_k - 1, 1));
+    write_ids(&original);
+    let restore = bank.run(0, &bufs, &dims).unwrap();
+    assert_eq!((restore.hits, restore.ops.len()), (dims.top_k - 1, 1));
+    let repeat = bank.run(0, &bufs, &dims).unwrap();
+    assert_eq!((repeat.hits, repeat.ops.len()), (dims.top_k, 0));
+    let mut actual = vec![0; dims.hidden * 4];
+    out.read_at(&stream, 0, &mut actual).unwrap();
+    for (i, bytes) in actual.chunks_exact(4).enumerate() {
+        assert_eq!(
+            f32::from_ne_bytes(bytes.try_into().unwrap()),
+            (i % 11) as f32 * 0.0625
+        );
+    }
+    let mut invalid = original.clone();
+    invalid[0] = invalid[1];
+    write_ids(&invalid);
+    assert!(bank.run(0, &bufs, &dims).is_err());
+    write_ids(&original);
+    assert!(
+        bank.run(0, &bufs, &dims).is_err(),
+        "invalid input must poison the owner"
+    );
+    drop(bank);
+    let mut io_bank = PersistentRouted::new(&ctx, &stream, &model, 0..1, dims.top_k + 1).unwrap();
+    let tensor = model.map().get(Role::ExpertGate, Some(0)).unwrap();
+    let weights = file.open();
+    let path = weights.paths()[tensor.shard].canonicalize().unwrap();
+    let dir = file.dir.path().canonicalize().unwrap();
+    assert_eq!(path.parent(), Some(dir.as_path()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(
+        layout
+            .read(&model, 0, changed[0] as u64, &mut vec![0; layout.bytes])
+            .is_err()
+    );
+    write_ids(&changed);
+    assert!(
+        io_bank.run(0, &bufs, &dims).is_err(),
+        "truncated shard must fail a miss"
+    );
+    write_ids(&original);
+    assert!(
+        io_bank.run(0, &bufs, &dims).is_err(),
+        "refill failure must poison the owner"
+    );
+    stream.synchronize().unwrap();
+}
+
+#[test]
+#[ignore = "requires admitted CUDA device; synthetic split GGUF"]
+fn pinned_disk_refill_reuses_record_and_checks_ownership() {
+    use super::expert_layout::{ExpertDeviceStacks, PinnedDiskRefill};
+    use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
+    let (_file, model, layout, _, _) = split_expert_fixture();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let experts = model.config().dims.experts as usize;
+    let geometry = BankGeometry::new(1, experts, 2, 3, layout.bytes).unwrap();
+    let mut row = vec![-1; experts];
+    for (slot, id) in [0usize, 1, 2].into_iter().enumerate() {
+        row[id] = slot as i32;
+    }
+    let state = || {
+        let policy =
+            ReplaceOnMissLru::from_fill(geometry, &[&row], &[vec![0; experts]], None).unwrap();
+        ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap()
+    };
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1, 2]).unwrap();
+    let mut policy = state();
+    let mut refill = PinnedDiskRefill::new(&ctx, &stream, &model, 0).unwrap();
+    for picks in [[1, 256], [257, 256]] {
+        let copies = refill.step(&mut bank, &mut policy, &picks).unwrap();
+        assert!(!copies.ops.is_empty());
+        for slot in 0..3 {
+            let id = policy.expert_in_slot(0, slot).unwrap();
+            let mut record = vec![0; layout.bytes];
+            layout.read(&model, 0, u64::from(id), &mut record).unwrap();
+            for (i, part) in layout.parts.iter().enumerate() {
+                let range = bank.part(i).unwrap();
+                let mut got = vec![0; part.bytes.len()];
+                range
+                    .buffer()
+                    .read_at(&stream, range.offset() + slot * got.len(), &mut got)
+                    .unwrap();
+                assert_eq!(got, record[part.bytes.clone()]);
+            }
+        }
+    }
+    assert!(
+        refill
+            .step(&mut bank, &mut policy, &[257, 256])
+            .unwrap()
+            .ops
+            .is_empty()
+    );
+
+    let foreign = CudaContext::new().unwrap();
+    let foreign_stream = foreign.stream().unwrap();
+    assert!(PinnedDiskRefill::new(&ctx, &foreign_stream, &model, 0).is_err());
+    let mut foreign_refill = PinnedDiskRefill::new(&foreign, &foreign_stream, &model, 0).unwrap();
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1, 2]).unwrap();
+    let mut policy = state();
+    for picks in [[0, 1], [1, 256]] {
+        assert!(foreign_refill.step(&mut bank, &mut policy, &picks).is_err());
+        assert!(!policy.is_poisoned());
+        assert_eq!(policy.slot_row(0), row);
+        assert!(bank.part(0).is_ok());
+    }
+    assert!(refill.step(&mut bank, &mut policy, &[1, 256]).is_ok());
+}
+
+#[test]
+#[ignore = "requires admitted CUDA device; truncates only an owned synthetic shard"]
+fn pinned_disk_refill_read_failure_poisons_policy_and_device() {
+    use super::expert_layout::{ExpertDeviceStacks, PinnedDiskRefill};
+    use crate::family::{
+        expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
+        recipe::Role,
+    };
+    let (file, model, layout, _, _) = split_expert_fixture();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
+    let mut refill = PinnedDiskRefill::new(&ctx, &stream, &model, 0).unwrap();
+    let experts = model.config().dims.experts as usize;
+    let geometry = BankGeometry::new(1, experts, 1, 2, layout.bytes).unwrap();
+    let mut row = vec![-1; experts];
+    row[0] = 0;
+    row[1] = 1;
+    let policy = ReplaceOnMissLru::from_fill(geometry, &[&row], &[vec![0; experts]], None).unwrap();
+    let mut state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
+    let tensor = model.map().get(Role::ExpertGate, Some(0)).unwrap();
+    let weights = file.open();
+    let path = weights.paths()[tensor.shard].canonicalize().unwrap();
+    let dir = file.dir.path().canonicalize().unwrap();
+    assert_eq!(path.parent(), Some(dir.as_path()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(refill.step(&mut bank, &mut state, &[256]).is_err());
+    assert!(state.is_poisoned());
+    assert!(bank.part(0).is_err());
+    assert!(refill.step(&mut bank, &mut state, &[0]).is_err());
 }
 
 #[test]
@@ -1673,26 +1972,63 @@ fn checkpoint_greedy_rows_with_cuda_projections() {
         .expect("Flash-Next GGUF");
     let host = HostModel::load(&model, model.config().layers()).expect("host model");
     let prompt = [9707, 11, 1879];
-    let expected = greedy_rows(&model, &host, &prompt, 3, 8).expect("host greedy rows");
+    let decisions = std::env::var("FIFI_FLASH_GGUF_DECISIONS")
+        .map(|value| value.parse::<usize>().expect("valid decision count"))
+        .unwrap_or(3);
+    assert!((1..=3).contains(&decisions));
+    let expected = if let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_ORACLE") {
+        #[derive(serde::Deserialize)]
+        struct Receipt {
+            prompt: Vec<u32>,
+            vocab: usize,
+            greedy: Vec<u32>,
+            logits: Vec<Vec<f32>>,
+        }
+        let file = std::fs::File::open(path).expect("open host oracle receipt");
+        let receipt: Receipt = serde_json::from_reader(std::io::BufReader::new(file))
+            .expect("parse host oracle receipt");
+        assert_eq!(receipt.prompt, prompt);
+        assert_eq!(receipt.logits.len(), 3);
+        assert_eq!(receipt.greedy.len(), 3);
+        for (row, &token) in receipt.logits.iter().zip(&receipt.greedy) {
+            assert_eq!(row.len(), receipt.vocab);
+            assert_eq!(greedy_token(row).expect("finite oracle logits"), token);
+        }
+        receipt.logits.into_iter().take(decisions).collect()
+    } else {
+        greedy_rows(&model, &host, &prompt, decisions, 8).expect("host greedy rows")
+    };
+    eprintln!("hybrid probe: oracle ready, decisions={decisions}");
     let ctx = CudaContext::new().expect("CUDA device");
     let stream = ctx.stream().expect("stream");
     let ngram = model.ngram().expect("n-gram table");
+    eprintln!("hybrid probe: CUDA context ready");
     let launches = Cell::new(0);
     let projector = HostProjector::new(&model.weights, &ngram, 8).with_cuda(Projection {
         ctx: &ctx,
         stream: &stream,
         launches: &launches,
     });
-    let actual = greedy_rows_with(projector, &host, &prompt, 3).expect("hybrid greedy rows");
+    let actual =
+        greedy_rows_with(projector, &host, &prompt, decisions).expect("hybrid greedy rows");
     assert!(launches.get() > 0, "no CUDA projections ran");
     assert_eq!(actual.len(), expected.len());
+    if let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_HYBRID_OUT") {
+        let greedy: Vec<_> = actual
+            .iter()
+            .map(|row| greedy_token(row).expect("finite hybrid logits"))
+            .collect();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new hybrid receipt");
+        let mut out = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut out, &serde_json::json!({"prompt": prompt, "greedy": greedy, "logits": actual, "cuda_projections": launches.get()})).expect("write hybrid receipt");
+        std::io::Write::flush(&mut out).expect("flush hybrid receipt");
+    }
     for (position, (got, want)) in actual.iter().zip(&expected).enumerate() {
         assert_eq!(got.len(), want.len());
-        assert_eq!(
-            greedy_token(got).unwrap(),
-            greedy_token(want).unwrap(),
-            "decision {position}"
-        );
         let (err, norm) = got
             .iter()
             .zip(want)
@@ -1705,12 +2041,478 @@ fn checkpoint_greedy_rows_with_cuda_projections() {
             "hybrid decision {position}: relative L2={relative_l2}, CUDA projections={}",
             launches.get()
         );
+        assert_eq!(
+            greedy_token(got).unwrap(),
+            greedy_token(want).unwrap(),
+            "decision {position}"
+        );
         // Provisional bring-up threshold, not a model quality criterion.
         assert!(
             relative_l2 <= 0.05,
             "decision {position}: relative L2 {relative_l2}"
         );
     }
+}
+
+/// Records or compares first-token per-layer residuals; diagnostic, not parity qualification.
+#[test]
+#[ignore = "requires the pinned GGUF and optionally an admitted CUDA device"]
+fn checkpoint_first_token_layer_trace() {
+    use super::host::{HostModel, run, run_with};
+    use super::projector::HostProjector;
+    let path = std::env::var_os("FIFI_FLASH_GGUF").expect("verified checkpoint");
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let host = HostModel::load(&model, model.config().layers()).expect("host model");
+    let token = [9707];
+    if let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_LAYER_OUT") {
+        let trace = run(&model, &host, &token, 8).expect("host trace");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("new layer receipt");
+        let mut out = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut out, &trace.layer_out).expect("write layer receipt");
+        std::io::Write::flush(&mut out).expect("flush layer receipt");
+        return;
+    }
+    let path = std::env::var_os("FIFI_FLASH_GGUF_LAYER_ORACLE").expect("layer oracle");
+    let expected: Vec<Vec<Vec<f32>>> = serde_json::from_reader(std::io::BufReader::new(
+        std::fs::File::open(path).expect("open layer oracle"),
+    ))
+    .expect("parse layer oracle");
+    let ctx = CudaContext::new().expect("CUDA device");
+    let stream = ctx.stream().expect("stream");
+    let ngram = model.ngram().expect("ngram");
+    let launches = Cell::new(0);
+    let projector = HostProjector::new(&model.weights, &ngram, 8).with_cuda(Projection {
+        ctx: &ctx,
+        stream: &stream,
+        launches: &launches,
+    });
+    let actual = run_with(projector, &host, &token).expect("hybrid trace");
+    assert!(launches.get() > 0);
+    assert_eq!(actual.layer_out.len(), 1);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(actual.layer_out[0].len(), expected[0].len());
+    for (index, (got, want)) in actual.layer_out[0].iter().zip(&expected[0]).enumerate() {
+        assert_eq!(got.len(), want.len());
+        let (error, norm) = got
+            .iter()
+            .zip(want)
+            .fold((0.0_f64, 0.0_f64), |(e, n), (&a, &b)| {
+                (
+                    e + (f64::from(a) - f64::from(b)).powi(2),
+                    n + f64::from(b).powi(2),
+                )
+            });
+        assert!(error.is_finite() && norm.is_finite() && norm > 0.0);
+        eprintln!(
+            "first-token layer {index}: relative L2={}",
+            (error / norm).sqrt()
+        );
+    }
+    eprintln!(
+        "first-token layer trace: CUDA projections={}",
+        launches.get()
+    );
+}
+
+/// Attribute first real projection error to activation quantization versus the native matvec.
+#[test]
+#[ignore = "requires the pinned GGUF and captured first-token host and hybrid projections"]
+fn checkpoint_first_projection_q8_activation_diagnostic() {
+    use std::io::BufRead;
+    #[derive(serde::Deserialize)]
+    struct Capture {
+        name: String,
+        input: Vec<f32>,
+        output: Vec<f32>,
+    }
+    fn first(path: &str) -> Capture {
+        let file = std::fs::File::open(std::env::var_os(path).expect("capture path"))
+            .expect("open capture");
+        serde_json::from_str(
+            &std::io::BufReader::new(file)
+                .lines()
+                .next()
+                .expect("first record")
+                .expect("read record"),
+        )
+        .expect("parse record")
+    }
+    let host = first("FIFI_FLASH_GGUF_HOST_CAPTURE");
+    let device = first("FIFI_FLASH_GGUF_HYBRID_CAPTURE");
+    assert_eq!(host.name, "blk.0.hc_attn_down.weight");
+    assert_eq!(host.name, device.name);
+    assert_eq!(host.input, device.input);
+    let path = std::env::var_os("FIFI_FLASH_GGUF").expect("checkpoint");
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let tensor = model
+        .map
+        .entries()
+        .iter()
+        .find(|t| t.name == host.name)
+        .expect("tensor");
+    assert_eq!(tensor.ty, GgufType::Q80);
+    assert_eq!(tensor.dims[0] as usize, host.input.len());
+    let blocks = mapped_blocks(&model, tensor, None, 0..tensor.dims[1]).expect("weight rows");
+    let weights = crate::weights::dequantize(tensor.ty, &blocks).expect("decode weights");
+    let quantized: Vec<f32> = host
+        .input
+        .chunks(32)
+        .flat_map(|chunk| {
+            let max = chunk.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+            let d = max / 127.0;
+            let stored_d = half::f16::from_f32(d).to_f32();
+            chunk.iter().map(move |&x| {
+                if max == 0.0 {
+                    0.0
+                } else {
+                    (x / d).round() * stored_d
+                }
+            })
+        })
+        .collect();
+    let qdot: Vec<f32> = weights
+        .chunks_exact(host.input.len())
+        .map(|row| row.iter().zip(&quantized).map(|(w, x)| w * x).sum())
+        .collect();
+    assert_eq!(qdot.len(), host.output.len());
+    assert_eq!(qdot.len(), device.output.len());
+    let rel = |a: &[f32], b: &[f32]| {
+        let (err, norm) = a
+            .iter()
+            .zip(b)
+            .fold((0.0_f64, 0.0_f64), |(e, n), (&x, &y)| {
+                (
+                    e + (f64::from(x) - f64::from(y)).powi(2),
+                    n + f64::from(y).powi(2),
+                )
+            });
+        assert!(norm > 0.0 && err.is_finite());
+        (err / norm).sqrt()
+    };
+    eprintln!(
+        "first projection relative L2: gpu_vs_f32={}, host_q8_vs_f32={}, gpu_vs_host_q8={}",
+        rel(&device.output, &host.output),
+        rel(&qdot, &host.output),
+        rel(&device.output, &qdot)
+    );
+}
+
+/// Compare native Q8 activation and FP16 GEMM on identical real expert inputs.
+#[test]
+#[ignore = "requires pinned GGUF, host layer-zero capture, and admitted CUDA device"]
+fn checkpoint_expert_gemm_precision_diagnostic() {
+    use std::io::BufRead;
+    #[derive(serde::Deserialize)]
+    struct Capture {
+        name: String,
+        expert: Option<u32>,
+        input: Vec<f32>,
+        output: Vec<f32>,
+    }
+    let path = std::env::var_os("FIFI_FLASH_GGUF_HOST_CAPTURE").expect("host capture");
+    let entries: Vec<Capture> =
+        std::io::BufReader::new(std::fs::File::open(path).expect("open capture"))
+            .lines()
+            .map(|line| serde_json::from_str(&line.expect("line")).expect("record"))
+            .collect();
+    let path = std::env::var_os("FIFI_FLASH_GGUF").expect("checkpoint");
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let ctx = CudaContext::new().expect("device");
+    let stream = ctx.stream().expect("stream");
+    for name in ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"] {
+        let capture = entries
+            .iter()
+            .find(|e| e.name == name && e.expert == Some(342))
+            .expect("captured expert");
+        let tensor = model
+            .map
+            .entries()
+            .iter()
+            .find(|t| t.name == name)
+            .expect("tensor");
+        let rows = tensor.dims[1] as usize;
+        let k = capture.input.len();
+        assert_eq!(tensor.dims[0] as usize, k);
+        assert_eq!(capture.output.len(), rows);
+        let blocks = mapped_blocks(&model, tensor, Some(342), 0..rows as u64).expect("expert rows");
+        let q8 = project(&ctx, &stream, tensor.ty, &blocks, &capture.input)
+            .expect("native q8 projection");
+        let launches = Cell::new(0);
+        let gemm = Projection {
+            ctx: &ctx,
+            stream: &stream,
+            launches: &launches,
+        }
+        .run_f16(tensor.ty, &blocks, &capture.input)
+        .expect("fp16 gemm");
+        assert_eq!(launches.get(), 1);
+        let rel = |a: &[f32]| {
+            let (err, norm) =
+                a.iter()
+                    .zip(&capture.output)
+                    .fold((0.0_f64, 0.0_f64), |(e, n), (&x, &y)| {
+                        (
+                            e + (f64::from(x) - f64::from(y)).powi(2),
+                            n + f64::from(y).powi(2),
+                        )
+                    });
+            assert!(err.is_finite() && norm > 0.0);
+            (err / norm).sqrt()
+        };
+        eprintln!(
+            "expert precision {name} type={:?} k={k} rows={rows} q8_rel_l2={} gemm_f16_rel_l2={}",
+            tensor.ty,
+            rel(&q8),
+            rel(&gemm)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires pinned GGUF, host layer-zero capture, and admitted CUDA device"]
+fn checkpoint_trunk_gemm_precision_diagnostic() {
+    use std::io::BufRead;
+    #[derive(serde::Deserialize)]
+    struct Capture {
+        name: String,
+        input: Vec<f32>,
+        output: Vec<f32>,
+    }
+    let path = std::env::var_os("FIFI_FLASH_GGUF_HOST_CAPTURE").expect("host capture");
+    let entries: Vec<Capture> =
+        std::io::BufReader::new(std::fs::File::open(path).expect("open capture"))
+            .lines()
+            .map(|line| serde_json::from_str(&line.expect("line")).expect("record"))
+            .collect();
+    let path = std::env::var_os("FIFI_FLASH_GGUF").expect("checkpoint");
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let ctx = CudaContext::new().expect("device");
+    let stream = ctx.stream().expect("stream");
+    for name in ["blk.0.hc_attn_down.weight", "blk.0.attn_qkv.weight"] {
+        let capture = entries
+            .iter()
+            .find(|e| e.name == name)
+            .expect("captured trunk");
+        let tensor = model
+            .map
+            .entries()
+            .iter()
+            .find(|t| t.name == name)
+            .expect("tensor");
+        let rows = tensor.dims[1] as usize;
+        assert_eq!(tensor.dims[0] as usize, capture.input.len());
+        assert_eq!(capture.output.len(), rows);
+        let blocks = mapped_blocks(&model, tensor, None, 0..rows as u64).expect("weight rows");
+        let launches = Cell::new(0);
+        let actual = Projection {
+            ctx: &ctx,
+            stream: &stream,
+            launches: &launches,
+        }
+        .run_f16(tensor.ty, &blocks, &capture.input)
+        .expect("fp16 gemm");
+        assert_eq!(launches.get(), 1);
+        let (error, norm) =
+            actual
+                .iter()
+                .zip(&capture.output)
+                .fold((0.0_f64, 0.0_f64), |(e, n), (&x, &y)| {
+                    (
+                        e + (f64::from(x) - f64::from(y)).powi(2),
+                        n + f64::from(y).powi(2),
+                    )
+                });
+        assert!(error.is_finite() && norm > 0.0);
+        let rel = (error / norm).sqrt();
+        eprintln!(
+            "trunk precision {name} type={:?} rows={rows} gemm_f16_rel_l2={rel}",
+            tensor.ty
+        );
+        assert!(rel < 0.005, "{name} relative L2 {rel}");
+    }
+}
+
+#[test]
+#[ignore = "requires the verified pinned GGUF and an admitted CUDA device"]
+fn checkpoint_delta_out_q6_grouped_activation_matches_host() {
+    use super::projector::{HostProjector, HostWeight, Remap, tile};
+    use crate::family::{
+        project::{Projector, cuda::CudaWeight},
+        recipe::Role,
+    };
+    use crate::kernels::cuda::resident::head_tile::{HeadTileCall, HeadTileShape};
+
+    let path =
+        std::env::var_os("FIFI_FLASH_GGUF").expect("set FIFI_FLASH_GGUF to verified first shard");
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .expect("Flash-Next GGUF");
+    let entry = model.map().get(Role::DeltaOut, Some(0)).unwrap();
+    assert_eq!(
+        entry.ty,
+        GgufType::Q6K,
+        "this diagnostic targets the pinned Q6_K layer"
+    );
+    let dims = &model.config().dims;
+    let (kh, vh, hd) = (
+        dims.key_heads as usize,
+        dims.value_heads as usize,
+        dims.value_dim as usize,
+    );
+    assert!(kh > 1 && vh > kh && vh % kh == 0);
+    assert_eq!(entry.dims[0] as usize, vh * hd);
+    assert!(!hd.is_multiple_of(entry.ty.block_elems() as usize));
+    let inputs: Vec<f32> = (0..vh * hd)
+        .map(|i| {
+            let head = i / hd;
+            let j = i % hd;
+            (((head * 31 + j * 17) % 101) as f32 - 50.0) / 50.0 + (head % 7) as f32 * 0.025
+        })
+        .collect();
+    let ngram = model.ngram().unwrap();
+    let mut host = HostProjector::new(&model.weights, &ngram, 1);
+    let reference = host
+        .linear(
+            &HostWeight::new(
+                &[entry],
+                Remap::ValueIn {
+                    hd,
+                    key_heads: kh,
+                    value_heads: vh,
+                },
+            ),
+            &inputs,
+        )
+        .unwrap();
+    let expected_tiled = tile(&inputs, hd, kh, vh);
+    assert_ne!(
+        inputs, expected_tiled,
+        "fixture must exercise the permutation"
+    );
+
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let raw = model.upload_delta_out(0, &ctx).unwrap();
+    let CudaWeight::Native { name, weight } = raw else {
+        panic!("native Q6_K expected")
+    };
+    assert_eq!(
+        name,
+        crate::family::exl3_pack::layer_name(0, "linear_attn.out_proj")
+    );
+    let input_bytes: Vec<u8> = inputs.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let grouped = ctx.allocate(input_bytes.len()).unwrap();
+    let tiled = ctx.allocate(input_bytes.len()).unwrap();
+    grouped.write_at(&stream, 0, &input_bytes).unwrap();
+    let head_bytes = hd * size_of::<f32>();
+    let reps = vh / kh;
+    for h in 0..vh {
+        let stored = (h % reps) * kh + h / reps;
+        ctx.copy_device(
+            &stream,
+            grouped.range(h * head_bytes, head_bytes).unwrap(),
+            tiled.range(stored * head_bytes, head_bytes).unwrap(),
+        )
+        .unwrap();
+    }
+    let single = ctx.allocate(input_bytes.len()).unwrap();
+    ctx.head_tile(
+        &stream,
+        HeadTileCall {
+            src: grouped.range(0, input_bytes.len()).unwrap(),
+            dst: single.range(0, input_bytes.len()).unwrap(),
+            shape: HeadTileShape {
+                key_heads: kh,
+                value_heads: vh,
+                head_dim: hd,
+            },
+        },
+    )
+    .unwrap();
+    let mut reordered = vec![0; input_bytes.len()];
+    tiled.read_at(&stream, 0, &mut reordered).unwrap();
+    let mut one_launch = vec![0; input_bytes.len()];
+    single.read_at(&stream, 0, &mut one_launch).unwrap();
+    assert_eq!(
+        one_launch, reordered,
+        "one launch must match the per-head copies"
+    );
+    let expected_bytes: Vec<u8> = expected_tiled
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect();
+    assert_eq!(
+        reordered, expected_bytes,
+        "device permutation must preserve every input bit"
+    );
+    let qbytes = q8_1_bytes(inputs.len(), 1).unwrap();
+    let q8 = ctx.allocate(qbytes).unwrap();
+    let out_bytes = reference.len() * size_of::<f32>();
+    let out = ctx.allocate(out_bytes).unwrap();
+    let run = |source: &crate::kernels::cuda::DeviceBuffer| {
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: source.range(0, input_bytes.len()).unwrap(),
+                y: q8.range(0, qbytes).unwrap(),
+                k: inputs.len(),
+                ncols: 1,
+            },
+        )
+        .unwrap();
+        ctx.matvec_native(
+            &stream,
+            &weight,
+            q8.range(0, qbytes).unwrap(),
+            out.range(0, out_bytes).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut raw = vec![0u8; out_bytes];
+        out.read_at(&stream, 0, &mut raw).unwrap();
+        raw.chunks_exact(4)
+            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let got = run(&single);
+    assert_eq!(
+        got,
+        run(&tiled),
+        "equivalent reorderings must project identically"
+    );
+    let wrong = run(&grouped);
+    let rel = |actual: &[f32]| {
+        let numerator: f64 = actual
+            .iter()
+            .zip(&reference)
+            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+            .sum();
+        let denominator: f64 = reference.iter().map(|&v| (v as f64).powi(2)).sum();
+        assert!(denominator > 0.0 && numerator.is_finite());
+        (numerator / denominator).sqrt()
+    };
+    let (error, wrong_error) = (rel(&got), rel(&wrong));
+    eprintln!(
+        "pinned DeltaOut Q6_K rows={} input_heads={vh} head_dim={hd}: reordered relative_l2={error:.6}, identity relative_l2={wrong_error:.6}, one_kernel_vs_device_copies={vh}",
+        reference.len()
+    );
+    assert!(error < 0.03, "reordered output relative L2 {error}");
+    assert!(
+        wrong_error > 0.1 && wrong_error > 5.0 * error,
+        "identity negative control {wrong_error}, reordered {error}"
+    );
 }
 
 #[test]

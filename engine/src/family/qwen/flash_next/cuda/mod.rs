@@ -67,6 +67,27 @@ mod state_tests;
     allow(dead_code, reason = "staged for the decode step (S4)")
 )]
 mod step_plan;
+
+/// Size the exact aligned single-row GGUF owner arena, without allocating it.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) fn gguf_decode_arena_bytes(
+    shape: &super::step::ModelShape,
+    kinds: &[bool],
+    positions: usize,
+    sm_count: u32,
+    max_k: usize,
+) -> Result<u64, crate::EngError> {
+    let geometry = state::FlashGeometry::new(shape, kinds)?;
+    let plan = step_plan::StepPlan::gguf_decode(
+        &geometry,
+        positions,
+        &step_plan::StepOptions::for_sm_count(sm_count),
+        max_k,
+    )?;
+    u64::try_from(plan.arena_bytes())
+        .map_err(|_| crate::EngError::MemoryPlan("GGUF decode arena size overflows".into()))
+}
+
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod step_plan_hazard_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -124,6 +145,10 @@ mod testkit {
 
 // The decode step. It needs the state and step plans, so it builds with the native CUDA backend
 // only. Staged: the executor is the first caller.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod gguf_moe;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod gguf_shared;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod mixer;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

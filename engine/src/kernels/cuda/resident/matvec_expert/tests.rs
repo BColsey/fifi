@@ -81,6 +81,146 @@ fn stack_rig(
 }
 
 /// The dense oracle: `matvec_q` on expert `id`'s weights against activation row `col`.
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn chunked_experts_match_single_pick_in_both_activation_modes() {
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    for ty in [QuantType::Q80, QuantType::Iq4Nl] {
+        for used in [1, 8, 9, 10, 33] {
+            check_chunked_experts(&ctx, &stream, ty, used);
+        }
+    }
+}
+
+fn check_chunked_experts(ctx: &CudaContext, stream: &DeviceStream, ty: QuantType, used: usize) {
+    let (k, rows, slots, stride) = (256, 12, 40, 16);
+    let mut rng = testkit::Rng::new(0x5315_9821);
+    let stack_bytes = reference::build_weight(ty, rows * slots, k, &mut rng);
+    let stack = testkit::upload_bytes(ctx, &stack_bytes);
+    let ids: Vec<i32> = (0..used).map(|i| ((i * 7 + 3) % slots) as i32).collect();
+    let ids = ids_buffer(ctx, &ids);
+    let x: Vec<f32> = (0..k * used)
+        .map(|i| ((i * 43 % 103) as f32 - 51.0) * 0.005)
+        .collect();
+    let input = testkit::upload_f32(ctx, &x);
+    let qrow = q8_1_bytes(k, 1).unwrap();
+    let q = testkit::upload_filled(ctx, 0, used * qrow);
+    ctx.quantize_q8_1_rows(
+        stream,
+        QuantizeCall {
+            x: input.range(0, used * k * 4).unwrap(),
+            y: q.range(0, used * qrow).unwrap(),
+            k,
+            ncols: used,
+        },
+    )
+    .unwrap();
+    for per_slot in [false, true] {
+        let size = 16 + used * stride * 4 + 16;
+        let got = testkit::upload_filled(ctx, 0xA5, size);
+        let want = testkit::upload_filled(ctx, 0xA5, size);
+        let x_len = if per_slot { used * qrow } else { qrow };
+        ctx.matvec_expert_chunks(
+            stream,
+            ExpertMatvecCall {
+                ty,
+                w_stack: stack.range(0, stack_bytes.len()).unwrap(),
+                ids: ids.range(0, used * 4).unwrap(),
+                x_q8: q.range(0, x_len).unwrap(),
+                x_per_slot: per_slot,
+                y: got.range(16, (stride * (used - 1) + rows) * 4).unwrap(),
+                y_slot_stride: stride,
+                k,
+                rows,
+                n_expert: slots,
+                n_used: used,
+                glu_gate: None,
+            },
+        )
+        .unwrap();
+        for rank in 0..used {
+            ctx.matvec_expert(
+                stream,
+                ExpertMatvecCall {
+                    ty,
+                    w_stack: stack.range(0, stack_bytes.len()).unwrap(),
+                    ids: ids.range(rank * 4, 4).unwrap(),
+                    x_q8: q
+                        .range(if per_slot { rank * qrow } else { 0 }, qrow)
+                        .unwrap(),
+                    x_per_slot: per_slot,
+                    y: want.range(16 + rank * stride * 4, rows * 4).unwrap(),
+                    y_slot_stride: stride,
+                    k,
+                    rows,
+                    n_expert: slots,
+                    n_used: 1,
+                    glu_gate: None,
+                },
+            )
+            .unwrap();
+        }
+        let got = testkit::read_bytes(ctx, &got, size);
+        let want = testkit::read_bytes(ctx, &want, size);
+        assert_eq!(got, want, "{ty:?} {used} experts per_slot={per_slot}");
+    }
+    if used == 10 {
+        let shared = testkit::upload_filled(ctx, 0xA5, used * qrow + used * stride * 4);
+        let result = ctx.matvec_expert_chunks(
+            stream,
+            ExpertMatvecCall {
+                ty,
+                w_stack: stack.range(0, stack_bytes.len()).unwrap(),
+                ids: ids.range(0, used * 4).unwrap(),
+                x_q8: shared.range(0, used * qrow).unwrap(),
+                x_per_slot: true,
+                y: shared
+                    .range(8 * qrow, (stride * (used - 1) + rows) * 4)
+                    .unwrap(),
+                y_slot_stride: stride,
+                k,
+                rows,
+                n_expert: slots,
+                n_used: used,
+                glu_gate: None,
+            },
+        );
+        assert_bad_request(result, "cross-chunk overlap", "overlap");
+        assert!(
+            testkit::read_bytes(ctx, &shared, used * qrow + used * stride * 4)
+                .iter()
+                .all(|b| *b == 0xA5)
+        );
+        let size = (stride * (used - 1) + rows) * 4;
+        let short = testkit::upload_filled(ctx, 0xA5, size);
+        let result = ctx.matvec_expert_chunks(
+            stream,
+            ExpertMatvecCall {
+                ty,
+                w_stack: stack.range(0, stack_bytes.len()).unwrap(),
+                ids: ids.range(0, used * 4).unwrap(),
+                x_q8: q.range(0, used * qrow).unwrap(),
+                x_per_slot: true,
+                y: short.range(0, size - 4).unwrap(),
+                y_slot_stride: stride,
+                k,
+                rows,
+                n_expert: slots,
+                n_used: used,
+                glu_gate: None,
+            },
+        );
+        assert_bad_request(result, "short final chunk output", "range holds");
+        assert!(
+            testkit::read_bytes(ctx, &short, size)
+                .iter()
+                .all(|b| *b == 0xA5)
+        );
+        ctx.ensure_usable().unwrap();
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "a test helper that spells out the oracle's view"

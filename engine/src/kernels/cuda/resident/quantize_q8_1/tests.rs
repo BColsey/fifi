@@ -77,6 +77,86 @@ fn parse_block(bytes: &[u8]) -> (f32, f32, [i8; 32]) {
     (d, s, qs)
 }
 
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn chunked_rows_match_single_row_and_reject_cross_chunk_overlap() {
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let k = 288;
+    let qrow = q8_1_bytes(k, 1).unwrap();
+    for n in [1, 8, 9, 10, 17] {
+        let x: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
+            .collect();
+        let input = testkit::upload_f32(&ctx, &x);
+        let got = testkit::upload_filled(&ctx, 0xA5, n * qrow + 32);
+        let want = testkit::upload_filled(&ctx, 0xA5, n * qrow + 32);
+        ctx.quantize_q8_1_rows(
+            &stream,
+            QuantizeCall {
+                x: input.range(0, k * n * 4).unwrap(),
+                y: got.range(0, n * qrow).unwrap(),
+                k,
+                ncols: n,
+            },
+        )
+        .unwrap();
+        for i in 0..n {
+            ctx.quantize_q8_1(
+                &stream,
+                QuantizeCall {
+                    x: input.range(i * k * 4, k * 4).unwrap(),
+                    y: want.range(i * qrow, qrow).unwrap(),
+                    k,
+                    ncols: 1,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            testkit::read_bytes(&ctx, &got, n * qrow + 32),
+            testkit::read_bytes(&ctx, &want, n * qrow + 32),
+            "{n} rows"
+        );
+    }
+    let n = 10;
+    let x_bytes = k * n * 4;
+    let shared = testkit::upload_filled(&ctx, 0xA5, x_bytes + n * qrow);
+    let result = ctx.quantize_q8_1_rows(
+        &stream,
+        QuantizeCall {
+            x: shared.range(0, x_bytes).unwrap(),
+            y: shared.range(k * 8 * 4, n * qrow).unwrap(),
+            k,
+            ncols: n,
+        },
+    );
+    assert_bad_request(result, "cross-chunk overlap", "overlap");
+    assert!(
+        testkit::read_bytes(&ctx, &shared, x_bytes + n * qrow)
+            .iter()
+            .all(|b| *b == 0xA5)
+    );
+    let x = testkit::upload_filled(&ctx, 0, x_bytes);
+    let y = testkit::upload_filled(&ctx, 0xA5, n * qrow);
+    let result = ctx.quantize_q8_1_rows(
+        &stream,
+        QuantizeCall {
+            x: x.range(0, x_bytes).unwrap(),
+            y: y.range(0, n * qrow - 4).unwrap(),
+            k,
+            ncols: n,
+        },
+    );
+    assert_bad_request(result, "short output", "range holds");
+    assert!(
+        testkit::read_bytes(&ctx, &y, n * qrow)
+            .iter()
+            .all(|b| *b == 0xA5)
+    );
+    ctx.ensure_usable().unwrap();
+}
+
 fn half_codes_away(stored: f32, reference: f32) -> u16 {
     testkit::f64_to_f16_bits(stored as f64).abs_diff(testkit::f64_to_f16_bits(reference as f64))
 }
