@@ -3,7 +3,10 @@
 use super::*;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
-    kernels::cuda::resident::relative_attention::{QUERY_TILE_LIMIT, RelativeAttentionTile},
+    kernels::cuda::resident::{
+        inkling_local_prep::OutputConvShape,
+        relative_attention::{QUERY_TILE_LIMIT, RelativeAttentionTile},
+    },
 };
 
 const ARENA_BYTES: usize = 8 << 20;
@@ -91,6 +94,54 @@ pub(in crate::family::inkling2) struct QueryClip<'a> {
 pub(in crate::family::inkling2) struct Sidecar<'a> {
     pub range: DeviceRange<'a>,
     pub query: Option<QueryClip<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ResidentOutput<'a> {
+    pub raw: DeviceRange<'a>,
+    pub convolution: Option<OutputConvolution<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct OutputConvolution<'a> {
+    pub history: usize,
+    // Raw history (newest first), channel-major tap weights, convolved destination.
+    pub planes: [DeviceRange<'a>; 3],
+}
+
+impl ResidentOutput<'_> {
+    fn validate(self, work: &Workspace, layout: Layout, rows: usize) -> Result<(), EngError> {
+        let Some(conv) = self.convolution else {
+            if layout.projected
+                && rows.checked_mul(layout.output) == Some(self.raw.bytes())
+                && !std::ptr::eq(self.raw.buffer(), &work.device)
+            {
+                return Ok(());
+            }
+            return Err(bad("incorrect resident CUDA attention output destination"));
+        };
+        let shape = OutputConvShape {
+            rows,
+            width: layout.output / 4,
+            history: conv.history,
+        };
+        if let Some([raw, past, weight, out, _]) = shape.words()
+            && layout.projected
+            && [self.raw, conv.planes[0], conv.planes[1], conv.planes[2]]
+                .into_iter()
+                .zip([raw, past, weight, out])
+                .all(|(r, words)| {
+                    r.bytes() == 4 * words
+                        && r.offset().is_multiple_of(4)
+                        && !std::ptr::eq(r.buffer(), &work.device)
+                })
+        {
+            return Ok(());
+        }
+        Err(bad(
+            "incorrect resident CUDA attention convolution destination",
+        ))
+    }
 }
 
 pub(in crate::family::inkling2) fn projection_side(query: bool) -> &'static [usize] {
@@ -290,6 +341,28 @@ impl ResidentAttention {
         projection: Option<&OutputProjection<'_>>,
         query_tiles: bool,
     ) -> Result<Vec<Vec<f32>>, EngError> {
+        self.step_prefill_to(
+            context,
+            slot,
+            (rows, side),
+            history,
+            projection,
+            (query_tiles, None),
+        )
+    }
+
+    /// A supplied destination is owned by the visit, not the reused attention tile.
+    /// The kernel validates convolved output through the attention status plane.
+    /// Raw-only consumers must check finite values before publishing the visit.
+    pub(super) fn step_prefill_to(
+        &self,
+        context: &CudaContext,
+        slot: usize,
+        (rows, side): (&[Row<'_>], Option<Sidecar<'_>>),
+        history: History<'_>,
+        projection: Option<&OutputProjection<'_>>,
+        (query_tiles, destination): (bool, Option<ResidentOutput<'_>>),
+    ) -> Result<Vec<Vec<f32>>, EngError> {
         let visit = self.visits[slot];
         let keep = side
             .as_ref()
@@ -341,6 +414,9 @@ impl ResidentAttention {
         let work = workspace
             .as_mut()
             .ok_or_else(|| bad("CUDA relative attention batch lacks workspace"))?;
+        if let Some(dest) = destination {
+            dest.validate(work, layout, count)?;
+        }
         work.encoded.clear();
         let mut offsets = Vec::with_capacity(count);
         for (i, row) in rows.iter().enumerate() {
@@ -378,10 +454,10 @@ impl ResidentAttention {
             layout,
             work,
             (&offsets, side),
-            (projection, tile),
+            (projection, tile, destination),
         )?;
-        // Commit may already have written the ring. Publish its cursor only after
-        // the fence, attention status and finite projected readback have passed.
+        // The ring is independent of the projection output. Publish its cursor
+        // after the fence and attention status (and host output check, if read).
         state.next_position[slot] = Some(position + count);
         if tile.is_some() {
             static TILED: std::sync::Once = std::sync::Once::new();
@@ -399,9 +475,10 @@ impl ResidentAttention {
         layout: Layout,
         work: &mut Workspace,
         (offsets, side): (&[[usize; 8]], Option<Sidecar<'_>>),
-        (projection, tile): (
+        (projection, tile, destination): (
             Option<&OutputProjection<'_>>,
             Option<(RelativeAttentionTile, [usize; 12])>,
+            Option<ResidentOutput<'_>>,
         ),
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let count = offsets.len();
@@ -475,6 +552,10 @@ impl ResidentAttention {
                 }
             }
             if let Some(p) = projection {
+                let y = match destination {
+                    Some(dest) => dest.raw,
+                    None => work.device.range(out_at, count * layout.output)?,
+                };
                 q8_row_reuse::project_output(
                     context,
                     &self.stream,
@@ -483,13 +564,38 @@ impl ResidentAttention {
                         dtype: p.dtype,
                         w: p.weight,
                         x: work.device.range(attention_at, count * layout.attention)?,
-                        y: work.device.range(out_at, count * layout.output)?,
+                        y,
                     },
                 )?;
             }
+            if let Some(dest) = destination
+                && let Some(conv) = dest.convolution
+            {
+                let [past, weight, output] = conv.planes;
+                context.inkling_output_conv(
+                    &self.stream,
+                    [
+                        dest.raw,
+                        past,
+                        weight,
+                        output,
+                        device.range(status_at, 4 * count)?,
+                    ],
+                    OutputConvShape {
+                        rows: count,
+                        width: layout.output / 4,
+                        history: conv.history,
+                    },
+                )?;
+            }
+            let readback = if destination.is_some() {
+                4 * count
+            } else {
+                count * (4 + layout.output)
+            };
             context.copy_to_pinned(
                 &self.stream,
-                work.device.range(status_at, count * (4 + layout.output))?,
+                work.device.range(status_at, readback)?,
                 &mut work.transfer,
                 0,
             )
@@ -503,6 +609,9 @@ impl ResidentAttention {
         work.transfer.read(0, &mut status)?;
         if status.into_iter().any(|byte| byte != 0) {
             return Err(bad("invalid CUDA relative attention batch state"));
+        }
+        if destination.is_some() {
+            return Ok(Vec::new());
         }
         (0..count)
             .map(|i| {

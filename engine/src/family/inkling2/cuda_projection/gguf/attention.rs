@@ -787,6 +787,93 @@ mod tests {
         assert!(batch(4, &device_rows[..3], device_side, &values, true).is_err());
         assert_eq!(cursor(), Some(9)); // rejected extent is pre-mutation
 
+        let resident_bytes = host_rows.len() * projection.rows * size_of::<f32>();
+        let resident = ctx.allocate(resident_bytes).unwrap();
+        let publish = |len, convolution| {
+            attention.step_prefill_to(
+                &ctx,
+                0,
+                (&host_rows, None),
+                History {
+                    position: 4,
+                    keys: &keys,
+                    values: &values,
+                },
+                Some(&projection),
+                (
+                    true,
+                    Some(prefill::ResidentOutput {
+                        raw: resident.range(0, len).unwrap(),
+                        convolution,
+                    }),
+                ),
+            )
+        };
+        assert!(publish(resident_bytes - 4, None).is_err());
+        assert_eq!(cursor(), Some(9));
+        assert!(publish(resident_bytes, None).unwrap().is_empty());
+        assert_eq!(cursor(), Some(8));
+        let mut resident_output = vec![0; resident_bytes];
+        resident.read_at(&stream, 0, &mut resident_output).unwrap();
+        assert_eq!(
+            resident_output,
+            reference
+                .0
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ring(), reference.1);
+
+        let past = [2.0, -0.0, 3.0, -2.5, 4.0, 5.0];
+        let taps = [0.5, -0.25, 0.125, 2.0, -1.0, 0.25, -0.75, 0.0];
+        let upload = |input: &[f32]| {
+            let mut bytes = Vec::new();
+            extend_words(&mut bytes, input);
+            let buf = ctx.allocate(bytes.len()).unwrap();
+            buf.write_at(&stream, 0, &bytes).unwrap();
+            buf
+        };
+        let history = upload(&past);
+        let filters = upload(&taps);
+        let convolved = ctx.allocate(resident_bytes).unwrap();
+        let conv = prefill::OutputConvolution {
+            history: 3,
+            planes: [&history, &filters, &convolved].map(|b| b.range(0, b.bytes()).unwrap()),
+        };
+        assert!(publish(resident_bytes, Some(conv)).unwrap().is_empty());
+        assert_eq!(cursor(), Some(8));
+        assert_eq!(ring(), reference.1);
+        let raw: Vec<_> = reference.0.iter().copied().map(f32::from_bits).collect();
+        let mut expected = Vec::new();
+        for at in 0..raw.len() {
+            let mut sum = 0.0;
+            for lag in 0..4 {
+                let source = if at / 2 >= lag {
+                    raw[at - 2 * lag]
+                } else {
+                    past[2 * (lag - at / 2 - 1) + at % 2]
+                };
+                sum += taps[4 * (at % 2) + 3 - lag] * source;
+            }
+            expected.push((sum + raw[at]) * 5.0f32.sqrt().recip());
+        }
+        let mut expected_bytes = Vec::new();
+        extend_words(&mut expected_bytes, &expected);
+        let mut got = vec![0; resident_bytes];
+        convolved.read_at(&stream, 0, &mut got).unwrap();
+        assert_eq!(got, expected_bytes);
+        resident.read_at(&stream, 0, &mut got).unwrap();
+        assert_eq!(got, resident_output); // next decode consumes raw, not convolved, history
+        filters
+            .write_at(&stream, 0, &f32::NAN.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            publish(resident_bytes, Some(conv)),
+            Err(bad("invalid CUDA relative attention batch state"))
+        );
+        assert_eq!(cursor(), None);
+
         // Both rewind and host-ahead cursor gaps must repair before reading.
         assert_eq!(
             bits(batch(4, &host_rows, None, &values, true).unwrap()),

@@ -42,7 +42,47 @@ pub(crate) struct PrepMath {
     pub eps: f32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OutputConvShape {
+    pub rows: usize,
+    pub width: usize,
+    pub history: usize,
+}
+
+impl OutputConvShape {
+    pub(crate) fn words(self) -> Option<[usize; 5]> {
+        let Self {
+            rows,
+            width,
+            history,
+        } = self;
+        let taps = PrepShape::TAPS;
+        if !(1..=512).contains(&rows) || !(1..=4096).contains(&width) || history >= taps {
+            return None;
+        }
+        let plane = rows * width;
+        Some([plane, (taps - 1) * width, taps * width, plane, rows])
+    }
+}
+
 impl CudaContext {
+    /// Apply ordered static taps on resident projected rows. The input plane is
+    /// unchanged and its tail can seed the next tile or the first decode row.
+    /// The caller initializes status, which the kernel only ORs into.
+    pub(crate) fn inkling_output_conv(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 5],
+        shape: OutputConvShape,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let [raw, past, weight, result, status] = ranges.each_ref().map(|r| self.raw_range(r));
+        let ranges = [raw?, past?, weight?, result?, status?];
+        self.launch_on(stream, |stream| {
+            resident::inkling_local_prep::output_conv(stream, ranges, shape)
+        })
+    }
+
     pub(crate) fn inkling_local_prep(
         &self,
         stream: &DeviceStream,

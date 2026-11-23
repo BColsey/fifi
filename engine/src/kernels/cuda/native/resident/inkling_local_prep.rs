@@ -1,9 +1,18 @@
 use std::ffi::{c_int, c_void};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
-use crate::kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape};
+use crate::kernels::cuda::resident::inkling_local_prep::{OutputConvShape, PrepMath, PrepShape};
 
 unsafe extern "C" {
+    fn inference_cuda_inkling_output_conv(
+        ranges: *const *mut c_void,
+        rows: c_int,
+        width: c_int,
+        history: c_int,
+        scale: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_inkling_local_prep(
         ranges: *const *mut c_void,
         queries: c_int,
@@ -16,6 +25,41 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+}
+
+pub(in crate::kernels::cuda) fn output_conv(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 5],
+    shape: OutputConvShape,
+) -> Result<(), DeviceFailure> {
+    let words = shape.words().ok_or_else(invalid_argument)?;
+    for (i, (range, words)) in ranges.iter().zip(words).enumerate() {
+        let bytes = words * size_of::<f32>();
+        if range.bytes() != bytes
+            || !range.offset.is_multiple_of(4)
+            || ranges[..i]
+                .iter()
+                .any(|other| !Span::of(range, bytes).apart(&Span::of(other, other.bytes())))
+        {
+            return Err(invalid_argument());
+        }
+    }
+    let pointers = ranges.map(|range| range.address());
+    let scale = ((PrepShape::TAPS + 1) as f32).sqrt().recip();
+    let mut stage = STAGE_NONE;
+    // SAFETY: the spans are aligned, sized for this bounded geometry, and distinct.
+    let status = unsafe {
+        inference_cuda_inkling_output_conv(
+            pointers.as_ptr(),
+            shape.rows as c_int,
+            shape.width as c_int,
+            shape.history as c_int,
+            scale,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
 }
 
 pub(in crate::kernels::cuda) fn launch(

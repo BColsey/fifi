@@ -85,7 +85,45 @@ __global__ void inkling_local_prep(Args a) {
         a.status[1 + blockIdx.x] = invalid;
     }
 }
+// Static output convolution. Raw projected rows are immutable and become the
+// next tile's history. Initial history is stored newest first.
+__global__ void inkling_output_conv(const float *raw, const float *past, const float *weight,
+                                    float *result, uint32_t *status, int rows, int width,
+                                    int history, float scale) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    bool bad = false;
+    if (channel < width) {
+        const int at = row * width + channel;
+        const float *w = weight + channel * kTaps;
+        float sum = 0.f;
+        for (int lag = 0; lag <= min(kTaps - 1, row + history); ++lag) {
+            const int source = row - lag;
+            const float value = source >= 0 ? raw[source * width + channel]
+                                            : past[(-source - 1) * width + channel];
+            sum = __fadd_rn(sum, __fmul_rn(w[kTaps - 1 - lag], value));
+        }
+        const float value = __fmul_rn(__fadd_rn(sum, raw[at]), scale);
+        result[at] = value;
+        bad = !isfinite(value);
+    }
+    const int invalid = __syncthreads_or(bad);
+    if (threadIdx.x == 0 && invalid) atomicOr(status + row, 1u);
+}
 } // namespace
+
+extern "C" int inference_cuda_inkling_output_conv(void *const *p, int rows, int width,
+    int history, float scale, void *stream, int *out_stage) {
+    constexpr int block = 128;
+    inkling_output_conv<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<const float *>(p[2]), static_cast<float *>(p[3]),
+        static_cast<uint32_t *>(p[4]), rows, width, history, scale);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
 
 extern "C" int inference_cuda_inkling_local_prep(void *const *p, int queries, int kv,
     int dims, int history, float qk_limit, float rel_limit, float eps, void *stream,
