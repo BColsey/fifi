@@ -6,6 +6,14 @@ use crate::kernels::cuda::resident::inkling_local_prep::{
 };
 
 unsafe extern "C" {
+    fn inference_cuda_inkling_weighted_norm(
+        ranges: *const *mut c_void,
+        rows: c_int,
+        width: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_inkling_depth_current(
         ranges: *const *mut c_void,
         rows: c_int,
@@ -45,6 +53,39 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+}
+
+pub(in crate::kernels::cuda) fn weighted_norm(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 4],
+    [rows, width]: [usize; 2],
+    eps: f32,
+) -> Result<(), DeviceFailure> {
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(invalid_argument());
+    }
+    let [plane, ..] = (DepthShape {
+        rows,
+        width,
+        depth: 1,
+    })
+    .words()
+    .ok_or_else(invalid_argument)?;
+    validate_f32_ranges(&ranges, [plane, width, plane, rows])?;
+    let pointers = ranges.map(|r| r.address());
+    let mut stage = STAGE_NONE;
+    // SAFETY: validated bounding geometry and disjoint, aligned regions.
+    let status = unsafe {
+        inference_cuda_inkling_weighted_norm(
+            pointers.as_ptr(),
+            rows as c_int,
+            width as c_int,
+            eps,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
 }
 
 pub(in crate::kernels::cuda) fn depth_current(

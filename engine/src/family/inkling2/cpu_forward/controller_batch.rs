@@ -276,7 +276,7 @@ impl CpuForward {
                                 state,
                                 host,
                                 range,
-                                conv.as_mut(),
+                                conv.as_mut().map(|conv| (conv, true)),
                             )?);
                             Ok(())
                         },

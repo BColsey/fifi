@@ -110,6 +110,32 @@ __global__ void inkling_output_conv(const float *raw, const float *past, const f
     const int invalid = __syncthreads_or(bad);
     if (threadIdx.x == 0 && invalid) atomicOr(status + row, 1u);
 }
+__device__ float ordered_rms_scale(const float *x, int width, float eps) {
+    float squares = -0.f;
+    for (int i = 0; i < width; ++i)
+        squares = __fadd_rn(squares, __fmul_rn(x[i], x[i]));
+    const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(squares, float(width)), eps));
+    return isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
+}
+
+__global__ void inkling_weighted_norm(const float *input, const float *gamma,
+    float *output, float *status, int width, float eps) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *x = input + row * width;
+    __shared__ float scale;
+    if (lane == 0) scale = ordered_rms_scale(x, width, eps);
+    __syncthreads();
+    bool bad = !isfinite(scale);
+    for (int i = lane; i < width; i += blockDim.x) {
+        const float value = __fmul_rn(__fmul_rn(x[i], scale), gamma[i]);
+        output[row * width + i] = value;
+        bad |= !isfinite(value);
+    }
+    const int failed = __syncthreads_or(bad);
+    if (lane == 0) status[row] = failed ? 1.f : 0.f;
+}
+
 // One CTA per token, with ordered accumulation matching Rust's depth RMSNorm.
 // The raw result feeds the residual stream; the normalized plane feeds depth.
 __global__ void inkling_depth_current(const float *prior, const float *attention,
@@ -123,16 +149,8 @@ __global__ void inkling_depth_current(const float *prior, const float *attention
         raw[at] = boundary ? out : __fadd_rn(prior[at], __fmul_rn(out, 1.f));
     }
     __syncthreads();
-    if (lane == 0) {
-        float squares = -0.f;
-        for (int i = 0; i < width; ++i) {
-            const float value = raw[offset + i];
-            squares = __fadd_rn(squares, __fmul_rn(value, value));
-        }
-        // Poison the depth score on overflow instead of silently normalizing to zero.
-        const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(squares, float(width)), 1.e-6f));
-        scale = isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
-    }
+    // Poison the depth score on overflow instead of silently normalizing to zero.
+    if (lane == 0) scale = ordered_rms_scale(raw + offset, width, 1.e-6f);
     __syncthreads();
     for (int i = lane; i < width; i += blockDim.x)
         normalized[offset + i] = __fmul_rn(raw[offset + i], scale);
@@ -167,6 +185,17 @@ __global__ void inkling_depth_mix(const float *planes, const float *weights,
     output[row * width + k] = __fdiv_rn(sum, mass);
 }
 } // namespace
+
+extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, int width,
+    float eps, void *stream, int *out_stage) {
+    inkling_weighted_norm<<<rows, 128, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
 
 extern "C" int inference_cuda_inkling_depth_current(void *const *p, int rows, int width,
     int boundary, void *stream, int *out_stage) {

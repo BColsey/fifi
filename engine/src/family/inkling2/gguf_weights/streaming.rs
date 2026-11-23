@@ -118,6 +118,50 @@ impl GgufTextWeights {
             .prefill_router_logits(name, inputs, layer, prompt)
     }
 
+    pub(in crate::family::inkling2) fn resident_prefill_router_shape(
+        &self,
+        layer: u32,
+        name: &str,
+    ) -> Option<[usize; 2]> {
+        self.cuda
+            .as_ref()?
+            .resident_prefill_router_shape(layer, name)
+    }
+
+    pub(in crate::family::inkling2) fn resident_prefill_router_logits(
+        &self,
+        name: &str,
+        rows: DeviceRange<'_>,
+    ) -> Result<Vec<f32>, EngError> {
+        self.cuda
+            .as_ref()
+            .ok_or_else(|| bad("prefill router requires a CUDA backend"))?
+            .resident_prefill_router_logits(name, rows)
+    }
+
+    pub(in crate::family::inkling2) fn admit_resident_prefill_experts(
+        &self,
+        names: [&str; 2],
+        layer: u32,
+        dims: [usize; 4],
+        caps: [f32; 2],
+    ) -> Result<bool, EngError> {
+        let Some(cuda) = self.cuda.as_ref() else {
+            return Ok(false);
+        };
+        let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
+            return Ok(false);
+        };
+        if source
+            .parts
+            .iter()
+            .any(|(tensor, _)| tensor.planes != dims[3])
+        {
+            return Ok(false);
+        }
+        cuda.admit_device_prefill(&mut source, layer, dims, dtypes, caps)
+    }
+
     pub(in crate::family::inkling2) fn observe_experts(&self, layer: usize, selected: &[usize]) {
         if let Some(ram) = &self.ram {
             ram.observe(layer, selected);

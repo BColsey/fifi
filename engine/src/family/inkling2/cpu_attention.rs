@@ -382,6 +382,7 @@ impl CpuForward {
         visit: LayerVisit,
         state: &mut VisitState,
         inputs: &[[Vec<f32>; 3]],
+        mut resident: Option<&mut attention::prefill::PrefillConv>,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
         let resident_query = attention::prefill::resident_query_enabled();
         if (!resident_query && !attention::prefill::device_side_enabled()) || inputs.len() < 2 {
@@ -414,7 +415,13 @@ impl CpuForward {
                 .map(|row| row.each_ref().map(Vec::as_slice))
                 .collect();
             let (host, range) = projector.tile(&refs, keep)?;
-            outputs.extend(bridge.consume(self, state, host, range, None)?);
+            outputs.extend(bridge.consume(
+                self,
+                state,
+                host,
+                range,
+                resident.as_deref_mut().map(|conv| (conv, false)),
+            )?);
         }
         if resident_query {
             note_resident_queries(false);
@@ -839,7 +846,7 @@ impl PrefillBridge<'_> {
         state: &mut VisitState,
         host: Vec<AttentionProjection>,
         range: crate::kernels::cuda::DeviceRange<'_>,
-        mut conv: Option<&mut attention::prefill::PrefillConv>,
+        mut conv: Option<(&mut attention::prefill::PrefillConv, bool)>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let query = self
             .scales
@@ -866,7 +873,7 @@ impl PrefillBridge<'_> {
                 state,
                 host.by_ref().take(count),
                 attention::prefill::Sidecar { range: sub, query },
-                conv.as_deref_mut(),
+                conv.as_mut().map(|(conv, read)| (&mut **conv, *read)),
             )?);
         }
         Ok(output)
@@ -878,7 +885,7 @@ impl PrefillBridge<'_> {
         state: &mut VisitState,
         host: impl Iterator<Item = AttentionProjection>,
         side: attention::prefill::Sidecar<'_>,
-        conv: Option<&mut attention::prefill::PrefillConv>,
+        conv: Option<(&mut attention::prefill::PrefillConv, bool)>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let prepared = host
             .map(|p| {
@@ -893,6 +900,7 @@ impl PrefillBridge<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
         let convolved = conv.is_some();
+        let status_only = matches!(conv, Some((_, false)));
         let values = {
             let _span = forward.phase_span(Work::DeviceAttention);
             let history = attention::History {
@@ -901,14 +909,14 @@ impl PrefillBridge<'_> {
                 values: &state.values,
             };
             // Finish consuming the sidecar before the next tile can overwrite it.
-            if let Some(conv) = conv {
+            if let Some(target) = conv {
                 self.device.step_prefill_conv(
                     self.context,
                     self.visit.state_slot,
                     (&rows, Some(side)),
                     history,
                     &self.projection,
-                    (conv, true),
+                    target,
                 )?
             } else {
                 self.device.step_prefill(
@@ -922,15 +930,18 @@ impl PrefillBridge<'_> {
         };
         // The device ring is only a cache: publish the prepared host K/V
         // after the device status and output have passed validation.
+        let capacity = forward.kv_capacity(self.visit.attention);
+        if status_only {
+            for row in prepared {
+                state.push(row.k, row.v, capacity);
+            }
+            return Ok(values);
+        }
         prepared
             .into_iter()
             .zip(values)
             .map(|(prepared, out)| {
-                state.push(
-                    prepared.k,
-                    prepared.v,
-                    forward.kv_capacity(self.visit.attention),
-                );
+                state.push(prepared.k, prepared.v, capacity);
                 if convolved {
                     Ok(out)
                 } else {

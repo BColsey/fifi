@@ -88,11 +88,73 @@ impl DepthShape {
     }
 }
 
+fn validate_planes<const N: usize>(
+    names: [&'static str; N],
+    ranges: &[DeviceRange<'_>; N],
+    words: [usize; N],
+) -> Result<(), EngError> {
+    for (i, (name, range)) in names.into_iter().zip(ranges).enumerate() {
+        let bytes = words[i] * size_of::<f32>();
+        if range.bytes() != bytes {
+            return Err(EngError::BadRequest(format!(
+                "wrong CUDA Inkling {name} extent"
+            )));
+        }
+        require_fit(name, range, bytes, align_of::<f32>())?;
+        let claim = Claim::of(name, range, bytes);
+        for (prev, range) in names.into_iter().zip(&ranges[..i]) {
+            require_apart(&claim, &Claim::of(prev, range, range.bytes()))?;
+        }
+    }
+    Ok(())
+}
+
 impl CudaContext {
+    /// Ordered FP32 RMSNorm followed by gamma; only the status rows are read back.
+    pub(crate) fn inkling_weighted_norm(
+        &self,
+        stream: &DeviceStream,
+        transfer: &mut PinnedBuf,
+        ranges: [DeviceRange<'_>; 4],
+        [rows, width]: [usize; 2],
+        eps: f32,
+    ) -> Result<(), EngError> {
+        let [plane, ..] = (DepthShape {
+            rows,
+            width,
+            depth: 1,
+        })
+        .words()
+        .filter(|_| eps.is_finite() && eps > 0.0)
+        .ok_or_else(|| {
+            EngError::BadRequest("invalid CUDA Inkling norm geometry or epsilon".into())
+        })?;
+        validate_planes(
+            ["input", "gamma", "output", "status"],
+            &ranges,
+            [plane, width, plane, rows],
+        )?;
+        let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
+        let raw = [a?, b?, c?, d?];
+        let queued = self
+            .launch_on(stream, |stream| {
+                resident::inkling_local_prep::weighted_norm(stream, raw, [rows, width], eps)
+            })
+            .and_then(|()| self.copy_to_pinned(stream, ranges[3], transfer, 0));
+        transfer.synchronize_after_enqueue(stream, queued)?;
+        let mut status = vec![0.0; rows];
+        transfer.read_f32(0, &mut status)?;
+        if status.iter().any(|&v| v != 0.0) {
+            return Err(EngError::BadRequest(
+                "non-finite CUDA Inkling MLP norm".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Form the next raw residual and its normalized scoring plane from
     /// `[prior, convolved_attention, next_raw, next_normalized]` on one stream.
     /// At a block boundary the caller retains the sealed prior separately.
-    #[allow(dead_code, reason = "the grouped resident visit is wired separately")]
     pub(crate) fn inkling_depth_current(
         &self,
         stream: &DeviceStream,
@@ -108,20 +170,11 @@ impl CudaContext {
         })
         .words()
         .ok_or_else(|| EngError::BadRequest("invalid Inkling current depth shape".into()))?;
-        let bytes = plane * size_of::<f32>();
-        let names = ["prior", "attention", "raw", "normalized"];
-        for (i, (name, range)) in names.into_iter().zip(&ranges).enumerate() {
-            if range.bytes() != bytes {
-                return Err(EngError::BadRequest(format!(
-                    "wrong Inkling current depth {name} extent"
-                )));
-            }
-            require_fit(name, range, bytes, align_of::<f32>())?;
-            let claim = Claim::of(name, range, bytes);
-            for (prev, range) in names.into_iter().zip(&ranges[..i]) {
-                require_apart(&claim, &Claim::of(prev, range, bytes))?;
-            }
-        }
+        validate_planes(
+            ["prior", "attention", "raw", "normalized"],
+            &ranges,
+            [plane; 4],
+        )?;
         let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
         let ranges = [a?, b?, c?, d?];
         self.launch_on(stream, |stream| {
@@ -132,7 +185,6 @@ impl CudaContext {
     /// Keep normalized depth planes and the mixed output on device. The compact
     /// round trip preserves host `f32::exp` rounding without moving hidden rows.
     /// `planes` are in scoring order (newest sealed to oldest, then current).
-    #[allow(dead_code, reason = "the grouped resident visit is wired separately")]
     pub(crate) fn inkling_depth_mix(
         &self,
         stream: &DeviceStream,

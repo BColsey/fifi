@@ -17,6 +17,9 @@ use crate::{
     },
 };
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod resident_first;
+
 struct PromptRow<'a> {
     stream: Stream,
     prelude: Option<Stream>,
@@ -328,6 +331,20 @@ impl CpuForward {
         } else {
             None
         };
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if batched_attention
+            && let Some((inputs, _)) = &attention_inputs
+            && self.try_resident_first_visit(
+                visit,
+                state,
+                rows,
+                weights,
+                (&layer, &prefix),
+                inputs,
+            )?
+        {
+            return Ok(());
+        }
         let batched = if let Some(chained) = chained {
             let outputs = match chained {
                 ChainedAttention::Host(p) => {
@@ -344,20 +361,21 @@ impl CpuForward {
             )?)
         } else if batched_attention {
             if let Some((inputs, batched_controllers)) = attention_inputs.take() {
-                let outputs = match self.attention_prefill_bridge(&layer, visit, state, &inputs)? {
-                    Some(outputs) => Some(outputs),
-                    None => self
-                        .project_prompt_attention(
-                            weights,
-                            &layer,
-                            visit,
-                            &inputs,
-                            batched_controllers,
-                            true,
-                        )?
-                        .map(|p| self.attention_prefill_batch(&layer, visit, state, p))
-                        .transpose()?,
-                };
+                let outputs =
+                    match self.attention_prefill_bridge(&layer, visit, state, &inputs, None)? {
+                        Some(outputs) => Some(outputs),
+                        None => self
+                            .project_prompt_attention(
+                                weights,
+                                &layer,
+                                visit,
+                                &inputs,
+                                batched_controllers,
+                                true,
+                            )?
+                            .map(|p| self.attention_prefill_batch(&layer, visit, state, p))
+                            .transpose()?,
+                    };
                 outputs
                     .map(|outputs| {
                         self.prompt_attention_residuals(
@@ -527,22 +545,37 @@ impl CpuForward {
         )?;
         let experts = self.spec.n_routed_experts as usize;
         let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
+        let routes = self.route_prefill_logits(layer, &logits, &bias, inputs.len())?;
         let rows = inputs
             .into_iter()
-            .zip(logits.chunks_exact(experts))
-            .map(|(input, scores)| {
-                let route = self.moe_route_from_logits(layer, scores.to_vec(), &bias)?;
-                Ok(MlpRow { route, input })
-            })
-            .collect::<Result<Vec<_>, EngError>>()?;
+            .zip(routes)
+            .map(|(input, route)| MlpRow { input, route })
+            .collect();
+        Ok((rows, retained))
+    }
+
+    fn route_prefill_logits(
+        &self,
+        layer: usize,
+        logits: &[f32],
+        bias: &[f32],
+        rows: usize,
+    ) -> Result<Vec<MoeRoute>, EngError> {
+        if bias.is_empty() || rows.checked_mul(bias.len()) != Some(logits.len()) {
+            return Err(bad("unexpected Inkling grouped router logit extent"));
+        }
+        let routes = logits
+            .chunks_exact(bias.len())
+            .map(|scores| self.moe_route_from_logits(layer, scores.to_vec(), bias))
+            .collect::<Result<Vec<_>, _>>()?;
         if std::env::var("FIFI_INKLING_DEBUG_PREFILL_ROUTES").as_deref() == Ok("1") {
-            let routes: Vec<_> = rows.iter().map(|row| &row.route.selected).collect();
+            let routes: Vec<_> = routes.iter().map(|route| &route.selected).collect();
             eprintln!(
                 "Inkling grouped route diagnostic {}",
                 serde_json::json!({"layer":layer,"routes":routes})
             );
         }
-        Ok((rows, retained))
+        Ok(routes)
     }
 
     fn diagnose_chained_projections(

@@ -906,6 +906,30 @@ impl GgufCuda {
         )
     }
 
+    pub(in crate::family::inkling2) fn resident_prefill_router_shape(
+        &self,
+        layer: u32,
+        name: &str,
+    ) -> Option<[usize; 2]> {
+        let (weight, _) = self.dense.get(name)?;
+        self.batch_prefill_router(layer, name)
+            .then_some(weight.shape)
+    }
+
+    pub(in crate::family::inkling2) fn resident_prefill_router_logits(
+        &self,
+        name: &str,
+        input: DeviceRange<'_>,
+    ) -> Result<Vec<f32>, EngError> {
+        let (weight, _) = self
+            .dense
+            .get(name)
+            .filter(|(_, dtype)| *dtype == DenseDtype::F32)
+            .ok_or_else(|| bad("missing F32 CUDA prefill router"))?;
+        self.step
+            .project_resident_router_rows(&self.context, weight, input)
+    }
+
     pub(in crate::family::inkling2) fn attention_projections<const N: usize>(
         &self,
         inputs: [&[f32]; 3],

@@ -292,6 +292,50 @@ impl GgufCuda {
         self.device_prefill.is_some() && !self.resident.placement().has_cold(layer)
     }
 
+    /// Validate every routable expert and reserve scratch before a device-only input is produced.
+    pub(in crate::family::inkling2) fn admit_device_prefill(
+        &self,
+        source: &mut impl ExpertPayloadSource,
+        layer: u32,
+        [rows, rank, hidden, experts]: [usize; 4],
+        dtypes: [DenseDtype; 2],
+        caps: [f32; 2],
+    ) -> Result<bool, EngError> {
+        let Some(workspace) = &self.device_prefill else {
+            return Ok(false);
+        };
+        if !self.resident.placement().full_layers().contains(&layer)
+            || experts == 0
+            || !self.valid_device_prefill(rows, rank, dtypes, caps)
+        {
+            return Ok(false);
+        }
+        let Some(projections) =
+            self.prepare_device_experts(source, layer, 0..experts, [rank, hidden], dtypes, caps)?
+        else {
+            return Ok(false);
+        };
+        Ok(workspace
+            .borrow_mut()
+            .fit(&self.context, rows, projections.geometry)?
+            .is_some())
+    }
+
+    fn valid_device_prefill(
+        &self,
+        rows: usize,
+        rank: usize,
+        dtypes: [DenseDtype; 2],
+        caps: [f32; 2],
+    ) -> bool {
+        rows >= 2
+            && (1..=32).contains(&rank)
+            && caps.iter().all(|cap| cap.is_finite() && *cap > 0.0)
+            && dtypes
+                .iter()
+                .all(|&dtype| dtype.is_packed_gguf() && !self.step.uses_q8_activations(dtype))
+    }
+
     pub(in crate::family::inkling2) fn prefill_device_experts(
         &self,
         source: &mut impl ExpertPayloadSource,
@@ -308,18 +352,19 @@ impl GgufCuda {
             return Ok(None);
         };
         let rank = routes.ids().next().map_or(0, <[usize]>::len);
-        if routes.len() < 2
-            || !(1..=32).contains(&rank)
-            || !caps.iter().all(|cap| cap.is_finite() && *cap > 0.0)
+        if !self.valid_device_prefill(routes.len(), rank, dtypes, caps)
             || routes.ids().any(|ids| ids.len() != rank)
-            || dtypes
-                .iter()
-                .any(|&dtype| !dtype.is_packed_gguf() || self.step.uses_q8_activations(dtype))
         {
             return Ok(None);
         }
-        let Some(projections) =
-            self.prepare_device_experts(source, layer, routes, [rank, hidden], dtypes, caps)?
+        let Some(projections) = self.prepare_device_experts(
+            source,
+            layer,
+            routes.ids().flatten().copied().collect::<BTreeSet<_>>(),
+            [rank, hidden],
+            dtypes,
+            caps,
+        )?
         else {
             return Ok(None);
         };
@@ -373,12 +418,11 @@ impl GgufCuda {
         &'a self,
         source: &mut impl ExpertPayloadSource,
         layer: u32,
-        routes: RowRoutes<'_>,
+        experts: impl IntoIterator<Item = usize>,
         [rank, hidden]: [usize; 2],
         dtypes: [DenseDtype; 2],
         caps: [f32; 2],
     ) -> Result<Option<Projections<'a>>, EngError> {
-        let experts: BTreeSet<_> = routes.ids().flatten().copied().collect();
         let mut matrices = BTreeMap::new();
         let mut middle = 0;
         for expert in experts {
