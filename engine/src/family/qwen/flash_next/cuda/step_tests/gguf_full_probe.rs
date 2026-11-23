@@ -108,6 +108,11 @@ struct ProbeInput {
     expected: Vec<f32>,
     /// `None` reports the logits error; `Some(b)` fails the test above `b`.
     bound: Option<f64>,
+    /// Greedy steps generated after the prompt (0 = prompt only).
+    continuation: usize,
+    /// Every oracle logit row: the prompt's final step followed by its greedy continuation.
+    /// `expected` is `oracle_rows[0]`.
+    oracle_rows: Vec<Vec<f32>>,
 }
 
 impl ProbeInput {
@@ -129,20 +134,69 @@ impl ProbeInput {
         let prompt: Vec<u32> =
             serde_json::from_value(oracle["prompt"].clone()).expect("oracle holds its prompt");
         assert!(!prompt.is_empty(), "oracle prompt is empty");
-        let expected: Vec<f32> =
-            serde_json::from_value(oracle["logits"][0].clone()).expect("oracle first logits");
+        let oracle_rows: Vec<Vec<f32>> =
+            serde_json::from_value(oracle["logits"].clone()).expect("oracle logits");
+        let expected = oracle_rows.first().cloned().expect("oracle first logits");
         assert!(expected.len() > 1 && expected.iter().all(|x| x.is_finite()));
+        for row in &oracle_rows {
+            assert!(row.len() == expected.len(), "oracle rows differ in width");
+        }
         let bound = Self::parse_bound(
             std::env::var("FIFI_FLASH_GGUF_LOGITS_BOUND")
                 .ok()
                 .as_deref(),
         )
         .unwrap_or_else(|message| panic!("FIFI_FLASH_GGUF_LOGITS_BOUND: {message}"));
+        let continuation = Self::parse_continuation(
+            std::env::var("FIFI_FLASH_GGUF_CONTINUATION")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|message| panic!("FIFI_FLASH_GGUF_CONTINUATION: {message}"));
+        assert!(
+            Self::continuation_fits_oracle(continuation, oracle_rows.len()),
+            "oracle holds {} greedy steps; it cannot qualify {continuation} continuation steps",
+            oracle_rows.len()
+        );
         Self {
             prompt,
             expected,
             bound,
+            continuation,
+            oracle_rows,
         }
+    }
+
+    /// One oracle row covers the prompt's own logits; each continuation step needs one more.
+    fn continuation_fits_oracle(continuation: usize, oracle_steps: usize) -> bool {
+        continuation + 1 <= oracle_steps
+    }
+
+    /// The token a position consumes: the prompt's own, or once the prompt is exhausted the
+    /// token the device chose at the previous position (recorded in step order).
+    fn fed_token(prompt: &[u32], generated: &[u32], position: usize) -> u32 {
+        match prompt.get(position) {
+            Some(token) => *token,
+            None => generated[position - prompt.len()],
+        }
+    }
+
+    /// Whether this step's row is the same computation on both sides. Each step consumes the
+    /// device's own previous choice, so the first differing choice ends comparability for this
+    /// step and every later one, even if the two happen to agree again.
+    fn comparable_so_far(diverged: &mut bool, actual: usize, expected: usize) -> bool {
+        *diverged |= actual != expected;
+        !*diverged
+    }
+
+    fn parse_continuation(value: Option<&str>) -> Result<usize, &'static str> {
+        let Some(text) = value else {
+            return Ok(0);
+        };
+        text.parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or("continuation must be a positive whole number of steps")
     }
 
     fn parse_bound(value: Option<&str>) -> Result<Option<f64>, &'static str> {
@@ -165,6 +219,7 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
     );
     let input = ProbeInput::open();
     let (prompt, expected) = (&input.prompt, &input.expected);
+    let total = prompt.len() + input.continuation;
     let model = GgufModel::open(Path::new(&path)).unwrap().unwrap();
     let shape = model.config().model_shape().unwrap();
     let layers = model.config().layers();
@@ -203,17 +258,17 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
     ProbeBudget::check_host(&model).expect("probe host admission");
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    let budget = ProbeBudget::new(&model, &ctx, prompt.len()).expect("probe preflight");
+    let budget = ProbeBudget::new(&model, &ctx, total).expect("probe preflight");
     let trunk =
         GgufTrunk::upload_with_final_guarded(&model, &ctx, &stream, 0..end, |layer, weights| {
             budget.group_guard(&ctx, layer, weights)
         })
         .expect("guarded trunk upload");
     let ngram = trunk.model().ngram().unwrap();
-    let mut feed = GgufTokenFeeds::new(trunk.model(), &ngram, prompt.len()).unwrap();
+    let mut feed = GgufTokenFeeds::new(trunk.model(), &ngram, total).unwrap();
     budget.before_step(&ctx).unwrap();
     let before_step = ctx.live_bytes();
-    let bound = GgufStep::new(&ctx, &stream, &trunk, prompt.len()).unwrap();
+    let bound = GgufStep::new(&ctx, &stream, &trunk, total).unwrap();
     assert_eq!(
         ctx.live_bytes() - before_step,
         budget.step_payload(),
@@ -244,7 +299,14 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
         );
     }
     budget.before_execution(&ctx).unwrap();
-    for (position, token) in prompt.iter().copied().enumerate() {
+    assert!(
+        input.continuation == 0 || (trace_window.is_none() && end == layers),
+        "continuation requires the untraced full model"
+    );
+    let mut generated: Vec<u32> = Vec::with_capacity(input.continuation);
+    let (mut diverged, mut comparable_steps) = (false, 0usize);
+    for position in 0..total {
+        let token = ProbeInput::fed_token(prompt, &generated, position);
         let start = feed.begin(token).unwrap();
         step.begin_token().unwrap();
         let (words, at) = step.words_buffer().unwrap();
@@ -326,22 +388,30 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
             trace.take().unwrap().finish(end);
             return;
         }
-        if position + 1 == prompt.len() && end == layers {
+        if position + 1 >= prompt.len() && end == layers {
             step.head(1).unwrap();
             let got = step
                 .read_f32(step.slot(Slot::Logits).unwrap(), expected.len())
                 .unwrap();
             assert_eq!(got.len(), expected.len());
             let actual_greedy = greedy(&got);
-            let expected_greedy = greedy(&expected);
-            let error = relative_l2(&got, &expected);
+            // Step 0 is the prompt's own logits; later steps follow the device's own tokens.
+            let step_index = position + 1 - prompt.len();
+            let host_row = &input.oracle_rows[step_index];
+            let expected_greedy = greedy(host_row);
+            let error = relative_l2(&got, host_row);
+            let comparable =
+                ProbeInput::comparable_so_far(&mut diverged, actual_greedy, expected_greedy);
+            comparable_steps += usize::from(comparable);
             eprintln!(
-                "first logits count={} relative_l2={error:.9} gpu_greedy={actual_greedy} host_greedy={expected_greedy} gpu_max={} host_max={}",
+                "greedy step={step_index} position={position} comparable={comparable} logits count={} relative_l2={error:.9} gpu_greedy={actual_greedy} host_greedy={expected_greedy} gpu_max={} host_max={}",
                 got.len(),
                 got[actual_greedy],
-                expected[expected_greedy]
+                host_row[expected_greedy]
             );
-            if let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_FULL_PROBE_LOGITS_OUT") {
+            if let Some(path) = std::env::var_os("FIFI_FLASH_GGUF_FULL_PROBE_LOGITS_OUT")
+                && step_index == 0
+            {
                 let output = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -349,20 +419,26 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
                     .unwrap();
                 serde_json::to_writer(output, &got).unwrap();
             }
-            // A measurement by default; the inherited tolerance is imposed only on request.
+            // A measurement by default; a tolerance is imposed only when the caller chose one.
             if let Some(bound) = input.bound {
                 assert!(
                     error.is_finite() && error < bound && actual_greedy == expected_greedy,
-                    "first logits mismatch: relative_l2={error}, gpu_greedy={actual_greedy}, host_greedy={expected_greedy}, bound={bound}"
+                    "greedy step {step_index} mismatch: relative_l2={error}, gpu_greedy={actual_greedy}, host_greedy={expected_greedy}, bound={bound}"
                 );
             } else {
                 assert!(error.is_finite(), "non-finite logits error");
-                eprintln!(
-                    "first logits comparison is a measurement; set FIFI_FLASH_GGUF_LOGITS_BOUND to assert"
-                );
+            }
+            if step_index < input.continuation {
+                generated.push(u32::try_from(actual_greedy).expect("greedy token id fits u32"));
             }
         }
         step.finish_token().unwrap();
+    }
+    if input.continuation > 0 {
+        eprintln!(
+            "greedy continuation: {} steps measured, {comparable_steps} comparable; each fed the device's own token; set FIFI_FLASH_GGUF_LOGITS_BOUND to assert",
+            input.continuation
+        );
     }
     if let Some(trace) = stateful {
         trace.finish(prompt.len());
@@ -380,5 +456,39 @@ mod probe_input_tests {
         for bad in ["", "0", "-1", "nan", "inf", "abc"] {
             assert!(ProbeInput::parse_bound(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn continuation_is_opt_in_and_positive() {
+        assert_eq!(ProbeInput::parse_continuation(None).unwrap(), 0);
+        assert_eq!(ProbeInput::parse_continuation(Some("2")).unwrap(), 2);
+        for bad in ["", "0", "-1", "1.5", "abc"] {
+            assert!(ProbeInput::parse_continuation(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(ProbeInput::continuation_fits_oracle(0, 1));
+        assert!(ProbeInput::continuation_fits_oracle(2, 3));
+        assert!(!ProbeInput::continuation_fits_oracle(3, 3));
+    }
+
+    #[test]
+    fn first_generated_position_feeds_the_prompt_final_choice() {
+        let prompt = [10u32, 20, 30];
+        let generated = [5854u32, 11];
+        assert_eq!(ProbeInput::fed_token(&prompt, &[], 0), 10);
+        assert_eq!(ProbeInput::fed_token(&prompt, &[], 2), 30);
+        assert_eq!(ProbeInput::fed_token(&prompt, &generated, 3), 5854);
+        assert_eq!(ProbeInput::fed_token(&prompt, &generated, 4), 11);
+    }
+
+    #[test]
+    fn a_divergence_ends_comparability_even_if_a_later_step_agrees() {
+        let mut diverged = false;
+        let flags: Vec<bool> = [(7, 7), (9, 7), (7, 7)]
+            .into_iter()
+            .map(|(actual, expected)| {
+                ProbeInput::comparable_so_far(&mut diverged, actual, expected)
+            })
+            .collect();
+        assert_eq!(flags, [true, false, false]);
     }
 }
