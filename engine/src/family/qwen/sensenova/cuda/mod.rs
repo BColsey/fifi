@@ -5,3 +5,4 @@
 //! shared kernels and planning pieces the way Flash-Next does, owning its step loop.
 
 pub(crate) mod geometry;
+pub(crate) mod load;
