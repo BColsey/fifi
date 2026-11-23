@@ -47,12 +47,14 @@ use crate::family::executor::{ExecutorOps, GenerationState};
 use crate::family::gguf_model::{Inventory, Role};
 use crate::family::project::cuda::{CudaWeight, CudaWeights, WeightLayout};
 use crate::family::qwen::qwen36::cuda::rules::check_token_id;
+use crate::family::sampler::Sampler;
 use crate::family::session::{
     DecodeSession, Limits, PrefixIdentity, PrefixSlot, SaveKind, StoreLimits, TokenStepper,
-    check_prompt,
+    check_prompt, sample_logits,
 };
-use crate::kernels::cuda::resident::step_params::StepParams;
-use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
+use crate::family::state_words::Word;
+use crate::kernels::cuda::resident::step_params::{STEP_PARAMS_BYTES, StepParams};
+use crate::kernels::cuda::{DeviceBuffer, DeviceRange, NativeWeight};
 
 /// The whole eager distributed step: the stack, the per-card weight views,
 /// the card op lists, and the token book.
@@ -98,6 +100,9 @@ pub(crate) struct CardSession {
     prefix_lookup: PrefixReport,
     /// Experimental: prompt-only feeds need state, not the vocabulary row.
     skip_prefill_head: bool,
+    compact_greedy: bool,
+    #[cfg(test)]
+    pub(super) compact_draws: usize,
     eos: Arc<[u32]>,
     sampler_vocab: usize,
 }
@@ -119,6 +124,13 @@ impl CardSequence {
             full_params_next: false,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenOutput {
+    Feed,
+    FullRow,
+    ShardWinners,
 }
 
 impl CardSession {
@@ -294,6 +306,10 @@ impl CardSession {
             marks: crate::family::mem::fill::FreeMarks::default(),
             skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
                 .is_some_and(|value| value == "1"),
+            compact_greedy: std::env::var_os("Q36_P2P_GREEDY_READBACK")
+                .is_some_and(|value| value == "1"),
+            #[cfg(test)]
+            compact_draws: 0,
             prefix: PrefixSlot::with_limits(effective_limits),
             prefix_path: CudaPrefillPath::Steps(options.kv_mode),
             identity,
@@ -306,6 +322,11 @@ impl CardSession {
 
     pub(crate) fn context_limit(&self) -> usize {
         self.context_limit
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_compact_greedy_for_test(&mut self, enabled: bool) {
+        self.compact_greedy = enabled;
     }
 
     #[cfg(test)]
@@ -462,9 +483,9 @@ impl CardSession {
     }
 
     /// The one launch path of a token: run the whole distributed step, fold
-    /// the status words, and optionally read the concatenated logits row.
-    /// `fed` advances only when the token ran clean.
-    fn run_token(&mut self, token: u32, read_logits: bool) -> Result<Vec<f32>, EngError> {
+    /// the status words, and optionally retain the already-computed shard winners.
+    /// The caller advances `fed` after the requested readback succeeds.
+    fn run_token(&mut self, token: u32, output: TokenOutput) -> Result<Vec<i32>, EngError> {
         self.require_healthy()?;
         check_token_id(token, self.sampler_vocab)?;
         if self.sequence.fed >= self.context_limit {
@@ -520,26 +541,20 @@ impl CardSession {
             &self.heads,
             self.eps,
             self.sequence.fed,
-            read_logits || !self.skip_prefill_head,
+            output != TokenOutput::Feed || !self.skip_prefill_head,
         )?;
         // The read-back: every stream joined, then every status word folded
         // BEFORE anything is handed out.
         for card in 0..cards {
             self.stack.streams()[card].synchronize()?;
         }
-        self.fold_statuses()?;
+        let winners = self.fold_statuses(output)?;
         // The step committed one clean position on every card; the books
         // carry the count the prefix export reads.
         for state in &mut self.sequence.states {
             state.commit_step(1, 0)?;
         }
-        let logits = if read_logits {
-            self.read_logits()?
-        } else {
-            Vec::new()
-        };
-        self.sequence.fed += 1;
-        Ok(logits)
+        Ok(winners)
     }
 
     /// Writes the global token id into every card's `TokenId` word.
@@ -556,16 +571,29 @@ impl CardSession {
     /// Reads and folds every card's step-status and ring-status words. Any
     /// nonzero word poisons the session and returns a `Backend` error
     /// naming the card and the words.
-    fn fold_statuses(&mut self) -> Result<(), EngError> {
+    fn fold_statuses(&mut self, output: TokenOutput) -> Result<Vec<i32>, EngError> {
+        let mut winners = Vec::new();
         let cards = self.stack.shards().len();
         let mut step_words = Vec::with_capacity(cards);
         let mut ring_words = Vec::with_capacity(cards);
         for card in 0..cards {
             let stream = &self.stack.streams()[card];
             let mut bytes = [0u8; 4];
-            let step = self.sequence.states[card].step_status()?;
-            step.buffer().read_at(stream, step.offset(), &mut bytes)?;
-            step_words.push(u32::from_le_bytes(bytes));
+            let status = if output == TokenOutput::ShardWinners {
+                // Argmax writes the local id and status into StepParams. Advance updates
+                // the position fields only. Read both in the existing status transfer.
+                let word = self.sequence.states[card].word(Word::StepParams)?;
+                let mut data = [0u8; STEP_PARAMS_BYTES];
+                word.buffer().read_at(stream, word.offset(), &mut data)?;
+                let params = StepParams::from_bytes(data);
+                winners.push(params.token_id);
+                params.status as u32
+            } else {
+                let step = self.sequence.states[card].step_status()?;
+                step.buffer().read_at(stream, step.offset(), &mut bytes)?;
+                u32::from_le_bytes(bytes)
+            };
+            step_words.push(status);
             self.stack.shards()[card]
                 .ring_word()
                 .read_at(stream, 0, &mut bytes)?;
@@ -585,7 +613,39 @@ impl CardSession {
                 ),
             });
         }
-        Ok(())
+        Ok(winners)
+    }
+
+    fn logits_view(&self, card: usize) -> Result<DeviceRange<'_>, EngError> {
+        let index = self.stack.plans()[card]
+            .index(Slot::Logits)
+            .ok_or_else(|| {
+                EngError::Checkpoint("card session: the plan holds no logits slot".into())
+            })?;
+        self.stack.shards()[card].tensor(index)
+    }
+
+    fn winning_token(&self, winners: &[i32], vocab: usize) -> Result<Option<u32>, EngError> {
+        let shards = self
+            .logits_starts
+            .iter()
+            .copied()
+            .zip(&self.heads)
+            .zip(winners)
+            .map(|((start, head), &local)| (start, head.n_rows(), local));
+        merge_visible_winners(shards, vocab, |card, local| {
+            let view = self.logits_view(card)?;
+            if local >= view.bytes() / size_of::<f32>() {
+                return Err(EngError::MemoryPlan(
+                    "card argmax index exceeds logits storage".into(),
+                ));
+            }
+            let offset = view.offset() + local * size_of::<f32>();
+            let mut bytes = [0u8; 4];
+            view.buffer()
+                .read_at(&self.stack.streams()[card], offset, &mut bytes)?;
+            Ok(f32::from_le_bytes(bytes))
+        })
     }
 
     /// Reads the cards' logits shards and rebuilds the full head row by
@@ -594,12 +654,7 @@ impl CardSession {
         let cards = self.stack.shards().len();
         let mut row = Vec::with_capacity(self.vocab);
         for card in 0..cards {
-            let index = self.stack.plans()[card]
-                .index(Slot::Logits)
-                .ok_or_else(|| {
-                    EngError::Checkpoint("card session: the plan holds no logits slot".into())
-                })?;
-            let view = self.stack.shards()[card].tensor(index)?;
+            let view = self.logits_view(card)?;
             let mut bytes = vec![0u8; view.bytes()];
             view.buffer()
                 .read_at(&self.stack.streams()[card], view.offset(), &mut bytes)?;
@@ -631,6 +686,40 @@ fn prefix_shard_depth(saved: &[ExportedState], cards: usize) -> Result<usize, En
     Ok(first.tokens)
 }
 
+/// Each head shard chose its lowest local id on a tie. The shards are in global id
+/// order, so keeping the first equal score also resolves ties across cards.
+fn merge_visible_winners(
+    shards: impl Iterator<Item = (usize, usize, i32)>,
+    vocab: usize,
+    mut score: impl FnMut(usize, usize) -> Result<f32, EngError>,
+) -> Result<Option<u32>, EngError> {
+    if u32::try_from(vocab).is_err() {
+        return Ok(None);
+    }
+    let mut best = None;
+    let mut maximum = f32::NEG_INFINITY;
+    for (card, (start, rows, local)) in shards.enumerate() {
+        if start >= vocab {
+            break;
+        }
+        let Ok(local) = usize::try_from(local) else {
+            return Ok(None);
+        };
+        if local >= rows.min(vocab - start) {
+            return Ok(None);
+        }
+        let value = score(card, local)?;
+        if !value.is_finite() {
+            return Ok(None);
+        }
+        if value > maximum {
+            maximum = value;
+            best = Some((start + local) as u32);
+        }
+    }
+    Ok(best)
+}
+
 /// The token id as the step word wants it: non-negative and i32-wide.
 fn card_token_id(token: u32) -> Result<i32, EngError> {
     i32::try_from(token)
@@ -654,7 +743,9 @@ impl TokenStepper for CardSession {
     const OPERATION: &'static str = "qwen36_cards";
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
-        self.run_token(token, false).map(|_| ())
+        self.run_token(token, TokenOutput::Feed)?;
+        self.sequence.fed += 1;
+        Ok(())
     }
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
@@ -693,7 +784,45 @@ impl TokenStepper for CardSession {
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
-        self.run_token(token, true)
+        self.run_token(token, TokenOutput::FullRow)?;
+        let row = self.read_logits().inspect_err(|_| self.poisoned = true)?;
+        self.sequence.fed += 1;
+        Ok(row)
+    }
+
+    fn next_token(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        vocab: usize,
+    ) -> Result<u32, EngError> {
+        if self.compact_greedy
+            && sampler.is_greedy()
+            && sampler.first_top2_margin().is_some()
+            && (1..=self.vocab).contains(&vocab)
+            && u32::try_from(vocab).is_ok()
+        {
+            let winners = self.run_token(token, TokenOutput::ShardWinners)?;
+            if let Some(id) = self
+                .winning_token(&winners, vocab)
+                .inspect_err(|_| self.poisoned = true)?
+            {
+                self.sequence.fed += 1;
+                #[cfg(test)]
+                {
+                    self.compact_draws += 1;
+                }
+                sampler.record_device_greedy(id);
+                return Ok(id);
+            }
+            // A head shard may extend past the tokenizer. If its best value is in
+            // that padding, sample the same completed row without feeding twice.
+            let row = self.read_logits().inspect_err(|_| self.poisoned = true)?;
+            self.sequence.fed += 1;
+            return sample_logits(Self::OPERATION, &row, sampler, vocab);
+        }
+        let row = self.logits(token)?;
+        sample_logits(Self::OPERATION, &row, sampler, vocab)
     }
 
     fn fed(&self) -> usize {
@@ -1051,6 +1180,79 @@ mod chunk_prefix_tests {
                 roots: 0,
                 entries: 0,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_greedy_tests {
+    use super::merge_visible_winners;
+
+    #[test]
+    fn compact_scores_match_full_greedy_on_visible_ties_and_shard_boundaries() {
+        for width in [1usize, 7, 64, 101] {
+            for cards in [1, 2, 3] {
+                let row: Vec<_> = (0..width * cards)
+                    .map(|i| ((i * 97 + 3) % 17) as f32 - 13.0)
+                    .collect();
+                for vocab in 1..=row.len() {
+                    let winners = row.chunks_exact(width).enumerate().map(|(card, chunk)| {
+                        let peak = chunk.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        (
+                            card * width,
+                            width,
+                            chunk.iter().position(|&x| x == peak).unwrap() as i32,
+                        )
+                    });
+                    let result = merge_visible_winners(winners, vocab, |card, local| {
+                        Ok(row[card * width + local])
+                    })
+                    .unwrap();
+                    let visible = &row[..vocab];
+                    let peak = visible.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let expected = visible.iter().position(|&x| x == peak).unwrap() as u32;
+                    if let Some(id) = result {
+                        assert_eq!(id, expected);
+                    } else {
+                        assert_ne!(vocab % width, 0, "full shards must produce a winner");
+                    }
+                }
+            }
+        }
+        let shards = [(0, 8, 7), (8, 8, 0), (16, 8, 1)].into_iter();
+        let mut read = Vec::new();
+        let id = merge_visible_winners(shards, 16, |card, local| {
+            read.push((card, local));
+            Ok(if card == 0 { -0.0 } else { 0.0 })
+        })
+        .unwrap();
+        assert_eq!(id, Some(7));
+        assert_eq!(read, [(0, 7), (1, 0)]);
+    }
+
+    #[test]
+    fn padded_or_invalid_shard_winners_take_the_full_row_path() {
+        for local in [-1, 2, 4, 300] {
+            let shards = [(0, 8, 0), (8, 4, local)].into_iter();
+            assert_eq!(
+                merge_visible_winners(shards, 10, |card, _| {
+                    assert_eq!(card, 0);
+                    Ok(1.0)
+                })
+                .unwrap(),
+                None
+            );
+        }
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                merge_visible_winners([(0, 1, 0)].into_iter(), 1, |_, _| Ok(value)).unwrap(),
+                None
+            );
+        }
+        let err = crate::EngError::MemoryPlan("test read error".into());
+        assert_eq!(
+            merge_visible_winners([(0, 1, 0)].into_iter(), 1, |_, _| Err(err.clone())).unwrap_err(),
+            err
         );
     }
 }
