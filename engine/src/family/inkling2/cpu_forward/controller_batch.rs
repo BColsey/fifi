@@ -259,6 +259,7 @@ impl CpuForward {
                             .collect()
                     });
                     let mut output = Vec::with_capacity(inputs.len());
+                    let mut conv = bridge.admit_conv(self, state, inputs.len())?;
                     let admitted = controllers.grouped_chained_tiles(
                         &inputs,
                         calls,
@@ -270,11 +271,20 @@ impl CpuForward {
                         |host, range| {
                             let range =
                                 range.ok_or_else(|| bad("missing resident Inkling query tile"))?;
-                            output.extend(bridge.consume(self, state, host, range)?);
+                            output.extend(bridge.consume(
+                                self,
+                                state,
+                                host,
+                                range,
+                                conv.as_mut(),
+                            )?);
                             Ok(())
                         },
                     )?;
                     if admitted {
+                        if let Some(conv) = conv {
+                            bridge.publish_conv_tail(state, conv)?;
+                        }
                         note_resident_queries(true);
                         return Ok(Some(ChainedAttention::Resident(output)));
                     }

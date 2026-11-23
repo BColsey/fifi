@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
     kernels::cuda::resident::{
-        inkling_local_prep::OutputConvShape,
+        inkling_local_prep::{OutputConvShape, PrepShape},
         relative_attention::{QUERY_TILE_LIMIT, RelativeAttentionTile},
     },
 };
@@ -105,8 +105,49 @@ pub(super) struct ResidentOutput<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct OutputConvolution<'a> {
     pub history: usize,
-    // Raw history (newest first), channel-major tap weights, convolved destination.
+    // Raw history (right-aligned, oldest first), channel-major weights, output.
     pub planes: [DeviceRange<'a>; 3],
+    pub read_convolved: bool,
+}
+
+/// Owns the admitted whole visit. Adjacent raw tiles become convolution
+/// history by slicing the same buffer, with no intermediate copies.
+pub(in crate::family::inkling2) struct PrefillConv {
+    raw: DeviceBuffer,
+    convolved: DeviceBuffer,
+    weights: DeviceBuffer,
+    stride: usize,
+    initial: usize,
+    rows: usize,
+    written: usize,
+}
+
+impl PrefillConv {
+    const PAST: usize = PrepShape::TAPS - 1;
+
+    fn destination(&self, count: usize) -> Result<ResidentOutput<'_>, EngError> {
+        if count == 0 || count > self.rows - self.written {
+            return Err(bad("CUDA prefill convolution exceeds admitted rows"));
+        }
+        Ok(ResidentOutput {
+            raw: self.raw.range(
+                (Self::PAST + self.written) * self.stride,
+                count * self.stride,
+            )?,
+            convolution: Some(OutputConvolution {
+                history: (self.initial + self.written).min(Self::PAST),
+                planes: [
+                    self.raw
+                        .range(self.written * self.stride, Self::PAST * self.stride)?,
+                    self.weights.range(0, self.weights.bytes())?,
+                    self.convolved
+                        .range(self.written * self.stride, count * self.stride)?,
+                ],
+                // Until depth mixing consumes the full convolved plane.
+                read_convolved: true,
+            }),
+        })
+    }
 }
 
 impl ResidentOutput<'_> {
@@ -332,6 +373,112 @@ impl ResidentAttention {
         self.step_prefill_dispatch(context, slot, inputs, history, projection, self.query_tiles)
     }
 
+    pub(in crate::family::inkling2) fn admit_prefill_conv(
+        &self,
+        context: &CudaContext,
+        shape: [usize; 2],
+        prior: &VecDeque<Vec<f32>>,
+        weights: &[f32],
+    ) -> Result<Option<PrefillConv>, EngError> {
+        let [rows, width] = shape;
+        let initial = prior.len();
+        let Some([plane, past, taps, _, _]) = (OutputConvShape {
+            rows,
+            width,
+            history: initial,
+        })
+        .words() else {
+            return Ok(None);
+        };
+        if weights.len() != taps || prior.iter().any(|row| row.len() != width) {
+            return Err(bad("invalid CUDA prefill convolution weights or history"));
+        }
+        let bytes = 4 * (2 * plane + past + taps);
+        if (context.memory_info()?.free as u64).saturating_sub(bytes as u64) < DEVICE_HEADROOM {
+            return Ok(None);
+        }
+        let buffers = (|| {
+            Ok::<_, EngError>([
+                context.allocate(4 * (plane + past))?,
+                context.allocate(4 * plane)?,
+                context.allocate(4 * taps)?,
+            ])
+        })();
+        let [raw, convolved, kernel] = match buffers {
+            Ok(buffers) => buffers,
+            Err(EngError::MemoryPlan(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if (context.memory_info()?.free as u64) < DEVICE_HEADROOM {
+            return Ok(None);
+        }
+        let mut upload = vec![0; 4 * (past - initial * width)];
+        for row in prior.iter().rev() {
+            extend_words(&mut upload, row);
+        }
+        raw.write_at(&self.stream, 0, &upload)?;
+        upload.clear();
+        extend_words(&mut upload, weights);
+        kernel.write_at(&self.stream, 0, &upload)?;
+        Ok(Some(PrefillConv {
+            raw,
+            convolved,
+            weights: kernel,
+            stride: 4 * width,
+            initial,
+            rows,
+            written: 0,
+        }))
+    }
+
+    pub(in crate::family::inkling2) fn step_prefill_conv(
+        &self,
+        context: &CudaContext,
+        slot: usize,
+        (rows, side): (&[Row<'_>], Option<Sidecar<'_>>),
+        history: History<'_>,
+        projection: &OutputProjection<'_>,
+        conv: &mut PrefillConv,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let destination = conv.destination(rows.len())?;
+        let output = self.step_prefill_to(
+            context,
+            slot,
+            (rows, side),
+            history,
+            Some(projection),
+            (self.query_tiles, Some(destination)),
+        )?;
+        conv.written += rows.len();
+        Ok(output)
+    }
+
+    pub(in crate::family::inkling2) fn prefill_conv_tail(
+        &self,
+        conv: PrefillConv,
+    ) -> Result<VecDeque<Vec<f32>>, EngError> {
+        if conv.written != conv.rows {
+            return Err(bad("incomplete CUDA prefill convolution visit"));
+        }
+        let count = (conv.written + conv.initial).min(PrefillConv::PAST);
+        let mut bytes = vec![0; count * conv.stride];
+        let first = PrefillConv::PAST + conv.written - count;
+        conv.raw
+            .read_at(&self.stream, first * conv.stride, &mut bytes)?;
+        let mut tail = VecDeque::with_capacity(count);
+        for row in bytes.chunks_exact(conv.stride).rev() {
+            let row: Vec<_> = row
+                .chunks_exact(4)
+                .map(|w| f32::from_ne_bytes(w.try_into().unwrap()))
+                .collect();
+            if !row.iter().all(|x| x.is_finite()) {
+                return Err(bad("non-finite CUDA prefill convolution history"));
+            }
+            tail.push_back(row);
+        }
+        Ok(tail)
+    }
+
     pub(super) fn step_prefill_dispatch(
         &self,
         context: &CudaContext,
@@ -482,6 +629,10 @@ impl ResidentAttention {
         ),
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let count = offsets.len();
+        let convolved_readback = destination
+            .and_then(|d| d.convolution)
+            .filter(|c| c.read_convolved)
+            .map(|c| c.planes[2]);
         let scales_at = layout.input * count;
         let status_at = scales_at + layout.scales;
         let out_at = status_at + 4 * count;
@@ -588,6 +739,9 @@ impl ResidentAttention {
                     },
                 )?;
             }
+            if let Some(convolved) = convolved_readback {
+                context.copy_to_pinned(&self.stream, convolved, &mut work.transfer, 4 * count)?;
+            }
             let readback = if destination.is_some() {
                 4 * count
             } else {
@@ -610,7 +764,7 @@ impl ResidentAttention {
         if status.into_iter().any(|byte| byte != 0) {
             return Err(bad("invalid CUDA relative attention batch state"));
         }
-        if destination.is_some() {
+        if destination.is_some() && convolved_readback.is_none() {
             return Ok(Vec::new());
         }
         (0..count)

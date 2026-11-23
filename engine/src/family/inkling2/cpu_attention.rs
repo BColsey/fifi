@@ -414,7 +414,7 @@ impl CpuForward {
                 .map(|row| row.each_ref().map(Vec::as_slice))
                 .collect();
             let (host, range) = projector.tile(&refs, keep)?;
-            outputs.extend(bridge.consume(self, state, host, range)?);
+            outputs.extend(bridge.consume(self, state, host, range, None)?);
         }
         if resident_query {
             note_resident_queries(false);
@@ -799,12 +799,47 @@ pub(super) struct PrefillBridge<'a> {
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 impl PrefillBridge<'_> {
+    pub(super) fn admit_conv(
+        &self,
+        forward: &CpuForward,
+        state: &VisitState,
+        rows: usize,
+    ) -> Result<Option<attention::prefill::PrefillConv>, EngError> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var("FIFI_INKLING_CUDA_PREFILL_OUTPUT_CONV").as_deref() == Ok("1")
+        }) || forward.math.sconv_kernel_size != 4
+        {
+            return Ok(None);
+        }
+        let width = forward.hidden();
+        let filter = forward
+            .weights
+            .vec(&format!("{}.attn_sconv.weight", self.layer), width * 4)?;
+        self.device
+            .admit_prefill_conv(self.context, [rows, width], &state.conv.attn.0, &filter)
+    }
+
+    pub(super) fn publish_conv_tail(
+        &self,
+        state: &mut VisitState,
+        conv: attention::prefill::PrefillConv,
+    ) -> Result<(), EngError> {
+        state.conv.attn.0 = self.device.prefill_conv_tail(conv)?;
+        static USED: std::sync::Once = std::sync::Once::new();
+        USED.call_once(|| {
+            eprintln!("Inkling CUDA used prefill output convolution and published only raw tail")
+        });
+        Ok(())
+    }
+
     pub(super) fn consume(
         &self,
         forward: &CpuForward,
         state: &mut VisitState,
         host: Vec<AttentionProjection>,
         range: crate::kernels::cuda::DeviceRange<'_>,
+        mut conv: Option<&mut attention::prefill::PrefillConv>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let query = self
             .scales
@@ -831,6 +866,7 @@ impl PrefillBridge<'_> {
                 state,
                 host.by_ref().take(count),
                 attention::prefill::Sidecar { range: sub, query },
+                conv.as_deref_mut(),
             )?);
         }
         Ok(output)
@@ -842,6 +878,7 @@ impl PrefillBridge<'_> {
         state: &mut VisitState,
         host: impl Iterator<Item = AttentionProjection>,
         side: attention::prefill::Sidecar<'_>,
+        conv: Option<&mut attention::prefill::PrefillConv>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let prepared = host
             .map(|p| {
@@ -855,20 +892,33 @@ impl PrefillBridge<'_> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
+        let convolved = conv.is_some();
         let values = {
             let _span = forward.phase_span(Work::DeviceAttention);
+            let history = attention::History {
+                position: state.position,
+                keys: &state.keys,
+                values: &state.values,
+            };
             // Finish consuming the sidecar before the next tile can overwrite it.
-            self.device.step_prefill(
-                self.context,
-                self.visit.state_slot,
-                (&rows, Some(side)),
-                attention::History {
-                    position: state.position,
-                    keys: &state.keys,
-                    values: &state.values,
-                },
-                Some(&self.projection),
-            )?
+            if let Some(conv) = conv {
+                self.device.step_prefill_conv(
+                    self.context,
+                    self.visit.state_slot,
+                    (&rows, Some(side)),
+                    history,
+                    &self.projection,
+                    conv,
+                )?
+            } else {
+                self.device.step_prefill(
+                    self.context,
+                    self.visit.state_slot,
+                    (&rows, Some(side)),
+                    history,
+                    Some(&self.projection),
+                )?
+            }
         };
         // The device ring is only a cache: publish the prepared host K/V
         // after the device status and output have passed validation.
@@ -881,7 +931,11 @@ impl PrefillBridge<'_> {
                     prepared.v,
                     forward.kv_capacity(self.visit.attention),
                 );
-                forward.finish_attention(&self.layer, state, &self.output_name, out, true)
+                if convolved {
+                    Ok(out)
+                } else {
+                    forward.finish_attention(&self.layer, state, &self.output_name, out, true)
+                }
             })
             .collect()
     }

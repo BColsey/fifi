@@ -825,7 +825,7 @@ mod tests {
         );
         assert_eq!(ring(), reference.1);
 
-        let past = [2.0, -0.0, 3.0, -2.5, 4.0, 5.0];
+        let past = [4.0, 5.0, 3.0, -2.5, 2.0, -0.0];
         let taps = [0.5, -0.25, 0.125, 2.0, -1.0, 0.25, -0.75, 0.0];
         let upload = |input: &[f32]| {
             let mut bytes = Vec::new();
@@ -840,6 +840,7 @@ mod tests {
         let conv = prefill::OutputConvolution {
             history: 3,
             planes: [&history, &filters, &convolved].map(|b| b.range(0, b.bytes()).unwrap()),
+            read_convolved: false,
         };
         assert!(publish(resident_bytes, Some(conv)).unwrap().is_empty());
         assert_eq!(cursor(), Some(8));
@@ -852,7 +853,7 @@ mod tests {
                 let source = if at / 2 >= lag {
                     raw[at - 2 * lag]
                 } else {
-                    past[2 * (lag - at / 2 - 1) + at % 2]
+                    past[2 * (3 + at / 2 - lag) + at % 2]
                 };
                 sum += taps[4 * (at % 2) + 3 - lag] * source;
             }
@@ -865,6 +866,56 @@ mod tests {
         assert_eq!(got, expected_bytes);
         resident.read_at(&stream, 0, &mut got).unwrap();
         assert_eq!(got, resident_output); // next decode consumes raw, not convolved, history
+
+        // A singleton first tile forces the second tile to combine uploaded
+        // history with the previous device tile without copying either.
+        attention.invalidate();
+        let prior = past.chunks_exact(2).rev().map(<[f32]>::to_vec).collect();
+        let mut visit_conv = attention
+            .admit_prefill_conv(&ctx, [4, 2], &prior, &taps)
+            .unwrap()
+            .unwrap();
+        let mut outputs = Vec::new();
+        for (span, position) in [(0..1, 4), (1..4, 5)] {
+            outputs.extend(
+                attention
+                    .step_prefill_conv(
+                        &ctx,
+                        0,
+                        (&host_rows[span], None),
+                        History {
+                            position,
+                            keys: &keys,
+                            values: &values,
+                        },
+                        &projection,
+                        &mut visit_conv,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            bits(outputs),
+            expected
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        );
+        let tail = attention.prefill_conv_tail(visit_conv).unwrap();
+        assert_eq!(
+            bits(tail.into()),
+            reference
+                .0
+                .chunks_exact(2)
+                .rev()
+                .take(3)
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ring(), reference.1);
+
         filters
             .write_at(&stream, 0, &f32::NAN.to_ne_bytes())
             .unwrap();

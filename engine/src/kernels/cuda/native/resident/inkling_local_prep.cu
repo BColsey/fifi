@@ -86,7 +86,7 @@ __global__ void inkling_local_prep(Args a) {
     }
 }
 // Static output convolution. Raw projected rows are immutable and become the
-// next tile's history. Initial history is stored newest first.
+// next tile's history. Initial history is right-aligned, oldest first.
 __global__ void inkling_output_conv(const float *raw, const float *past, const float *weight,
                                     float *result, uint32_t *status, int rows, int width,
                                     int history, float scale) {
@@ -100,7 +100,7 @@ __global__ void inkling_output_conv(const float *raw, const float *past, const f
         for (int lag = 0; lag <= min(kTaps - 1, row + history); ++lag) {
             const int source = row - lag;
             const float value = source >= 0 ? raw[source * width + channel]
-                                            : past[(-source - 1) * width + channel];
+                                            : past[(kTaps - 1 + source) * width + channel];
             sum = __fadd_rn(sum, __fmul_rn(w[kTaps - 1 - lag], value));
         }
         const float value = __fmul_rn(__fadd_rn(sum, raw[at]), scale);
