@@ -110,7 +110,53 @@ __global__ void inkling_output_conv(const float *raw, const float *past, const f
     const int invalid = __syncthreads_or(bad);
     if (threadIdx.x == 0 && invalid) atomicOr(status + row, 1u);
 }
+// Planes are normalized and packed in the CPU traversal order: most recent
+// sealed block first and current last. Each dot accumulates in scalar order.
+__global__ void inkling_depth_scores(const float *planes, const float *query,
+                                      float *scores, int rows, int width, int depth, float scale) {
+    const int row = blockIdx.x;
+    const int d = threadIdx.x;
+    if (d >= depth) return;
+    const float *current = planes + (d * rows + row) * width;
+    float acc = -0.f;
+    for (int k = 0; k < width; ++k)
+        acc = __fadd_rn(acc, __fmul_rn(current[k], query[k]));
+    scores[row * depth + d] = __fmul_rn(acc, scale);
+}
+
+__global__ void inkling_depth_mix(const float *planes, const float *weights,
+                                   float *output, int rows, int width, int depth) {
+    const int row = blockIdx.y;
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= width) return;
+    float sum = 0.f;
+    float mass = 0.f;
+    for (int d = 0; d < depth; ++d) {
+        const float weight = weights[row * depth + d];
+        mass = __fadd_rn(mass, weight);
+        sum = __fadd_rn(sum, __fmul_rn(weight, planes[(d * rows + row) * width + k]));
+    }
+    output[row * width + k] = __fdiv_rn(sum, mass);
+}
 } // namespace
+
+extern "C" int inference_cuda_inkling_depth_mix(void *const *p, int rows, int width,
+    int depth, float scale, int scores_only, void *stream, int *out_stage) {
+    if (scores_only) {
+        inkling_depth_scores<<<rows, 32, 0, (cudaStream_t)stream>>>(
+            static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+            static_cast<float *>(p[2]), rows, width, depth, scale);
+    } else {
+        constexpr int block = 128;
+        inkling_depth_mix<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
+            static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+            static_cast<float *>(p[2]), rows, width, depth);
+    }
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
 
 extern "C" int inference_cuda_inkling_output_conv(void *const *p, int rows, int width,
     int history, float scale, void *stream, int *out_stage) {

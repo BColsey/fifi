@@ -1,7 +1,7 @@
 //! Prepare one local Inkling attention row before resident relative attention.
 
 use crate::EngError;
-use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, native::resident};
+use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, PinnedBuf, native::resident};
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrepShape {
@@ -65,7 +65,82 @@ impl OutputConvShape {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DepthShape {
+    pub rows: usize,
+    pub width: usize,
+    pub depth: usize,
+}
+
+impl DepthShape {
+    pub(crate) fn words(self) -> Option<[usize; 4]> {
+        let Self { rows, width, depth } = self;
+        if !(1..=512).contains(&rows) || !(1..=4096).contains(&width) || !(1..=16).contains(&depth)
+        {
+            return None;
+        }
+        let plane = rows * width;
+        Some([depth * plane, width, rows * depth, plane])
+    }
+}
+
 impl CudaContext {
+    /// Keep normalized depth planes and the mixed output on device. The compact
+    /// round trip preserves host `f32::exp` rounding without moving hidden rows.
+    /// `planes` are in scoring order (newest sealed to oldest, then current).
+    #[allow(dead_code, reason = "the grouped resident visit is wired separately")]
+    pub(crate) fn inkling_depth_mix(
+        &self,
+        stream: &DeviceStream,
+        transfer: &mut PinnedBuf,
+        [planes, query, compact, output]: [DeviceRange<'_>; 4],
+        shape: DepthShape,
+    ) -> Result<(), EngError> {
+        let [_, _, scores, _] = shape
+            .words()
+            .ok_or_else(|| EngError::BadRequest("invalid CUDA Inkling depth shape".into()))?;
+        let queued = self
+            .inkling_depth_pass(stream, [planes, query, compact], shape, true)
+            .and_then(|()| self.copy_to_pinned(stream, compact, transfer, 0));
+        transfer.synchronize_after_enqueue(stream, queued)?;
+        let mut values = vec![0.0; scores];
+        transfer.read_f32(0, &mut values)?;
+        for row in values.chunks_exact_mut(shape.depth) {
+            if row.iter().any(|v| !v.is_finite()) {
+                return Err(EngError::BadRequest(
+                    "non-finite CUDA Inkling depth score".into(),
+                ));
+            }
+            let peak = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for v in row {
+                *v = (*v - peak).exp();
+            }
+        }
+        let upload: Vec<_> = values.into_iter().map(f32::to_ne_bytes).collect();
+        transfer.write(0, upload.as_flattened())?;
+        let queued = self
+            .copy_from_pinned(stream, transfer, 0, compact)
+            .and_then(|()| {
+                self.inkling_depth_pass(stream, [planes, compact, output], shape, false)
+            });
+        transfer.synchronize_after_enqueue(stream, queued)
+    }
+
+    fn inkling_depth_pass(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 3],
+        shape: DepthShape,
+        scores_only: bool,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let [a, b, c] = ranges.each_ref().map(|r| self.raw_range(r));
+        let ranges = [a?, b?, c?];
+        self.launch_on(stream, |stream| {
+            resident::inkling_local_prep::depth_mix(stream, ranges, shape, scores_only)
+        })
+    }
+
     /// Apply ordered static taps on resident projected rows. The input plane is
     /// unchanged and its tail can seed the next tile or the first decode row.
     /// The caller initializes status, which the kernel only ORs into.
@@ -98,5 +173,96 @@ impl CudaContext {
         self.launch_on(stream, |raw| {
             resident::inkling_local_prep::launch(raw, ranges, shape, history, math)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::cuda::{
+        device_present,
+        testkit::{read_bytes, upload_bytes},
+    };
+
+    fn bytes(values: &[f32]) -> Vec<[u8; 4]> {
+        values.iter().map(|x| x.to_ne_bytes()).collect()
+    }
+
+    fn reference(planes: &[f32], query: &[f32], shape: DepthShape, row: usize) -> Vec<u32> {
+        let DepthShape { rows, width, depth } = shape;
+        let at = |d| (d * rows + row) * width;
+        let scale = (width as f32).sqrt().recip();
+        let dots: Vec<f32> = (0..depth)
+            .map(|d| {
+                planes[at(d)..][..width]
+                    .iter()
+                    .zip(query)
+                    .map(|(x, q)| x * q)
+                    .sum::<f32>()
+                    * scale
+            })
+            .collect();
+        let peak = dots.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut result = vec![0.0; width];
+        let mut mass = 0.0;
+        for (d, s) in dots.into_iter().enumerate() {
+            let weight = (s - peak).exp();
+            mass += weight;
+            for (sum, x) in result.iter_mut().zip(&planes[at(d)..][..width]) {
+                *sum += weight * x;
+            }
+        }
+        result.into_iter().map(|x| (x / mass).to_bits()).collect()
+    }
+
+    #[test]
+    fn depth_mix_round_trips_only_compact_rows_and_matches_scalar_bits() {
+        if !device_present("Inkling CUDA depth mix") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let mut seed = 15_u32;
+        let mut generate = |n| {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 8) as f32 * (1.0 / 8388608.0) - 1.0
+                })
+                .collect::<Vec<_>>()
+        };
+        for [rows, width, depth] in [[1, 32, 1], [33, 129, 6], [511, 2304, 9]] {
+            let shape = DepthShape { rows, width, depth };
+            let [p, q, c, o] = shape.words().unwrap();
+            let planes = generate(p);
+            let query = generate(q);
+            let p = upload_bytes(&ctx, bytes(&planes).as_flattened());
+            let q = upload_bytes(&ctx, bytes(&query).as_flattened());
+            let c = ctx.allocate(c * 4).unwrap();
+            let o = ctx.allocate(o * 4).unwrap();
+            let mut transfer = ctx.pinned_buf(c.bytes()).unwrap();
+            ctx.inkling_depth_mix(
+                &stream,
+                &mut transfer,
+                [
+                    p.range(0, p.bytes()).unwrap(),
+                    q.range(0, q.bytes()).unwrap(),
+                    c.range(0, c.bytes()).unwrap(),
+                    o.range(0, o.bytes()).unwrap(),
+                ],
+                shape,
+            )
+            .unwrap();
+            let actual = read_bytes(&ctx, &o, o.bytes());
+            for (r, row) in actual.chunks_exact(width * 4).enumerate() {
+                let row = row
+                    .chunks_exact(4)
+                    .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
+                assert!(
+                    row.eq(reference(&planes, &query, shape, r)),
+                    "{rows}x{width} depth {depth} row {r}"
+                );
+            }
+        }
     }
 }
