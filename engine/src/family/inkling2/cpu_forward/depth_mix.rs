@@ -112,9 +112,45 @@ fn normalize(row: &[f32]) -> Vec<f32> {
 
 fn mix_rows<'a>(rows: impl Iterator<Item = &'a [f32]> + Clone, query: &[f32]) -> Vec<f32> {
     let scale = (query.len() as f32).sqrt().recip();
-    let scores: Vec<_> = rows.clone().map(|row| dot(row, query) * scale).collect();
+    static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let scores: Vec<_> = if *BATCH
+        .get_or_init(|| std::env::var("FIFI_INKLING_HOST_DEPTH_SCORE4").as_deref() == Ok("1"))
+    {
+        score_rows4(rows.clone(), query, scale)
+    } else {
+        rows.clone().map(|row| dot(row, query) * scale).collect()
+    };
     let peak = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     weighted_mix(scores.into_iter().zip(rows), query.len(), peak)
+}
+
+fn score_rows4<'a>(
+    mut rows: impl Iterator<Item = &'a [f32]>,
+    query: &[f32],
+    scale: f32,
+) -> Vec<f32> {
+    let mut scores = Vec::with_capacity(rows.size_hint().0);
+    loop {
+        let group = std::array::from_fn(|_| rows.next());
+        let [Some(a), Some(b), Some(c), Some(d)] = group else {
+            scores.extend(
+                group
+                    .into_iter()
+                    .flatten()
+                    .map(|row| dot(row, query) * scale),
+            );
+            return scores;
+        };
+        // Independent row accumulators permit parallel execution without reassociating any dot.
+        let mut sums = [-0.0; 4];
+        for ((((q, a), b), c), d) in query.iter().zip(a).zip(b).zip(c).zip(d) {
+            sums[0] += a * q;
+            sums[1] += b * q;
+            sums[2] += c * q;
+            sums[3] += d * q;
+        }
+        scores.extend(sums.map(|sum| sum * scale));
+    }
 }
 
 fn weighted_mix<'a>(
@@ -174,6 +210,20 @@ mod tests {
         raw_fork.seal(vec![0.0; 4]);
         cached_fork.seal(vec![0.0; 4]);
         same_bits(&raw_fork, &cached_fork);
+    }
+
+    #[test]
+    fn interleaved_scores_preserve_scalar_reductions_and_tail_order() {
+        let q = [0.5, 1.0, -3.0, 1.0, -0.0];
+        let rows: Vec<_> = (0..11)
+            .map(|i| [1e10, i as f32, -0.25, -5e9, 0.0])
+            .collect();
+        for n in 0..=rows.len() {
+            let iter = rows[..n].iter().rev().map(|r| r.as_slice());
+            let actual = score_rows4(iter.clone(), &q, 0.37);
+            let expected = iter.map(|r| (dot(r, &q) * 0.37).to_bits());
+            assert!(actual.into_iter().map(f32::to_bits).eq(expected));
+        }
     }
 
     fn same_bits(raw: &Stream, cached: &Stream) {
