@@ -1562,10 +1562,8 @@ fn initial_cache(
         return Ok(None);
     }
     let kv_mode = serve_kv_mode(settings)?;
-    let cells = context_tokens(
-        u32::try_from(crate::family::cell_pool::INITIAL_CELLS).unwrap_or(u32::MAX),
-        kv_mode,
-    )?;
+    let ceiling = context_tokens(settings.context_limit, kv_mode)?;
+    let cells = ceiling.min(crate::family::cell_pool::INITIAL_CELLS);
     Ok(Some(InitialCache {
         cells,
         bytes: kv_cache_bytes(cells, kv_mode)?,
@@ -2392,6 +2390,12 @@ mod initial_cache_tests {
             full - initial.bytes
         );
         assert!(full - initial.bytes > 0);
+
+        let short = settings(r#"{"context_limit": 512}"#);
+        let initial = initial_cache(&short, false).unwrap().unwrap();
+        assert_eq!(initial.cells, 512);
+        assert_eq!(initial.bytes, kv_cache_bytes(512, kv_mode).unwrap());
+
         // One session named: the plain engine keeps the state it builds, so nothing is credited.
         let single = settings(r#"{"max_seqs": 1}"#);
         assert!(initial_cache(&single, false).unwrap().is_none());
