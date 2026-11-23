@@ -28,7 +28,7 @@ const MINI_PIN: TokenizerPin = TokenizerPin {
 };
 
 pub(crate) fn load(dir: &Path) -> Result<TokenizerBundle, EngError> {
-    let bundle = TokenizerBundle::load_with_template(dir, &MINI_PIN, text_template)?;
+    let bundle = TokenizerBundle::load_with_template(dir, Some(&MINI_PIN), text_template)?;
     if !bundle.load_notes().is_empty() {
         return Err(EngError::Checkpoint(
             "Inkling 2 Mini CPU requires the tokenizer files from the pinned Mini release".into(),

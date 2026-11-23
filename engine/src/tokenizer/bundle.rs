@@ -413,7 +413,7 @@ impl TokenizerBundle {
 
     pub(crate) fn load_with_template(
         dir: &Path,
-        pin: &TokenizerPin,
+        pin: Option<&TokenizerPin>,
         parse: impl FnOnce(&str) -> Result<ChatTemplate, EngError>,
     ) -> Result<Self, EngError> {
         let mut notes = Vec::new();
