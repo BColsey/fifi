@@ -7,14 +7,15 @@
 | `nemotron35` | Nemotron 3.5 Super, 120B total, 12B active | no | yes, greedy only | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` at revision `8a115b9d`. |
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
-| `gemma4` | Nemotron Bolt E4B | no | Bolt E4B only | A compatible Bolt E4B GGUF. Other Gemma4 checkpoints are not served. |
-| `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md) |
-| `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
+| `gemma4` | Nemotron Bolt E4B | no | Bolt E4B only | The Bolt E4B Q8_0 GGUF or a K-quant conversion of it; a bare weights file is detected from `general.architecture` = `gemma4`. Other Gemma4 checkpoints are not served. |
+| `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md), or a text GGUF (mainline `inkling2_loop` or repository-root `inkling2` layout) |
 | `sensenova` | SenseNova-Loop-9B (text) | CPU only | no | Experimental host path for [SenseNova-Loop-9B GGUF](https://huggingface.co/sensenova/SenseNova-Loop-9B-GGUF). |
 | `raon1` | Raon-1-mini-preview, 28.8B total, 4.3B active | no | in the source tree | `raon-1-mini-preview-Q4_K_M.gguf` from `KRAFTON/Raon-1-mini-preview-gguf`. The tokenizer and chat template are read from the GGUF file, so the directory needs no tokenizer files. |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
+
+A model path that holds only the GGUF weights file starts from its `general.architecture` metadata: `qwen35moe` selects the Qwen3.6 family and `gemma4` selects Bolt E4B. The other architectures this build knows by name — `sensenova_loop` (pass `--family sensenova`), `qwen4exp`, `nemotron_h_moe`, `dflash` and `clip` — are refused with a note; a `raon1` weights file serves like the tables above describe.
 
 On CUDA, any `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves (the largest when there are several; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file); the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
 
@@ -47,8 +48,11 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 
 | Format | Used by |
 | --- | --- |
-| MLX affine-quantized safetensors; the quantization is read from `config.json` | Qwen3.6 and Flint on Apple Silicon |
+| MLX affine-quantized safetensors; the quantization is read from `config.json` | Qwen3.6, Qwen3.8-27B and Flint on Apple Silicon |
 | GGUF with F16, Q4_K, Q5_0, Q6_K and Q8_0 tensors | Qwen3.6 on CUDA |
+| GGUF Q8_0, and K-quant conversions of it | Bolt E4B on CUDA |
+| GGUF, matrices dequantized on demand | SenseNova-Loop on CPU (the published Q4_K_M file) |
+| GGUF, mainline `inkling2_loop` or repository-root `inkling2` layout | Inkling 2 Mini on Apple Silicon |
 | EXL3 | Qwen3.6 and Flint on CUDA |
 | NVFP4 safetensors | Nemotron 3.5 Super |
 | Mixed NVFP4 and MXFP8 safetensors | Inkling 2 Mini on Apple Silicon |
@@ -62,4 +66,10 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | Flint, Apple Silicon | 32,768 | 32,768 |
 | Flint, CUDA | 131,072 | 262,144 |
 | Nemotron 3.5 Super | set in config | |
+| SenseNova-Loop, CPU | the GGUF's declared context, capped at 4,096 | 4,096 |
 | Inkling 2 Mini, Apple Silicon | 1,024 | Configurable up to the model limit of 1,048,576, subject to admission |
+
+## Recent updates
+
+- **Opt-in on-demand KV for Qwen3.6 GGUF on CUDA.** With `Q36_TIERED_KV_ON_DEMAND=1` (default off), a single-card sessions start funds a small initial cell count instead of the full context ceiling and grows the cache as positions are fed. The flag changes nothing else: starts that do not plan sessions ignore it, and a named tiered member still refuses `max_seqs`.
+- **Bolt sliding-window ring layout.** A sliding layer's cache is a ring: position `p` lives in cell `p % ring`, so a session's cache grows with the full-attention layers only. Disk prefix snapshots moved to version 2 (`bolt-kv8-snapshot-v2`): a snapshot keeps every position of the full-attention layers and only the last window of each sliding layer, in position order. A version 1 entry holds every position of every layer and is never read as a version 2 one.
