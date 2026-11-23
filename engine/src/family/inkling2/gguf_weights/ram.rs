@@ -8,7 +8,7 @@ use crate::{
     family::{
         inkling2::cpu_forward::{route, sigmoid},
         mem::HostFacts,
-        qwen36::tiered::guess::{LayerRouter, RecallMeter, RouterGuess},
+        qwen::qwen36::tiered::guess::{LayerRouter, RecallMeter, RouterGuess},
     },
 };
 

@@ -5,7 +5,7 @@ use crate::{
     expert_tier::{CudaBankLease, ExpertId, VRAM_HEADROOM_BYTES},
     family::{
         inkling2::TextSpec,
-        qwen36::tiered::{PolicyMode, TieredConfig, policy::ExpertPolicy},
+        qwen::qwen36::tiered::{PolicyMode, TieredConfig, policy::ExpertPolicy},
     },
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
 };
