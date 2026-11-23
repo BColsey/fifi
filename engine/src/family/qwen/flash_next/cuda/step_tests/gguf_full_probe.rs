@@ -212,7 +212,8 @@ impl ProbeInput {
     }
 
     /// `FIFI_FLASH_GGUF_PROBE_PRECISION`: absent is the production default
-    /// ([`GgufDecodePrecision::default()`]); `exact` and `q8` each name one for a comparison.
+    /// ([`GgufDecodePrecision::default()`]); `exact` names it and `q8` selects the earlier
+    /// 8-bit-activation arithmetic for a comparison.
     fn parse_precision(value: Option<&str>) -> Result<GgufDecodePrecision, &'static str> {
         match value {
             None => Ok(GgufDecodePrecision::default()),
@@ -515,7 +516,7 @@ mod probe_input_tests {
     fn precision_follows_the_production_default_unless_named() {
         use super::GgufDecodePrecision;
         // Unconfigured, the probe measures what a new step runs: one definition of the default.
-        assert_eq!(GgufDecodePrecision::default(), GgufDecodePrecision::Q8);
+        assert_eq!(GgufDecodePrecision::default(), GgufDecodePrecision::Exact);
         assert_eq!(
             ProbeInput::parse_precision(None),
             Ok(GgufDecodePrecision::default())

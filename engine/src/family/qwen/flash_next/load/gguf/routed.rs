@@ -107,7 +107,7 @@ pub(in super::super::super) struct PersistentRouted<'a> {
     qa: DeviceBuffer,
     #[cfg(test)]
     f16_down_probe: Option<Range<usize>>,
-    /// The arithmetic of the expert projections: the shipped `Q8` until
+    /// The arithmetic of the expert projections: [`GgufDecodePrecision::default()`] until
     /// [`Self::set_decode_precision`].
     precision: GgufDecodePrecision,
     poisoned: bool,
