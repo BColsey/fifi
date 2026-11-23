@@ -141,7 +141,10 @@ impl QwenResidentStep<'_> {
     }
 
     /// Called once after tiered banks are attached and serving has enabled prefix reuse.
-    pub(crate) fn configure_tiered_prefix_store(&mut self) -> Result<(), EngError> {
+    pub(crate) fn configure_tiered_prefix_store(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(), EngError> {
         let Some(raw) = std::env::var_os(TIERED_EXTRA_BYTES_ENV) else {
             return Ok(());
         };
@@ -152,9 +155,11 @@ impl QwenResidentStep<'_> {
             return Ok(());
         }
         let budget = byte_limit(TIERED_EXTRA_BYTES_ENV, Some(&raw))?.unwrap_or_default();
-        let layout = self.state.layout();
-        let capacity = layout.kv.capacity;
-        let payload = entry_bytes(layout, capacity)?;
+        let layout = crate::family::decode_step::state_layout::StateLayout::new(
+            &self.res.dims,
+            &self.seq_options(capacity),
+        )?;
+        let payload = entry_bytes(&layout, capacity)?;
         // The cgroup-aware admission budget, not the bare meminfo figure, for the same
         // reason as the pinned-prefix probe: a capped host must not plan a second entry
         // from memory it cannot use. A failed probe keeps the one-entry store (logged).

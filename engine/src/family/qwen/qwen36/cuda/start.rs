@@ -1593,10 +1593,10 @@ fn initial_cache(
     let bytes = kv_cache_bytes(cells, serve_kv_mode(settings)?)?;
     let part = session_part_bytes(dims, settings, initial)?;
     let full_part = session_part_bytes(dims, settings, settings.context_limit)?;
-    // The pool holds at most one ceiling. During a grow, the old planes are still live.
+    // During a grow the card holds both complete parts, including fixed state.
     let growth_reserve = full_part
-        .saturating_sub(part)
         .saturating_mul(2)
+        .saturating_sub(part)
         .saturating_sub(crate::family::mem::DEVICE.load_headroom);
     let bank_credit = full_reserve
         .saturating_sub(bytes)
@@ -2303,7 +2303,7 @@ fn make(
         )?;
         tiered_slots = Some(slots);
         if settings.prefix_reuse {
-            step.configure_tiered_prefix_store()?;
+            step.configure_tiered_prefix_store(ceiling_cells)?;
         }
         eprintln!(
             "q36 cuda: tiered, {} slots per layer, {} cpu threads, timeout {} ms",
@@ -2424,9 +2424,13 @@ mod initial_cache_tests {
             full
         );
         assert!(initial.bank_credit > 0);
-        let grown = session_part_bytes(&dims, &pooled, 32768).unwrap()
-            - session_part_bytes(&dims, &pooled, 1024).unwrap();
-        assert!(crate::family::mem::DEVICE.load_headroom + initial.growth_reserve >= 2 * grown);
+        let startup_part = session_part_bytes(&dims, &pooled, 1024).unwrap();
+        let old_part = session_part_bytes(&dims, &pooled, 31744).unwrap();
+        let new_part = session_part_bytes(&dims, &pooled, 32768).unwrap();
+        assert!(
+            startup_part + crate::family::mem::DEVICE.load_headroom + initial.growth_reserve
+                >= old_part + new_part
+        );
 
         assert!(!tiered_kv_on_demand(session_plan(&pooled, false), None));
         // Device-first without a host quota can yield a normal plan, but start uses the plain executor.

@@ -129,7 +129,7 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     /// The options of a sequence part whose KV planes hold `cells` positions.
-    fn seq_options(&self, cells: usize) -> StepOptions {
+    pub(in crate::family::qwen::qwen36::cuda) fn seq_options(&self, cells: usize) -> StepOptions {
         let layout = self.state.layout();
         StepOptions {
             kv_mode: layout.kv.mode,
