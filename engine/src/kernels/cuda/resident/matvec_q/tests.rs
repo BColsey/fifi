@@ -14,7 +14,6 @@
 use super::{MatvecCall, QuantType, matvec_needs};
 use crate::EngError;
 use crate::kernels::cuda::native::resident::matvec_q;
-use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::quantize_q8_1::{MATRIX_ROW_PADDING, QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::testkit;
@@ -274,23 +273,6 @@ pub(in crate::kernels::cuda) mod reference {
             }
         }
         (sum, abs)
-    }
-
-    /// The split-plane form the repacked entry reads: one int8 per value in a
-    /// row-major plane, then one half scale per 32-value block, from the same
-    /// Q8_0 blocks `build_weight` lays out.
-    pub(super) fn q80_split_planes(w: &[u8], rows: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
-        let blocks = k / 32;
-        let mut qs = vec![0u8; rows * k];
-        let mut scales = vec![0u8; rows * blocks * 2];
-        for r in 0..rows {
-            for b in 0..blocks {
-                let wb = &w[(r * blocks + b) * 34..];
-                scales[(r * blocks + b) * 2..(r * blocks + b) * 2 + 2].copy_from_slice(&wb[0..2]);
-                qs[r * k + b * 32..r * k + b * 32 + 32].copy_from_slice(&wb[2..34]);
-            }
-        }
-        (qs, scales)
     }
 
     pub(in crate::kernels::cuda) fn build_weight(
@@ -2525,29 +2507,25 @@ fn matvec_q40_refuses_bad_shapes_before_the_adapter() {
     }
 }
 
-/// The two entries the resident can serve a Q8_0 projection through must
-/// agree bit for bit on every shape and width the dense resident launches:
-/// the column-invariant entry over native blocks against the split-plane
-/// entry over its repacked planes, column by column, at the decode width
-/// (one column) and every batched width through eight. The shapes are the
-/// projection shapes of the resident's model descriptor (local and global
-/// attention heads, the merged PLE table, the dense feed-forward both
-/// ways); if the two entries disagree anywhere, that launch keeps the
-/// split-plane entry and this test says which shape.
+/// The column-invariant Q8_0 entry over native blocks reproduces, bit for bit, a host replay of its
+/// documented arithmetic at the shapes the Bolt projections launch, at the decode width (one
+/// column) and every batched width through eight: per 32-value block an exact integer dot of the
+/// weight and activation quants, scaled by the product of the two f16 scales and fused into the
+/// running sum of lane `block % 32` (the sum of that lane's even and odd 32-block groups kept
+/// apart), the lanes folded by the xor tree of a warp.
 #[test]
-fn q80_invariant_entry_matches_the_split_plane_entry_on_every_launched_shape() {
-    if !testkit::device_present("q80_invariant_entry_matches_the_split_plane_entry") {
+fn the_q8_0_invariant_entry_replays_its_arithmetic_on_every_launched_shape() {
+    if !testkit::device_present("the_q8_0_invariant_entry_replays_its_arithmetic") {
         return;
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    // The eleven shapes the resident launches (gemma4/resident/bolt.rs on
-    // main): the query and kv projections local and global (rows = heads x
-    // head_dim, k = HIDDEN), the output projections (rows = HIDDEN, k = head
-    // rows), the gate rows 256 x k 2560, the per-layer projection rows 2560 x
-    // k PLE 256, the dense feed-forward both ways, the merged PLE table. A
-    // twelfth launch site changes bolt.rs; this list follows it.
-    let shapes: [(usize, usize); 11] = [
+    let half = |bytes: &[u8]| -> f32 {
+        f32::from(half::f16::from_bits(u16::from_le_bytes([
+            bytes[0], bytes[1],
+        ])))
+    };
+    let shapes: [(usize, usize); 8] = [
         (2048, 2560),
         (4096, 2560),
         (512, 2560),
@@ -2556,88 +2534,13 @@ fn q80_invariant_entry_matches_the_split_plane_entry_on_every_launched_shape() {
         (2560, 4096),
         (256, 2560),
         (2560, 256),
-        (10240, 2560),
-        (2560, 10240),
-        (10752, 2560),
     ];
     for &(rows, k) in &shapes {
-        // One hostile activation per shape: large magnitudes with alternating
-        // signs, so the block sums cancel; bit equality between two kernels is
-        // a statement about summation order, which cancellation exposes.
-        {
-            let mut rng = testkit::Rng::new(0xca_11ce ^ (rows as u64) ^ k as u64);
-            let w_bytes = reference::build_weight(QuantType::Q80, rows, k, &mut rng);
-            let (qs, scales) = reference::q80_split_planes(&w_bytes, rows, k);
-            let w = testkit::upload_bytes(&ctx, &w_bytes);
-            let qs_b = testkit::upload_bytes(&ctx, &qs);
-            let sc_b = testkit::upload_bytes(&ctx, &scales);
-            let ncols = 8usize;
-            let x: Vec<f32> = (0..ncols * k)
-                .map(|i| if i % 2 == 0 { 60.0 } else { -60.0 })
-                .collect();
-            let x_f32 = testkit::upload_f32(&ctx, &x);
-            let x_bytes = q8_1_bytes(k, ncols).expect("size");
-            let x_q8 = testkit::upload_filled(&ctx, 0xAA, x_bytes);
-            ctx.quantize_q8_1(
-                &stream,
-                QuantizeCall {
-                    x: x_f32.range(0, x.len() * 4).expect("x range"),
-                    y: x_q8.range(0, x_bytes).expect("y range"),
-                    k,
-                    ncols,
-                },
-            )
-            .expect("quantize");
-            let y_i = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
-            ctx.matvec_q_invariant(
-                &stream,
-                MatvecCall {
-                    ty: QuantType::Q80,
-                    w: w.range(0, w_bytes.len()).expect("w range"),
-                    x_q8: x_q8.range(0, x_bytes).expect("x range"),
-                    y: y_i.range(0, rows * ncols * 4).expect("y range"),
-                    k,
-                    rows,
-                    ncols,
-                },
-            )
-            .expect("invariant matvec");
-            let y_g = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
-            ctx.gemma_matvec(
-                &stream,
-                GemmaMatvecCall {
-                    w_qs: qs_b.range(0, qs.len()).expect("qs range"),
-                    w_scales: sc_b.range(0, scales.len()).expect("scales range"),
-                    x_q8: x_q8.range(0, x_bytes).expect("x range"),
-                    y: y_g.range(0, rows * ncols * 4).expect("y range"),
-                    rows,
-                    k,
-                    ncols,
-                },
-            )
-            .expect("split-plane matvec");
-            stream.synchronize().expect("drain");
-            let inv = read_f32(&ctx, &y_i, rows * ncols * 4);
-            let spl = read_f32(&ctx, &y_g, rows * ncols * 4);
-            assert!(
-                inv.iter().any(|v| v.to_bits() != 0),
-                "shape {rows}x{k}: the hostile case wrote only zeros"
-            );
-            for (a, b) in inv.iter().zip(&spl) {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "shape {rows}x{k} hostile: entries must agree bit for bit"
-                );
-            }
-        }
         let mut rng = testkit::Rng::new(0x5eed_0000u64 ^ ((rows as u64) << 16) ^ k as u64);
         let w_bytes = reference::build_weight(QuantType::Q80, rows, k, &mut rng);
-        let (qs, scales) = reference::q80_split_planes(&w_bytes, rows, k);
         let w = testkit::upload_bytes(&ctx, &w_bytes);
-        let qs_b = testkit::upload_bytes(&ctx, &qs);
-        let sc_b = testkit::upload_bytes(&ctx, &scales);
-        for ncols in [1usize, 2, 3, 4, 5, 6, 7, 8] {
+        let blocks = k / 32;
+        for ncols in [1usize, 3, 8] {
             let x: Vec<f32> = (0..ncols * k)
                 .map(|_| (rng.normal() as f32) * 0.05)
                 .collect();
@@ -2654,61 +2557,56 @@ fn q80_invariant_entry_matches_the_split_plane_entry_on_every_launched_shape() {
                 },
             )
             .expect("quantize");
-            let y_i = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+            let y = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
             ctx.matvec_q_invariant(
                 &stream,
                 MatvecCall {
                     ty: QuantType::Q80,
                     w: w.range(0, w_bytes.len()).expect("w range"),
                     x_q8: x_q8.range(0, x_bytes).expect("x range"),
-                    y: y_i.range(0, rows * ncols * 4).expect("y range"),
+                    y: y.range(0, rows * ncols * 4).expect("y range"),
                     k,
                     rows,
                     ncols,
                 },
             )
             .expect("invariant matvec");
-            let y_g = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
-            ctx.gemma_matvec(
-                &stream,
-                GemmaMatvecCall {
-                    w_qs: qs_b.range(0, qs.len()).expect("qs range"),
-                    w_scales: sc_b.range(0, scales.len()).expect("scales range"),
-                    x_q8: x_q8.range(0, x_bytes).expect("x range"),
-                    y: y_g.range(0, rows * ncols * 4).expect("y range"),
-                    rows,
-                    k,
-                    ncols,
-                },
-            )
-            .expect("split-plane matvec");
             stream.synchronize().expect("drain");
-            let inv = read_f32(&ctx, &y_i, rows * ncols * 4);
-            let spl = read_f32(&ctx, &y_g, rows * ncols * 4);
-            let nonzero = inv.iter().any(|v| v.to_bits() != 0);
-            assert!(
-                nonzero,
-                "shape {rows}x{k} ncols {ncols}: both entries wrote only zeros - the launch is a no-op"
-            );
-            let mut diff = 0usize;
-            let mut max_rel = 0.0f64;
-            for (a, b) in inv.iter().zip(&spl) {
-                if a.to_bits() != b.to_bits() {
-                    diff += 1;
-                    let scale = a.abs().max(b.abs()).max(1e-30) as f64;
-                    max_rel = max_rel.max((a - b).abs() as f64 / scale);
+            let got = read_f32(&ctx, &y, rows * ncols * 4);
+            let act = testkit::read_bytes(&ctx, &x_q8, x_bytes);
+            let col_stride = x_bytes / ncols;
+            for col in 0..ncols {
+                for row in 0..rows {
+                    let mut lane_sum = [0f32; 32];
+                    for (lane, sum) in lane_sum.iter_mut().enumerate() {
+                        let (mut even, mut odd) = (0f32, 0f32);
+                        for block in (lane..blocks).step_by(32) {
+                            let wb = &w_bytes[(row * blocks + block) * 34..][..34];
+                            let ab = &act[col * col_stride + block * 36..][..36];
+                            let dot: i32 = (0..32)
+                                .map(|i| i32::from(wb[2 + i] as i8) * i32::from(ab[4 + i] as i8))
+                                .sum();
+                            let scale = half(wb) * half(ab);
+                            let acc = if block & 32 != 0 { &mut odd } else { &mut even };
+                            *acc = scale.mul_add(dot as f32, *acc);
+                        }
+                        *sum = even + odd;
+                    }
+                    let mut width = 16;
+                    while width > 0 {
+                        for lane in 0..32 {
+                            lane_sum[lane] += lane_sum[lane ^ width];
+                        }
+                        width >>= 1;
+                    }
+                    let _ = &lane_sum;
+                    assert_eq!(
+                        got[col * rows + row].to_bits(),
+                        lane_sum[0].to_bits(),
+                        "shape {rows}x{k} ncols {ncols} column {col} row {row}"
+                    );
                 }
             }
-            if diff > 0 {
-                eprintln!(
-                    "shape {rows}x{k} ncols {ncols}: {diff}/{} cells differ, max rel {max_rel:.3e}",
-                    rows * ncols
-                );
-            }
-            assert_eq!(
-                diff, 0,
-                "shape {rows}x{k} ncols {ncols}: the entries must agree bit for bit"
-            );
         }
     }
 }

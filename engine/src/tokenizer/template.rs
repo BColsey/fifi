@@ -56,10 +56,16 @@ impl ChatTemplate {
         env.set_unknown_method_callback(unknown_method);
         // The engine loads one template per process. The owned source keeps the
         // environment free of lifetimes without leaking the bytes.
-        env.add_template_owned("chat", without_generation_tags(&normalize_newlines(source)))
-            .map_err(|error| {
-                EngError::Checkpoint(format!("chat_template.jinja syntax error: {error}"))
-            })?;
+        let grammar = ToolGrammar::for_template(source);
+        let normalized = normalize_newlines(source);
+        let template = if grammar == ToolGrammar::Inkling {
+            inkling_template(&normalized)
+        } else {
+            without_generation_tags(&normalized)
+        };
+        env.add_template_owned("chat", template).map_err(|error| {
+            EngError::Checkpoint(format!("chat_template.jinja syntax error: {error}"))
+        })?;
         let demote_mid_system = demotion_fixes_mid_system(&env);
         // Only the pinned Qwen3.6 template is eligible for the replay
         // default: it is the one template with an A/B. Other templates that
@@ -88,7 +94,7 @@ impl ChatTemplate {
         }
         Ok(Self {
             env,
-            grammar: ToolGrammar::for_template(source),
+            grammar,
             chatml_delimiters: source.contains("<|im_start|>") && source.contains("<|im_end|>"),
             demote_mid_system,
             think_replay,
@@ -161,6 +167,18 @@ impl ChatTemplate {
         self.render_with(msgs, tools, thinking, false)
     }
 
+    /// Renders without a generation prompt, with each tool call also given in the OpenAI shape
+    /// (`function` holding `name` and `arguments`) that some templates read. For probing a
+    /// template's own markers; serving renders through [`Self::render`].
+    pub(crate) fn render_openai_calls(
+        &self,
+        msgs: &[PromptMessage],
+        tools: &[ToolSpec],
+        thinking: Thinking,
+    ) -> Result<String, EngError> {
+        self.render_inner(msgs, tools, thinking, false, true)
+    }
+
     fn render_with(
         &self,
         msgs: &[PromptMessage],
@@ -168,10 +186,21 @@ impl ChatTemplate {
         thinking: Thinking,
         generation_prompt: bool,
     ) -> Result<String, EngError> {
+        self.render_inner(msgs, tools, thinking, generation_prompt, false)
+    }
+
+    fn render_inner(
+        &self,
+        msgs: &[PromptMessage],
+        tools: &[ToolSpec],
+        thinking: Thinking,
+        generation_prompt: bool,
+        openai_calls: bool,
+    ) -> Result<String, EngError> {
         if msgs.is_empty() {
             return Err(EngError::BadRequest("message list is empty".to_string()));
         }
-        let context = build_context(msgs, tools, thinking, generation_prompt, self)?;
+        let context = build_context(msgs, tools, thinking, generation_prompt, openai_calls, self)?;
         let template = self.env.get_template("chat").map_err(render_defect)?;
         template.render(context).map_err(render_error)
     }
@@ -211,6 +240,14 @@ fn without_generation_tags(source: &str) -> String {
 // Jinja turns every newline sequence in template text into "\n".
 fn normalize_newlines(source: &str) -> String {
     source.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+// Hugging Face's generation blocks annotate assistant spans for training. MiniJinja
+// only needs the rendered text. Substitute a true block with the same whitespace controls.
+fn inkling_template(source: &str) -> String {
+    source
+        .replace("{%- generation -%}", "{%- if true -%}")
+        .replace("{%- endgeneration -%}", "{%- endif -%}")
 }
 
 /// Two probe renders at load decide whether demoting a mid-list system
@@ -333,13 +370,39 @@ fn build_context(
     tools: &[ToolSpec],
     thinking: Thinking,
     generation_prompt: bool,
+    openai_calls: bool,
     template: &ChatTemplate,
 ) -> Result<Value, EngError> {
     let mut context = serde_json::Map::new();
-    let mut messages = message_context(msgs)?;
+    let mut messages = message_context(msgs, openai_calls)?;
     let rows = messages
         .as_array_mut()
         .expect("message_context returns an array");
+    if template.grammar == ToolGrammar::Inkling {
+        if !tools.is_empty()
+            || msgs
+                .iter()
+                .any(|msg| !msg.tool_calls.is_empty() || matches!(msg.role, super::Role::Tool))
+        {
+            return Err(EngError::BadRequest(
+                "Inkling 2 Mini experimental serving accepts text chat without tools".into(),
+            ));
+        }
+        for row in rows.iter_mut() {
+            if row["role"] == "developer" {
+                row["role"] = serde_json::json!("system");
+            }
+        }
+        match thinking {
+            Thinking::Default => {}
+            Thinking::On => {
+                context.insert("reasoning_effort".into(), serde_json::json!("high"));
+            }
+            Thinking::Off => {
+                context.insert("reasoning_effort".into(), serde_json::json!("none"));
+            }
+        }
+    }
     if template.grammar == ToolGrammar::Qwen {
         // Legacy clients have always rendered developer messages as system messages and
         // ignored reasoning replay. Keep that contract unless think replay is enabled:
@@ -443,7 +506,10 @@ fn build_context(
     Ok(Value::from_serialize(serde_json::Value::Object(context)))
 }
 
-fn message_context(msgs: &[PromptMessage]) -> Result<serde_json::Value, EngError> {
+fn message_context(
+    msgs: &[PromptMessage],
+    openai_calls: bool,
+) -> Result<serde_json::Value, EngError> {
     let mut messages = to_value(msgs, "messages")?;
     let rows = messages
         .as_array_mut()
@@ -471,6 +537,12 @@ fn message_context(msgs: &[PromptMessage]) -> Result<serde_json::Value, EngError
                 ));
             }
             call["arguments"] = parsed;
+            if openai_calls {
+                call["function"] = serde_json::json!({
+                    "name": call["name"].clone(),
+                    "arguments": call["arguments"].clone(),
+                });
+            }
         }
     }
     Ok(messages)
@@ -571,5 +643,25 @@ mod limit_tests {
             .render(&messages, &[], Thinking::Default)
             .expect("renders");
         assert!(text.contains("turn 4999"));
+    }
+}
+
+#[cfg(test)]
+mod inkling_tests {
+    use super::*;
+
+    #[test]
+    fn inkling_generation_annotations_keep_their_whitespace_controls() {
+        let source = "a \n{%- generation -%}\n {{ value }} \n{%- endgeneration -%}\n b";
+        let mut env = minijinja::Environment::new();
+        assert!(env.add_template("original", source).is_err());
+        let rewritten = inkling_template(source);
+        env.add_template("rewritten", &rewritten).unwrap();
+        let text = env
+            .get_template("rewritten")
+            .unwrap()
+            .render(minijinja::context!(value => "answer"))
+            .unwrap();
+        assert_eq!(text, "aanswerb");
     }
 }

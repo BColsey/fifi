@@ -41,11 +41,21 @@ pub struct GgufFact {
     /// `general.architecture` from the header, when it is a string.
     pub architecture: Option<String>,
     pub tensor_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inkling2_loop:
+        Option<Result<crate::family::inkling2_mini::gguf_metadata::Geometry, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inkling2_tensors: Option<Result<(), String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelInspection {
+    /// The directory of the model's side files (`config.json`, tokenizer files): the model path,
+    /// or the parent of the weights file it names.
     pub model_dir: PathBuf,
+    /// What the model path names: the directory, or the one weights file (first shard of a
+    /// split set) that was asked for.
+    pub weights_path: PathBuf,
     pub files: Vec<FileFact>,
     /// Every `.gguf` file, parsed header-first. `None` inside the vector
     /// is impossible: an unparseable GGUF lands in `gguf_errors` instead,
@@ -63,6 +73,53 @@ pub struct ModelInspection {
 }
 
 impl ModelInspection {
+    pub(crate) fn has_inkling_safetensors(&self) -> bool {
+        self.safetensors_files > 0
+            && self
+                .config_model_types
+                .iter()
+                .any(|kind| kind == crate::family::inkling2_mini::MODEL_TYPE)
+    }
+
+    pub(crate) fn inkling_ggufs(&self) -> impl Iterator<Item = &GgufFact> {
+        self.gguf_files
+            .iter()
+            .filter(|file| file.inkling2_loop.is_some())
+    }
+
+    pub(crate) fn inkling_gguf(&self) -> Result<Option<&GgufFact>, EngError> {
+        // A corrupt header does not identify its architecture, so it cannot be
+        // distinguished from a second text checkpoint during startup.
+        if !self.gguf_errors.is_empty() {
+            return Err(checkpoint(self.gguf_errors.join("; ")));
+        }
+        if self.has_inkling_safetensors() {
+            return Ok(None);
+        }
+        let mut files = self.inkling_ggufs();
+        let selected = files.next();
+        if files.next().is_some() {
+            return Err(checkpoint(
+                "select one Inkling 2 Mini text GGUF per model directory".into(),
+            ));
+        }
+        if selected.is_none() && self.model_dir.is_file() {
+            return Err(checkpoint(format!(
+                "{} is not an Inkling 2 Mini text GGUF",
+                self.model_dir.display()
+            )));
+        }
+        if let Some(file) = selected {
+            if let Some(Err(error)) = &file.inkling2_loop {
+                return Err(checkpoint(error.clone()));
+            }
+            if let Some(Err(error)) = &file.inkling2_tensors {
+                return Err(checkpoint(error.clone()));
+            }
+        }
+        Ok(selected)
+    }
+
     /// Total checkpoint bytes on disk: GGUF payloads plus safetensors
     /// shards. This is the preflight's weight figure: what the loader
     /// uploads or maps, before any residency policy.
@@ -76,26 +133,61 @@ fn checkpoint(message: String) -> EngError {
     EngError::Checkpoint(format!("model inspection: {message}"))
 }
 
-/// Inspect `model_dir`; tokenizer presence is read from `tokenizer_dir`
-/// (pass the same path twice for the usual one-directory layout).
-pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection, EngError> {
-    crate::storage_guard::require_local(model_dir, "model weights")?;
-    if !model_dir.is_dir() {
+/// Inspect a model path: a directory of weights, or one GGUF file (a `.gguf` name, an Ollama
+/// blob that only starts with the GGUF magic, or any shard of a split set). A file names its own
+/// weights only: its siblings are not counted, and `config.json` and tokenizer files are looked
+/// for beside it. Tokenizer presence is read from `tokenizer_dir` (pass the same path twice for
+/// the usual one-directory layout). A symlink is judged by its own name: a link to one shard of a
+/// split set is that one file unless its name follows the split pattern.
+pub fn inspect(model_path: &Path, tokenizer_dir: &Path) -> Result<ModelInspection, EngError> {
+    crate::storage_guard::require_local(model_path, "model weights")?;
+    let from_file = crate::family::gguf_select::is_gguf_file(model_path);
+    if !from_file && !model_path.is_dir() {
         return Err(checkpoint(format!(
-            "{} is not a directory",
-            model_dir.display()
+            "{} is not a directory or a GGUF file",
+            model_path.display()
         )));
     }
-    let mut files = Vec::new();
-    let entries = std::fs::read_dir(model_dir)
-        .map_err(|error| checkpoint(format!("cannot list {}: {error}", model_dir.display())))?;
-    for entry in entries {
-        let entry = entry
+    let (model_dir, weights_path) = if from_file {
+        let first = crate::family::gguf_select::first_shard(model_path);
+        (crate::family::gguf_select::directory_of(&first), first)
+    } else {
+        (model_path.to_path_buf(), model_path.to_path_buf())
+    };
+    let mut names: Vec<PathBuf> = Vec::new();
+    if from_file {
+        // The file, or every shard of its split set that is present.
+        match crate::weights::shard_name_of(&weights_path) {
+            Some(name) => {
+                for number in 1..=name.count {
+                    let shard = name.sibling(&weights_path, number);
+                    if !shard.is_file() {
+                        return Err(checkpoint(format!(
+                            "shard {number} of {} of the split GGUF set {} is missing",
+                            name.count, name.stem
+                        )));
+                    }
+                    names.push(shard);
+                }
+            }
+            None => names.push(weights_path.clone()),
+        }
+    } else {
+        let entries = std::fs::read_dir(&model_dir)
             .map_err(|error| checkpoint(format!("cannot list {}: {error}", model_dir.display())))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                checkpoint(format!("cannot list {}: {error}", model_dir.display()))
+            })?;
+            names.push(entry.path());
+        }
+    }
+    let mut found: Vec<(PathBuf, FileFact)> = Vec::new();
+    for path in names {
         // `entry.metadata()` does not traverse symlinks, and every file
         // of a hub-cache snapshot is a symlink into `blobs/` — follow the
         // entry's path so hub layouts count as the files they point at.
-        let metadata = match std::fs::metadata(entry.path()) {
+        let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             // A link whose blob is gone (a half-finished download) names
             // no file: skip it, the way a missing file is skipped.
@@ -103,26 +195,35 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
             Err(error) => {
                 return Err(checkpoint(format!(
                     "cannot stat {}: {error}",
-                    entry.path().display()
+                    path.display()
                 )));
             }
         };
         if metadata.is_file() {
-            files.push(FileFact {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                bytes: metadata.len(),
-            });
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            found.push((
+                path,
+                FileFact {
+                    name,
+                    bytes: metadata.len(),
+                },
+            ));
         }
     }
-    files.sort_by(|a, b| a.name.cmp(&b.name));
+    found.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    let files: Vec<FileFact> = found.iter().map(|(_, fact)| fact.clone()).collect();
 
     let mut gguf_files = Vec::new();
     let mut gguf_errors = Vec::new();
     let mut safetensors_files = 0usize;
     let mut safetensors_bytes = 0u64;
-    for file in &files {
-        if file.name.ends_with(".gguf") {
-            match gguf_fact(&model_dir.join(&file.name), file.bytes) {
+    for (path, file) in &found {
+        // A file asked for by path is a GGUF whatever its name (an Ollama blob has none).
+        if from_file || file.name.ends_with(".gguf") || file.name.ends_with(".gguf_file") {
+            match gguf_fact(path, file.bytes) {
                 Ok(mut fact) => {
                     fact.file.clone_from(&file.name);
                     gguf_files.push(fact);
@@ -137,8 +238,10 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
         }
     }
 
+    // A lone weights file is read for what its header says: a `config.json` beside it may belong
+    // to another model in the directory.
     let config_path = model_dir.join("config.json");
-    let has_config_json = config_path.is_file();
+    let has_config_json = !from_file && config_path.is_file();
     let config_model_types = if has_config_json {
         read_model_types(&config_path).unwrap_or_default()
     } else {
@@ -156,7 +259,8 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
     }
 
     Ok(ModelInspection {
-        model_dir: model_dir.to_path_buf(),
+        model_dir,
+        weights_path,
         files,
         gguf_files,
         gguf_errors,
@@ -169,17 +273,65 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
     })
 }
 
+/// Whether the GGUF at `path` declares an Inkling architecture: an Inkling text
+/// checkpoint reads its sidecar files from its parent directory, unlike other
+/// bare GGUFs, which are their own tokenizer.
+pub(crate) fn gguf_is_inkling(path: &Path) -> bool {
+    crate::weights::shared_header(path, GGUF_HEADER_CAP_BYTES)
+        .ok()
+        .and_then(|header| match header.meta("general.architecture") {
+            Some(MetaValue::String(value)) => {
+                Some(matches!(value.as_str(), "inkling2_loop" | "inkling2"))
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
     let header = crate::weights::shared_header(path, GGUF_HEADER_CAP_BYTES)?;
     let architecture = match header.meta("general.architecture") {
         Some(MetaValue::String(value)) => Some(value.clone()),
         _ => None,
     };
+    let inkling2_loop =
+        matches!(architecture.as_deref(), Some("inkling2_loop" | "inkling2")).then(|| {
+            // main reads the header through shared_header, which keeps no reader; the
+            // geometry inspection needs positioned reads, so it opens its own.
+            let mut reader = match std::fs::File::open(path) {
+                Ok(file) => std::io::BufReader::new(file),
+                Err(error) => {
+                    return Err(super::describe_error(&checkpoint(format!(
+                        "cannot open {}: {error}",
+                        path.display()
+                    ))));
+                }
+            };
+            crate::family::inkling2_mini::gguf_metadata::inspect(&header, &mut reader)
+                .map_err(|error| super::describe_error(&error))
+        });
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf_file"))
+        && architecture.as_deref() != Some("inkling2_loop")
+    {
+        return Err(checkpoint(
+            ".gguf_file requires the inkling2_loop architecture".into(),
+        ));
+    }
+    let inkling2_tensors = inkling2_loop.as_ref().and_then(|geometry| {
+        geometry.as_ref().ok().map(|_| {
+            crate::family::inkling2_mini::gguf::validate_tensors(&header)
+                .map_err(|error| super::describe_error(&error))
+        })
+    });
     Ok(GgufFact {
         file: String::new(),
         file_bytes,
         architecture,
         tensor_count: header.tensors().len(),
+        inkling2_loop,
+        inkling2_tensors,
     })
 }
 
@@ -324,5 +476,162 @@ mod tests {
         .unwrap();
         let report = inspect(&dir, &dir).unwrap();
         assert_eq!(report.config_model_types, ["outer"]);
+    }
+
+    /// A GGUF header with no keys and no tensors, padded to `len` bytes.
+    fn gguf_bytes(len: usize) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.resize(len, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_gguf_file_counts_only_itself_and_reads_its_side_files_beside_it() {
+        let dir = scratch("one-file");
+        std::fs::write(dir.join("a-q4.gguf"), gguf_bytes(100)).unwrap();
+        std::fs::write(dir.join("a-q8.gguf"), gguf_bytes(300)).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"gemma4"}"#).unwrap();
+        let file = dir.join("a-q4.gguf");
+        let report = inspect(&file, &dir).unwrap();
+        assert_eq!(report.gguf_files.len(), 1);
+        assert_eq!(report.weight_bytes(), 100);
+        assert_eq!(report.weights_path, file);
+        assert_eq!(report.model_dir, dir);
+        // A config.json beside a lone file is not read: it may belong to another model.
+        assert!(report.config_model_types.is_empty());
+        assert!(!report.has_config_json);
+        // The directory form reads it and still counts both files.
+        let whole = inspect(&dir, &dir).unwrap();
+        assert_eq!(whole.gguf_files.len(), 2);
+        assert_eq!(whole.config_model_types, ["gemma4"]);
+    }
+
+    #[test]
+    fn an_ollama_blob_and_a_split_set_are_inspected_by_path() {
+        let dir = scratch("blob-and-split");
+        let blob = dir.join("sha256-feedbeef");
+        std::fs::write(&blob, gguf_bytes(64)).unwrap();
+        let report = inspect(&blob, &blob).unwrap();
+        assert_eq!(report.gguf_files.len(), 1, "{:?}", report.gguf_errors);
+        assert_eq!(report.gguf_files[0].file, "sha256-feedbeef");
+        for number in 1..=2 {
+            std::fs::write(
+                dir.join(format!("s-{number:05}-of-00002.gguf")),
+                gguf_bytes(200),
+            )
+            .unwrap();
+        }
+        // Any shard names the set, and the set is counted whole.
+        let report = inspect(&dir.join("s-00002-of-00002.gguf"), &dir).unwrap();
+        assert_eq!(report.gguf_files.len(), 2);
+        assert_eq!(report.weight_bytes(), 400);
+        assert_eq!(report.weights_path, dir.join("s-00001-of-00002.gguf"));
+    }
+
+    #[test]
+    fn a_split_set_with_a_shard_missing_is_refused_naming_the_shard() {
+        let dir = scratch("split-missing");
+        std::fs::write(dir.join("s-00002-of-00003.gguf"), gguf_bytes(100)).unwrap();
+        std::fs::write(dir.join("s-00003-of-00003.gguf"), gguf_bytes(100)).unwrap();
+        let error = crate::capability::describe_error(
+            &inspect(&dir.join("s-00002-of-00003.gguf"), &dir).unwrap_err(),
+        );
+        assert!(error.contains("shard 1 of 3"), "{error}");
+        std::fs::write(dir.join("s-00001-of-00003.gguf"), gguf_bytes(100)).unwrap();
+        std::fs::remove_file(dir.join("s-00003-of-00003.gguf")).unwrap();
+        let error = crate::capability::describe_error(
+            &inspect(&dir.join("s-00001-of-00003.gguf"), &dir).unwrap_err(),
+        );
+        assert!(error.contains("shard 3 of 3"), "{error}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_gguf_is_refused_naming_what_is_accepted() {
+        let dir = scratch("not-gguf");
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, b"hello").unwrap();
+        let error = crate::capability::describe_error(&inspect(&text, &dir).unwrap_err());
+        assert!(error.contains("not a directory or a GGUF file"), "{error}");
+    }
+
+    use crate::test_paths::relative_to_cwd;
+
+    #[test]
+    fn a_relative_path_to_a_file_is_inspected_like_the_absolute_one() {
+        let dir = scratch("relative");
+        let file = dir.join("m.gguf");
+        std::fs::write(&file, gguf_bytes(100)).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"gemma4"}"#).unwrap();
+        let relative = relative_to_cwd(&file);
+        assert!(relative.is_relative());
+        let by_relative = inspect(&relative, &relative).unwrap();
+        let by_absolute = inspect(&file, &file).unwrap();
+        assert_eq!(by_relative.gguf_files, by_absolute.gguf_files);
+        assert_eq!(by_relative.weights_path, relative);
+        assert_eq!(by_relative.model_dir, relative.parent().unwrap());
+        // A directory named relatively is counted whole.
+        let whole = inspect(relative.parent().unwrap(), relative.parent().unwrap()).unwrap();
+        assert_eq!(whole.gguf_files.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_gguf_is_a_gguf_whatever_either_name() {
+        let dir = scratch("symlink");
+        let blob = dir.join("blobs").join("sha256-abc");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, gguf_bytes(300)).unwrap();
+        // A link named like a GGUF, and a link with no extension at all.
+        let named = dir.join("model.gguf");
+        let bare = dir.join("latest");
+        std::os::unix::fs::symlink(&blob, &named).unwrap();
+        std::os::unix::fs::symlink(&blob, &bare).unwrap();
+        for link in [&named, &bare] {
+            let report = inspect(link, link).unwrap();
+            assert_eq!(
+                report.gguf_files.len(),
+                1,
+                "{link:?}: {:?}",
+                report.gguf_errors
+            );
+            assert_eq!(report.weight_bytes(), 300, "{link:?}");
+        }
+        // A dangling link is refused by name, not read as an empty model.
+        let gone = dir.join("gone.gguf");
+        std::os::unix::fs::symlink(dir.join("missing"), &gone).unwrap();
+        let error = crate::capability::describe_error(&inspect(&gone, &dir).unwrap_err());
+        assert!(error.contains("dangling symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_judged_by_its_own_name_even_when_it_points_at_one_shard_of_a_set() {
+        let dir = scratch("shardlink");
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let first = crate::weights::write_two_shard_set(&dir.join("blobs"), "big");
+        let link = dir.join("model.gguf");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        // The link's name has no `-0000N-of-0000M` part, so it is one file: the shard it points
+        // at. Naming the shard itself, or the directory of the set, serves the whole set.
+        let report = inspect(&link, &link).unwrap();
+        assert_eq!(report.gguf_files.len(), 1);
+        assert_eq!(report.weights_path, link);
+        let whole = inspect(&first, &first).unwrap();
+        assert_eq!(whole.gguf_files.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_loops_is_refused_and_not_followed_forever() {
+        let dir = scratch("looplink");
+        let (a, b) = (dir.join("a.gguf"), dir.join("b.gguf"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let error = crate::capability::describe_error(&inspect(&a, &dir).unwrap_err());
+        assert!(error.contains("a.gguf"), "{error}");
+        assert!(error.contains("does not resolve"), "{error}");
     }
 }

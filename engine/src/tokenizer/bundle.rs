@@ -385,6 +385,22 @@ impl TokenizerBundle {
     /// executors compare the vocabulary with the model's own head size and refuse a larger one.
     /// `tokenizer.json` and `tokenizer_config.json` are required.
     pub fn load(dir: &Path, pin: &TokenizerPin) -> Result<Self, EngError> {
+        Self::load_checked(dir, Some(pin))
+    }
+
+    /// Loads the tokenizer files of `dir` as they are: no pin, so no digest or vocabulary
+    /// comparison and no warning for a file that differs from some qualified revision. The
+    /// bundle's identity is the digests of the bytes it read. A directory of GGUF weights with no
+    /// `tokenizer.json` starts from the vocabulary in the GGUF header, as `load` does.
+    pub fn load_observed(dir: &Path) -> Result<Self, EngError> {
+        Self::load_checked(dir, None)
+    }
+
+    fn load_checked(dir: &Path, pin: Option<&TokenizerPin>) -> Result<Self, EngError> {
+        // A GGUF file named as the tokenizer source is its own vocabulary: its header builds it.
+        if crate::family::gguf_select::is_gguf_file(dir) {
+            return super::gguf::bundle_from_lone_gguf(dir);
+        }
         // A directory of GGUF weights with no tokenizer.json starts from the vocabulary in the
         // GGUF header. The pin names files that are not there, so it does not apply.
         if !dir.join("tokenizer.json").is_file()
@@ -395,14 +411,19 @@ impl TokenizerBundle {
         let mut notes = Vec::new();
         let tokenizer_bytes = require(
             "tokenizer.json",
-            read_observed(dir, "tokenizer.json", pin.tokenizer_json, &mut notes)?,
+            read_observed(
+                dir,
+                "tokenizer.json",
+                pin.map(|pin| pin.tokenizer_json),
+                &mut notes,
+            )?,
         )?;
         let config_bytes = require(
             "tokenizer_config.json",
             read_observed(
                 dir,
                 "tokenizer_config.json",
-                pin.tokenizer_config_json,
+                pin.map(|pin| pin.tokenizer_config_json),
                 &mut notes,
             )?,
         )?;
@@ -410,7 +431,7 @@ impl TokenizerBundle {
         let template_bytes = match read_observed(
             dir,
             "chat_template.jinja",
-            pin.chat_template_jinja,
+            pin.map(|pin| pin.chat_template_jinja),
             &mut notes,
         )? {
             Some(bytes) => bytes,
@@ -436,7 +457,7 @@ impl TokenizerBundle {
         let generation_bytes = read_observed(
             dir,
             "generation_config.json",
-            pin.generation_config_json,
+            pin.map(|pin| pin.generation_config_json),
             &mut notes,
         )?;
         if generation_bytes.is_none() {
@@ -453,7 +474,7 @@ impl TokenizerBundle {
                 chat_template: template_bytes,
                 generation_config_json: generation_bytes,
             },
-            Some(pin.vocab_size),
+            pin.map(|pin| pin.vocab_size),
             notes,
         )
     }
@@ -1323,7 +1344,7 @@ fn resend_digest(msgs: &[PromptMessage], tools_json: &str, thinking: Thinking) -
 fn read_observed(
     dir: &Path,
     name: &str,
-    expected: [u8; 32],
+    expected: Option<[u8; 32]>,
     notes: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>, EngError> {
     let bytes = match fs::read(dir.join(name)) {
@@ -1336,7 +1357,7 @@ fn read_observed(
         }
     };
     let observed = digest(&bytes);
-    if observed != expected {
+    if let Some(expected) = expected.filter(|expected| *expected != observed) {
         notes.push(format!(
             "tokenizer: {name} sha256 {} differs from the pinned {}; serving the observed file",
             hex32(&observed),

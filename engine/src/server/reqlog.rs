@@ -330,7 +330,7 @@ const DIGEST_KEY: u64 = 0x5f1f_3a7c_d2e1_9b04;
 /// `engine`, `started_at_ms`, `queue_wait_ms`, and `prefill_ms` are in:
 /// the panel groups rates by engine and splits queue from prefill.
 /// `reused_tokens` stays in, so reuse is visible on the panel.
-const RING_KEYS: [&str; 19] = [
+const RING_KEYS: [&str; 22] = [
     "request_id",
     "method",
     "endpoint",
@@ -350,6 +350,9 @@ const RING_KEYS: [&str; 19] = [
     "prefill_ms",
     "time_to_first_token_ms",
     "decode_tokens_per_second",
+    "prefill_bank_passes",
+    "prefill_bank_misses",
+    "prefill_bank_upload_bytes",
 ];
 
 pub(crate) const RING_CAP: usize = 64;
@@ -1268,11 +1271,14 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        let mut expected = super::RING_KEYS;
+        let mut expected: Vec<_> = super::RING_KEYS
+            .into_iter()
+            .filter(|key| !key.starts_with("prefill_bank_"))
+            .collect();
         expected.sort_unstable();
         assert_eq!(
             keys, expected,
-            "the row exposes exactly the allowlisted keys"
+            "the fake executor did not measure expert activity"
         );
         assert_eq!(row["model"], model);
         assert_eq!(row["endpoint"], "/v1/messages");
@@ -1281,7 +1287,14 @@ mod tests {
         // A second row with a fractional timing proves the schema's number
         // type for the three timing fields on real ring data, not by luck
         // of an integral millisecond.
-        ring.push("{\"model\": \"m\", \"endpoint\": \"/v1/messages\", \"queue_wait_ms\": 12.4}");
+        ring.push(
+            &json!({
+                "model": "m", "endpoint": "/v1/messages", "queue_wait_ms": 12.4,
+                "prefill_bank_passes": 4, "prefill_bank_misses": 2, "prefill_bank_upload_bytes": 512,
+                "prefill_bank_miss_histogram": [0, 1],
+            })
+            .to_string(),
+        );
         let request = testkit::get("/v1/recent-requests", Some(testkit::API_KEY));
         let (status, _headers, bytes) = testkit::send(&app, request).await;
         assert_eq!(status, StatusCode::OK);
@@ -1290,6 +1303,10 @@ mod tests {
         let rows = reply["requests"].as_array().expect("requests array");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["queue_wait_ms"].as_f64(), Some(12.4));
+        assert_eq!(rows[0]["prefill_bank_passes"], 4);
+        assert_eq!(rows[0]["prefill_bank_misses"], 2);
+        assert_eq!(rows[0]["prefill_bank_upload_bytes"], 512);
+        assert!(rows[0].get("prefill_bank_miss_histogram").is_none());
     }
 
     #[test]
@@ -2257,8 +2274,8 @@ mod tests {
         let expected = "Adding.".len() + CALL.len() + 1;
         assert_eq!(line["completion_tokens"], expected);
         let raw = &capture.writes()[0];
-        for secret in ["zebra-prompt", "Adding", "function", testkit::API_KEY] {
-            assert!(!raw.contains(secret), "{secret} reached the log: {raw}");
+        for canary in ["zebra-prompt", "Adding", "function", testkit::API_KEY] {
+            assert!(!raw.contains(canary), "{canary} reached the log: {raw}");
         }
     }
 

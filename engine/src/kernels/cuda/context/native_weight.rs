@@ -1,6 +1,6 @@
 //! Weights in the GGUF file's own block layout, resident on the device:
-//! [`CudaContext::upload_native`] reads a Q4_K, Q5_0, Q6_K or Q8_0 tensor through a
-//! [`BlockReader`] in chunks of WHOLE ROWS and uploads each chunk at its byte offset into ONE
+//! [`CudaContext::upload_native`] reads a tensor of any type with a native kernel
+//! (`QuantType::from_gguf`) through a [`BlockReader`] in chunks of WHOLE ROWS and uploads each chunk at its byte offset into ONE
 //! device allocation made up front. No repack runs: the bytes land as the file holds them,
 //! row-major blocks, and the MMVQ kernels (`matvec_q`, `matvec_expert`) and the native
 //! embedding gather read them there.
@@ -241,7 +241,8 @@ impl CudaContext {
         Ok(())
     }
 
-    /// Reads a Q4_K, Q5_0, Q6_K or Q8_0 tensor through `read` in chunks of whole rows and
+    /// Reads a tensor of any type with a native kernel (`QuantType::from_gguf`) through `read` in
+    /// chunks of whole rows and
     /// uploads the file's own blocks into one device allocation made up front.
     ///
     /// A chunk holds as many whole rows as fit `chunk_limit` bytes and at least one, however
@@ -381,8 +382,8 @@ impl NativeWeight {
     }
 }
 
-/// Checks the tensor of a native upload: the type must be one of the four the MMVQ kernels
-/// read, `k` a positive multiple of the type's block size up to `native::MAX_DIM`, `n_rows` at
+/// Checks the tensor of a native upload: the type must be one with a native kernel
+/// (`QuantType::from_gguf`), `k` a positive multiple of the type's block size up to `native::MAX_DIM`, `n_rows` at
 /// least one (any count: no 8-row rule), and the source length exactly the native byte count.
 fn checked_native(tensor: QuantTensor<'_>) -> Result<QuantType, EngError> {
     let Some(quant) = QuantType::from_gguf(tensor.ty) else {

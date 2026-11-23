@@ -885,6 +885,20 @@ impl GgufHeader {
     pub fn meta(&self, key: &str) -> Option<&MetaValue> {
         find(&self.metadata, key)
     }
+    /// An unsigned integer key stored as u32 or u64; `None` when the key is absent or holds
+    /// another type.
+    pub fn meta_u64(&self, key: &str) -> Option<u64> {
+        match self.meta(key)? {
+            MetaValue::U32(value) => Some(u64::from(*value)),
+            MetaValue::U64(value) => Some(*value),
+            _ => None,
+        }
+    }
+    /// An unsigned integer key that fits u32; `None` when absent, of another type or too large.
+    pub fn meta_u32(&self, key: &str) -> Option<u32> {
+        self.meta_u64(key)
+            .and_then(|value| u32::try_from(value).ok())
+    }
     pub fn tensors(&self) -> &[GgufTensor] {
         &self.tensors
     }

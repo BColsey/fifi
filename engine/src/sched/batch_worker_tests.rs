@@ -142,6 +142,10 @@ struct WindowFake {
     background_want: usize,
     background_steps: Arc<std::sync::atomic::AtomicUsize>,
     background_drained: Arc<std::sync::atomic::AtomicBool>,
+    /// The keys the fake has saved, when it keeps a real prefix store: a restore feeds the longest
+    /// saved key that is a proper prefix of the prompt into the row and reports its length, as an
+    /// executor that copies saved state back would leave the row. `None` restores nothing.
+    saved_keys: Option<Vec<Vec<u32>>>,
 }
 
 impl WindowFake {
@@ -188,6 +192,7 @@ impl WindowFake {
             background_want: 0,
             background_steps: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saved_keys: None,
         }
     }
 
@@ -474,7 +479,20 @@ impl ExecutorOps for WindowFake {
         self.spacing
     }
 
-    fn restore_prefix(&mut self, _row: &mut Row, prompt: &[u32]) -> Result<usize, EngError> {
+    fn restore_prefix(&mut self, row: &mut Row, prompt: &[u32]) -> Result<usize, EngError> {
+        if let Some(keys) = &self.saved_keys {
+            let best = keys
+                .iter()
+                .filter(|key| key.len() < prompt.len() && prompt.starts_with(key))
+                .max_by_key(|key| key.len())
+                .cloned();
+            if let Some(key) = best {
+                row.fake.prefill(&mut row.state, &key)?;
+                self.note(&format!("restore:{}", key.len()));
+                self.report.hit = PrefixHit::Tip;
+                return Ok(key.len());
+            }
+        }
         // Deliberately executor-global restore metadata, like the real Qwen executor.
         self.report.hit = if prompt[0] == 0 {
             PrefixHit::Root
@@ -487,6 +505,9 @@ impl ExecutorOps for WindowFake {
 
     fn save_prefix(&mut self, _row: &Row, key: &[u32], kind: SaveKind) -> Result<bool, EngError> {
         self.note(&format!("save:{}", key.len()));
+        if let Some(keys) = &mut self.saved_keys {
+            keys.push(key.to_vec());
+        }
         lock(&self.log).saves.push((key.len(), kind));
         self.report.entries += 1;
         self.report.bytes += 100;
@@ -1109,23 +1130,29 @@ fn a_prompt_that_finishes_prefill_joins_after_one_adoption_tick() {
 }
 
 #[test]
-fn cancelling_the_last_prefill_piece_keeps_the_row_out_of_decode() {
-    let log = Log::default();
-    let (hold, entered, unblock) = gate();
-    let mut fake = WindowFake::new(&log);
-    fake.hold_prefill = Some(hold);
-    let (engine, release) = start_with_budget(fake, 4);
-    let (request, events) = job(&[1; 3], 2);
-    engine.handle().try_submit(request).unwrap();
-    release.send(()).unwrap();
-    entered.recv_timeout(WAIT).unwrap();
-    events.cancel();
-    unblock.send(()).unwrap();
-    let result = collect(events);
-    assert_eq!(finish(&result), DecodeFinish::Cancelled);
-    assert_eq!(usage(&result).completion_tokens, 0);
-    engine.shutdown();
-    assert!(lock(&log).windows.is_empty());
+fn cancelling_the_last_prefill_piece_publishes_no_tokens_in_either_worker() {
+    for max_seqs in [1, 2] {
+        let log = Log::default();
+        let (hold, entered, unblock) = gate();
+        let mut fake = WindowFake::new(&log);
+        fake.max = max_seqs;
+        fake.hold_prefill = Some(hold);
+        let (engine, release) = start_with_budget(fake, 4);
+        let (request, events) = job(&[1; 3], 2);
+        engine.handle().try_submit(request).unwrap();
+        release.send(()).unwrap();
+        entered.recv_timeout(WAIT).unwrap();
+        events.cancel();
+        unblock.send(()).unwrap();
+        let result = collect(events);
+        assert_eq!(finish(&result), DecodeFinish::Cancelled);
+        assert_eq!(usage(&result).completion_tokens, 0);
+        assert!(output(&result).is_empty());
+        assert_eq!(engine.shutdown().state, EngineState::Stopped);
+        // The single worker can call decode to finish cancellation; the batch worker
+        // must not submit a cancelled row to its native window.
+        assert!(lock(&log).windows.is_empty());
+    }
 }
 
 #[test]
@@ -1717,30 +1744,18 @@ fn a_cancelled_growth_denial_returns_its_permits_and_keeps_an_independent_checkp
 }
 
 #[test]
-fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store() {
-    // The batch pre-pass against a REAL store (FakeExecutor + prefix limits + session
-    // budget with `max_seqs` 8, so spawn_engine selects the BATCH worker - not the
-    // WindowFake evict counter, and not the single-worker path the same fake defaults
-    // to). The denied conversation's second turn restores its own tip, the growth
-    // cannot fit, the pre-pass protects the restored anchor, and the rebuild
-    // re-restores it (reused > 0) - the integration pin that the protect id from a real
-    // restored session survives the batch restart path. A mutant that deletes the batch
-    // restart fails this fixture outright (the turn errors instead of finishing). This
-    // fixture does NOT discriminate a no-protect mutant - the restore moves the denied
-    // conversation's entry to MRU, so the oldest OTHER tip spends with or without
-    // protection (same for the worker twin in worker.rs,
-    // `a_denial_keeps_the_denied_jobs_own_restored_anchor_and_spends_a_dead_tip`). The
-    // arms that CAN be discriminated are pinned elsewhere: the tier order by
-    // hand-built-store mutants in family/session.rs
-    // (`an_interior_anchor_spends_before_an_older_covering_root` and the two-path
-    // fixture). The adoption-denial knob test below exercises the STORE's own protect
-    // at the engine level - the worker's protect WIRING itself is not discriminated by
-    // any engine fixture (store-level tests pin the semantics); its candidate is the
-    // OLDEST entry, so a drop-first or no-protect mutant spends it and reused_tokens
-    // flips 100 -> 0.
+fn a_denial_restart_restores_the_jobs_own_tip_in_both_workers() {
+    for max_seqs in [1, 8] {
+        assert_denial_restart_restores_tip(max_seqs);
+    }
+}
+
+fn assert_denial_restart_restores_tip(max_seqs: usize) {
+    // Use a real store and pool so the second turn must evict and re-restore its own
+    // tip. This does not discriminate a missing protect ID: restore also makes the tip MRU.
     let (release, held) = mpsc::channel();
     let mut fake = FakeExecutor::new(vec![vec![EOS]; 6], &[EOS], 10_000);
-    fake.with_max_seqs(8);
+    fake.with_max_seqs(max_seqs);
     fake.with_prefix_limits(2, 6);
     fake.with_session_budget(10_000_000, 1_024, 3_000_000);
     // Clone the window counter BEFORE the fake moves into the factory: a positive
@@ -1781,13 +1796,12 @@ fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store(
     let denied = denied.with_prefix_boundary(3_499).expect("boundary");
     handle.try_submit(denied).expect("submit");
     let events = collect(denied_events);
-    assert!(
-        matches!(events.last(), Some(JobEvent::Finished(usage)) if usage.reused_tokens > 0),
-        "the rebuild re-restored the denied job's own tip: {events:?}"
-    );
-    assert!(
+    assert_eq!(usage(&events).reused_tokens, 100, "max_seqs={max_seqs}");
+    assert_eq!(finish(&events), DecodeFinish::Stop, "max_seqs={max_seqs}");
+    assert_eq!(
         windows.load(Ordering::SeqCst) > 0,
-        "the batch branch ran: the engine advanced decode windows"
+        max_seqs > 1,
+        "only the batch branch advances decode windows"
     );
     drop(handle);
     engine.shutdown();
@@ -3252,5 +3266,108 @@ fn a_natively_failed_batching_engine_does_not_drain_background_work() {
     assert!(
         !drained.load(Ordering::SeqCst),
         "a failed engine's device state is not read at shutdown"
+    );
+}
+
+/// Serves a chat turn that restores a saved prefix while another stream decodes and the prompt rows
+/// of the tick are shared: the restored row is fed exactly the tail, in pieces of the shared tick,
+/// and reaches its first window holding the same tokens a cold row holds, so it draws the same text.
+#[test]
+fn a_restored_prompt_with_its_tail_in_shared_pieces_reaches_the_cold_rows_tokens() {
+    let seed_prompt: Vec<u32> = (0..40).map(|index| 100 + index).collect();
+    let mut turn_two = seed_prompt.clone();
+    turn_two.extend((0..30).map(|index| 200 + index));
+    let first_window_with = |log: &Log, first: u32, at_least: usize| -> Vec<u32> {
+        lock(log)
+            .windows
+            .iter()
+            .find_map(|window| {
+                window
+                    .iter()
+                    .find(|row| row.first() == Some(&first) && row.len() >= at_least)
+                    .cloned()
+            })
+            .expect("the prompt reached a window")
+    };
+    let run = |restore: bool| -> (Log, Vec<u32>, Vec<u32>) {
+        let log = Log::default();
+        let mut fake = WindowFake::new(&log);
+        fake.max = 2;
+        fake.script_tokens = 400;
+        fake.prompt_share = Some(4);
+        fake.saved_keys = restore.then(Vec::new);
+        fake.window_delay = Some(Duration::from_millis(2));
+        let (engine, release) = start(fake);
+        release.send(()).expect("load");
+        // Turn one saves the first 40 tokens, then ends.
+        let mut first_prompt = seed_prompt.clone();
+        first_prompt.push(99);
+        let (first, first_events) = job(&first_prompt, 1);
+        engine
+            .handle()
+            .try_submit(first.with_prefix_boundary(seed_prompt.len()).expect("tip"))
+            .expect("turn one");
+        collect(first_events);
+        // A long stream decodes while turn two restores and prefills its tail.
+        let (stream, stream_events) = job(&[1], 150);
+        engine.handle().try_submit(stream).expect("stream");
+        wait(|| lock(&log).calls.iter().any(|call| call == "window"));
+        let (second, second_events) = job(&turn_two, 3);
+        engine
+            .handle()
+            .try_submit(
+                second
+                    .with_prefix_boundary(turn_two.len() - 1)
+                    .expect("tip"),
+            )
+            .expect("turn two");
+        let events = collect(second_events);
+        let text = usage(&events).completion_tokens;
+        assert_eq!(text, 3);
+        let tokens: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                JobEvent::Batch(batch) => Some(batch.tokens.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let history = first_window_with(&log, 100, turn_two.len());
+        stream_events.cancel();
+        collect(stream_events);
+        engine.shutdown();
+        (log, history, tokens)
+    };
+    let (restored_log, restored_history, restored_tokens) = run(true);
+    let (cold_log, cold_history, cold_tokens) = run(false);
+    assert_eq!(restored_history[..turn_two.len()], turn_two[..]);
+    assert_eq!(restored_history, cold_history, "the same tokens in the row");
+    assert_eq!(restored_tokens, cold_tokens, "the same drawn text");
+    // The restore covered the 40 saved tokens, and the rows fed after it are the 30 of the tail.
+    let calls = lock(&restored_log).calls.clone();
+    let at = calls
+        .iter()
+        .position(|call| call == "restore:40")
+        .expect("the saved prefix was restored");
+    let pieces: Vec<usize> = calls[at..]
+        .iter()
+        .filter_map(|call| call.strip_prefix("prefill:"))
+        .map(|rows| rows.parse::<usize>().expect("rows"))
+        .collect();
+    assert_eq!(
+        pieces.iter().sum::<usize>(),
+        turn_two.len() - 40,
+        "the rows fed after the restore are the tail: {pieces:?}"
+    );
+    assert!(
+        pieces.len() > 1,
+        "the tail ran in several shared pieces: {pieces:?}"
+    );
+    assert!(
+        lock(&cold_log)
+            .calls
+            .iter()
+            .all(|call| !call.starts_with("restore:")),
+        "the cold run restored nothing"
     );
 }

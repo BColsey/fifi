@@ -25,6 +25,17 @@ pub(crate) use gguf_tables::KSIGNS_IQ2XS;
 pub(crate) use gguf_tables::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL,
 };
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use gguf_tables::{IQ1S_GRID_U16, inkling_codebook_words};
+/// The same lattice tables and the packed IQ1_S grid for the Metal expert path, which
+/// uploads them once per model.
+#[cfg(all(
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(feature = "native-cuda")
+))]
+pub(crate) use gguf_tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID};
 mod gguf_identity;
 mod gguf_weights;
 mod header;
@@ -54,25 +65,25 @@ pub(crate) mod acquire_read {
 }
 pub(crate) use gguf::shared_header;
 pub use gguf::{
-    ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SplitInfo, check_split_set,
-    hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
+    ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SMALL_VECTOR_BYTES, SplitInfo,
+    check_split_set, hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
 };
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,
 };
-pub use gguf_encode::{
-    encode_plain_float_rows, encode_q8_0, is_plain_float, plain_float_as_q8_0, q8_0_len,
-};
+pub(crate) use gguf_dequant::{dot_q6_k, dot_q8_0};
+pub use gguf_encode::{encode_plain_float_rows, encode_q8_0, is_plain_float, q8_0_len};
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };
 pub use gguf_identity::{TENSOR_SAMPLE, gguf_identity_digest};
-pub(crate) use gguf_split::shard_name_of;
 #[cfg(test)]
 pub(crate) use gguf_split::write_two_shard_set;
+pub(crate) use gguf_split::{ShardName, shard_name_of};
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
+pub(crate) use shard::read_stored_header;
 pub use shard::{HeaderEntry, ShardHeader};
 pub use tiered::{LoadLimits, ShardIo, TieredWeights};
 

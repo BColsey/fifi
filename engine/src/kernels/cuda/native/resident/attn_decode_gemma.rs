@@ -158,17 +158,6 @@ fn plane_bytes(kv_heads: usize, cells: usize, head_dim: usize) -> Option<(usize,
     Some((codes, scales))
 }
 
-/// Ring 0 is a linear cache; R > 0 needs a window and `window + m - 1 <= R <= cells`, the rule of
-/// the other attention kernels' rings.
-pub(in crate::kernels::cuda) fn ring_admitted(
-    ring: usize,
-    window: usize,
-    m: usize,
-    cells: usize,
-) -> bool {
-    ring == 0 || (window > 0 && ring >= window + m - 1 && ring <= cells)
-}
-
 fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFailure> {
     let (codes, scales) =
         plane_bytes(call.n_kv_head, call.cells, call.head_dim).ok_or_else(invalid_argument)?;
@@ -178,12 +167,12 @@ fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFa
         .and_then(|v| v.checked_mul(call.head_dim))
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(invalid_argument)?;
-    let dims = (1..=16).contains(&call.m)
+    let dims = (1..=64).contains(&call.m)
         && matches!((call.n_q_head, call.n_kv_head), (16, 1) | (16, 8) | (8, 2))
         && matches!(call.head_dim, 256 | 512)
         && (1..=i32::MAX as usize).contains(&call.cells)
         && call.window <= call.cells
-        && ring_admitted(call.ring, call.window, call.m, call.cells)
+        && crate::family::kv_ring::ring_admits(call.ring, call.window, call.m, call.cells)
         && call.scale.is_finite()
         && call.scale.abs() < 1e30;
     let reads = [

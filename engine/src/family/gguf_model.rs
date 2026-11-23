@@ -217,16 +217,16 @@ fn check_metadata(header: &GgufHeader, spec: &FamilySpec, nextn: u32) -> Result<
     Ok(())
 }
 
-/// The llama.cpp conversion writes these count keys as u32.
+/// A count key of the llama.cpp conversion, which writes them as u32 or u64.
 fn meta_count(header: &GgufHeader, key: &str) -> Result<u64, EngError> {
-    match header.meta(key) {
-        Some(MetaValue::U32(value)) => Ok(u64::from(*value)),
-        Some(MetaValue::U64(value)) => Ok(*value),
-        Some(_) => Err(reject(format!(
-            "metadata key {key} is not a u32 or u64 integer"
-        ))),
-        None => Err(reject(format!("metadata key {key} is missing"))),
-    }
+    header.meta_u64(key).ok_or_else(|| {
+        let what = if header.meta(key).is_none() {
+            "is missing"
+        } else {
+            "is not a u32 or u64 integer"
+        };
+        reject(format!("metadata key {key} {what}"))
+    })
 }
 
 fn match_tensors<'a>(

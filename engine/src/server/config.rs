@@ -4,7 +4,9 @@
 
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
 use crate::family::gemma::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
+use crate::family::inkling2_mini::FAMILY as INKLING_FAMILY;
 use crate::family::qwen::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
+use crate::family::qwen::sensenova::{ARCHITECTURE as SENSENOVA_ARCH, FAMILY as SENSENOVA_FAMILY};
 use crate::family::{
     nemotron::nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
     qwen::qwen36::{
@@ -29,7 +31,7 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// The family names that this build recognizes, including staged backends.
-pub(crate) const FAMILIES: [&str; 7] = [
+pub(crate) const FAMILIES: [&str; 9] = [
     FAKE_FAMILY,
     FLASH_FAMILY,
     Q36_FAMILY,
@@ -37,20 +39,38 @@ pub(crate) const FAMILIES: [&str; 7] = [
     FLINT_FAMILY,
     NEMOTRON_FAMILY,
     GEMMA4_FAMILY,
+    INKLING_FAMILY,
+    SENSENOVA_FAMILY,
 ];
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
 
-/// The families that a GGUF `general.architecture` identifies, so a directory holding only the
-/// weights file starts with no `config.json` and no `--family`. One line per architecture: a
-/// family adds its line once a start from a GGUF-only directory serves a chat. Not listed:
-/// Flash-Next `qwen4exp` (its loader stops on quantization kernels that do not exist yet, such as
-/// IQ2_S), Nemotron `nemotron_h_moe` (its entry needs an options block), Raon `raon1` (its CUDA
-/// serving is not on main) and Flint.
+/// The families that a GGUF `general.architecture` identifies, so a model path that holds only
+/// the weights file starts with no `config.json` and no `--family`. One line per architecture: a
+/// family adds its line once a start from a bare GGUF file serves a chat. The architectures that
+/// are left out, and why, are in [`gguf_architecture_note`].
 pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
     ("qwen35moe", crate::family::qwen::qwen36::factory::FAMILY),
     ("gemma4", crate::family::gemma::gemma4::FAMILY),
 ];
+
+/// Why a GGUF architecture that is not in [`GGUF_ARCHITECTURE_FAMILIES`] is not served, for the
+/// refusal text; an architecture with no line is simply not a family of this engine.
+pub(crate) fn gguf_architecture_note(architecture: &str) -> Option<&'static str> {
+    Some(match architecture {
+        "qwen4exp" => {
+            "Flash-Next's loader stops on quantization kernels that do not exist yet (IQ2_S and others)"
+        }
+        "nemotron_h_moe" => "the Nemotron entry needs an options block: write a --config file",
+        "raon1" => "Raon's CUDA serving is not on main yet",
+        SENSENOVA_ARCH => "SenseNova CPU serving is experimental; pass --family sensenova",
+        "dflash" => "a draft model for speculative decoding, not a model to serve on its own",
+        "clip" => {
+            "a vision projector (mmproj), not a language model: name the model file beside it"
+        }
+        _ => return None,
+    })
+}
 
 /// The architectures of [`GGUF_ARCHITECTURE_FAMILIES`], for refusal text.
 pub(crate) fn known_gguf_architectures() -> String {
@@ -86,6 +106,14 @@ pub(crate) struct Config {
     /// `sampler_trace.rs`'s contract.
     #[serde(default)]
     pub(crate) sample_trace: bool,
+    /// True when a runtime-added engine of a family that keeps its card memory for the
+    /// process lifetime (Qwen3.6 dense/moe, Flash-Next) is served by a supervised
+    /// `enginesrv serve --model` worker process instead: stopping that engine ends the
+    /// worker and frees its memory, where the in-process start holds it until restart.
+    /// The default is false: such an add is refused exactly as before, and every other
+    /// family still loads in-process whatever this key says.
+    #[serde(default)]
+    pub(crate) supervised_engines: bool,
     /// The built web frontend to serve at `/` (`web/dist` after
     /// `npm run build`). Absent: no frontend routes, as before. The
     /// shell and its hashed assets are public like `/health`; every API
@@ -102,8 +130,7 @@ pub(crate) struct EngineConfig {
     pub(crate) tokenizer_dir: PathBuf,
     pub(crate) family: String,
     pub(crate) model: Option<String>,
-    /// The context limit of the `fake` family. A real family reports its own limit when it
-    /// starts, and the file does not set it.
+    /// Context limit for the fake and Inkling 2 Mini families.
     pub(crate) context_limit: Option<u32>,
     pub(crate) fake: Option<FakeOptions>,
     pub(crate) flash_next: Option<FlashOptions>,
@@ -137,6 +164,21 @@ pub(crate) struct FakeOptions {
     pub(crate) reply: Option<String>,
     #[serde(default)]
     pub(crate) token_delay_ms: u64,
+}
+
+/// SenseNova always builds the tokenizer from the GGUF it loads. Accept the model path itself
+/// (the normal config convention), or the first shard for a file in a split set.
+pub(crate) fn check_sensenova_tokenizer_path(
+    model: &Path,
+    tokenizer: &Path,
+) -> Result<(), StartupError> {
+    if model == tokenizer || crate::family::gguf_select::first_shard(model) == tokenizer {
+        return Ok(());
+    }
+    Err(StartupError(format!(
+        "the {SENSENOVA_FAMILY} family uses the embedded GGUF tokenizer; use the model path (or the first shard of the model) instead of {}",
+        tokenizer.display()
+    )))
 }
 
 impl EngineConfig {
@@ -279,12 +321,26 @@ impl Config {
                     )));
                 }
             }
-            if engine.family != FAKE_FAMILY
-                && (engine.context_limit.is_some() || engine.fake.is_some())
+            if engine.fake.is_some() && engine.family != FAKE_FAMILY {
+                return Err(StartupError(format!(
+                    "engines[{index}] sets fake, which only the {FAKE_FAMILY} family takes"
+                )));
+            }
+            if engine.context_limit.is_some()
+                && !matches!(engine.family.as_str(), FAKE_FAMILY | INKLING_FAMILY)
             {
                 return Err(StartupError(format!(
-                    "engines[{index}] sets context_limit or fake, which only the {FAKE_FAMILY} family takes"
+                    "engines[{index}] sets context_limit, which only the {FAKE_FAMILY} family and the {INKLING_FAMILY} family take"
                 )));
+            }
+            if engine.family == INKLING_FAMILY {
+                crate::family::inkling2_mini::factory::context_limit(engine.context_limit)
+                    .map_err(|error| {
+                        StartupError(format!(
+                            "engines[{index}].context_limit: {}",
+                            error.describe()
+                        ))
+                    })?;
             }
             if engine.family != FLASH_FAMILY && engine.flash_next.is_some() {
                 return Err(StartupError(format!(
@@ -313,6 +369,11 @@ impl Config {
                 return Err(StartupError(format!(
                     "engines[{index}] sets flint, which only the {FLINT_FAMILY} family takes"
                 )));
+            }
+            if engine.family == SENSENOVA_FAMILY {
+                check_sensenova_tokenizer_path(&engine.model_dir, &engine.tokenizer_dir).map_err(
+                    |error| StartupError(format!("engines[{index}].tokenizer_dir: {error}")),
+                )?;
             }
             if let Some(options) = &engine.flint {
                 options
@@ -402,6 +463,18 @@ mod tests {
             {"id": "e1", "model_dir": "m", "tokenizer_dir": "t", "family": "fake"}
         ]
     }"#;
+
+    #[test]
+    fn supervised_engines_is_opt_in() {
+        let config = load(VALID).expect("valid config");
+        assert!(!config.supervised_engines, "absent means false");
+        let mut value: serde_json::Value = serde_json::from_str(VALID).unwrap();
+        value["supervised_engines"] = serde_json::json!(true);
+        let config = load(&value.to_string()).expect("valid config");
+        assert!(config.supervised_engines);
+        value["supervised_engines"] = serde_json::json!("yes");
+        assert!(message(load(&value.to_string())).contains("expected a boolean"));
+    }
 
     #[test]
     fn flint_cuda_profile_is_explicit_and_family_scoped() {
@@ -666,6 +739,33 @@ mod tests {
     fn an_empty_model_directory_is_rejected() {
         let text = VALID.replace(r#""model_dir": "m""#, r#""model_dir": """#);
         assert!(message(load(&text)).contains("engines[0].model_dir"));
+    }
+
+    #[test]
+    fn a_sensenova_entry_accepts_only_its_embedded_tokenizer_and_no_options() {
+        let text = VALID
+            .replace(r#""family": "fake""#, r#""family": "sensenova""#)
+            .replace(r#""tokenizer_dir": "t""#, r#""tokenizer_dir": "m""#);
+        assert_eq!(
+            load(&text).expect("valid").engines[0].model_name(),
+            "sensenova"
+        );
+        let external = text.replace(r#""tokenizer_dir": "m""#, r#""tokenizer_dir": "t""#);
+        assert!(message(load(&external)).contains("embedded GGUF tokenizer"));
+        for (member, refusal) in [
+            (r#""context_limit": 99"#, "only the fake family"),
+            (
+                r#""kv_cache": {}"#,
+                "sensenova family does not keep an on-disk prefix cache",
+            ),
+            (r#""qwen36": {}"#, "sets qwen36"),
+        ] {
+            let with_option = text.replace(
+                r#""family": "sensenova""#,
+                &format!(r#""family": "sensenova", {member}"#),
+            );
+            assert!(message(load(&with_option)).contains(refusal), "{member}");
+        }
     }
 
     #[test]

@@ -56,10 +56,10 @@ fn meta_f32(model: &Raon1Model, key: &str) -> Result<f32, EngError> {
 }
 
 fn meta_u32(model: &Raon1Model, key: &str) -> Result<u32, EngError> {
-    match model.header().meta(key) {
-        Some(MetaValue::U32(v)) => Ok(*v),
-        _ => Err(reject(format!("metadata key {key} is missing or not u32"))),
-    }
+    model
+        .header()
+        .meta_u32(key)
+        .ok_or_else(|| reject(format!("metadata key {key} is missing or not u32")))
 }
 
 fn meta_bool(model: &Raon1Model, key: &str) -> Result<bool, EngError> {

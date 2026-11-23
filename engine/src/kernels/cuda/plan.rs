@@ -6,7 +6,7 @@
 //! and compares the sum with the free device memory before the first upload.
 
 use crate::EngError;
-use crate::weights::GgufType;
+use crate::weights::{GgufType, SMALL_VECTOR_BYTES};
 
 /// Rows and columns of one tile of the vendored `mma884` layout.
 pub(crate) const TILE_ROWS: u64 = 8;
@@ -59,9 +59,12 @@ pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64
     let elements = rows.checked_mul(cols).ok_or_else(overflow)?;
     let tile_bytes = match ty {
         GgufType::F32 => return elements.checked_mul(4).ok_or_else(overflow),
-        // A half vector (norm, bias, gate) widens to F32 at upload; a half matrix is the
-        // source size, which is also what a Q8_0 encode of it reads.
-        GgufType::F16 | GgufType::Bf16 if dims.len() == 1 => {
+        // A small half vector (norm, bias, gate: `GgufTensor::is_small_half_vector`) widens to
+        // F32 at upload; a half matrix, or a vector of a MiB or more, is the source size, which
+        // is also what a Q8_0 encode of it reads.
+        GgufType::F16 | GgufType::Bf16
+            if dims.len() == 1 && elements.saturating_mul(2) < SMALL_VECTOR_BYTES =>
+        {
             return elements.checked_mul(4).ok_or_else(overflow);
         }
         GgufType::F16 | GgufType::Bf16 => return elements.checked_mul(2).ok_or_else(overflow),
@@ -447,6 +450,15 @@ mod tests {
         assert_eq!(device_bytes("table", GgufType::Bf16, &[3, 7]), Ok(42));
         assert_eq!(device_bytes("norm", GgufType::Bf16, &[5]), Ok(20));
         assert_eq!(device_bytes("norm", GgufType::F16, &[5]), Ok(20));
+        // A one-dimensional half tensor of a MiB or more is not a small vector: it keeps its
+        // two bytes per element (the rule of `GgufTensor::is_small_half_vector`).
+        let over = (SMALL_VECTOR_BYTES / 2) + 1;
+        assert_eq!(device_bytes("big", GgufType::F16, &[over]), Ok(over * 2));
+        assert_eq!(device_bytes("big", GgufType::Bf16, &[over]), Ok(over * 2));
+        assert_eq!(
+            device_bytes("small", GgufType::F16, &[over - 2]),
+            Ok((over - 2) * 4)
+        );
     }
 
     #[test]

@@ -123,6 +123,10 @@ fn serve(
         );
         let _ = stream.write_all(body);
     };
+    // The real hub answers 400 to an encoded slash in the repo id.
+    if path.contains("%2F") {
+        return reply(&mut stream, "400 Bad Request", "", b"{}", 2);
+    }
     if path.contains("/resolve/") {
         if stall.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
@@ -298,7 +302,7 @@ fn a_download_writes_the_hub_layout_with_verified_blobs_and_relative_links() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
     // The cache listing shows the snapshot as complete.
-    let listing = hub.cache();
+    let listing = hub.cache(false);
     let row = &listing["models"][0]["snapshots"][0];
     assert_eq!(row["commit"], COMMIT);
     assert_eq!(row["complete"], true);
@@ -455,7 +459,10 @@ fn a_dangling_or_wrong_sized_link_is_replaced_not_trusted() {
     std::fs::create_dir_all(&snap).expect("snapshot");
     std::os::unix::fs::symlink("../../blobs/gone", snap.join("m.bin")).expect("dangling");
     // The listing already calls the half-filled snapshot incomplete.
-    assert_eq!(hub.cache()["models"][0]["snapshots"][0]["complete"], false);
+    assert_eq!(
+        hub.cache(false)["models"][0]["snapshots"][0]["complete"],
+        false
+    );
     let job = hub.start_download("org/name", "main").expect("admitted");
     assert!(matches!(finished(&job), JobState::Done { .. }));
     assert_eq!(
@@ -621,7 +628,7 @@ fn the_listing_offers_serve_only_for_a_complete_snapshot_of_a_known_family() {
             std::fs::write(repo.join(format!(".fifi-incomplete-{commit}")), b"").expect("marker");
         }
     }
-    let listing = hub.cache();
+    let listing = hub.cache(false);
     let rows = listing["models"][0]["snapshots"]
         .as_array()
         .expect("snapshots");
@@ -642,6 +649,35 @@ fn the_listing_offers_serve_only_for_a_complete_snapshot_of_a_known_family() {
     assert_eq!(partial["complete"], false);
     assert_eq!(partial["servable"], false);
     assert_eq!(partial["families"], serde_json::json!([]));
+}
+
+#[test]
+fn a_flash_next_pack_is_offered_for_serve_under_supervision_alone() {
+    let dir = tempfile::tempdir().expect("hub dir");
+    let hub = HfHub::new(
+        "http://127.0.0.1:9".to_string(),
+        dir.path().to_path_buf(),
+        None,
+    );
+    let flash = crate::family::spec::QWEN3_8_FLASH_NEXT;
+    let model_type = flash.model_types[0];
+    let snap = snapshot(dir.path(), "org/flash");
+    std::fs::create_dir_all(&snap).expect("snapshot");
+    std::fs::write(
+        snap.join("config.json"),
+        format!("{{\"model_type\":\"{model_type}\"}}"),
+    )
+    .expect("config");
+    std::fs::write(snap.join("model.safetensors"), vec![0_u8; 64]).expect("weights");
+    let row = |supervised: bool| hub.cache(supervised)["models"][0]["snapshots"][0].clone();
+    // Without supervision nothing could start it, so the page offers nothing.
+    assert_eq!(row(false)["servable"], false);
+    assert_eq!(row(false)["families"], serde_json::json!([]));
+    let offered = row(true);
+    assert_eq!(offered["complete"], true);
+    assert_eq!(offered["servable"], true);
+    assert_eq!(offered["families"], serde_json::json!([flash.name]));
+    assert!(offered.get("estimate").is_none());
 }
 
 fn derive_fake(
@@ -779,4 +815,354 @@ fn a_pack_estimate_counts_one_quantization_of_one_revision() {
     let shards = pack_estimate(&files(&[("a.safetensors", 10), ("b.safetensors", 20)]));
     assert_eq!(shards["vram_bytes"], 30);
     assert_eq!(shards["planned"], false);
+}
+
+/// A GGUF file with no keys and no tensors, `length` bytes long: a header the planner can read.
+fn gguf_file(length: usize, fill: u8) -> Vec<u8> {
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.resize(length, fill);
+    bytes
+}
+
+fn fetch_with(
+    hub: &Arc<HfHub>,
+    quant: Option<&str>,
+    fit: &mut dyn FnMut(&Path) -> Result<super::fetch_name::Fit, super::config::StartupError>,
+    accepts: &dyn Fn(&Path) -> Result<(), super::config::StartupError>,
+) -> Result<PathBuf, super::config::StartupError> {
+    super::fetch_name::resolve(
+        hub,
+        &super::fetch_name::Wanted {
+            repo: "org/m".to_string(),
+            quant: quant.map(str::to_string),
+        },
+        super::fetch_name::Planner { accepts, fit },
+        &mut |_| {},
+    )
+}
+
+#[test]
+fn a_name_fetches_only_the_files_of_the_quantization_asked_for() {
+    let q4 = gguf_file(300, 4);
+    let q8 = gguf_file(600, 8);
+    let mock = MockHub::start(vec![
+        file("README.md", b"readme"),
+        file("model-Q4_K_M.gguf", &q4),
+        file("model-Q8_0.gguf", &q8),
+        file("mmproj-M-F16.gguf", &gguf_file(90, 1)),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let path = fetch_with(
+        &hub,
+        Some("q8_0"),
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
+        &|_| Ok(()),
+    )
+    .expect("fetched");
+    assert_eq!(path, snapshot(dir.path(), "org/m").join("model-Q8_0.gguf"));
+    assert_eq!(std::fs::read(&path).expect("file"), q8);
+    let blobs: Vec<String> = std::fs::read_dir(repo_cache_dir(dir.path(), "org/m").join("blobs"))
+        .expect("blobs")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        blobs,
+        vec![sha256_hex(&q8)],
+        "only the chosen quantization is stored"
+    );
+}
+
+#[test]
+fn without_a_label_the_planner_chooses_and_a_planner_stub_has_the_real_header_and_size() {
+    let q4 = gguf_file(300, 4);
+    let q8 = gguf_file(600, 8);
+    let mock = MockHub::start(vec![
+        file("model-Q4_K_M.gguf", &q4),
+        file("model-Q8_0.gguf", &q8),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let mut seen = Vec::new();
+    let path = fetch_with(
+        &hub,
+        None,
+        &mut |stub| {
+            let length = std::fs::metadata(stub).expect("stub").len();
+            assert_eq!(&std::fs::read(stub).expect("stub")[..4], b"GGUF");
+            seen.push(length);
+            if length <= 300 {
+                Ok(super::fetch_name::Fit::Resident)
+            } else {
+                Ok(super::fetch_name::Fit::NotResident)
+            }
+        },
+        &|_| Ok(()),
+    )
+    .expect("fetched");
+    // The planner saw the largest first, then the next, at each one's own size.
+    assert_eq!(seen, vec![600, 300]);
+    assert!(path.ends_with("model-Q4_K_M.gguf"), "{path:?}");
+    // The stubs are gone once the choice is made.
+    assert!(
+        !dir.path()
+            .join(format!(".fifi-plan-{}", std::process::id()))
+            .exists()
+    );
+}
+
+#[test]
+fn a_repo_the_engine_does_not_serve_is_refused_before_any_weight_is_downloaded() {
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
+        &|_| {
+            Err(super::config::StartupError(
+                "no family serves the GGUF architecture mamba9".into(),
+            ))
+        },
+    )
+    .expect_err("refused");
+    assert!(error.0.contains("mamba9"), "{}", error.0);
+    assert!(
+        !repo_cache_dir(dir.path(), "org/m").join("blobs").exists(),
+        "nothing was stored"
+    );
+}
+
+#[test]
+fn a_disk_too_small_for_the_smallest_quantization_refuses_before_any_file_is_read() {
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), Some(100));
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
+        &|_| Ok(()),
+    )
+    .expect_err("refused");
+    assert!(error.0.contains("free in"), "{}", error.0);
+    assert!(
+        mock.resolve_requests().is_empty(),
+        "{:?}",
+        mock.resolve_requests()
+    );
+}
+
+#[test]
+fn a_repo_with_no_gguf_and_a_label_it_lacks_are_refused_naming_what_it_holds() {
+    let mock = MockHub::start(vec![
+        file("model.safetensors", b"x"),
+        file("config.json", b"{}"),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
+        &|_| Ok(()),
+    )
+    .expect_err("no gguf");
+    assert!(error.0.contains("holds no complete GGUF"), "{}", error.0);
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &gguf_file(300, 4))]);
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        Some("Q2_K"),
+        &mut |_| Ok(super::fetch_name::Fit::Resident),
+        &|_| Ok(()),
+    )
+    .expect_err("no such quantization");
+    assert!(error.0.contains("Q4_K_M"), "{}", error.0);
+}
+
+#[test]
+fn an_interrupted_download_resumes_from_its_partial_instead_of_starting_over() {
+    let content = payload(200, 7);
+    let mock = MockHub::start(vec![file("model-Q8_0.gguf", &content)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    // An earlier run died after 130 bytes: its partial is named by the file's hash.
+    let blobs = repo_cache_dir(dir.path(), "org/m").join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs");
+    std::fs::write(
+        blobs.join(format!("{}.incomplete", sha256_hex(&content))),
+        &content[..130],
+    )
+    .expect("partial");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let done = hub
+        .download_and_wait("org/m", "main", &|_| true, &mut |_| {})
+        .expect("resumed");
+    assert_eq!(
+        std::fs::read(done.join("model-Q8_0.gguf")).expect("file"),
+        content
+    );
+    let ranges: Vec<String> = mock
+        .resolve_requests()
+        .iter()
+        .filter_map(|line| line.split("range=").nth(1).map(str::to_string))
+        .collect();
+    assert_eq!(ranges, vec!["130-193".to_string(), "194-199".to_string()]);
+    assert!(
+        !blobs
+            .join(format!("{}.incomplete", sha256_hex(&content)))
+            .exists()
+    );
+}
+
+fn all_resident() -> impl FnMut(&Path) -> Result<super::fetch_name::Fit, super::config::StartupError>
+{
+    |_| Ok(super::fetch_name::Fit::Resident)
+}
+
+#[test]
+fn a_second_resolve_serves_the_cached_file_with_no_request() {
+    let q4 = gguf_file(300, 4);
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &q4)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let first = fetch_with(&hub, None, &mut all_resident(), &|_| Ok(())).expect("fetched");
+    let after_first = mock.requests.lock().expect("log").len();
+    // A hub nobody answers for: the cache alone must serve.
+    let dead = hub_with_endpoint("http://127.0.0.1:9", dir.path());
+    let again = fetch_with(&dead, None, &mut all_resident(), &|_| Ok(())).expect("cached");
+    assert_eq!(first, again);
+    let named =
+        fetch_with(&dead, Some("q4_k_m"), &mut all_resident(), &|_| Ok(())).expect("cached");
+    assert_eq!(first, named);
+    assert_eq!(mock.requests.lock().expect("log").len(), after_first);
+}
+
+fn hub_with_endpoint(endpoint: &str, dir: &Path) -> Arc<HfHub> {
+    Arc::new(HfHub::with_limits(
+        endpoint.to_string(),
+        dir.to_path_buf(),
+        None,
+        64,
+        Duration::from_secs(2),
+        Box::new(free_disk_bytes),
+    ))
+}
+
+#[test]
+fn a_set_in_a_subdirectory_is_chosen_whole_and_a_set_missing_a_shard_is_never_offered() {
+    let mock = MockHub::start(vec![
+        file(
+            "UD-Q4_K_XL/model-UD-Q4_K_XL-00001-of-00002.gguf",
+            &gguf_file(200, 1),
+        ),
+        file(
+            "UD-Q4_K_XL/model-UD-Q4_K_XL-00002-of-00002.gguf",
+            &gguf_file(150, 2),
+        ),
+        // The larger set lacks its second shard: it is not a quantization of this repo.
+        file("Q8_0/model-Q8_0-00001-of-00002.gguf", &gguf_file(900, 3)),
+        file("model-Q2_K.gguf", &[]),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let path = fetch_with(&hub, None, &mut all_resident(), &|_| Ok(())).expect("fetched");
+    assert_eq!(
+        path,
+        snapshot(dir.path(), "org/m").join("UD-Q4_K_XL/model-UD-Q4_K_XL-00001-of-00002.gguf")
+    );
+    assert!(
+        path.with_file_name("model-UD-Q4_K_XL-00002-of-00002.gguf")
+            .is_file()
+    );
+    let error = fetch_with(&hub, Some("Q8_0"), &mut all_resident(), &|_| Ok(()))
+        .expect_err("Q8_0 is incomplete in the listing");
+    assert!(error.0.contains("UD-Q4_K_XL"), "{}", error.0);
+    // Cached, the same set is found again with no label, through the same rule.
+    let dead = hub_with_endpoint("http://127.0.0.1:9", dir.path());
+    assert_eq!(
+        fetch_with(&dead, None, &mut all_resident(), &|_| Ok(())).expect("cached"),
+        path
+    );
+}
+
+#[test]
+fn a_planner_that_cannot_run_is_an_error_not_a_smaller_quantization() {
+    let mock = MockHub::start(vec![
+        file("model-Q4_K_M.gguf", &gguf_file(300, 4)),
+        file("model-Q8_0.gguf", &gguf_file(600, 8)),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let error = fetch_with(
+        &hub,
+        None,
+        &mut |_| {
+            Err(super::config::StartupError(
+                "the plan could not be made".into(),
+            ))
+        },
+        &|_| Ok(()),
+    )
+    .expect_err("planner error");
+    assert!(
+        error.0.contains("the plan could not be made"),
+        "{}",
+        error.0
+    );
+    assert!(!repo_cache_dir(dir.path(), "org/m").join("blobs").exists());
+}
+
+#[test]
+fn two_processes_fetching_one_blob_write_it_once() {
+    let content = payload(4000, 5);
+    let mock = MockHub::start(vec![file("model-Q4_K_M.gguf", &content)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Two hub bridges over one cache stand for two processes: each holds its own lock handle.
+    let run = |hub: Arc<HfHub>| {
+        std::thread::spawn(move || hub.download_and_wait("org/m", "main", &|_| true, &mut |_| {}))
+    };
+    let first = run(hub_with(
+        &mock,
+        dir.path(),
+        32,
+        Duration::from_secs(5),
+        None,
+    ));
+    let second = run(hub_with(
+        &mock,
+        dir.path(),
+        32,
+        Duration::from_secs(5),
+        None,
+    ));
+    let (first, second) = (
+        first.join().expect("thread"),
+        second.join().expect("thread"),
+    );
+    for done in [first, second] {
+        let done = done.expect("downloaded");
+        assert_eq!(
+            std::fs::read(done.join("model-Q4_K_M.gguf")).expect("file"),
+            content
+        );
+    }
+    let fetched: u64 = mock
+        .resolve_requests()
+        .iter()
+        .filter_map(|line| line.split("range=").nth(1)?.split_once('-'))
+        .map(|(start, end)| {
+            end.parse::<u64>().expect("end") + 1 - start.parse::<u64>().expect("start")
+        })
+        .sum();
+    assert_eq!(
+        fetched,
+        content.len() as u64,
+        "the bytes crossed the wire once"
+    );
 }

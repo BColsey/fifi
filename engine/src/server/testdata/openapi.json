@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "2b8e531ff6428e14980d583981d71824c01506a65f120ebac8b5751dca4301b4",
+ "x-source-sha256": "245393d91dbdd857a4328d7c0a876c828d38eed28448d58a9bbe39977d5013dc",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -293,7 +293,9 @@
       "required": [
        "cpu_threads",
        "mem_total_bytes",
-       "mem_available_bytes"
+       "mem_available_bytes",
+       "cpu_times",
+       "proc_io"
       ],
       "properties": {
        "cpu_threads": {
@@ -305,6 +307,40 @@
        },
        "mem_available_bytes": {
         "description": "Available RAM in bytes at answer time, or an unavailable object with the reason."
+       },
+       "cpu_times": {
+        "description": "Aggregate /proc/stat jiffies (user through steal, without duplicate guest time). Null when unavailable.",
+        "type": [
+         "array",
+         "null"
+        ],
+        "minItems": 4,
+        "maxItems": 8,
+        "items": {
+         "type": "integer",
+         "minimum": 0
+        }
+       },
+       "proc_io": {
+        "description": "This process's block-level read and write bytes from /proc/self/io, or null when unavailable. These counters exclude reads served from the page cache.",
+        "type": [
+         "object",
+         "null"
+        ],
+        "properties": {
+         "read_bytes": {
+          "type": "integer",
+          "minimum": 0
+         },
+         "write_bytes": {
+          "type": "integer",
+          "minimum": 0
+         }
+        },
+        "required": [
+         "read_bytes",
+         "write_bytes"
+        ]
        }
       }
      },
@@ -349,9 +385,49 @@
         },
         "execution": {
          "$ref": "#/components/schemas/MlxExecution"
+        },
+        "expert_placement": {
+         "$ref": "#/components/schemas/ExpertPlacement"
         }
        }
       }
+     }
+    }
+   },
+   "ExpertPlacement": {
+    "type": "object",
+    "required": [
+     "mode"
+    ],
+    "description": "Expert bank and backing sizes at startup, when the backend reports them. Copies can overlap. This is not live residency or a total model size. Unknown fields are absent.",
+    "properties": {
+     "mode": {
+      "type": "string",
+      "enum": [
+       "resident",
+       "host_streamed",
+       "disk_streamed"
+      ]
+     },
+     "vram_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Device expert bank bytes."
+     },
+     "ram_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Pinned expert backing store bytes. Excludes staging and the disk victim cache."
+     },
+     "disk_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Expert weight bytes in the streaming source."
+     },
+     "slots_per_layer": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Device expert slots per MoE layer."
      }
     }
    },
@@ -2257,6 +2333,38 @@
      }
     }
    },
+   "Logs": {
+    "type": "object",
+    "required": [
+     "events"
+    ],
+    "properties": {
+     "events": {
+      "type": "array",
+      "maxItems": 512,
+      "description": "Server event lines, oldest first.",
+      "items": {
+       "type": "object",
+       "required": [
+        "ts_ms",
+        "line"
+       ],
+       "properties": {
+        "ts_ms": {
+         "type": "integer",
+         "minimum": 0,
+         "description": "Unix milliseconds of the event."
+        },
+        "line": {
+         "type": "string",
+         "maxLength": 256,
+         "description": "Lifecycle text. Excludes request content and raw engine and download error messages."
+        }
+       }
+      }
+     }
+    }
+   },
    "RecentRequests": {
     "type": "object",
     "required": [
@@ -2265,7 +2373,7 @@
     "properties": {
      "requests": {
       "type": "array",
-      "description": "The last 64 rows of the request log, newest first. A row holds the allowlisted keys of the request log, every one of them, with null for a value the row does not have. /v1/messages/count_tokens lines never land in the ring.",
+      "description": "The last 64 rows of the request log, newest first. Rows expose only allowlisted fields. Prefill expert-bank counters are absent when not measured. Token-counting requests are excluded.",
       "items": {
        "type": "object",
        "properties": {
@@ -2362,6 +2470,21 @@
           "number",
           "null"
          ]
+        },
+        "prefill_bank_passes": {
+         "type": "integer",
+         "minimum": 0,
+         "description": "Layer admit passes during prefill, when measured."
+        },
+        "prefill_bank_misses": {
+         "type": "integer",
+         "minimum": 0,
+         "description": "Experts the prefill admit passes moved in."
+        },
+        "prefill_bank_upload_bytes": {
+         "type": "integer",
+         "minimum": 0,
+         "description": "Bytes queued for expert copies during prefill."
         }
        }
       }
@@ -2552,6 +2675,10 @@
      "memory_held_until_restart": {
       "type": "boolean",
       "description": "True when the engine's family keeps its weights allocated for the life of the process, so stopping the engine does not return its card or host memory until the server restarts."
+     },
+     "supervised": {
+      "type": "boolean",
+      "description": "True when a supervised worker process serves this engine: stopping it ends the worker, so its memory is freed at once. Such an engine is always runtime_added and never memory_held_until_restart."
      }
     }
    },
@@ -3306,6 +3433,28 @@
     }
    }
   },
+  "/v1/logs": {
+   "get": {
+    "operationId": "listLogs",
+    "summary": "Server event ring (server extension)",
+    "description": "The process's latest startup, engine, and download events.\nThis bounded tail excludes raw stderr and request content.\nThe response has Cache-Control: no-store.",
+    "responses": {
+     "200": {
+      "description": "The retained event lines.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Logs"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     }
+    }
+   }
+  },
   "/v1/route-trace": {
    "get": {
     "operationId": "getRouteTrace",
@@ -3366,7 +3515,7 @@
    "post": {
     "operationId": "addEngine",
     "summary": "Start one engine at runtime (server extension)",
-    "description": "Server extension. Boots one engine in the running process through the exact CLI boot path, so a model the GUI downloaded to the hub cache is served without a restart. model_dir accepts a local model directory or org/repo, resolved to the hub cache the way serve --model does. The load is asynchronous; the state surfaces report progress. Only engines this route added can be removed by DELETE /v1/engines/{id}. An id is 1 to 64 characters of letters, digits, dot, underscore or dash; at most eight runtime engines run at once. Error text names directories as model_dir and tokenizer_dir, not by their host paths.",
+    "description": "Server extension. Boots one engine in the running process through the exact CLI boot path, so a model the GUI downloaded to the hub cache is served without a restart. model_dir accepts a local model directory or org/repo, resolved to the hub cache the way serve --model does. The load is asynchronous; the state surfaces report progress. Only engines this route added can be removed by DELETE /v1/engines/{id}. An id is 1 to 64 characters of letters, digits, dot, underscore or dash; at most eight runtime engines run at once. Error text names directories as model_dir and tokenizer_dir, not by their host paths. When the configuration sets supervised_engines, an add of a family that keeps its memory for the process lifetime starts a supervised worker process from the derived configuration instead, and its loader stages and failures surface through these same state routes. There family also names a family that serve --model cannot derive on its own (qwen3_8_flash_next): the worker then starts from the bare entry a configuration file carries, with every option at its default. An add that names no family and whose model_dir holds a Flash-Next pack (config.json model_type qwen4_exp) is served the same way, so the hub cache page can add it by directory alone. Without supervised_engines such an add is refused.",
     "requestBody": {
      "required": true,
      "content": {
@@ -3425,6 +3574,10 @@
           },
           "state": {
            "type": "string"
+          },
+          "supervised": {
+           "type": "boolean",
+           "description": "Present and true when a supervised worker process serves this engine; its loader stages surface through the engine and model lists."
           }
          }
         }
@@ -3444,7 +3597,7 @@
    "delete": {
     "operationId": "removeEngine",
     "summary": "Stop one runtime-added engine (server extension)",
-    "description": "Stops one engine the runtime API added. In-flight and queued jobs on it are cancelled; sessions bound to it rebind on their next request. Boot-configured engines are refused. The answer says whether the stop returned the engine's memory: the Qwen3.6 and Flash-Next families allocate their weights for the life of the process, so for them memory_released is false, the card memory returns only when the server process restarts, and POST /v1/engines refuses another engine of the family until then (\"restart the server to free card memory\"). A second stop of an engine that is still shutting down answers so.",
+    "description": "Stops one engine the runtime API added. In-flight and queued jobs on it are cancelled; sessions bound to it rebind on their next request. Boot-configured engines are refused. The answer says whether the stop returned the engine's memory: the Qwen3.6 and Flash-Next families allocate their weights for the life of the process, so for them memory_released is false, the card memory returns only when the server process restarts, and POST /v1/engines refuses another engine of the family until then (\"restart the server to free card memory\") \u2014 unless the engine runs as a supervised worker, whose process ends here and frees its memory at once. A second stop of an engine that is still shutting down answers so.",
     "parameters": [
      {
       "name": "id",
@@ -3483,7 +3636,11 @@
           },
           "memory_released": {
            "type": "boolean",
-           "description": "False when the family keeps its weights allocated for the life of the process (Qwen3.6 and Flash-Next): the engine stopped, but its card memory returns only when the server process restarts, and a new engine of that family is refused until then."
+           "description": "False when the family keeps its weights allocated for the life of the process (Qwen3.6 and Flash-Next): the engine stopped, but its card memory returns only when the server process restarts, and a new engine of that family is refused until then. Always true for a supervised worker, whose process ends here."
+          },
+          "supervised": {
+           "type": "boolean",
+           "description": "Present and true when the engine ran as a supervised worker process that this stop ended."
           },
           "memory_held_until_restart": {
            "type": "boolean",
@@ -3700,7 +3857,7 @@
                 },
                 "servable": {
                  "type": "boolean",
-                 "description": "Complete, and serve --model would start it as a family of this build."
+                 "description": "Complete, and this server can start it: serve --model would start it as a family of this build, or it is a Flash-Next pack (config.json model_type qwen4_exp) and the configuration sets supervised_engines. families names the family either way; a Flash-Next pack carries no estimate."
                 },
                 "families": {
                  "type": "array",

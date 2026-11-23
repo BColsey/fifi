@@ -743,6 +743,31 @@ pub(crate) fn chunk_costs(dims: &StepDims, nsm: usize) -> Result<Vec<ChunkCost>,
     M_LADDER.iter().map(|&m| chunk_cost(dims, m, nsm)).collect()
 }
 
+/// Whether the prefill admission keeps a chunk arena at all for a start whose resident state is
+/// `state` bytes: the smallest rung of the ladder passes the admission's own rule with `budget`
+/// device bytes (free after the weight load, less the headroom), the decode arena, and the
+/// device prefix tip. The card choice asks this before it sizes the context, so it cannot pick a
+/// context whose state leaves the prefill one token per step.
+pub(crate) fn smallest_chunk_passes(
+    dims: &StepDims,
+    nsm: usize,
+    budget: usize,
+    (decode_arena, tip): (usize, usize),
+    state: usize,
+) -> Result<bool, EngError> {
+    let mut admission = Admission::qwen36(budget);
+    admission.decode_arena = decode_arena;
+    if tip > 0 {
+        admission.device_extras.push(Extra {
+            name: "device-prefix-delta",
+            fixed: tip,
+            bytes_per_token: 0,
+        });
+    }
+    let smallest = chunk_costs(dims, nsm)?.pop().ok_or_else(overflow)?;
+    admission.passes(state, &smallest)
+}
+
 #[cfg(test)]
 mod card_tests {
     use super::*;
@@ -875,6 +900,173 @@ mod card_tests {
                             "card {card}, m {m}, nsm {nsm}: Delta overlaps {slot:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The incident: a UD-IQ4_XS default start chose fp16 at 243,712 positions with a budget of
+    /// 4,864,344,064 bytes after the load, and the prefill kept one token per step. The figures
+    /// the admission charged then go through the admission's own rule: the state alone exceeds the
+    /// budget at 243,712, and the stepped-down 223,232 passes.
+    #[test]
+    fn the_incident_context_is_refused_and_the_stepped_down_one_passes() {
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let state_at =
+            |context: usize| state_bytes(&dims, KvMode::Fp16, context, 1).expect("state");
+        assert_eq!(state_at(243_712), 5_057_086_208);
+        assert_eq!(state_at(223_232), 4_637_655_808);
+        let budget = 4_864_344_064;
+        let tip = 65_863_680;
+        let decode = 2_238_724;
+        let passes = |context: usize| {
+            smallest_chunk_passes(&dims, 82, budget, (decode, tip), state_at(context))
+                .expect("the rule answers")
+        };
+        assert!(!passes(243_712), "the state alone exceeds the budget");
+        assert!(passes(223_232), "the chosen context leaves the arena room");
+        // The boundary is monotone: no longer context passes where a shorter one is refused.
+        let mut refused = false;
+        for context in (200_000..262_144).step_by(1024) {
+            let ok = passes(context);
+            assert!(!(refused && ok), "{context}");
+            refused |= !ok;
+        }
+        assert!(refused);
+    }
+
+    /// The default start of every local Qwen3.6-architecture GGUF on a free 3090: the context the
+    /// card fit picks without and with the prefill admission asked first, and the figures the
+    /// admission charges at each. Reads headers only.
+    #[test]
+    #[ignore = "reads the real GGUF headers under $HOME/models and $HOME/.ollama"]
+    fn the_default_fit_keeps_a_prefill_arena_for_every_local_qwen36_gguf() {
+        use crate::family::qwen::qwen36::admission_sketch::{
+            CudaFitAsk, choose_cuda_fit, cuda_kv_per_position,
+        };
+        use crate::family::qwen::qwen36::settings::KvDtype;
+        use crate::weights::{GgufHeader, MetaValue};
+        use std::{fs::File, io::BufReader, io::Read, path::PathBuf};
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let tip = crate::family::qwen::qwen36::settings::delta_state_bytes(&QWEN3_6_35B_A3B)
+            .expect("tip") as usize;
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in [
+            home.join("models/qwen3.6"),
+            home.join("models/qwen3.6/iq"),
+            home.join("models/qwen3.6/requant"),
+            home.join(".ollama/models/blobs"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && entry.metadata().unwrap().len() > (1 << 30) {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let floor = |kv: KvDtype, context: u32| {
+            let cache = u64::from(context) * cuda_kv_per_position(&QWEN3_6_35B_A3B, kv).ok()?;
+            Some(
+                cache
+                    + if kv == KvDtype::Q8 {
+                        256 << 20
+                    } else {
+                        1 << 30
+                    },
+            )
+        };
+        for free in [22_820u64 << 20, 23_416 << 20, 24_000 << 20] {
+            eprintln!("--- {} MiB free", free >> 20);
+            for path in &files {
+                let mut magic = [0u8; 4];
+                File::open(path).unwrap().read_exact(&mut magic).unwrap();
+                if &magic != b"GGUF" {
+                    continue;
+                }
+                let file = File::open(path).unwrap();
+                let Ok(header) = GgufHeader::parse(
+                    &mut BufReader::new(&file),
+                    file.metadata().unwrap().len(),
+                    512 << 20,
+                ) else {
+                    continue;
+                };
+                if !matches!(header.meta("general.architecture"),
+                    Some(MetaValue::String(arch)) if arch == "qwen35moe")
+                {
+                    continue;
+                }
+                let weights: u64 = header.tensors().iter().map(|t| t.byte_len()).sum();
+                let budget = free
+                    .saturating_sub(weights)
+                    .saturating_sub(crate::family::mem::DEVICE.load_unplanned)
+                    .saturating_sub(1 << 30) as usize;
+                let admits = |kv: KvDtype, context: u32| -> Result<bool, EngError> {
+                    let mode = if kv == KvDtype::Q8 {
+                        KvMode::Int8G32
+                    } else {
+                        KvMode::Fp16
+                    };
+                    if mode != KvMode::Fp16 {
+                        return Ok(true);
+                    }
+                    let options = StepOptions {
+                        kv_mode: mode,
+                        context_tokens: context as usize,
+                        delta_slots: 1,
+                        forked_experts: false,
+                        tiered: None,
+                        layout: WeightLayout::Native,
+                    };
+                    let state = StateLayout::new(&dims, &options)
+                        .and_then(|layout| layout.bytes())
+                        .expect("state");
+                    smallest_chunk_passes(&dims, 82, budget, (3 << 20, tip), state)
+                };
+                let fit = |admits: &dyn Fn(KvDtype, u32) -> Result<bool, EngError>| {
+                    choose_cuda_fit(
+                        &QWEN3_6_35B_A3B,
+                        CudaFitAsk {
+                            free,
+                            weights,
+                            int8_usable: true,
+                            kv: None,
+                            context: None,
+                        },
+                        &floor,
+                        admits,
+                    )
+                    .unwrap()
+                };
+                let (without, with) = (fit(&|_, _| Ok(true)), fit(&admits));
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                eprintln!(
+                    "{name:60.60} weights {:.2} GiB | without {without:?} | with {with:?}",
+                    weights as f64 / (1u64 << 30) as f64
+                );
+                // Asking the admission never lengthens the same form's context; a form that has no
+                // arena at any context gives way to the next one.
+                if let (Some(with), Some(without)) = (with, without)
+                    && with.form == without.form
+                {
+                    assert!(with.context <= without.context);
                 }
             }
         }

@@ -55,7 +55,7 @@ use super::{
         fixed_chunk_rows, fixed_staging_rows, ledger_line, needs_arena, stage_label,
         wide_stage_candidate,
     },
-    prefill_plan::{chunk_costs, exl3_chunk_costs, state_bytes},
+    prefill_plan::{PART_CHARGE, SPARE_MIN, chunk_costs, exl3_chunk_costs, state_bytes},
     prefix::{CudaPrefillPath, CudaSavedPrefix, PendingPrefix},
     readback::{
         ReadbackPlan, SHORTLIST_VAR, SYNC_EACH_VAR, captured_report, check_mode,
@@ -441,6 +441,14 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The tiered runtime; interior mutability because the token body takes `&self`.
     tiered: Option<std::cell::RefCell<TieredRuntime<'a>>>,
     tiered_report: TokenReport,
+    /// The sessions the card-short planner funded beside the banks; `None` on every other start.
+    sessions_funded: Option<usize>,
+    /// The most cells a session may grow to when the step's own state is built smaller than the
+    /// context (the state grows on demand); `None` when the state is the context.
+    ceiling_cells: Option<usize>,
+    /// The least free VRAM seen while serving: the first prefill, the first decode and every
+    /// later new low, so the headroom constants can be judged against what the engine measured.
+    free_marks: crate::family::mem::fill::FreeMarks,
     globals: GlobalWeights<'a>,
     /// The layout the step runs: the loaded weights' own layout, checked against the options at
     /// construction.
@@ -888,6 +896,9 @@ impl<'a> QwenResidentStep<'a> {
             tiered_parts,
             tiered: None,
             tiered_report: TokenReport::default(),
+            sessions_funded: None,
+            ceiling_cells: None,
+            free_marks: crate::family::mem::fill::FreeMarks::default(),
             globals: GlobalWeights::new(
                 &res.names,
                 &GlobalSpecs::new(&res.dims),
@@ -1277,6 +1288,21 @@ impl<'a> QwenResidentStep<'a> {
             );
             (Some(cost.m), Some(plan))
         } else {
+            // The unfixed admission's figures, so a start that keeps one token per step can be
+            // closed by subtraction: which charge left no room.
+            let smallest = costs.last().map_or((0, 0), |cost| (cost.arena, cost.part));
+            eprintln!(
+                "q36 cuda: prefill admission ledger: budget={} decode_arena={} state={} cap={} \
+                 smallest_arena={} smallest_part={} part_charge={PART_CHARGE} spare_min={SPARE_MIN} \
+                 extras_fixed={}",
+                admit.budget,
+                admit.decode_arena,
+                admit.state_planned,
+                admit.cap,
+                smallest.0,
+                smallest.1,
+                budget.extras.iter().map(|extra| extra.fixed).sum::<usize>(),
+            );
             admit_with_staging(&admit, &budget.extras, &costs, staging)?
         };
         if admit.cap == 4096 {
@@ -1398,6 +1424,73 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     /// The counters of the last token's tiered boundary (all zero on a plain step).
+    /// Records the sessions the planner funded beside the banks: the sessions executor caps itself
+    /// at them.
+    pub(crate) fn set_ceiling_cells(&mut self, cells: usize) {
+        self.ceiling_cells = Some(cells);
+    }
+
+    pub(crate) fn set_sessions_funded(&mut self, sessions: usize) {
+        self.sessions_funded = Some(sessions);
+    }
+
+    /// The free VRAM now, or `None` when the card cannot be read (a read during graph capture
+    /// refuses, and a failed read is not worth failing a token over).
+    fn read_free_vram(context: &CudaContext) -> Option<u64> {
+        context
+            .memory_info()
+            .ok()
+            .map(|info| u64::try_from(info.free).unwrap_or(0))
+    }
+
+    /// Records a reading already in hand (the load's own) as the point `label`.
+    pub(crate) fn record_free_vram(&mut self, label: &str, free: u64) {
+        if let Some(line) = self.free_marks.record(label, free) {
+            eprintln!("q36 cuda: {line}");
+        }
+    }
+
+    /// A throttled reading at `label`: the first time it is reached, then at most every few
+    /// seconds, so a decode loop pays a clock read per token.
+    pub(crate) fn mark_free_vram(&mut self, label: &str) {
+        let context = &self.context;
+        if let Some(line) = self
+            .free_marks
+            .sample(label, std::time::Instant::now(), || {
+                Self::read_free_vram(context)
+            })
+        {
+            eprintln!("q36 cuda: {line}");
+        }
+    }
+
+    /// A reading after a prefill piece of `rows` rows: at once when it is the largest yet.
+    pub(crate) fn mark_prefill_vram(&mut self, rows: usize) {
+        let context = &self.context;
+        if let Some(line) = self
+            .free_marks
+            .sample_prefill(rows, std::time::Instant::now(), || {
+                Self::read_free_vram(context)
+            })
+        {
+            eprintln!("q36 cuda: {line}");
+        }
+    }
+
+    /// The least free VRAM seen while serving.
+    #[allow(dead_code, reason = "the receipt line and the tests read it")]
+    pub(crate) fn free_vram_low(&self) -> Option<u64> {
+        self.free_marks.low()
+    }
+
+    /// The host bytes the tiered runtime pins (the staging ring and the route scratch); zero
+    /// without a tiered runtime.
+    pub(crate) fn tiered_pinned_bytes(&self) -> u64 {
+        self.tiered
+            .as_ref()
+            .map_or(0, |runtime| runtime.borrow().pinned_bytes())
+    }
+
     pub(crate) fn last_tiered_report(&self) -> TokenReport {
         self.tiered_report
     }
@@ -1549,7 +1642,8 @@ impl<'a> QwenResidentStep<'a> {
             .sparse
             .as_ref()
             .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds));
-        // The tiered chunk path stays behind its existing, default-off gate.
+        // The tiered chunk arm runs for a session whose start asked for it and whose file it can
+        // read (`tiered_load::tiered_chunk_arm`).
         let tiered_chunk = self.tiered.as_ref().filter(|_| self.tiered_chunk);
         let mut fam = Q36ChunkFamily::new(
             self.exl3_bank,

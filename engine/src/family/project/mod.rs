@@ -11,6 +11,7 @@ use crate::EngError;
 pub(crate) mod cuda;
 
 pub(crate) mod exl3_jobs_plan;
+pub(crate) mod gguf;
 
 /// Executes the quantized projections of one forward step.
 ///

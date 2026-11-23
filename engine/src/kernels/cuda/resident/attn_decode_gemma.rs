@@ -15,7 +15,7 @@
 //! synchronizes.
 //!
 //! Every refusal is a BadRequest and happens before any native call: the backend is
-//! usable; m is in 1..=16; query heads 16 with kv heads 1 or 8, or 8 with 2;
+//! usable; m is in 1..=64; query heads 16 with kv heads 1 or 8, or 8 with 2;
 //! head_dim is 256 or
 //! 512; cells is positive; the scale is finite below 1e30 in magnitude; every range
 //! holds its bytes at 4-byte alignment; out overlaps none of q, the K code plane or
@@ -120,9 +120,9 @@ impl CudaContext {
             .and_then(|v| v.checked_mul(call.head_dim))
             .and_then(|v| v.checked_mul(4))
             .ok_or_else(|| EngError::BadRequest("the attention size overflows".to_owned()))?;
-        if !(1..=16).contains(&call.m) {
+        if !(1..=64).contains(&call.m) {
             return Err(EngError::BadRequest(format!(
-                "the attention takes 1 to 16 tokens, got {}",
+                "the attention takes 1 to 64 tokens, got {}",
                 call.m
             )));
         }
@@ -138,12 +138,7 @@ impl CudaContext {
                 "the attention needs an i32 cell capacity and a window within it".to_owned(),
             ));
         }
-        if !crate::kernels::cuda::native::resident::attn_decode_gemma::ring_admitted(
-            call.ring,
-            call.window,
-            call.m,
-            call.cells,
-        ) {
+        if !crate::family::kv_ring::ring_admits(call.ring, call.window, call.m, call.cells) {
             return Err(EngError::BadRequest(format!(
                 "the attention ring {} needs a window and window + m - 1 <= ring <= cells, \
                  got window {}, m {}, cells {}",

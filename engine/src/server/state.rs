@@ -14,10 +14,20 @@ use crate::EngError;
 use crate::family::sampler::{CaptureHandle, SamplingDefaults};
 use crate::sched::worker::{EngineHandle, EngineState, RetryClass};
 use crate::tokenizer::TokenizerBundle;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The most server events the monitor's ring holds.
+const EVENT_CAP: usize = 512;
+
+/// One server event line for `GET /v1/logs`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct EventLine {
+    pub(crate) ts_ms: u64,
+    pub(crate) line: String,
+}
 
 /// The quiet time after which a stream sends a keep-alive comment (the server design).
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -97,9 +107,11 @@ pub(crate) struct AppState {
     started: u64,
     requests: AtomicU64,
     keep_alive: Duration,
-    /// The ids of the engines whose failure text the log already holds.
-    reported: Mutex<HashSet<String>>,
     log: Box<dyn Fn(&str) + Send + Sync>,
+    /// The monitor's event ring, fed by lifecycle calls and the hub's
+    /// download events, read by `GET /v1/logs`. Bounded by EVENT_CAP;
+    /// lines are server-authored lifecycle text, never request text.
+    events: Arc<Mutex<VecDeque<EventLine>>>,
     request_log: Sink,
     /// The monitor's recent-request ring, fed by the served routes' log
     /// lines and read by `GET /v1/recent-requests`.
@@ -110,6 +122,14 @@ pub(crate) struct AppState {
     /// Whether the process permits sampler-trace capture: the config's
     /// `sample_trace` setting, checked before a request arms a sampler.
     sample_trace: bool,
+    /// The supervised worker engines (see `supervisor.rs`): a
+    /// runtime-added engine of a process-lifetime family serves from
+    /// its own process, so stopping it frees the memory.
+    workers: Arc<super::supervisor::WorkerSupervisor>,
+    /// Whether runtime-added pinned-family engines start supervised
+    /// workers instead of loading in-process: the config's
+    /// `supervised_engines` setting, set once at boot.
+    supervised_engines: std::sync::atomic::AtomicBool,
     /// The sampler-trace ring, fed by submit when a request arms capture
     /// and read by `GET /v1/sampler-trace`.
     traces: SamplerTraceRing,
@@ -144,6 +164,21 @@ pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Append one event to a ring, evicting the oldest line at the cap.
+fn push_event(ring: &mut VecDeque<EventLine>, line: &str) {
+    if ring.len() >= EVENT_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(EventLine {
+        ts_ms: now_ms(),
+        line: line
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(256)
+            .collect(),
+    });
 }
 
 /// Why `remove_engine` refused: the id names an engine the boot
@@ -190,8 +225,8 @@ impl AppState {
             started: unix_seconds(),
             requests: AtomicU64::new(0),
             keep_alive: KEEP_ALIVE,
-            reported: Mutex::new(HashSet::new()),
             log: Box::new(|line| eprintln!("error: {line}")),
+            events: Arc::new(Mutex::new(VecDeque::new())),
             request_log: default_sink(),
             recent: RecentRing::new(),
             active: ActiveBoard::new(),
@@ -200,6 +235,8 @@ impl AppState {
             prompt_memory: Arc::new(Mutex::new(HashMap::new())),
             web_dir: None,
             sessions: Mutex::new(HashMap::new()),
+            workers: Arc::new(super::supervisor::WorkerSupervisor::new()),
+            supervised_engines: std::sync::atomic::AtomicBool::new(false),
             telemetry: Mutex::new(None),
         }
     }
@@ -276,6 +313,31 @@ impl AppState {
     pub(crate) fn with_keep_alive(mut self, interval: Duration) -> Self {
         self.keep_alive = interval;
         self
+    }
+
+    pub(crate) fn record_event(&self, line: &str) {
+        let mut ring = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        push_event(&mut ring, line);
+    }
+
+    /// The ring, oldest first, for `GET /v1/logs`.
+    pub(crate) fn events_snapshot(&self) -> Vec<EventLine> {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Route the hub's download lifecycle into the event ring. Runs
+    /// after every builder, so the closure shares the final ring.
+    pub(crate) fn wire_hub_events(&self) {
+        let ring = Arc::clone(&self.events);
+        self.hf.set_event_logger(move |line| {
+            let mut ring = ring.lock().unwrap_or_else(PoisonError::into_inner);
+            push_event(&mut ring, line);
+        });
     }
 
     pub(crate) fn keep_alive(&self) -> Duration {
@@ -426,7 +488,7 @@ impl AppState {
     }
 
     /// The message of the `not_ready` answer: the state of every engine. It never shows the text
-    /// of a failure, because the route is public. `new_failures` supplies that text for the log.
+    /// of a failure, because the route is public. `log_new_failures` supplies that text for the log.
     pub(crate) fn not_ready_message(&self) -> String {
         let engines = self.engines();
         if engines.is_empty() {
@@ -439,22 +501,21 @@ impl AppState {
         format!("no engine is ready: {}", parts.join("; "))
     }
 
-    fn new_failures(&self) -> Vec<String> {
-        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
-        self.engines()
-            .iter()
-            .filter_map(|entry| {
-                let cause = entry.handle.failure()?;
-                reported
-                    .insert(entry.id.clone())
-                    .then(|| format!("engine {} failed: {cause}", entry.id))
-            })
-            .collect()
+    fn log_failure(&self, entry: &EngineEntry) {
+        // Keep the claim and append together so a concurrent stop cannot overtake them.
+        let mut ring = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(failure) = entry.handle.unreported_failure() {
+            let id = &entry.id;
+            push_event(&mut ring, &format!("engine {id} failed ({})", failure.code));
+            drop(ring);
+            // Raw diagnostics can contain local paths or remote error text.
+            (self.log)(&format!("engine {id} failed: {}", failure.message));
+        }
     }
 
     pub(crate) fn log_new_failures(&self) {
-        for line in self.new_failures() {
-            (self.log)(&line);
+        for entry in self.engines().iter() {
+            self.log_failure(entry);
         }
     }
 
@@ -513,7 +574,69 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len();
-        owned + stopping
+        owned + stopping + self.workers.count()
+    }
+
+    /// The supervised worker engines.
+    pub(crate) fn workers(&self) -> &super::supervisor::WorkerSupervisor {
+        &self.workers
+    }
+
+    /// A test drives the real spawn with a stand-in for `enginesrv`.
+    #[cfg(test)]
+    pub(crate) fn with_worker_binary(mut self, binary: std::path::PathBuf) -> Self {
+        self.workers = Arc::new(super::supervisor::WorkerSupervisor::with_worker_binary(
+            binary,
+        ));
+        self
+    }
+
+    /// Whether runtime-added pinned-family engines start supervised
+    /// workers: the config's `supervised_engines` setting.
+    pub(crate) fn supervised_engines(&self) -> bool {
+        self.supervised_engines
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_supervised_engines(&self, on: bool) {
+        self.supervised_engines
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The engine id a session is bound to, when it has one: the
+    /// proxy path's read side of `resolve_session`.
+    pub(crate) fn session_binding(&self, id: &str) -> Option<String> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        sessions.get_mut(id).map(|(engine_id, used)| {
+            *used = now_ms();
+            engine_id.clone()
+        })
+    }
+
+    /// Binds a session to an engine id the local resolve path does
+    /// not know: a supervised worker. Mirrors `resolve_session`'s
+    /// capacity eviction.
+    pub(crate) fn bind_session(&self, id: &str, engine_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if sessions.len() >= SESSION_CAP
+            && !sessions.contains_key(id)
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            sessions.remove(&oldest);
+        }
+        sessions.insert(id.to_string(), (engine_id.to_string(), now_ms()));
+    }
+
+    /// Drops every session binding an engine id holds: the worker
+    /// stop path, mirroring `remove_engine`'s retain.
+    pub(crate) fn drop_sessions_for(&self, engine_id: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, (bound, _)| bound != engine_id);
     }
 
     /// Test hook: marks an id as shutting down, the window a second
@@ -531,9 +654,9 @@ impl AppState {
         &self.hf
     }
 
-    /// True when `id` names a served engine.
+    /// True when `id` names a served engine or a supervised worker.
     pub(crate) fn engine_exists(&self, id: &str) -> bool {
-        self.engines().iter().any(|entry| entry.id == id)
+        self.engines().iter().any(|entry| entry.id == id) || self.workers.contains(id)
     }
 
     /// True when the runtime API — not the boot configuration —
@@ -587,6 +710,8 @@ impl AppState {
         }
         let mut list: Vec<Arc<EngineEntry>> = engines.iter().cloned().collect();
         list.push(Arc::clone(&shared));
+        // Record registration before another request can observe this engine failing.
+        self.record_event(&format!("engine {} registered", shared.id));
         *engines = list.into();
         drop(engines);
         self.owned
@@ -648,6 +773,10 @@ impl AppState {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, (engine_id, _)| engine_id != id);
         let report = engine.shutdown();
+        if let Some(entry) = &removed {
+            self.log_failure(entry);
+        }
+        self.record_event(&format!("engine {id} stopped"));
         self.stopping
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -673,6 +802,35 @@ impl AppState {
             match models.iter_mut().find(|model| model.id == entry.model) {
                 Some(model) => model.engines.push(info),
                 None => models.push(Model::new(entry.model.clone(), self.started, vec![info])),
+            }
+        }
+        // The supervised workers ride the same list once their engine
+        // can name its model: before readiness the engine list shows
+        // them, and a name that arrives late groups exactly when
+        // requests can use it. The failure detail stays on the engine
+        // list, which the worker's own loader state feeds.
+        for worker in self.workers.snapshot() {
+            let Some(model) = worker.model else {
+                continue;
+            };
+            let info = EngineInfo {
+                id: worker.id.clone(),
+                model: model.clone(),
+                // The four states the supervisor records, as the wire
+                // type's static names; the stage detail a loading
+                // worker carries stays on the engine list.
+                state: match worker.status.state.as_str() {
+                    "ready" => "ready",
+                    "failed" => "failed",
+                    "stopped" => "stopped",
+                    _ => "starting",
+                },
+                load_stage: None,
+                error: None,
+            };
+            match models.iter_mut().find(|candidate| candidate.id == model) {
+                Some(candidate) => candidate.engines.push(info),
+                None => models.push(Model::new(model, self.started, vec![info])),
             }
         }
         ModelList::new(models)
@@ -731,6 +889,28 @@ mod tests {
             AppState::new(testkit::API_KEY, entries),
             vec![first, second],
         )
+    }
+
+    #[test]
+    fn event_ring_evicts_the_oldest_and_bounds_each_line() {
+        let state = AppState::new(testkit::API_KEY, Vec::new());
+        for i in 0..=super::EVENT_CAP {
+            state.record_event(&format!("event {i}\n{}", "é".repeat(300)));
+        }
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), super::EVENT_CAP);
+        assert!(events[0].line.starts_with("event 1é"));
+        assert_eq!(events[0].line.chars().count(), 256);
+    }
+
+    #[test]
+    fn wire_hub_events_routes_download_lines_into_the_ring() {
+        let state = AppState::new(testkit::API_KEY, Vec::new());
+        state.wire_hub_events();
+        state.hf().emit("download org/repo finished: 1.0 MiB");
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].line, "download org/repo finished: 1.0 MiB");
     }
 
     #[test]
@@ -920,17 +1100,43 @@ mod tests {
             testkit::entry("e1", "model-a", &broken, 4_096),
             testkit::entry("e2", "model-b", &waiting, 4_096),
         ];
-        let state = AppState::new(testkit::API_KEY, entries);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let state = AppState::new(testkit::API_KEY, entries).with_log(move |line| {
+            sink.lock().expect("sink").push(line.to_string());
+        });
         testkit::wait_for_state(&state.engines()[0].handle, EngineState::Error);
-        let first = state.new_failures();
-        assert_eq!(first.len(), 1, "{first:?}");
-        assert!(first[0].starts_with("engine e1 failed: "), "{first:?}");
-        assert!(first[0].contains("fixture load failure"), "{first:?}");
-        assert!(
-            state.new_failures().is_empty(),
-            "the text was reported twice"
-        );
+        state.log_new_failures();
+        state.log_new_failures();
+        let lines = seen.lock().expect("sink");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("engine e1 failed: "));
+        assert!(lines[0].contains("fixture load failure"));
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].line.starts_with("engine e1 failed ("));
+        assert!(!events[0].line.contains("fixture load failure"));
         drop(gate);
+    }
+
+    #[test]
+    fn reused_engine_ids_report_each_failure_even_if_removed_before_a_poll() {
+        let state = AppState::new(testkit::API_KEY, Vec::new());
+        for _ in 0..2 {
+            let engine = testkit::failing_engine();
+            let entry = testkit::entry("repeat", "model-a", &engine, 4_096);
+            let handle = entry.handle.clone();
+            assert!(state.add_engine(entry, engine).is_some());
+            testkit::wait_for_state(&handle, EngineState::Error);
+            state.remove_engine("repeat").expect("remove failed engine");
+        }
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), 6);
+        for instance in events.as_chunks::<3>().0 {
+            assert_eq!(instance[0].line, "engine repeat registered");
+            assert!(instance[1].line.starts_with("engine repeat failed ("));
+            assert_eq!(instance[2].line, "engine repeat stopped");
+        }
     }
 
     #[test]

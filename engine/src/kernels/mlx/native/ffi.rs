@@ -105,6 +105,12 @@ unsafe extern "C" {
     /// The OS page size in bytes, or 0 when the query fails.
     #[link_name = "inference_page_size"]
     pub(super) fn inference_page_size() -> usize;
+    #[link_name = "inference_mlx_start_memory_pressure"]
+    pub(super) fn mlx_start_memory_pressure() -> i32;
+    #[link_name = "inference_mlx_memory_pressure"]
+    pub(super) fn mlx_memory_pressure() -> u32;
+    #[link_name = "inference_mlx_process_io"]
+    pub(super) fn mlx_process_io(read_bytes: *mut u64, peak_bytes: *mut u64) -> i32;
     #[cfg(test)]
     #[link_name = "inference_mlx_process_rss_bytes"]
     pub(super) fn mlx_process_rss_bytes(bytes: *mut u64) -> i32;
@@ -123,6 +129,7 @@ unsafe extern "C" {
     pub(super) fn mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     #[link_name = "inference_mlx_reset_peak_memory"]
     pub(super) fn mlx_reset_peak_memory() -> i32;
+    #[cfg(test)]
     #[link_name = "inference_mlx_row_invariant_products"]
     pub(super) fn mlx_row_invariant_products() -> bool;
     #[link_name = "inference_mlx_set_row_invariant_products"]
@@ -617,6 +624,27 @@ unsafe extern "C" {
         u_in: mlx_array,
         dims: *const i32,
         source: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
+    #[link_name = "inference_mlx_inkling_expert_kernel"]
+    pub(super) fn mlx_inkling_expert_kernel(
+        output: *mut mlx_array,
+        projected: mlx_array,
+        route_weights: mlx_array,
+        dims: *const i32,
+        source: *const c_char,
+        header: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
+    #[link_name = "inference_mlx_inkling_gguf"]
+    pub(super) fn mlx_inkling_gguf(
+        output: *mut mlx_array,
+        activation: mlx_array,
+        payload: mlx_array,
+        codes: mlx_array,
+        dims: *const i32,
+        source: *const c_char,
+        header: *const c_char,
         stream: mlx_stream,
     ) -> i32;
     /// The router_topk fused kernel (Q36 decode MoE): the stable top-k selection and

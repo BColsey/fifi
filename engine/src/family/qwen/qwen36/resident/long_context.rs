@@ -1317,7 +1317,6 @@ fn long_context_prompts() {
 /// server uses, except for the levers of the table above.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mac {
-    use super::super::super::settings::{KvDtype, chunked_prefill_allowed, kv_dtype_name};
     use super::super::chunk_plan::{ChunkCost, PrefillTerms, admitted_chunk};
     use super::super::decode_timing::required_activation_from_env;
     use super::super::decoder::{ResidentDecoder, StepMode};
@@ -1330,6 +1329,7 @@ mod mac {
     };
     use super::super::within_mode::env_number;
     use super::*;
+    use crate::family::qwen::qwen36::settings::{KvDtype, chunked_prefill_allowed, kv_dtype_name};
     use crate::{
         EngError,
         family::{

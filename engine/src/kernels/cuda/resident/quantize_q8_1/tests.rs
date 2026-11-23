@@ -21,7 +21,7 @@
 //! column may be flushed to zero by `-ftz` (a legal fast-math outcome): the test accepts the
 //! flushed result or the invariants, and reports which it saw.
 
-use super::{QuantizeCall, q8_1_bytes, quantize_needs};
+use super::{MAX_ROWS, QuantizeCall, q8_1_bytes, quantize_needs};
 use crate::EngError;
 use crate::kernels::cuda::resident::matvec_q::tests::{Owner, assert_bad_request};
 use crate::kernels::cuda::testkit;
@@ -84,7 +84,7 @@ fn chunked_rows_match_single_row_and_reject_cross_chunk_overlap() {
     let stream = ctx.stream().unwrap();
     let k = 288;
     let qrow = q8_1_bytes(k, 1).unwrap();
-    for n in [1, 8, 9, 10, 17] {
+    for n in [1, 8, 9, 10, 17, MAX_ROWS, MAX_ROWS + 1, MAX_ROWS * 2 + 1] {
         let x: Vec<f32> = (0..k * n)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
             .collect();
@@ -119,14 +119,14 @@ fn chunked_rows_match_single_row_and_reject_cross_chunk_overlap() {
             "{n} rows"
         );
     }
-    let n = 10;
+    let n = MAX_ROWS + 1;
     let x_bytes = k * n * 4;
     let shared = testkit::upload_filled(&ctx, 0xA5, x_bytes + n * qrow);
     let result = ctx.quantize_q8_1_rows(
         &stream,
         QuantizeCall {
             x: shared.range(0, x_bytes).unwrap(),
-            y: shared.range(k * 8 * 4, n * qrow).unwrap(),
+            y: shared.range(k * MAX_ROWS * 4, n * qrow).unwrap(),
             k,
             ncols: n,
         },
@@ -393,13 +393,13 @@ fn quantize_rejects_unsound_calls_before_launching() {
         ),
         (
             "no columns",
-            "takes 1 to 8 rows",
+            "takes 1 to 64 rows",
             Spec { ncols: 0, ..VALID },
         ),
         (
-            "nine columns",
-            "takes 1 to 8 rows",
-            Spec { ncols: 9, ..VALID },
+            "sixty-five columns",
+            "takes 1 to 64 rows",
+            Spec { ncols: 65, ..VALID },
         ),
         (
             "k that overflows the byte count",

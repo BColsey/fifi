@@ -194,6 +194,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
         let out = st.prefill(self, toks, context_limit);
         self.record_prefill_piece(toks.len(), began);
         self.pump_disk_prefill();
+        self.mark_prefill_vram(toks.len());
         out
     }
 
@@ -217,10 +218,13 @@ impl ExecutorOps for QwenResidentStep<'_> {
         };
         self.log_prefill_job();
         let Some(mut speculator) = self.speculator.take() else {
-            return st.decode(self, generation, &limits);
+            let batch = st.decode(self, generation, &limits);
+            self.mark_free_vram("a decode batch");
+            return batch;
         };
         let batch = speculator.decode(st, self, generation, &limits);
         self.speculator = Some(speculator);
+        self.mark_free_vram("a speculative decode batch");
         batch
     }
 
@@ -333,7 +337,7 @@ impl QwenResidentStep<'_> {
     /// only this body — exactly like the Mac glue.
     /// Writes the one prefill line of a job, once: the first decode after the prefill, or
     /// the next reset when no decode ran.
-    fn log_prefill_job(&mut self) {
+    pub(super) fn log_prefill_job(&mut self) {
         // A session that has not fed a row yet has nothing to report: an empty line at the
         // first reset would name no path and no pieces.
         if self.last_prefill_report().feed_rows_calls().is_empty() {

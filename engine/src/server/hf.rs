@@ -368,7 +368,14 @@ pub(crate) struct HfHub {
     chunk_bytes: u64,
     chunk_timeout: Duration,
     free_space: FreeSpaceFn,
+    /// The server's event-ring tap, wired by `AppState::wire_hub_events`:
+    /// download lifecycle lines for `GET /v1/logs`. `None` in tests that
+    /// never wire it.
+    event_logger: Mutex<Option<EventTap>>,
 }
+
+/// The signature of the server's event-ring tap.
+type EventTap = Box<dyn Fn(&str) + Send + Sync>;
 
 type FreeSpaceFn = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
@@ -404,6 +411,36 @@ const CHUNK_RETRIES: usize = 2;
 /// file and fetches it again.
 const FILE_ATTEMPTS: usize = 3;
 
+/// The most bytes read of one hub API answer: a repo listing with thousands of files is a few
+/// MiB; a larger answer is not one.
+const API_BODY_LIMIT: u64 = 16 << 20;
+
+/// The first read of a GGUF header: most headers (metadata and tensor table) are inside it; a
+/// longer one is read again with four times the length, up to the cap.
+const HEADER_PROBE_BYTES: u64 = 8 << 20;
+const HEADER_CAP_BYTES: u64 = 256 << 20;
+
+/// The bytes at the start of a `size`-byte GGUF file that hold its complete header, from
+/// `read(length)`, which returns the first `length` bytes: a read of growing length until the
+/// header parses.
+pub(crate) fn read_gguf_header(
+    name: &str,
+    size: u64,
+    read: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let mut length = HEADER_PROBE_BYTES.min(size);
+    loop {
+        let bytes = read(length)?;
+        if crate::weights::GgufHeader::from_bytes(&bytes, size, HEADER_CAP_BYTES).is_ok() {
+            return Ok(bytes);
+        }
+        if length >= size || length >= HEADER_CAP_BYTES {
+            return Err(format!("{name} has no readable GGUF header"));
+        }
+        length = (length * 4).min(size).min(HEADER_CAP_BYTES);
+    }
+}
+
 /// The directory the hub stores inside a repo that no client wants:
 /// xet bookkeeping, not model data.
 const SKIPPED_PREFIX: &str = ".cache/";
@@ -412,6 +449,12 @@ const SKIPPED_PREFIX: &str = ".cache/";
 /// filled: the snapshot is not servable until the job removes it.
 fn incomplete_marker(repo_dir: &Path, commit: &str) -> PathBuf {
     repo_dir.join(format!(".fifi-incomplete-{commit}"))
+}
+
+/// A name no other job of any process shares: job ids count from the process's start time, so
+/// two processes started in one millisecond would repeat them.
+fn job_tag(job: &Job) -> String {
+    format!("{}-{}", std::process::id(), job.id)
 }
 
 fn unix_millis() -> u64 {
@@ -500,12 +543,17 @@ impl HfHub {
             env!("CARGO_PKG_VERSION"),
             " (hub bridge)"
         );
+        // An https hub never redirects a read to plain http; a configured http endpoint (a
+        // mirror on loopback) is the user's own choice.
+        let https_only = !endpoint.starts_with("http://");
         let api: ureq::Agent = ureq::Agent::config_builder()
+            .https_only(https_only)
             .timeout_global(Some(API_TIMEOUT))
             .user_agent(user_agent)
             .build()
             .into();
         let downloader: ureq::Agent = ureq::Agent::config_builder()
+            .https_only(https_only)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(chunk_timeout))
             .user_agent(user_agent)
@@ -526,7 +574,34 @@ impl HfHub {
             chunk_bytes: chunk_bytes.max(1),
             chunk_timeout,
             free_space,
+            event_logger: Mutex::new(None),
         }
+    }
+
+    /// Install the tap the server's event ring reads. The hub never
+    /// holds the ring itself, only this closure.
+    pub(crate) fn set_event_logger(&self, tap: impl Fn(&str) + Send + Sync + 'static) {
+        *self.event_logger.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(tap));
+    }
+    pub(super) fn emit(&self, line: &str) {
+        if let Some(tap) = self
+            .event_logger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            tap(line);
+        }
+    }
+
+    /// The free bytes under the cache directory, as the downloads see them; `None` when unknown.
+    pub(crate) fn free_bytes(&self) -> Option<u64> {
+        (self.free_space)(&self.hub_dir)
+    }
+
+    /// The cache directory this bridge writes into.
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.hub_dir
     }
 
     /// The cached snapshot of one repo's `main` ref in this bridge's cache.
@@ -544,9 +619,17 @@ impl HfHub {
         match request.call() {
             Ok(mut response) => {
                 let mut text = String::new();
-                let _ = response.body_mut().as_reader().read_to_string(&mut text);
-                serde_json::from_str(&text)
-                    .map_err(|error| format!("hub answer is not JSON: {error}"))
+                let _ = response
+                    .body_mut()
+                    .as_reader()
+                    .take(API_BODY_LIMIT)
+                    .read_to_string(&mut text);
+                serde_json::from_str(&text).map_err(|error| {
+                    format!(
+                        "hub answer is not JSON (or longer than {} MiB): {error}",
+                        API_BODY_LIMIT >> 20
+                    )
+                })
             }
             Err(ureq::Error::StatusCode(code)) => Err(format!("hub returned {code}")),
             Err(error) => Err(format!("hub unreachable: {error}")),
@@ -608,7 +691,7 @@ impl HfHub {
     pub(crate) fn tree(&self, repo: &str, revision: &str) -> Result<Tree, String> {
         let info = self.api_get(&format!(
             "/api/models/{}?revision={}",
-            urlencode(repo),
+            urlencode_path(repo),
             urlencode(revision)
         ))?;
         let commit = info
@@ -639,7 +722,7 @@ impl HfHub {
         let listing = self
             .api_get(&format!(
                 "/api/models/{}/tree/{}?recursive=true",
-                urlencode(repo),
+                urlencode_path(repo),
                 urlencode(revision)
             ))
             .map_err(|error| format!("the file sizes could not be read: {error}"))?;
@@ -689,7 +772,7 @@ impl HfHub {
     /// The local cache as the GUI shows it: every `models--*`
     /// directory with its refs, snapshot paths, blob bytes, and the
     /// family each complete snapshot would start as.
-    pub(crate) fn cache(&self) -> serde_json::Value {
+    pub(crate) fn cache(&self, supervised: bool) -> serde_json::Value {
         let mut models: Vec<serde_json::Value> = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.hub_dir) else {
             return serde_json::json!({ "hub_dir": self.hub_dir.display().to_string(), "models": models });
@@ -716,7 +799,7 @@ impl HfHub {
                 "repo": repo,
                 "bytes": dir_bytes(&dir.join("blobs")),
                 "refs": ref_list(&dir.join("refs")),
-                "snapshots": snapshot_list(&dir),
+                "snapshots": snapshot_list(&dir, supervised),
             }));
         }
         serde_json::json!({
@@ -762,8 +845,23 @@ impl HfHub {
         repo: &str,
         revision: &str,
     ) -> Result<Arc<Job>, String> {
+        self.start_download_selected(repo, revision, &|_| true)
+    }
+
+    /// Like [`Self::start_download`], for the files of the revision that `select` keeps: the files
+    /// one serve loads, not the whole repo.
+    pub(crate) fn start_download_selected(
+        self: &Arc<Self>,
+        repo: &str,
+        revision: &str,
+        select: &dyn Fn(&HubFile) -> bool,
+    ) -> Result<Arc<Job>, String> {
         self.check_slots(repo, revision)?;
-        let tree = self.tree(repo, revision)?;
+        let mut tree = self.tree(repo, revision)?;
+        tree.files.retain(|file| select(file));
+        if tree.files.is_empty() {
+            return Err(format!("{repo} has no file that matches"));
+        }
         let repo_dir = repo_cache_dir(&self.hub_dir, repo);
         let snapshot_dir = repo_dir.join("snapshots").join(&tree.commit);
         let blobs_dir = repo_dir.join("blobs");
@@ -849,6 +947,64 @@ impl HfHub {
             .sum()
     }
 
+    /// The first bytes of one file of a commit that hold its complete GGUF header: a ranged read
+    /// of growing length until the header parses. The caller plans against the real header
+    /// without downloading the weights.
+    pub(crate) fn gguf_header_bytes(
+        &self,
+        repo: &str,
+        commit: &str,
+        file: &HubFile,
+    ) -> Result<Vec<u8>, String> {
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            self.endpoint,
+            repo,
+            commit,
+            urlencode_path(&file.path)
+        );
+        read_gguf_header(&file.path, file.size, &mut |length| {
+            chunk_request(
+                &self.downloader,
+                self.token.as_deref(),
+                &url,
+                0,
+                length,
+                length == file.size,
+            )
+        })
+    }
+
+    /// Runs one selected download to its end on the calling thread, handing the live state to
+    /// `progress` about once a second. Returns the snapshot directory when every selected file
+    /// is whole and linked; the cause when the job failed or was cancelled. An interrupted run
+    /// leaves resumable partials that the next call continues.
+    pub(crate) fn download_and_wait(
+        self: &Arc<Self>,
+        repo: &str,
+        revision: &str,
+        select: &dyn Fn(&HubFile) -> bool,
+        progress: &mut dyn FnMut(&JobState),
+    ) -> Result<PathBuf, String> {
+        let job = self.start_download_selected(repo, revision, select)?;
+        let mut last = std::time::Instant::now() - Duration::from_secs(2);
+        loop {
+            let state = job.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match state {
+                JobState::Downloading { .. } => {
+                    if last.elapsed() >= Duration::from_secs(1) {
+                        progress(&state);
+                        last = std::time::Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                JobState::Done { path, .. } => return Ok(path),
+                JobState::Cancelled => return Err("the download was cancelled".to_string()),
+                JobState::Failed(cause) => return Err(cause),
+            }
+        }
+    }
+
     /// Asks a running job to stop; a finished job answers what it
     /// finished as. The thread notices at its next chunk wait.
     pub(crate) fn cancel(&self, id: u64) -> CancelOutcome {
@@ -879,6 +1035,7 @@ impl HfHub {
         match self.run_job_inner(job) {
             Ok(()) => {}
             Err(cause) if cause == CANCELLED => {
+                self.emit(&format!("download {} cancelled", job.repo));
                 *job.state.lock().unwrap_or_else(|e| e.into_inner()) = JobState::Cancelled;
             }
             Err(cause) => {
@@ -886,6 +1043,7 @@ impl HfHub {
                 // A cancellation that loses the race to the error path
                 // stays a cancellation, not a failure.
                 if state.is_active() {
+                    self.emit(&format!("download {} failed", job.repo));
                     *state = JobState::Failed(cause);
                 }
             }
@@ -893,6 +1051,11 @@ impl HfHub {
     }
 
     fn run_job_inner(&self, job: &Job) -> Result<(), String> {
+        self.emit(&format!(
+            "download {} started: {} files",
+            job.repo,
+            job.files.len()
+        ));
         let repo_dir = repo_cache_dir(&self.hub_dir, &job.repo);
         let snapshot_dir = repo_dir.join("snapshots").join(&job.commit);
         let blobs_dir = repo_dir.join("blobs");
@@ -918,12 +1081,17 @@ impl HfHub {
             let refs = repo_dir.join("refs");
             std::fs::create_dir_all(&refs)
                 .map_err(|error| format!("cannot create {}: {error}", refs.display()))?;
-            let tmp = refs.join(format!(".job{}.tmp", job.id));
+            let tmp = refs.join(format!(".job{}.tmp", job_tag(job)));
             std::fs::write(&tmp, &job.commit)
                 .and_then(|_| std::fs::rename(&tmp, refs.join(&job.revision)))
                 .map_err(|error| format!("cannot record the ref: {error}"))?;
         }
         let _ = std::fs::remove_file(&marker);
+        self.emit(&format!(
+            "download {} finished: {:.1} MiB",
+            job.repo,
+            bytes_done as f64 / (1024.0 * 1024.0)
+        ));
         let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
         *state = JobState::Done {
             commit: job.commit.clone(),
@@ -954,11 +1122,17 @@ impl HfHub {
         if link.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&link);
         }
+        // One writer per blob: another process or job fetching the same hash waits here, then
+        // finds the blob placed and takes it.
+        let _lock = match file.sha256.as_deref() {
+            Some(sha) => Some(lock_blob(job, blobs_dir, sha)?),
+            None => None,
+        };
         let blob = match file.sha256.as_deref() {
             Some(sha) if blob_has_size(&blobs_dir.join(sha), file.size) => sha.to_string(),
             _ => self.fetch_verified(job, file, blobs_dir, bytes_before)?,
         };
-        place_link(&link, &file.path, &blob, job.id)
+        place_link(&link, &file.path, &blob, &job_tag(job))
     }
 
     /// Fetches one file into `blobs/` and returns its blob name, the
@@ -972,7 +1146,13 @@ impl HfHub {
         blobs_dir: &Path,
         bytes_before: u64,
     ) -> Result<String, String> {
-        let part = blobs_dir.join(format!(".{}.part", job.id));
+        // A file whose hash the hub states keeps its partial under that hash: a later run, in
+        // this process or another, continues it. A file with no stated hash restarts.
+        let resumable = file.sha256.is_some();
+        let part = match &file.sha256 {
+            Some(sha) => blobs_dir.join(format!("{sha}.incomplete")),
+            None => blobs_dir.join(format!(".{}.part", job_tag(job))),
+        };
         let mut last = String::new();
         for _ in 0..FILE_ATTEMPTS {
             set_bytes(job, bytes_before, &file.path);
@@ -1001,7 +1181,9 @@ impl HfHub {
                     return Ok(hash);
                 }
                 Err(cause) => {
-                    let _ = std::fs::remove_file(&part);
+                    if !resumable {
+                        let _ = std::fs::remove_file(&part);
+                    }
                     if cause == CANCELLED {
                         return Err(cause);
                     }
@@ -1028,10 +1210,38 @@ impl HfHub {
             job.commit,
             urlencode_path(&file.path)
         );
-        let mut out = std::fs::File::create(part)
-            .map_err(|error| format!("cannot create {}: {error}", part.display()))?;
         let mut hasher = sha2::Sha256::new();
         let mut offset = 0_u64;
+        // Bytes an earlier pass left in a resumable partial are hashed again and kept; a partial
+        // longer than the file is not one of its prefixes and starts over.
+        let kept = if file.sha256.is_some() {
+            std::fs::metadata(part).map_or(0, |meta| meta.len())
+        } else {
+            0
+        };
+        let mut out = if kept > 0 && kept <= file.size {
+            let mut earlier = std::fs::File::open(part)
+                .map_err(|error| format!("cannot read {}: {error}", part.display()))?;
+            let mut buffer = vec![0_u8; 1 << 20];
+            loop {
+                let read = earlier
+                    .read(&mut buffer)
+                    .map_err(|error| format!("cannot read {}: {error}", part.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                offset += read as u64;
+            }
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(part)
+                .map_err(|error| format!("cannot append to {}: {error}", part.display()))?
+        } else {
+            std::fs::File::create(part)
+                .map_err(|error| format!("cannot create {}: {error}", part.display()))?
+        };
+        job.written.fetch_add(offset, Ordering::Relaxed);
         while offset < file.size {
             let length = self.chunk_bytes.min(file.size - offset);
             let mut tries = 0;
@@ -1192,6 +1402,33 @@ fn link_resolves_to(link: &Path, size: u64) -> bool {
     std::fs::metadata(link).is_ok_and(|meta| meta.is_file() && meta.len() == size)
 }
 
+/// An exclusive advisory lock on `.locks/<sha>.lock` beside `blobs/`, held until the returned file drops. The wait
+/// polls, so a cancelled job leaves it.
+fn lock_blob(job: &Job, blobs_dir: &Path, sha: &str) -> Result<std::fs::File, String> {
+    let dir = blobs_dir.parent().unwrap_or(blobs_dir).join(".locks");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join(format!("{sha}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    loop {
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(file),
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                if job.cancel.load(Ordering::SeqCst) {
+                    return Err(CANCELLED.to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("cannot lock {}: {error}", path.display())),
+        }
+    }
+}
+
 fn blob_has_size(blob: &Path, size: u64) -> bool {
     std::fs::metadata(blob).is_ok_and(|meta| meta.is_file() && meta.len() == size)
 }
@@ -1211,7 +1448,7 @@ fn file_present(snapshot_dir: &Path, blobs_dir: &Path, file: &HubFile) -> bool {
 /// temporary name beside it and renamed over the final name, so a
 /// reader sees the old state or the new one and two writers of the same
 /// file cannot leave a half state.
-fn place_link(link: &Path, path: &str, blob: &str, job_id: u64) -> Result<(), String> {
+fn place_link(link: &Path, path: &str, blob: &str, job_id: &str) -> Result<(), String> {
     let parent = link
         .parent()
         .ok_or_else(|| format!("{} has no directory", link.display()))?;
@@ -1373,6 +1610,12 @@ fn ref_list(refs_dir: &Path) -> Vec<serde_json::Value> {
 }
 
 /// True when every link under `dir` resolves to a file.
+/// Whether a snapshot of a repo is whole: no marker of a fill in progress, and every link in it
+/// reaches a blob.
+pub(crate) fn snapshot_complete(repo_dir: &Path, commit: &str, snapshot: &Path) -> bool {
+    !incomplete_marker(repo_dir, commit).exists() && links_resolve(snapshot)
+}
+
 fn links_resolve(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -1401,7 +1644,10 @@ fn links_resolve(dir: &Path) -> bool {
 /// complete, and, when it is, the family `serve --model` would start
 /// it as and the memory the planner estimates for it. A snapshot is
 /// complete when no job is still filling it and every link resolves.
-fn snapshot_list(repo_dir: &Path) -> Vec<serde_json::Value> {
+/// Under `supervised_engines` a Flash-Next pack, which `serve --model`
+/// cannot start, is servable as well; the planner makes no estimate
+/// for it.
+fn snapshot_list(repo_dir: &Path, supervised: bool) -> Vec<serde_json::Value> {
     let Ok(entries) = std::fs::read_dir(repo_dir.join("snapshots")) else {
         return Vec::new();
     };
@@ -1412,9 +1658,14 @@ fn snapshot_list(repo_dir: &Path) -> Vec<serde_json::Value> {
             let commit = entry.file_name().into_string().ok()?;
             let path = entry.path();
             let gguf = gguf_files(&path);
-            let complete = !incomplete_marker(repo_dir, &commit).exists() && links_resolve(&path);
+            let complete = snapshot_complete(repo_dir, &commit, &path);
             let family = if complete {
                 super::model_serve::servable_family(&path).ok()
+            } else {
+                None
+            };
+            let pack = if complete && supervised && family.is_none() {
+                super::model_serve::flash_next_family(&path)
             } else {
                 None
             };
@@ -1436,8 +1687,8 @@ fn snapshot_list(repo_dir: &Path) -> Vec<serde_json::Value> {
                 "path": path.display().to_string(),
                 "gguf": gguf,
                 "complete": complete,
-                "servable": family.is_some(),
-                "families": family.iter().collect::<Vec<_>>(),
+                "servable": family.is_some() || pack.is_some(),
+                "families": family.as_deref().into_iter().chain(pack).collect::<Vec<_>>(),
             });
             if let Some(estimate) = estimate {
                 row["estimate"] = estimate;
@@ -1523,7 +1774,8 @@ pub(crate) struct SearchParams {
 /// GET /v1/hf/cache — the local hub cache.
 pub(crate) async fn cache(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let hub = Arc::clone(state.hf());
-    let listing = tokio::task::spawn_blocking(move || hub.cache())
+    let supervised = state.supervised_engines();
+    let listing = tokio::task::spawn_blocking(move || hub.cache(supervised))
         .await
         .unwrap_or_else(
             |error| serde_json::json!({ "error": format!("cache scan failed: {error}") }),

@@ -1,6 +1,15 @@
 import { test } from "node:test";
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { coerceSettings, defaultSettings, newChatRecord, newUiMessage } from "./store.js";
+import {
+  coerceSettings,
+  defaultSettings,
+  loadApiKey,
+  loadSettings,
+  newChatRecord,
+  newUiMessage,
+  saveApiKey,
+  saveSettings,
+} from "./store.js";
 
 test("chat and message IDs work when randomUUID is unavailable on LAN HTTP", () => {
   const original = Object.getOwnPropertyDescriptor(globalThis, "crypto");
@@ -40,7 +49,6 @@ const baseDrawer = {
 
 test("valid stored settings pass through unchanged", () => {
   const raw = {
-    apiKey: "sk-1",
     theme: "dark",
     model: "fifi-8b",
     drawer: {
@@ -54,7 +62,6 @@ test("valid stored settings pass through unchanged", () => {
     },
   };
   deepStrictEqual(coerceSettings(raw), {
-    apiKey: "sk-1",
     theme: "dark",
     model: "fifi-8b",
     drawer: {
@@ -71,7 +78,6 @@ test("valid stored settings pass through unchanged", () => {
 
 test("a wrong-typed field falls back to its default", () => {
   const out = coerceSettings({
-    apiKey: 42,
     theme: "blue",
     model: null,
     drawer: {
@@ -99,7 +105,6 @@ test("null stored values yield the defaults instead of throwing", () => {
 
 test("an array is never treated as a settings object", () => {
   const root = Object.assign(["junk"], {
-    apiKey: "sk-1",
     drawer: { ...baseDrawer },
   });
   deepStrictEqual(coerceSettings(root), defaultSettings);
@@ -169,6 +174,35 @@ test("the exact contract boundary values are accepted", () => {
   const upper = coerceSettings({ drawer: { ...baseDrawer, temperature: 2, topP: 1 } });
   strictEqual(upper.drawer.temperature, 2);
   strictEqual(upper.drawer.topP, 1);
+});
+
+test("the API key is kept in memory and never reaches storage", () => {
+  const written: string[] = [];
+  const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: () =>
+        JSON.stringify({ theme: "dark", model: "fifi-8b", apiKey: "sk-old", drawer: baseDrawer }),
+      setItem: (_name: string, value: string) => written.push(value),
+    },
+  });
+  try {
+    saveApiKey("");
+    const settings = loadSettings();
+    strictEqual(settings.theme, "dark");
+    strictEqual("apiKey" in settings, false);
+    strictEqual(written.length, 1);
+    ok(!written[0]?.includes("sk-old"));
+    strictEqual(loadApiKey(), "");
+    saveApiKey("sk-1");
+    strictEqual(loadApiKey(), "sk-1");
+    saveSettings({ ...loadSettings(), model: "fifi-9b" });
+    ok(written.every((text) => !text.includes("sk-1")));
+  } finally {
+    if (original) Object.defineProperty(globalThis, "localStorage", original);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
 });
 
 test("recordTrace coerces strictly: only true is true", () => {

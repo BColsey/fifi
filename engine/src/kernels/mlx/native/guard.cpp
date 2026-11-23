@@ -19,9 +19,8 @@
 #include <mutex>
 #include <unistd.h>
 #include <mach/mach.h>
-#ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <libproc.h>
-#endif
+#include <dispatch/dispatch.h>
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <atomic>
@@ -376,6 +375,51 @@ extern "C" size_t inference_page_size() noexcept {
   return size > 0 ? static_cast<size_t>(size) : 0;
 }
 
+// Process-lifetime source and state. The callback has no model, stream or Rust
+// pointer to release during engine shutdown, and never calls the MLX adapter.
+static std::atomic<unsigned int> memory_pressure_high_water{0};
+
+extern "C" int inference_mlx_start_memory_pressure() noexcept {
+  static const dispatch_source_t source = []() noexcept -> dispatch_source_t {
+    dispatch_source_t result = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (result == nullptr) return nullptr;
+    dispatch_set_context(result, result);
+    dispatch_source_set_event_handler_f(result, [](void* context) noexcept {
+      const unsigned long flags =
+          dispatch_source_get_data(static_cast<dispatch_source_t>(context));
+      const unsigned int severity = (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) ? 2u
+          : (flags & DISPATCH_MEMORYPRESSURE_WARN) ? 1u : 0u;
+      // Event handlers for this single source do not run concurrently.
+      if (severity > memory_pressure_high_water.load(std::memory_order_relaxed)) {
+        memory_pressure_high_water.store(severity, std::memory_order_relaxed);
+      }
+    });
+    dispatch_resume(result);
+    return result;
+  }();
+  return source == nullptr ? 1 : 0;
+}
+
+extern "C" unsigned int inference_mlx_memory_pressure() noexcept {
+  return memory_pressure_high_water.load(std::memory_order_relaxed);
+}
+
+// Kernel-attributed disk reads and process-lifetime peak physical footprint.
+extern "C" int inference_mlx_process_io(std::uint64_t* read_bytes,
+                                       std::uint64_t* peak_bytes) noexcept {
+  rusage_info_v4 usage{};
+  const int status = proc_pid_rusage(getpid(), RUSAGE_INFO_V4,
+                                     reinterpret_cast<rusage_info_t*>(&usage));
+  if (status == 0) {
+    *read_bytes = usage.ri_diskio_bytesread;
+    *peak_bytes = usage.ri_lifetime_max_phys_footprint;
+  }
+  return status;
+}
+
 extern "C" int inference_mlx_process_rss_bytes(std::uint64_t* bytes) noexcept {
   mach_task_basic_info_data_t info{};
   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
@@ -478,8 +522,8 @@ extern "C" int inference_mlx_async_eval(const mlx_vector_array outputs) noexcept
 // One row meets a weight through the same tiled kernel a window of rows does: the row is stacked
 // with a copy of itself and the first result row is kept. The one-row (vector) kernel adds in
 // another order than the tiled one, so without this a row's result depends on whether it shares
-// its step with another row. A decoder that decodes windows turns it on for its engine thread
-// before it traces anything.
+// its step with another row. A decoder turns it on for its engine thread before it traces
+// anything and the context turns it off again when it drops.
 static thread_local bool one_row_products_tiled = false;
 
 extern "C" void inference_mlx_set_row_invariant_products(bool on) noexcept {
@@ -498,7 +542,7 @@ extern "C" int inference_mlx_quantized_matmul(
     mlx_optional_int bits, const char* mode, mlx_stream stream) noexcept {
   return run_selected_operation(result, stream, [&] {
     if (one_row_products_are_tiled() && mlx_array_ndim(activation) == 2 &&
-        mlx_array_shape(activation)[0] == 1) {
+        mlx_array_ndim(weight) == 2 && mlx_array_shape(activation)[0] == 1) {
       mlx_vector_array parts = mlx_vector_array_new();
       mlx_vector_array_append_value(parts, activation);
       mlx_vector_array_append_value(parts, activation);
@@ -1905,6 +1949,100 @@ extern "C" int inference_mlx_act_mul(
   });
 }
 
+// Inkling's activations and ordered expert merge share this launcher.
+// dims contains rows, width, work items, picks, and quantizer (0/1/2).
+extern "C" int inference_mlx_inkling_expert_kernel(
+    mlx_array* output, mlx_array projected, mlx_array route_weights, const int* dims,
+    const char* source, const char* header, mlx_stream stream) noexcept {
+  return run_selected_operation(output, stream, [&] {
+    const bool gated = route_weights.ctx != nullptr;
+    const bool nvfp4 = dims[4] == 1;
+    const bool mxfp8 = dims[4] == 2;
+    const bool quantized = nvfp4 || mxfp8;
+    const char* input_names[] = {"projected", "n_items", "route_weights"};
+    const char* output_names[] = {"result"};
+    const size_t input_count = gated || quantized ? 3 : 2;
+    mlx_vector_string in_names = mlx_vector_string_new_data(input_names, input_count);
+    mlx_vector_string out_names = mlx_vector_string_new_data(output_names, 1);
+    const char* kernel_name = nvfp4 ? "inkling_nvfp4_activation"
+        : mxfp8 ? "inkling_mxfp8_activation"
+        : gated ? "inkling_capped_activation" : "inkling_expert_merge";
+    mlx_fast_metal_kernel kernel = mlx_fast_metal_kernel_new(
+        kernel_name, in_names, out_names, source, header, true, false);
+    mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
+    mlx_array n_items = mlx_array_new_int(dims[2]);
+    // The raw-input kernel's false GATED template never reads its third operand.
+    const mlx_array operands[] = {projected, n_items, gated ? route_weights : projected};
+    mlx_vector_array inputs = mlx_vector_array_new_data(operands, input_count);
+    mlx_vector_array outputs = mlx_vector_array_new();
+    const int output_shape[] = {dims[0], gated ? 1 : dims[1], dims[1]};
+    int status = (in_names.ctx && out_names.ctx && kernel.ctx && config.ctx &&
+                  n_items.ctx && inputs.ctx && outputs.ctx) ? 0 : 1;
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_output_arg(
+        config, output_shape, gated ? 3 : 2, MLX_FLOAT32);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_grid(
+        config, nvfp4 ? 128 : dims[2], nvfp4 ? dims[0] : 1, 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_thread_group(
+        config, quantized ? 128 : 64, 1, 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "WIDTH", dims[1]);
+    if (status == 0 && quantized) status =
+        mlx_fast_metal_kernel_config_add_template_arg_int(config, "GATED", gated ? 1 : 0);
+    if (status == 0 && !gated && !quantized) status =
+        mlx_fast_metal_kernel_config_add_template_arg_int(config, "PICKS", dims[3]);
+    if (status == 0) status = mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+    if (status == 0 && mlx_vector_array_size(outputs) != 1) status = 1;
+    if (status == 0) status = mlx_vector_array_get(output, outputs, 0);
+    int released = mlx_vector_array_free(outputs);
+    released |= mlx_vector_array_free(inputs);
+    released |= mlx_array_free(n_items);
+    mlx_fast_metal_kernel_config_free(config);
+    mlx_fast_metal_kernel_free(kernel);
+    released |= mlx_vector_string_free(out_names);
+    released |= mlx_vector_string_free(in_names);
+    return status != 0 ? status : released;
+  });
+}
+
+
+// dims describes [input width, output rows, packed row bytes, GGML type].
+extern "C" int inference_mlx_inkling_gguf(
+    mlx_array* output, mlx_array activation, mlx_array payload, mlx_array codes,
+    const int* dims, const char* source, const char* header, mlx_stream stream) noexcept {
+  return run_selected_operation(output, stream, [&] {
+    const char* input_names[] = {"activation", "payload", "codes"};
+    const char* output_names[] = {"result"};
+    mlx_vector_string in_names = mlx_vector_string_new_data(input_names, 3);
+    mlx_vector_string out_names = mlx_vector_string_new_data(output_names, 1);
+    mlx_fast_metal_kernel kernel = mlx_fast_metal_kernel_new(
+        "inkling_gguf_packed_matvec", in_names, out_names, source, header, true, false);
+    mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
+    // Q2_0 and NVFP4 never use the codebook input.
+    const mlx_array operands[] = {activation, payload, codes.ctx ? codes : payload};
+    mlx_vector_array inputs = mlx_vector_array_new_data(operands, 3);
+    mlx_vector_array outputs = mlx_vector_array_new();
+    const int shape[] = {1, dims[1]};
+    int status = (in_names.ctx && out_names.ctx && kernel.ctx && config.ctx &&
+                  inputs.ctx && outputs.ctx) ? 0 : 1;
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_output_arg(
+        config, shape, 2, MLX_FLOAT32);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_grid(config, 32, dims[1], 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "WIDTH", dims[0]);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "ROW_BYTES", dims[2]);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "FORMAT", dims[3]);
+    if (status == 0) status = mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+    if (status == 0 && mlx_vector_array_size(outputs) != 1) status = 1;
+    if (status == 0) status = mlx_vector_array_get(output, outputs, 0);
+    int released = mlx_vector_array_free(outputs);
+    released |= mlx_vector_array_free(inputs);
+    mlx_fast_metal_kernel_config_free(config);
+    mlx_fast_metal_kernel_free(kernel);
+    released |= mlx_vector_string_free(out_names);
+    released |= mlx_vector_string_free(in_names);
+    return status != 0 ? status : released;
+  });
+}
+
 
 // The router_topk fused kernel (Q36 decode MoE): the stable top-k selection of
 // one router probability row plus the renormalized gates in ONE launch,
@@ -2912,8 +3050,8 @@ static int compile_moe_lhs_index(int batch) noexcept {
 }
 
 // Builds one (rows, flat) pair of the persistent row-index operands for `batch` rows over
-// `top_k` experts. `rows` matches the clamped ids shape ([k] at B=1, [B,k] above) with the row
-// id broadcast along the experts; `flat` enumerates the B*k gathered rows in the same shape.
+// `top_k` experts. `rows` matches the clamped ids shape ([k] at B=1, read as [1,k] by the closure, [B,k] above)
+// with the row id broadcast along the experts; `flat` enumerates the B*k gathered rows in the same shape.
 // Both are evaluated, so the traced closures bind them as constants instead of replaying their
 // producers as kernels. Called only on a cache miss of the pair below. The values equal exactly what mlx_gather_qmm derives internally when
 // the lhs slot is null, so the gathers read the same indices as before.
@@ -3034,7 +3172,7 @@ static int compile_moe_lhs_for(
   return 0;
 }
 
-// Vectorized B>1 MoE. The single-row body below stays on its original op sequence.
+// Vectorized MoE for 1, 2, 4 and 8 rows; one row is the same graph as a window of one.
 // Row indices [B,1] broadcast against the once-clamped expert ids [B,k], so each gate/up
 // gather reads only that row's activation. The down input already has batch axes [B,k];
 // MLX's default lhs indices enumerate those pairs, matching the same expert ids [B,k].
@@ -3068,9 +3206,9 @@ static int compile_moe_rows(
   if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
   // The fused router top-k kernel replaces the eight selection and renorm ops below at the
   // decode contract (a multiple-of-32 expert count up to 1024 and top-k up to 32); the ids and
-  // the gates come out in the exact shapes and the same rank order, tie rule, and gate rounding
-  // as the op chain, for one row and for a window alike, so a row's gates do not depend on its
-  // window.
+  // the gates come out in the exact shapes and the same rank order and tie rule as the op chain
+  // (the gates within two units in the last place of it), for one row and for a window alike, so
+  // a row's gates do not depend on its window.
   const bool router_kernel =
       p->experts % 32 == 0 && p->experts <= 1024 && p->top_k <= 32;
   if (status == 0 && router_kernel) {
@@ -3210,11 +3348,10 @@ static int compile_moe_rows(
   return status != 0 ? status : release;
 }
 
-// The compiled device-routed MoE decode block body. B>1 dispatches to the row-vectorized
-// helper after argument collection; B=1 replays the original op sequence of
-// `engine/src/family/qwen/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`,
-// calling the same inference_mlx_* shims that the uncompiled Rust path calls, in the same
-// order. A stable
+// The compiled device-routed MoE decode block body. Every row count dispatches to the
+// row-vectorized helper after argument collection; its op order follows
+// `engine/src/family/qwen/qwen36/resident/moe.rs` `step_device`, `route_device`, and `combine`
+// and calls the same inference_mlx_* shims the uncompiled Rust path calls. A stable
 // ascending argsort of the negated probabilities keeps the lowest index first on ties, like the
 // host rule. The expert ids are clamped below the expert count ONCE per layer: the
 // top-probability take and the three gathered products share the one `mlx_minimum` node. The
@@ -3229,9 +3366,9 @@ static int compile_moe_rows(
 // scales, biases of the shared gate, up, and down weights; shared_scalar_t [H,1]; payload,
 // scales, biases of the gate, up, and down expert stacks (a null biases slot when the weight
 // has none); post_norm [H] (the folded post-attention RMS norm weight).
-// Output order (4), B=1: out [1,H] in the activation dtype (the folded residual sum);
-// ids [k] (U32, once-clamped);
-// gates [k,1,1] (F32); health [1] (F32). B>1: [B,H], [B,k], [B,k,1,1], [B].
+// Output order (4): out [B,H] in the activation dtype (the folded residual sum); ids [B,k]
+// (U32, once-clamped); gates [B,k,1,1] (F32); health [B] (F32). One row reports its route as
+// ids [k] and gates [k,1,1], the shapes its readers take.
 static int compile_moe_body(
     mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
   compile_moe_body_entries_.fetch_add(1, std::memory_order_relaxed);

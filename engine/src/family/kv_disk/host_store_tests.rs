@@ -410,16 +410,36 @@ fn an_opened_tier_takes_the_bound_the_plan_resolved() {
     }
 }
 
+/// Runs `body` with `host` as the facts the default budget reads, then restores the real ones.
+fn with_fake_host<T>(host: crate::family::mem::HostFacts, body: impl FnOnce() -> T) -> T {
+    use crate::family::mem::FAKE_HOST;
+    FAKE_HOST.with(|fake| *fake.borrow_mut() = Some(host));
+    let result = body();
+    FAKE_HOST.with(|fake| *fake.borrow_mut() = None);
+    result
+}
+
+fn fake_host(cgroup_remaining: Option<u64>) -> crate::family::mem::HostFacts {
+    crate::family::mem::HostFacts::from_meminfo(
+        "test",
+        "MemTotal: 67108864 kB\nMemAvailable: 62914560 kB\n",
+        cgroup_remaining,
+    )
+    .unwrap()
+}
+
 #[test]
 fn the_default_budget_leaves_out_what_the_engine_holds() {
-    let none = default_host_budget(0).expect("the machine's memory is known");
-    let held = default_host_budget(1 << 30).expect("the machine's memory is known");
-    assert_eq!(
-        none - held,
-        none.min(1 << 30),
-        "a host with less room leaves none"
-    );
-    assert_eq!(default_host_budget(u64::MAX), Some(0), "never below zero");
+    with_fake_host(fake_host(None), || {
+        let none = default_host_budget(0).expect("the machine's memory is known");
+        let held = default_host_budget(1 << 30).expect("the machine's memory is known");
+        assert_eq!(
+            none - held,
+            none.min(1 << 30),
+            "a host with less room leaves none"
+        );
+        assert_eq!(default_host_budget(u64::MAX), Some(0), "never below zero");
+    });
 }
 
 /// A vector-landed family that sets a planner budget, and one that keeps the trait default.
@@ -465,9 +485,11 @@ test_family!(Plain);
 #[test]
 fn a_family_budget_reaches_the_tier_through_the_shared_trait() {
     assert_eq!(HostFamily::host_budget(&Planned(77)), Some(77));
-    assert_eq!(
-        HostFamily::host_budget(&Plain),
-        default_host_budget(4_096),
-        "without a planner budget the trait default: the machine's, less what the family holds"
-    );
+    with_fake_host(fake_host(Some(12 << 30)), || {
+        assert_eq!(
+            HostFamily::host_budget(&Plain),
+            default_host_budget(4_096),
+            "without a planner budget the trait default: the machine's, less what the family holds"
+        );
+    });
 }

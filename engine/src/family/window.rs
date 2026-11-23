@@ -47,7 +47,16 @@ pub(crate) trait WindowRows: ExecutorOps {
     /// The `operation` of the `Backend` errors this family's rows raise.
     const OPERATION: &'static str;
 
-    /// Splits one session into its token side, its model side and the executor's limits.
+    /// Brings the model side of `session` to the row before the driver reads or changes it
+    /// (`split`, a feed). A family whose model side runs one session at a time exchanges the
+    /// session in here. A row that cannot be brought is refused alone, before its feed. The
+    /// default has nothing to do.
+    fn activate_row(&mut self, _session: &mut Self::Session) -> Result<()> {
+        Ok(())
+    }
+
+    /// Splits one session into its token side, its model side and the executor's limits. The
+    /// driver calls [`Self::activate_row`] for the session first whenever it reads the model side.
     fn split<'a>(
         &'a mut self,
         session: &'a mut Self::Session,
@@ -99,9 +108,10 @@ fn window_error(message: &str) -> EngError {
     }
 }
 
-fn fed_of<F: WindowRows>(family: &mut F, session: &mut F::Session) -> usize {
+fn fed_of<F: WindowRows>(family: &mut F, session: &mut F::Session) -> Result<usize> {
+    family.activate_row(session)?;
     let (_, step, _) = family.split(session);
-    step.fed()
+    Ok(step.fed())
 }
 
 fn pending_of<F: WindowRows>(family: &mut F, session: &mut F::Session) -> Result<u32> {
@@ -183,6 +193,7 @@ fn prepare_row<F: WindowRows>(
     generation: &mut GenerationState,
 ) -> Result<Prepared> {
     let token = pending_of(family, session)?;
+    family.activate_row(session)?;
     let ends = generation.cancel.load(Ordering::SeqCst) || generation.remaining_tokens() == Some(0);
     if !ends {
         family.check_row(&*session, token)?;
@@ -214,7 +225,7 @@ fn step_window<F: WindowRows>(
     let fed_before: Vec<usize> = admitted
         .iter()
         .map(|&slot| fed_of(family, &mut *sessions[slot]))
-        .collect();
+        .collect::<Result<_>>()?;
     // A request that records its draw needs the host walk, so its window takes the logits rows.
     let drawn_on_device = family.draws_on_device()
         && !admitted
@@ -240,7 +251,7 @@ fn step_window<F: WindowRows>(
     };
     // Record every consumed input before any result check or sampler can fail.
     for (&slot, &before) in admitted.iter().zip(&fed_before) {
-        let after = fed_of(family, &mut *sessions[slot]);
+        let after = fed_of(family, &mut *sessions[slot])?;
         let (core, _, _) = family.split(&mut *sessions[slot]);
         core.record_feed(before, after);
     }
@@ -291,6 +302,7 @@ fn publish_drawn<F: WindowRows>(
         ));
     }
     generation.sampler.record_device_draw(token);
+    family.activate_row(session)?;
     let (core, mut step, limits) = family.split(session);
     core.finish_decode_token(&mut step, generation, &limits, token)
 }
@@ -309,6 +321,7 @@ fn publish_row<F: WindowRows>(
             "a row returned a token outside the sampler vocabulary",
         ));
     }
+    family.activate_row(session)?;
     let (core, mut step, limits) = family.split(session);
     core.finish_decode_token(&mut step, generation, &limits, token)
 }

@@ -8,6 +8,7 @@
 // that row r of a launch of n rows carries the bytes of a launch of one row on row r's inputs. The
 // device tests compare them bit for bit. The kv8 append and the attention decode entries live in
 // kv8_append.cu and attn_decode_q8.cu, next to the quantizer and the split plan they share.
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stddef.h>
@@ -151,7 +152,7 @@ __global__ void attn_prep_multi_k(PrepMulti a) {
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const char *step = (const char *)a.rows[t].step;
     const long long first = *(const int *)(step + INFERENCE_CUDA_STEP_POS_OFFSET);
-    if (first < 0 || first + 1 > a.cells) {
+    if (first < 0 || first + 1 > a.rows[t].cells) {
         if (blockIdx.x == 0 && threadIdx.x == 0)
             atomicOr((int *)(step + INFERENCE_CUDA_STEP_STATUS_OFFSET), kStatusInvalidStepState);
         if (head < a.n_head) a.q[((size_t)t * a.n_head + head) * D + d] = __int_as_float(0x7fc00000);
@@ -263,6 +264,49 @@ extern "C" int inference_cuda_attn_prep_multi_launch(const inference_cuda_attn_p
                        (const float *)a->q_norm, (const float *)a->k_norm, a->eps, a->rope_base,
                        (float *)a->q, (float *)a->k_rows, (float *)a->v_rows, a->rows};
         attn_prep_multi_k<<<dim3(a->n_head + 2 * a->n_kv_head, a->n), kHeadDim, 0, (cudaStream_t)stream>>>(k);
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+namespace {
+
+// The fp16 append of one token per row: block (kv head, row), thread per dimension. The planes,
+// the position word and the status word are the row's own; the value is rounded to nearest even,
+// as the single-sequence attn_prep rounds the rows it appends to an fp16 cache.
+__global__ void kv16_append_multi_k(const float *k, const float *v, const inference_cuda_kv_row *rows,
+                                    int n_kv_head, int head_dim) {
+    const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const char *step = (const char *)rows[t].step;
+    const long long pos = *(const int *)(step + INFERENCE_CUDA_STEP_POS_OFFSET);
+    if (pos < 0 || pos >= rows[t].cells) {
+        if (h == 0 && d == 0) atomicOr((int *)(step + INFERENCE_CUDA_STEP_STATUS_OFFSET), kStatusInvalidStepState);
+        return;
+    }
+    const size_t src = ((size_t)t * n_kv_head + h) * head_dim + d;
+    const size_t dst = ((size_t)pos * n_kv_head + h) * head_dim + d;
+    ((__half *)rows[t].k_codes)[dst] = __float2half_rn(k[src]);
+    ((__half *)rows[t].v_codes)[dst] = __float2half_rn(v[src]);
+}
+
+}  // namespace
+
+extern "C" int inference_cuda_kv16_append_multi_launch(const inference_cuda_kv16_append_multi_args *a,
+                                                       void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (a == NULL || stream == NULL || a->k == NULL || a->v == NULL || a->rows == NULL ||
+            !rows_ok(a->n) || a->n_kv_head < 1 || a->n_kv_head > kMaxKvHeads || a->head_dim < 32 ||
+            a->head_dim > 1024 || a->head_dim % 32 != 0 || a->cells < 1 || a->cells > kMaxCells ||
+            !aligned(a->k, 4) || !aligned(a->v, 4) || !aligned(a->rows, 8)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        kv16_append_multi_k<<<dim3(a->n_kv_head, a->n), a->head_dim, 0, (cudaStream_t)stream>>>(
+            (const float *)a->k, (const float *)a->v, a->rows, a->n_kv_head, a->head_dim);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

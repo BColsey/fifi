@@ -982,6 +982,9 @@ fn the_rung_reads_the_synthetic_pack_like_the_buffered_source() {
         synthetic::checkpoint_with_image(&|_, _, _| synthetic::Tweak::Normal);
     let dir = tempfile::tempdir().expect("tempdir");
     let shard = dir.path().join("m.safetensors");
+    // This fixture's payload contains only routed expert tensors.
+    let header_len = u64::from_le_bytes(image[..8].try_into().unwrap());
+    let payload_bytes = image.len() as u64 - 8 - header_len;
     std::fs::write(&shard, &image).expect("the shard mirrors");
     let checkpoint: &'static crate::weights::exl3::Checkpoint = Box::leak(Box::new(checkpoint));
     let buffered = PackRecordSource::new(checkpoint).expect("the buffered source derives");
@@ -1014,6 +1017,7 @@ fn the_rung_reads_the_synthetic_pack_like_the_buffered_source() {
             &mode,
             "the rung states its start-decided mode"
         );
+        assert_eq!(rung.expert_source_bytes(), Some(payload_bytes));
         for layer in 0..synthetic::LAYERS {
             let misses: Vec<u16> = (0..synthetic::EXPERTS as u16).collect();
             let records = rung.read_packed(layer, &misses).expect("the batch reads");

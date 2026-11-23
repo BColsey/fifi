@@ -163,7 +163,7 @@ impl PrefixPinPool {
         tokens: usize,
     ) -> Result<PinnedLanding, EngError> {
         self.live_source = None;
-        if self.layout != state.layout {
+        if !self.layout.same_form(&state.layout) {
             return Err(invalid("state layout changed"));
         }
         if tokens == 0 || tokens > state.layout.kv.capacity {
@@ -242,7 +242,7 @@ impl PrefixPinPool {
             && saved.owner == stream.id()
             && saved.identity == state.identity
             && saved.layout == self.layout
-            && saved.layout == state.layout
+            && self.layout.same_form(&state.layout)
             && saved.tokens <= state.tokens()
             && state.book.begin_export(stream.id()).is_ok()
             && self
@@ -265,7 +265,7 @@ impl PrefixPinPool {
         self.live_source = None;
         state.resident_kv()?;
         state.book.begin_export(stream.id())?;
-        if self.layout != state.layout {
+        if !self.layout.same_form(&state.layout) {
             return Err(invalid("state layout changed"));
         }
         drop(recycled);
@@ -326,7 +326,8 @@ impl PrefixPinPool {
             || !Rc::ptr_eq(&pending.instance, &state.instance)
             || self.generations.get(saved.slot) != Some(&saved.generation)
             || saved.owner != stream.id()
-            || saved.layout != state.layout
+            || saved.layout != self.layout
+            || !self.layout.same_form(&state.layout)
             || saved.identity != state.identity
             || saved.tokens > state.tokens()
             || self
@@ -343,12 +344,16 @@ impl PrefixPinPool {
                 .layout
                 .kv
                 .prefix_ranges(layer, pending.inherited_tokens)?;
-            for (range, old) in state
+            // The runs are in the same order for every capacity; the host slab keeps the offsets
+            // of the pool's own layout.
+            let hosts = self.layout.kv.prefix_ranges(layer, saved.tokens)?;
+            for ((range, old), host_range) in state
                 .layout
                 .kv
                 .prefix_ranges(layer, saved.tokens)?
                 .into_iter()
                 .zip(inherited)
+                .zip(hosts)
             {
                 let bytes = range
                     .bytes
@@ -363,7 +368,8 @@ impl PrefixPinPool {
                     .ok_or_else(|| invalid("device offset overflows"))?;
                 let host = self
                     .delta_bytes
-                    .checked_add(device)
+                    .checked_add(host_range.device_offset)
+                    .and_then(|at| at.checked_add(old.bytes))
                     .ok_or_else(|| invalid("host offset overflows"))?;
                 ctx.copy_to_pinned(
                     stream,
@@ -398,7 +404,8 @@ impl PrefixPinPool {
         };
         if self.generations.get(saved.slot) != Some(&saved.generation)
             || saved.owner != stream.id()
-            || saved.layout != state.layout
+            || saved.layout != self.layout
+            || !self.layout.same_form(&state.layout)
             || saved.identity != state.identity
             || saved.tokens > state.layout.kv.capacity
             || !Rc::ptr_eq(slot, &saved.data)
@@ -425,14 +432,21 @@ impl PrefixPinPool {
             state.delta.range(0, self.delta_bytes)?,
         )?;
         for layer in 0..state.layout.kv.layers {
-            for range in state.layout.kv.prefix_ranges(layer, saved.tokens)? {
+            let hosts = self.layout.kv.prefix_ranges(layer, saved.tokens)?;
+            for (range, host_range) in state
+                .layout
+                .kv
+                .prefix_ranges(layer, saved.tokens)?
+                .into_iter()
+                .zip(hosts)
+            {
                 if range.bytes == 0 {
                     continue;
                 }
                 ctx.copy_from_pinned(
                     stream,
                     &mut buffer,
-                    self.delta_bytes + range.device_offset,
+                    self.delta_bytes + host_range.device_offset,
                     state
                         .resident_kv()?
                         .range(range.device_offset, range.bytes)?,

@@ -127,11 +127,11 @@ pub(super) fn apply_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::fixtures::{checkpoint, config};
-    use super::super::super::ops::values;
-    use super::super::super::weights::ResidentWeights;
     use super::super::{assert_parity, import_f32};
     use super::*;
+    use crate::family::qwen::flash_next::resident::fixtures::{checkpoint, config};
+    use crate::family::qwen::flash_next::resident::ops::values;
+    use crate::family::qwen::flash_next::resident::weights::ResidentWeights;
     use crate::family::qwen::flash_next::{hyper as host, load::FlashWeights, mlx::MlxProjector};
     use crate::kernels::MlxKernels;
     use crate::weights::StreamedCheckpoint;

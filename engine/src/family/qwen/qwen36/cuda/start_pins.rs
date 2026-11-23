@@ -96,10 +96,14 @@ fn make_takes_the_step_layout_from_the_loaded_weights() {
     // its resolved KV form; paged mode charges the checked physical resource plan.
     let start = pinned(fn_section("fn start("));
     let planned = start
-        .find("StartupPlan::new(settings,verify,allow_unpinned,modes)?")
+        .find("startup_plan_of(settings,verify,allow_unpinned)?")
         .unwrap();
     let tokenizer = start.find("TokenizerBundle::load").unwrap();
     assert!(planned < tokenizer);
+    // Both arms build the plan, in the one function the start and the check share.
+    let arms = pinned(fn_section("fn startup_plan_of("));
+    assert!(arms.contains("StartupPlan::new_device_first(settings,verify,allow_unpinned,modes)"));
+    assert!(arms.contains("StartupPlan::new(settings,verify,allow_unpinned,modes)"));
     let plan = pinned(fn_section("fn new("));
     assert!(plan.contains("serve_kv_mode(settings)?"));
     assert!(plan.contains("context_tokens(settings.context_limit,kv_mode)?"));

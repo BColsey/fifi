@@ -11,7 +11,8 @@
 //! This code is a reference for later packets. It favors plain loops over speed.
 
 use crate::EngError;
-use crate::family::math::{expect_len, rope_half, sigmoid, silu, softplus};
+use crate::family::math::{delta_rule, dot64, expect_len, rope_half, sigmoid, silu, softplus};
+pub(crate) use crate::family::math::{rms_plain, rms_unit};
 use crate::family::project::Projector;
 use crate::family::route::route_experts;
 use crate::family::spec::{AttentionKind, Router};
@@ -205,30 +206,6 @@ impl HostState {
     }
 }
 
-fn dot64(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum()
-}
-
-/// `x / sqrt(mean(x^2) + eps)`, the operation of `mx.fast.rms_norm(x, None, eps)`.
-pub(crate) fn rms_unit(x: &[f32], eps: f32) -> Vec<f32> {
-    let mean = x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / x.len().max(1) as f64;
-    let scale = 1.0 / (mean + f64::from(eps)).sqrt();
-    x.iter().map(|v| (f64::from(*v) * scale) as f32).collect()
-}
-
-/// `rms_unit` times `weight`, the weight applied as stored (no `1 +`).
-pub(crate) fn rms_plain(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, EngError> {
-    expect_len(weight, x.len(), "rms norm weight")?;
-    Ok(rms_unit(x, eps)
-        .into_iter()
-        .zip(weight)
-        .map(|(v, w)| v * w)
-        .collect())
-}
-
 fn softmax(x: &[f32]) -> Vec<f32> {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f64> = x.iter().map(|v| f64::from(*v - max).exp()).collect();
@@ -248,28 +225,6 @@ pub(crate) fn qk_norm(q: &[f32], k: &[f32]) -> (Vec<f32>, Vec<f32>) {
         .map(|v| v * inv_scale)
         .collect();
     (q, k)
-}
-
-/// One gated delta-rule step of one value head. `rec` holds `value_dim` rows of `key_dim` values.
-/// For each row `j`: `S[j] <- decay * S[j]`, `delta = (v[j] - S[j] . k) * beta`, `S[j] <- S[j] + delta * k`,
-/// and the output is `S[j] . q`.
-fn delta_rule(
-    rec: &mut [f32],
-    (q, k, v): (&[f32], &[f32], &[f32]),
-    (decay, beta): (f32, f32),
-) -> Vec<f32> {
-    let mut out = Vec::with_capacity(v.len());
-    for (row, value) in rec.chunks_mut(k.len()).zip(v) {
-        for s in row.iter_mut() {
-            *s *= decay;
-        }
-        let delta = (value - dot64(row, k) as f32) * beta;
-        for (s, key) in row.iter_mut().zip(k) {
-            *s += key * delta;
-        }
-        out.push(dot64(row, q) as f32);
-    }
-    out
 }
 
 /// Rule (mlx-lm `GatedDeltaNet.__call__` with `gated_delta_ops`): project, causal depthwise

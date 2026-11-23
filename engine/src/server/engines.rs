@@ -26,7 +26,7 @@ use crate::EngError;
 /// page needs: the directory the weights came from, so a cache
 /// snapshot can be matched to the engine serving it.
 pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let engines: Vec<serde_json::Value> = state
+    let mut engines: Vec<serde_json::Value> = state
         .entries()
         .iter()
         .map(|entry| {
@@ -53,6 +53,30 @@ pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json:
             row
         })
         .collect();
+    // The supervised workers ride the same list, with the state
+    // their own health poll reported.
+    for worker in state.workers().snapshot() {
+        let mut row = serde_json::json!({
+            "id": worker.id,
+            "model": worker.model,
+            "model_dir": worker.model_dir.display().to_string(),
+            "state": worker.status.state,
+            "runtime_added": true,
+            "memory_held_until_restart": false,
+            "supervised": true,
+        });
+        let cells = row.as_object_mut().expect("row is an object");
+        if let Some(stage) = worker.status.load_stage {
+            cells.insert("load_stage".into(), stage.into());
+        }
+        if let Some(error) = worker.status.error {
+            cells.insert("error".into(), serde_json::json!({ "message": error }));
+        }
+        if let Some(context) = worker.status.context_limit {
+            cells.insert("context_limit".into(), context.into());
+        }
+        engines.push(row);
+    }
     Json(serde_json::json!({ "engines": engines }))
 }
 
@@ -153,6 +177,26 @@ pub(crate) async fn add(
     let derive = state.derive();
     let scrub_model = model_dir.clone();
     let scrub_tokenizer = tokenizer_dir.clone();
+    // Under supervision the request names a family that `serve --model`
+    // cannot derive (Flash-Next has no simplified startup) instead of
+    // leaving it to detection: the worker reads the bare entry a boot
+    // configuration carries.
+    let bare_family = body.family.clone().filter(|family| {
+        state.supervised_engines()
+            && super::run::holds_memory_until_restart(family)
+            && !crate::server::model_serve::DETECTABLE_FAMILIES
+                .iter()
+                .any(|(name, _)| name == family)
+    });
+    // The hub page adds an engine by directory alone, so a pack the request
+    // names no family for is recognised by what it holds. A family the
+    // request does name stands.
+    let bare_family = bare_family.or_else(|| {
+        (body.family.is_none() && state.supervised_engines())
+            .then(|| super::model_serve::flash_next_family(&model_dir))
+            .flatten()
+            .map(str::to_string)
+    });
     let derivation = tokio::task::spawn_blocking(move || {
         let args = crate::server::model_serve::ModelServeArgs {
             model_dir,
@@ -163,7 +207,18 @@ pub(crate) async fn add(
             listen: None,
             print_config: false,
         };
-        let mut config = derive(&args)?;
+        let mut config = match &bare_family {
+            Some(family) => {
+                if !args.model_dir.is_dir() {
+                    return Err(crate::server::StartupError(format!(
+                        "model_dir {} is not a directory",
+                        args.model_dir.display()
+                    )));
+                }
+                crate::server::model_serve::bare_config(&args, family)
+            }
+            None => derive(&args)?,
+        };
         let mut engines = std::mem::take(&mut config.engines);
         if engines.is_empty() {
             return Err(crate::server::StartupError(
@@ -173,7 +228,7 @@ pub(crate) async fn add(
         // `build_config` always assembles exactly one engine; the
         // guard above keeps that assumption honest if it ever changes.
         let engine_config = engines.swap_remove(0);
-        Ok::<_, crate::server::StartupError>((config.prefix_reuse, engine_config))
+        Ok::<_, crate::server::StartupError>((config, engine_config))
     })
     .await
     .map_err(|_| EngError::BadRequest("engine derivation failed".into()))?
@@ -184,11 +239,43 @@ pub(crate) async fn add(
             scrub_tokenizer.as_deref(),
         ))
     })?;
-    let (file_prefix_reuse, mut engine_config) = derivation;
+    let (mut config, mut engine_config) = derivation;
     engine_config.id = id.clone();
+    if state.supervised_engines() && super::run::holds_memory_until_restart(&engine_config.family) {
+        // A process-lifetime family starts a supervised worker, so
+        // stopping the engine ends the process and frees its memory:
+        // the refusal below belongs to the in-process path only.
+        let model_name = engine_config.model.clone().unwrap_or_default();
+        let model_dir = engine_config.model_dir.display().to_string();
+        // The worker reads its engine from this configuration: back in
+        // it goes, for the in-process path alone took it out.
+        config.engines.push(engine_config);
+        return state
+            .workers()
+            .spawn(&id, config, Some(model_name.clone()))
+            .map_err(|error| {
+                ServerError::from(EngError::BadRequest(scrub_paths(
+                    &error,
+                    &scrub_model,
+                    scrub_tokenizer.as_deref(),
+                )))
+            })
+            .map(|()| {
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "id": id,
+                        "model": model_name,
+                        "model_dir": model_dir,
+                        "state": "starting",
+                        "supervised": true,
+                    })),
+                )
+            });
+    }
     refuse_pinned_family(&state, &engine_config.family)?;
     let started = tokio::task::spawn_blocking(move || {
-        crate::server::run::start_one(&engine_config, file_prefix_reuse)
+        crate::server::run::start_one(&engine_config, config.prefix_reuse)
     })
     .await
     .map_err(|_| EngError::BadRequest("engine start failed".into()))?
@@ -314,6 +401,24 @@ pub(crate) async fn remove(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     if !valid_engine_id(&id) {
         return Err(ServerError::NotFound("no such engine".into()));
+    }
+    if state.workers().contains(&id) {
+        // A supervised worker: its process ends, so the memory it
+        // held is genuinely freed — the honest answer the in-process
+        // stop cannot give.
+        let model = state
+            .workers()
+            .get(&id)
+            .and_then(|worker| worker.model.clone());
+        state.workers().stop(&id);
+        state.drop_sessions_for(&id);
+        return Ok(Json(serde_json::json!({
+            "id": id,
+            "model": model.unwrap_or_default(),
+            "state": "stopped",
+            "memory_released": true,
+            "supervised": true,
+        })));
     }
     let id_for_stop = id.clone();
     let stopped = tokio::task::spawn_blocking(move || state.remove_engine(&id_for_stop))

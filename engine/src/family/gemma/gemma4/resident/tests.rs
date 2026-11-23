@@ -2,7 +2,7 @@
 use super::{Gemma, VOCAB};
 
 #[test]
-#[ignore = "requires the pinned Humanizer file and a device"]
+#[ignore = "requires a Humanizer Q8_0 file and a device"]
 fn decodes_one_token_against_the_pinned_checkpoint() {
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         return;
@@ -31,12 +31,11 @@ fn decodes_one_token_against_the_pinned_checkpoint() {
     assert!(peak <= 30.0 + 1e-3, "softcap exceeded: {peak}");
 }
 
-/// Measures the decode matvec against the pinned gate matrix: one 15,360-row
+/// Measures the decode matvec against a gate matrix: one 15,360-row
 /// width read per launch. Set GEMMA4_BANDWIDTH_PROBE to the launch count.
 #[test]
-#[ignore = "requires the pinned Humanizer file, a device and GEMMA4_BANDWIDTH_PROBE"]
+#[ignore = "requires a Humanizer Q8_0 file, a device and GEMMA4_BANDWIDTH_PROBE"]
 fn measures_matvec_bandwidth() {
-    use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
     let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
         return;
     };
@@ -45,8 +44,8 @@ fn measures_matvec_bandwidth() {
     };
     let reps: usize = reps.parse().expect("probe count");
     let model: Gemma = super::load(std::path::Path::new(&path)).expect("load");
-    // The embedding is the one matrix that stays in the checkpoint's native Q8_0 layout,
-    // so it is what the vendored matvec probe can measure.
+    // The embedding is a native weight of the file's own type, so it is what the vendored
+    // matvec probe can measure.
     let embed = &model.embed;
     let out = &model.logits;
     let q8 = &model.scratch.q8_hidden;
@@ -54,23 +53,18 @@ fn measures_matvec_bandwidth() {
     for _ in 0..reps {
         model
             .ctx
-            .matvec_q(
+            .matvec_native(
                 &model.stream,
-                MatvecCall {
-                    ty: QuantType::Q80,
-                    w: embed.buf.range(0, embed.bytes()).expect("embed"),
-                    x_q8: q8.range(0, q8.bytes()).expect("q8"),
-                    y: out.buf.range(0, out.bytes()).expect("out"),
-                    k: embed.k,
-                    rows: embed.rows,
-                    ncols: 1,
-                },
+                embed,
+                q8.range(0, q8.bytes()).expect("q8"),
+                out.buf.range(0, out.bytes()).expect("out"),
+                1,
             )
             .expect("matvec");
     }
     model.stream.synchronize().expect("sync");
     let seconds = started.elapsed().as_secs_f64();
-    let bytes = reps * embed.bytes();
+    let bytes = reps * embed.buffer().bytes();
     eprintln!(
         "bandwidth reps={reps} seconds={seconds:.3} gb_per_s={:.1}",
         bytes as f64 / seconds / 1e9
@@ -152,9 +146,12 @@ fn each_layer_reads_the_previous_layers_output() {
 
 /// This trace downloads five ids and five log probabilities, never a logits row.
 #[test]
-#[ignore = "requires the pinned Humanizer file and an exclusive device lease"]
+#[ignore = "requires a Humanizer Q8_0 file and an exclusive device lease"]
 fn traces_first_position_top_five() {
-    let path = std::env::var("GEMMA4_Q8_FILE").expect("checkpoint path required");
+    let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
+        println!("SKIPPED: GEMMA4_Q8_FILE is not set");
+        return;
+    };
     let mut model = super::load(std::path::Path::new(&path)).expect("load");
     let prompt: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -182,4 +179,77 @@ fn traces_first_position_top_five() {
         "GEMMA4_TOP5={}",
         serde_json::to_string(&trace).expect("json")
     );
+}
+
+/// The path a K-quant per-layer table takes at load: the merged payload sliced by layer, uploaded
+/// as native blocks and gathered by token id. Each gathered row is the host decode of the blocks
+/// of that token and layer.
+#[test]
+#[ignore = "requires a device; use --test-threads=1"]
+fn a_k_quant_merged_table_slices_uploads_and_gathers_each_layers_rows() {
+    use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
+    use crate::kernels::cuda::resident::embed::EmbedNativeCall;
+    use crate::weights::{GgufType, dequantize};
+
+    let (layers, vocab, ple) = (3usize, 5usize, 256usize);
+    let mut merged = vec![0u8; vocab * layers * 144];
+    for (index, block) in merged.as_chunks_mut::<144>().0.iter_mut().enumerate() {
+        for (at, byte) in block.iter_mut().enumerate() {
+            *byte = ((index * 31 + at * 7) % 251) as u8;
+        }
+        // Finite binary16 scales: d = 0.0625 and dmin = 0.03125.
+        block[0..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x2800u16.to_le_bytes());
+    }
+    let ctx = crate::kernels::cuda::CudaContext::with_admission(
+        &crate::family::project::cuda::served_admission(),
+    )
+    .expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ids = [4i32, 0, 2];
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    let ids_buffer = ctx.upload(&id_bytes).expect("ids");
+    let status = ctx.upload(&[0u8; 4]).expect("status");
+    for layer in 0..layers {
+        let bytes = ple_rows_from_merged(&merged, GgufType::Q4K, layer, ple, layers, vocab)
+            .expect("the layer slice");
+        let weight = super::matrix_from_bytes(&ctx, "table", GgufType::Q4K, ple, vocab, &bytes)
+            .expect("native upload");
+        let out = ctx.upload(&vec![0u8; ids.len() * ple * 4]).expect("out");
+        ctx.embed_native(
+            &stream,
+            EmbedNativeCall {
+                weight: &weight,
+                ids: ids_buffer.range(0, id_bytes.len()).expect("ids range"),
+                x: out.range(0, ids.len() * ple * 4).expect("x range"),
+                status: status.range(0, 4).expect("status range"),
+                m: ids.len(),
+            },
+        )
+        .expect("gather");
+        stream.synchronize().expect("sync");
+        let mut raw = vec![0u8; ids.len() * ple * 4];
+        ctx.download(&out, &mut raw).expect("download");
+        let got: Vec<f32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        for (row, &id) in ids.iter().enumerate() {
+            let at = id as usize * 144;
+            let want = dequantize(GgufType::Q4K, &bytes[at..at + 144]).expect("host decode");
+            let peak = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            for (column, (a, b)) in got[row * ple..(row + 1) * ple]
+                .iter()
+                .zip(&want)
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() <= 1e-5 * peak,
+                    "layer {layer} token {id} column {column}: {a} against {b}"
+                );
+            }
+        }
+    }
 }

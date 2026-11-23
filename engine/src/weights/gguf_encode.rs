@@ -71,13 +71,6 @@ pub fn encode_plain_float_rows(ty: GgufType, src: &[u8], out: &mut [u8]) -> Resu
     encode_q8_0_into(&dequantize(ty, src)?, out)
 }
 
-/// The Q8_0 bytes of a float tensor of type `ty` read from `source`.
-pub fn plain_float_as_q8_0(ty: GgufType, source: &[u8]) -> Result<Vec<u8>, EngError> {
-    let mut out = vec![0u8; q8_0_len(source.len() / if ty == GgufType::F32 { 4 } else { 2 })];
-    encode_plain_float_rows(ty, source, &mut out)?;
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,10 +106,10 @@ mod tests {
             .iter()
             .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
             .collect();
-        assert_eq!(
-            plain_float_as_q8_0(GgufType::F32, &f32_bytes).expect("f32"),
-            plain_float_as_q8_0(GgufType::F16, &f16_bytes).expect("f16")
-        );
-        assert!(plain_float_as_q8_0(GgufType::Q80, &[]).is_err());
+        let (mut from_f32, mut from_f16) = (vec![0u8; Q8_0_BYTES], vec![0u8; Q8_0_BYTES]);
+        encode_plain_float_rows(GgufType::F32, &f32_bytes, &mut from_f32).expect("f32");
+        encode_plain_float_rows(GgufType::F16, &f16_bytes, &mut from_f16).expect("f16");
+        assert_eq!(from_f32, from_f16);
+        assert!(encode_plain_float_rows(GgufType::Q80, &[], &mut []).is_err());
     }
 }

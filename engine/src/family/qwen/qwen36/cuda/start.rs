@@ -10,7 +10,7 @@
 //! process is refused.
 use crate::family::exl3::layer_table::LayerTable;
 
-use super::super::admission_sketch::choose_cuda_fit;
+use super::super::admission_sketch::{CudaFitAsk, choose_cuda_fit};
 use super::super::card_short::{self, CardFigures, CardShort, CardVerdict};
 use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
@@ -35,8 +35,8 @@ use super::{
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
     tiered_load::{
-        attach_tiered_parts, bank_slot_bytes, expert_quant, names_without_experts,
-        planning_geometry, tiered_chunk_arm,
+        attach_tiered_parts, bank_slot_bytes, expert_quant, layer_slot_bytes,
+        names_without_experts, planning_geometry, tiered_chunk_arm,
     },
 };
 use crate::family::decode_step::shard::ShardTable;
@@ -114,6 +114,9 @@ struct StartupPlan {
     verify: bool,
     allow_unpinned: bool,
     modes: RuntimeModes,
+    /// The cells the step's state is built with, when the sessions executor grows it on demand
+    /// (the tiered rung): the cache the context names is a ceiling, not a reservation.
+    initial_cells: Option<InitialCache>,
 }
 
 impl StartupPlan {
@@ -164,6 +167,7 @@ impl StartupPlan {
             verify,
             allow_unpinned,
             modes,
+            initial_cells: None,
         })
     }
 
@@ -254,6 +258,7 @@ impl StartupPlan {
             verify,
             allow_unpinned,
             modes,
+            initial_cells: None,
         })
     }
 }
@@ -894,13 +899,8 @@ pub(crate) fn start(
             std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
         )?;
     }
-    let modes = runtime_modes(settings)?;
     let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
-    let plan = if device_first {
-        StartupPlan::new_device_first(settings, verify, allow_unpinned, modes)?
-    } else {
-        StartupPlan::new(settings, verify, allow_unpinned, modes)?
-    };
+    let plan = startup_plan_of(settings, verify, allow_unpinned)?;
     for key in &settings.ignored_mlx_keys {
         eprintln!("{}", ignored_mlx_line(key));
     }
@@ -926,14 +926,30 @@ pub(crate) fn start(
         (None, None)
     };
     let sessions = session_plan(&owned, device_first);
-    let engine = if let Some((seqs, sizing)) = sessions {
+    // A named tiered member sized its banks itself: nothing is funded for sessions beside them,
+    // so a count above one is refused here, before any weight is read.
+    if let (Some(count), Some(_), true) = (sessions, owned.tiered, owned.max_seqs_set) {
+        return Err(EngError::BadRequest(format!(
+            "engine config: max_seqs {count} with a named tiered member: the member sizes the \
+             banks and funds no sessions beside them; drop the member and the planner funds \
+             them, or drop max_seqs"
+        )));
+    }
+    // A start that named a session count asked for sessions: a step that cannot host them refuses.
+    let allow_single = !owned.max_seqs_set;
+    let on_demand = tiered_kv_on_demand(
+        sessions,
+        std::env::var_os("Q36_TIERED_KV_ON_DEMAND").as_deref(),
+    );
+    let engine = if let Some(seqs) = sessions {
         spawn_engine_noted(piece, ready_note, move |stages| {
-            let (step, core) = make_announced(stages, owned, rules, plan, guard, announce)?;
-            crate::family::pooled_sessions::PooledSessions::new(step, core, seqs, sizing)
+            let (step, core) =
+                make_announced(stages, owned, rules, plan, guard, announce, on_demand)?;
+            crate::family::pooled_sessions::PooledSessions::new(step, core, seqs, allow_single)
         })?
     } else if owned.cuda_devices == [0] {
         spawn_engine_noted(piece, ready_note, move |stages| {
-            make_announced(stages, owned, rules, plan, guard, announce)
+            make_announced(stages, owned, rules, plan, guard, announce, false)
         })?
     } else {
         spawn_engine_noted(piece, ready_note, move |stages| {
@@ -951,18 +967,13 @@ pub(crate) fn start(
 ///
 /// A start that names no `max_seqs` runs the sessions executor whenever its form can hold more
 /// than one session: the plain resident GGUF step on one card. The count then comes from the
-/// cache pool, and `max_seqs` is only a cap. A named count above one splits the pool evenly; a
-/// named 1 keeps the one-session step.
-fn session_plan(
-    settings: &Q36Settings,
-    device_first: bool,
-) -> Option<(usize, crate::family::pooled_sessions::Sizing)> {
-    use crate::family::pooled_sessions::Sizing;
+/// cache pool, and `max_seqs` is only a cap (a named 1 keeps the one-session step).
+fn session_plan(settings: &Q36Settings, device_first: bool) -> Option<usize> {
     if settings.cuda_devices != [0] {
         return None;
     }
     if settings.max_seqs_set {
-        return (settings.max_seqs > 1).then_some((settings.max_seqs, Sizing::EvenShare));
+        return (settings.max_seqs > 1).then_some(settings.max_seqs);
     }
     let plain = settings.weights == WeightFormat::Gguf
         && !settings.speculation.enabled()
@@ -973,7 +984,7 @@ fn session_plan(
         && settings.draft_verify == VerifyMode::Eager
         && !device_first
         && !super::sparse_exec::armed();
-    plain.then_some((DEFAULT_SESSION_CAP, Sizing::WholePool))
+    plain.then_some(DEFAULT_SESSION_CAP)
 }
 
 /// The most sessions a default start serves; the pool decides how many are live.
@@ -1329,6 +1340,7 @@ fn lower_rung(
     settings: &Q36Settings,
     plan: &StartupPlan,
     model: &GgufModel,
+    on_demand: bool,
 ) -> Result<Option<(Q36Settings, StartupPlan, CardShort)>, EngError> {
     if plan.paged.is_some() || !card_short::automatic(settings, plan.device_first_native.is_some())
     {
@@ -1345,11 +1357,13 @@ fn lower_rung(
     // The card and the host of this decision, read together.
     let facts = Facts::read_card(("q36 cuda tiered", "Qwen36"), projector.card_bytes())?;
     let free = facts.card_free();
+    let initial = initial_cache(settings, &dims, plan.reserve, on_demand)?;
     let figures = CardFigures {
         free,
         tensors,
         expert_bytes: tensors.saturating_sub(resident),
         kv_cache: plan.reserve,
+        kv_credit: initial.as_ref().map_or(0, |cache| cache.bank_credit),
         work: load_options(plan.reserve, plan.modes.fixed_admission)
             .reserve
             .work,
@@ -1358,6 +1372,14 @@ fn lower_rung(
         // headroom, so the ladder promises slots against that one.
         tiered_headroom: prefill_headroom(false) as u64,
         slot_bytes: bank_slot_bytes(geometry)?,
+        after_load_floor: after_load_floor()?,
+        session_part_bytes: session_part_bytes(
+            &dims,
+            settings,
+            initial_cells(settings.context_limit),
+        )?,
+        sessions: planned_sessions(settings),
+        sessions_named: settings.max_seqs_set,
         layers: dims.shape.kinds.len(),
         experts: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
@@ -1371,7 +1393,18 @@ fn lower_rung(
         CardVerdict::Short(short) => {
             let variant = card_short::tiered_variant(settings);
             let modes = runtime_modes(&variant)?;
-            let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+            let mut variant_plan =
+                StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+            if settings.max_seqs_set && short.sessions < settings.max_seqs {
+                return Err(EngError::MemoryPlan(format!(
+                    "tiered: context {} cannot hold {} initial sessions",
+                    settings.context_limit, settings.max_seqs
+                )));
+            }
+            if let Some(initial) = initial {
+                variant_plan.reserve = initial.bytes;
+                variant_plan.initial_cells = Some(initial);
+            }
             Ok(Some((variant, variant_plan, short)))
         }
     }
@@ -1420,16 +1453,291 @@ fn load_need_of<'a>(
 }
 
 /// Whether the step can run the int8 cache: its chunk prefill needs the prefill arena, which the
-/// plan's chunked prefill (the int8 cache's opt-in) provides. The answer is the prefill admission's
-/// own predicate (`needs_arena`), so the card choice never plans a form the step then refuses
-/// ("fixed prefill admission: this step cannot use a chunk arena").
-fn int8_cache_usable(plan: &StartupPlan) -> bool {
-    super::prefill_driver::needs_arena(
-        WeightLayout::Native,
-        KvMode::Int8G32,
-        false,
-        plan.modes.chunked,
-    )
+/// chunked prefill (the int8 cache's own default, switched off by `Q36_CUDA_CHUNK_PREFILL=0`)
+/// provides. The flag is read for the int8 form, not for the plan the config builds, whose form is
+/// still undecided. The answer is the prefill admission's own predicate (`needs_arena`), so the card
+/// choice never plans a form the step then refuses ("fixed prefill admission: this step cannot use
+/// a chunk arena").
+fn int8_cache_usable() -> bool {
+    let chunked = std::env::var_os(CHUNK_PREFILL_VAR)
+        .and_then(|value| chunk_prefill_wanted(KvDtype::Q8, Some(&value)).ok())
+        .unwrap_or(true);
+    super::prefill_driver::needs_arena(WeightLayout::Native, KvMode::Int8G32, false, chunked)
+}
+
+/// Whether the prefill admission keeps a chunk arena for a cache form at a context, from the free
+/// bytes before the weights are uploaded: the admission's own rule for the form (the unfixed
+/// ladder for fp16, `fixed_kv8_passes` for int8) over the state at that context, with what the
+/// weight load takes beyond its planned tensor bytes and the measurement band held back, the
+/// headroom, the decode arena and the device prefix tip charged as the admission charges them.
+/// A question it cannot answer is an error, never a yes.
+fn prefill_admits_of<'a>(
+    nsm: usize,
+    settings: &'a Q36Settings,
+    plan: &'a StartupPlan,
+    (free, weights): (u64, u64),
+) -> Result<impl Fn(KvDtype, u32) -> Result<bool, EngError> + 'a, EngError> {
+    let dims = StepDims::new(
+        &HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?,
+        &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
+    )?;
+    let tip = match plan.modes.prefix {
+        PrefixMemory::DeviceTip => {
+            crate::family::qwen::qwen36::settings::delta_state_bytes(&settings.spec)?
+        }
+        _ => 0,
+    };
+    let cap = chunk_prefill_rows(std::env::var_os(CHUNK_ROWS_VAR).as_deref())? as usize;
+    let after_load = free
+        .saturating_sub(weights)
+        .saturating_sub(crate::family::mem::DEVICE.load_unplanned)
+        .saturating_sub(crate::family::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let bytes = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+    Ok(move |kv: KvDtype, context: u32| {
+        let mode = kv_mode_of(kv, WeightLayout::Native)?;
+        let options = step_options(context, WeightLayout::Native, mode)?;
+        let state = StateLayout::new(&dims, &options)?.bytes()?;
+        let scratch = KernelScratch::for_dims(&dims, STEP_ROWS, mode)?;
+        let decode = StepPlan::new(&dims, STEP_ROWS, &options, &scratch)?.arena_bytes();
+        match mode {
+            KvMode::Fp16 => super::prefill_plan::smallest_chunk_passes(
+                &dims,
+                nsm,
+                bytes(after_load.saturating_sub(prefill_headroom(false) as u64)),
+                (decode, bytes(tip)),
+                state,
+            ),
+            KvMode::Int8G32 => {
+                let resident = (state as u64) + (decode as u64) + tip;
+                super::prefill_driver::fixed_kv8_passes(
+                    &dims,
+                    nsm,
+                    (
+                        bytes(after_load.saturating_sub(prefill_headroom(true) as u64)),
+                        bytes(after_load.saturating_sub(resident)),
+                    ),
+                    (decode, bytes(tip)),
+                    (state, context as usize, cap),
+                )
+            }
+        }
+    })
+}
+
+/// Whether `free` bytes hold `weights` and still leave `floor` free after the load.
+fn weights_leave_the_floor(free: u64, weights: u64, floor: u64) -> bool {
+    free >= weights.saturating_add(floor)
+}
+
+/// The memory receipt of a GGUF start, taken once the step and its banks exist: the card used,
+/// the dense core, the share of the routed experts resident and the bytes of each tier, summed
+/// layer by layer (a file that mixes record types has a size per layer). `slots` is the bank
+/// depth of a tiered start, `None` for a start that holds every expert on the card; `pinned` is
+/// what the engine's own host pool pins and `cache` the key-value cache it holds.
+fn memory_receipt(
+    projector: &CudaProjector,
+    model: &GgufModel,
+    dims: &StepDims,
+    (slots, pinned): (Option<usize>, u64),
+    cache: crate::family::mem::fill::CacheFigure,
+) -> Result<crate::family::mem::fill::TierReceipt, EngError> {
+    use crate::family::mem::fill::{LayerTier, TierReceipt};
+    let info = projector.memory_info()?;
+    let card = (
+        u64::try_from(info.total).unwrap_or(0),
+        u64::try_from(info.free).unwrap_or(0),
+    );
+    let names = model.plan().device_names();
+    let dense = native_load_bytes(&model.weights, &names_without_experts(&names))?;
+    let experts = u64::try_from(dims.shape.moe.experts).unwrap_or(0);
+    let quants = expert_quant(model.weights.header(), dims)?;
+    let held = slots.map_or(experts, |slots| u64::try_from(slots).unwrap_or(0));
+    let layers: Vec<LayerTier> = layer_slot_bytes(dims, &quants)?
+        .into_iter()
+        .map(|slot_bytes| LayerTier {
+            slots: held,
+            slot_bytes,
+        })
+        .collect();
+    Ok(TierReceipt::from_layers(card, dense, experts, &layers, pinned).with_cache(cache))
+}
+
+/// The cache of a pooled start at the cells a session begins with: the cells and the bytes. The
+/// sessions executor builds its parts at these and grows them on demand.
+struct InitialCache {
+    cells: usize,
+    bytes: u64,
+    growth_reserve: u64,
+    bank_credit: u64,
+}
+
+fn tiered_kv_on_demand(sessions: Option<usize>, flag: Option<&std::ffi::OsStr>) -> bool {
+    sessions.is_some() && flag == Some(std::ffi::OsStr::new("1"))
+}
+
+fn initial_cells(ceiling: u32) -> u32 {
+    ceiling.min(crate::family::cell_pool::INITIAL_CELLS as u32)
+}
+
+fn initial_cache(
+    settings: &Q36Settings,
+    dims: &StepDims,
+    full_reserve: u64,
+    on_demand: bool,
+) -> Result<Option<InitialCache>, EngError> {
+    if !on_demand {
+        return Ok(None);
+    }
+    let initial = initial_cells(settings.context_limit);
+    let cells = initial as usize;
+    let bytes = kv_cache_bytes(cells, serve_kv_mode(settings)?)?;
+    let part = session_part_bytes(dims, settings, initial)?;
+    let full_part = session_part_bytes(dims, settings, settings.context_limit)?;
+    // During a grow the card holds both complete parts, including fixed state.
+    let growth_reserve = full_part
+        .saturating_mul(2)
+        .saturating_sub(part)
+        .saturating_sub(crate::family::mem::DEVICE.load_headroom);
+    let bank_credit = full_reserve
+        .saturating_sub(bytes)
+        .saturating_sub(growth_reserve);
+    // Keep the old plan where shrinking would not give any memory back to the banks.
+    Ok((bank_credit > 0).then_some(InitialCache {
+        cells,
+        bytes,
+        growth_reserve,
+        bank_credit,
+    }))
+}
+
+/// The sessions a start asks the lower rung to fund beside its banks: the named count, else the
+/// tiered target. The planner takes what the card funds up to it.
+fn planned_sessions(settings: &Q36Settings) -> usize {
+    let target = if settings.max_seqs_set {
+        settings.max_seqs
+    } else {
+        card_short::TIERED_SESSION_TARGET
+    };
+    target.min((settings.context_limit / initial_cells(settings.context_limit).max(1)) as usize)
+}
+
+/// Device bytes of one session's part at its initial cells: the planes, the DeltaNet and the
+/// convolution state a session after the first keeps beside the banks.
+fn session_part_bytes(
+    dims: &StepDims,
+    settings: &Q36Settings,
+    cells: u32,
+) -> Result<u64, EngError> {
+    let kv_mode = kv_mode_of(settings.kv, WeightLayout::Native)?;
+    let options = step_options(cells, WeightLayout::Native, kv_mode)?;
+    Ok(u64::try_from(StateLayout::new(dims, &options)?.bytes()?).unwrap_or(u64::MAX))
+}
+
+/// The bytes the weights must leave free once they are loaded: what the load takes beyond the
+/// planned tensors, plus the free-after-load floor the start refuses below. The cache, the work
+/// and the headroom come after that check, so no context changes it.
+fn after_load_floor() -> Result<u64, EngError> {
+    let floor = u64::try_from(min_free_after_load()?).unwrap_or(u64::MAX);
+    Ok(crate::family::mem::DEVICE
+        .load_unplanned
+        .saturating_add(floor))
+}
+
+/// Asks the card fit again with no prefill gate: whether a fit exists at all. A fit that exists
+/// without the gate and not with it means the card holds the weights and a cache but leaves no
+/// room for a prefill arena at any context, which the start refuses by name.
+fn require_prefill_room(
+    settings: &Q36Settings,
+    ask: CudaFitAsk,
+    load_need: &dyn Fn(KvDtype, u32) -> Option<u64>,
+) -> Result<(), EngError> {
+    match choose_cuda_fit(&settings.spec, ask, load_need, &|_, _| Ok(true))? {
+        Some(_) => Err(EngError::MemoryPlan(
+            "q36 cuda: the card holds the weights and a KV cache but leaves no room for a prefill \
+             arena at any context; name a smaller context_limit or a cache form that leaves \
+             room"
+                .to_owned(),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The multiprocessor count the prefill admission sizes its chunk arena for.
+fn device_nsm(projector: &CudaProjector) -> Result<usize, EngError> {
+    Ok(projector.context().mmq_device_facts()?.nsm)
+}
+
+/// What the card choice reads from the device: the free bytes before the weights are uploaded and
+/// the multiprocessor count.
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceReading {
+    pub(crate) free: u64,
+    pub(crate) nsm: usize,
+}
+
+/// A card choice: the settings and startup plan of the cache form and context the card carries,
+/// with the figures it was made from.
+struct CardChoice {
+    variant: Q36Settings,
+    plan: StartupPlan,
+    fit: super::super::admission_sketch::CudaFit,
+    free: u64,
+}
+
+/// The cache form and context a start that left them to the card serves, from the device reading
+/// and the weight bytes the load pins. `None` when the config fixes both (or fits no form at all,
+/// which the lower rung or the load's own refusal then handles). The start and `check` both
+/// decide through this function.
+fn card_choice(
+    reading: DeviceReading,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    weights: u64,
+) -> Result<Option<CardChoice>, EngError> {
+    if !(settings.kv_auto || settings.context_auto)
+        || plan.paged.is_some()
+        || plan.device_first_native.is_some()
+        || !card_short::automatic(settings, false)
+    {
+        return Ok(None);
+    }
+    let free = reading.free;
+    // A card that leaves the weights below the free-after-load floor holds no context: the lower
+    // rung decides, before anything is uploaded (the same figure it is asked with).
+    if !weights_leave_the_floor(free, weights, after_load_floor()?) {
+        return Ok(None);
+    }
+    let ask = CudaFitAsk {
+        free,
+        weights,
+        int8_usable: int8_cache_usable(),
+        kv: (!settings.kv_auto).then_some(settings.kv),
+        context: (!settings.context_auto).then_some(settings.context_limit),
+    };
+    let load_need = load_need_of(settings, plan);
+    let Some(fit) = choose_cuda_fit(
+        &settings.spec,
+        ask,
+        &load_need,
+        &prefill_admits_of(reading.nsm, settings, plan, (free, weights))?,
+    )?
+    else {
+        require_prefill_room(settings, ask, &load_need)?;
+        return Ok(None);
+    };
+    let variant = Q36Settings {
+        kv: fit.form,
+        context_limit: fit.context,
+        ..settings.clone()
+    };
+    let modes = runtime_modes(&variant)?;
+    let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+    Ok(Some(CardChoice {
+        variant,
+        plan: variant_plan,
+        fit,
+        free,
+    }))
 }
 
 /// The cache form and context of a start that left them to the card, asked before any weight is
@@ -1444,34 +1752,15 @@ fn card_fit(
     plan: &StartupPlan,
     model: &GgufModel,
 ) -> Result<Option<(Q36Settings, StartupPlan)>, EngError> {
-    if !(settings.kv_auto || settings.context_auto)
-        || plan.paged.is_some()
-        || plan.device_first_native.is_some()
-        || !card_short::automatic(settings, false)
-    {
-        return Ok(None);
-    }
     let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
-    let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
-    let Some(fit) = choose_cuda_fit(
-        &settings.spec,
-        free,
-        weights,
-        int8_cache_usable(plan),
-        (!settings.kv_auto).then_some(settings.kv),
-        (!settings.context_auto).then_some(settings.context_limit),
-        &load_need_of(settings, plan),
-    )?
-    else {
+    let reading = DeviceReading {
+        free: u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX),
+        nsm: device_nsm(projector)?,
+    };
+    let Some(choice) = card_choice(reading, settings, plan, weights)? else {
         return Ok(None);
     };
-    let variant = Q36Settings {
-        kv: fit.form,
-        context_limit: fit.context,
-        ..settings.clone()
-    };
-    let modes = runtime_modes(&variant)?;
-    let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+    let (free, fit) = (choice.free, choice.fit);
     let form = match fit.form {
         KvDtype::Q8 => "int8",
         KvDtype::F32 | KvDtype::Bf16 => "fp16",
@@ -1487,7 +1776,54 @@ fn card_fit(
             fit.context
         );
     }
-    Ok(Some((variant, variant_plan)))
+    Ok(Some((choice.variant, choice.plan)))
+}
+
+/// The startup plan of settings: the same one `start` builds before it reads the card.
+fn startup_plan_of(
+    settings: &Q36Settings,
+    verify: bool,
+    allow_unpinned: bool,
+) -> Result<StartupPlan, EngError> {
+    let modes = runtime_modes(settings)?;
+    let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
+    if device_first {
+        StartupPlan::new_device_first(settings, verify, allow_unpinned, modes)
+    } else {
+        StartupPlan::new(settings, verify, allow_unpinned, modes)
+    }
+}
+
+/// The cache form and context a start with these settings would serve on this card, for
+/// `check`: the same choice `start` makes (`card_choice`), from the card read now and the weights
+/// of the checkpoint the start selects. `None` when the settings fix both, the card fits no form,
+/// or the checkpoint cannot be opened (the load reports that itself).
+pub(crate) fn planned_fit(settings: &Q36Settings) -> Result<Option<(KvDtype, u32)>, EngError> {
+    if settings.weights != WeightFormat::Gguf {
+        return Ok(None);
+    }
+    let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
+    let plan = startup_plan_of(settings, false, allow_unpinned)?;
+    let (gguf, _, _) = select_gguf_noted(&settings.artifact, allow_unpinned)?;
+    let model = open_qwen3_6_35b_a3b(&gguf, None)?;
+    let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
+    let projector = CudaProjector::new()?;
+    let reading = DeviceReading {
+        free: u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX),
+        nsm: device_nsm(&projector)?,
+    };
+    planned_fit_from(reading, settings, &plan, weights)
+}
+
+/// `planned_fit` from figures already read.
+fn planned_fit_from(
+    reading: DeviceReading,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    weights: u64,
+) -> Result<Option<(KvDtype, u32)>, EngError> {
+    Ok(card_choice(reading, settings, plan, weights)?
+        .map(|choice| (choice.variant.kv, choice.variant.context_limit)))
 }
 
 /// Positions the context is lowered by when the load's own admission refuses a context the card
@@ -1509,14 +1845,20 @@ fn replan_smaller(
     }
     let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    if !weights_leave_the_floor(free, weights, after_load_floor()?) {
+        return Ok(None);
+    }
     let Some(fit) = choose_cuda_fit(
         &settings.spec,
-        free,
-        weights,
-        true,
-        Some(settings.kv),
-        Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
+        CudaFitAsk {
+            free,
+            weights,
+            int8_usable: true,
+            kv: Some(settings.kv),
+            context: Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
+        },
         &load_need_of(settings, plan),
+        &prefill_admits_of(device_nsm(projector)?, settings, plan, (free, weights))?,
     )?
     else {
         return Ok(None);
@@ -1541,8 +1883,17 @@ fn make_announced(
     plan: StartupPlan,
     guard: BuildGuard,
     announce: Option<std::sync::mpsc::SyncSender<Announcement<Q36Settings>>>,
+    on_demand: bool,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
-    let built = make(stages, settings, rules, plan, guard, announce.as_ref());
+    let built = make(
+        stages,
+        settings,
+        rules,
+        plan,
+        guard,
+        announce.as_ref(),
+        on_demand,
+    );
     announce_failure(&built, announce.as_ref());
     built
 }
@@ -1557,6 +1908,7 @@ fn make(
     plan: StartupPlan,
     mut guard: BuildGuard,
     announce: Option<&std::sync::mpsc::SyncSender<Announcement<Q36Settings>>>,
+    on_demand: bool,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
     let verify = plan.verify;
     let allow_unpinned = plan.allow_unpinned;
@@ -1584,7 +1936,7 @@ fn make(
     // The lower rung: a GGUF start the card cannot carry whole serves the tiered path when card
     // plus host can, instead of refusing at the load's admission.
     let (mut settings, mut plan, card_short) = match gguf.as_ref() {
-        Some((model, _)) => match lower_rung(&projector, &settings, &plan, model)? {
+        Some((model, _)) => match lower_rung(&projector, &settings, &plan, model, on_demand)? {
             Some((variant, variant_plan, short)) => (variant, variant_plan, Some(short)),
             None => (settings, plan, None),
         },
@@ -1706,6 +2058,7 @@ fn make(
         verify: _,
         allow_unpinned: _,
         modes,
+        initial_cells,
     } = plan;
     let device_first = device_first_native.is_some();
     if device_first && paged.is_none() {
@@ -1723,6 +2076,12 @@ fn make(
     stages.begin("building the step");
     let mut options = step_options(settings.context_limit, layout, kv_mode)?;
     options.tiered = tiered;
+    // The cache the context names is a ceiling: a start whose sessions grow on demand builds its
+    // state at the initial cells and lets the banks take the rest of the card.
+    let ceiling_cells = options.context_tokens;
+    if let Some(initial) = &initial_cells {
+        options.context_tokens = initial.cells;
+    }
     let res = match paged {
         Some(plan) => StepResources::allocate_paged(projector.context(), plan)?,
         None => {
@@ -1785,6 +2144,10 @@ fn make(
         )?,
         None => QwenResidentStep::new(projector.context(), res, weights, &options, rules)?,
     };
+    if initial_cells.is_some() {
+        // The state is built small; the context the config named is what a session may grow to.
+        step.set_ceiling_cells(ceiling_cells);
+    }
     if let Some((model, path)) = gguf.as_ref() {
         step.set_prefix_identity(gguf_prefix_identity(
             &model.weights,
@@ -1918,6 +2281,7 @@ fn make(
             eprintln!("{}", rollback_startup_line(&plan, cover, arena_admitted)?);
         }
     }
+    let mut tiered_slots = None;
     if let Some(plan) = tiered {
         // The banks come last: they take what the weights, the KV cache and the step state left.
         let (model, gguf) = gguf.as_ref().ok_or_else(|| {
@@ -1928,16 +2292,26 @@ fn make(
             projector.context(),
             ((model.weights.header(), gguf), &res.dims),
             &plan,
+            // The sessions the planner funded beside the banks; a config that named its tiered
+            // member sized its banks itself and keeps them whole.
+            (
+                card_short.as_ref().map_or(1, |short| short.sessions),
+                initial_cells
+                    .as_ref()
+                    .map_or(0, |cache| cache.growth_reserve),
+            ),
         )?;
+        tiered_slots = Some(slots);
         if settings.prefix_reuse {
-            step.configure_tiered_prefix_store()?;
+            step.configure_tiered_prefix_store(ceiling_cells)?;
         }
         eprintln!(
             "q36 cuda: tiered, {} slots per layer, {} cpu threads, timeout {} ms",
             slots, plan.threads, plan.timeout_ms
         );
         if let Some(short) = &card_short {
-            eprintln!("{}", short.line(slots, options.context_tokens));
+            step.set_sessions_funded(short.sessions);
+            eprintln!("{}", short.line(slots, ceiling_cells));
             if settings.prefix_reuse {
                 eprintln!(
                     "q36 cuda: prefix reuse follows the tiered engine's prefix store, which is off \
@@ -1952,7 +2326,7 @@ fn make(
         weight_format_name(settings.weights),
         before.free.saturating_sub(after.free),
         after.free,
-        options.context_tokens,
+        ceiling_cells,
         match options.kv_mode {
             KvMode::Fp16 => "fp16",
             KvMode::Int8G32 => "int8g32",
@@ -1960,6 +2334,28 @@ fn make(
         if settings.capture { "on" } else { "off" },
         projector.context().single_gather_suffix() + &step.shared_in_routed_suffix()
     );
+    // The load's own reading is the first mark; the receipt is a report, never a reason to fail a
+    // start that is otherwise good.
+    step.record_free_vram("load", u64::try_from(after.free).unwrap_or(0));
+    if let Some((model, _)) = gguf.as_ref() {
+        let cache = crate::family::mem::fill::CacheFigure {
+            cells: u64::try_from(options.context_tokens).unwrap_or(0),
+            bytes: kv_cache,
+        };
+        eprintln!(
+            "{}",
+            crate::family::mem::fill::report_line(
+                "q36 cuda",
+                memory_receipt(
+                    projector,
+                    model,
+                    &res.dims,
+                    (tiered_slots, step.tiered_pinned_bytes()),
+                    cache,
+                ),
+            )
+        );
+    }
     Ok((step, DecodeSession::default()))
 }
 
@@ -1989,6 +2385,94 @@ fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Re
         step.enable_disk_tier(&resolved, origin);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod initial_cache_tests {
+    use super::*;
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options};
+
+    fn settings(body: &str) -> Q36Settings {
+        let options: Q36Options = serde_json::from_str(body).expect("a valid qwen36 object");
+        Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("valid settings")
+    }
+
+    #[test]
+    fn an_opted_in_pool_credits_only_bytes_not_needed_for_growth() {
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
+        let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap();
+        let dims = StepDims::new(&shape, &inv).unwrap();
+        let pooled = settings(r#"{"context_limit":32768}"#);
+        let mode = serve_kv_mode(&pooled).unwrap();
+        let full = kv_cache_bytes(32768, mode).unwrap();
+        let flag = Some(std::ffi::OsStr::new("1"));
+        let enabled = tiered_kv_on_demand(session_plan(&pooled, false), flag);
+        let initial = initial_cache(&pooled, &dims, full, enabled)
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.cells, 1024);
+        assert_eq!(initial.bytes, kv_cache_bytes(1024, mode).unwrap());
+        assert_eq!(
+            initial.bytes + initial.growth_reserve + initial.bank_credit,
+            full
+        );
+        assert!(initial.bank_credit > 0);
+        let startup_part = session_part_bytes(&dims, &pooled, 1024).unwrap();
+        let old_part = session_part_bytes(&dims, &pooled, 31744).unwrap();
+        let new_part = session_part_bytes(&dims, &pooled, 32768).unwrap();
+        assert!(
+            startup_part + crate::family::mem::DEVICE.load_headroom + initial.growth_reserve
+                >= old_part + new_part
+        );
+
+        assert!(!tiered_kv_on_demand(session_plan(&pooled, false), None));
+        // Device-first without a host quota can yield a normal plan, but start uses the plain executor.
+        let disabled = tiered_kv_on_demand(session_plan(&pooled, true), flag);
+        assert!(
+            initial_cache(&pooled, &dims, full, disabled)
+                .unwrap()
+                .is_none()
+        );
+        let long = settings(r#"{"context_limit":131072}"#);
+        assert!(
+            initial_cache(&long, &dims, kv_cache_bytes(131072, mode).unwrap(), true)
+                .unwrap()
+                .is_none()
+        );
+        let short = settings(r#"{"context_limit":512}"#);
+        assert_eq!(initial_cells(short.context_limit), 512);
+        assert_eq!(planned_sessions(&short), 1);
+    }
+}
+
+#[cfg(test)]
+mod after_load_floor_tests {
+    use super::*;
+
+    /// The measured start: Q4_K_M weights on a card with 21.6 GB free planned a 9,216-cell int8
+    /// cache and the load then refused with 909,967,360 bytes free against the 1 GiB floor. The
+    /// fit now sees that the weights alone leave less than the floor, at that level and one step
+    /// below, and answers the lower rung before any upload.
+    #[test]
+    fn the_weights_alone_below_the_floor_leave_no_context() {
+        let weights = 20_408_576_512u64;
+        let floor = crate::family::mem::DEVICE.load_unplanned + (1 << 30);
+        assert!(!weights_leave_the_floor(21_600_468_992, weights, floor));
+        assert!(!weights_leave_the_floor(21_300_000_000, weights, floor));
+        assert!(weights_leave_the_floor(weights + floor, weights, floor));
+        assert!(!weights_leave_the_floor(
+            weights + floor - 1,
+            weights,
+            floor
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2526,5 +3010,73 @@ mod fused_inproj_tests {
             format!("{error:?}").contains("GDN_FUSE_INPROJ"),
             "{error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod check_choice_tests {
+    use super::*;
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options};
+
+    /// The figures a 24 GiB card with the Q4_K_M checkpoint reads at start.
+    const FREE: u64 = 24_188_420_096;
+    const WEIGHTS: u64 = 20_408_576_512;
+    const NSM: usize = 82;
+
+    #[test]
+    fn check_chooses_the_cache_form_and_context_the_start_chooses() {
+        let settings = Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&Q36Options::default()),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("the CUDA settings");
+        assert!(
+            settings.kv_auto && settings.context_auto,
+            "a config that names neither leaves both to the card"
+        );
+        let plan = startup_plan_of(&settings, false, false).expect("startup plan");
+        let reading = DeviceReading {
+            free: FREE,
+            nsm: NSM,
+        };
+        let served = card_choice(reading, &settings, &plan, WEIGHTS)
+            .expect("the card choice")
+            .expect("a fit");
+        let checked = planned_fit_from(reading, &settings, &plan, WEIGHTS)
+            .expect("the check's choice")
+            .expect("a fit");
+        assert_eq!(checked, (served.variant.kv, served.variant.context_limit));
+        assert_eq!(checked, (KvDtype::Q8, 242_688));
+    }
+
+    #[test]
+    fn fp16_auto_context_keeps_room_for_chunk_prefill() {
+        let mut settings = Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&Q36Options::default()),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("the CUDA settings");
+        settings.kv = KvDtype::F32;
+        settings.kv_auto = false;
+        // Prefix reuse pins a device tip at start, the admission's most expensive prefix mode:
+        // a fit that holds it also holds the cheaper prefix modes the flag really serves.
+        settings.prefix_reuse = true;
+        let plan = startup_plan_of(&settings, false, false).expect("startup plan");
+        assert!(matches!(plan.modes.prefix, PrefixMemory::DeviceTip));
+        let free = 24_085_921_792;
+        let choice = card_choice(DeviceReading { free, nsm: NSM }, &settings, &plan, WEIGHTS)
+            .expect("the card choice")
+            .expect("a context with a chunk arena fits");
+        assert_eq!(choice.variant.kv, KvDtype::F32);
+        let context = choice.variant.context_limit;
+        assert!(context < 119_808, "the old fit left no arena");
+        let admits = prefill_admits_of(NSM, &settings, &plan, (free, WEIGHTS)).expect("the gate");
+        assert!(admits(KvDtype::F32, context).expect("check the fit"));
     }
 }

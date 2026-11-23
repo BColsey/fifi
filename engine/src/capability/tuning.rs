@@ -244,14 +244,23 @@ pub(crate) fn attention_splits_or_env(
     tuned: usize,
     sm_count: u32,
 ) -> Result<usize, crate::EngError> {
-    match std::env::var(env) {
-        Err(_) => Ok(attention_splits(tuned, sm_count)),
-        Ok(text) => match text.trim().parse::<usize>() {
-            Ok(count) if (1..=SPLIT_CEILING).contains(&count) => Ok(count),
-            _ => Err(crate::EngError::BadRequest(format!(
-                "{env} takes 1 to {SPLIT_CEILING}, got {text:?}"
-            ))),
-        },
+    attention_splits_from(env, std::env::var(env).ok().as_deref(), tuned, sm_count)
+}
+
+/// [`attention_splits_or_env`] over the variable's text, so the rule has a host test: edition 2024
+/// makes `std::env::set_var` unsafe and the crate denies `unsafe_code`.
+fn attention_splits_from(
+    env: &str,
+    raw: Option<&str>,
+    tuned: usize,
+    sm_count: u32,
+) -> Result<usize, crate::EngError> {
+    match raw.map(|text| (text, text.trim().parse::<usize>())) {
+        None => Ok(attention_splits(tuned, sm_count)),
+        Some((_, Ok(count))) if (1..=SPLIT_CEILING).contains(&count) => Ok(count),
+        Some((text, _)) => Err(crate::EngError::BadRequest(format!(
+            "{env} takes 1 to {SPLIT_CEILING}, got {text:?}"
+        ))),
     }
 }
 
@@ -767,5 +776,42 @@ mod tests {
             assert!(splits >= last && (1..=SPLIT_CEILING).contains(&splits));
             last = splits;
         }
+    }
+
+    #[test]
+    fn the_split_variable_overrides_the_device_count_and_a_bad_value_is_refused() {
+        let at = |raw: Option<&str>| attention_splits_from("X_SPLITS", raw, 32, 20);
+        // Unset: the tuned count scaled to the device.
+        assert_eq!(at(None).expect("unset"), 8);
+        // In range, spaces trimmed: the operator's count wins, at the bounds too.
+        assert_eq!(at(Some("32")).expect("32"), 32);
+        assert_eq!(at(Some(" 7 ")).expect("7"), 7);
+        assert_eq!(at(Some("1")).expect("1"), 1);
+        assert_eq!(at(Some("128")).expect("128"), SPLIT_CEILING);
+        // Out of range or not a count: refused, naming the variable and the text.
+        for bad in ["0", "129", "-1", "", "many", "3.5"] {
+            let refusal = format!("{:?}", at(Some(bad)).expect_err(bad));
+            assert!(
+                refusal.contains("X_SPLITS") && refusal.contains("takes 1 to 128"),
+                "{bad}: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_path_name_keeps_the_tuned_name_and_names_any_other_count() {
+        // Off, the tuned count (the name entries were written under), another count.
+        assert_eq!(split_path_name("p", None, 32), "p attention-split false");
+        assert_eq!(split_path_name("p", Some(32), 32), "p attention-split true");
+        assert_eq!(
+            split_path_name("p", Some(8), 32),
+            "p attention-split true splits 8"
+        );
+        // The tuned count of another family keeps its own name.
+        assert_eq!(split_path_name("q", Some(16), 16), "q attention-split true");
+        assert_eq!(
+            split_path_name("q", Some(32), 16),
+            "q attention-split true splits 32"
+        );
     }
 }

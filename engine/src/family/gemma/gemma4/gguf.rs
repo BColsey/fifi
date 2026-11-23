@@ -27,8 +27,8 @@ const BOLT_LIMITS: GgufLimits = GgufLimits {
     // sits just above it (the legacy per-tensor ceiling was ~712 MiB).
     max_tensor_bytes: 3 << 30,
 };
-/// The most the Humanizer's resident ring and attention kernels take as a window.
-const HUMANIZER_MAX_WINDOW: u64 = 4096;
+/// The positions the Humanizer keeps per head; a window is at most that many.
+pub(super) const HUMANIZER_CELLS: u64 = 8192;
 const LAYERS: usize = 48;
 const HIDDEN: u64 = 3840;
 const FEED_FORWARD: u64 = 15360;
@@ -61,7 +61,7 @@ const FLOAT_SCALARS: [(&str, f64); 4] = [
     ("gemma4.attention.layer_norm_rms_epsilon", 1.0e-6),
 ];
 
-/// Opens the pinned Humanizer Q8_0 GGUF and checks its metadata and tensors.
+/// Opens a Humanizer-geometry Q8_0 GGUF and checks its metadata and tensors.
 ///
 /// Opener rejections are EngError::Checkpoint with the prefix gguf model: and
 /// name the offending metadata key or tensor. Failures of GgufWeights::open
@@ -91,7 +91,7 @@ pub(crate) fn open_humanizer_weights(path: &Path) -> Result<HumanizerFile, EngEr
     check_int_scalars(header, &HUMANIZER_INT_SCALARS)?;
     check_float_scalars(header)?;
     check_bool_scalar(header, "tokenizer.ggml.add_bos_token", true)?;
-    let window = read_window(header, HUMANIZER_MAX_WINDOW)?;
+    let window = read_window(header, HUMANIZER_CELLS)?;
     let kv = read_i32_array(
         &weights,
         header,
@@ -114,16 +114,7 @@ pub(crate) fn open_humanizer_weights(path: &Path) -> Result<HumanizerFile, EngEr
 /// The sliding window of the header: present, positive and at most `most`.
 fn read_window(header: &crate::weights::GgufHeader, most: u64) -> Result<usize, EngError> {
     let key = "gemma4.attention.sliding_window";
-    let window = match header.meta(key) {
-        Some(MetaValue::U32(value)) => u64::from(*value),
-        Some(MetaValue::U64(value)) => *value,
-        Some(_) => {
-            return Err(reject(format!(
-                "metadata key {key} is not an unsigned integer"
-            )));
-        }
-        None => return Err(reject(format!("metadata key {key} is missing"))),
-    };
+    let window = uint_meta(header, key)?;
     if window == 0 || window > most {
         return Err(reject(format!(
             "metadata key {key} is {window}, expected 1 to {most}"
@@ -132,10 +123,31 @@ fn read_window(header: &crate::weights::GgufHeader, most: u64) -> Result<usize, 
     Ok(window as usize)
 }
 
-/// One expected tensor: storage type and dimensions in file order.
+/// How the file stores one expected tensor.
+#[derive(Clone, Copy)]
+pub(super) enum Stored {
+    /// Exactly this type (the norms and scales, which every file keeps in F32).
+    Exact(GgufType),
+    /// A matrix: any type a native kernel reads, which is how the Q8_0 original and its K-quant
+    /// and IQ requants share one inventory.
+    Matrix,
+}
+
+impl Stored {
+    /// The type a test fixture writes for this tensor: the exact one, or Q8_0 for a matrix.
+    #[cfg(test)]
+    pub(super) fn fixture(self) -> GgufType {
+        match self {
+            Self::Exact(ty) => ty,
+            Self::Matrix => GgufType::Q80,
+        }
+    }
+}
+
+/// One expected tensor: how it is stored and its dimensions in file order.
 pub(super) struct Expected {
     pub(super) name: String,
-    pub(super) ty: GgufType,
+    pub(super) ty: Stored,
     pub(super) dims: Vec<u64>,
 }
 
@@ -144,17 +156,17 @@ pub(super) fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
     let mut expected = Vec::with_capacity(667);
     expected.push(Expected {
         name: "token_embd.weight".to_owned(),
-        ty: GgufType::Q80,
+        ty: Stored::Matrix,
         dims: vec![HIDDEN, VOCAB],
     });
     expected.push(Expected {
         name: "output_norm.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![HIDDEN],
     });
     expected.push(Expected {
         name: "rope_freqs.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![256],
     });
     for (layer, &heads) in kv.iter().enumerate() {
@@ -168,12 +180,12 @@ pub(super) fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
         let base = format!("blk.{layer}.");
         let norm = |suffix: &str, width: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::F32,
+            ty: Stored::Exact(GgufType::F32),
             dims: vec![width],
         };
         let matrix = |suffix: &str, rows: u64, cols: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::Q80,
+            ty: Stored::Matrix,
             dims: vec![rows, cols],
         };
         expected.push(norm("attn_norm.weight", HIDDEN));
@@ -216,9 +228,9 @@ fn check_inventory(
     // The missing-tensor refusal below names the first absent entry in this
     // order; sorting keeps that name stable regardless of inventory build order.
     expected.sort_by(|left, right| left.name.cmp(&right.name));
-    let table: std::collections::HashMap<&str, (&GgufType, &[u64])> = expected
+    let table: std::collections::HashMap<&str, (Stored, &[u64])> = expected
         .iter()
-        .map(|item| (item.name.as_str(), (&item.ty, item.dims.as_slice())))
+        .map(|item| (item.name.as_str(), (item.ty, item.dims.as_slice())))
         .collect();
     for tensor in header.tensors() {
         // A tensor the recipe does not read and that cannot change the result (a file's own extras)
@@ -229,13 +241,24 @@ fn check_inventory(
             }
             continue;
         };
-        if tensor.ggml_type() != **ty {
-            return Err(reject(format!(
-                "tensor {} has type {}, expected {}",
-                tensor.name(),
-                tensor.ggml_type().name(),
-                ty.name()
-            )));
+        let stored = tensor.ggml_type();
+        match ty {
+            Stored::Matrix if !stored.has_native_kernel() => {
+                return Err(reject(format!(
+                    "tensor {} has type {}, expected a matrix type with a native kernel",
+                    tensor.name(),
+                    stored.name()
+                )));
+            }
+            Stored::Exact(want) if stored != *want => {
+                return Err(reject(format!(
+                    "tensor {} has type {}, expected {}",
+                    tensor.name(),
+                    stored.name(),
+                    want.name()
+                )));
+            }
+            _ => {}
         }
         if tensor.dims() != *dims {
             return Err(reject(format!(
@@ -294,16 +317,7 @@ fn check_int_scalars(
     scalars: &[(&str, u64)],
 ) -> Result<(), EngError> {
     for (key, want) in scalars {
-        let found = match header.meta(key) {
-            Some(MetaValue::U32(value)) => u64::from(*value),
-            Some(MetaValue::U64(value)) => *value,
-            Some(_) => {
-                return Err(reject(format!(
-                    "metadata key {key} is not an unsigned integer"
-                )));
-            }
-            None => return Err(reject(format!("metadata key {key} is missing"))),
-        };
+        let found = uint_meta(header, key)?;
         if found != *want {
             return Err(reject(format!(
                 "metadata key {key} is {found}, expected {want}"
@@ -311,6 +325,14 @@ fn check_int_scalars(
         }
     }
     Ok(())
+}
+
+fn uint_meta(header: &crate::weights::GgufHeader, key: &str) -> Result<u64, EngError> {
+    header.meta_u64(key).ok_or_else(|| {
+        reject(format!(
+            "metadata key {key} is missing or not an unsigned integer"
+        ))
+    })
 }
 
 /// Checks each float scalar against the expected value in its stored precision.
@@ -552,26 +574,40 @@ pub(crate) fn open_bolt_weights(path: &Path) -> Result<(GgufWeights, BoltSpellin
     Ok((weights, spelling))
 }
 
-/// Extracts one layer's PLE rows from the canonical merged
-/// per_layer_token_embd payload. The reference layout is token-major: each
-/// of the `vocab` rows carries every layer's PLE block contiguous, so a
-/// layer's slice is `width` Q8 bytes at a per-row `stride` offset.
+/// Extracts one layer's PLE rows from the canonical merged per_layer_token_embd payload of type
+/// `ty`. The reference layout is token-major: each of the `vocab` rows carries every layer's PLE
+/// block contiguous, so a layer's slice is `ple` values' blocks at a per-row `stride` offset.
 #[cfg(any(test, feature = "native-cuda"))]
 pub(crate) fn ple_rows_from_merged(
     merged: &[u8],
+    ty: GgufType,
     layer: usize,
     ple: usize,
     layers: usize,
     vocab: usize,
-) -> Vec<u8> {
-    let stride = (ple * layers / 32) * 34;
-    let width = (ple / 32) * 34;
+) -> Result<Vec<u8>, EngError> {
+    let (elems, bytes) = (ty.block_elems() as usize, ty.block_bytes() as usize);
+    if !ple.is_multiple_of(elems) {
+        return Err(reject(format!(
+            "the per-layer table of {} has rows of {ple} values, not whole blocks",
+            ty.name()
+        )));
+    }
+    let width = ple / elems * bytes;
+    let stride = width * layers;
+    if merged.len() != stride * vocab || layer >= layers {
+        return Err(reject(format!(
+            "the merged per-layer table holds {} bytes, expected {} for layer {layer} of {layers}",
+            merged.len(),
+            stride * vocab
+        )));
+    }
     let mut out = Vec::with_capacity(vocab * width);
     for token in 0..vocab {
         let at = token * stride + layer * width;
         out.extend_from_slice(&merged[at..at + width]);
     }
-    out
+    Ok(out)
 }
 
 /// Resolves which tensor spelling the file carries. A file with both
@@ -614,33 +650,33 @@ fn bolt_expected_inventory(spelling: BoltSpelling) -> Vec<Expected> {
     let mut expected = Vec::with_capacity(707);
     expected.push(Expected {
         name: "token_embd.weight".to_owned(),
-        ty: GgufType::Q80,
+        ty: Stored::Matrix,
         dims: vec![BOLT_HIDDEN, BOLT_VOCAB],
     });
     expected.push(Expected {
         name: "output_norm.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![BOLT_HIDDEN],
     });
     expected.push(Expected {
         name: "rope_freqs.weight".to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![BOLT_GLOBAL_HEAD / 2],
     });
     expected.push(Expected {
         name: spelling.ple_model_proj().to_owned(),
-        ty: GgufType::Q80,
+        ty: Stored::Matrix,
         dims: vec![BOLT_HIDDEN, BOLT_PER_LAYER_INPUT * BOLT_LAYERS as u64],
     });
     expected.push(Expected {
         name: spelling.ple_proj_norm().to_owned(),
-        ty: GgufType::F32,
+        ty: Stored::Exact(GgufType::F32),
         dims: vec![BOLT_PER_LAYER_INPUT],
     });
     if let Some(name) = spelling.per_layer_token_embd() {
         expected.push(Expected {
             name: name.to_owned(),
-            ty: GgufType::Q80,
+            ty: Stored::Matrix,
             dims: vec![BOLT_PER_LAYER_INPUT * BOLT_LAYERS as u64, BOLT_VOCAB],
         });
     }
@@ -655,12 +691,12 @@ fn bolt_expected_inventory(spelling: BoltSpelling) -> Vec<Expected> {
         let base = format!("blk.{layer}.");
         let norm = |suffix: &str, width: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::F32,
+            ty: Stored::Exact(GgufType::F32),
             dims: vec![width],
         };
         let matrix = |suffix: &str, rows: u64, cols: u64| Expected {
             name: format!("{base}{suffix}"),
-            ty: GgufType::Q80,
+            ty: Stored::Matrix,
             dims: vec![rows, cols],
         };
         expected.push(norm("attn_norm.weight", BOLT_HIDDEN));

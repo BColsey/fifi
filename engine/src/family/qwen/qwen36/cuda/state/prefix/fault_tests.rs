@@ -1,10 +1,10 @@
 //! A real sticky fault must poison import without publishing or freeing native owners.
-use super::super::super::{
-    common_tests::dims, paging_cow_tests::write_loaded, paging_store::PageId,
-};
 use super::super::paged_prefix_tests::{options, pages, seeded_state, snapshot_budget};
 use super::PrefixState;
 use crate::family::graph_state::book::Health;
+use crate::family::qwen::qwen36::cuda::{
+    common_tests::dims, paging_cow_tests::write_loaded, paging_store::PageId,
+};
 use crate::{
     EngError,
     kernels::cuda::{

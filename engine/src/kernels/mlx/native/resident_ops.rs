@@ -20,11 +20,11 @@ use super::{
     handles::{Array, Resident, native_byte_len, native_dtype},
 };
 #[cfg(test)]
-use crate::kernels::{QuantizationMode, QuantizationSpec};
+use crate::kernels::QuantizationSpec;
 use crate::{
     EngError,
     kernels::{
-        BinaryOp, ReduceOp, RopeSpec, UnaryOp,
+        BinaryOp, QuantizationMode, ReduceOp, RopeSpec, UnaryOp,
         elementwise::{self, AxisRule, ElementwiseInputs, ElementwiseLayout, output_bytes},
         gated_delta,
         rope::{self, RopeLayout, RopeOperands, RopeStep},
@@ -62,6 +62,14 @@ pub(super) const DELTA_MIDDLE_SOURCE: &str =
     concat!(include_str!("delta_middle_v1.body.metal"), "\0");
 
 pub(super) const ACT_MUL_SOURCE: &str = concat!(include_str!("act_mul.body.metal"), "\0");
+
+const INKLING_ACTIVATION_SOURCE: &str =
+    concat!(include_str!("inkling_activation.body.metal"), "\0");
+const INKLING_MERGE_SOURCE: &str = concat!(include_str!("inkling_merge.body.metal"), "\0");
+const INKLING_GGUF_SOURCE: &str = concat!(include_str!("inkling_gguf.body.metal"), "\0");
+const INKLING_HEADER: &str = concat!(include_str!("inkling_experts.header.metal"), "\0");
+const INKLING_NVFP4_SOURCE: &str = concat!(include_str!("inkling_nvfp4.body.metal"), "\0");
+const INKLING_MXFP8_SOURCE: &str = concat!(include_str!("inkling_mxfp8.body.metal"), "\0");
 
 pub(super) const GDN_POST_SOURCE: &str = concat!(include_str!("gdn_post.body.metal"), "\0");
 
@@ -2348,14 +2356,15 @@ impl Context {
         Ok(state.resident(out, Dtype::Bf16, vec![rows, hidden], byte_len))
     }
 
-    /// The fused MoE router top-k (Q36 decode): the stable top-k selection of one probability
-    /// row `probs` `[1, experts]` F32 plus the renormalized gates in ONE kernel - the same
-    /// rank order, tie rule, and gate rounding as the op chain of `route_device`. Returns
-    /// `(ids, gates)`: `ids` `[k]` U32 in rank order (already below `experts`, so the caller
-    /// wraps them in `BoundedIndices` without a clamp node) and `gates` `[k, 1, 1]` F32.
-    /// `BadRequest` unless the row is F32 `[1, experts]` with `experts` a nonzero multiple of
-    /// 32 at most 1024 and `top_k` between 1 and `experts` at most 32; the general path stays
-    /// the op chain. Health is NOT computed here: the caller keeps its own reduce node.
+    /// The fused MoE router top-k (Q36 decode): the stable top-k selection of `[rows, experts]`
+    /// F32 probability rows (one to eight rows) plus the renormalized gates in ONE kernel - the
+    /// same rank order and tie rule as the op chain of `route_device`, with gates within two units in the last place. Returns
+    /// `(ids, gates)`: one row gives `ids` `[k]` and `gates` `[k, 1, 1]`, a window gives `[rows,
+    /// k]` and `[rows, k, 1, 1]`. The ids are U32 in rank order, already below `experts`, so the
+    /// caller wraps them in `BoundedIndices` without a clamp node. `BadRequest` unless the rows
+    /// are F32 with `experts` a nonzero multiple of 32 at most 1024 and `top_k` between 1 and
+    /// `experts` at most 32; the general path stays the op chain. Health is NOT computed here:
+    /// the caller keeps its own reduce node.
     pub(in crate::kernels::mlx) fn router_topk(
         &mut self,
         probs: &ExecutionTensor,
@@ -2373,9 +2382,14 @@ impl Context {
                 "moe router top-k needs the F32 softmax row".into(),
             ));
         }
-        if probs.shape() != [1, experts] {
+        let &[rows, width] = probs.shape() else {
             return Err(EngError::BadRequest(
-                "moe router top-k needs the [1, experts] probability row".into(),
+                "moe router top-k needs a [rows, experts] probability matrix".into(),
+            ));
+        };
+        if width != experts || !(1..=8).contains(&rows) {
+            return Err(EngError::BadRequest(
+                "moe router top-k needs one to eight [experts] probability rows".into(),
             ));
         }
         if experts == 0
@@ -2390,9 +2404,14 @@ impl Context {
                     .into(),
             ));
         }
-        let dims = native_ints(label, &[1, experts, top_k, top_k.max(8), renorm as u32])?;
-        let ids_shape = native_ints(label, &[top_k])?;
-        let gates_shape = native_ints(label, &[top_k, 1, 1])?;
+        let dims = native_ints(label, &[rows, experts, top_k, top_k.max(8), renorm as u32])?;
+        let (ids_dims, gates_dims): (Vec<u32>, Vec<u32>) = if rows == 1 {
+            (vec![top_k], vec![top_k, 1, 1])
+        } else {
+            (vec![rows, top_k], vec![rows, top_k, 1, 1])
+        };
+        let ids_shape = native_ints(label, &ids_dims)?;
+        let gates_shape = native_ints(label, &gates_dims)?;
         let _input = probs.share();
         clear_message();
         let stream = state.stream.0;
@@ -2405,31 +2424,31 @@ impl Context {
                 probs.storage.native_array(),
                 dims.as_ptr(),
                 ids_shape.as_ptr(),
-                1,
+                ids_shape.len() as i32,
                 gates_shape.as_ptr(),
-                3,
+                gates_shape.len() as i32,
                 MOE_ROUTER_SOURCE.as_ptr().cast(),
                 stream,
             )
         });
-        let ids_len = u64::from(top_k);
+        let ids_len = u64::from(rows) * u64::from(top_k);
         let expected_ids = ExpectedOutput {
             operation: label,
             stream,
-            shape: &[top_k],
+            shape: &ids_dims,
             byte_len: ids_len * 4,
             dtype: Dtype::U32,
             promotes: false,
         };
         expected_ids.complete(&ids, built)?;
         let expected_gates = ExpectedOutput {
-            shape: &[top_k, 1, 1],
+            shape: &gates_dims,
             dtype: Dtype::F32,
             ..expected_ids
         };
         expected_gates.complete(&gates, Ok(()))?;
-        let ids = state.resident(ids, Dtype::U32, vec![top_k], ids_len * 4);
-        let gates = state.resident(gates, Dtype::F32, vec![top_k, 1, 1], ids_len * 4);
+        let ids = state.resident(ids, Dtype::U32, ids_dims, ids_len * 4);
+        let gates = state.resident(gates, Dtype::F32, gates_dims, ids_len * 4);
         Ok((ids, gates))
     }
 
@@ -2775,6 +2794,192 @@ impl Context {
         };
         expected.complete(&h, built)?;
         Ok(state.resident(h, Dtype::Bf16, vec![rows, ncol], byte_len))
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_activation(
+        &mut self,
+        gate_up: &ExecutionTensor,
+        weights: &ExecutionTensor,
+        quantization: Option<QuantizationMode>,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "Inkling capped activation";
+        let &[rows, 1, combined] = gate_up.shape() else {
+            return Err(bad_request(
+                "Inkling gate/up must have shape [routes, 1, 2 * width]",
+            ));
+        };
+        if combined == 0 || !combined.is_multiple_of(2) || weights.shape() != [rows] {
+            return Err(bad_request(
+                "Inkling gate/up and route weight shapes disagree",
+            ));
+        }
+        self.inkling_expert_kernel(
+            label,
+            gate_up,
+            Some(weights),
+            [rows, combined / 2, 1],
+            quantization,
+        )
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_quantized_rows(
+        &mut self,
+        input: &ExecutionTensor,
+        mode: QuantizationMode,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "Inkling input quantization";
+        let &[rows, width] = input.shape() else {
+            return Err(bad_request(
+                "Inkling quantization input must have shape [tokens, hidden]",
+            ));
+        };
+        self.inkling_expert_kernel(label, input, None, [rows, width, 1], Some(mode))
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_merge(
+        &mut self,
+        down: &ExecutionTensor,
+        rows: u32,
+        picks: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "Inkling expert merge";
+        let &[routes, 1, width] = down.shape() else {
+            return Err(bad_request(
+                "Inkling down output must have shape [routes, 1, hidden]",
+            ));
+        };
+        if picks == 0 || rows.checked_mul(picks) != Some(routes) {
+            return Err(bad_request("Inkling down output and route count disagree"));
+        }
+        self.inkling_expert_kernel(label, down, None, [rows, width, picks], None)
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_gguf_matvec(
+        &mut self,
+        activation: &ExecutionTensor,
+        payload: &ExecutionTensor,
+        codes: Option<&ExecutionTensor>,
+        dtype: crate::weights::GgufType,
+    ) -> Result<ExecutionTensor, EngError> {
+        use crate::weights::{GgufType, inkling_codebook_words};
+        let operation = "Inkling GGUF packed matvec";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_f32_operand(operation, state, activation)?;
+        check_owner(operation, state, payload)?;
+        let (&[1, width], &[rows, stride]) = (activation.shape(), payload.shape()) else {
+            return Err(bad_request(
+                "Inkling GGUF matvec expects one F32 row and a U8 matrix",
+            ));
+        };
+        let codebook_words = inkling_codebook_words(dtype);
+        if (!matches!(dtype, GgufType::Q20 | GgufType::Nvfp4) && codebook_words.is_none())
+            || width == 0
+            || rows == 0
+            || payload.dtype() != Dtype::U8
+            || !u64::from(width).is_multiple_of(dtype.block_elems())
+            || u64::from(stride) != u64::from(width) / dtype.block_elems() * dtype.block_bytes()
+            || u64::from(rows) * u64::from(stride) > u64::from(u32::MAX)
+        {
+            return Err(bad_request("Inkling GGUF matvec has invalid block layout"));
+        }
+        let code_array = match (codebook_words, codes) {
+            (Some(words), Some(codes))
+                if codes.dtype() == Dtype::U32 && codes.shape() == [words] =>
+            {
+                check_owner(operation, state, codes)?;
+                codes.storage.native_array()
+            }
+            (None, None) => ffi::NULL_ARRAY,
+            _ => return Err(bad_request("Inkling GGUF matvec has an invalid codebook")),
+        };
+        let dims = native_ints(operation, &[width, rows, stride, dtype.id()])?;
+        let layout = shape::dequantize(operation, &[1, rows])?;
+        clear_message();
+        let stream = state.stream.0;
+        let output = dispatch_elementwise(operation, &layout, stream, |slot| unsafe {
+            ffi::mlx_inkling_gguf(
+                slot,
+                activation.storage.native_array(),
+                payload.storage.native_array(),
+                code_array,
+                dims.as_ptr(),
+                INKLING_GGUF_SOURCE.as_ptr().cast(),
+                INKLING_HEADER.as_ptr().cast(),
+                stream,
+            )
+        })?;
+        Ok(elementwise_result(state, output, layout))
+    }
+
+    fn inkling_expert_kernel(
+        &mut self,
+        label: &'static str,
+        projected: &ExecutionTensor,
+        weights: Option<&ExecutionTensor>,
+        [rows, width, picks]: [u32; 3],
+        quantization: Option<QuantizationMode>,
+    ) -> Result<ExecutionTensor, EngError> {
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_f32_operand(label, state, projected)?;
+        let (code, group, source) = match quantization {
+            Some(QuantizationMode::Nvfp4) => (1, 16, INKLING_NVFP4_SOURCE),
+            Some(QuantizationMode::Mxfp8) => (2, 32, INKLING_MXFP8_SOURCE),
+            Some(_) => {
+                return Err(bad_request(
+                    "Inkling activation format must be NVFP4 or MXFP8",
+                ));
+            }
+            None if weights.is_some() => (0, 1, INKLING_ACTIVATION_SOURCE),
+            None => (0, 1, INKLING_MERGE_SOURCE),
+        };
+        if width == 0 || !width.is_multiple_of(group) {
+            return Err(bad_request(
+                "Inkling activation width must contain complete quantization groups",
+            ));
+        }
+        if quantization == Some(QuantizationMode::Nvfp4)
+            && (u64::from(width) + 4) * 4 > state.max_threadgroup_memory
+        {
+            return Err(bad_request(
+                "Inkling NVFP4 row exceeds Metal threadgroup memory",
+            ));
+        }
+        let projected_elements = projected.byte_len() / Dtype::F32.byte_width();
+        if projected_elements > u64::from(u32::MAX) {
+            return Err(bad_request(
+                "Inkling expert kernel input exceeds Metal index limits",
+            ));
+        }
+        let items = rows
+            .checked_mul(width)
+            .ok_or_else(|| bad_request("Inkling expert grid overflows"))?;
+        let dims = native_ints(label, &[rows, width, items, picks, code])?;
+        let (shape, weight_array) = match weights {
+            Some(weights) => {
+                check_f32_operand(label, state, weights)?;
+                (vec![rows, 1, width], weights.storage.native_array())
+            }
+            None => (vec![rows, width], ffi::NULL_ARRAY),
+        };
+        let layout = shape::dequantize(label, &shape)?;
+        clear_message();
+        let stream = state.stream.0;
+        let output = dispatch_elementwise(label, &layout, stream, |slot| unsafe {
+            ffi::mlx_inkling_expert_kernel(
+                slot,
+                projected.storage.native_array(),
+                weight_array,
+                dims.as_ptr(),
+                source.as_ptr().cast(),
+                INKLING_HEADER.as_ptr().cast(),
+                stream,
+            )
+        })?;
+        Ok(elementwise_result(state, output, layout))
     }
 
     /// Runs the gdn_post fused kernel: o = bf16(rms_norm(core) * silu(z)).
@@ -3802,9 +4007,9 @@ mod rebind_tests {
         true
     }
 
-    fn resident(kernels: &mut MlxKernels, salt: f32) -> ExecutionTensor {
+    fn resident(kernels: &mut MlxKernels, base: f32) -> ExecutionTensor {
         let values: Vec<u8> = (0..8)
-            .flat_map(|lane| (salt + lane as f32 / 8.0).to_le_bytes())
+            .flat_map(|lane| (base + lane as f32 / 8.0).to_le_bytes())
             .collect();
         kernels
             .import_tensor(&Tensor::try_from_host(Dtype::F32, vec![1, 1, 8], values).unwrap())

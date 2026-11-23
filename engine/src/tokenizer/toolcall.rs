@@ -39,6 +39,12 @@ use std::collections::{HashMap, HashSet};
 #[path = "toolcall_flint_tests.rs"]
 mod flint_tests;
 
+pub(crate) const INKLING_TEMPLATE_SHA: &str =
+    "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc";
+pub(crate) const INKLING_TEXT: &str = "<|content_text|>";
+pub(crate) const INKLING_THINKING: &str = "<|content_thinking|>";
+pub(crate) const INKLING_END: &str = "<|end_message|>";
+
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 const CALL_OPEN: &str = "<tool_call>";
@@ -54,6 +60,7 @@ pub enum ToolGrammar {
     #[default]
     Qwen,
     Flint,
+    Inkling,
 }
 
 impl ToolGrammar {
@@ -61,10 +68,10 @@ impl ToolGrammar {
         use sha2::{Digest, Sha256};
         // RecursiveSI/flint 2a247be0 and flint-int4 3b93f905 share these exact bytes.
         let hash = format!("{:x}", Sha256::digest(source.as_bytes()));
-        if hash == "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466" {
-            Self::Flint
-        } else {
-            Self::Qwen
+        match hash.as_str() {
+            "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466" => Self::Flint,
+            INKLING_TEMPLATE_SHA => Self::Inkling,
+            _ => Self::Qwen,
         }
     }
 }
@@ -243,10 +250,10 @@ impl ToolCallParser {
                 events.push(self.call_event(body));
                 continue;
             }
-            let markers: &[&str] = if self.reasoning {
-                &[THINK_CLOSE]
-            } else {
-                &[THINK_OPEN, CALL_OPEN]
+            let markers: &[&str] = match (self.grammar, self.reasoning) {
+                (ToolGrammar::Inkling, _) => &[INKLING_TEXT, INKLING_THINKING, INKLING_END],
+                (_, true) => &[THINK_CLOSE],
+                (_, false) => &[THINK_OPEN, CALL_OPEN],
             };
             let hit = markers
                 .iter()
@@ -265,8 +272,8 @@ impl ToolCallParser {
             self.held.clear();
             self.leading = true;
             match marker {
-                THINK_CLOSE => self.reasoning = false,
-                THINK_OPEN => self.reasoning = true,
+                THINK_CLOSE | INKLING_TEXT | INKLING_END => self.reasoning = false,
+                THINK_OPEN | INKLING_THINKING => self.reasoning = true,
                 _ => self.in_call = true,
             }
         }
@@ -302,6 +309,7 @@ impl ToolCallParser {
         let parsed = match self.grammar {
             ToolGrammar::Qwen => parse_body(&body, &self.schemas),
             ToolGrammar::Flint => parse_flint_body(&body, &self.schemas),
+            ToolGrammar::Inkling => unreachable!("Inkling text has no tool call parser"),
         };
         match parsed {
             Ok((name, arguments)) => {
@@ -1036,6 +1044,33 @@ mod tests {
             out.tool_calls.len(),
             1,
             "expected the quoted call to parse only if the grammar treats it as structural; got {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inkling_tests {
+    use super::*;
+
+    #[test]
+    fn inkling_text_and_reasoning_channels_split_across_batches() {
+        let mut parser = ToolCallParser::with_grammar(
+            Start::Content,
+            ToolSchemas::default(),
+            "inkling_",
+            ToolGrammar::Inkling,
+        );
+        let mut events = parser.push("<|content_think");
+        assert!(events.is_empty());
+        events.extend(parser.push("ing|>private"));
+        events.extend(parser.push("<|end_message|><|content_text|>answer"));
+        events.extend(parser.finish());
+        assert_eq!(
+            events,
+            vec![
+                ToolEvent::Reasoning("private".into()),
+                ToolEvent::Content("answer".into())
+            ]
         );
     }
 }

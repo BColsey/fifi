@@ -144,14 +144,14 @@ pub(super) fn step(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::deltanet::{self, DeltaState};
-    use super::super::super::load::FlashWeights;
-    use super::super::super::mlx::MlxProjector;
-    use super::super::super::step::AttnWeights;
     use super::super::fixtures;
     use super::super::ops::{f32_tensor, values, zeros};
     use super::super::weights::{RAttn, ResidentWeights};
     use super::*;
+    use crate::family::qwen::flash_next::deltanet::{self, DeltaState};
+    use crate::family::qwen::flash_next::load::FlashWeights;
+    use crate::family::qwen::flash_next::mlx::MlxProjector;
+    use crate::family::qwen::flash_next::step::AttnWeights;
 
     /// Asserts cosine >= 0.99999 and max error / max host magnitude <= 1e-4 (the metric of `mlx.rs:167-198`).
     fn assert_parity(got: &[f32], want: &[f32], what: &str) {

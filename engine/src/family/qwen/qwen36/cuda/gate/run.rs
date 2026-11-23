@@ -521,7 +521,13 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     let mut step = build_step(&projector, &res, &device, rules, s, layout)?;
     if let Some(plan) = s.tiered {
         let source = (model.weights.header(), s.gguf.as_path());
-        attach_tiered_parts(&mut step, projector.context(), (source, &res.dims), &plan)?;
+        attach_tiered_parts(
+            &mut step,
+            projector.context(),
+            (source, &res.dims),
+            &plan,
+            (1, 0),
+        )?;
     }
     run_all(&mut step, s, mode, identities)
 }
@@ -1152,7 +1158,10 @@ mod tests {
         let on = identities_of(&tiered, 100, 90, 40);
         assert_eq!(on["tiered"]["slots"], 40);
         assert_eq!(on["tiered"]["threads"], 4);
-        assert_eq!(on["tiered"]["timeout_ms"], 10_000);
+        assert_eq!(
+            on["tiered"]["timeout_ms"],
+            crate::family::step_dims::TieredPlan::DEFAULT_TIMEOUT_MS
+        );
         assert_eq!(on["tiered"]["preload"], true);
         assert_eq!(
             session_options(&tiered, WeightLayout::Native)

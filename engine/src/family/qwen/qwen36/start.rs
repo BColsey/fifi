@@ -173,6 +173,20 @@ fn open_engine(
         eprintln!("{line}");
     }
     executor.enable_disk_tier(owned)?;
+    // The memory receipt: a report, never a reason to fail a good start.
+    if let Some(machine) = crate::family::mem::mac_memory() {
+        eprintln!(
+            "{}",
+            crate::family::mem::fill::unified_line(
+                "q36 mlx",
+                machine.physical_bytes,
+                machine.metal_bytes,
+                std::fs::metadata(&owned.artifact)
+                    .ok()
+                    .map(|meta| meta.len()),
+            )
+        );
+    }
     Ok((executor, session))
 }
 

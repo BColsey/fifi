@@ -172,6 +172,15 @@ pub(crate) struct KvPool {
 }
 
 impl KvPool {
+    /// Whether `other` stores the same kind of cache, however many positions it holds: the same
+    /// mode, layers, KV heads and head width. Only the offsets of the planes differ.
+    pub(crate) fn same_form(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.layers == other.layers
+            && self.kv_heads == other.kv_heads
+            && self.head_dim == other.head_dim
+    }
+
     pub(crate) fn new(dims: &StepDims, mode: KvMode, capacity: usize) -> Result<Self, EngError> {
         Self::new_with_heads(dims, mode, capacity, dims.shape.attn.heads_kv)
     }
@@ -365,6 +374,13 @@ pub(crate) struct StateLayout {
 }
 
 impl StateLayout {
+    /// Whether `other` holds the same state, however many positions its cache has: the exported
+    /// prefix of one is the import of the other ([`KvPool::prefix_ranges`] keeps the runs in
+    /// the same order).
+    pub(crate) fn same_form(&self, other: &Self) -> bool {
+        self.delta == other.delta && self.words == other.words && self.kv.same_form(&other.kv)
+    }
+
     /// Device bytes of the pools and the words, the state term of the admission sum. The decode
     /// arena (`StepPlan::arena_bytes`), the workspace (`Admission`) and a prefill arena are
     /// separate terms.

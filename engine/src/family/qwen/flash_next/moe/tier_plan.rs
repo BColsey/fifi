@@ -330,7 +330,7 @@ impl TierPlan {
                 let plan = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)?;
                 (tier, plan.page_cache_left, cold_bytes)
             }
-            TierChoice::CardTiered { .. } => {
+            TierChoice::CardTiered { .. } | TierChoice::CardDisk { .. } => {
                 return Err(refuse(
                     "the host ladder answered a card tier to a plan that passed no card figures"
                         .into(),

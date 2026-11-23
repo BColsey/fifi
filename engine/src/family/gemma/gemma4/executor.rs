@@ -331,11 +331,11 @@ mod tests {
         Some(GenerationState::new(IncrementalDecoder::new(&tokenizer)))
     }
 
-    /// Fills the pinned 8,192-cell context, then decodes four steps, so the
+    /// Fills the 8,192-cell context, then decodes four steps, so the
     /// memory plan and the thermals are measured at the stated limit.
     /// Set GEMMA4_CONTEXT_TOKENS to the cell count.
     #[test]
-    #[ignore = "requires the pinned file, a device and GEMMA4_CONTEXT_TOKENS"]
+    #[ignore = "requires a Humanizer Q8_0 file, a device and GEMMA4_CONTEXT_TOKENS"]
     fn fills_the_stated_context() {
         let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
             return;
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the pinned Humanizer file and a device"]
+    #[ignore = "requires a Humanizer Q8_0 file and a device"]
     fn prefills_and_decodes_three_tokens() {
         let Ok(path) = std::env::var("GEMMA4_Q8_FILE") else {
             return;

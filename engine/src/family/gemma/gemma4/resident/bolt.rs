@@ -15,8 +15,9 @@
 //! projection and the logit softcap.
 //!
 //! Limits:
-//! - The cache holds the planned number of cells per physical layer (up to the model's 65,536
-//!   maximum positions), chosen from the free card at load.
+//! - The four full-attention layers hold the planned number of cells (up to the model's 65,536
+//!   maximum positions), chosen from the free card at load; each sliding layer holds a ring of
+//!   the window plus one prefill chunk, whatever the context.
 //! - Prefill runs bounded batches through the batched step.
 //! - The per-head RMSNorm runs one batched launch across heads.
 //! - Shared layers rotate one scratch k row, because the rope kernel requires
@@ -37,27 +38,31 @@ use super::bolt_graph::{
 };
 use super::step::layer_buffers;
 use super::{
-    Kv, Matrix, PackedMatrix, Vector, epsilon, matrix, packed_matrix, scalar, vector,
-    vector_filled, zero,
+    Kv, Vector, epsilon, matrix, matrix_from_bytes, matvec, scalar, vector, vector_filled, zero,
 };
 use crate::EngError;
 use crate::family::card_fit::CellFigures;
+use crate::family::cell_pool::{CellLease, CellPool, fit_planes, fund_growth};
 use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
+use crate::family::kv_ring::KvRing;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
-use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{
     WideAttention, WideCall, WideGeometry, WideLoad,
 };
+use crate::kernels::cuda::prefill::dense_chunk_gemm::DenseChunkGemm;
+use crate::kernels::cuda::prefill::mmq_dense::has_dense_case;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
-use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
+use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
-use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
-use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::resident::multi_row::{
+    AppendMultiCall, DecodeGemmaMultiCall, KvRow, KvRows, ROW_RECORD_BYTES, STEP_BLOCK_BYTES,
+};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
@@ -66,7 +71,8 @@ use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::shortlist;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
-use crate::weights::GgufType;
+use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Geometry is read from the family descriptor, the single source of truth;
@@ -87,6 +93,20 @@ pub(crate) const GLOBAL_HEAD: usize = NEMOTRON_BOLT_E4B.global_head_dim as usize
 /// Width of one per-layer input and of the gated mixing inside every layer.
 pub(crate) const PLE: usize = 256;
 pub(crate) const FFN: usize = 10_240;
+/// The fewest prompt rows of a chunk that run on the tensor cores; a shorter chunk keeps the matvec.
+const MMQ_MIN_ROWS: usize = 16;
+/// The widest activation a chunk projects.
+const MMQ_K_MAX: usize = FFN;
+
+/// Whether a group of projections over one activation runs on the tensor cores: the chunk is wide
+/// enough and every weight of the group rests in one type that has a dense case, since one
+/// quantized activation serves one layout.
+fn on_tensor_cores(mut types: impl Iterator<Item = QuantType>, m: usize) -> bool {
+    let Some(first) = types.next() else {
+        return false;
+    };
+    m >= MMQ_MIN_ROWS && has_dense_case(first) && types.all(|ty| ty == first)
+}
 /// The model's maximum positions: the ceiling of the planned KV cells per physical layer.
 pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {
     Some(dense) => dense.context_limit as usize,
@@ -94,14 +114,13 @@ pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {
 };
 /// The cell count a refusal is worded for when the card carries no planned count.
 const FALLBACK_CELLS: usize = 32_768;
-pub(crate) const LOCAL_WINDOW: usize = NEMOTRON_BOLT_E4B.sliding_window as usize;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 /// The identity and mixing scales applied to the per-layer inputs.
 const PLE_IDENTITY_SCALE: f32 = 16.0;
 const PLE_COMBINED_SCALE: f32 = std::f32::consts::SQRT_2.recip();
 
 /// The device bytes the scratch can hold at once: every growable activation
-/// vector and q8 buffer sized for `PREFILL_BATCH` rows (the maximum
+/// vector and q8 buffer sized for the planned prefill rows (the maximum
 /// `grow_scratch` allocates), plus the fixed ones/logits/head/qk buffers and
 /// the three input cells. The starter admits this against free memory before
 /// loading. `None` on overflow. Mirrors `grow_scratch` so the charge cannot
@@ -109,8 +128,8 @@ const PLE_COMBINED_SCALE: f32 = std::f32::consts::SQRT_2.recip();
 /// is charged only when the split is armed, at the device's split count (the split is the default since it
 /// landed; the admission must refuse an armed load before allocating), and the wide
 /// prefill attention's only when `wide_prefill` (the device gate passed).
-pub(crate) fn scratch_bytes(attn_splits: Option<usize>, wide_prefill: bool) -> Option<u64> {
-    let rows = Bolt::PREFILL_BATCH as u64;
+pub(crate) fn scratch_bytes(splits: Option<usize>, wide: bool, rows: usize) -> Option<u64> {
+    let rows64 = rows as u64;
     let growable_f32 = [
         8 * HIDDEN,                 // h[4], nrm, nrm2, proj, down
         3 * HEADS * GLOBAL_HEAD,    // q_normed, q, ctx_out
@@ -121,28 +140,27 @@ pub(crate) fn scratch_bytes(attn_splits: Option<usize>, wide_prefill: bool) -> O
     ];
     let mut total = 0u64;
     for elements in growable_f32 {
-        total = total.checked_add((elements as u64).checked_mul(rows)?.checked_mul(4)?)?;
+        total = total.checked_add((elements as u64).checked_mul(rows64)?.checked_mul(4)?)?;
     }
     // Fixed f32 buffers: ones, logits, logits_capped.
     total = total.checked_add(((GLOBAL_HEAD + 2 * VOCAB) as u64).checked_mul(4)?)?;
-    // Growable q8 buffers at PREFILL_BATCH columns.
+    // Growable q8 buffers at the planned prefill columns.
     for width in [HIDDEN, HEADS * GLOBAL_HEAD, FFN, PLE] {
-        total = total.checked_add(q8_1_bytes(width, Bolt::PREFILL_BATCH)? as u64)?;
+        total = total.checked_add(q8_1_bytes(width, rows)? as u64)?;
     }
-    // Fixed q8 buffers: the head row and the qk dump.
-    total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, 1)? as u64)?;
-    total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS)? as u64)?;
+    // The q8 buffers sized once: the head rows and the qk dump.
+    total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, rows)? as u64)?;
+    total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, rows * HEADS)? as u64)?;
     // ids, pos, kv_len input cells.
     total = total.checked_add(12)?;
     // The split partial buffer, present only when the attention split is armed.
-    if let Some(splits) = attn_splits {
-        total = total.checked_add(attn_part_bytes(splits) as u64)?;
+    if let Some(splits) = splits {
+        total = total.checked_add(attn_part_bytes(splits, rows) as u64)?;
     }
-    // The wide prefill attention's partial buffer, present only when the device gate passed.
     // The wide prefill attention's partial buffer, present only when the device gate passed; the
     // buffer holds at most 128 splits, so the model maximum bounds it for every planned cell count.
-    total = total.checked_add(wide_geometry(MAX_CELLS).charge(wide_prefill)?)?;
-    Some(total)
+    total = total.checked_add(wide_geometry(MAX_CELLS).charge(wide)?)?;
+    total.checked_add(DenseChunkGemm::bytes(MMQ_K_MAX, rows)?)
 }
 
 /// The parity dump directory, read from BOLT_TRACE_DIR once. The trace hook
@@ -173,9 +191,9 @@ pub(crate) const ATTN_SPLIT_MIN_KEYS: usize = 128;
 /// The split partial buffer of the resident's attention: stats (max, sum) plus
 /// the accumulator vector, per (token, q head, split). Sized on the 512-dim
 /// global head and the full prefill batch, because the eager step runs the
-/// same kernels for m = 1..=PREFILL_BATCH; the 256-dim local layers need less.
-pub(crate) const fn attn_part_bytes(splits: usize) -> usize {
-    Bolt::PREFILL_BATCH * HEADS * splits * (2 + GLOBAL_HEAD) * 4
+/// same kernels for m = 1..=rows; the 256-dim local layers need less.
+pub(crate) const fn attn_part_bytes(splits: usize, rows: usize) -> usize {
+    rows * HEADS * splits * (2 + GLOBAL_HEAD) * 4
 }
 
 /// The split count on `ctx`'s device: the tuned count scaled by the device query's multiprocessor
@@ -216,27 +234,27 @@ pub(crate) fn attn_split_wanted() -> Result<bool, EngError> {
 /// What the wide prefill attention sees of the global layers: the prefill batch at most, over
 /// the whole cache.
 fn wide_geometry(cells: usize) -> WideGeometry {
-    WideGeometry::unscaled(HEADS, KV_HEADS, cells, Bolt::PREFILL_BATCH)
+    WideGeometry::unscaled(HEADS, KV_HEADS, cells)
 }
 
 pub(crate) struct BoltLayer {
     attn_norm: Vector,
     q_norm: Vector,
     k_norm: Option<Vector>,
-    q: PackedMatrix,
-    k: Option<PackedMatrix>,
-    v: Option<PackedMatrix>,
-    out: PackedMatrix,
+    q: NativeWeight,
+    k: Option<NativeWeight>,
+    v: Option<NativeWeight>,
+    out: NativeWeight,
     post_attn_norm: Vector,
     ffn_norm: Vector,
-    ffn_gate: PackedMatrix,
-    ffn_up: PackedMatrix,
-    ffn_down: PackedMatrix,
+    ffn_gate: NativeWeight,
+    ffn_up: NativeWeight,
+    ffn_down: NativeWeight,
     post_ffw_norm: Vector,
-    ple_gate: PackedMatrix,
-    ple_proj: PackedMatrix,
+    ple_gate: NativeWeight,
+    ple_proj: NativeWeight,
     post_ple_norm: Vector,
-    table: Matrix,
+    table: NativeWeight,
     scale: f32,
     global: bool,
     head: usize,
@@ -256,18 +274,29 @@ impl BoltLayer {
 /// number of sequences can step through the same weights.
 pub(crate) struct BoltSeq {
     id: u64,
+    /// The cells of each head's plane: what this session's request was sized to.
+    cells: usize,
+    /// The pool cells this session holds; they return when the session drops.
+    lease: CellLease,
     /// One entry per layer; `Some` for the physical layers.
     kv: Vec<Option<Kv>>,
     /// The position of the first row of the step (`StepParams.pos`).
     pos: DeviceBuffer,
     /// The key count the first row attends over (`pos + 1`).
     kv_len: DeviceBuffer,
+    /// The 32-byte step block a window's rows read: the position at byte 4 and the key count at
+    /// byte 8 (the layout of `StepParams`), so one launch can read the words of every row. A
+    /// window writes this block and not the two words above; a chunk or a lone token writes
+    /// those and not this block.
+    step: DeviceBuffer,
 }
 
-/// A copy of the cache cells of one sequence below a position, in host memory. The planes of the
-/// 24 physical layers are stored layer by layer, plane by plane (k codes, k scales, v codes,
-/// v scales) and kv head by kv head, each as the cells `0..fed` of that head, so an entry holds
-/// `fed` times the cost of one position. It restores into any sequence.
+/// A copy of the cache of one sequence below a position, in host memory. The planes of the 24
+/// physical layers are stored layer by layer, plane by plane (k codes, k scales, v codes, v
+/// scales) and kv head by kv head, each head's kept positions in position order: `0..fed` for a
+/// full-attention layer, the last window for a sliding layer. An entry holds `fed` times the cost
+/// of one full-attention position plus one window of the sliding layers. It restores into any
+/// sequence, whatever its ring.
 pub(crate) struct BoltSnapshot {
     fed: usize,
     /// Shared so the disk tier can read it in chunks while the store still owns the entry.
@@ -300,35 +329,14 @@ impl BoltSnapshot {
     }
 }
 
-/// Admits `bytes` of snapshot against the host's available memory: the cgroup-aware budget, or the
-/// bare `MemAvailable` figure when the cgroup tree cannot be read (the probe logs which). A probe
-/// that cannot verify anything proceeds with a log line, as the other prefix stores do: an
-/// optional save must not turn a host whose cgroup layout the probe cannot parse into a host
-/// where every save is refused and prefix reuse disappears silently.
-fn admit_snapshot(bytes: usize, host: Result<(u64, u64), EngError>) -> Result<(), EngError> {
-    match host {
-        Ok((_total, available)) if (bytes as u64) > available => {
-            Err(EngError::MemoryPlan(format!(
-                "a Bolt prefix snapshot needs {bytes} bytes and the host budget is {available} bytes"
-            )))
-        }
-        Ok(_) => Ok(()),
-        Err(error) => {
-            eprintln!(
-                "gemma4 bolt: prefix snapshot host budget: probe unavailable ({}); proceeding without the check",
-                error.describe()
-            );
-            Ok(())
-        }
-    }
-}
-
 /// The logits rows of a window: the raw head output and its softcap, one vocabulary row per
 /// sequence. Allocated only for an engine that serves more than one sequence.
 pub(crate) struct WindowBuffers {
     rows: usize,
     logits: Vector,
     capped: Vector,
+    /// The row records of every physical layer of one step, rewritten each step.
+    tables: DeviceBuffer,
 }
 
 /// What the rows of one step are.
@@ -336,7 +344,12 @@ enum Rows<'a> {
     /// `m` consecutive positions of one sequence from `pos`: a prompt chunk or one decode token.
     Chunk { seq: &'a BoltSeq, pos: usize },
     /// One token of each of several sequences, in window order.
-    Window { seqs: &'a [&'a BoltSeq] },
+    Window {
+        seqs: &'a [&'a BoltSeq],
+        /// The row records of each layer's own planes, by layer; `None` for a layer that reads
+        /// another layer's cache.
+        tables: &'a [Option<KvRows<'a>>],
+    },
 }
 
 impl Rows<'_> {
@@ -401,10 +414,22 @@ pub(crate) struct Scratch {
 }
 
 pub(crate) struct Bolt {
-    /// KV cells per physical layer: the planned context of this load.
+    /// The most KV cells one session holds per physical layer: the model's context, or less when
+    /// the card carries less.
     cells: usize,
     /// The splits of one decode attention launch on this device.
     attn_splits: usize,
+    /// The rows of one prefill chunk: the planned rows of this load. It is also the widest append
+    /// any caller makes (`prefill_batch` refuses more), so it sizes the sliding layers' rings.
+    pub(crate) rows: usize,
+    /// The positions a sliding layer reaches, from the spec the file's header was checked against.
+    local_window: usize,
+    /// The geometry of a sliding layer's cache: a ring of `local_window + rows - 1` cells. A test
+    /// can set it linear, which keeps every position in the sliding layers' planes as the
+    /// control the ring must equal bit for bit.
+    local_ring: KvRing,
+    /// The cells every session of this load draws from: what the card carries beside the weights.
+    pool: Arc<CellPool>,
     /// The captured one-token decode body, armed by [`bolt_graph`]. Declared
     /// FIRST so it drops first: fields drop in declaration order, and the
     /// graph must be destroyed before any buffer whose address it baked (a
@@ -419,12 +444,14 @@ pub(crate) struct Bolt {
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<BoltLayer>,
-    pub(crate) embed: Matrix,
-    pub(crate) ple_model: PackedMatrix,
+    pub(crate) embed: NativeWeight,
+    pub(crate) ple_model: NativeWeight,
     pub(crate) ple_model_norm: Vector,
     pub(crate) out_norm: Vector,
     pub(crate) rope_freqs: Option<Vector>,
     pub(crate) scratch: Scratch,
+    /// The tensor-core GEMM of a prompt chunk's projections.
+    mmq: Option<DenseChunkGemm>,
     pub(crate) logits: Vector,
     pub(crate) logits_capped: Vector,
     pub(crate) eps: f32,
@@ -455,14 +482,17 @@ pub(crate) fn bolt_demand(
     attn_splits: Option<usize>,
     cells: usize,
     wide_prefill: bool,
+    prefill_rows: usize,
 ) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
     let kv = super::super::budget::bolt_kv_plan(cells as u64)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
+    // The first session: the full-attention layers' cells and every sliding layer's ring.
     let kv_bytes = kv
         .positions
         .checked_mul(kv.bytes_per_position)
+        .and_then(|bytes| bytes.checked_add(super::super::budget::bolt_ring_bytes(prefill_rows)?))
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV cache charge overflows".into()))?;
-    let scratch = scratch_bytes(attn_splits, wide_prefill)
+    let scratch = scratch_bytes(attn_splits, wide_prefill, prefill_rows)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
     Ok(crate::kernels::cuda::plan::Demand {
         tensors: weights_bytes,
@@ -472,18 +502,45 @@ pub(crate) fn bolt_demand(
     })
 }
 
+/// The cells, prefill rows and demand of one load.
+type Planned = (usize, usize, usize, crate::kernels::cuda::plan::Demand);
+
+/// The working set shared by every session and the first session's sliding rings, which are
+/// charged with it: the rings do not grow with the context, so they are not part of the pool.
+fn shared_bytes(splits: Option<usize>, wide: bool, rows: usize) -> Option<u64> {
+    scratch_bytes(splits, wide, rows)?.checked_add(super::super::budget::bolt_ring_bytes(rows)?)
+}
+
 /// The byte figures of Bolt's per-session cell sizing, planned by the shared card-fit rule.
-fn cell_figures(attn_splits: Option<usize>, wide_prefill: bool) -> Result<CellFigures, EngError> {
+fn cell_figures(splits: Option<usize>, wide: bool, rows: usize) -> Result<CellFigures, EngError> {
     CellFigures::checked(
         super::super::budget::bolt_kv_bytes_per_position(),
-        scratch_bytes(attn_splits, wide_prefill),
+        shared_bytes(splits, wide, rows),
         (
             super::super::budget::BOLT_HEADROOM_BYTES,
-            super::super::budget::BOLT_SEQ_FIXED_BYTES,
+            super::super::budget::BOLT_SEQ_FIXED_BYTES
+                .saturating_add(super::super::budget::bolt_ring_bytes(rows).unwrap_or(u64::MAX)),
         ),
-        (MAX_CELLS, FALLBACK_CELLS),
     )
     .ok_or_else(|| EngError::MemoryPlan("the Bolt cell figures overflow".into()))
+}
+
+/// The positions a weights file's header gives as its context, at most the model maximum. `None`
+/// when the header cannot be read or gives no positive count.
+fn header_context(path: &std::path::Path) -> Option<usize> {
+    use crate::weights::MetaValue;
+    let header = crate::weights::shared_header(path, 256 << 20).ok()?;
+    let value = match header.meta("gemma4.context_length")? {
+        MetaValue::U32(value) => u64::from(*value),
+        MetaValue::U64(value) => *value,
+        MetaValue::I32(value) => u64::try_from(*value).ok()?,
+        MetaValue::I64(value) => u64::try_from(*value).ok()?,
+        _ => return None,
+    };
+    usize::try_from(value)
+        .ok()
+        .filter(|&value| value > 0)
+        .map(|value| value.min(MAX_CELLS))
 }
 
 /// The sessions a start plans its cells for: the count the config names, else the most the
@@ -493,7 +550,7 @@ fn planned_sessions(seqs: super::super::config::MaxSeqs) -> Result<usize, EngErr
     Ok(match seqs {
         MaxSeqs::Count(count) => count,
         MaxSeqs::Auto if decode_graph_wanted()? => 1,
-        MaxSeqs::Auto => Bolt::PREFILL_BATCH,
+        MaxSeqs::Auto => Bolt::WINDOW_ROWS,
     })
 }
 
@@ -534,14 +591,31 @@ pub(crate) fn load_choosing(
     // override or the default says; the admission charges its buffer when it is built.
     let wide_load = WideLoad::read(&ctx, "gemma4 bolt", wide_geometry(MAX_CELLS))?;
     let wide = wide_load.passed();
-    // The cells a card serves for a file, and the demand of that load.
-    let plan = |bytes: u64| -> Result<(usize, crate::kernels::cuda::plan::Demand), EngError> {
-        let cells = cell_figures(split, wide)?.serve(free, bytes, sessions);
-        Ok((cells, bolt_demand(bytes, split, cells, wide)?))
+    // The cells a card carries for a file, the rows of one prefill chunk it takes, and the demand
+    // of that load: one session holds at most the cells the file's header gives as its context,
+    // and every session leases its cells from the pool of what the card carries.
+    let plan = |file: &crate::family::gguf_select::GgufFile| -> Result<Planned, EngError> {
+        let rows = cell_figures(split, wide, Bolt::WINDOW_ROWS)?.prefill_rows(
+            free,
+            file.bytes,
+            (super::super::budget::BOLT_PREFILL_LADDER, FALLBACK_CELLS),
+            &|rows| shared_bytes(split, wide, rows),
+            "FIFI_BOLT_PREFILL_ROWS",
+        );
+        let figures = cell_figures(split, wide, rows)?;
+        let (cells, pool) =
+            figures.planned(free, file.bytes, sessions, (MAX_CELLS, FALLBACK_CELLS));
+        let cells = cells.min(header_context(&file.path).unwrap_or(MAX_CELLS));
+        Ok((
+            cells,
+            pool,
+            rows,
+            bolt_demand(file.bytes, split, cells, wide, rows)?,
+        ))
     };
     let choice = crate::family::gguf_select::choose(files, &|file| {
-        plan(file.bytes)
-            .and_then(|(_, demand)| crate::kernels::cuda::plan::admit(&demand, free))
+        plan(file)
+            .and_then(|(_, _, _, demand)| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
             .map_err(|error| error.describe())
     })?;
@@ -555,12 +629,19 @@ pub(crate) fn load_choosing(
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
     )
     .to_string();
-    let (cells, demand) = plan(choice.chosen.bytes)?;
+    if header_context(&choice.chosen.path).is_none() {
+        eprintln!(
+            "bolt cuda: {} states no context length; serving up to the model maximum of {MAX_CELLS} cells",
+            choice.chosen.path.display()
+        );
+    }
+    let (cells, pool, rows, demand) = plan(&choice.chosen)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     planned(cells);
     eprintln!(
-        "bolt cuda: {cells} KV cells per layer chosen from the card ({free} bytes free, {} bytes \
-         of weights; the model maximum is {MAX_CELLS})",
+        "bolt cuda: {pool} KV cells per layer and {rows} prefill rows per chunk chosen from the \
+         card, shared by every session up to {cells} each ({free} bytes free, {} bytes of \
+         weights; the model maximum is {MAX_CELLS})",
         choice.chosen.bytes
     );
     let mut layers = Vec::with_capacity(LAYERS);
@@ -576,13 +657,7 @@ pub(crate) fn load_choosing(
                 )
             })?;
             let (ty, bytes) = weights.read_tensor(name)?;
-            if ty != GgufType::Q80 {
-                return Err(EngError::Checkpoint(format!(
-                    "gguf model: tensor {name} is {}, expected Q8_0",
-                    ty.name()
-                )));
-            }
-            Some(bytes)
+            Some((bytes, ty))
         }
     };
     for layer in 0..LAYERS {
@@ -609,7 +684,7 @@ pub(crate) fn load_choosing(
             } else {
                 None
             },
-            q: packed_matrix(
+            q: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_q.weight"),
@@ -617,7 +692,7 @@ pub(crate) fn load_choosing(
                 HEADS * head,
             )?,
             k: if physical {
-                Some(packed_matrix(
+                Some(matrix(
                     &weights,
                     &ctx,
                     &format!("{base}attn_k.weight"),
@@ -628,7 +703,7 @@ pub(crate) fn load_choosing(
                 None
             },
             v: if physical {
-                Some(packed_matrix(
+                Some(matrix(
                     &weights,
                     &ctx,
                     &format!("{base}attn_v.weight"),
@@ -638,7 +713,7 @@ pub(crate) fn load_choosing(
             } else {
                 None
             },
-            out: packed_matrix(
+            out: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_output.weight"),
@@ -652,15 +727,15 @@ pub(crate) fn load_choosing(
                 HIDDEN,
             )?,
             ffn_norm: vector(&weights, &ctx, &format!("{base}ffn_norm.weight"), HIDDEN)?,
-            ffn_gate: packed_matrix(
+            ffn_gate: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_gate.weight"),
                 HIDDEN,
                 FFN,
             )?,
-            ffn_up: packed_matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
-            ffn_down: packed_matrix(
+            ffn_up: matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
+            ffn_down: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_down.weight"),
@@ -673,14 +748,14 @@ pub(crate) fn load_choosing(
                 &format!("{base}post_ffw_norm.weight"),
                 HIDDEN,
             )?,
-            ple_gate: packed_matrix(
+            ple_gate: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}{}", spelling.ple_gate()),
                 HIDDEN,
                 PLE,
             )?,
-            ple_proj: packed_matrix(
+            ple_proj: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}{}", spelling.ple_proj()),
@@ -696,23 +771,22 @@ pub(crate) fn load_choosing(
             table: match spelling.ple_table(layer) {
                 Some(name) => matrix(&weights, &ctx, &name, PLE, VOCAB)?,
                 None => {
-                    let bytes = ple_rows_from_merged(
-                        merged.as_deref().ok_or_else(|| {
-                            EngError::Checkpoint(
-                                "gguf model: the merged table was hoisted for the canonical spelling"
-                                    .to_string(),
-                            )
-                        })?,
-                        layer,
+                    let (merged, merged_ty) = merged.as_ref().ok_or_else(|| {
+                        EngError::Checkpoint(
+                            "gguf model: the merged table was hoisted for the canonical spelling"
+                                .to_string(),
+                        )
+                    })?;
+                    let bytes =
+                        ple_rows_from_merged(merged, *merged_ty, layer, PLE, LAYERS, VOCAB)?;
+                    matrix_from_bytes(
+                        &ctx,
+                        "per_layer_token_embd.weight",
+                        *merged_ty,
                         PLE,
-                        LAYERS,
                         VOCAB,
-                    );
-                    Matrix {
-                        buf: ctx.upload(&bytes)?,
-                        rows: VOCAB,
-                        k: PLE,
-                    }
+                        &bytes,
+                    )?
                 }
             },
             scale: scalar(&weights, &format!("{base}layer_output_scale.weight"))?,
@@ -722,7 +796,7 @@ pub(crate) fn load_choosing(
         });
     }
     let embed = matrix(&weights, &ctx, "token_embd.weight", HIDDEN, VOCAB)?;
-    let ple_model = packed_matrix(
+    let ple_model = matrix(
         &weights,
         &ctx,
         spelling.ple_model_proj(),
@@ -771,15 +845,15 @@ pub(crate) fn load_choosing(
         )?,
         q8_mixed: zero(&ctx, q8_1_bytes(FFN, 1).expect("mixed q8 size"))?,
         q8_ple_mixed: zero(&ctx, q8_1_bytes(PLE, 1).expect("ple mixed q8 size"))?,
-        q8_head: zero(&ctx, q8_1_bytes(GLOBAL_HEAD, 1).expect("head q8 size"))?,
+        q8_head: zero(&ctx, q8_1_bytes(GLOBAL_HEAD, rows).expect("head q8 size"))?,
         q8_qk: zero(
             &ctx,
-            q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS).expect("qk dump size"),
+            q8_1_bytes(GLOBAL_HEAD, rows * HEADS).expect("qk dump size"),
         )?,
-        ids: zero(&ctx, Bolt::PREFILL_BATCH * 4)?,
+        ids: zero(&ctx, rows * 4)?,
         status: zero(&ctx, 4)?,
         attn_part: if attn_split {
-            Some(zero(&ctx, attn_part_bytes(attn_splits))?)
+            Some(zero(&ctx, attn_part_bytes(attn_splits, rows))?)
         } else {
             None
         },
@@ -787,15 +861,46 @@ pub(crate) fn load_choosing(
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
     let wide_prefill = wide_load.build(&ctx, wide_geometry(cells))?;
+    let mmq = DenseChunkGemm::new(&ctx, MMQ_K_MAX, rows)
+        .inspect_err(|error| eprintln!("bolt cuda: no tensor-core prefill: {}", error.describe()))
+        .ok();
+    // The pool was planned from the free memory before the weights went up; what the load
+    // allocated beyond its demand is already gone, so the pool is cut to what the card holds now.
+    let held = u64::try_from(ctx.memory_info()?.free).unwrap_or(0);
+    let pool = cell_figures(split, wide, rows)?.held_pool(pool, held, sessions);
+    // The memory receipt: a report, never a reason to fail a good start.
+    let receipt = ctx.memory_info().map(|info| {
+        let per_position = super::super::budget::bolt_kv_bytes_per_position().unwrap_or(0);
+        let cells = u64::try_from(pool).unwrap_or(0);
+        crate::family::mem::fill::TierReceipt::dense_only(
+            (
+                u64::try_from(info.total).unwrap_or(0),
+                u64::try_from(info.free).unwrap_or(0),
+            ),
+            choice.chosen.bytes,
+            Some(crate::family::mem::fill::CacheFigure {
+                cells,
+                bytes: per_position.saturating_mul(cells),
+            }),
+        )
+    });
+    eprintln!(
+        "{}",
+        crate::family::mem::fill::report_line("bolt cuda", receipt)
+    );
     let draw = crate::family::decode_step::draw::DrawBuffers::new(
         &ctx,
-        Bolt::PREFILL_BATCH,
+        Bolt::WINDOW_ROWS,
         VOCAB,
         Bolt::DRAW_WIDTH,
     )?;
     Ok(Bolt {
-        cells,
+        cells: cells.min(pool),
         attn_splits,
+        rows,
+        local_window: NEMOTRON_BOLT_E4B.sliding_window as usize,
+        local_ring: NEMOTRON_BOLT_E4B.kv_ring(AttentionKind::Sliding, rows),
+        pool: CellPool::new(pool),
         ctx,
         stream,
         layers,
@@ -805,6 +910,7 @@ pub(crate) fn load_choosing(
         out_norm,
         rope_freqs,
         scratch,
+        mmq,
         logits,
         logits_capped,
         eps,
@@ -818,8 +924,22 @@ pub(crate) fn load_choosing(
     })
 }
 
+impl BoltSeq {
+    /// The cells of each head's plane this sequence holds.
+    pub(crate) fn cells(&self) -> usize {
+        self.cells
+    }
+
+    /// The most cells this sequence can be resized to: its own and every free cell of the pool.
+    pub(crate) fn reachable(&self) -> usize {
+        self.lease.reachable()
+    }
+}
+
 impl Bolt {
-    pub(crate) const PREFILL_BATCH: usize = 8;
+    /// The most sessions one decode window steps together: the decode attention and the head
+    /// launch are planned for this many rows.
+    pub(crate) const WINDOW_ROWS: usize = 8;
 
     /// The KV cells per physical layer this load serves.
     pub(crate) fn cells(&self) -> usize {
@@ -831,25 +951,216 @@ impl Bolt {
         self.attn_splits
     }
 
+    /// Makes the sliding layers of sequences created from now on keep every position in a linear
+    /// plane, or a ring again: the control a ring must equal bit for bit. A test hook; the ring is
+    /// what every start uses.
+    #[cfg(test)]
+    pub(crate) fn set_linear_local_layers(&mut self, linear: bool) {
+        self.local_ring = if linear {
+            KvRing::LINEAR
+        } else {
+            NEMOTRON_BOLT_E4B.kv_ring(AttentionKind::Sliding, self.rows)
+        };
+    }
+
+    /// The cells the card carries for every session together.
+    pub(crate) fn pool(&self) -> &Arc<CellPool> {
+        &self.pool
+    }
+
+    /// The sessions that hold cells of the pool now.
+    pub(crate) fn live_sessions(&self) -> usize {
+        Arc::strong_count(&self.pool).saturating_sub(1)
+    }
+
+    /// The free VRAM now, `None` when the card cannot be read.
+    pub(crate) fn free_vram(&self) -> Option<u64> {
+        self.ctx
+            .memory_info()
+            .ok()
+            .map(|info| u64::try_from(info.free).unwrap_or(0))
+    }
+
     /// Allocates the device state of one more sequence: zeroed KV8 planes for the physical
     /// layers at `cells` positions and its two position words. The planes are read only below
     /// the position word, so a sequence that is reset needs no clearing.
     pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
-        // One zero chunk on the device, copied down every plane: the planes are cleared at
-        // device speed and no host memory the size of a plane is touched.
-        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
-        let built = self.build_seq(&zeros);
-        // The queued copies read `zeros`: the stream drains before it drops, whether or not the
-        // build succeeded.
-        let drained = self.stream.synchronize();
-        let seq = built?;
-        drained?;
+        self.new_seq_cells(self.cells)
+    }
+
+    /// A sequence over `cells` cells per head, leased from the pool.
+    pub(crate) fn new_seq_cells(&self, cells: usize) -> Result<BoltSeq, EngError> {
+        let mut seq = BoltSeq {
+            id: 0,
+            cells: 0,
+            lease: self.pool.lease_for(cells, self.cells)?,
+            kv: Vec::new(),
+            pos: zero(&self.ctx, 4)?,
+            kv_len: zero(&self.ctx, 4)?,
+            step: zero(&self.ctx, STEP_BLOCK_BYTES)?,
+        };
+        self.fill_seq(&mut seq)?;
         Ok(seq)
     }
 
-    fn build_seq(&self, zeros: &DeviceBuffer) -> Result<BoltSeq, EngError> {
+    /// Resizes `seq` to `cells` per head: its planes are released first and the new ones
+    /// allocated and zeroed, so the peak is one session's planes, not two. The contents are not
+    /// kept: a session is resized only at the start of a request, before any prefix restore. A
+    /// pool that cannot fund the growth refuses with a memory-plan error and leaves `seq` as it
+    /// was.
+    pub(crate) fn resize_seq(&self, seq: &mut BoltSeq, cells: usize) -> Result<(), EngError> {
+        if cells == seq.cells {
+            return Ok(());
+        }
+        seq.lease.resize_for(cells, self.cells)?;
+        self.fill_seq(seq)
+    }
+
+    /// Gives `seq` room for `positions` positions with the `fed` cells it has kept: leases the
+    /// cells from the pool (the one growth rule of `family::cell_pool`) and re-lays the planes in
+    /// larger ones. A pool or a card that cannot fund it refuses with a memory-plan error and
+    /// leaves `seq` as it was: its planes, its lease and its id. No other sequence is touched.
+    pub(crate) fn make_room(
+        &self,
+        seq: &mut BoltSeq,
+        fed: usize,
+        positions: usize,
+    ) -> Result<(), EngError> {
+        let held = seq.cells;
+        if positions <= held {
+            return Ok(());
+        }
+        let who = seq.id;
+        let cells = fund_growth(&mut seq.lease, who, held, positions, self.cells)?;
+        // The old planes stay until the copy ends: the card must hold both.
+        let per_position = crate::family::gemma::gemma4::budget::bolt_seq_cost(self.rows)
+            .map_or(0, |cost| cost.per_position);
+        let cells = fit_planes(
+            &mut seq.lease,
+            who,
+            held,
+            cells,
+            positions,
+            self.ctx.memory_info().ok().map(|info| info.free as u64),
+            |cells| per_position.saturating_mul(cells as u64),
+        )?;
+        let began = std::time::Instant::now();
+        match self.grow_planes(seq, cells, fed) {
+            Ok(()) => {
+                eprintln!(
+                    "gemma4 bolt: session {who} grew from {held} to {cells} cells in {:.1} ms ({} of {} cells free)",
+                    began.elapsed().as_secs_f64() * 1000.0,
+                    self.pool.free(),
+                    self.pool.total()
+                );
+                Ok(())
+            }
+            Err(error) => {
+                seq.lease.resize(held);
+                Err(match error {
+                    EngError::MemoryPlan(detail) => EngError::MemoryPlan(format!(
+                        "session {who} cannot grow from {held} to {cells} cells on the card: \
+                         {detail}; the request ends here and the others go on"
+                    )),
+                    other => other,
+                })
+            }
+        }
+    }
+
+    /// Re-lays the planes of `seq` in `cells` cells per head, keeping the first `fed` cells of
+    /// every head of every plane of a full-attention layer. A sliding layer's ring has the same
+    /// cells whatever the context, so its planes are moved, not copied. The old planes are
+    /// released after the copies on the stream, so the peak is both sets of the full-attention
+    /// planes together. The sequence takes a new id, so a captured decode graph never replays the
+    /// old planes.
+    fn grow_planes(&self, seq: &mut BoltSeq, cells: usize, fed: usize) -> Result<(), EngError> {
+        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
+        let built = self.build_kv(&zeros, cells, Some(&seq.kv));
+        let drained = self.stream.synchronize();
+        let mut grown = built?;
+        drained?;
+        let keep = fed.min(seq.cells);
+        for (old, new) in seq.kv.iter().zip(grown.iter_mut()) {
+            let (Some(old), Some(new)) = (old, new) else {
+                continue;
+            };
+            let layer_head = old.shape.head_dim;
+            let (from_cells, to_cells) = (old.shape.cells, new.shape.cells);
+            for (from, to, unit) in [
+                (&old.k_codes, &new.k_codes, layer_head),
+                (&old.k_scales, &new.k_scales, (layer_head / 32) * 2),
+                (&old.v_codes, &new.v_codes, layer_head),
+                (&old.v_scales, &new.v_scales, (layer_head / 32) * 2),
+            ] {
+                for kv_head in 0..KV_HEADS {
+                    let bytes = keep.min(from_cells).min(to_cells) * unit;
+                    if bytes == 0 {
+                        continue;
+                    }
+                    self.ctx.copy_device(
+                        &self.stream,
+                        from.range(kv_head * from_cells * unit, bytes)?,
+                        to.range(kv_head * to_cells * unit, bytes)?,
+                    )?;
+                }
+            }
+        }
+        // The copies read the old planes: the stream drains before they drop.
+        self.stream.synchronize()?;
+        // The rings keep their planes: only the layers `build_kv` left empty move across.
+        for (old, new) in seq.kv.iter_mut().zip(grown.iter_mut()) {
+            if new.is_none() {
+                *new = old.take();
+            }
+        }
+        seq.kv = grown;
+        seq.cells = cells;
+        seq.id = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Builds the planes of `seq` at the cells its lease holds. The sequence takes a new id, so a
+    /// captured decode graph never replays old planes.
+    fn fill_seq(&self, seq: &mut BoltSeq) -> Result<(), EngError> {
+        seq.kv = Vec::new();
+        seq.cells = 0;
+        let cells = seq.lease.cells();
+        // One zero chunk on the device, copied down every plane: the planes are cleared at
+        // device speed and no host memory the size of a plane is touched.
+        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
+        let built = self.build_kv(&zeros, cells, None);
+        // The queued copies read `zeros`: the stream drains before it drops, whether or not the
+        // build succeeded.
+        let drained = self.stream.synchronize();
+        seq.kv = built?;
+        drained?;
+        seq.cells = cells;
+        seq.id = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The cache geometry of one physical layer and the context its cells are counted for: a
+    /// full-attention layer keeps a plane of the session's cells, a sliding layer a ring whose
+    /// cells do not depend on the session (the linear control keeps the session's cells too).
+    fn layer_geometry(&self, layer: &BoltLayer, seq_cells: usize) -> (KvRing, usize) {
+        if layer.global || self.local_ring == KvRing::LINEAR {
+            (KvRing::LINEAR, seq_cells)
+        } else {
+            (self.local_ring, MAX_CELLS)
+        }
+    }
+
+    /// The planes of every physical layer at `cells` cells for the full-attention layers. With the
+    /// planes a sequence already `holds`, the layers whose planes are rings are left out (`None`):
+    /// a ring has the same cells at any context, so the caller moves those across.
+    fn build_kv(
+        &self,
+        zeros: &DeviceBuffer,
+        cells: usize,
+        holds: Option<&[Option<Kv>]>,
+    ) -> Result<Vec<Option<Kv>>, EngError> {
         let ctx = &self.ctx;
-        let cells = self.cells;
         let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
             let buffer = ctx.allocate(bytes)?;
             let mut at = 0;
@@ -861,41 +1172,52 @@ impl Bolt {
             Ok(buffer)
         };
         let mut kv = Vec::with_capacity(LAYERS);
-        for layer in &self.layers {
+        for (index, layer) in self.layers.iter().enumerate() {
             let head = layer.head;
-            kv.push(if layer.physical() {
-                Some(Kv {
-                    k_codes: plane(KV_HEADS * cells * head)?,
-                    k_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
-                    v_codes: plane(KV_HEADS * cells * head)?,
-                    v_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
-                    shape: Kv8Shape::linear(1, KV_HEADS, head, cells, Kv8CodeScale::UnroundedF32),
-                })
-            } else {
+            let held_ring = holds
+                .and_then(|planes| planes.get(index))
+                .and_then(Option::as_ref)
+                .is_some_and(|plane| plane.geometry != KvRing::LINEAR);
+            kv.push(if !layer.physical() || held_ring {
                 None
+            } else {
+                let (geometry, context) = self.layer_geometry(layer, cells);
+                let shape = Kv8Shape::of_layer(
+                    geometry,
+                    context,
+                    1,
+                    KV_HEADS,
+                    head,
+                    Kv8CodeScale::UnroundedF32,
+                );
+                let plane_cells = shape.cells;
+                Some(Kv {
+                    k_codes: plane(KV_HEADS * plane_cells * head)?,
+                    k_scales: plane(KV_HEADS * plane_cells * (head / 32) * 2)?,
+                    v_codes: plane(KV_HEADS * plane_cells * head)?,
+                    v_scales: plane(KV_HEADS * plane_cells * (head / 32) * 2)?,
+                    shape,
+                    geometry,
+                    context,
+                })
             });
         }
-        Ok(BoltSeq {
-            id: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
-            kv,
-            pos: zero(ctx, 4)?,
-            kv_len: zero(ctx, 4)?,
-        })
+        Ok(kv)
     }
 
-    /// The `(offset, bytes)` ranges of the cells `0..fed` of every plane of one layer's cache, in
-    /// the order a snapshot stores them. Cells are laid out `[kv head][cell][unit]`, so the cells
-    /// of one head are contiguous from the head's base.
-    fn snapshot_ranges(head: usize, fed: usize, cells: usize) -> [[(usize, usize); KV_HEADS]; 4] {
-        let codes = head;
-        let scales = (head / 32) * 2;
-        let plane = |unit: usize| {
-            let mut ranges = [(0, 0); KV_HEADS];
-            for (kv_head, range) in ranges.iter_mut().enumerate() {
-                *range = (kv_head * cells * unit, fed * unit);
-            }
-            ranges
-        };
+    /// The `(offset, bytes)` ranges of the positions a snapshot of `fed` tokens keeps, of every
+    /// plane of one layer's cache, in the order a snapshot stores them: plane by plane (k codes,
+    /// k scales, v codes, v scales), kv head by kv head, a head's cells in position order. A
+    /// full-attention layer keeps cells `0..fed`; a sliding layer keeps its last window, which
+    /// sits in ring cells (two runs when it wraps).
+    fn snapshot_ranges(
+        geometry: KvRing,
+        context: usize,
+        head: usize,
+        fed: usize,
+    ) -> [Vec<(usize, usize)>; 4] {
+        let (codes, scales) = (head, (head / 32) * 2);
+        let plane = |unit: usize| geometry.plane_ranges(context, fed, KV_HEADS, unit);
         [plane(codes), plane(scales), plane(codes), plane(scales)]
     }
 
@@ -906,7 +1228,8 @@ impl Bolt {
             .iter()
             .filter(|layer| layer.physical())
             .map(|layer| {
-                Self::snapshot_ranges(layer.head, fed, self.cells)
+                let (geometry, context) = self.layer_geometry(layer, self.cells);
+                Self::snapshot_ranges(geometry, context, layer.head, fed)
                     .iter()
                     .map(|plane| plane.iter().map(|range| range.1).sum::<usize>())
                     .sum()
@@ -914,32 +1237,32 @@ impl Bolt {
             .collect()
     }
 
-    /// Copies the cells `0..fed` of every plane of `seq` into host memory. The copy is what a
-    /// later request restores into any sequence, so it holds at most one sequence's cache
-    /// (`cells` positions) and is allocated only for the cells it covers; a host whose available
-    /// memory (less the OS floor) cannot hold it refuses with a memory-plan error and nothing
-    /// is stored.
+    /// Copies the kept positions of every plane of `seq` into host memory: `0..fed` of a
+    /// full-attention layer, the last window of a sliding layer (read out of its ring cells, in
+    /// position order). The copy is what a later request restores into any sequence, so it is
+    /// allocated only for the positions it covers; a host whose available memory (less the OS
+    /// floor) cannot hold it refuses with a memory-plan error and nothing is stored.
     pub(crate) fn snapshot_seq(&self, seq: &BoltSeq, fed: usize) -> Result<BoltSnapshot, EngError> {
-        if fed > self.cells {
+        if fed > seq.cells {
             return Err(EngError::ContextLimit(
                 "the Bolt snapshot exceeds the context".to_owned(),
             ));
         }
         let mut total = 0usize;
-        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
-            if planes.is_some() {
-                for plane in Self::snapshot_ranges(layer.head, fed, self.cells) {
-                    total += plane.iter().map(|range| range.1).sum::<usize>();
-                }
+        for planes in seq.kv.iter().flatten() {
+            for plane in
+                Self::snapshot_ranges(planes.geometry, planes.context, planes.shape.head_dim, fed)
+            {
+                total += plane.iter().map(|range| range.1).sum::<usize>();
             }
         }
         // Linux grants an allocation it cannot back and kills the process later, so the
         // allocation cannot be what refuses: the host's available memory (with the OS floor and
         // the enclosing cgroup's limit) is checked first.
-        admit_snapshot(
+        crate::family::host_store::admit_entry(
+            "a Bolt prefix snapshot",
             total,
-            crate::family::mem::HostFacts::read("a Bolt prefix snapshot", "a Bolt prefix snapshot")
-                .map(|host| host.host_memory()),
+            crate::family::mem::HostFacts::read("a Bolt prefix snapshot", "a Bolt prefix snapshot"),
         )?;
         let mut data = Vec::new();
         data.try_reserve_exact(total).map_err(|_| {
@@ -949,13 +1272,14 @@ impl Bolt {
         })?;
         data.resize(total, 0);
         let mut at = 0;
-        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
-            let Some(kv) = planes else { continue };
+        for kv in seq.kv.iter().flatten() {
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
-            for (buffer, ranges) in buffers
-                .into_iter()
-                .zip(Self::snapshot_ranges(layer.head, fed, self.cells))
-            {
+            for (buffer, ranges) in buffers.into_iter().zip(Self::snapshot_ranges(
+                kv.geometry,
+                kv.context,
+                kv.shape.head_dim,
+                fed,
+            )) {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
                         buffer.read_at(&self.stream, offset, &mut data[at..at + bytes])?;
@@ -967,22 +1291,29 @@ impl Bolt {
         Ok(BoltSnapshot::from_parts(fed, data))
     }
 
-    /// Writes a snapshot into `seq`: the cells `0..fed` of every plane. The cells above are left
-    /// as they are, which is safe because the position word bounds every read.
+    /// Writes a snapshot into `seq`: the positions `0..fed` of a full-attention layer and the last
+    /// window of a sliding layer, each into the cell its geometry gives (a ring cell is
+    /// `position % ring`). The cells above are left as they are, which is safe because the
+    /// position word bounds every read.
     pub(crate) fn restore_seq(
         &self,
         seq: &BoltSeq,
         snapshot: &BoltSnapshot,
     ) -> Result<(), EngError> {
+        if snapshot.fed > seq.cells {
+            return Err(EngError::ContextLimit(
+                "the Bolt snapshot exceeds the session's cells".to_owned(),
+            ));
+        }
         let mut at = 0;
-        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
-            let Some(kv) = planes else { continue };
+        for kv in seq.kv.iter().flatten() {
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
-            for (buffer, ranges) in
-                buffers
-                    .into_iter()
-                    .zip(Self::snapshot_ranges(layer.head, snapshot.fed, self.cells))
-            {
+            for (buffer, ranges) in buffers.into_iter().zip(Self::snapshot_ranges(
+                kv.geometry,
+                kv.context,
+                kv.shape.head_dim,
+                snapshot.fed,
+            )) {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
                         buffer.write_at(&self.stream, offset, &snapshot.data[at..at + bytes])?;
@@ -997,10 +1328,10 @@ impl Bolt {
     /// Allocates the logits rows that a window of up to `rows` sequences needs, once. A request
     /// for fewer rows than are held keeps the buffers.
     pub(crate) fn reserve_window(&mut self, rows: usize) -> Result<(), EngError> {
-        if !(2..=Self::PREFILL_BATCH).contains(&rows) {
+        if !(2..=Self::WINDOW_ROWS).contains(&rows) {
             return Err(EngError::BadRequest(format!(
                 "a Bolt window holds 2 to {} rows, got {rows}",
-                Self::PREFILL_BATCH
+                Self::WINDOW_ROWS
             )));
         }
         if self.window.as_ref().is_some_and(|held| held.rows >= rows) {
@@ -1010,6 +1341,9 @@ impl Bolt {
             rows,
             logits: vector_filled(&self.ctx, rows * VOCAB, 0.0)?,
             capped: vector_filled(&self.ctx, rows * VOCAB, 0.0)?,
+            tables: self
+                .ctx
+                .allocate(rows * PHYSICAL_LAYERS * ROW_RECORD_BYTES)?,
         });
         Ok(())
     }
@@ -1045,6 +1379,49 @@ impl Bolt {
             .collect())
     }
 
+    /// The row records of a window: for each physical layer, one record per sequence naming that
+    /// sequence's planes of the layer, their cells and its step block, written in one copy into the
+    /// window's table buffer. The cache append and the attention of every layer read them, so each
+    /// is one launch over all rows.
+    fn window_tables<'a>(
+        &'a self,
+        seqs: &'a [&'a BoltSeq],
+    ) -> Result<Vec<Option<KvRows<'a>>>, EngError> {
+        let held = self
+            .window
+            .as_ref()
+            .expect("the window buffers are reserved");
+        let mut per_layer: Vec<Vec<KvRow<'a>>> = Vec::with_capacity(PHYSICAL_LAYERS);
+        let mut index_of = Vec::with_capacity(PHYSICAL_LAYERS);
+        for (index, layer) in self.layers.iter().enumerate() {
+            if !layer.physical() {
+                continue;
+            }
+            let mut rows = Vec::with_capacity(seqs.len());
+            for seq in seqs {
+                let own = seq.kv[index].as_ref().expect("a physical layer has planes");
+                rows.push(KvRow {
+                    k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                    k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                    v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                    v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                    step: seq.step.range(0, STEP_BLOCK_BYTES)?,
+                    cells: own.shape.cells,
+                });
+            }
+            per_layer.push(rows);
+            index_of.push(index);
+        }
+        let built = self
+            .ctx
+            .kv_rows_layers(&self.stream, &held.tables, &per_layer)?;
+        let mut tables: Vec<Option<KvRows<'a>>> = (0..LAYERS).map(|_| None).collect();
+        for (index, table) in index_of.into_iter().zip(built) {
+            tables[index] = Some(table);
+        }
+        Ok(tables)
+    }
+
     /// Steps one token of each sequence together, as [`Self::decode_rows`], and leaves the capped
     /// logits rows on the device.
     fn step_window(
@@ -1059,10 +1436,10 @@ impl Bolt {
                 "a Bolt window needs one token and one position per sequence".to_owned(),
             ));
         }
-        if !(2..=Self::PREFILL_BATCH).contains(&m) {
+        if !(2..=Self::WINDOW_ROWS).contains(&m) {
             return Err(EngError::BadRequest(format!(
                 "a Bolt window holds 2 to {} rows, got {m}",
-                Self::PREFILL_BATCH
+                Self::WINDOW_ROWS
             )));
         }
         if self.window.as_ref().is_none_or(|held| held.rows < m) {
@@ -1070,7 +1447,11 @@ impl Bolt {
                 "the Bolt window buffers are not reserved for this many rows".to_owned(),
             ));
         }
-        if positions.iter().any(|&pos| pos >= self.cells) {
+        if seqs
+            .iter()
+            .zip(positions)
+            .any(|(seq, &pos)| pos >= seq.cells)
+        {
             return Err(EngError::ContextLimit(
                 "the Bolt decode window exceeds the context".to_owned(),
             ));
@@ -1079,12 +1460,23 @@ impl Bolt {
         let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         self.scratch.ids.write_at_enqueue(&self.stream, 0, &ids)?;
         for (seq, &pos) in seqs.iter().zip(positions) {
-            seq.pos
-                .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
-            seq.kv_len
-                .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
+            // Position at byte 4 and key count at byte 8 of the step block, in one copy.
+            let mut words = [0u8; 8];
+            words[..4].copy_from_slice(&(pos as i32).to_le_bytes());
+            words[4..].copy_from_slice(&((pos as i32) + 1).to_le_bytes());
+            seq.step.write_at_enqueue(&self.stream, 4, &words)?;
         }
-        self.decode_body(&Rows::Window { seqs }, true, m)?;
+        {
+            let tables = self.window_tables(seqs)?;
+            self.decode_body(
+                &Rows::Window {
+                    seqs,
+                    tables: &tables,
+                },
+                true,
+                m,
+            )?;
+        }
         self.graph_mode.note_eager();
         Ok(())
     }
@@ -1161,7 +1553,10 @@ impl Bolt {
         self.graph = None;
         if on {
             if self.scratch.attn_part.is_none() {
-                self.scratch.attn_part = Some(zero(&self.ctx, attn_part_bytes(self.attn_splits))?);
+                self.scratch.attn_part = Some(zero(
+                    &self.ctx,
+                    attn_part_bytes(self.attn_splits, self.rows),
+                )?);
             }
         } else {
             self.scratch.attn_part = None;
@@ -1221,14 +1616,14 @@ impl Bolt {
         pos: usize,
         logits: bool,
     ) -> Result<(), EngError> {
-        if !(1..=Self::PREFILL_BATCH).contains(&tokens.len()) {
+        if !(1..=self.rows).contains(&tokens.len()) {
             return Err(EngError::BadRequest(
-                "a Bolt prefill batch needs 1 to 8 tokens".to_owned(),
+                "a Bolt prefill batch needs 1 to its planned rows".to_owned(),
             ));
         }
         if pos
             .checked_add(tokens.len())
-            .is_none_or(|end| end > self.cells)
+            .is_none_or(|end| end > seq.cells)
         {
             return Err(EngError::ContextLimit(
                 "the Bolt prefill batch exceeds the context".to_owned(),
@@ -1246,7 +1641,7 @@ impl Bolt {
         // A buffer replacement invalidates a captured body (it baked the old
         // address), so the graph drops when a replacement actually happens -
         // not on every call, or no prefill would ever leave the graph armed.
-        // (The load-time capacity already covers every PREFILL_BATCH chunk, so
+        // (The load-time capacity already covers every planned prefill chunk, so
         // nothing replaces in practice.)
         let replaced = self.grow_scratch_buffers(rows)?;
         if replaced {
@@ -1256,7 +1651,7 @@ impl Bolt {
     }
 
     /// Grows every scratch buffer whose capacity is below `rows` up to the
-    /// PREFILL_BATCH capacity, reporting whether any buffer was replaced.
+    /// planned prefill capacity, reporting whether any buffer was replaced.
     fn grow_scratch_buffers(&mut self, rows: usize) -> Result<bool, EngError> {
         let mut replaced = false;
         let sc = &mut self.scratch;
@@ -1282,7 +1677,7 @@ impl Bolt {
             (&mut sc.ple_mixed, PLE),
         ]) {
             if v.len < rows * width {
-                let len = Self::PREFILL_BATCH * width;
+                let len = self.rows * width;
                 v.buf = self.ctx.allocate(len * 4)?;
                 v.len = len;
                 replaced = true;
@@ -1297,11 +1692,50 @@ impl Bolt {
             if buffer.bytes() < q8_1_bytes(width, rows).expect("bounded q8 rows") {
                 *buffer = self
                     .ctx
-                    .allocate(q8_1_bytes(width, Self::PREFILL_BATCH).expect("bounded q8 rows"))?;
+                    .allocate(q8_1_bytes(width, self.rows).expect("bounded q8 rows"))?;
                 replaced = true;
             }
         }
         Ok(replaced)
+    }
+
+    /// The projections of one group over one activation, `x` as f32 rows and `x_q8` as q8_1 rows:
+    /// one `(weight, y)` per projection. A chunk of 16 rows or more runs the group on the tensor
+    /// cores when every weight of it rests in one type that has a dense case, since one quantized
+    /// activation serves one layout; any other group runs each weight through the matvec.
+    fn project_group(
+        &self,
+        group: &[(&NativeWeight, &Vector)],
+        x: &Vector,
+        x_q8: &DeviceBuffer,
+        m: usize,
+    ) -> Result<(), EngError> {
+        let first = group[0].0;
+        let wide = on_tensor_cores(group.iter().map(|(weight, _)| weight.quant()), m);
+        match self.mmq.as_ref().filter(|_| wide) {
+            Some(gemm) => {
+                let rows = x.buf.range(0, m * first.k() * 4)?;
+                gemm.input(&self.ctx, &self.stream, first, rows, m)?;
+                group.iter().try_for_each(|(weight, y)| {
+                    let y = y.buf.range(0, m * weight.n_rows() * 4)?;
+                    gemm.project(&self.ctx, &self.stream, weight, m, y)
+                })
+            }
+            None => group
+                .iter()
+                .try_for_each(|(weight, y)| self.matvec(weight, weight.n_rows(), x_q8, y, m)),
+        }
+    }
+
+    fn matvec(
+        &self,
+        weight: &NativeWeight,
+        rows: usize,
+        x_q8: &DeviceBuffer,
+        y: &Vector,
+        m: usize,
+    ) -> Result<(), EngError> {
+        matvec(&self.ctx, &self.stream, weight, rows, x_q8, y, m)
     }
 
     /// Keeps the existing norm reduction and quantization order for every activation row.
@@ -1357,7 +1791,7 @@ impl Bolt {
         logits: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
-        if pos.checked_add(m).is_none_or(|end| end > self.cells) {
+        if pos.checked_add(m).is_none_or(|end| end > seq.cells) {
             return Err(EngError::ContextLimit(
                 "the Bolt decode step exceeds the context".to_owned(),
             ));
@@ -1428,15 +1862,14 @@ impl Bolt {
         let h1 = &sc.h[1];
         let h2 = &sc.h[2];
         let h3 = &sc.h[3];
-        ctx.embed_q8(
+        ctx.embed_native(
             stream,
-            EmbedQ8Call {
-                out: h0.buf.range(0, h0.bytes())?,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
+            EmbedNativeCall {
+                weight: &self.embed,
                 ids: sc.ids.range(0, m * 4)?,
+                x: h0.buf.range(0, h0.bytes())?,
+                status: sc.status.range(0, 4)?,
                 m,
-                n_rows: self.embed.rows,
-                k: self.embed.k,
             },
         )?;
         ctx.row_scale(
@@ -1500,17 +1933,12 @@ impl Bolt {
                 rows: 1,
             },
         )?;
-        ctx.matvec_q(
+        ctx.matvec_native(
             stream,
-            MatvecCall {
-                ty: QuantType::Q80,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: self.logits.buf.range(0, self.logits.bytes())?,
-                k: HIDDEN,
-                rows: self.embed.rows,
-                ncols: 1,
-            },
+            &self.embed,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            self.logits.buf.range(0, self.logits.bytes())?,
+            1,
         )?;
         ctx.softcap(
             stream,
@@ -1573,20 +2001,15 @@ impl Bolt {
         let row_bytes = q8_1_bytes(HIDDEN, 1).expect("hidden q8 row size");
         for first in (0..m).step_by(HEAD_COLUMNS) {
             let columns = HEAD_COLUMNS.min(m - first);
-            ctx.matvec_q(
+            ctx.matvec_native(
                 stream,
-                MatvecCall {
-                    ty: QuantType::Q80,
-                    w: self.embed.buf.range(0, self.embed.bytes())?,
-                    x_q8: sc.q8_hidden.range(first * row_bytes, columns * row_bytes)?,
-                    y: window
-                        .logits
-                        .buf
-                        .range(first * VOCAB * 4, columns * VOCAB * 4)?,
-                    k: HIDDEN,
-                    rows: self.embed.rows,
-                    ncols: columns,
-                },
+                &self.embed,
+                sc.q8_hidden.range(first * row_bytes, columns * row_bytes)?,
+                window
+                    .logits
+                    .buf
+                    .range(first * VOCAB * 4, columns * VOCAB * 4)?,
+                columns,
             )?;
         }
         ctx.softcap(
@@ -1616,21 +2039,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: self.ple_model.qs.range(0, self.ple_model.qs_bytes())?,
-                w_scales: self
-                    .ple_model
-                    .scales
-                    .range(0, self.ple_model.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.ple_all.buf.range(0, m * ple_rows * 4)?,
-                k: HIDDEN,
-                rows: ple_rows,
-                ncols: m,
-            },
-        )?;
+        self.matvec(&self.ple_model, ple_rows, &sc.q8_hidden, &sc.ple_all, m)?;
         ctx.row_scale(
             stream,
             RowScaleCall {
@@ -1644,8 +2053,9 @@ impl Bolt {
     }
 
     /// Rotation, cache append and attention of one layer. A chunk runs them once over its
-    /// consecutive rows against its sequence; a window runs them once per row against that
-    /// row's sequence, with the launch a lone row makes.
+    /// consecutive rows against its sequence. A window rotates each row against its own position
+    /// word, then runs the append and the attention once over all rows, each reading its own
+    /// planes, cells, position and key count from its record.
     fn rope_append_attend(&self, index: usize, rows: &Rows<'_>, m: usize) -> Result<(), EngError> {
         let layer = &self.layers[index];
         let ctx = &self.ctx;
@@ -1658,7 +2068,7 @@ impl Bolt {
         let source = layer.kv_source.unwrap_or(index);
         let pos = rows.trace_pos();
         let attn_split = sc.attn_part.as_ref().map(|part| {
-            let bytes = attn_part_bytes(self.attn_splits);
+            let bytes = attn_part_bytes(self.attn_splits, self.rows);
             AttnDecodeGemmaSplit {
                 // Sized at load for the full prefill batch; the range cannot fail.
                 part: part.range(0, bytes).expect("partial buffer"),
@@ -1666,30 +2076,24 @@ impl Bolt {
                 min_keys: ATTN_SPLIT_MIN_KEYS,
             }
         });
-        // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
-        // row sits at cell `first`.
-        let group =
-            |seq: &BoltSeq, row: usize, count: usize, first: usize| -> Result<(), EngError> {
-                let own = seq.kv[source]
-                    .as_ref()
-                    .expect("the shared-KV source layer is physical");
+        // The rotation of `count` rows starting at row `row` of the scratch, the position read
+        // from `pos_word`.
+        let rotate =
+            |row: usize, count: usize, pos_word: DeviceRange<'_>| -> Result<(), EngError> {
+                let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
+                let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
                 // A shared layer rotates its query only; the rope kernel requires at least one k
                 // row, so it rotates one scratch row that no later launch reads.
                 ctx.rope_gemma(
                     stream,
                     RopeGemmaCall {
-                        q: sc
-                            .q_normed
-                            .buf
-                            .range(row * q_rows * 4, count * q_rows * 4)?,
+                        q: sc.q_normed.buf.range(at, bytes)?,
                         k: if physical {
-                            sc.k_normed
-                                .buf
-                                .range(row * kv_rows * 4, count * kv_rows * 4)?
+                            sc.k_normed.buf.range(kat, kbytes)?
                         } else {
                             sc.k_normed.buf.range(0, kv_rows * 4)?
                         },
-                        pos: seq.pos.range(0, 4)?,
+                        pos: pos_word,
                         factors: match (&self.rope_freqs, layer.global) {
                             (Some(freqs), true) => Some(freqs.buf.range(0, freqs.bytes())?),
                             _ => None,
@@ -1701,106 +2105,158 @@ impl Bolt {
                         head_dim: head,
                         global_mode: layer.global,
                     },
-                )?;
+                )
+            };
+        // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
+        // row sits at cell `first`.
+        let group = |seq: &BoltSeq,
+                     row: usize,
+                     count: usize,
+                     first: usize|
+         -> Result<(), EngError> {
+            let own = seq.kv[source]
+                .as_ref()
+                .expect("the shared-KV source layer is physical");
+            // One chunk is appended whole before it is attended, so a sliding layer's ring
+            // must hold the window plus the chunk: a wider chunk would overwrite cells its own
+            // first rows still read. The ring is sized from `rows`, the widest chunk
+            // `prefill_batch` takes, so this refuses a caller that bypassed that limit.
+            if !own.geometry.admits(count) {
+                return Err(EngError::BadRequest(format!(
+                    "a Bolt append of {count} rows is wider than the sliding ring's margin of {}",
+                    own.geometry.widest_append()
+                )));
+            }
+            let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
+            let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
+            rotate(row, count, seq.pos.range(0, 4)?)?;
+            if physical {
+                let data = Kv8Data {
+                    k: sc.k_normed.buf.range(kat, kbytes)?,
+                    v: sc.v_normed.buf.range(kat, kbytes)?,
+                    k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                    k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                    v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                    v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                };
+                if count == 1 {
+                    // The decode entry: the device pos word is authoritative, so a captured
+                    // replay writes the cell of the step it replays instead of the
+                    // capture-time cell. The status word satisfies the launch contract; the
+                    // caller's host check that `pos + m` leaves the context makes the
+                    // kernel's refuse path unreachable, so the word is never read back.
+                    ctx.kv8_append(
+                        stream,
+                        Kv8Shape {
+                            rows: 1,
+                            ..own.shape
+                        },
+                        data,
+                        seq.pos.range(0, 4)?,
+                        sc.status.range(0, 4)?,
+                    )?;
+                } else {
+                    // The prefill chunk entry takes its position as a host scalar; it is never
+                    // captured (a multi-token step refuses arming), so the baked-scalar hazard
+                    // does not arise.
+                    ctx.kv8_chunk(
+                        stream,
+                        Kv8Shape {
+                            rows: count,
+                            ..own.shape
+                        },
+                        data,
+                        first,
+                    )?;
+                }
+            }
+            self.trace(
+                pos,
+                &format!("L{index}_v"),
+                &sc.v_normed,
+                (row + count) * kv_rows * 4,
+            );
+            // A prompt chunk of two or more rows on a global layer runs the wide prefill
+            // attention when it is on; a lone row, and so every decode step, keeps the decode
+            // attention.
+            let call = WideCall::new(
+                [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
+                sc.q_normed.buf.range(at, bytes)?,
+                sc.ctx_out.buf.range(at, bytes)?,
+                count,
+                first,
+            )
+            .with_cells(own.shape.cells);
+            let take = layer.global && count > 1;
+            if WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
+                return Ok(());
+            }
+            ctx.attn_decode_gemma(
+                stream,
+                AttnDecodeGemmaCall {
+                    out: sc.ctx_out.buf.range(at, bytes)?,
+                    status: None,
+                    q: sc.q_normed.buf.range(at, bytes)?,
+                    k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                    k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                    v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                    v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                    kv_len: seq.kv_len.range(0, 4)?,
+                    m: count,
+                    n_q_head: HEADS,
+                    n_kv_head: KV_HEADS,
+                    head_dim: head,
+                    cells: own.shape.cells,
+                    window: if layer.global { 0 } else { self.local_window },
+                    scale: 1.0,
+                    split: attn_split,
+                    ring: own.shape.ring,
+                },
+            )
+        };
+        match rows {
+            Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
+            Rows::Window { seqs, tables } => {
+                // Each row rotates against its own position word; the cache append and the
+                // attention then run once over all rows, each reading its own planes, cells,
+                // position and key count from its record.
+                for (row, seq) in seqs.iter().enumerate() {
+                    rotate(row, 1, seq.step.range(4, 4)?)?;
+                }
+                let table = tables[source]
+                    .as_ref()
+                    .expect("a window table for every layer that owns planes");
+                let rows = seqs.len();
+                let own = seqs[0].kv[source]
+                    .as_ref()
+                    .expect("the shared-KV source layer is physical");
                 if physical {
-                    let data = Kv8Data {
-                        k: sc
-                            .k_normed
-                            .buf
-                            .range(row * kv_rows * 4, count * kv_rows * 4)?,
-                        v: sc
-                            .v_normed
-                            .buf
-                            .range(row * kv_rows * 4, count * kv_rows * 4)?,
-                        k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
-                        k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
-                        v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
-                        v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
-                    };
-                    if count == 1 {
-                        // The decode entry: the device pos word is authoritative, so a captured
-                        // replay writes the cell of the step it replays instead of the
-                        // capture-time cell. The status word satisfies the launch contract; the
-                        // caller's host check that `pos + m` leaves the context makes the
-                        // kernel's refuse path unreachable, so the word is never read back.
-                        ctx.kv8_append(
-                            stream,
-                            Kv8Shape {
-                                rows: 1,
-                                ..own.shape
-                            },
-                            data,
-                            seq.pos.range(0, 4)?,
-                            sc.status.range(0, 4)?,
-                        )?;
-                    } else {
-                        // The prefill chunk entry takes its position as a host scalar; it is never
-                        // captured (a multi-token step refuses arming), so the baked-scalar hazard
-                        // does not arise.
-                        ctx.kv8_chunk(
-                            stream,
-                            Kv8Shape {
-                                rows: count,
-                                ..own.shape
-                            },
-                            data,
-                            first,
-                        )?;
-                    }
+                    ctx.kv8_append_multi(
+                        stream,
+                        AppendMultiCall {
+                            shape: Kv8Shape { rows, ..own.shape },
+                            k: sc.k_normed.buf.range(0, rows * kv_rows * 4)?,
+                            v: sc.v_normed.buf.range(0, rows * kv_rows * 4)?,
+                            rows: table,
+                        },
+                    )?;
                 }
-                self.trace(
-                    pos,
-                    &format!("L{index}_v"),
-                    &sc.v_normed,
-                    (row + count) * kv_rows * 4,
-                );
-                // A prompt chunk of two or more rows on a global layer runs the wide prefill
-                // attention when it is on; a lone row, and so every decode step, keeps the decode
-                // attention.
-                let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
-                let call = WideCall::new(
-                    [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
-                    sc.q_normed.buf.range(at, bytes)?,
-                    sc.ctx_out.buf.range(at, bytes)?,
-                    count,
-                    first,
-                );
-                let take = layer.global && count > 1;
-                if WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
-                    return Ok(());
-                }
-                ctx.attn_decode_gemma(
+                ctx.attn_decode_gemma_multi(
                     stream,
-                    AttnDecodeGemmaCall {
-                        out: sc.ctx_out.buf.range(row * q_rows * 4, count * q_rows * 4)?,
-                        status: None,
-                        q: sc
-                            .q_normed
-                            .buf
-                            .range(row * q_rows * 4, count * q_rows * 4)?,
-                        k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
-                        k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
-                        v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
-                        v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
-                        kv_len: seq.kv_len.range(0, 4)?,
-                        m: count,
+                    DecodeGemmaMultiCall {
                         n_q_head: HEADS,
                         n_kv_head: KV_HEADS,
                         head_dim: head,
-                        cells: self.cells,
-                        window: if layer.global { 0 } else { LOCAL_WINDOW },
+                        window: if layer.global { 0 } else { self.local_window },
+                        ring: own.shape.ring,
                         scale: 1.0,
+                        q: sc.q_normed.buf.range(0, rows * q_rows * 4)?,
+                        rows: table,
                         split: attn_split,
-                        ring: 0,
+                        out: sc.ctx_out.buf.range(0, rows * q_rows * 4)?,
                     },
                 )
-            };
-        match rows {
-            Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
-            Rows::Window { seqs } => seqs
-                .iter()
-                .enumerate()
-                .try_for_each(|(row, seq)| group(seq, row, 1, 0)),
+            }
         }
     }
 
@@ -1854,33 +2310,14 @@ impl Bolt {
             sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             m,
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.q.qs.range(0, layer.q.qs_bytes())?,
-                w_scales: layer.q.scales.range(0, layer.q.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.q.buf.range(0, m * q_rows * 4)?,
-                k: HIDDEN,
-                rows: q_rows,
-                ncols: m,
-            },
-        )?;
-        if let (Some(k), Some(v)) = (&layer.k, &layer.v) {
-            for (weight, y) in [(k, &sc.k), (v, &sc.v)] {
-                ctx.gemma_matvec(
-                    stream,
-                    GemmaMatvecCall {
-                        w_qs: weight.qs.range(0, weight.qs_bytes())?,
-                        w_scales: weight.scales.range(0, weight.scales_bytes())?,
-                        x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                        y: y.buf.range(0, m * kv_rows * 4)?,
-                        k: HIDDEN,
-                        rows: kv_rows,
-                        ncols: m,
-                    },
-                )?;
-            }
+        match (&layer.k, &layer.v) {
+            (Some(k), Some(v)) => self.project_group(
+                &[(&layer.q, &sc.q), (k, &sc.k), (v, &sc.v)],
+                &sc.nrm,
+                &sc.q8_hidden,
+                m,
+            )?,
+            _ => self.project_group(&[(&layer.q, &sc.q)], &sc.nrm, &sc.q8_hidden, m)?,
         }
         // The QK-norm of the reference graph: each head of q and of k is
         // RMS-normalized and scaled by its own weight before RoPE. Values get the
@@ -1945,18 +2382,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.out.qs.range(0, layer.out.qs_bytes())?,
-                w_scales: layer.out.scales.range(0, layer.out.scales_bytes())?,
-                x_q8: sc.q8_ctx.range(0, sc.q8_ctx.bytes())?,
-                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
-                k: q_rows,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        self.project_group(&[(&layer.out, &sc.proj)], &sc.ctx_out, &sc.q8_ctx, m)?;
         self.trace(pos, &format!("L{index}_proj"), &sc.proj, m * HIDDEN * 4);
         self.norm_rows(
             stream,
@@ -1990,20 +2416,12 @@ impl Bolt {
             sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             m,
         )?;
-        for (weight, y) in [(&layer.ffn_gate, &sc.gate), (&layer.ffn_up, &sc.up)] {
-            ctx.gemma_matvec(
-                stream,
-                GemmaMatvecCall {
-                    w_qs: weight.qs.range(0, weight.qs_bytes())?,
-                    w_scales: weight.scales.range(0, weight.scales_bytes())?,
-                    x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                    y: y.buf.range(0, m * FFN * 4)?,
-                    k: HIDDEN,
-                    rows: FFN,
-                    ncols: m,
-                },
-            )?;
-        }
+        self.project_group(
+            &[(&layer.ffn_gate, &sc.gate), (&layer.ffn_up, &sc.up)],
+            &sc.nrm,
+            &sc.q8_hidden,
+            m,
+        )?;
         ctx.gelu_ffn(
             stream,
             GeluFfnCall {
@@ -2023,21 +2441,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.ffn_down.qs.range(0, layer.ffn_down.qs_bytes())?,
-                w_scales: layer
-                    .ffn_down
-                    .scales
-                    .range(0, layer.ffn_down.scales_bytes())?,
-                x_q8: sc.q8_mixed.range(0, sc.q8_mixed.bytes())?,
-                y: sc.down.buf.range(0, m * HIDDEN * 4)?,
-                k: FFN,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        self.project_group(&[(&layer.ffn_down, &sc.down)], &sc.mixed, &sc.q8_mixed, m)?;
         self.norm_rows(
             stream,
             sc.down.buf.range(0, m * HIDDEN * 4)?,
@@ -2063,36 +2467,36 @@ impl Bolt {
         self.trace(pos, &format!("L{index}_r2"), r2, m * HIDDEN * 4);
         // The per-layer-input block: the gated mixing of the second residual with
         // this layer's token-identity input, projected back to the hidden width.
-        for row in 0..m {
-            // The skipped-shared prefill packs the per-layer planes at the prefix
-            // stride, not the full 42-layer stride.
-            let at = (row * ple_stride + index * PLE) * 4;
-            ctx.add_rmsnorm_q8(
-                stream,
-                AddNormQ8Call {
-                    n: PLE,
-                    eps: self.eps,
-                    h: sc.ple_scaled.buf.range(at, PLE * 4)?,
-                    delta: None,
-                    weight: self
-                        .ple_model_norm
-                        .buf
-                        .range(0, self.ple_model_norm.bytes())?,
-                    norm_out: sc.ple_nrm.buf.range(row * PLE * 4, PLE * 4)?,
-                    q8: sc.q8_head.range(0, sc.q8_head.bytes())?,
-                    rows: 1,
-                },
-            )?;
-        }
-        ctx.embed_q8(
+        // The skipped-shared prefill packs the per-layer planes at the prefix stride, not the
+        // full 42-layer stride: the rows of this layer's slice sit `ple_stride` apart.
+        ctx.add_rmsnorm_q8_strided(
             stream,
-            EmbedQ8Call {
-                out: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
-                w: layer.table.buf.range(0, layer.table.bytes())?,
+            AddNormQ8Call {
+                n: PLE,
+                eps: self.eps,
+                h: sc
+                    .ple_scaled
+                    .buf
+                    .range(index * PLE * 4, ((m - 1) * ple_stride + PLE) * 4)?,
+                delta: None,
+                weight: self
+                    .ple_model_norm
+                    .buf
+                    .range(0, self.ple_model_norm.bytes())?,
+                norm_out: sc.ple_nrm.buf.range(0, m * PLE * 4)?,
+                q8: sc.q8_head.range(0, sc.q8_head.bytes())?,
+                rows: m,
+            },
+            ple_stride,
+        )?;
+        ctx.embed_native(
+            stream,
+            EmbedNativeCall {
+                weight: &layer.table,
                 ids: sc.ids.range(0, m * 4)?,
+                x: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                status: sc.status.range(0, 4)?,
                 m,
-                n_rows: layer.table.rows,
-                k: layer.table.k,
             },
         )?;
         self.trace(pos, &format!("L{index}_plep"), &sc.ple_nrm, m * PLE * 4);
@@ -2137,21 +2541,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.ple_gate.qs.range(0, layer.ple_gate.qs_bytes())?,
-                w_scales: layer
-                    .ple_gate
-                    .scales
-                    .range(0, layer.ple_gate.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.ple_nrm.buf.range(0, m * PLE * 4)?,
-                k: HIDDEN,
-                rows: PLE,
-                ncols: m,
-            },
-        )?;
+        self.matvec(&layer.ple_gate, PLE, &sc.q8_hidden, &sc.ple_nrm, m)?;
         ctx.gelu_ffn(
             stream,
             GeluFfnCall {
@@ -2173,21 +2563,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.ple_proj.qs.range(0, layer.ple_proj.qs_bytes())?,
-                w_scales: layer
-                    .ple_proj
-                    .scales
-                    .range(0, layer.ple_proj.scales_bytes())?,
-                x_q8: sc.q8_ple_mixed.range(0, sc.q8_ple_mixed.bytes())?,
-                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
-                k: PLE,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        self.matvec(&layer.ple_proj, HIDDEN, &sc.q8_ple_mixed, &sc.proj, m)?;
         self.trace(pos, &format!("L{index}_pled"), &sc.proj, m * HIDDEN * 4);
         self.norm_rows(
             stream,
@@ -2230,26 +2606,68 @@ impl Bolt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn plan_cells(
-        free: u64,
-        weights: u64,
-        split: bool,
-        wide: bool,
-        sessions: usize,
-    ) -> Result<Option<usize>, EngError> {
-        Ok(cell_figures(split.then_some(ATTN_SPLIT_MAX), wide)?.plan(free, weights, sessions))
+    #[test]
+    fn a_file_serves_no_more_cells_than_its_header_gives_as_context() {
+        use crate::tokenizer::gguf::tests::{gguf_file, kv_u32_for_tests};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = |name: &str, kvs: Vec<Vec<u8>>| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, gguf_file(&kvs)).expect("write");
+            header_context(&path)
+        };
+        assert_eq!(
+            at(
+                "short.gguf",
+                vec![kv_u32_for_tests("gemma4.context_length", 4096)]
+            ),
+            Some(4096)
+        );
+        assert_eq!(
+            at(
+                "long.gguf",
+                vec![kv_u32_for_tests("gemma4.context_length", 1 << 20)]
+            ),
+            Some(MAX_CELLS),
+            "never past the model maximum"
+        );
+        assert_eq!(
+            at(
+                "zero.gguf",
+                vec![kv_u32_for_tests("gemma4.context_length", 0)]
+            ),
+            None
+        );
+        assert_eq!(at("none.gguf", vec![]), None);
+        assert_eq!(header_context(&dir.path().join("missing.gguf")), None);
     }
 
-    fn cells_for(
+    use super::*;
+
+    fn planned_cells(
         free: u64,
         weights: u64,
-        split: bool,
+        splits: Option<usize>,
         wide: bool,
         sessions: usize,
-    ) -> Result<usize, EngError> {
-        Ok(cell_figures(split.then_some(ATTN_SPLIT_MAX), wide)?.serve(free, weights, sessions))
+    ) -> Result<(usize, usize), EngError> {
+        Ok(cell_figures(splits, wide, 8)?.planned(
+            free,
+            weights,
+            sessions,
+            (MAX_CELLS, FALLBACK_CELLS),
+        ))
+    }
+
+    fn pool_cells(free: u64, weights: u64, split: bool, wide: bool, sessions: usize) -> usize {
+        planned_cells(
+            free,
+            weights,
+            split.then_some(ATTN_SPLIT_MAX),
+            wide,
+            sessions,
+        )
+        .expect("plan")
+        .1
     }
 
     #[test]
@@ -2264,24 +2682,42 @@ mod tests {
     }
 
     #[test]
+    fn a_group_runs_on_the_tensor_cores_only_in_one_type_with_a_dense_case() {
+        use QuantType::{Iq4Nl, Q4K, Q6K, Q80};
+        let wide = MMQ_MIN_ROWS;
+        assert!(on_tensor_cores([Q80, Q80, Q80].into_iter(), wide));
+        assert!(on_tensor_cores([Q4K, Q4K].into_iter(), wide));
+        assert!(on_tensor_cores([Q6K].into_iter(), 64));
+        // A mixed group keeps each weight on the matvec: one activation layout serves one type.
+        assert!(!on_tensor_cores([Q4K, Q6K, Q6K].into_iter(), wide));
+        assert!(!on_tensor_cores([Q80, Q4K].into_iter(), wide));
+        // A short chunk, a type without a dense case and an empty group never do.
+        assert!(!on_tensor_cores([Q80, Q80].into_iter(), wide - 1));
+        assert!(!on_tensor_cores([Iq4Nl].into_iter(), wide));
+        assert!(!on_tensor_cores(std::iter::empty(), wide));
+    }
+
+    #[test]
     fn scratch_bytes_charges_the_prefill_maximum() {
-        // Growable f32 vectors at PREFILL_BATCH rows (89,856 elements x 8 x 4),
+        // Growable f32 vectors at 8 rows (89,856 elements x 8 x 4),
         // fixed f32 ones + two logits rows (524,800 x 4), growable q8 at eight
-        // columns plus the fixed head/qk buffers, plus the 12 input-cell bytes;
+        // columns plus the head and qk buffers, plus the 12 input-cell bytes;
         // the armed split adds its partial buffer on top.
-        let disarmed = scratch_bytes(None, false).expect("the disarmed scratch computes");
-        let armed = scratch_bytes(Some(ATTN_SPLIT_MAX), false).expect("the armed scratch computes");
-        assert_eq!(disarmed, 5_168_716);
-        assert_eq!(armed, 9_379_404);
-        assert_eq!(armed - disarmed, attn_part_bytes(ATTN_SPLIT_MAX) as u64);
+        let disarmed = scratch_bytes(None, false, 8).expect("the disarmed scratch computes");
+        let armed =
+            scratch_bytes(Some(ATTN_SPLIT_MAX), false, 8).expect("the armed scratch computes");
+        let gemm = DenseChunkGemm::bytes(MMQ_K_MAX, 8).expect("the gemm charge computes");
+        assert_eq!(disarmed, 5_172_748 + gemm);
+        assert_eq!(armed, 9_383_436 + gemm);
+        assert_eq!(armed - disarmed, attn_part_bytes(ATTN_SPLIT_MAX, 8) as u64);
         // The wide prefill attention's partial buffer is charged only where the gate passed.
         let wide = wide_geometry(MAX_CELLS)
             .part_bytes()
             .expect("the wide partial size computes") as u64;
         assert_eq!(wide, 16_842_752);
-        assert_eq!(scratch_bytes(None, true), Some(disarmed + wide));
+        assert_eq!(scratch_bytes(None, true, 8), Some(disarmed + wide));
         assert_eq!(
-            scratch_bytes(Some(ATTN_SPLIT_MAX), true),
+            scratch_bytes(Some(ATTN_SPLIT_MAX), true, 8),
             Some(armed + wide)
         );
     }
@@ -2292,7 +2728,7 @@ mod tests {
         // no room for the headroom reserve must be refused by the shared admit;
         // the same demand fits once the reserve is included.
         let weights_bytes = 3_000_000_000u64;
-        let demand = bolt_demand(weights_bytes, Some(ATTN_SPLIT_MAX), 32_768, true)
+        let demand = bolt_demand(weights_bytes, Some(ATTN_SPLIT_MAX), 32_768, true, 8)
             .expect("the Bolt demand computes");
         assert_eq!(demand.tensors, weights_bytes);
         assert!(demand.kv_cache > 0 && demand.work > 0 && demand.headroom > 0);
@@ -2314,245 +2750,81 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_the_host_cannot_back_is_refused_before_it_is_allocated() {
-        use crate::family::mem::HostFacts;
-        let one_gib = 1usize << 30;
-        let meminfo = |available_gib: u64| {
-            format!(
-                "MemTotal:       {} kB\nMemAvailable:   {} kB\n",
-                32 * (1 << 20),
-                available_gib * (1 << 20)
-            )
-        };
-        // The budget is the available figure, clamped by the cgroup's remaining bytes.
-        let tight = HostFacts::from_meminfo("test", &meminfo(20), Some(1 << 29)).expect("host");
-        let error = admit_snapshot(one_gib, Ok(tight.host_memory()))
-            .expect_err("a cgroup with half a GiB left cannot back 1 GiB");
-        assert!(
-            matches!(&error, EngError::MemoryPlan(text) if text.contains("a Bolt prefix snapshot")),
-            "{error:?}"
-        );
-        let roomy = HostFacts::from_meminfo("test", &meminfo(20), None).expect("host");
-        assert!(admit_snapshot(one_gib, Ok(roomy.host_memory())).is_ok());
-    }
-
-    /// A cgroup layout the probe cannot parse falls back to the bare figure, and a probe that
-    /// cannot verify anything proceeds: the save is not refused for a host the probe cannot read.
-    #[test]
-    fn a_probe_that_cannot_read_the_host_falls_back_and_proceeds() {
-        use crate::family::mem::HostFacts;
-        let one_gib = 1usize << 30;
-        let meminfo = "MemTotal:       33554432 kB\nMemAvailable:    2097152 kB\n";
-        let refusal = EngError::MemoryPlan("cgroup v1 layout".into());
-        // The bare fallback keeps the machine-wide figures: 2 GiB available backs 1 GiB.
-        let bare = HostFacts::bare("test", "test", &refusal, meminfo)
-            .expect("bare")
-            .host_memory();
-        assert_eq!(bare.1, 2 << 30);
-        assert!(admit_snapshot(one_gib, Ok(bare)).is_ok());
-        assert!(
-            admit_snapshot(3 << 30, Ok(bare)).is_err(),
-            "the bare figure still refuses"
-        );
-        // Both probes failing: the save proceeds, as the other stores' saves do.
-        assert!(admit_snapshot(one_gib, Err(refusal)).is_ok());
-    }
-
-    #[test]
-    fn the_planned_cells_are_the_largest_count_the_card_carries() {
+    fn the_pool_is_the_largest_count_the_card_carries() {
         let weights = 7_578_800_000u64;
         let free_for = |cells: usize| {
-            let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false).expect("demand");
+            let demand =
+                bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false, 8).expect("demand");
             demand.tensors + demand.kv_cache + demand.work + demand.headroom
         };
-        // A 3090-sized card holds the model maximum.
-        assert_eq!(
-            plan_cells(22_000_000_000, weights, true, false, 1).expect("plan"),
-            Some(MAX_CELLS)
-        );
-        // A card that carries 40,960 cells and not one step more gets exactly those.
+        // A card that carries 40,960 cells and not one step more has exactly those, and one
+        // session may hold all of them.
         let free = free_for(40_960);
         assert_eq!(
-            plan_cells(free, weights, true, false, 1).expect("plan"),
-            Some(40_960)
+            planned_cells(free, weights, Some(ATTN_SPLIT_MAX), false, 1).expect("plan"),
+            (40_960, 40_960)
         );
-        assert_eq!(
-            plan_cells(free - 1, weights, true, false, 1).expect("plan"),
-            Some(39_936)
-        );
-        // The count the plan returns passes the shared admission, and a card short of the
-        // smallest count plans none.
-        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false).expect("demand");
+        assert_eq!(pool_cells(free - 1, weights, true, false, 1), 39_936);
+        // The pool passes the shared admission, and a card short of one cell plans the fallback
+        // that the admission refuses with its own figures.
+        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false, 8).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
-        assert_eq!(
-            plan_cells(free_for(1024) - 1, weights, true, false, 1).expect("plan"),
-            None
-        );
+        let short = free_for(0) - 1;
+        assert_eq!(pool_cells(short, weights, true, false, 1), FALLBACK_CELLS);
+        let refused =
+            bolt_demand(weights, Some(ATTN_SPLIT_MAX), FALLBACK_CELLS, false, 8).expect("demand");
+        assert!(crate::kernels::cuda::plan::admit(&refused, short).is_err());
         assert_eq!(MAX_CELLS, 65_536);
     }
 
-    /// The cell planner as it was written inside Bolt before the shared planner took it over.
-    fn reference_cells(
-        free: u64,
-        weights: u64,
-        split: bool,
-        wide: bool,
-        sessions: usize,
-    ) -> Option<usize> {
-        use crate::family::card_fit::{
-            CacheForm, CardBytes, ContextLimits, SESSION_PLAN_SLACK_BYTES, plan_card_fit,
-        };
-        let per_position =
-            crate::family::gemma::gemma4::budget::bolt_kv_bytes_per_position().unwrap();
-        let scratch = scratch_bytes(split.then_some(ATTN_SPLIT_MAX), wide).unwrap();
-        let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
-        let unlisted = if extra > 0 {
-            SESSION_PLAN_SLACK_BYTES
-        } else {
-            0
-        };
-        let charge = |cells: u32| {
-            let cache = u64::from(cells).checked_mul(per_position)?;
-            let further = cache
-                .checked_add(crate::family::gemma::gemma4::budget::BOLT_SEQ_FIXED_BYTES)?
-                .checked_mul(extra)?;
-            cache
-                .checked_add(scratch)?
-                .checked_add(crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES)?
-                .checked_add(unlisted)?
-                .checked_add(further)
-        };
-        let ceiling = u32::try_from(MAX_CELLS).unwrap();
-        plan_card_fit(
-            CardBytes {
-                free,
-                weights,
-                band: 0,
-            },
-            &[CacheForm {
-                form: (),
-                charge: &charge,
-            }],
-            ContextLimits {
-                ceiling,
-                sufficient: ceiling,
-            },
-        )
-        .map(|fit| fit.context as usize)
-    }
-
+    /// One session holds up to the model's context whatever the planned session count; the pool
+    /// is what the card carries for all of them together. On a 3090 the pool funds the full
+    /// context for a lone prompt and an even share of it for each of eight sessions.
     #[test]
-    fn the_shared_planner_gives_the_cells_the_bolt_planner_gave() {
-        let weights = 7_578_800_000u64;
-        let mut seen = 0;
-        for free in (6..=24u64).map(|gib| gib * 1_000_000_000 + 123_456_789) {
-            for sessions in 1..=Bolt::PREFILL_BATCH {
-                for (split, wide) in [(true, false), (true, true), (false, false)] {
-                    let old = reference_cells(free, weights, split, wide, sessions);
-                    let new = cell_figures(split.then_some(ATTN_SPLIT_MAX), wide)
-                        .expect("figures")
-                        .plan(free, weights, sessions);
-                    assert_eq!(
-                        new, old,
-                        "free {free} sessions {sessions} split {split} wide {wide}"
-                    );
-                    seen += 1;
-                }
-            }
-        }
-        // The default start on a 3090: eight planned sessions, the split armed, the gate passing
-        // or not.
-        for wide in [false, true] {
-            let free = 22_000_000_000u64;
-            let one = reference_cells(free, weights, true, wide, 1);
-            let all = reference_cells(free, weights, true, wide, 8).unwrap_or(0);
-            let old = one.map_or(FALLBACK_CELLS, |one| all.max(one.min(FALLBACK_CELLS)));
-            let now = cell_figures(Some(ATTN_SPLIT_MAX), wide)
-                .expect("figures")
-                .serve(free, weights, 8);
-            eprintln!("default start, wide {wide}: served {old} cells before, {now} cells now");
-            assert_eq!(now, old);
-        }
-        assert_eq!(seen, 19 * 8 * 3);
+    fn a_session_holds_the_model_context_and_the_pool_is_what_the_card_carries() {
+        let weights = 7_946_927_552u64;
+        let free = 23_448_322_048u64;
+        let (cells, pool) = planned_cells(
+            free,
+            weights,
+            Some(ATTN_SPLIT_MAX),
+            false,
+            Bolt::WINDOW_ROWS,
+        )
+        .expect("plan");
+        assert_eq!(cells, MAX_CELLS);
+        assert!(
+            (MAX_CELLS..Bolt::WINDOW_ROWS * MAX_CELLS).contains(&pool),
+            "{pool}"
+        );
+        eprintln!(
+            "3090 default start: pool {pool} cells, one session up to {cells}, an even share of \
+             {} for each of {} sessions",
+            pool / Bolt::WINDOW_ROWS,
+            Bolt::WINDOW_ROWS
+        );
+        // A smaller card still holds the pool of what it carries; one session never holds more
+        // than the pool.
+        let small =
+            planned_cells(12_000_000_000, weights, Some(ATTN_SPLIT_MAX), false, 2).expect("plan");
+        assert!(small.0 <= small.1 && small.1 < pool);
     }
 
     #[test]
     fn the_planned_cells_fund_the_wide_prefill_buffer_when_the_gate_passes() {
         let weights = 7_600_000_000u64;
         for free in [11_000_000_000u64, 14_000_000_000, 21_000_000_000] {
-            let plain = cells_for(free, weights, true, false, 1).expect("cells");
-            let wide = cells_for(free, weights, true, true, 1).expect("cells");
+            let plain = planned_cells(free, weights, Some(ATTN_SPLIT_MAX), false, 1)
+                .expect("cells")
+                .0;
+            let wide = planned_cells(free, weights, Some(ATTN_SPLIT_MAX), true, 1)
+                .expect("cells")
+                .0;
             assert!(wide <= plain, "{free}: {wide} against {plain}");
-            let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), wide, true).expect("demand");
+            let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), wide, true, 8).expect("demand");
             crate::kernels::cuda::plan::admit(&demand, free)
                 .unwrap_or_else(|error| panic!("{free}: {wide} cells: {error:?}"));
         }
-    }
-
-    /// The sessions the planner funds once `cells` are resident beside the weights.
-    fn funded_sessions(free: u64, weights: u64, cells: usize) -> usize {
-        use crate::family::seq_plan::{SeqInputs, plan_seqs};
-        // What the first session holds beyond its admission demand, as measured on the 3090.
-        const UNLISTED_BYTES: u64 = 196 << 20;
-        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false).expect("demand");
-        let after_first =
-            free.saturating_sub(demand.tensors + demand.kv_cache + demand.work + UNLISTED_BYTES);
-        let plan = plan_seqs(
-            SeqInputs {
-                free: after_first,
-                headroom: crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES,
-                cost: crate::family::gemma::gemma4::budget::bolt_seq_cost().expect("cost"),
-                context: cells as u64,
-                row_cap: Bolt::PREFILL_BATCH,
-                ceiling: Bolt::PREFILL_BATCH,
-            },
-            None,
-        )
-        .expect("plan");
-        plan.seqs
-    }
-
-    #[test]
-    fn widening_the_cache_never_costs_a_session_the_fixed_size_funded() {
-        let weights = 7_946_927_552u64;
-        let target = Bolt::PREFILL_BATCH;
-        for free in (9u64..=24)
-            .map(|gib| gib << 30)
-            .chain([23_448_322_048, 23_566_221_312])
-        {
-            let cells = cells_for(free, weights, true, false, target).expect("cells");
-            let old = funded_sessions(free, weights, FALLBACK_CELLS);
-            let now = funded_sessions(free, weights, cells);
-            assert!(
-                cells
-                    >= FALLBACK_CELLS.min(
-                        plan_cells(free, weights, true, false, 1)
-                            .unwrap()
-                            .unwrap_or(0)
-                    ),
-                "{free}: {cells} cells"
-            );
-            assert!(
-                now >= old,
-                "{free}: {now} sessions at {cells} cells, {old} at the fixed size"
-            );
-        }
-    }
-
-    #[test]
-    fn the_cache_is_widened_only_as_far_as_every_planned_session_fits() {
-        let weights = 7_946_927_552u64;
-        let free = 23_448_322_048u64;
-        let cells = cells_for(free, weights, true, false, Bolt::PREFILL_BATCH).expect("cells");
-        assert!(cells > FALLBACK_CELLS && cells < MAX_CELLS, "{cells}");
-        assert_eq!(funded_sessions(free, weights, cells), Bolt::PREFILL_BATCH);
-        // The model maximum alone would have cost a session on this card.
-        assert!(funded_sessions(free, weights, MAX_CELLS) < Bolt::PREFILL_BATCH);
-        // One planned session (the decode graph) takes the whole model maximum.
-        assert_eq!(
-            cells_for(free, weights, true, false, 1).expect("cells"),
-            MAX_CELLS
-        );
     }
 
     fn logits(model: &Bolt) -> Vec<f32> {
@@ -2602,18 +2874,27 @@ mod tests {
         word_bytes.extend_from_slice(&0i32.to_le_bytes());
         word_bytes.extend_from_slice(&1i32.to_le_bytes());
         let words = ctx.upload(&word_bytes).expect("words");
+        let status = ctx.upload(&zero(4)).expect("status");
+        let q8_matrix = |rows: usize, k: usize| {
+            super::matrix_from_bytes(
+                &ctx,
+                "zeros",
+                crate::weights::GgufType::Q80,
+                k,
+                rows,
+                &zero(rows * (k / 32) * 34),
+            )
+            .expect("matrix")
+        };
         // Embedding gather and the hidden-path ops at full Bolt widths.
-        ctx.embed_q8(
+        ctx.embed_native(
             &stream,
-            EmbedQ8Call {
-                out: f32s(2560).range(0, 2560 * 4).unwrap(),
-                w: i8s(1024 * (2560 / 32) * 34)
-                    .range(0, 1024 * (2560 / 32) * 34)
-                    .unwrap(),
+            EmbedNativeCall {
+                weight: &q8_matrix(1024, 2560),
                 ids: words.range(0, 4).unwrap(),
+                x: f32s(2560).range(0, 2560 * 4).unwrap(),
+                status: status.range(0, 4).unwrap(),
                 m: 1,
-                n_rows: 1024,
-                k: 2560,
             },
         )
         .expect("embed 2560");
@@ -2656,37 +2937,7 @@ mod tests {
                 },
             )
             .expect("quantize {k}");
-            ctx.gemma_matvec(
-                &stream,
-                GemmaMatvecCall {
-                    w_qs: i8s(256 * k).range(0, 256 * k).unwrap(),
-                    w_scales: u16s(256 * (k / 32)).range(0, 256 * (k / 32) * 2).unwrap(),
-                    x_q8: i8s(q8_1_bytes(k, 1).unwrap())
-                        .range(0, q8_1_bytes(k, 1).unwrap())
-                        .unwrap(),
-                    y: f32s(256).range(0, 256 * 4).unwrap(),
-                    k,
-                    rows: 256,
-                    ncols: 1,
-                },
-            )
-            .expect("matvec k={k}");
         }
-        ctx.gemma_matvec(
-            &stream,
-            GemmaMatvecCall {
-                w_qs: i8s(10752 * 2560).range(0, 10752 * 2560).unwrap(),
-                w_scales: u16s(10752 * 80).range(0, 10752 * 80 * 2).unwrap(),
-                x_q8: i8s(q8_1_bytes(2560, 1).unwrap())
-                    .range(0, q8_1_bytes(2560, 1).unwrap())
-                    .unwrap(),
-                y: f32s(10752).range(0, 10752 * 4).unwrap(),
-                k: 2560,
-                rows: 10752,
-                ncols: 1,
-            },
-        )
-        .expect("matvec ple projection");
         // The per-head norm at 256 and 512, including the interior-slice pattern.
         let ple = f32s(256 * 42);
         for n in [256usize, 512] {
@@ -2724,17 +2975,14 @@ mod tests {
         )
         .expect("ple slice norm");
         // The PLE table gather and the gated mixing at 256.
-        ctx.embed_q8(
+        ctx.embed_native(
             &stream,
-            EmbedQ8Call {
-                out: f32s(256).range(0, 256 * 4).unwrap(),
-                w: i8s(1024 * (256 / 32) * 34)
-                    .range(0, 1024 * (256 / 32) * 34)
-                    .unwrap(),
+            EmbedNativeCall {
+                weight: &q8_matrix(1024, 256),
                 ids: words.range(0, 4).unwrap(),
+                x: f32s(256).range(0, 256 * 4).unwrap(),
+                status: status.range(0, 4).unwrap(),
                 m: 1,
-                n_rows: 1024,
-                k: 256,
             },
         )
         .expect("ple table gather");
@@ -2887,11 +3135,12 @@ mod tests {
         }
     }
 
-    /// The cells the default start picks serve every session the planner then funds, each up to
-    /// the last cell.
+    /// The default start's pool serves every session the planner then funds, each at its even
+    /// share and up to its last cell, and one session alone takes the model's context.
     #[test]
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
-    fn the_default_cells_serve_every_planned_session_to_the_last_cell() {
+    fn the_default_pool_serves_every_planned_session_to_the_last_cell() {
+        use crate::family::cell_pool::CELL_GRANULE;
         use crate::family::seq_plan::{SeqInputs, plan_seqs};
         let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
         let bytes = std::fs::metadata(&path).expect("model file").len();
@@ -2901,40 +3150,321 @@ mod tests {
             &|_| {},
         )
         .expect("load");
-        let cells = model.cells();
-        let first = model.new_seq().expect("first session");
+        let pool = model.pool().total();
+        let initial = CELL_GRANULE;
+        let first = model.new_seq_cells(initial).expect("first session");
         let free = u64::try_from(model.ctx.memory_info().expect("memory").free).unwrap_or(u64::MAX);
         let plan = plan_seqs(
             SeqInputs {
                 free,
                 headroom: crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES,
-                cost: crate::family::gemma::gemma4::budget::bolt_seq_cost().expect("cost"),
-                context: cells as u64,
-                row_cap: Bolt::PREFILL_BATCH,
-                ceiling: Bolt::PREFILL_BATCH,
+                cost: crate::family::gemma::gemma4::budget::bolt_seq_cost(model.rows)
+                    .expect("cost"),
+                context: initial as u64,
+                row_cap: Bolt::WINDOW_ROWS,
+                ceiling: Bolt::WINDOW_ROWS,
             },
             None,
         )
         .expect("session plan");
+        let share = pool / plan.seqs / CELL_GRANULE * CELL_GRANULE;
         eprintln!(
-            "default cells {cells}, planned sessions {} ({})",
+            "pool {pool} cells, one session up to {}, planned sessions {} ({}), even share {share}",
+            model.cells(),
             plan.seqs,
             plan.describe()
         );
-        assert!(cells >= FALLBACK_CELLS, "{cells}");
+        assert_eq!(plan.seqs, Bolt::WINDOW_ROWS);
         let mut seqs = vec![first];
         for _ in 1..plan.seqs {
-            seqs.push(model.new_seq().expect("a planned session"));
+            seqs.push(model.new_seq_cells(initial).expect("a planned session"));
         }
+        for seq in &mut seqs {
+            model.resize_seq(seq, share).expect("an even share");
+        }
+        assert!(
+            model.pool().free() < share,
+            "the shares leave less than one share free"
+        );
         model.reserve_window(plan.seqs).expect("the window rows");
         let refs: Vec<&BoltSeq> = seqs.iter().collect();
         let tokens = vec![2u32; plan.seqs];
-        let positions = vec![cells - 1; plan.seqs];
+        let positions = vec![share - 1; plan.seqs];
         let rows = model
             .decode_rows(&refs, &tokens, &positions)
             .expect("every session decodes at the last cell");
         assert_eq!(rows.len(), plan.seqs);
         assert!(rows.iter().all(|row| row.len() == VOCAB));
+        // The pool is spent: another session queues.
+        assert!(matches!(
+            model.new_seq_cells(share),
+            Err(EngError::MemoryPlan(_))
+        ));
+        // One session alone takes the model's context: the others return their cells.
+        drop(refs);
+        seqs.truncate(1);
+        let mut lone = seqs.pop().expect("one session");
+        model
+            .resize_seq(&mut lone, model.cells())
+            .expect("the whole context");
+        assert_eq!(lone.cells(), model.cells());
+        model
+            .prefill_batch(&lone, &[2], model.cells() - 1, false)
+            .expect("the last cell of the whole context");
+    }
+
+    /// A sequence grown in the middle of a decode gives, at every step, the logits of a sequence
+    /// sized for the whole run from the start, bit for bit: the growth crosses the sliding window
+    /// of the local layers and re-lays every plane. A wrong copy would serve wrong text.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_sequence_grown_mid_decode_gives_the_logits_of_one_sized_for_the_run() {
+        use crate::family::cell_pool::CELL_GRANULE;
+        let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
+        let bytes = std::fs::metadata(&path).expect("model file").len();
+        let mut model = load_choosing(
+            &[crate::family::gguf_select::GgufFile { path, bytes }],
+            crate::family::gemma::gemma4::config::MaxSeqs::Auto,
+            &|_| {},
+        )
+        .expect("load");
+        // A run under a sanitizer is slow: BOLT_GROW_STEPS shortens it (it must pass one granule).
+        let steps = std::env::var("BOLT_GROW_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1600usize);
+        let mut grown = model.new_seq_cells(CELL_GRANULE).expect("small sequence");
+        let full = model
+            .new_seq_cells(steps.next_multiple_of(CELL_GRANULE))
+            .expect("whole run");
+        let mut growths = 0;
+        for pos in 0..steps {
+            let token = 2 + (pos as u32 * 17) % 5000;
+            let before = grown.cells();
+            model.make_room(&mut grown, pos, pos + 1).expect("room");
+            growths += usize::from(grown.cells() != before);
+            model.decode(&grown, token, pos).expect("grown step");
+            let a = model.capped_logits().expect("grown logits");
+            model.decode(&full, token, pos).expect("full step");
+            let b = model.capped_logits().expect("full logits");
+            let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(
+                same,
+                "the logits differ at position {pos} (grown holds {} cells)",
+                grown.cells()
+            );
+        }
+        assert!(growths >= 1, "the sequence grew during the run");
+        assert!(grown.cells() >= steps);
+    }
+
+    fn load_q8() -> Bolt {
+        let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
+        let bytes = std::fs::metadata(&path).expect("model file").len();
+        load_choosing(
+            &[crate::family::gguf_select::GgufFile { path, bytes }],
+            crate::family::gemma::gemma4::config::MaxSeqs::Auto,
+            &|_| {},
+        )
+        .expect("load")
+    }
+
+    /// The bits of the capped logits of the last step.
+    fn logit_bits(model: &Bolt) -> Vec<u32> {
+        model
+            .capped_logits()
+            .expect("logits")
+            .iter()
+            .map(|value| value.to_bits())
+            .collect()
+    }
+
+    /// A session whose sliding layers keep a ring gives, at every chunk and every decode step, the
+    /// logits of a session that keeps every position in linear planes, bit for bit: the prompt
+    /// crosses the 512-position window, the chunk widths run from one to the planned rows, and the
+    /// positions straddle the ring's end at every offset.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_ring_session_gives_the_logits_of_the_linear_control_bit_for_bit() {
+        use crate::family::cell_pool::CELL_GRANULE;
+        let mut model = load_q8();
+        assert_ne!(
+            model.local_ring,
+            KvRing::LINEAR,
+            "the ring is what a start builds"
+        );
+        let cells = 2 * CELL_GRANULE;
+        let ring = model.new_seq_cells(cells).expect("ring session");
+        model.set_linear_local_layers(true);
+        let linear = model.new_seq_cells(cells).expect("linear session");
+        model.set_linear_local_layers(false);
+        // The ring planes are the fixed small size; the linear control keeps every cell.
+        let ring_cells = |seq: &BoltSeq| {
+            seq.kv
+                .iter()
+                .flatten()
+                .map(|kv| kv.shape.cells)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            ring_cells(&ring).iter().any(|&c| c < cells),
+            "{:?}",
+            ring_cells(&ring)
+        );
+        assert!(ring_cells(&linear).iter().all(|&c| c == cells));
+        let widths = [
+            1usize,
+            4,
+            8.min(model.rows),
+            3,
+            6,
+            5.min(model.rows),
+            2,
+            7.min(model.rows),
+            1,
+            model.rows,
+        ];
+        let mut pos = 0usize;
+        let mut turn = 0usize;
+        while pos < 1_700 {
+            let width = widths[turn % widths.len()].min(1_700 - pos);
+            let tokens: Vec<u32> = (0..width)
+                .map(|i| 2 + ((pos + i) as u32 * 37) % 9_000)
+                .collect();
+            model
+                .prefill_batch(&ring, &tokens, pos, true)
+                .expect("ring chunk");
+            let a = logit_bits(&model);
+            model
+                .prefill_batch(&linear, &tokens, pos, true)
+                .expect("linear chunk");
+            let b = logit_bits(&model);
+            assert_eq!(
+                a,
+                b,
+                "the logits differ after the chunk ending at {}",
+                pos + width
+            );
+            pos += width;
+            turn += 1;
+        }
+        for step in 0..40usize {
+            let token = 3 + (step as u32 * 11) % 5_000;
+            model.decode(&ring, token, pos + step).expect("ring step");
+            let a = logit_bits(&model);
+            model
+                .decode(&linear, token, pos + step)
+                .expect("linear step");
+            assert_eq!(
+                a,
+                logit_bits(&model),
+                "the logits differ at decode step {step}"
+            );
+        }
+    }
+
+    /// A snapshot keeps the sliding layers' last window and a restore writes it back where the
+    /// ring wants it: for every fed count around the window and the ring's end, a fresh session
+    /// restored from the snapshot continues with the logits of the session it was taken from.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_snapshot_of_a_ring_session_restores_into_another_session_bit_for_bit() {
+        use crate::family::cell_pool::CELL_GRANULE;
+        let mut model = load_q8();
+        let cells = 2 * CELL_GRANULE;
+        let source = model.new_seq_cells(cells).expect("source");
+        let target = model.new_seq_cells(cells).expect("target");
+        let total = 1_600usize;
+        let token_at = |pos: usize| 2 + (pos as u32 * 29) % 9_000;
+        let tokens: Vec<u32> = (0..total).map(token_at).collect();
+        // Feed the source one token at a time, saving at the counts that straddle the window.
+        let mut snapshots = Vec::new();
+        for pos in 0..total {
+            model
+                .prefill_batch(&source, &tokens[pos..=pos], pos, false)
+                .expect("feed");
+            let fed = pos + 1;
+            if [100, 511, 512, 513, 519, 520, 1_030, 1_600].contains(&fed) {
+                snapshots.push((fed, model.snapshot_seq(&source, fed).expect("snapshot")));
+            }
+        }
+        for (fed, snapshot) in &snapshots {
+            let layers = model.snapshot_layer_bytes(*fed);
+            assert_eq!(
+                layers.iter().sum::<usize>(),
+                snapshot.bytes(),
+                "size at {fed}"
+            );
+            // The budget's closed form is the same number: every full-attention position and one
+            // window of the sliding layers.
+            assert_eq!(
+                crate::family::gemma::gemma4::budget::bolt_snapshot_bytes(*fed),
+                Some(snapshot.bytes() as u64),
+                "budget at {fed}"
+            );
+            // Past the window the entry stops growing with the prefix on the sliding layers.
+            let probe = model.new_seq_cells(cells).expect("probe");
+            for pos in 0..*fed {
+                model
+                    .prefill_batch(&probe, &tokens[pos..=pos], pos, false)
+                    .expect("refeed");
+            }
+            // A fresh session and a grown one take the same entry and continue like the probe: the
+            // grown session moved its rings and re-laid its full-attention planes first.
+            model.restore_seq(&target, snapshot).expect("restore");
+            let mut grown = model.new_seq_cells(CELL_GRANULE).expect("small session");
+            model
+                .make_room(&mut grown, 0, *fed + 8)
+                .expect("room for the entry");
+            model
+                .restore_seq(&grown, snapshot)
+                .expect("restore into a grown session");
+            for step in 0..6usize {
+                let token = 5 + step as u32;
+                model.decode(&probe, token, fed + step).expect("probe step");
+                let a = logit_bits(&model);
+                model
+                    .decode(&target, token, fed + step)
+                    .expect("restored step");
+                assert_eq!(a, logit_bits(&model), "fed {fed} step {step}");
+                model.decode(&grown, token, fed + step).expect("grown step");
+                assert_eq!(a, logit_bits(&model), "grown, fed {fed} step {step}");
+            }
+        }
+        // The window caps the sliding layers: a long entry is not larger than a window-long one by
+        // more than the full-attention layers' cells.
+        let (short, long) = (
+            model.snapshot_layer_bytes(600),
+            model.snapshot_layer_bytes(1_600),
+        );
+        let sliding = |layers: &[usize]| layers[0];
+        assert_eq!(
+            sliding(&short),
+            sliding(&long),
+            "a sliding layer stores its window only"
+        );
+        assert!(
+            long[5] > short[5],
+            "a full-attention layer stores every position"
+        );
+    }
+
+    /// The ring a start builds is exactly as wide as the widest chunk a step takes, and its
+    /// admission rule refuses one row more (the append itself is refused by `rope_append_attend`
+    /// and by the kernel launch, tested there).
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn the_ring_margin_is_the_widest_chunk_a_step_takes() {
+        let model = load_q8();
+        let seq = model.new_seq().expect("session");
+        let margin = model.local_ring.widest_append();
+        assert_eq!(
+            margin, model.rows,
+            "the ring is sized for the widest chunk a step takes"
+        );
+        assert!(!model.local_ring.admits(margin + 1));
+        assert!(model.local_ring.admits(margin));
+        drop(seq);
     }
 
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.
@@ -2952,7 +3482,7 @@ mod tests {
             Err(EngError::BadRequest(_))
         ));
         assert!(matches!(
-            model.prefill_batch(&seq, &[2; 9], 0, false),
+            model.prefill_batch(&seq, &vec![2; model.rows + 1], 0, false),
             Err(EngError::BadRequest(_))
         ));
         assert!(matches!(
@@ -2976,7 +3506,7 @@ mod tests {
             model.decode(&seq, 2, usize::MAX),
             Err(EngError::ContextLimit(_))
         ));
-        let prompt: Vec<u32> = (0..32).map(|i| 2 + i * 17).collect();
+        let prompt: Vec<u32> = (0..150).map(|i| 2 + i * 17).collect();
         let single_started = std::time::Instant::now();
         for (pos, &token) in prompt.iter().enumerate() {
             if pos + 1 == prompt.len() {
@@ -3000,9 +3530,9 @@ mod tests {
             .decode(&seq, 2, prompt.len())
             .expect("single continuation");
         let continued = logits(&model);
-        eprintln!("timing 32 single steps {single_elapsed:?}");
-        // Eight rows is the shipped cap; three also exercises a partial final batch.
-        for width in [1, Bolt::PREFILL_BATCH, 3] {
+        eprintln!("timing {} single steps {single_elapsed:?}", prompt.len());
+        // The planned rows are the shipped cap; 33 and 3 also exercise a partial final batch.
+        for width in [1, Bolt::WINDOW_ROWS, 3, 33, model.rows] {
             let started = std::time::Instant::now();
             let mut pos = 0;
             for batch in prompt.chunks(width) {
@@ -3012,13 +3542,25 @@ mod tests {
                 pos += batch.len();
             }
             let elapsed = started.elapsed();
-            assert_logits(&logits(&model), &expected);
+            // A chunk of 16 rows or more runs on the tensor cores, whose f32 sums add in another
+            // order: its logits stay within the distribution tolerance instead of the matvec's.
+            let check = |got: &[f32], want: &[f32]| {
+                if width < MMQ_MIN_ROWS {
+                    return assert_logits(got, want);
+                }
+                let (kl, max_abs, same_top) = compare_logits(want, got);
+                eprintln!("tensor cores m={width}: kl {kl:.3e} max|dlogit| {max_abs:.3e}");
+                assert!(kl < 0.1, "m={width}: a different distribution");
+                let _ = (same_top, max_abs);
+            };
+            check(&logits(&model), &expected);
             model
                 .decode(&seq, 2, prompt.len())
                 .expect("batch continuation");
-            assert_logits(&logits(&model), &continued);
+            check(&logits(&model), &continued);
             eprintln!(
-                "timing 32 batched tokens m={width} {elapsed:?}; speedup {:.3}",
+                "timing {} batched tokens m={width} {elapsed:?}; speedup {:.3}",
+                prompt.len(),
                 single_elapsed.as_secs_f64() / elapsed.as_secs_f64()
             );
         }
@@ -3105,7 +3647,7 @@ mod tests {
                     elapsed,
                 )
             };
-            let run = |model: &mut Bolt, wide: bool| run_width(model, wide, Bolt::PREFILL_BATCH);
+            let run = |model: &mut Bolt, wide: bool| run_width(model, wide, Bolt::WINDOW_ROWS);
             let (old, old_launches, old_time) = run(&mut model, false);
             let (new, new_launches, new_time) = run(&mut model, true);
             // Pieces of any width whose rows all sit in chunks of two or more leave the logits of
@@ -3113,7 +3655,7 @@ mod tests {
             for &width in &widths {
                 // A lone row at the end of a prompt takes the decode attention, so a width that
                 // leaves one differs from pieces of 8 by the attention paths' own difference.
-                if len % width == 1 || len % Bolt::PREFILL_BATCH == 1 {
+                if len % width == 1 || len % Bolt::WINDOW_ROWS == 1 {
                     continue;
                 }
                 let (other, _, _) = run_width(&mut model, true, width);
@@ -3158,9 +3700,9 @@ mod tests {
             let width = if lone_heavy && state >> 63 == 0 {
                 1
             } else if lone_heavy {
-                2 + pick % (Bolt::PREFILL_BATCH - 1)
+                2 + pick % (Bolt::WINDOW_ROWS - 1)
             } else {
-                1 + pick % Bolt::PREFILL_BATCH
+                1 + pick % Bolt::WINDOW_ROWS
             };
             widths.push(width.min(left));
             left -= width.min(left);
@@ -3204,17 +3746,36 @@ mod tests {
                 .map_or(0, |(i, _)| i)
         };
         let lone_heavy = std::env::var("BOLT_SCORE_CUT").is_ok_and(|cut| cut == "lone-heavy");
+        let tensor_mode = std::env::var("BOLT_SCORE_MODE").is_ok_and(|mode| mode == "tensor");
+        let mut stash = None;
         let mut report = String::new();
         for (doc, line) in docs.lines().enumerate() {
             let tokens: Vec<u32> = line
                 .split_whitespace()
                 .map(|t| t.parse().expect("a token id"))
                 .collect();
-            let widths = score_widths(tokens.len(), doc as u64 + 1, lone_heavy);
+            let widths = if tensor_mode {
+                // Chunks of the planned rows, which run on the tensor cores, and the remainder.
+                let mut widths = vec![model.rows; tokens.len() / model.rows];
+                widths.extend(Some(tokens.len() % model.rows).filter(|&rest| rest > 0));
+                widths
+            } else {
+                score_widths(tokens.len(), doc as u64 + 1, lone_heavy)
+            };
             // Scored positions: the last token of every third piece, whose next token is known.
             let mut rows: Vec<(usize, usize, [Vec<f32>; 2])> = Vec::new();
             for (pass, wide) in [false, true].into_iter().enumerate() {
-                model.use_wide_prefill(wide);
+                if tensor_mode {
+                    // The two passes differ in the projections only: the matvec, then the tensor cores.
+                    model.use_wide_prefill(true);
+                    if pass == 0 {
+                        stash = model.mmq.take();
+                    } else {
+                        model.mmq = stash.take();
+                    }
+                } else {
+                    model.use_wide_prefill(wide);
+                }
                 let mut pos = 0;
                 for (index, &width) in widths.iter().enumerate() {
                     let batch = &tokens[pos..pos + width];
@@ -3272,10 +3833,16 @@ mod tests {
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
     fn skip_prefill_matches_full_layer_prefill() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
-        let prompt: Vec<u32> = (0..32).map(|i| 2 + i * 17).collect();
+        let prompt: Vec<u32> = (0..150).map(|i| 2 + i * 17).collect();
         let n = prompt.len();
-        // Widths 8 (the shipped cap), 3 (a partial final batch) and 1.
-        for width in [Bolt::PREFILL_BATCH, 3, 1] {
+        // The planned rows (the shipped cap), 33 and 3 (partial final batches) and 1.
+        for width in [
+            crate::family::gemma::gemma4::budget::BOLT_PREFILL_LADDER[0],
+            33,
+            Bolt::WINDOW_ROWS,
+            3,
+            1,
+        ] {
             // Fresh load per width: the cache starts zeroed, so a missing
             // skip-path write here is not masked by the last width's cells.
             let mut model = super::load(std::path::Path::new(&path)).expect("load");
@@ -3298,7 +3865,7 @@ mod tests {
             // Full-layer prefill overwrites the same cells from position 0:
             // every batch reads logits, so every layer runs.
             let mut pos = 0;
-            for batch in prompt.chunks(Bolt::PREFILL_BATCH) {
+            for batch in prompt.chunks(width) {
                 model
                     .prefill_batch(&seq, batch, pos, true)
                     .expect("full batch");

@@ -80,6 +80,8 @@ pub mod gate;
 #[cfg(test)]
 mod geometry_tests;
 #[cfg(test)]
+mod grow_step_device_tests;
+#[cfg(test)]
 mod krow_alpha_device_tests;
 #[cfg(test)]
 mod krow_device_tests;

@@ -3217,3 +3217,99 @@ mod fault_tests {
         );
     }
 }
+
+fn raw_bytes(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Vec<u8> {
+    kernels
+        .readback(tensor)
+        .unwrap()
+        .host_bytes()
+        .unwrap()
+        .to_vec()
+}
+
+fn router_lcg(seed: &mut u64) -> u32 {
+    *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    (*seed >> 33) as u32
+}
+
+/// The fused router top-k gives every row of a window the ids of the op chain and the bits of its
+/// own one-row call. Its gates differ from the op chain's in the last digits (the kernel sums and
+/// divides in its own order), so those compare within two units in the last place.
+#[test]
+#[ignore = "requires an explicit Mac GPU allocation; no model weights"]
+fn the_fused_router_matches_the_op_chain_for_every_row_of_a_window() {
+    const EXPERTS: usize = 64;
+    let _serial = crate::native_test_lock();
+    let mut k = MlxKernels::try_new().unwrap();
+    let floats = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    };
+    for (top_k, renorm) in [(8u32, true), (8, false), (4, true)] {
+        for batch in [1usize, 2, 4, 8] {
+            let mut seed = 0x70b_u64 + batch as u64;
+            // Every row gets a tied pair, so the lowest-index rule is part of the comparison.
+            let mut logits: Vec<f32> = (0..batch * EXPERTS)
+                .map(|_| (router_lcg(&mut seed) % 4000) as f32 / 500.0 - 4.0)
+                .collect();
+            for row in logits.chunks_mut(EXPERTS) {
+                row[40] = row[7];
+            }
+            let host = Tensor::try_from_host(
+                Dtype::F32,
+                vec![batch as u32, EXPERTS as u32],
+                logits.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+            .unwrap();
+            let logits = k.import_tensor(&host).unwrap();
+            let probs = k.softmax(&logits).unwrap();
+            let (ids, gates) = k
+                .router_topk(&probs, EXPERTS as u32, top_k, renorm)
+                .unwrap();
+            let ids = raw_bytes(&mut k, &ids);
+            let gates = raw_bytes(&mut k, &gates);
+            let width = top_k as usize;
+            for row in 0..batch {
+                let at = row * width * 4..(row + 1) * width * 4;
+                let one = k
+                    .slice(&probs, &[row as u32, 0], &[row as u32 + 1, EXPERTS as u32])
+                    .unwrap();
+                let (solo_ids, solo_gates) =
+                    k.router_topk(&one, EXPERTS as u32, top_k, renorm).unwrap();
+                let flat = k.reshape(&one, &[EXPERTS as u32]).unwrap();
+                let (want_ids, want_gates) =
+                    moe::route_op_chain(&mut k, &flat, EXPERTS as u32, top_k, renorm).unwrap();
+                let context =
+                    format!("row {row} of a window of {batch} (k {top_k}, renorm {renorm})");
+                assert_eq!(
+                    ids[at.clone()],
+                    raw_bytes(&mut k, want_ids.ids()),
+                    "ids of {context}"
+                );
+                assert_eq!(
+                    ids[at.clone()],
+                    raw_bytes(&mut k, &solo_ids),
+                    "solo ids of {context}"
+                );
+                assert_eq!(
+                    gates[at.clone()],
+                    raw_bytes(&mut k, &solo_gates),
+                    "gates of {context} against its one-row call"
+                );
+                let want = floats(&raw_bytes(&mut k, &want_gates));
+                for (got, want) in floats(&gates[at]).iter().zip(&want) {
+                    assert!(
+                        (got - want).abs() <= 2.0 * f32::EPSILON * want.abs(),
+                        "gates of {context} against the op chain: {got} against {want}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -1,4 +1,4 @@
-//! `enginesrv serve --model <dir>`: the simplified startup.
+//! `enginesrv serve --model <path>`: the simplified startup.
 //!
 //! A front end, not a second loader. Discovery reads the directory the
 //! way `capability::inspect` already does; the chosen settings go into
@@ -10,8 +10,8 @@
 //! load-time admission ledger, which is authoritative anyway.
 //!
 //! Selection rules: the family comes from `config.json`'s `model_type`
-//! matched against the family specs (or `--family` when there is no
-//! evidence); the weight format is `gguf` when a GGUF is present
+//! or a GGUF architecture (only the latter for a named file). An explicit
+//! `--family` can also select a supported family. The weight format is `gguf` when a GGUF is present
 //! (the qualified default — an EXL3-only directory serves `exl3` with
 //! its experimental acknowledgement printed, never silently). No
 //! experimental feature is armed by this path: every other option is
@@ -21,26 +21,26 @@ use std::path::{Path, PathBuf};
 
 use crate::capability::probe::{CompiledBackends, HardwareFacts};
 use crate::capability::{Probe, describe_error, inspect, preflight};
-use crate::server::config::{Config, EngineConfig, StartupError};
+use crate::family::inkling2_mini;
+use crate::family::qwen::qwen36::{
+    factory::{DENSE_FAMILY, FAMILY as Q36_FAMILY},
+    settings::Q36Options,
+};
+use crate::family::qwen::sensenova;
+use crate::server::config::{Config, EngineConfig, StartupError, check_sensenova_tokenizer_path};
 
-/// The families `--model` can identify and start. One row per
-/// detectable family; extending to Flint is a row here plus its
-/// loader's own checks staying the authority.
+/// Families detected from `config.json` model types. GGUF-only families are
+/// detected separately from their GGUF architecture metadata.
 pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
-    (
-        crate::family::qwen::qwen36::factory::FAMILY,
-        crate::family::QWEN3_6_35B_A3B.model_types,
-    ),
-    (
-        crate::family::qwen::qwen36::factory::DENSE_FAMILY,
-        crate::family::QWEN3_8_27B_DENSE.model_types,
-    ),
+    (Q36_FAMILY, crate::family::QWEN3_6_35B_A3B.model_types),
+    (DENSE_FAMILY, crate::family::QWEN3_8_27B_DENSE.model_types),
+    (inkling2_mini::FAMILY, &[inkling2_mini::MODEL_TYPE]),
 ];
 
 /// Whether a family's engine entry carries the Qwen3.6 options block (the Qwen3.6 families);
 /// every other family starts from a bare entry.
 fn uses_qwen36_options(family: &str) -> bool {
-    DETECTABLE_FAMILIES.iter().any(|(name, _)| *name == family)
+    matches!(family, Q36_FAMILY | DENSE_FAMILY)
 }
 
 /// The families that a GGUF `general.architecture` identifies when the directory has no
@@ -65,7 +65,7 @@ pub(crate) struct ModelServeArgs {
     pub(crate) print_config: bool,
 }
 
-/// Parse the arguments after `serve` when the first one is `--model`.
+/// Parse the arguments of the simplified startup (`serve`, with or without `--model`).
 /// The flag set is the preflight candidate surface plus the serving
 /// address and `--print-config`; anything else is a usage error, not a
 /// guess.
@@ -118,15 +118,11 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ModelServeArgs, StartupError
         }
         index += 1;
     }
-    if parsed.model_dir.as_os_str().is_empty() {
-        return Err(StartupError(format!(
-            "serve --model: --model <dir> is required\n{USAGE}"
-        )));
-    }
+    // No `--model` is the default start: `resolve_model_dir` chooses a local model.
     Ok(parsed)
 }
 
-const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8] [--listen <addr>] [--print-config]";
+const USAGE: &str = "usage: enginesrv serve [--model <dir|file.gguf|name|org/repo[:QUANT]>] [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
 
 /// What discovery chose: the family, the weight format, and the
 /// options that carry them. Every other option stays the resolver's
@@ -135,18 +131,35 @@ const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>
 pub(crate) struct Discovered {
     pub(crate) family: String,
     pub(crate) weight_format: &'static str,
-    pub(crate) options: crate::family::qwen::qwen36::settings::Q36Options,
+    pub(crate) qwen36: Option<Q36Options>,
     pub(crate) tokenizer_dir: PathBuf,
 }
 
-/// Inspect the directory and choose family, format, and options.
+/// Where the tokenizer is read from when `--tokenizer-dir` is not given: the model directory; for
+/// a model path that is one GGUF file, the file itself, whose header carries the vocabulary and the
+/// chat template. A sibling `tokenizer.json` is never taken for a lone file, because it may belong
+/// to another model in the same directory: pass the directory to use its files.
+fn default_tokenizer_dir(model: &Path) -> PathBuf {
+    if crate::family::gguf_select::is_gguf_file(model) {
+        let first = crate::family::gguf_select::first_shard(model);
+        // An Inkling text checkpoint reads its sidecars from the parent; every other
+        // bare GGUF is its own tokenizer.
+        if crate::capability::inspect::gguf_is_inkling(&first) {
+            return crate::family::gguf_select::directory_of(&first);
+        }
+        first
+    } else {
+        model.to_path_buf()
+    }
+}
+
+/// Inspect the model path and choose family, format, and options.
 /// Pure filesystem evidence; no preflight, no probing.
 fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
-    let tokenizer_dir = args
-        .tokenizer_dir
-        .clone()
-        .unwrap_or_else(|| args.model_dir.clone());
-    let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
+    let default_tokenizer = default_tokenizer_dir(&args.model_dir);
+    // Discovery does not use tokenizer files. Leave any tokenizer override unread until
+    // the family's options have been checked.
+    let inspection = inspect::inspect(&args.model_dir, &default_tokenizer)
         .map_err(|error| StartupError(describe_error(&error)))?;
 
     let has_gguf = !inspection.gguf_files.is_empty();
@@ -159,33 +172,49 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     }
 
     let family = select_family(args, &inspection)?;
-    if !uses_qwen36_options(&family) {
-        for (flag, given) in [
-            ("--kv", args.kv_dtype.is_some()),
-            ("--context", args.context_limit.is_some()),
-        ] {
-            if given {
-                return Err(StartupError(format!(
-                    "serve --model: {flag} is not an option of the {family} family; write a --config file"
-                )));
-            }
+    if family == sensenova::FAMILY {
+        if let Some(tokenizer) = args.tokenizer_dir.as_deref() {
+            check_sensenova_tokenizer_path(&args.model_dir, tokenizer).map_err(|error| {
+                StartupError(format!("serve --model: --tokenizer-dir: {error}"))
+            })?;
+        }
+        if !inspection
+            .gguf_files
+            .iter()
+            .any(|file| file.architecture.as_deref() == Some(sensenova::ARCHITECTURE))
+        {
+            return Err(StartupError(format!(
+                "serve --model: {} has no GGUF weights with architecture sensenova_loop",
+                args.model_dir.display()
+            )));
         }
     }
-    let weight_format = select_weight_format(has_gguf, has_safetensors);
+    refuse_non_qwen36_flags(&family, args)?;
+    let weight_format = if family == inkling2_mini::FAMILY {
+        if !inspection.has_inkling_safetensors() && inspection.inkling_ggufs().next().is_some() {
+            "gguf"
+        } else {
+            "safetensors"
+        }
+    } else if family == sensenova::FAMILY {
+        "gguf"
+    } else {
+        select_weight_format(has_gguf, has_safetensors)
+    };
 
-    let options = crate::family::qwen::qwen36::settings::Q36Options {
+    let qwen36 = uses_qwen36_options(&family).then(|| Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
         // they are.
         weight_format: (weight_format != MLX_WEIGHTS).then(|| weight_format.to_string()),
         context_limit: args.context_limit,
         kv_dtype: args.kv_dtype.clone(),
-        ..crate::family::qwen::qwen36::settings::Q36Options::default()
-    };
+        ..Q36Options::default()
+    });
     Ok(Discovered {
         family,
         weight_format,
-        options,
-        tokenizer_dir,
+        qwen36,
+        tokenizer_dir: args.tokenizer_dir.clone().unwrap_or(default_tokenizer),
     })
 }
 
@@ -194,9 +223,23 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
 /// snapshot of its `main` ref, and anything else is left for
 /// discovery to reject in its own words.
 fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupError> {
+    if args.model_dir.as_os_str().is_empty() {
+        return resolve_default_model(
+            args,
+            &super::local_models::Stores::from_env(),
+            &|candidate| vet(candidate).map(|_| ()),
+            &mut |line| eprintln!("{line}"),
+        );
+    }
     let text = args.model_dir.to_string_lossy();
-    if args.model_dir.exists() {
+    // A path that exists, or a link that points nowhere: the model check names what is wrong with
+    // it (a dangling link) instead of reading its name as a store entry.
+    if args.model_dir.exists() || std::fs::symlink_metadata(&args.model_dir).is_ok() {
         return Ok(args.clone());
+    }
+    // `org/repo` or `org/repo:QUANT`: the hub cache, then the hub itself.
+    if let Some(wanted) = super::fetch_name::parse_wanted(&text) {
+        return resolve_hub_name(args, &wanted);
     }
     if let Some(snapshot) = super::hf::cached_main_snapshot(&text) {
         eprintln!(
@@ -230,20 +273,128 @@ fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupErr
     Ok(args.clone())
 }
 
-/// Discover the model, run the non-probing preflight, and build the
-/// in-memory `Config` for the existing serve path. Prints the chosen
-/// configuration and any qualification acknowledgement before the
-/// engines start.
-pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
-    // An `org/repo` id names a hub-cache download (the GUI's model
-    // page, or `hf download`); a literal existing path always wins.
-    let args = resolve_model_dir(args)?;
-    let discovered = discover(&args)?;
+/// `serve` with no `--model`: the most recently written model of the local stores that a family
+/// serves. Models a family refuses are skipped, each with its reason; with none left the error
+/// says where to get one. The choice and how to name another are printed.
+fn resolve_default_model(
+    args: &ModelServeArgs,
+    stores: &super::local_models::Stores,
+    can_start: &dyn Fn(&ModelServeArgs) -> Result<(), StartupError>,
+    say: &mut dyn FnMut(&str),
+) -> Result<ModelServeArgs, StartupError> {
+    let local = super::local_models::all(stores);
+    let mut skipped: Vec<String> = Vec::new();
+    for model in &local {
+        let mut resolved = args.clone();
+        resolved.model_dir = model.path.clone();
+        match can_start(&resolved) {
+            Ok(()) => {
+                for line in &skipped {
+                    say(line);
+                }
+                let passed_over = if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", after passing over {} newer that could not start",
+                        skipped.len()
+                    )
+                };
+                say(&format!(
+                    "model: no --model given; serving {} from {} (the newest of {} local{passed_over}); name another with --model <name>",
+                    model.name,
+                    model.store,
+                    local.len()
+                ));
+                return Ok(resolved);
+            }
+            Err(error) => skipped.push(format!(
+                "model: skipping {} ({}): {}",
+                model.name,
+                model.path.display(),
+                error.0.lines().next().unwrap_or_default()
+            )),
+        }
+    }
+    let tried = if skipped.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", skipped.join("\n"))
+    };
+    Err(StartupError(format!(
+        "serve: no --model given and no model is stored locally that this engine serves (looked in {}, {} and {}){tried}\nname one: --model <org/repo> fetches a GGUF repo from the hub, --model <file.gguf> serves a file, or put a model in the models directory",
+        stores.models.display(),
+        stores.ollama.display(),
+        stores.hub.display()
+    )))
+}
 
-    // The preflight of a serving process: every check that needs no
-    // device. CUDA facts stay deliberately unavailable (the module
-    // docs); host facts are a /proc read the system endpoint already
-    // does per request.
+/// A hub repo name that is not a path: one quantization of its cached snapshot, or of the hub
+/// when the cache holds none that fits, chosen by the planner.
+fn resolve_hub_name(
+    args: &ModelServeArgs,
+    wanted: &super::fetch_name::Wanted,
+) -> Result<ModelServeArgs, StartupError> {
+    let mut resolved = args.clone();
+    let hub = std::sync::Arc::new(super::hf::HfHub::from_env());
+    // The planner reads the machine once, and only when a choice needs it.
+    let facts = std::cell::OnceCell::new();
+    let measured = || facts.get_or_init(crate::capability::probe::probe);
+    let accepts = |stub: &Path| {
+        let mut stub_args = args_for_path(stub);
+        if args.family.as_deref() == Some(sensenova::FAMILY) {
+            stub_args.family.clone_from(&args.family);
+        }
+        discover(&stub_args).map(|_| ())
+    };
+    let mut fit = |stub: &Path| planned_fit(stub, measured());
+    resolved.model_dir = super::fetch_name::resolve(
+        &hub,
+        wanted,
+        super::fetch_name::Planner {
+            accepts: &accepts,
+            fit: &mut fit,
+        },
+        &mut |line| eprintln!("{line}"),
+    )?;
+    Ok(resolved)
+}
+
+fn args_for_path(path: &Path) -> ModelServeArgs {
+    ModelServeArgs {
+        model_dir: path.to_path_buf(),
+        ..ModelServeArgs::default()
+    }
+}
+
+/// Whether the shared planner plans the stub's weights fully resident on this host's card at the
+/// default context: the preflight estimate's own fit. A plan with no estimate is not resident; a
+/// preflight that cannot run is an error.
+fn planned_fit(stub: &Path, facts: &HardwareFacts) -> Result<super::fetch_name::Fit, StartupError> {
+    use super::fetch_name::Fit;
+    let report = preflight::preflight(stub, stub, &preflight::Candidate::default(), facts)
+        .map_err(|error| StartupError(describe_error(&error)))?;
+    Ok(match report.estimate {
+        Some(estimate) if estimate.fit == preflight::ResourceFit::Fits => Fit::Resident,
+        _ => Fit::NotResident,
+    })
+}
+
+/// A model that a family serves and the preflight passes, before anything is printed.
+struct Vetted {
+    args: ModelServeArgs,
+    discovered: Discovered,
+    report: preflight::PreflightReport,
+    /// The GGUF SenseNova serves, which is both its weights and its tokenizer; other
+    /// families have none.
+    embedded: Option<PathBuf>,
+}
+
+/// Discovery and the preflight of a serving process: every check that needs no device. CUDA
+/// facts stay deliberately unavailable (the module docs); host facts are a /proc read the
+/// system endpoint already does per request. An unsupported verdict is the error.
+fn vet(args: &ModelServeArgs) -> Result<Vetted, StartupError> {
+    let discovered = discover(args)?;
     let facts = HardwareFacts {
         backends: CompiledBackends::of_this_build(),
         cuda: no_cuda_facts(),
@@ -255,22 +406,55 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         kv_dtype: args.kv_dtype.clone(),
         prefill_rows: None,
     };
-    let report = preflight::preflight(
-        &args.model_dir,
-        &discovered.tokenizer_dir,
-        &candidate,
-        &facts,
-    )
-    .map_err(|error| StartupError(describe_error(&error)))?;
+    // SenseNova uses the selected GGUF for both weights and tokenizer, even for directory
+    // input with external tokenizer files or other GGUF families beside it.
+    let embedded = if discovered.family == sensenova::FAMILY {
+        Some(
+            sensenova::serve::select_gguf(&args.model_dir)
+                .map_err(|error| StartupError(describe_error(&error)))?,
+        )
+    } else {
+        None
+    };
+    let model_path = embedded.as_deref().unwrap_or(&args.model_dir);
+    let tokenizer_path = embedded.as_deref().unwrap_or(&discovered.tokenizer_dir);
+    let report = preflight::preflight(model_path, tokenizer_path, &candidate, &facts)
+        .map_err(|error| StartupError(describe_error(&error)))?;
+    if report.verdict == preflight::Verdict::Unsupported {
+        return Err(StartupError(format!(
+            "serve --model: this build cannot serve {}:\n{}next: {}",
+            args.model_dir.display(),
+            failed_checks(&report),
+            report.next_step
+        )));
+    }
+    Ok(Vetted {
+        args: args.clone(),
+        discovered,
+        report,
+        embedded,
+    })
+}
+
+/// Discover the model, run the non-probing preflight, and build the
+/// in-memory `Config` for the existing serve path. Prints the chosen
+/// configuration and any qualification acknowledgement before the
+/// engines start.
+pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
+    // Refused before the resolution: a hub name would download the whole quant first.
+    if args.family.as_deref() == Some(sensenova::FAMILY) {
+        refuse_non_qwen36_flags(sensenova::FAMILY, args)?;
+    }
+    // An `org/repo` id names a hub-cache download (the GUI's model
+    // page, or `hf download`); a literal existing path always wins.
+    let args = resolve_model_dir(args)?;
+    let Vetted {
+        args,
+        discovered,
+        report,
+        embedded,
+    } = vet(&args)?;
     match report.verdict {
-        preflight::Verdict::Unsupported => {
-            return Err(StartupError(format!(
-                "serve --model: this build cannot serve {}:\n{}next: {}",
-                args.model_dir.display(),
-                failed_checks(&report),
-                report.next_step
-            )));
-        }
         preflight::Verdict::Experimental => {
             eprintln!(
                 "qualification: EXPERIMENTAL — the quality gates for this configuration have not passed; serving it because serve --model prints this acknowledgement"
@@ -280,25 +464,62 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         _ => eprint!("{}", warned_checks(&report)),
     }
 
-    let backend = crate::family::qwen::qwen36::factory::backend_of_build();
+    let backend = if embedded.is_some() {
+        "cpu"
+    } else {
+        backend_name(crate::family::qwen::qwen36::factory::backend_of_build())
+    };
     eprintln!(
-        "model: {} — family {}, {} weights, backend {}",
+        "model: {} — family {}, {} weights, backend {backend}",
         args.model_dir.display(),
         discovered.family,
         discovered.weight_format,
-        backend_name(backend),
     );
-    eprintln!(
-        "settings: the family defaults for context and KV dtype (override with --context, --kv); memory feasibility is decided at load by the runtime admission ledger — 'enginesrv check {}' prints the full preflight",
-        args.model_dir.display()
-    );
+    if embedded.is_some() {
+        eprintln!(
+            "settings: embedded GGUF tokenizer; context and KV settings are set by the family"
+        );
+    } else if discovered.qwen36.is_some() {
+        eprintln!(
+            "settings: the family defaults for context and KV dtype (override with --context, --kv); memory feasibility is decided at load by the runtime admission ledger — 'enginesrv check {}' prints the full preflight",
+            args.model_dir.display()
+        );
+    }
 
-    Ok(config_from(&discovered, &args))
+    let mut config = config_from(&discovered, &args);
+    if let Some(file) = embedded {
+        config.engines[0].model_dir = file.clone();
+        config.engines[0].tokenizer_dir = file;
+    }
+    Ok(config)
 }
 
 /// Assemble the in-memory `Config` — the document a `--config` file
 /// would carry, headed for the identical serve path.
 fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
+    let inkling = discovered.family == inkling2_mini::FAMILY;
+    let simplified = !inkling && uses_qwen36_options(&discovered.family);
+    let mut config = bare_config(args, &discovered.family);
+    let engine = &mut config.engines[0];
+    engine.tokenizer_dir = discovered.tokenizer_dir.clone();
+    if simplified {
+        engine.id = "q36".to_string();
+        engine.qwen36 = discovered.qwen36.clone();
+    }
+    if inkling {
+        engine.id = "inkling".to_string();
+        engine.context_limit = args.context_limit;
+    }
+    config
+}
+
+/// The configuration a supervised worker reads for a family that has
+/// no simplified startup (Flash-Next): the bare entry a `--config`
+/// file carries, with the family named rather than detected and every
+/// option left to its default. `serve --model` still refuses such a
+/// family on its own, because a command line has nothing to name it
+/// by.
+pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
     Config {
         listen: args
             .listen
@@ -307,16 +528,16 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         api_key_env: DEFAULT_API_KEY_ENV.to_string(),
         prefix_reuse: Some(false),
         sample_trace: false,
+        supervised_engines: false,
         web_dir: None,
         engines: vec![EngineConfig {
-            id: if uses_qwen36_options(&discovered.family) {
-                "q36".to_string()
-            } else {
-                discovered.family.clone()
-            },
+            id: family.to_string(),
             model_dir: args.model_dir.clone(),
-            tokenizer_dir: discovered.tokenizer_dir.clone(),
-            family: discovered.family.clone(),
+            tokenizer_dir: args
+                .tokenizer_dir
+                .clone()
+                .unwrap_or_else(|| args.model_dir.clone()),
+            family: family.to_string(),
             model: None,
             context_limit: None,
             think_replay: None,
@@ -324,7 +545,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             kv_cache: None,
             fake: None,
             flash_next: None,
-            qwen36: uses_qwen36_options(&discovered.family).then(|| discovered.options.clone()),
+            qwen36: None,
             nemotron: None,
             gemma4: None,
             flint: None,
@@ -364,17 +585,22 @@ pub(crate) fn config_json(config: &Config) -> String {
             q36.insert("kv_dtype".into(), json!(value));
         }
     }
+    let mut entry = json!({
+        "id": engine.id,
+        "family": engine.family,
+        "model_dir": engine.model_dir.display().to_string(),
+        "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
+    });
+    if engine.qwen36.is_some() {
+        entry["qwen36"] = json!(q36);
+    } else if let Some(context_limit) = engine.context_limit {
+        entry["context_limit"] = json!(context_limit);
+    }
     let document = json!({
         "listen": config.listen,
         "api_key_env": config.api_key_env,
         "prefix_reuse": config.prefix_reuse,
-        "engines": [{
-            "id": engine.id,
-            "family": engine.family,
-            "model_dir": engine.model_dir.display().to_string(),
-            "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
-            "qwen36": q36,
-        }],
+        "engines": [entry],
     });
     serde_json::to_string_pretty(&document).expect("the built config is valid JSON")
 }
@@ -392,10 +618,26 @@ pub(crate) fn servable_family(model_dir: &Path) -> Result<String, String> {
     select_family(&ModelServeArgs::default(), &inspection).map_err(|error| error.0)
 }
 
-/// The memory one engine of a downloaded snapshot needs, from the
-/// capability preflight's own estimate (the planner's closed-form cache
-/// and admission terms) with the weight term narrowed to the one
-/// quantization a serve loads.
+/// The Flash-Next family when the directory holds one of its packs, else
+/// `None`. To every other test a pack is a Qwen3.8 snapshot, and
+/// `servable_family` finds no family of this build in it: the model type
+/// the spec table gives Flash-Next is what names it.
+pub(crate) fn flash_next_family(model_dir: &Path) -> Option<&'static str> {
+    let inspection = inspect::inspect(model_dir, model_dir).ok()?;
+    let spec = &crate::family::spec::QWEN3_8_FLASH_NEXT;
+    spec.model_types
+        .iter()
+        .any(|claimed| {
+            inspection
+                .config_model_types
+                .iter()
+                .any(|seen| seen == claimed)
+        })
+        .then_some(spec.name)
+}
+
+/// The memory one engine of a downloaded snapshot needs, including the
+/// preflight's closed-form cache and admission terms.
 pub(crate) struct TierEstimate {
     pub(crate) vram_bytes: u64,
     pub(crate) ram_bytes: u64,
@@ -415,12 +657,17 @@ pub(crate) fn estimate_tiers(model_dir: &Path, family: &str) -> Option<TierEstim
     };
     let report = preflight::preflight(model_dir, model_dir, &candidate, &facts).ok()?;
     let estimate = report.estimate?;
-    let (weights, picked) = match crate::family::gguf_select::candidates(model_dir) {
-        Ok((_, candidates)) if !candidates.is_empty() => {
-            (candidates[0].bytes, "the largest GGUF quantization on disk")
-        }
-        _ => (estimate.weight_bytes, "the checkpoint files on disk"),
-    };
+    let (weights, picked) =
+        if family == crate::family::qwen::qwen36::factory::FAMILY && facts.backends.cuda {
+            (estimate.weight_bytes, "the GGUF selected by preflight")
+        } else {
+            match crate::family::gguf_select::candidates(model_dir) {
+                Ok((_, candidates)) if !candidates.is_empty() => {
+                    (candidates[0].bytes, "the largest GGUF quantization on disk")
+                }
+                _ => (estimate.weight_bytes, "the checkpoint files on disk"),
+            }
+        };
     let other = estimate.total_bytes.saturating_sub(estimate.weight_bytes);
     Some(TierEstimate {
         vram_bytes: weights + other + estimate.admission_charges_bytes,
@@ -434,12 +681,38 @@ pub(crate) fn estimate_tiers(model_dir: &Path, family: &str) -> Option<TierEstim
     })
 }
 
+/// The flags only the Qwen3.6 options block carries, refused for every other family. Also
+/// called before hub resolution for SenseNova, so an unusable combination fails before a
+/// multi-gigabyte download instead of after it.
+fn refuse_non_qwen36_flags(family: &str, args: &ModelServeArgs) -> Result<(), StartupError> {
+    if uses_qwen36_options(family) {
+        return Ok(());
+    }
+    for (flag, given) in [
+        ("--kv", args.kv_dtype.is_some()),
+        ("--context", args.context_limit.is_some()),
+    ] {
+        if given {
+            let hint = if family == sensenova::FAMILY {
+                ""
+            } else {
+                "; write a --config file"
+            };
+            return Err(StartupError(format!(
+                "serve --model: {flag} is not an option of the {family} family{hint}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn select_family(
     args: &ModelServeArgs,
     inspection: &inspect::ModelInspection,
 ) -> Result<String, StartupError> {
     if let Some(family) = &args.family {
-        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family) {
+        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family) || family == sensenova::FAMILY
+        {
             return Ok(family.clone());
         }
         return Err(StartupError(format!(
@@ -447,12 +720,18 @@ fn select_family(
             detectable_names()
         )));
     }
+    // The explicitly chosen file is authoritative even in a mixed model directory.
+    if args.model_dir.is_file() && inspection.inkling_ggufs().next().is_some() {
+        return Ok(inkling2_mini::FAMILY.into());
+    }
     let mut matches: Vec<&str> = DETECTABLE_FAMILIES
         .iter()
         .filter(|(_, types)| {
             types
                 .iter()
                 .any(|t| inspection.config_model_types.iter().any(|seen| seen == t))
+                || (types.contains(&inkling2_mini::MODEL_TYPE)
+                    && inspection.inkling_ggufs().next().is_some())
         })
         .map(|(name, _)| *name)
         .collect();
@@ -478,9 +757,27 @@ fn select_family(
                 .iter()
                 .filter_map(|fact| fact.architecture.as_deref())
                 .collect();
-            if inspection.config_model_types.is_empty() && !seen.is_empty() {
+            if inspection.config_model_types.is_empty()
+                && seen.is_empty()
+                && !inspection.gguf_files.is_empty()
+            {
                 return Err(StartupError(format!(
-                    "serve --model: no family serves the GGUF architecture {}; known architectures: {}; pass --family or write a --config file",
+                    "serve --model: {} names no general.architecture, so no family can be chosen from it; known architectures: {}; pass --family (detectable families: {}) or write a --config file",
+                    inspection.weights_path.display(),
+                    crate::server::config::known_gguf_architectures(),
+                    detectable_names()
+                )));
+            }
+            if inspection.config_model_types.is_empty() && !seen.is_empty() {
+                let why: String = seen
+                    .iter()
+                    .filter_map(|architecture| {
+                        crate::server::config::gguf_architecture_note(architecture)
+                    })
+                    .map(|note| format!(" ({note})"))
+                    .collect();
+                return Err(StartupError(format!(
+                    "serve --model: no family serves the GGUF architecture {}{why}; known architectures: {}; pass --family or write a --config file",
                     seen.join(", "),
                     crate::server::config::known_gguf_architectures()
                 )));
@@ -524,6 +821,7 @@ fn detectable_names() -> String {
     DETECTABLE_FAMILIES
         .iter()
         .map(|(name, _)| *name)
+        .chain(std::iter::once(sensenova::FAMILY))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -568,7 +866,7 @@ fn warned_checks(report: &preflight::PreflightReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelServeArgs, discover, parse_args};
+    use super::{ModelServeArgs, discover, flash_next_family, parse_args, servable_family};
     use crate::family::qwen::qwen36::settings::Q36Options;
     use crate::server::config::Config;
     use std::path::{Path, PathBuf};
@@ -583,6 +881,93 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.resize(32, 0);
         bytes
+    }
+
+    fn gguf_arch(arch: &str) -> Vec<u8> {
+        let mut bytes = minimal_gguf();
+        bytes.truncate(24);
+        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend((key.len() as u64).to_le_bytes());
+        bytes.extend(key);
+        bytes.extend(8u32.to_le_bytes());
+        bytes.extend((arch.len() as u64).to_le_bytes());
+        bytes.extend(arch.as_bytes());
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        bytes
+    }
+
+    #[test]
+    fn discover_inkling_gguf_text_with_optional_sidecars() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        for (filename, arch) in [
+            ("mini.gguf", "inkling2"),
+            ("mmproj.gguf", "clip"),
+            ("draft.gguf", "dflash"),
+        ] {
+            std::fs::write(model.path().join(filename), gguf_arch(arch)).unwrap();
+        }
+        let found = discover(&ModelServeArgs {
+            model_dir: model.path().into(),
+            tokenizer_dir: Some(tokenizer.path().into()),
+            ..ModelServeArgs::default()
+        })
+        .unwrap();
+        assert_eq!(found.family, "inkling2_mini");
+        assert_eq!(found.weight_format, "gguf");
+        assert_eq!(found.tokenizer_dir, tokenizer.path());
+    }
+
+    #[test]
+    fn explicit_inkling_gguf_selects_one_file_and_resolves_the_tokenizer() {
+        let model = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let fork = model.path().join("fork.gguf");
+        let mainline = model.path().join("mainline.gguf_file");
+        std::fs::write(&fork, gguf_arch("inkling2")).unwrap();
+        std::fs::write(&mainline, gguf_arch("inkling2_loop")).unwrap();
+        std::fs::write(model.path().join("malformed-draft.gguf"), b"GGUF-broken").unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            r#"{"model_type":"qwen3_5_moe"}"#,
+        )
+        .unwrap();
+        std::fs::write(model.path().join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(external.path().join("chat_template.jinja"), b"template").unwrap();
+
+        for (path, tokenizer_dir, expected_dir, basename, present) in [
+            (&fork, None, model.path(), "fork.gguf", "tokenizer.json"),
+            (
+                &mainline,
+                Some(external.path().to_owned()),
+                external.path(),
+                "mainline.gguf_file",
+                "chat_template.jinja",
+            ),
+        ] {
+            let found = discover(&ModelServeArgs {
+                model_dir: path.clone(),
+                tokenizer_dir,
+                ..ModelServeArgs::default()
+            })
+            .unwrap();
+            assert_eq!(found.family, "inkling2_mini");
+            assert_eq!(found.weight_format, "gguf");
+            assert_eq!(found.tokenizer_dir, expected_dir);
+
+            let report = crate::capability::inspect::inspect(path, &found.tokenizer_dir).unwrap();
+            assert_eq!(report.model_dir, *model.path());
+            assert_eq!(report.weights_path, *path);
+            assert_eq!(report.files.len(), 1);
+            assert_eq!(report.gguf_files.len(), 1);
+            assert_eq!(report.gguf_files[0].file, basename);
+            assert!(report.gguf_errors.is_empty(), "{:?}", report.gguf_errors);
+            assert_eq!(report.tokenizer_present, [present]);
+        }
+        let directory = crate::capability::inspect::inspect(model.path(), model.path()).unwrap();
+        assert_eq!(directory.inkling_ggufs().count(), 2);
+        assert_eq!(directory.gguf_errors.len(), 1);
     }
 
     fn copy_tokenizer(dir: &Path) {
@@ -624,6 +1009,41 @@ mod tests {
             model_dir: dir.to_path_buf(),
             ..ModelServeArgs::default()
         }
+    }
+
+    #[test]
+    fn a_flash_next_pack_is_named_by_its_model_type() {
+        let flash = crate::family::spec::QWEN3_8_FLASH_NEXT;
+        for model_type in flash.model_types {
+            let pack = model_dir(Some(model_type), false, true);
+            assert_eq!(flash_next_family(pack.path()), Some(flash.name));
+            // The listing's special case holds only while serve --model
+            // cannot start the pack itself.
+            assert!(servable_family(pack.path()).is_err());
+        }
+        let dense = crate::family::QWEN3_8_27B_DENSE.model_types[0];
+        let dense = model_dir(Some(dense), false, true);
+        assert_eq!(flash_next_family(dense.path()), None);
+        let unnamed = model_dir(None, false, true);
+        assert_eq!(flash_next_family(unnamed.path()), None);
+        assert_eq!(flash_next_family(Path::new("/nonexistent")), None);
+    }
+
+    #[test]
+    fn a_sensenova_name_refuses_foreign_flags_before_any_download() {
+        let args = ModelServeArgs {
+            model_dir: PathBuf::from("sensenova/SenseNova-Loop-9B-GGUF"),
+            family: Some("sensenova".into()),
+            context_limit: Some(8192),
+            ..ModelServeArgs::default()
+        };
+        let error = super::build_config(&args).expect_err("refused before resolution");
+        assert!(
+            error
+                .to_string()
+                .contains("--context is not an option of the sensenova family"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -700,11 +1120,11 @@ mod tests {
         // Only the discovered format is set: context and KV stay the
         // resolver's own defaults — nothing experimental is armed.
         assert_eq!(
-            discovered.options,
-            Q36Options {
+            discovered.qwen36,
+            Some(Q36Options {
                 weight_format: Some("gguf".to_string()),
                 ..Q36Options::default()
-            }
+            })
         );
     }
 
@@ -724,7 +1144,7 @@ mod tests {
         // A directory of safetensors shards is an MLX pack on an MLX build, which sets no
         // `weight_format` (the MLX arm refuses `exl3`), and an EXL3 pack elsewhere.
         assert_eq!(
-            discovered.options.weight_format.as_deref(),
+            discovered.qwen36.unwrap().weight_format.as_deref(),
             (!super::MLX_BUILD).then_some("exl3")
         );
     }
@@ -745,8 +1165,9 @@ mod tests {
         args.context_limit = Some(8192);
         args.kv_dtype = Some("q8".to_string());
         let discovered = discover(&args).expect("discovers");
-        assert_eq!(discovered.options.context_limit, Some(8192));
-        assert_eq!(discovered.options.kv_dtype.as_deref(), Some("q8"));
+        let options = discovered.qwen36.expect("qwen36 options");
+        assert_eq!(options.context_limit, Some(8192));
+        assert_eq!(options.kv_dtype.as_deref(), Some("q8"));
     }
 
     #[test]
@@ -841,7 +1262,7 @@ mod tests {
         let engine = &reread.engines[0];
         assert_eq!(engine.family, "qwen3_6_35b_a3b");
         assert_eq!(engine.model_dir, args.model_dir);
-        assert_eq!(engine.qwen36, Some(discovered.options));
+        assert_eq!(engine.qwen36, discovered.qwen36);
         // No extra fields can hide in the printed document: from_file
         // runs deny_unknown_fields, so the round-trip above is the
         // proof. The key variable is named (as in every config file);
@@ -939,6 +1360,37 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_gguf_discovers_its_own_family_and_reads_side_files_only_from_a_named_directory()
+    {
+        let dir = directory_of_architecture("qwen35moe");
+        let file = dir.path().join("model.gguf");
+        std::fs::write(
+            dir.path().join("bolt.gguf"),
+            crate::tokenizer::gguf::tests::tiny_gguf("gemma4", "gpt2", "raon"),
+        )
+        .expect("write another architecture");
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").expect("write tokenizer");
+        let args = args_for(&file);
+        let discovered = discover(&args).expect("discover explicit checkpoint");
+        assert_eq!(
+            discovered.family,
+            crate::family::qwen::qwen36::factory::FAMILY
+        );
+        assert_eq!(
+            discovered.tokenizer_dir, file,
+            "the header supplies the vocabulary"
+        );
+        let named = ModelServeArgs {
+            tokenizer_dir: Some(dir.path().to_path_buf()),
+            ..args_for(&file)
+        };
+        let discovered = discover(&named).expect("discover with a named directory");
+        let config = super::config_from(&discovered, &named);
+        assert_eq!(config.engines[0].model_dir, file);
+        assert_eq!(config.engines[0].tokenizer_dir, dir.path());
+    }
+
+    #[test]
     fn an_architecture_outside_the_table_is_refused_naming_it_and_the_known_ones() {
         for architecture in ["mamba9", "flint", "qwen4exp", "nemotron_h_moe", "raon1"] {
             let dir = directory_of_architecture(architecture);
@@ -989,5 +1441,300 @@ mod tests {
             let error = discover(&with_flag).unwrap_err().0;
             assert!(error.contains("--context is not an option"), "{error}");
         }
+    }
+
+    /// One tiny GGUF of `architecture` at `path`.
+    fn write_architecture(path: &Path, architecture: &str) {
+        std::fs::write(
+            path,
+            crate::tokenizer::gguf::tests::tiny_gguf(architecture, "gpt2", "raon"),
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn a_bare_gguf_file_is_identified_by_its_own_architecture_not_its_neighbours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_architecture(&dir.path().join("a.gguf"), "qwen35moe");
+        write_architecture(&dir.path().join("b.gguf"), "gemma4");
+        for (name, family) in [
+            ("a.gguf", "qwen3_6_35b_a3b"),
+            ("b.gguf", crate::family::gemma::gemma4::FAMILY),
+        ] {
+            let discovered = discover(&args_for(&dir.path().join(name))).expect("discovers");
+            assert_eq!(discovered.family, family, "{name}");
+            assert_eq!(discovered.weight_format, "gguf");
+        }
+    }
+
+    #[test]
+    fn an_ollama_blob_with_no_extension_is_served_like_any_gguf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blob = dir.path().join("sha256-0f1e2d3c");
+        write_architecture(&blob, "gemma4");
+        let discovered = discover(&args_for(&blob)).expect("discovers");
+        assert_eq!(discovered.family, crate::family::gemma::gemma4::FAMILY);
+    }
+
+    #[test]
+    fn the_tokenizer_of_a_bare_file_is_the_file_even_with_a_tokenizer_json_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("m.gguf");
+        write_architecture(&file, "gemma4");
+        assert_eq!(super::default_tokenizer_dir(&file), file);
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").expect("write");
+        assert_eq!(super::default_tokenizer_dir(&file), file);
+        // A directory is its own tokenizer directory.
+        assert_eq!(super::default_tokenizer_dir(dir.path()), dir.path());
+    }
+
+    #[test]
+    fn a_refused_architecture_is_named_with_its_reason_when_there_is_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (architecture, reason) in [
+            ("raon1", "CUDA serving is not on main"),
+            ("clip", "vision projector"),
+            ("dflash", "draft model"),
+            ("qwen4exp", "quantization kernels"),
+        ] {
+            let file = dir.path().join(format!("{architecture}.gguf"));
+            write_architecture(&file, architecture);
+            let error = discover(&args_for(&file)).unwrap_err().0;
+            assert!(error.contains(reason), "{architecture}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_gguf_that_names_no_architecture_is_refused_saying_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("mystery.gguf");
+        std::fs::write(&file, minimal_gguf()).expect("write");
+        let error = discover(&args_for(&file)).unwrap_err().0;
+        assert!(error.contains("names no general.architecture"), "{error}");
+    }
+
+    #[test]
+    fn two_models_in_one_directory_each_read_only_their_own_header() {
+        // Side files beside a lone file may belong to the other model: neither the config.json
+        // model_type nor the tokenizer.json of the directory decides for a named file.
+        let dir = model_dir(Some("qwen3_5_moe"), false, false);
+        write_architecture(&dir.path().join("a.gguf"), "qwen35moe");
+        write_architecture(&dir.path().join("b.gguf"), "gemma4");
+        let b = dir.path().join("b.gguf");
+        let discovered = discover(&args_for(&b)).expect("discovers");
+        assert_eq!(discovered.family, crate::family::gemma::gemma4::FAMILY);
+        assert_eq!(discovered.tokenizer_dir, b);
+        // Naming the directory still uses its files.
+        let whole = discover(&args_for(dir.path())).expect("discovers");
+        assert_eq!(whole.family, "qwen3_6_35b_a3b");
+        assert_eq!(whole.tokenizer_dir, dir.path());
+    }
+
+    #[test]
+    fn an_experimental_sensenova_file_does_not_change_another_familys_directory() {
+        let dir = directory_of_architecture("qwen35moe");
+        write_architecture(&dir.path().join("a-sensenova.gguf"), "sensenova_loop");
+        assert_eq!(
+            discover(&args_for(dir.path())).unwrap().family,
+            "qwen3_6_35b_a3b"
+        );
+    }
+
+    #[test]
+    fn a_sensenova_file_uses_only_its_own_weights_and_embedded_tokenizer() {
+        let dir = model_dir(Some("qwen3_5_moe"), false, false);
+        write_architecture(&dir.path().join("another.gguf"), "qwen35moe");
+        let model = dir.path().join("sensenova.gguf");
+        std::fs::write(
+            &model,
+            crate::tokenizer::gguf::tests::tiny_gguf("sensenova_loop", "gpt2", "raon"),
+        )
+        .expect("write");
+        std::fs::write(dir.path().join("generation_config.json"), b"not JSON").unwrap();
+        let mut args = args_for(&model);
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("--family sensenova")
+        );
+        args.family = Some("sensenova".to_owned());
+        let config = super::build_config(&args).expect("preflights the selected file");
+        let engine = &config.engines[0];
+        assert_eq!(engine.family, "sensenova");
+        assert_eq!(engine.model_dir, model);
+        assert_eq!(engine.tokenizer_dir, model);
+        assert!(engine.qwen36.is_none());
+
+        let mut directory = args_for(dir.path());
+        directory.family.clone_from(&args.family);
+        let config = super::build_config(&directory).expect("pins the selected SenseNova file");
+        assert_eq!(config.engines[0].model_dir, model);
+        assert_eq!(config.engines[0].tokenizer_dir, model);
+        args.tokenizer_dir = Some(model);
+        assert_eq!(
+            discover(&args).expect("explicit family").family,
+            "sensenova"
+        );
+        args.tokenizer_dir = Some(dir.path().to_path_buf());
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("embedded GGUF tokenizer")
+        );
+        args.tokenizer_dir = None;
+        args.context_limit = Some(1024);
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("--context is not an option")
+        );
+        args.context_limit = None;
+        args.kv_dtype = Some("q8".to_owned());
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("--kv is not an option")
+        );
+        args.kv_dtype = None;
+        args.model_dir = dir.path().join("another.gguf");
+        assert!(
+            discover(&args)
+                .unwrap_err()
+                .0
+                .contains("no GGUF weights with architecture sensenova_loop")
+        );
+    }
+
+    #[test]
+    fn a_relative_path_and_a_symlink_name_the_model_like_its_absolute_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real").join("sha256-0f1e");
+        std::fs::create_dir_all(real.parent().expect("parent")).expect("dirs");
+        write_architecture(&real, "gemma4");
+        let link = dir.path().join("bolt.gguf");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let relative = crate::test_paths::relative_to_cwd(&link);
+        for path in [&real, &link, &relative] {
+            let discovered = discover(&args_for(path)).expect("discovers");
+            assert_eq!(
+                discovered.family,
+                crate::family::gemma::gemma4::FAMILY,
+                "{path:?}"
+            );
+            assert_eq!(discovered.tokenizer_dir, *path, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_into_a_crowded_directory_takes_its_own_header_and_none_of_the_neighbours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).expect("store");
+        let real = store.join("sha256-0f1e");
+        write_architecture(&real, "gemma4");
+        write_architecture(&store.join("other.gguf"), "qwen35moe");
+        write_architecture(&store.join("another.gguf"), "qwen35moe");
+        std::fs::write(store.join("tokenizer.json"), b"{}").expect("tokenizer");
+        let shelf = dir.path().join("shelf");
+        std::fs::create_dir_all(&shelf).expect("shelf");
+        let link = shelf.join("bolt.gguf");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let discovered = discover(&args_for(&link)).expect("discovers");
+        assert_eq!(discovered.family, crate::family::gemma::gemma4::FAMILY);
+        // The side files come from the link's own directory, not the target's.
+        assert_eq!(discovered.tokenizer_dir, link);
+    }
+
+    #[test]
+    fn a_dangling_plain_name_is_named_a_dangling_link_not_a_store_miss() {
+        // A relative name resolves against the working directory, so the link goes there under a
+        // name no other test uses and is removed on every exit path.
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let name = format!("dangling-{}.gguf", std::process::id());
+        let _guard = Remove(PathBuf::from(&name));
+        std::os::unix::fs::symlink("no-such-target", &name).expect("link");
+        let error = super::build_config(&args_for(Path::new(&name)))
+            .unwrap_err()
+            .0;
+        assert!(error.contains("dangling symlink"), "{error}");
+        assert!(!error.contains("nothing local is named"), "{error}");
+    }
+
+    fn stores_in(root: &Path) -> crate::server::local_models::Stores {
+        crate::server::local_models::Stores {
+            models: root.join("models"),
+            ollama: root.join("ollama"),
+            hub: root.join("hub"),
+        }
+    }
+
+    #[test]
+    fn serve_with_no_model_names_none_and_parses() {
+        let args =
+            parse_args(&["--listen".to_string(), "127.0.0.1:9".to_string()]).expect("parses");
+        assert!(args.model_dir.as_os_str().is_empty());
+        assert_eq!(parse_args(&[]).expect("parses"), ModelServeArgs::default());
+    }
+
+    #[test]
+    fn the_default_model_is_the_newest_one_a_family_serves() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let models = root.path().join("models");
+        for name in ["old", "new", "newest"] {
+            std::fs::create_dir_all(models.join(name)).expect("dir");
+        }
+        write_architecture(&models.join("old").join("old.gguf"), "qwen35moe");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        write_architecture(&models.join("new").join("new.gguf"), "gemma4");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // The newest file is not a model any family serves: it is skipped, with its reason.
+        write_architecture(
+            &models.join("newest").join("newest.gguf"),
+            "no-such-architecture",
+        );
+        let mut said = Vec::new();
+        let chosen = super::resolve_default_model(
+            &ModelServeArgs::default(),
+            &stores_in(root.path()),
+            &|candidate| discover(candidate).map(|_| ()),
+            &mut |line| said.push(line.to_string()),
+        )
+        .expect("chosen");
+        assert_eq!(chosen.model_dir, models.join("new"));
+        assert!(
+            said.iter().any(|line| line.contains("skipping newest")),
+            "{said:?}"
+        );
+        let last = said.last().expect("a line");
+        assert!(
+            last.contains("serving new ")
+                && last.contains("passing over 1 newer")
+                && last.contains("--model <name>"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_local_the_default_start_says_where_to_get_a_model() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let error = super::resolve_default_model(
+            &ModelServeArgs::default(),
+            &stores_in(root.path()),
+            &|_| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .0;
+        assert!(error.contains("no --model given"), "{error}");
+        assert!(error.contains("--model <org/repo>"), "{error}");
     }
 }

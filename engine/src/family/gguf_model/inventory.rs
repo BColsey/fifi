@@ -85,7 +85,7 @@ const DELTA_ROLES: [Role; 9] = [
 // native kernels read (`GgufType::has_native_kernel`): the decode matvec, the expert matvec,
 // the prefill GEMMs and the embedding gather all dispatch on the type, so no role has a list of
 // its own. A dense role also takes the plain float types, which the load encodes to Q8_0 blocks
-// (`weights::plain_float_as_q8_0`); the routed expert stacks do not, their tiers read the
+// (`weights::encode_plain_float_rows`); the routed expert stacks do not, their tiers read the
 // file's own records. The order is the order the refusal text names them in.
 static NATIVE_TYPES: LazyLock<Vec<GgufType>> = LazyLock::new(GgufType::native_types);
 static DENSE_TYPES: LazyLock<Vec<GgufType>> = LazyLock::new(|| {

@@ -51,6 +51,19 @@ Saved prefixes live in pinned host memory. The pool holds up to nine slots (eigh
 At 180,224 positions with the 8-bit cache, one slot takes about 2.03 GB, so nine slots take about 18.2 GB.
 The engine also wants 1 GiB of free host memory beyond the pool; when that is short it keeps fewer saved prefixes, down to none.
 
+## Bolt
+
+Bolt keeps saved prefixes in host memory. A saved prefix is a copy of the cache of one session below its position: the four full-attention layers keep every position (8,704 bytes a position) and the twenty sliding layers keep their last 512 positions (10.6 MiB in all), so a prefix of 32,768 positions takes about 283 MiB and one of 4,000 tokens about 46 MB. Restoring one writes it back into whichever session serves the next request.
+
+Startup keeps one saved prefix for each session the engine serves at once, as many as the host's byte budget for saved prefixes holds. The budget is the machine's memory less the OS floor and less the memory the process already holds; the disk tier writes the oldest saved prefixes to disk when the store grows past it. Every save also checks the memory that is free now: the copy must fit above the OS floor (inside a cgroup limit, within what the cgroup has left), or the save is skipped and the next turn processes its prompt whole. A host that is busy at startup keeps the store and starts saving once the memory frees up; a host that tightens later stops saving.
+
+The startup line says what was decided:
+
+- `prefix reuse is on: ... N kept; the host may hold X MiB of them; each save checks the free memory again`.
+- `prefix reuse is on but saving waits: the host budget of X MiB cannot fund a saved prefix of up to Z MiB; ...`, when the budget is under one entry. Saves start once the host can fund one.
+- `prefix reuse is on: ... the host memory could not be read, so the saves are not sized against it`, when the machine's memory is unknown. The store then keeps one entry.
+- `prefix reuse is off (the configuration sets prefix_reuse to false)`, when the configuration turned it off.
+
 ## Flint
 
 On Apple Silicon, the full-attention KV cache grows with use: a request allocates its prompt length rounded up to 4,096 rows, and the buffers double as the conversation grows, up to the 32,768-token limit.

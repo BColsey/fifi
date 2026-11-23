@@ -1,16 +1,14 @@
 //! Decode and bounded prompt batches of the resident Gemma 4 Humanizer model.
 
-use super::{CELLS, FFN, Gemma, HEADS, HIDDEN, SOFT_CAP, VOCAB};
+use super::{CELLS, FFN, Gemma, HEADS, HIDDEN, SOFT_CAP, VOCAB, matvec};
 use crate::EngError;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideCall};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
-use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
+use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
-use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::Kv8Data;
-use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
@@ -154,15 +152,14 @@ impl Gemma {
         let h1 = &sc.h[1];
         let h2 = &sc.h[2];
         let h3 = &sc.h[3];
-        ctx.embed_q8(
+        ctx.embed_native(
             stream,
-            EmbedQ8Call {
-                out: h0.buf.range(0, h0.bytes())?,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
+            EmbedNativeCall {
+                weight: &self.embed,
                 ids: sc.ids.range(0, m * 4)?,
+                x: h0.buf.range(0, h0.bytes())?,
+                status: sc.status.range(0, 4)?,
                 m,
-                n_rows: self.embed.rows,
-                k: self.embed.k,
             },
         )?;
         ctx.row_scale(
@@ -201,17 +198,12 @@ impl Gemma {
                 q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             },
         )?;
-        ctx.matvec_q(
+        ctx.matvec_native(
             stream,
-            MatvecCall {
-                ty: QuantType::Q80,
-                w: self.embed.buf.range(0, self.embed.bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: self.logits.buf.range(0, self.logits.bytes())?,
-                k: HIDDEN,
-                rows: self.embed.rows,
-                ncols: 1,
-            },
+            &self.embed,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            self.logits.buf.range(0, self.logits.bytes())?,
+            1,
         )?;
         ctx.softcap(
             stream,
@@ -262,56 +254,10 @@ impl Gemma {
             },
             m,
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.q.qs.range(0, layer.q.qs_bytes())?,
-                w_scales: layer.q.scales.range(0, layer.q.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.q.buf.range(0, m * q_rows * 4)?,
-                k: HIDDEN,
-                rows: q_rows,
-                ncols: m,
-            },
-        )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.k.qs.range(0, layer.k.qs_bytes())?,
-                w_scales: layer.k.scales.range(0, layer.k.scales_bytes())?,
-                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                y: sc.k.buf.range(0, m * kv_rows * 4)?,
-                k: HIDDEN,
-                rows: kv_rows,
-                ncols: m,
-            },
-        )?;
-        match &layer.v {
-            Some(v) => ctx.gemma_matvec(
-                stream,
-                GemmaMatvecCall {
-                    w_qs: v.qs.range(0, v.qs_bytes())?,
-                    w_scales: v.scales.range(0, v.scales_bytes())?,
-                    x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                    y: sc.v.buf.range(0, m * kv_rows * 4)?,
-                    k: HIDDEN,
-                    rows: kv_rows,
-                    ncols: m,
-                },
-            )?,
-            None => ctx.gemma_matvec(
-                stream,
-                GemmaMatvecCall {
-                    w_qs: layer.k.qs.range(0, layer.k.qs_bytes())?,
-                    w_scales: layer.k.scales.range(0, layer.k.scales_bytes())?,
-                    x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                    y: sc.v.buf.range(0, m * kv_rows * 4)?,
-                    k: HIDDEN,
-                    rows: kv_rows,
-                    ncols: m,
-                },
-            )?,
-        }
+        matvec(ctx, stream, &layer.q, q_rows, &sc.q8_hidden, &sc.q, m)?;
+        matvec(ctx, stream, &layer.k, kv_rows, &sc.q8_hidden, &sc.k, m)?;
+        let v = layer.v.as_ref().unwrap_or(&layer.k);
+        matvec(ctx, stream, v, kv_rows, &sc.q8_hidden, &sc.v, m)?;
         // The QK-norm of the reference graph: each head of q and of k is
         // RMS-normalized and scaled by its own weight before RoPE. The raw
         // matvec output stays in sc.q/sc.k and the normalized rows land in the
@@ -443,18 +389,7 @@ impl Gemma {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.out.qs.range(0, layer.out.qs_bytes())?,
-                w_scales: layer.out.scales.range(0, layer.out.scales_bytes())?,
-                x_q8: sc.q8_ctx.range(0, sc.q8_ctx.bytes())?,
-                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
-                k: q_rows,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        matvec(ctx, stream, &layer.out, HIDDEN, &sc.q8_ctx, &sc.proj, m)?;
         self.norm_rows(
             AddNormQ8Call {
                 rows: 1,
@@ -495,20 +430,8 @@ impl Gemma {
             },
             m,
         )?;
-        for (weight, y) in [(&layer.gate, &sc.gate), (&layer.up, &sc.up)] {
-            ctx.gemma_matvec(
-                stream,
-                GemmaMatvecCall {
-                    w_qs: weight.qs.range(0, weight.qs_bytes())?,
-                    w_scales: weight.scales.range(0, weight.scales_bytes())?,
-                    x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-                    y: y.buf.range(0, m * FFN * 4)?,
-                    k: HIDDEN,
-                    rows: FFN,
-                    ncols: m,
-                },
-            )?;
-        }
+        matvec(ctx, stream, &layer.gate, FFN, &sc.q8_hidden, &sc.gate, m)?;
+        matvec(ctx, stream, &layer.up, FFN, &sc.q8_hidden, &sc.up, m)?;
         ctx.gelu_ffn(
             stream,
             GeluFfnCall {
@@ -528,18 +451,7 @@ impl Gemma {
                 ncols: m,
             },
         )?;
-        ctx.gemma_matvec(
-            stream,
-            GemmaMatvecCall {
-                w_qs: layer.down.qs.range(0, layer.down.qs_bytes())?,
-                w_scales: layer.down.scales.range(0, layer.down.scales_bytes())?,
-                x_q8: sc.q8_mixed.range(0, sc.q8_mixed.bytes())?,
-                y: sc.down.buf.range(0, m * HIDDEN * 4)?,
-                k: FFN,
-                rows: HIDDEN,
-                ncols: m,
-            },
-        )?;
+        matvec(ctx, stream, &layer.down, HIDDEN, &sc.q8_mixed, &sc.down, m)?;
         self.norm_rows(
             AddNormQ8Call {
                 rows: 1,
@@ -648,9 +560,9 @@ mod tests {
 
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.
     #[test]
-    #[ignore = "requires the pinned Humanizer file and Xavier; use --release --test-threads=1"]
+    #[ignore = "requires a Humanizer Q8_0 file and Xavier; use --release --test-threads=1"]
     fn batched_prefill_matches_single_steps() {
-        let path = std::env::var("GEMMA4_Q8_FILE").expect("pinned model path");
+        let path = std::env::var("GEMMA4_Q8_FILE").expect("model path");
         let mut model = super::super::load(std::path::Path::new(&path)).expect("load");
         assert!(matches!(
             model.prefill_batch(&[], 0, false),

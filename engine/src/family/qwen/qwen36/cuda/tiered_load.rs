@@ -105,6 +105,21 @@ pub(super) fn planning_geometry(
     ExpertBankGeometry::widest(geometry_of(dims, [GgufType::Q4K; 3]), quants)
 }
 
+/// The device bytes of one expert record in each layer: a file that mixes record types has a
+/// different size per layer.
+pub(super) fn layer_slot_bytes(
+    dims: &StepDims,
+    quants: &[[GgufType; 3]],
+) -> Result<Vec<u64>, EngError> {
+    quants
+        .iter()
+        .map(|quant| {
+            let geometry = geometry_of(dims, *quant);
+            Ok(ExpertBank::bytes_for(geometry, geometry.top_k)? / geometry.top_k as u64)
+        })
+        .collect()
+}
+
 /// The device bytes of one expert slot in one layer's bank.
 pub(super) fn bank_slot_bytes(geometry: ExpertBankGeometry) -> Result<u64, EngError> {
     let minimum_bank = ExpertBank::bytes_for(geometry, geometry.top_k)?;
@@ -199,19 +214,26 @@ pub(super) fn tiered_chunk_arm(header: &GgufHeader, dims: &StepDims) -> Result<b
     ) {
         return Ok(false);
     }
-    let unsupported = require_q4k_shexp(header, dims.shape.kinds.len())
-        .err()
-        .map(|error| format!("{error:?}"))
-        .or_else(|| {
-            let types = expert_quant(header, dims).ok()?;
-            let q4k = [GgufType::Q4K; 3];
-            let mixed = types.iter().any(|quant| *quant != q4k);
-            mixed.then(|| "the routed experts are not Q4_K in every layer".to_owned())
-        });
+    let shared = require_q4k_shexp(header, dims.shape.kinds.len());
+    let routed = expert_quant(header, dims)?;
+    let unsupported = chunk_arm_refusal(shared.err().map(|error| format!("{error:?}")), &routed);
     if let Some(why) = &unsupported {
         eprintln!("q36 cuda: Q36_TIERED_CHUNK=1 ignored, the chunk arm reads Q4_K experts: {why}");
     }
     Ok(unsupported.is_none())
+}
+
+/// Why the chunk arm cannot read a file: its shared experts are not Q4_K (`shared`, the refusal
+/// of the shared-expert check), or some layer stores a routed stack in another type. `None` when
+/// it can.
+fn chunk_arm_refusal(shared: Option<String>, routed: &[[GgufType; 3]]) -> Option<String> {
+    shared.or_else(|| {
+        let q4k = [GgufType::Q4K; 3];
+        routed
+            .iter()
+            .any(|quant| *quant != q4k)
+            .then(|| "the routed experts are not Q4_K in every layer".to_owned())
+    })
 }
 
 pub(super) fn build_tiered(
@@ -291,8 +313,22 @@ pub(super) fn attach_tiered_parts(
     ctx: &CudaContext,
     (source, dims): ((&GgufHeader, &Path), &StepDims),
     plan: &TieredPlan,
+    (sessions, growth_reserve): (usize, u64),
 ) -> Result<usize, EngError> {
     let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
+    // The banks leave the loader's headroom and the parts of the sessions beside them, by the
+    // same rule the card-short planner used to size the slots.
+    let sessions_reserve = super::super::card_short::tiered_session_reserve(
+        step.seq_bytes_at(
+            step.seq_cells()
+                .min(crate::family::cell_pool::INITIAL_CELLS),
+        ),
+        sessions,
+    )
+    .ok_or_else(|| EngError::MemoryPlan("tiered: the sessions' reserve overflows".into()))?;
+    let reserve = ADMISSION_RESERVE
+        .saturating_add(sessions_reserve)
+        .saturating_add(growth_reserve);
     let layers = dims.shape.kinds.len();
     let quants = expert_quant(source.0, dims)?;
     let geometry = planning_geometry(dims, &quants)?;
@@ -303,7 +339,7 @@ pub(super) fn attach_tiered_parts(
         SlotRequest::Exactly(count) => count,
     };
     let cold_cap = if shared_types {
-        cold_cap_for(free, geometry, layers, planned, ADMISSION_RESERVE)
+        cold_cap_for(free, geometry, layers, planned, reserve)
     } else {
         0
     };
@@ -320,7 +356,7 @@ pub(super) fn attach_tiered_parts(
         layers,
         plan.slots,
         dims.shape.moe.experts,
-        ADMISSION_RESERVE,
+        reserve,
         cold_bytes,
     )?;
     let (banks, host, cold) = build_tiered(ctx, source, dims, plan, slots, cold_cap)?;
@@ -412,6 +448,19 @@ fn build_router_guess(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_chunk_arm_needs_q4k_shared_and_routed_experts_in_every_layer() {
+        use super::{GgufType, chunk_arm_refusal};
+        let q4k = [GgufType::Q4K; 3];
+        let mixed = [GgufType::Q4K, GgufType::Q4K, GgufType::Q6K];
+        assert_eq!(chunk_arm_refusal(None, &[q4k, q4k]), None);
+        let routed = chunk_arm_refusal(None, &[q4k, mixed]).expect("one layer stores a Q6_K down");
+        assert!(routed.contains("not Q4_K in every layer"), "{routed}");
+        let shared = chunk_arm_refusal(Some("shexp is Q8_0".into()), &[q4k]).expect("shared");
+        assert_eq!(shared, "shexp is Q8_0");
+        assert!(chunk_arm_refusal(None, &[[GgufType::Q80; 3]]).is_some());
+    }
+
     use super::*;
     use crate::family::qwen::qwen36::cuda::common_tests::dims;
 

@@ -40,14 +40,50 @@ impl GgufFile {
     }
 }
 
-fn is_gguf(path: &Path) -> bool {
+pub(crate) fn is_gguf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
 }
 
-/// The directory of a model path: the path itself, or the parent of a path to a `.gguf` file.
+/// Whether `path` is a GGUF file: named `.gguf`, or holding the GGUF magic whatever its name
+/// (an Ollama blob is `sha256-<hex>` with no extension).
+pub(crate) fn is_gguf_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if is_gguf(path)
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf_file"))
+    {
+        return true;
+    }
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok()
+        && &magic == b"GGUF"
+}
+
+/// The first shard of the split set that `path` belongs to, when it is a shard and the first
+/// exists; any other path unchanged.
+pub(crate) fn first_shard(path: &Path) -> PathBuf {
+    match shard_name_of(path) {
+        Some(name) if name.number != 1 => {
+            let first = name.sibling(path, 1);
+            if first.is_file() {
+                first
+            } else {
+                path.to_path_buf()
+            }
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The directory of a model path: the path itself, or the parent of a path to a GGUF file.
 pub(crate) fn directory_of(model: &Path) -> PathBuf {
-    if model.is_file() && is_gguf(model) {
+    if is_gguf_file(model) {
         match model.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => return parent.to_path_buf(),
             _ => return PathBuf::from("."),
@@ -64,13 +100,15 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
         EngError::Checkpoint(format!("model path {}: {error}", what.display()))
     };
     if model.is_file() {
-        if !is_gguf(model) {
+        if !is_gguf_file(model) {
             return Err(EngError::Checkpoint(format!(
-                "model path {} is a file without the .gguf extension; name a .gguf file or the \
-                 directory that holds it",
+                "model path {} is a file that does not start with the GGUF magic; name a GGUF \
+                 file or the directory that holds it",
                 model.display()
             )));
         }
+        let first = first_shard(model);
+        let model = first.as_path();
         let mut bytes = std::fs::metadata(model)
             .map_err(|error| read(error, model))?
             .len();
@@ -137,43 +175,6 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
     }
     files.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
     Ok((model.to_path_buf(), files))
-}
-
-/// Whether the weights file of `model` (the first of its candidates) states `architecture` and
-/// every integer key of `keys` with the given value, and `softcap` as a float: the identity a
-/// directory with no `config.json` is checked by. The error names the key that differs.
-#[cfg(any(feature = "native-cuda", test))]
-pub(crate) fn check_header_identity(
-    model: &Path,
-    architecture: &str,
-    keys: &[(&str, u32)],
-    softcap: Option<(&str, f32)>,
-) -> Result<(), EngError> {
-    use crate::weights::{MetaValue, shared_header};
-    let (_, files) = candidates(model)?;
-    let header = shared_header(&files[0].path, 256 << 20)?;
-    let bad =
-        |message: String| EngError::Checkpoint(format!("{}: {message}", files[0].path.display()));
-    match header.meta("general.architecture") {
-        Some(MetaValue::String(name)) if name == architecture => {}
-        _ => return Err(bad(format!("general.architecture is not {architecture}"))),
-    }
-    for (key, expected) in keys {
-        match header.meta(key) {
-            Some(MetaValue::U32(found)) if found == expected => {}
-            Some(MetaValue::U32(found)) => {
-                return Err(bad(format!("{key} is {found}, expected {expected}")));
-            }
-            _ => return Err(bad(format!("{key} is missing or not an integer"))),
-        }
-    }
-    if let Some((key, expected)) = softcap {
-        match header.meta(key) {
-            Some(MetaValue::F32(found)) if (*found - expected).abs() < 1e-6 => {}
-            _ => return Err(bad(format!("{key} is not {expected}"))),
-        }
-    }
-    Ok(())
 }
 
 /// The chosen file and the log line that names it and the other candidates.
@@ -334,7 +335,7 @@ mod tests {
         let message = candidates(&dir.path().join("config.json"))
             .unwrap_err()
             .describe();
-        assert!(message.contains(".gguf extension"), "{message}");
+        assert!(message.contains("GGUF magic"), "{message}");
     }
 
     #[test]
@@ -386,31 +387,57 @@ mod tests {
         );
     }
 
+    /// A GGUF header with no keys and no tensors, padded to `len` bytes.
+    fn gguf_bytes(len: usize) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.resize(len, 0);
+        bytes
+    }
+
     #[test]
-    fn a_header_that_states_the_identity_passes_and_a_changed_key_is_named() {
-        use crate::tokenizer::gguf::tests::{
-            gguf_file, kv_f32_for_tests, kv_string_for_tests, kv_u32_for_tests,
-        };
+    fn a_file_with_the_gguf_magic_is_a_model_whatever_it_is_named() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let keys = crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_KEYS;
-        let soft = crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_SOFTCAP;
-        let mut kvs = vec![kv_string_for_tests("general.architecture", "gemma4")];
-        kvs.extend(
-            keys.iter()
-                .map(|(key, value)| kv_u32_for_tests(key, *value)),
+        let blob = dir.path().join("sha256-0123abcd");
+        std::fs::write(&blob, gguf_bytes(64)).expect("write");
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, b"hello world").expect("write");
+        assert!(super::is_gguf_file(&blob));
+        assert!(!super::is_gguf_file(&other));
+        assert!(!super::is_gguf_file(dir.path()));
+        assert_eq!(super::directory_of(&blob), dir.path());
+        let (found, files) = super::candidates(&blob).expect("a blob is a candidate");
+        assert_eq!(found, dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, blob);
+        let error = super::candidates(&other)
+            .expect_err("not a GGUF")
+            .describe();
+        assert!(error.contains("GGUF magic"), "{error}");
+    }
+
+    #[test]
+    fn any_shard_of_a_split_set_names_the_whole_set_from_its_first_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for number in 1..=3 {
+            std::fs::write(
+                dir.path().join(format!("m-{number:05}-of-00003.gguf")),
+                gguf_bytes(100 * number),
+            )
+            .expect("write");
+        }
+        let third = dir.path().join("m-00003-of-00003.gguf");
+        let first = dir.path().join("m-00001-of-00003.gguf");
+        assert_eq!(super::first_shard(&third), first);
+        let (_, files) = super::candidates(&third).expect("candidates");
+        assert_eq!(
+            files,
+            vec![super::GgufFile {
+                path: first,
+                bytes: 600
+            }]
         );
-        kvs.push(kv_f32_for_tests(soft.0, soft.1));
-        std::fs::write(dir.path().join("bolt.gguf"), gguf_file(&kvs)).expect("write");
-        super::check_header_identity(dir.path(), "gemma4", keys, Some(soft)).expect("identity");
-        kvs[1] = kv_u32_for_tests(keys[0].0, 30);
-        std::fs::write(dir.path().join("bolt.gguf"), gguf_file(&kvs)).expect("write");
-        let error = super::check_header_identity(dir.path(), "gemma4", keys, Some(soft))
-            .expect_err("another depth")
-            .describe();
-        assert!(error.contains("gemma4.block_count is 30"), "{error}");
-        let error = super::check_header_identity(dir.path(), "other", keys, Some(soft))
-            .expect_err("another architecture")
-            .describe();
-        assert!(error.contains("general.architecture"), "{error}");
     }
 }

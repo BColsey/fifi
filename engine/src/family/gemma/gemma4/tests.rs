@@ -5,12 +5,12 @@ const HUMANIZER_CONFIG: &[u8] = include_bytes!("../../../../testdata/gemma4/huma
 const BOLT_CONFIG: &[u8] = include_bytes!("../../../../testdata/gemma4/bolt-config.json");
 
 #[test]
-fn accepts_the_pinned_bolt_configuration() {
+fn accepts_the_bolt_configuration() {
     check_bolt_config(BOLT_CONFIG).unwrap();
 }
 
 #[test]
-fn the_pinned_bolt_configuration_agrees_with_the_family_descriptor() {
+fn the_bolt_configuration_agrees_with_the_family_descriptor() {
     check_bolt_config(BOLT_CONFIG).unwrap();
     let spec = NEMOTRON_BOLT_E4B;
     let root: serde_json::Value = serde_json::from_slice(BOLT_CONFIG).unwrap();
@@ -83,7 +83,7 @@ fn assert_bolt_field(config: &[u8], field: &str) {
 }
 
 #[test]
-fn accepts_the_pinned_humanizer_configuration() {
+fn accepts_the_humanizer_configuration() {
     check_humanizer_config(HUMANIZER_CONFIG).unwrap();
 }
 
@@ -107,7 +107,7 @@ fn assert_checkpoint_field(config: &[u8], field: &str) {
 }
 
 #[test]
-fn checks_the_pinned_architecture_and_both_tied_embedding_flags() {
+fn checks_the_architecture_and_both_tied_embedding_flags() {
     let mut config: serde_json::Value = serde_json::from_slice(HUMANIZER_CONFIG).unwrap();
     config["architectures"][0] = "OtherForConditionalGeneration".into();
     assert_checkpoint_field(&serde_json::to_vec(&config).unwrap(), "architectures");
@@ -504,7 +504,7 @@ fn kv_bool_array(key: &str, values: &[bool]) -> Kv {
     }
 }
 
-/// The scalar metadata of the pinned checkpoint, minus excluded keys.
+/// The scalar metadata of a Humanizer checkpoint, minus excluded keys.
 fn base_kvs(exclude: &[&str]) -> Vec<Kv> {
     let mut heads = Vec::new();
     let mut pattern = Vec::new();
@@ -689,7 +689,7 @@ fn rejects_missing_unexpected_and_mistyped_tensors() {
     ));
     expect_rejection(
         open(&build_gguf(&kvs, &tensors)),
-        "tensor blk.0.attn_q.weight has type F32, expected Q8_0",
+        "tensor blk.0.attn_q.weight has type F32, expected a matrix type with a native kernel",
     );
 
     let mut tensors = globals();
@@ -1112,6 +1112,47 @@ fn bolt_both_spellings_share_one_kv_map() {
     }
 }
 
+/// A K-quant table slices by its own block layout: a layer of 256 values is one 144-byte Q4_K
+/// block, so token `t` of layer `l` sits at `t * 144 * layers + l * 144`.
+#[test]
+fn a_k_quant_merged_table_slices_by_its_own_blocks() {
+    use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
+    use crate::weights::GgufType;
+
+    let (layers, vocab) = (3usize, 5usize);
+    let merged: Vec<u8> = (0..vocab * layers * 144).map(|i| (i % 251) as u8).collect();
+    for layer in 0..layers {
+        let got =
+            ple_rows_from_merged(&merged, GgufType::Q4K, layer, 256, layers, vocab).expect("slice");
+        assert_eq!(got.len(), vocab * 144);
+        for token in 0..vocab {
+            let at = token * layers * 144 + layer * 144;
+            assert_eq!(&got[token * 144..(token + 1) * 144], &merged[at..at + 144]);
+        }
+    }
+    assert!(ple_rows_from_merged(&merged, GgufType::Q4K, 3, 256, layers, vocab).is_err());
+    // A merged table whose length is not `vocab` rows of every layer's blocks is refused, the
+    // short one by a byte and the long one by a block.
+    let short = ple_rows_from_merged(
+        &merged[..merged.len() - 1],
+        GgufType::Q4K,
+        0,
+        256,
+        layers,
+        vocab,
+    )
+    .expect_err("a table one byte short");
+    assert!(
+        short.describe().contains("merged per-layer table holds"),
+        "{}",
+        short.describe()
+    );
+    let mut long = merged.clone();
+    long.extend([0u8; 144]);
+    assert!(ple_rows_from_merged(&long, GgufType::Q4K, 0, 256, layers, vocab).is_err());
+    assert!(ple_rows_from_merged(&merged, GgufType::Q4K, 0, 100, layers, vocab).is_err());
+}
+
 #[test]
 fn the_merged_table_and_per_layer_tables_carry_the_same_weights() {
     use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
@@ -1175,7 +1216,8 @@ fn the_merged_table_and_per_layer_tables_carry_the_same_weights() {
         .read_tensor("per_layer_token_embd.weight")
         .expect("merged table reads");
     for layer in [0, 5, 24, 41] {
-        let from_merged = ple_rows_from_merged(&merged.1, layer, ple, layers, vocab);
+        let from_merged = ple_rows_from_merged(&merged.1, GgufType::Q80, layer, ple, layers, vocab)
+            .expect("the layer slice");
         let (_, from_legacy) = legacy
             .read_tensor(&format!("blk.{layer}.per_layer_embd.weight"))
             .expect("legacy table reads");
@@ -1369,7 +1411,7 @@ fn a_humanizer_gguf_is_accepted_by_its_geometry_and_names_its_own_window() {
         .collect();
     let tensors: Vec<_> = super::gguf::expected_inventory(&kv)
         .into_iter()
-        .map(|item| (item.name, item.ty, item.dims))
+        .map(|item| (item.name, item.ty.fixture(), item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut digests = Vec::new();
@@ -1390,10 +1432,10 @@ fn a_humanizer_window_of_zero_or_past_the_resident_limit_is_refused() {
         .collect();
     let tensors: Vec<_> = super::gguf::expected_inventory(&kv)
         .into_iter()
-        .map(|item| (item.name, item.ty, item.dims))
+        .map(|item| (item.name, item.ty.fixture(), item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
-    for window in [0u32, 4097] {
+    for window in [0u32, 8193] {
         let path = dir.path().join(format!("humanizer-{window}.gguf"));
         write_bolt_gguf(&humanizer_kvs(window, "w"), &tensors, &path);
         expect_rejection(
@@ -1410,7 +1452,7 @@ fn an_extra_tensor_that_would_change_the_result_is_refused_and_a_harmless_one_is
         .collect();
     let complete: Vec<_> = super::gguf::expected_inventory(&kv)
         .into_iter()
-        .map(|item| (item.name, item.ty, item.dims))
+        .map(|item| (item.name, item.ty.fixture(), item.dims))
         .collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("humanizer-extra.gguf");
@@ -1455,5 +1497,45 @@ fn the_bolt_configuration_takes_its_own_context_and_ids_but_only_the_built_windo
     assert_bolt_field(
         &edit(&|text| text["max_position_embeddings"] = 256.into()),
         "text_config.max_position_embeddings",
+    );
+}
+
+#[test]
+fn the_check_validates_the_files_the_load_may_choose_among() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bolt_gguf(
+        &bolt_base_kvs(&[]),
+        &bolt_tensors(),
+        &dir.path().join("bolt.gguf"),
+    );
+    std::fs::write(dir.path().join("a-larger.gguf"), vec![0u8; 1 << 20])
+        .expect("write a junk file");
+    let files = super::serve::bolt_files(dir.path()).expect("the valid file is enough");
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].path, dir.path().join("bolt.gguf"));
+    assert!(super::serve::check_checkpoint(&dir.path().join("a-larger.gguf")).is_err());
+    std::fs::remove_file(dir.path().join("bolt.gguf")).expect("remove the valid file");
+    assert!(super::serve::bolt_files(dir.path()).is_err());
+}
+
+#[test]
+fn a_lone_bolt_gguf_passes_the_dispatch_gate_with_no_side_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bolt_gguf(
+        &bolt_base_kvs(&[]),
+        &bolt_tensors(),
+        &dir.path().join("bolt.gguf"),
+    );
+    super::serve::bolt_geometry(dir.path()).expect("a directory of the one file passes");
+    super::serve::bolt_geometry(&dir.path().join("bolt.gguf")).expect("the file path passes");
+    let other = tempfile::tempdir().expect("tempdir");
+    let kvs: Vec<Kv> = bolt_base_kvs(&["gemma4.block_count"])
+        .into_iter()
+        .chain([kv_u32("gemma4.block_count", 30)])
+        .collect();
+    write_bolt_gguf(&kvs, &bolt_tensors(), &other.path().join("bolt.gguf"));
+    expect_rejection(
+        super::serve::bolt_geometry(other.path()),
+        "gemma4.block_count",
     );
 }

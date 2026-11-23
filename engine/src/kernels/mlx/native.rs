@@ -152,6 +152,29 @@ impl State {
     }
 }
 
+/// The contexts alive on this thread. The per-thread kernel choice in the native layer outlives
+/// no thread's last context, and never a context that is still running.
+mod live_contexts {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn enter() {
+        LIVE.with(|live| live.set(live.get() + 1));
+    }
+
+    /// Records one context gone; true when it was the last one of the thread.
+    pub(super) fn leave() -> bool {
+        LIVE.with(|live| {
+            let left = live.get().saturating_sub(1);
+            live.set(left);
+            left == 0
+        })
+    }
+}
+
 pub(super) struct Context {
     state: Option<State>,
     _thread: PhantomData<Rc<()>>,
@@ -226,6 +249,7 @@ impl Context {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Whether this thread's one-row products take the tiled kernel a window of rows takes.
     pub(super) fn row_invariant_products(&self) -> bool {
         unsafe { ffi::mlx_row_invariant_products() }
@@ -305,6 +329,7 @@ impl Context {
                 message: "Metal threadgroup-memory limit is unavailable".into(),
             });
         }
+        live_contexts::enter();
         Ok(Self {
             state: Some(State {
                 retire,
@@ -366,6 +391,11 @@ impl Drop for Context {
             // so it only drops the count.
             compile::teardown_clear();
         }
+        // The tiled one-row products belong to the thread's contexts: the last one to go leaves
+        // the ordinary kernels to the next context there, until its decoder asks otherwise.
+        if live_contexts::leave() {
+            unsafe { ffi::mlx_set_row_invariant_products(false) };
+        }
     }
 }
 
@@ -376,6 +406,25 @@ pub(crate) fn qualification_process_usage() -> Option<(u64, u64)> {
     let mut footprint_bytes = 0;
     let status = unsafe { ffi::mlx_process_usage(&mut read_bytes, &mut footprint_bytes) };
     (status == 0).then_some((read_bytes, footprint_bytes))
+}
+
+/// Starts one process-wide pressure observer without touching any native owner.
+pub(crate) fn start_memory_pressure() -> bool {
+    // The shim owns the source for the process lifetime and accepts no pointers.
+    unsafe { ffi::mlx_start_memory_pressure() == 0 }
+}
+
+pub(crate) fn memory_pressure() -> u32 {
+    // The shim reads only a process-wide atomic, with no stream or receiver state.
+    unsafe { ffi::mlx_memory_pressure() }
+}
+
+/// Reads the macOS counters used in opt-in phase measurements.
+pub(crate) fn process_io() -> Option<(u64, u64)> {
+    let mut reads = 0;
+    let mut peak = 0;
+    // Both outputs are valid for the duration of this call and are written on success.
+    (unsafe { ffi::mlx_process_io(&mut reads, &mut peak) } == 0).then_some((reads, peak))
 }
 
 #[cfg(test)]

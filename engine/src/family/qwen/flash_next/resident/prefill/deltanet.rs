@@ -221,11 +221,11 @@ pub(super) fn chunk(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::deltanet::step as decode_step;
-    use super::super::super::ops::{assert_close, values, zeros};
-    use super::super::super::weights::{RAttn, ResidentWeights, synthetic};
     use super::super::{assert_parity, import_f32};
     use super::*;
+    use crate::family::qwen::flash_next::resident::deltanet::step as decode_step;
+    use crate::family::qwen::flash_next::resident::ops::{assert_close, values, zeros};
+    use crate::family::qwen::flash_next::resident::weights::{RAttn, ResidentWeights, synthetic};
 
     fn delta_weights(weights: &ResidentWeights) -> &RDelta {
         let RAttn::Delta(rw) = &weights.layers[0].attn else {

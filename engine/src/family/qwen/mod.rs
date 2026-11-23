@@ -1,6 +1,6 @@
 //! The Qwen lineage: its children, each a spec, a recipe and a weight map over the shared engine.
 //! What the children share and the engine does not (name conventions, chat template quirks and
-//! layer kinds unique to the lineage) belongs here; today that is nothing.
+//! layer kinds unique to the lineage) belongs here.
 
 #[allow(
     dead_code,
@@ -12,3 +12,4 @@ pub(crate) mod flash_next;
     reason = "the Q36 host reference serves later work; until it lands, only tests and the Mac reference run call it"
 )]
 pub mod qwen36;
+pub(crate) mod sensenova;

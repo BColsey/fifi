@@ -68,9 +68,9 @@ pub(super) fn causal_conv(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::ops::{assert_close, values};
     use super::super::import_f32;
     use super::*;
+    use crate::family::qwen::flash_next::resident::ops::{assert_close, values};
 
     /// Unit spacing, three taps (the DeltaNet shape). Channel 0: ring `[1, 2, 3]`, taps
     /// `[0.5, 0.25, 0.125]`, last 2. Channel 1: ring `[10, 20, 30]`, taps `[1, -1, 2]`, last 3.

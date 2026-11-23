@@ -13,7 +13,9 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use super::template::ChatTemplate;
-use super::{PromptMessage, Role, Thinking, TokenizerBundle, TokenizerParts};
+use super::{
+    PromptMessage, Role, Thinking, TokenizerBundle, TokenizerParts, ToolCallSpec, ToolSpec,
+};
 use crate::EngError;
 use crate::weights::{ArrayMeta, GgufHeader, MetaValue};
 
@@ -52,8 +54,9 @@ const END_MARKERS: [&str; 7] = [
 
 /// The stop set of a vocabulary with no `generation_config.json`: the eos id first, then the eot
 /// and eom ids when the file carries them, then the token the chat template ends an assistant
-/// turn with, then every control-type token whose text is an end marker, in id order, without
-/// repeats.
+/// turn with, then the token it opens a tool response with (a model that calls a tool stops there
+/// and does not write the response itself), then every control-type token whose text is an end
+/// marker, in id order, without repeats.
 fn stop_ids(
     tokens: &[String],
     types: &[i32],
@@ -61,9 +64,15 @@ fn stop_ids(
     eot: Option<u32>,
     eom: Option<u32>,
     turn_end: Option<u32>,
+    tool_response: Option<u32>,
 ) -> Vec<u32> {
     let mut ids = vec![eos];
-    for id in eot.into_iter().chain(eom).chain(turn_end) {
+    for id in eot
+        .into_iter()
+        .chain(eom)
+        .chain(turn_end)
+        .chain(tool_response)
+    {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -114,6 +123,77 @@ fn template_turn_end(tokens: &[String], types: &[i32], template: &str) -> Option
         })
         .max_by_key(|(_, (token, _))| token.len())
         .map(|(id, _)| id as u32)
+}
+
+/// Whether a token's text has the shape of a chat delimiter, `<|name>`, `<name|>` or `<|name|>`:
+/// such a user-defined token marks structure and is special like a control token, so decoding
+/// that skips special tokens leaves it out. Ordinary markup such as `<think>` has no bar and stays
+/// plain text.
+fn delimiter_shaped(token: &str) -> bool {
+    token.len() >= 3
+        && token.starts_with('<')
+        && token.ends_with('>')
+        && (token.starts_with("<|") || token.ends_with("|>"))
+}
+
+/// The delimiter token that the chat template writes between an assistant tool call and the
+/// tool's answer: the point where a model that has called a tool must stop. Found by rendering a
+/// tool call and its response and taking the last delimiter-shaped special token before the
+/// response text that the plain generation prompt does not itself contain (a turn opener such as
+/// `<|im_start|>` is in the generation prompt, so it is never taken). `None` when the template has
+/// no tool support or writes no such token.
+fn template_tool_response_opener(tokens: &[String], types: &[i32], template: &str) -> Option<u32> {
+    const PROBE: &str = "zq7xk";
+    let message = |role: Role, content: Option<&str>| {
+        let tool = matches!(role, Role::Tool);
+        PromptMessage {
+            role,
+            content: content.map(str::to_owned),
+            reasoning_content: None,
+            name: tool.then(|| "probe_tool".to_owned()),
+            tool_call_id: tool.then(|| "call0".to_owned()),
+            tool_calls: Vec::new(),
+        }
+    };
+    let mut call = message(Role::Assistant, None);
+    call.tool_calls.push(ToolCallSpec {
+        id: "call0".to_owned(),
+        name: "probe_tool".to_owned(),
+        arguments: "{}".to_owned(),
+    });
+    let tools = [ToolSpec(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "probe_tool",
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    }))];
+    let chat = ChatTemplate::probe(template).ok()?;
+    let user = message(Role::User, Some("hello"));
+    let asked = chat
+        .render(std::slice::from_ref(&user), &tools, Thinking::Default)
+        .ok()?;
+    let text = chat
+        .render_openai_calls(
+            &[user, call, message(Role::Tool, Some(PROBE))],
+            &tools,
+            Thinking::Default,
+        )
+        .ok()?;
+    let head = &text[..text.find(PROBE)?];
+    tokens
+        .iter()
+        .zip(types)
+        .enumerate()
+        .filter(|(_, (token, kind))| {
+            (**kind == TYPE_CONTROL || **kind == TYPE_USER_DEFINED)
+                && delimiter_shaped(token)
+                && !asked.contains(token.as_str())
+        })
+        .filter_map(|(id, (token, _))| head.rfind(token.as_str()).map(|at| (at, id as u32)))
+        .max()
+        .map(|(_, id)| id)
 }
 
 fn reject(message: impl Into<String>) -> EngError {
@@ -197,6 +277,8 @@ pub(crate) struct GgufTokenizer {
     eom_id: Option<u32>,
     /// The token the chat template ends an assistant message with, see [`template_turn_end`].
     turn_end: Option<u32>,
+    /// The token the chat template opens a tool response with, see [`template_tool_response_opener`].
+    tool_response: Option<u32>,
     /// The line that says a spec's template stands in for a header that carries none.
     template_note: Option<String>,
     /// The bytes of a `generation_config.json` beside the weights file, when there is one.
@@ -206,8 +288,19 @@ pub(crate) struct GgufTokenizer {
 }
 
 impl GgufTokenizer {
-    /// Reads the tokenizer keys of the GGUF at `path`. Only the header is read.
+    /// Reads the tokenizer keys of the GGUF at `path`, and the `generation_config.json` beside it
+    /// when there is one. Only the header of the weights file is read.
     pub(crate) fn read(path: &Path) -> Result<Self, EngError> {
+        Self::read_with(path, true)
+    }
+
+    /// Reads the tokenizer keys of the GGUF at `path` and nothing beside it: a lone file's header
+    /// is all it says, whatever else sits in its directory.
+    pub(crate) fn read_alone(path: &Path) -> Result<Self, EngError> {
+        Self::read_with(path, false)
+    }
+
+    fn read_with(path: &Path, sidecar: bool) -> Result<Self, EngError> {
         let file = File::open(path)
             .map_err(|error| reject(format!("cannot open {}: {error}", path.display())))?;
         let header = crate::weights::shared_header(path, HEADER_CAP_BYTES)?;
@@ -277,17 +370,26 @@ impl GgufTokenizer {
                 .as_deref()
                 .and_then(crate::family::spec::chat_template_fallback)
             {
-                Some(row) => {
+                // A spec's template stands in only for a vocabulary it fits: the token that ends
+                // an assistant turn in it must be a token of this file.
+                Some(row) if template_turn_end(&tokens, &types, row.template).is_some() => {
                     template_note = Some(format!(
                         "chat template: the GGUF carries none; using the template of the {} spec",
                         row.spec
                     ));
                     row.template.to_owned()
                 }
+                Some(row) => {
+                    return Err(reject(format!(
+                        "tokenizer.chat_template is missing, and the template of the {} spec does not fit this vocabulary",
+                        row.spec
+                    )));
+                }
                 None => return Err(reject("tokenizer.chat_template is missing")),
             },
         };
         let turn_end = template_turn_end(&tokens, &types, &chat_template);
+        let tool_response = template_tool_response_opener(&tokens, &types, &chat_template);
         let (eot_id, eom_id) = (
             optional_id("tokenizer.ggml.eot_token_id"),
             optional_id("tokenizer.ggml.eom_token_id"),
@@ -306,9 +408,11 @@ impl GgufTokenizer {
             eot_id,
             eom_id,
             turn_end,
+            tool_response,
             template_note,
             generation_config: path
                 .parent()
+                .filter(|_| sidecar)
                 .and_then(|dir| std::fs::read(dir.join("generation_config.json")).ok()),
             add_bos: matches!(
                 header.meta("tokenizer.ggml.add_bos_token"),
@@ -327,6 +431,7 @@ impl GgufTokenizer {
             self.eot_id,
             self.eom_id,
             self.turn_end,
+            self.tool_response,
         )
     }
 
@@ -386,7 +491,7 @@ impl GgufTokenizer {
                     "lstrip": false,
                     "rstrip": false,
                     "normalized": false,
-                    "special": kind == TYPE_CONTROL,
+                    "special": kind == TYPE_CONTROL || delimiter_shaped(token),
                 }));
             }
         }
@@ -496,7 +601,15 @@ fn serialize(value: &serde_json::Value) -> Result<Vec<u8>, EngError> {
 
 /// The tokenizer bundle of the GGUF at `path`, built from its own header.
 pub(crate) fn bundle_from_gguf(path: &Path) -> Result<TokenizerBundle, EngError> {
-    let tokenizer = GgufTokenizer::read(path)?;
+    bundle_of(GgufTokenizer::read(path)?, path)
+}
+
+/// The tokenizer bundle of one GGUF file named alone: its header and nothing beside it.
+pub(crate) fn bundle_from_lone_gguf(path: &Path) -> Result<TokenizerBundle, EngError> {
+    bundle_of(GgufTokenizer::read_alone(path)?, path)
+}
+
+fn bundle_of(tokenizer: GgufTokenizer, path: &Path) -> Result<TokenizerBundle, EngError> {
     let note = format!(
         "tokenizer: built from the metadata of {} (pre-tokenizer {}, {} tokens, {} merges)",
         path.display(),
@@ -515,6 +628,10 @@ pub(crate) fn bundle_from_gguf(path: &Path) -> Result<TokenizerBundle, EngError>
 /// A draft model's file without a template is skipped; later shards of a split model hold no
 /// tokenizer keys and are never first. `None` when no file qualifies.
 pub(crate) fn vocabulary_gguf(dir: &Path) -> Result<Option<std::path::PathBuf>, EngError> {
+    // A path to one weights file is its own candidate.
+    if crate::family::gguf_select::is_gguf_file(dir) {
+        return Ok(has_vocabulary(dir).then(|| dir.to_path_buf()));
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(None),
@@ -532,27 +649,32 @@ pub(crate) fn vocabulary_gguf(dir: &Path) -> Result<Option<std::path::PathBuf>, 
     files.sort();
     for file in files {
         // A file that is not a readable GGUF is not a candidate; the start reports its own.
-        let Ok(header) = crate::weights::shared_header(&file, HEADER_CAP_BYTES) else {
-            continue;
-        };
-        // A file with no template qualifies when a spec names one for its architecture.
-        let has_template = matches!(
-            header.meta("tokenizer.chat_template"),
-            Some(MetaValue::String(_))
-        ) || matches!(
-            header.meta("general.architecture"),
-            Some(MetaValue::String(name))
-                if crate::family::spec::chat_template_fallback(name).is_some()
-        );
-        if matches!(
-            header.meta("tokenizer.ggml.tokens"),
-            Some(MetaValue::Array(_))
-        ) && has_template
-        {
+        if has_vocabulary(&file) {
             return Ok(Some(file));
         }
     }
     Ok(None)
+}
+
+/// Whether the GGUF at `path` carries a vocabulary and a chat template (or an architecture whose
+/// spec names one); an unreadable file does not.
+fn has_vocabulary(path: &Path) -> bool {
+    let Ok(header) = crate::weights::shared_header(path, HEADER_CAP_BYTES) else {
+        return false;
+    };
+    let has_template = matches!(
+        header.meta("tokenizer.chat_template"),
+        Some(MetaValue::String(_))
+    ) || matches!(
+        header.meta("general.architecture"),
+        Some(MetaValue::String(name))
+            if crate::family::spec::chat_template_fallback(name).is_some()
+    );
+    has_template
+        && matches!(
+            header.meta("tokenizer.ggml.tokens"),
+            Some(MetaValue::Array(_))
+        )
 }
 
 /// Reads the whole data range of one metadata array.
@@ -629,7 +751,7 @@ fn int_array(file: &File, array: &ArrayMeta, expect: usize) -> Result<Vec<i32>, 
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{GgufTokenizer, bundle_from_gguf};
+    use super::{GgufTokenizer, bundle_from_gguf, vocabulary_gguf};
     use crate::tokenizer::{PromptMessage, Role, Thinking};
     use std::path::PathBuf;
 
@@ -650,16 +772,9 @@ pub(crate) mod tests {
         kv(key, 8, &string(value))
     }
 
-    pub(crate) fn kv_string_for_tests(key: &str, value: &str) -> Vec<u8> {
-        kv_string(key, value)
-    }
-
+    #[cfg(feature = "native-cuda")]
     pub(crate) fn kv_u32_for_tests(key: &str, value: u32) -> Vec<u8> {
         kv(key, 4, &value.to_le_bytes())
-    }
-
-    pub(crate) fn kv_f32_for_tests(key: &str, value: f32) -> Vec<u8> {
-        kv(key, 6, &value.to_le_bytes())
     }
 
     fn kv_array(key: &str, elem_type: u32, items: &[Vec<u8>]) -> Vec<u8> {
@@ -796,8 +911,166 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// A space-marker vocabulary file of `architecture` whose header has no chat template.
-    fn space_marker_file_without_template(architecture: &str) -> PathBuf {
+    /// A Gemma-shaped header: delimiter tokens of user-defined type, a template that closes a
+    /// turn with `<turn|>` and opens a tool response with `<|tool_response>`.
+    fn delimiter_file() -> PathBuf {
+        const GEMMA_LIKE: &str = "{%- for m in messages -%}\
+            {%- if m.role == 'user' -%}<|turn>user\n{{ m.content }}<turn|>\n\
+            {%- elif m.role == 'assistant' -%}<|turn>model\n\
+            {%- if m.tool_calls -%}{%- for c in m.tool_calls -%}<|tool_call>call:{{ c.name }}{}<tool_call|><|tool_response>{%- endfor -%}\
+            {%- else -%}{{ m.content }}<turn|>\n{%- endif -%}\
+            {%- elif m.role == 'tool' -%}response:{{ m.content }}<tool_response|>{%- endif -%}\
+            {%- endfor -%}{%- if add_generation_prompt -%}<|turn>model\n{%- endif -%}";
+        let tokens = [
+            "<pad>",
+            "<eos>",
+            "<bos>",
+            "<unk>",
+            "a",
+            "b",
+            "\u{2581}",
+            "<0x7A>",
+            "<|turn>",
+            "<turn|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|\"|>",
+            "<|channel>",
+            "<channel|>",
+            "<think>",
+        ];
+        let types = [3, 3, 3, 3, 1, 1, 1, 6, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
+        let kvs = vocabulary_kvs(
+            "gemma4",
+            &tokens,
+            &types,
+            &[],
+            GEMMA_LIKE,
+            1,
+            vec![
+                kv("tokenizer.ggml.bos_token_id", 4, &2u32.to_le_bytes()),
+                kv("tokenizer.ggml.unknown_token_id", 4, &3u32.to_le_bytes()),
+            ],
+        );
+        write_temp(&gguf_file(&kvs))
+    }
+
+    #[test]
+    fn delimiter_shaped_user_defined_tokens_are_special_and_ordinary_markup_is_not() {
+        let path = delimiter_file();
+        let parts = GgufTokenizer::read(&path)
+            .expect("read")
+            .parts()
+            .expect("parts");
+        let json: serde_json::Value = serde_json::from_slice(&parts.tokenizer_json).expect("json");
+        let special = |content: &str| {
+            json["added_tokens"]
+                .as_array()
+                .expect("added tokens")
+                .iter()
+                .find(|token| token["content"] == content)
+                .unwrap_or_else(|| panic!("{content} is an added token"))["special"]
+                .as_bool()
+                .expect("flag")
+        };
+        for token in [
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|\"|>",
+            "<|channel>",
+            "<channel|>",
+        ] {
+            assert!(special(token), "{token}");
+        }
+        assert!(!special("<think>"));
+        // Decoding that skips special tokens leaves the delimiters out.
+        let bundle = bundle_from_gguf(&path).expect("bundle");
+        let ids: Vec<u32> = ["a", "<|channel>", "b", "<channel|>"]
+            .iter()
+            .map(|token| bundle.tokenizer().token_id(token).expect("id"))
+            .collect();
+        assert_eq!(bundle.tokenizer().decode(&ids).expect("decode"), "ab");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_stop_set_has_the_turn_end_and_the_tool_response_opener_but_no_turn_opener() {
+        let path = delimiter_file();
+        let tokenizer = GgufTokenizer::read(&path).expect("read");
+        let id = |text: &str| {
+            tokenizer
+                .tokens
+                .iter()
+                .position(|token| token == text)
+                .expect("token") as u32
+        };
+        assert_eq!(
+            tokenizer.stop_ids(),
+            [1, id("<turn|>"), id("<|tool_response>")]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_lone_file_ignores_the_generation_config_beside_it_and_a_directory_reads_it() {
+        let path = delimiter_file();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("m.gguf");
+        std::fs::copy(&path, &file).expect("copy");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            br#"{"eos_token_id": [1, 5]}"#,
+        )
+        .expect("write");
+        let ids = |bundle: &crate::tokenizer::TokenizerBundle| bundle.eos_token_ids().to_vec();
+        let alone = super::bundle_from_lone_gguf(&file).expect("alone");
+        let beside = bundle_from_gguf(&file).expect("beside");
+        assert!(!ids(&alone).contains(&5), "{:?}", ids(&alone));
+        assert!(ids(&beside).contains(&5), "{:?}", ids(&beside));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn two_vocabularies_in_one_directory_each_file_gets_its_own() {
+        // No tokenizer.json and two files that both carry a vocabulary: a name-sorted scan of the
+        // directory would give the first file's vocabulary to both.
+        let first = delimiter_file();
+        let second = space_marker_file_without_template("gemma4");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a-first.gguf");
+        let b = dir.path().join("b-second.gguf");
+        std::fs::copy(&first, &a).expect("copy");
+        std::fs::copy(&second, &b).expect("copy");
+        let sizes = |path: &std::path::Path| {
+            crate::tokenizer::gemma::load(path)
+                .expect("a file is its own tokenizer")
+                .vocab_size()
+        };
+        let (size_a, size_b) = (sizes(&a), sizes(&b));
+        assert_ne!(size_a, size_b);
+        assert_eq!(
+            size_a,
+            bundle_from_gguf(&first).expect("first").vocab_size()
+        );
+        assert_eq!(
+            size_b,
+            bundle_from_gguf(&second).expect("second").vocab_size()
+        );
+        // The preflight's resolver names the asked-for file too.
+        assert_eq!(vocabulary_gguf(&b).expect("scan"), Some(b.clone()));
+        assert_eq!(vocabulary_gguf(&a).expect("scan"), Some(a.clone()));
+        // Naming the directory is the user's word for "whichever comes first".
+        assert_eq!(vocabulary_gguf(dir.path()).expect("scan"), Some(a));
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn the_gemma_loader_reads_a_lone_gguf_and_pins_no_revision() {
         let tokens = [
             "<pad>",
             "<eos>",
@@ -810,6 +1083,49 @@ pub(crate) mod tests {
             "<0x7A>",
         ];
         let types = [3, 3, 3, 3, 1, 1, 1, 1, 6];
+        let kvs = vocabulary_kvs(
+            "gemma4",
+            &tokens,
+            &types,
+            &["\u{2581} b"],
+            TEMPLATE,
+            1,
+            vec![
+                kv("tokenizer.ggml.unknown_token_id", 4, &3u32.to_le_bytes()),
+                kv("tokenizer.ggml.bos_token_id", 4, &2u32.to_le_bytes()),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("model.gguf"), gguf_file(&kvs)).expect("write");
+        let bundle =
+            crate::tokenizer::gemma::load(dir.path()).expect("the header is the tokenizer");
+        assert_eq!(bundle.tokenizer().encode("a b").expect("encode"), [4, 7]);
+        assert!(
+            bundle
+                .load_notes()
+                .iter()
+                .all(|note| !note.contains("pinned")),
+            "{:?}",
+            bundle.load_notes()
+        );
+    }
+
+    /// A space-marker vocabulary file of `architecture` whose header has no chat template.
+    fn space_marker_file_without_template(architecture: &str) -> PathBuf {
+        let tokens = [
+            "<pad>",
+            "<eos>",
+            "<bos>",
+            "<unk>",
+            "a",
+            "b",
+            "\u{2581}",
+            "\u{2581}b",
+            "<0x7A>",
+            "<|turn>",
+            "<turn|>",
+        ];
+        let types = [3, 3, 3, 3, 1, 1, 1, 1, 6, 3, 3];
         let mut kvs = vocabulary_kvs(
             "gemma4",
             &tokens,
@@ -849,6 +1165,26 @@ pub(crate) mod tests {
                 .template
                 .as_bytes()
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_spec_template_that_does_not_fit_the_vocabulary_is_refused_not_applied() {
+        // The vocabulary has no `<turn|>`: the Gemma template would end turns with a token the
+        // file does not have, so no template is better than that one.
+        let tokens = [
+            "<pad>", "<eos>", "<bos>", "<unk>", "a", "b", "\u{2581}", "<0x7A>",
+        ];
+        let types = [3, 3, 3, 3, 1, 1, 1, 6];
+        let mut kvs = vocabulary_kvs("gemma4", &tokens, &types, &[], "unused", 1, vec![]);
+        kvs.retain(|entry| !entry.starts_with(&string("tokenizer.chat_template")));
+        kvs[0] = kv_string("general.architecture", "gemma4");
+        let path = write_temp(&gguf_file(&kvs));
+        let error = GgufTokenizer::read(&path)
+            .err()
+            .expect("refused")
+            .describe();
+        assert!(error.contains("does not fit this vocabulary"), "{error}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1338,14 +1674,17 @@ pub(crate) mod tests {
         // </s> is a control token; the user-defined and normal tokens never count.
         let types = [1, 3, 3, 4, 3, 3];
         assert_eq!(
-            super::stop_ids(&tokens, &types, 2, None, None, None),
+            super::stop_ids(&tokens, &types, 2, None, None, None, None),
             [2, 1]
         );
         assert_eq!(
-            super::stop_ids(&tokens, &types, 2, Some(5), Some(5), None),
+            super::stop_ids(&tokens, &types, 2, Some(5), Some(5), None, None),
             [2, 5, 1]
         );
-        assert_eq!(super::stop_ids(&tokens, &[1; 6], 2, None, None, None), [2]);
+        assert_eq!(
+            super::stop_ids(&tokens, &[1; 6], 2, None, None, None, None),
+            [2]
+        );
     }
 
     /// For a checkpoint with a `generation_config.json`, the derived stop set equals its
@@ -1483,6 +1822,59 @@ pub(crate) mod tests {
     #[ignore = "needs GGUF_EDGE_RAON, a GGUF with the raon pre-tokenizer"]
     fn the_raon_pre_tokenizer_equals_the_recorded_ids_on_the_edge_texts() {
         check_edges("raon", "GGUF_EDGE_RAON");
+    }
+
+    /// Decoding with the special tokens skipped agrees with the reference `tokenizer.json` on a
+    /// thinking turn and a tool-call turn: every delimiter the reference marks special is
+    /// skipped here too. Skipped when `GGUF_TOKENIZER_FILE` or `GGUF_TOKENIZER_JSON` is unset.
+    #[test]
+    fn decoding_a_thinking_and_a_tool_call_turn_matches_the_tokenizer_json() {
+        let (Ok(gguf), Ok(json)) = (
+            std::env::var("GGUF_TOKENIZER_FILE"),
+            std::env::var("GGUF_TOKENIZER_JSON"),
+        ) else {
+            eprintln!("skipped: GGUF_TOKENIZER_FILE or GGUF_TOKENIZER_JSON is unset");
+            return;
+        };
+        let bundle = bundle_from_gguf(std::path::Path::new(&gguf)).expect("bundle");
+        let reference =
+            crate::tokenizer::Tokenizer::from_bytes(&std::fs::read(&json).expect("json"))
+                .expect("reference tokenizer");
+        let ours = bundle.tokenizer();
+        let id = |token: &str| ours.token_id(token).unwrap_or_else(|| panic!("{token}"));
+        let mut turns: Vec<Vec<u32>> = Vec::new();
+        for (opener, closer) in [
+            ("<|channel>", "<channel|>"),
+            ("<|tool_call>", "<tool_call|>"),
+            ("<|tool_response>", "<tool_response|>"),
+        ] {
+            let mut ids = vec![id(opener)];
+            ids.extend(
+                ours.encode("thinking about it, then call:get_weather{city:")
+                    .expect("encode"),
+            );
+            ids.push(id("<|\"|>"));
+            ids.extend(ours.encode("Paris").expect("encode"));
+            ids.push(id("<|\"|>"));
+            ids.push(id(closer));
+            ids.extend(ours.encode("The answer is 42.").expect("encode"));
+            turns.push(ids);
+        }
+        for ids in &turns {
+            assert_eq!(
+                ours.decode(ids).expect("decode"),
+                reference.decode(ids).expect("reference decode"),
+                "{ids:?}"
+            );
+        }
+        // Every id the reference skips, ours skips.
+        for id in 0..ours.vocab_size() {
+            assert_eq!(
+                ours.decode(&[id]).expect("decode"),
+                reference.decode(&[id]).expect("reference decode"),
+                "token {id}"
+            );
+        }
     }
 
     /// A space-marker GGUF (`GGUF_TOKENIZER_FILE`) against the `tokenizer.json` of the same model

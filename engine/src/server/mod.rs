@@ -15,12 +15,14 @@ mod error;
 mod fake;
 #[cfg(test)]
 mod family_registry_tests;
+mod fetch_name;
 #[cfg(test)]
 mod flint_tests;
 mod hf;
 #[cfg(test)]
 mod hf_tests;
 mod local_models;
+mod loopback_key;
 mod messages;
 mod model_serve;
 mod pieces;
@@ -32,6 +34,7 @@ pub(crate) mod run;
 mod sampler_trace;
 mod sse;
 mod state;
+pub(crate) mod supervisor;
 #[cfg(test)]
 mod testkit;
 mod tokenize;

@@ -14,7 +14,7 @@
 //! test asserts invariants, not bytes, and reports the bit-equal share.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
-//! usable; `k` is a multiple of 32; `ncols` is in `1..=8`; `x` holds `ncols * k` floats and `y`
+//! usable; `k` is a multiple of 32; `ncols` is in `1..=64`; `x` holds `ncols * k` floats and `y`
 //! holds [`q8_1_bytes`] bytes, both 4-byte aligned; `y` overlaps no byte of `x`. A refused call
 //! changes nothing.
 
@@ -27,7 +27,7 @@ use crate::kernels::cuda::native::resident::quantize_q8_1::{QuantizeRaw, quantiz
 /// Values per row are padded up to this (the vendored `MATRIX_ROW_PADDING`).
 pub(crate) const MATRIX_ROW_PADDING: usize = 512;
 /// Maximum rows per launch, matching the native entry's `ncols` guard.
-pub(crate) const MAX_ROWS: usize = 8;
+pub(crate) const MAX_ROWS: usize = 64;
 
 pub(crate) struct QuantizeCall<'b> {
     pub(crate) x: DeviceRange<'b>,
@@ -61,7 +61,7 @@ impl CudaContext {
 
     /// Quantize an arbitrary positive number of rows as ordered native-size launches.
     /// The whole input and output are checked for overlap before any launch, including
-    /// cross-chunk overlap. The original single-launch interface keeps its eight-row limit.
+    /// cross-chunk overlap. The original single-launch interface keeps its native row limit.
     #[cfg_attr(not(test), allow(dead_code, reason = "staged for GGUF routed decode"))]
     pub(crate) fn quantize_q8_1_rows(
         &self,

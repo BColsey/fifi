@@ -1,6 +1,6 @@
 //! The resident Gemma 4 Humanizer decode step on one CUDA device.
 //!
-//! This module composes the checked resident operations over the pinned Q8_0
+//! This module composes the checked resident operations over a Q8_0
 //! checkpoint: a Q8_0 embedding gather, forty-eight decoder layers (attention over
 //! the KV8 planes, split-half RoPE, the GELU-tanh gated feed-forward, the residual
 //! sums and the layer scalar), the final RMSNorm, the tied-embedding logit
@@ -35,10 +35,14 @@ mod window_tests;
 
 use crate::EngError;
 use crate::family::kv_ring::KvRing;
+use crate::family::project::cuda::matrix::{
+    upload_matrix as matrix, upload_matrix_bytes as matrix_from_bytes,
+};
 use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};
+use crate::kernels::cuda::resident::matvec_q::MatvecCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, NativeWeight};
 use crate::weights::{GgufType, GgufWeights};
 
 pub(crate) const LAYERS: usize = 48;
@@ -48,41 +52,9 @@ pub(crate) const HIDDEN: usize = 3840;
 pub(crate) const VOCAB: usize = 262_144;
 pub(crate) const HEADS: usize = 16;
 /// KV cells held per head: the 8,192-token combined context of the goal.
-pub(crate) const CELLS: usize = 8192;
+pub(crate) const CELLS: usize = super::gguf::HUMANIZER_CELLS as usize;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 pub(crate) const FFN: usize = 15360;
-
-/// One Q8_0 matrix resident on the device, raw checkpoint blocks.
-pub(crate) struct Matrix {
-    pub(crate) buf: DeviceBuffer,
-    pub(crate) rows: usize,
-    pub(crate) k: usize,
-}
-
-impl Matrix {
-    fn bytes(&self) -> usize {
-        self.rows * (self.k / 32) * 34
-    }
-}
-
-/// One Q8_0 matrix resident on the device in the split layout gemma_matvec reads: one
-/// int8 quant plane per row, then one half scale per 32-value block.
-pub(crate) struct PackedMatrix {
-    pub(crate) qs: DeviceBuffer,
-    pub(crate) scales: DeviceBuffer,
-    rows: usize,
-    k: usize,
-}
-
-impl PackedMatrix {
-    fn qs_bytes(&self) -> usize {
-        self.rows * self.k
-    }
-
-    fn scales_bytes(&self) -> usize {
-        self.rows * (self.k / 32) * 2
-    }
-}
 
 pub(crate) struct Vector {
     pub(crate) buf: DeviceBuffer,
@@ -101,21 +73,24 @@ pub(crate) struct Kv {
     v_codes: DeviceBuffer,
     v_scales: DeviceBuffer,
     shape: Kv8Shape,
+    /// The ring geometry the planes were built from, and the context their cells were counted for.
+    geometry: KvRing,
+    context: usize,
 }
 
 pub(crate) struct Layer {
     attn_norm: Vector,
     q_norm: Vector,
     k_norm: Vector,
-    q: PackedMatrix,
-    k: PackedMatrix,
-    v: Option<PackedMatrix>,
-    out: PackedMatrix,
+    q: NativeWeight,
+    k: NativeWeight,
+    v: Option<NativeWeight>,
+    out: NativeWeight,
     post_attn_norm: Vector,
     ffn_norm: Vector,
-    gate: PackedMatrix,
-    up: PackedMatrix,
-    down: PackedMatrix,
+    gate: NativeWeight,
+    up: NativeWeight,
+    down: NativeWeight,
     post_ffw_norm: Vector,
     scale: f32,
     global: bool,
@@ -149,13 +124,15 @@ pub(crate) struct Scratch {
     pub(crate) ids: DeviceBuffer,
     pub(crate) pos: DeviceBuffer,
     pub(crate) kv_len: DeviceBuffer,
+    /// The gather's status word: a bad token id sets a bit here.
+    pub(crate) status: DeviceBuffer,
 }
 
 pub(crate) struct Gemma {
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<Layer>,
-    pub(crate) embed: Matrix,
+    pub(crate) embed: NativeWeight,
     pub(crate) out_norm: Vector,
     pub(crate) rope_freqs: Option<Vector>,
     pub(crate) scratch: Scratch,
@@ -171,7 +148,7 @@ pub(crate) struct Gemma {
 /// What the wide prefill attention sees of the global layers: one kv head of 512-wide planes
 /// read by every query head, at most one prefill batch of rows.
 fn wide_geometry() -> WideGeometry {
-    WideGeometry::unscaled(HEADS, 1, CELLS, Gemma::PREFILL_BATCH)
+    WideGeometry::unscaled(HEADS, 1, CELLS)
 }
 
 pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
@@ -187,33 +164,30 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
         // A local layer reaches the last `window` positions, so it keeps a ring of that many
         // cells plus one prefill batch; a global layer keeps every position.
         let geometry = KvRing::sliding(if global { 0 } else { window }, Gemma::PREFILL_BATCH);
-        let cells = geometry.cells(CELLS);
+        let shape = Kv8Shape::of_layer(geometry, CELLS, 1, n_kv, head, Kv8CodeScale::UnroundedF32);
+        // The planes take the shape's cells: there is one derivation of a ring's cell count.
+        let cells = shape.cells;
         let kv = Kv {
             k_codes: zero(&ctx, n_kv * cells * head)?,
             k_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
             v_codes: zero(&ctx, n_kv * cells * head)?,
             v_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
-            shape: Kv8Shape {
-                rows: 1,
-                n_kv_head: n_kv,
-                head_dim: head,
-                cells,
-                code_scale: Kv8CodeScale::UnroundedF32,
-                ring: geometry.kernel_ring(CELLS),
-            },
+            shape,
+            geometry,
+            context: CELLS,
         };
         layers.push(Layer {
             attn_norm: vector(&weights, &ctx, &format!("{base}attn_norm.weight"), HIDDEN)?,
             q_norm: vector(&weights, &ctx, &format!("{base}attn_q_norm.weight"), head)?,
             k_norm: vector(&weights, &ctx, &format!("{base}attn_k_norm.weight"), head)?,
-            q: packed_matrix(
+            q: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_q.weight"),
                 HIDDEN,
                 HEADS * head,
             )?,
-            k: packed_matrix(
+            k: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_k.weight"),
@@ -223,7 +197,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
             v: if global {
                 None
             } else {
-                Some(packed_matrix(
+                Some(matrix(
                     &weights,
                     &ctx,
                     &format!("{base}attn_v.weight"),
@@ -231,7 +205,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
                     n_kv * head,
                 )?)
             },
-            out: packed_matrix(
+            out: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}attn_output.weight"),
@@ -245,15 +219,15 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
                 HIDDEN,
             )?,
             ffn_norm: vector(&weights, &ctx, &format!("{base}ffn_norm.weight"), HIDDEN)?,
-            gate: packed_matrix(
+            gate: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_gate.weight"),
                 HIDDEN,
                 FFN,
             )?,
-            up: packed_matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
-            down: packed_matrix(
+            up: matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
+            down: matrix(
                 &weights,
                 &ctx,
                 &format!("{base}ffn_down.weight"),
@@ -307,6 +281,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
         ids: zero(&ctx, 4)?,
         pos: zero(&ctx, 4)?,
         kv_len: zero(&ctx, 4)?,
+        status: zero(&ctx, 4)?,
     };
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
@@ -341,95 +316,34 @@ fn vector_filled(ctx: &CudaContext, len: usize, value: f32) -> Result<Vector, En
     })
 }
 
-fn matrix(
-    weights: &GgufWeights,
+/// The shared matvec of the first `rows` rows of `weight` over the `m` q8_1 rows `x_q8`, into the
+/// rows of `y`, in launches of up to 8 columns; the column-invariant entry makes a column the same
+/// bytes whatever launch it sits in, which the window and chunk equalities of the step rely on.
+fn matvec(
     ctx: &CudaContext,
-    name: &str,
-    k: usize,
+    stream: &DeviceStream,
+    weight: &NativeWeight,
     rows: usize,
-) -> Result<Matrix, EngError> {
-    let (ty, bytes) = weights.read_tensor(name)?;
-    if ty != GgufType::Q80 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} is {}, expected Q8_0",
-            ty.name()
-        )));
+    x_q8: &DeviceBuffer,
+    y: &Vector,
+    m: usize,
+) -> Result<(), EngError> {
+    let k = weight.k();
+    let row_bytes = q8_1_bytes(k, 1).expect("activation row size");
+    for first in (0..m).step_by(8) {
+        let columns = 8.min(m - first);
+        let call = MatvecCall {
+            ty: weight.quant(),
+            w: weight.buffer().range(0, weight.buffer().bytes())?,
+            x_q8: x_q8.range(first * row_bytes, columns * row_bytes)?,
+            y: y.buf.range(first * rows * 4, columns * rows * 4)?,
+            k,
+            rows,
+            ncols: columns,
+        };
+        ctx.matvec_q_invariant(stream, call)?;
     }
-    if bytes.len() != rows * (k / 32) * 34 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} holds {} bytes, expected {}",
-            bytes.len(),
-            rows * (k / 32) * 34
-        )));
-    }
-    Ok(Matrix {
-        buf: ctx.upload(&bytes)?,
-        rows,
-        k,
-    })
-}
-
-/// Reads one Q8_0 tensor and splits each 34-byte block into the quant plane and the
-/// half scale plane that gemma_matvec reads.
-fn packed_matrix(
-    weights: &GgufWeights,
-    ctx: &CudaContext,
-    name: &str,
-    k: usize,
-    rows: usize,
-) -> Result<PackedMatrix, EngError> {
-    let (ty, bytes) = weights.read_tensor(name)?;
-    if ty != GgufType::Q80 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} is {}, expected Q8_0",
-            ty.name()
-        )));
-    }
-    let blocks = k / 32;
-    if bytes.len() != rows * blocks * 34 {
-        return Err(EngError::Checkpoint(format!(
-            "gguf model: tensor {name} holds {} bytes, expected {}",
-            bytes.len(),
-            rows * blocks * 34
-        )));
-    }
-    let mut qs = vec![0u8; rows * k];
-    let mut scales = vec![0u8; rows * blocks * 2];
-    // The split is a pure copy, so it runs over row chunks: 11.6 GB serially cost 23 s
-    // of load on the Jetson.
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(16);
-    let per = rows.div_ceil(workers.max(1));
-    let source = &bytes;
-    std::thread::scope(|scope| {
-        let chunks = qs
-            .chunks_mut(per * k)
-            .zip(scales.chunks_mut(per * blocks * 2))
-            .enumerate();
-        for (index, (qs_chunk, scales_chunk)) in chunks {
-            let first = index * per;
-            scope.spawn(move || {
-                for (local, r) in (first..rows.min(first + per)).enumerate() {
-                    for b in 0..blocks {
-                        let at = (r * blocks + b) * 34;
-                        let q_at = local * k + b * 32;
-                        let s_at = local * blocks * 2 + b * 2;
-                        scales_chunk[s_at] = source[at];
-                        scales_chunk[s_at + 1] = source[at + 1];
-                        qs_chunk[q_at..q_at + 32].copy_from_slice(&source[at + 2..at + 34]);
-                    }
-                }
-            });
-        }
-    });
-    Ok(PackedMatrix {
-        qs: ctx.upload(&qs)?,
-        scales: ctx.upload(&scales)?,
-        rows,
-        k,
-    })
+    Ok(())
 }
 
 fn vector(

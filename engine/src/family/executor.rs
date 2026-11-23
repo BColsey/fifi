@@ -2,7 +2,7 @@
 
 use crate::EngError;
 use crate::family::sampler::Sampler;
-use crate::family::session::{SaveKind, StoreLimits};
+use crate::family::session::{self, DecodeSession, Limits, SaveKind, StoreLimits, TokenStepper};
 use crate::sched::job::{PrefillBankReport, PrefixReport};
 use crate::tokenizer::{DecodeBatch, IncrementalDecoder};
 use std::sync::Arc;
@@ -209,6 +209,10 @@ pub(crate) trait ExecutorOps {
     fn mlx_execution_plan(&self) -> Option<&super::mlx_report::MlxExecutionPlan> {
         None
     }
+    /// The routed experts' placement after startup has built the bank.
+    fn expert_placement(&self) -> Option<&super::expert_placement::ExpertPlacement> {
+        None
+    }
     /// The limits of this executor's prefix store: how many pinned roots and how many LRU entries
     /// it holds. The worker asks once per job and plans its save points with the answer: it emits a
     /// root point only when `roots > 0`, so a job with a root boundary behaves like a job without
@@ -314,13 +318,70 @@ pub(crate) trait ExecutorOps {
     }
 }
 
+/// Runs one model state through the shared decode policy, without a prefix store.
+pub(crate) struct SerialDecode<S> {
+    step: S,
+    eos: Vec<u32>,
+    sampler_vocab: usize,
+    context_limit: usize,
+}
+
+impl<S: TokenStepper> SerialDecode<S> {
+    pub(crate) fn new(step: S, eos: Vec<u32>, sampler_vocab: usize, context_limit: usize) -> Self {
+        Self {
+            step,
+            eos,
+            sampler_vocab,
+            context_limit,
+        }
+    }
+}
+
+impl<S: TokenStepper> ExecutorOps for SerialDecode<S> {
+    type Session = DecodeSession;
+
+    fn check_prompt(&self, prompt_tokens: usize) -> Result<()> {
+        session::check_prompt(prompt_tokens, self.context_limit)
+    }
+
+    fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32] {
+        st.history()
+    }
+
+    fn reset(&mut self, st: &mut Self::Session) -> Result<()> {
+        st.reset(&mut self.step)
+    }
+
+    fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()> {
+        st.prefill(&mut self.step, toks, self.context_limit)
+    }
+
+    fn decode(
+        &mut self,
+        st: &mut Self::Session,
+        generation: &mut GenerationState,
+    ) -> Result<DecodeBatch> {
+        st.decode(
+            &mut self.step,
+            generation,
+            &Limits {
+                eos: &self.eos,
+                sampler_vocab: self.sampler_vocab,
+                context_limit: self.context_limit,
+            },
+        )
+    }
+
+    fn boundary(&mut self, _st: &mut Self::Session) {}
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BatchPolicy, ExecutorOps, GenerationState};
+    use super::{BatchPolicy, ExecutorOps, GenerationState, SerialDecode};
     use crate::EngError;
     use crate::family::sampler::{Sampler, SamplingParams};
-    use crate::family::session::{SaveKind, StoreLimits};
-    use crate::tokenizer::{DecodeBatch, IncrementalDecoder, Tokenizer};
+    use crate::family::session::{DecodeSession, SaveKind, StoreLimits, TokenStepper};
+    use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
     use std::sync::atomic::Ordering;
 
     const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"a":0},"merges":[]}}"#;
@@ -359,6 +420,54 @@ mod tests {
         for _ in 0..5 {
             let id = state.sampler.sample(&[0.0, 2.0, 1.0]).expect("sample");
             assert_eq!(id, 1);
+        }
+    }
+
+    #[derive(Default)]
+    struct Step(Vec<u32>);
+
+    impl TokenStepper for Step {
+        const OPERATION: &'static str = "test_serial_decode";
+
+        fn feed(&mut self, token: u32) -> Result<(), EngError> {
+            self.0.push(token);
+            Ok(())
+        }
+
+        fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+            self.feed(token)?;
+            assert_eq!(self.0, [0, 0, 0]);
+            Ok(vec![1.0])
+        }
+
+        fn fed(&self) -> usize {
+            self.0.len()
+        }
+
+        fn reset(&mut self) -> Result<(), EngError> {
+            self.0.clear();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn serial_decode_feeds_each_prompt_token_once_and_honors_the_budget() {
+        for pieces in [&[&[0, 0, 0][..]][..], &[&[0][..], &[0, 0][..]][..]] {
+            let mut executor = SerialDecode::new(Step::default(), vec![], 1, 4);
+            let mut session = DecodeSession::default();
+            for piece in pieces {
+                executor.prefill(&mut session, piece).unwrap();
+            }
+            assert_eq!(executor.step.fed(), 2);
+            let mut generation = new_state().with_max_tokens(1);
+            let batch = executor.decode(&mut session, &mut generation).unwrap();
+            assert_eq!(batch.tokens, [0]);
+            assert_eq!(batch.text, "a");
+            assert!(matches!(batch.finish, Some(DecodeFinish::Length)));
+            assert_eq!(executor.history(&session), [0, 0, 0, 0]);
+            executor.reset(&mut session).unwrap();
+            assert_eq!(executor.step.fed(), 0);
+            assert!(executor.history(&session).is_empty());
         }
     }
 

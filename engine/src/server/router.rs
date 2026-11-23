@@ -38,6 +38,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/v1/system", get(system))
         .route("/v1/telemetry", get(telemetry))
         .route("/v1/recent-requests", get(recent_requests))
+        .route("/v1/logs", get(logs))
         .route("/v1/sampler-trace", get(get_sampler_trace))
         .route("/v1/route-trace", get(get_route_trace))
         .route("/v1/chat/completions", post(chat))
@@ -58,10 +59,24 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
             get(super::hf::downloads).post(super::hf::start_download),
         )
         .route("/v1/hf/downloads/{id}", delete(super::hf::cancel_download))
+        // The proxy runs inside the authentication layer: a request
+        // the caller may not make must not reach the worker, and a
+        // request whose routing names a supervised worker skips the
+        // local handler instead of running beside it. Routes whose
+        // bodies carry none of the routing fields pass straight
+        // through.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::supervisor::proxy_to_worker,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let messages_routes = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::supervisor::proxy_to_worker,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_messages_auth,
@@ -232,20 +247,28 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         .iter()
         .map(|entry| {
             let status = entry.handle.state();
+            let settings = if status == crate::sched::worker::EngineState::Loading {
+                &entry.effective
+            } else {
+                entry.handle.loaded_effective().unwrap_or(&entry.effective)
+            };
             let mut engine = serde_json::json!({
                 "id": entry.id,
                 "model": entry.model,
                 "state": state_name(status),
                 "queued": entry.handle.queued(),
                 "context_limit": entry.context_limit,
-                // The retained rows the engine started with (empty where a
-                // family composes no per-key origins) — not a re-resolution.
-                "settings": entry.effective,
+                "settings": settings,
             });
             if status != crate::sched::worker::EngineState::Loading
                 && let Some(plan) = entry.handle.mlx_execution()
             {
                 engine["execution"] = json!(plan);
+            }
+            if status != crate::sched::worker::EngineState::Loading
+                && let Some(placement) = entry.handle.expert_placement()
+            {
+                engine["expert_placement"] = json!(placement);
             }
             engine
         })
@@ -257,9 +280,63 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "cpu_threads": host.cpu_threads,
             "mem_total_bytes": probe_json(&host.mem_total_bytes),
             "mem_available_bytes": probe_json(&host.mem_available_bytes),
+            // Rate inputs, not rates: the monitor diffs two polls into
+            // a CPU percentage and disk throughput. Null off Linux.
+            "cpu_times": read_cpu_times(),
+            "proc_io": read_proc_io().map(|(read_bytes, write_bytes)| {
+                json!({"read_bytes": read_bytes, "write_bytes": write_bytes})
+            }),
         },
         "engines": engines,
     }))
+}
+
+/// `/proc/stat`'s aggregate CPU line as cumulative jiffy counts
+/// (`user nice system idle iowait irq softirq steal ...`). The
+/// monitor diffs two polls into a utilisation percentage; `None`
+/// off Linux, where the figure stays absent rather than wrong.
+fn read_cpu_times() -> Option<Vec<u64>> {
+    parse_cpu_times(std::fs::read_to_string("/proc/stat").ok()?.lines().next()?)
+}
+
+fn parse_cpu_times(line: &str) -> Option<Vec<u64>> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    // Guest and guest_nice are already included in user and nice.
+    let times: Vec<u64> = fields
+        .take(8)
+        .map(|f| f.parse().ok())
+        .collect::<Option<_>>()?;
+    (times.len() >= 4).then_some(times)
+}
+
+/// `/proc/self/io`'s `read_bytes` and `write_bytes`: this process's
+/// block-level I/O, which is the model-streaming and download
+/// traffic the monitor's disk figure wants. `None` off Linux.
+fn read_proc_io() -> Option<(u64, u64)> {
+    parse_proc_io(&std::fs::read_to_string("/proc/self/io").ok()?)
+}
+
+fn parse_proc_io(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| -> Option<u64> {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+    };
+    Some((field("read_bytes:")?, field("write_bytes:")?))
+}
+
+/// The monitor's server-event ring: engine lifecycle, failures and
+/// download lines, oldest first, bounded by the state's ring cap.
+async fn logs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.log_new_failures();
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(json!({"events": state.events_snapshot()})),
+    )
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
@@ -503,9 +580,16 @@ mod tests {
             assert_eq!(body["backends_compiled"], serde_json::json!([]));
         }
         assert!(body["host"]["cpu_threads"].as_u64().is_some_and(|n| n >= 1));
+        // The rate inputs: present everywhere, populated on Linux.
+        assert!(matches!(
+            body["host"]["cpu_times"],
+            serde_json::Value::Null | serde_json::Value::Array(_)
+        ));
+        assert!(body["host"]["proc_io"].is_object() || body["host"]["proc_io"].is_null());
         assert_eq!(body["engines"][0]["id"], "e1");
         assert_eq!(body["engines"][0]["context_limit"], 4_096);
-        // No device claims of any kind from a serving process.
+        assert!(body["engines"][0].get("expert_placement").is_none());
+        // The fake engine publishes no device facts.
         let text = body.to_string();
         assert!(!text.contains("vram") && !text.contains("device"), "{text}");
     }
@@ -539,6 +623,96 @@ mod tests {
         assert_eq!(rows[0]["key"], "context_limit");
         assert_eq!(rows[0]["value"], "32768");
         assert_eq!(rows[0]["origin"], "config_file");
+    }
+
+    #[tokio::test]
+    async fn system_route_reports_worker_resolved_flint_settings() {
+        use crate::{
+            capability::effective::flint_effective,
+            exec_fake::FakeExecutor,
+            family::flint::{
+                budget::{CpuMoeConfig, FlintEnv, LayerMajor},
+                prefill_order::{OrderInputs, resolve_prefill_order},
+                settings::FlintOptions,
+            },
+            sched::worker::spawn_engine,
+        };
+        let start = |mode, fails| {
+            let (gate, wait) = std::sync::mpsc::channel::<()>();
+            let (staged, ready) = std::sync::mpsc::channel();
+            let engine = spawn_engine(16, move |stages| {
+                let options = FlintOptions::cuda_default();
+                let cpu_moe = CpuMoeConfig::default();
+                let inputs = OrderInputs::for_options(&options, &cpu_moe, true, true);
+                let order = resolve_prefill_order(None, None, &inputs)
+                    .unwrap()
+                    .with_mode(mode);
+                stages.publish_effective(flint_effective(
+                    &options,
+                    &FlintEnv::default(),
+                    Some(&order),
+                ));
+                staged.send(()).unwrap();
+                wait.recv().unwrap();
+                if fails {
+                    return Err(crate::EngError::Checkpoint("fixture load failure".into()));
+                }
+                Ok((
+                    FakeExecutor::new(Vec::new(), &[testkit::EOS], 32),
+                    Default::default(),
+                ))
+            })
+            .unwrap();
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(engine.handle().loaded_effective().is_none());
+            (engine, gate)
+        };
+        let (fallback, release_fallback) = start(LayerMajor::Off, false);
+        let (jobs, release_jobs) = start(LayerMajor::Jobs, false);
+        let (failed, release_failed) = start(LayerMajor::Jobs, true);
+        let entries = vec![
+            testkit::entry("fallback", "model-a", &fallback, 4096),
+            testkit::entry("jobs", "model-b", &jobs, 4096),
+            testkit::entry("failed", "model-c", &failed, 4096),
+        ];
+        let app = router(Arc::new(AppState::new(testkit::API_KEY, entries)));
+        let query = || async {
+            let (status, _, bytes) =
+                testkit::send(&app, testkit::get("/v1/system", Some(testkit::API_KEY))).await;
+            assert_eq!(status, StatusCode::OK);
+            testkit::json_of(&bytes)
+        };
+        let loading = query().await;
+        for engine in loading["engines"].as_array().unwrap() {
+            assert_eq!(engine["state"], "loading");
+            assert_eq!(engine["settings"], serde_json::json!([]));
+        }
+        release_jobs.send(()).unwrap();
+        release_failed.send(()).unwrap();
+        release_fallback.send(()).unwrap();
+        testkit::wait_for_state(&jobs.handle(), EngineState::Ready);
+        testkit::wait_for_state(&failed.handle(), EngineState::Error);
+        testkit::wait_for_state(&fallback.handle(), EngineState::Ready);
+        let settled = query().await;
+        let setting = |index: usize, key| {
+            settled["engines"][index]["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["key"] == key)
+                .unwrap()["value"]
+                .as_str()
+                .unwrap()
+        };
+        assert!(setting(0, "layer_major").starts_with("off (token-major) (default-fallback"));
+        assert_eq!(setting(0, "tall_hilo"), "off");
+        assert_eq!(setting(1, "tall_hilo"), "on");
+        assert_eq!(settled["engines"][2]["settings"], serde_json::json!([]));
+        fallback.shutdown();
+        jobs.shutdown();
+        failed.shutdown();
     }
 
     #[tokio::test]
@@ -690,6 +864,46 @@ mod tests {
         assert_schema("RecentRequests", &body);
         assert!(body["requests"].as_array().expect("array").is_empty());
         assert!(body["active"].as_array().expect("active array").is_empty());
+    }
+
+    #[tokio::test]
+    async fn logs_route_lists_the_event_ring_oldest_first() {
+        let state = Arc::new(AppState::new(testkit::API_KEY, Vec::new()));
+        state.record_event("engine e1 registered");
+        state.record_event("engine e1 stopped");
+        let app = router(state);
+        let (status, _, _) = testkit::send(&app, testkit::get("/v1/logs", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let request = testkit::get("/v1/logs", Some(testkit::API_KEY));
+        let (status, headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-store");
+        let body = testkit::json_of(&body);
+        assert_schema("Logs", &body);
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["line"], "engine e1 registered");
+        assert_eq!(events[1]["line"], "engine e1 stopped");
+        assert!(events[0]["ts_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn cpu_times_parse_from_the_aggregate_proc_stat_line() {
+        let times = super::parse_cpu_times("cpu  100 20 30 4000 50 0 0 10 55 7").expect("parse");
+        assert_eq!(times, vec![100, 20, 30, 4000, 50, 0, 0, 10]);
+        assert!(super::parse_cpu_times("cpu 100 1 3").is_none());
+        assert!(super::parse_cpu_times("procs_running 3").is_none());
+        // A non-numeric jiffy poisons the whole line, not one field.
+        assert!(super::parse_cpu_times("cpu 100 x 3").is_none());
+    }
+
+    #[test]
+    fn proc_io_reads_only_the_two_counter_lines() {
+        let pair =
+            super::parse_proc_io("rchar: 1\nread_bytes: 4096\nwchar: 2\nwrite_bytes: 8192\n")
+                .expect("parse");
+        assert_eq!(pair, (4096, 8192));
+        assert!(super::parse_proc_io("read_bytes: 4096\n").is_none());
     }
 
     fn web_state() -> (
@@ -1178,6 +1392,83 @@ mod tests {
         let body = testkit::json_of(&body);
         assert_eq!(body["error"]["code"], "bad_request");
         assert_eq!(body["error"]["message"], "model_dir is required");
+    }
+
+    /// The supervised add as one piece: the handler's derivation and the
+    /// real spawn. The in-process path takes the engine out of the derived
+    /// configuration; the worker's configuration must still carry it.
+    #[tokio::test]
+    async fn a_supervised_add_hands_the_worker_its_engine() {
+        let scratch = std::env::temp_dir();
+        let tag = format!("fifi-supervised-add-{}", std::process::id());
+        let model_dir = scratch.join(&tag);
+        std::fs::create_dir_all(&model_dir).expect("model directory");
+        // Nothing listens there: the front keeps the worker `starting`.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a free port")
+            .local_addr()
+            .expect("address")
+            .port();
+        let script = scratch.join(format!("{tag}.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"enginesrv listening on 127.0.0.1:{port}\"\n\
+                 exec sleep 60\n"
+            ),
+        )
+        .expect("the stand-in worker");
+        assert!(
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod")
+                .success()
+        );
+        let engine = testkit::engine(testkit::script("unused"));
+        let entry = testkit::entry("boot", "fake-model", &engine, 128);
+        let family = crate::family::qwen::flash_next::factory::FAMILY;
+        let state = Arc::new(
+            AppState::new(testkit::API_KEY, vec![entry]).with_worker_binary(script.clone()),
+        );
+        state.set_supervised_engines(true);
+        let body = serde_json::json!({ "id": "flash", "family": family, "model_dir": model_dir });
+        let (status, _headers, bytes) =
+            testkit::send(&router(Arc::clone(&state)), post_engines(&body.to_string())).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(testkit::json_of(&bytes)["supervised"], true);
+
+        let config_path = scratch.join(format!("fifi-worker-{}-flash.json", std::process::id()));
+        let written = crate::server::config::Config::from_file(&config_path)
+            .expect("the worker's configuration file");
+        let engine = &written.engines[0];
+        assert_eq!(engine.family, family);
+        assert!(
+            engine.model_dir.ends_with(&tag),
+            "{}",
+            engine.model_dir.display()
+        );
+
+        let request = testkit::request("DELETE", "/v1/engines/flash", Some(testkit::API_KEY));
+        let (status, _headers, _body) = testkit::send(&router(state), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while config_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the configuration file outlived the worker"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir(&model_dir);
     }
 
     #[tokio::test]

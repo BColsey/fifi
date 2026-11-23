@@ -426,11 +426,11 @@ mod tests {
 /// The recorder inside `ResidentDecoder::step` on the synthetic checkpoint (Mac only).
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod native {
-    use super::super::super::load::FlashWeights;
     use super::super::fixtures::{Entry, config, tensors};
     use super::super::moe::tests::checkpoint_from;
     use super::super::{ResidentDecoder, StepMode};
     use super::*;
+    use crate::family::qwen::flash_next::load::FlashWeights;
     use crate::kernels::MlxKernels;
 
     const LAYER0_ROUTER: &str = "language_model.model.layers.0.mlp.gate.weight";

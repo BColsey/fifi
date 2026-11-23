@@ -51,9 +51,10 @@ __device__ __forceinline__ int quants4_w(const unsigned char *q, int group) {
     return (int)p[0] | ((int)p[1] << 16);
 }
 
+template <int NCols>
 __global__ void __launch_bounds__(256, 2) matvec_q80(const unsigned char *w,
                                                      const unsigned char *x_q8, float *y, int k,
-                                                     int rows, int ncols, int w_blocks,
+                                                     int rows, int w_blocks,
                                                      size_t x_row_bytes) {
     const int warp = (int)(threadIdx.x >> 5);
     const int lane = (int)(threadIdx.x & 31);
@@ -66,8 +67,11 @@ __global__ void __launch_bounds__(256, 2) matvec_q80(const unsigned char *w,
      * over the whole block (an exact integer dot), folds the two f16 scales in
      * once, and accumulates in block order with the b&32 split; the reduce is a
      * full xor tree. Every column repeats the same sequence, so the results do
-     * not depend on how many columns share the launch. */
-    float acc0[8] = {}, acc1[8] = {};
+     * not depend on how many columns share the launch. The column count is a
+     * template parameter so the accumulators stay in registers; __fmaf_rn pins the
+     * fused form, as a runtime-column loop over local arrays would otherwise emit
+     * a multiply and an add (two roundings). */
+    float acc0[NCols] = {}, acc1[NCols] = {};
     for (int b = lane; b < w_blocks; b += 32) {
         const unsigned char *wb = wrow + (size_t)b * kBlockBytes;
         int v[8];
@@ -76,7 +80,8 @@ __global__ void __launch_bounds__(256, 2) matvec_q80(const unsigned char *w,
             v[i] = quants4_w(wb + 2, i);
         }
         const float d_w = half_at(wb);
-        for (int col = 0; col < ncols; ++col) {
+        #pragma unroll
+        for (int col = 0; col < NCols; ++col) {
             const unsigned char *act = x_q8 + (size_t)col * x_row_bytes + (size_t)b * kXBlock;
             const int *a = (const int *)(act + 4);
             int d = 0;
@@ -85,11 +90,6 @@ __global__ void __launch_bounds__(256, 2) matvec_q80(const unsigned char *w,
                 d = __dp4a(v[i], a[i], d);
             }
             const float s = d_w * half_at(act);
-            /* __fmaf_rn pins the fused form: with the runtime-column accumulator
-             * arrays in local memory the compiler emits FMUL+FADD (two roundings)
-             * while the register-resident split-plane kernel contracts to one FFMA -
-             * a per-block 1-ulp drift at k not tile-sized (k = 2560 = 80 blocks,
-             * caught as the serve text divergence). */
             if (b & 32) {
                 acc1[col] = __fmaf_rn(s, (float)d, acc1[col]);
             } else {
@@ -97,7 +97,8 @@ __global__ void __launch_bounds__(256, 2) matvec_q80(const unsigned char *w,
             }
         }
     }
-    for (int col = 0; col < ncols; ++col) {
+    #pragma unroll
+    for (int col = 0; col < NCols; ++col) {
         float acc = acc0[col] + acc1[col];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -144,9 +145,21 @@ extern "C" int inference_cuda_matvec_q80_launch(const inference_cuda_matvec_q80_
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const int blocks = (rows + kWarps - 1) / kWarps;
-        matvec_q80<<<blocks, kWarps * 32, 0, (cudaStream_t)stream>>>(
-            (const unsigned char *)args->w, (const unsigned char *)args->x_q8, args->y, k, rows,
-            ncols, w_blocks, x_row_bytes);
+#define LAUNCH_COLS(N) \
+    case N: matvec_q80<N><<<blocks, kWarps * 32, 0, (cudaStream_t)stream>>>( \
+        (const unsigned char *)args->w, (const unsigned char *)args->x_q8, args->y, k, rows, \
+        w_blocks, x_row_bytes); break
+        switch (ncols) {
+            LAUNCH_COLS(1);
+            LAUNCH_COLS(2);
+            LAUNCH_COLS(3);
+            LAUNCH_COLS(4);
+            LAUNCH_COLS(5);
+            LAUNCH_COLS(6);
+            LAUNCH_COLS(7);
+            LAUNCH_COLS(8);
+        }
+#undef LAUNCH_COLS
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

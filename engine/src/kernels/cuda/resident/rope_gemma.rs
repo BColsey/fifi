@@ -8,7 +8,7 @@
 //! it is queued. It allocates nothing, copies nothing and never synchronizes.
 //!
 //! Every refusal is a BadRequest and happens before any native call: the backend is
-//! usable, rows are in 1..=16, query heads 16 with kv heads 1 or 8, or 8 with 2,
+//! usable, rows are in 1..=64, query heads 16 with kv heads 1 or 8, or 8 with 2,
 //! head_dim matches
 //! the mode (256 local, 512 global), the ranges hold their rows at 4-byte alignment,
 //! and q shares no byte with k. A refused call changes nothing.
@@ -76,9 +76,9 @@ impl CudaContext {
             .and_then(|v| v.checked_mul(call.head_dim))
             .and_then(|v| v.checked_mul(4))
             .ok_or_else(|| EngError::BadRequest("the rope_gemma size overflows".to_owned()))?;
-        if !(1..=16).contains(&call.rows_q) || !(1..=16).contains(&call.rows_k) {
+        if !(1..=64).contains(&call.rows_q) || !(1..=64).contains(&call.rows_k) {
             return Err(EngError::BadRequest(format!(
-                "the rope_gemma takes 1 to 16 rows, got q {} k {}",
+                "the rope_gemma takes 1 to 64 rows, got q {} k {}",
                 call.rows_q, call.rows_k
             )));
         }

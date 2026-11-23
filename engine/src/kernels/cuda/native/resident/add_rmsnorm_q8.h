@@ -39,13 +39,14 @@ typedef struct inference_cuda_add_rmsnorm_q8_args {
     int n;              /* multiple of 256, 256..32768 */
     float eps;          /* finite, > 0 */
     int rows;           /* row count, 1..262144; one block per row */
+    int h_stride;       /* f32 elements between rows of h: 0 = n, else >= n; delta, norm_out and q8 stay dense */
 } inference_cuda_add_rmsnorm_q8_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48,
+static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h_stride) == 52,
               "inference_cuda_add_rmsnorm_q8_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48,
+_Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h_stride) == 52,
                "inference_cuda_add_rmsnorm_q8_args layout");
 #endif
 

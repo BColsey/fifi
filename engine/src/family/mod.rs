@@ -49,6 +49,7 @@ pub(in crate::family) mod exl3_tensors;
     reason = "ungated so plain host gates compile the seam; the Flash-Next bank reaches it everywhere, the flint resident cache under test or native-cuda; the allow covers the members only tests still reach"
 )]
 pub(crate) mod expert_bank;
+pub(crate) mod expert_placement;
 pub mod flint;
 pub mod gemma;
 pub mod gguf_model;
@@ -58,6 +59,17 @@ pub(crate) mod gguf_select;
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
 pub(crate) mod host_shape;
+/// The shared plan of a prefix store whose entries live in host memory.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(all(feature = "native-cuda", target_os = "linux")),
+    allow(
+        dead_code,
+        reason = "the CUDA starts are the callers; host builds test the plan"
+    )
+)]
+pub(crate) mod host_store;
+pub mod inkling2_mini;
 pub mod keys;
 #[allow(
     dead_code,

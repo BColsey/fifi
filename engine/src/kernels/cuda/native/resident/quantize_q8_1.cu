@@ -42,7 +42,7 @@ extern "C" int inference_cuda_quantize_q8_1_launch(const inference_cuda_quantize
         const int k = args->k;
         const int ncols = args->ncols;
         if (args->x == NULL || args->y == NULL || k < 32 || k % QK8_1 != 0 ||
-            ncols < 1 || ncols > 8 || !aligned(args->x, sizeof(float)) ||
+            ncols < 1 || ncols > 64 || !aligned(args->x, sizeof(float)) ||
             !aligned(args->y, sizeof(float))) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }

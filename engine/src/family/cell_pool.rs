@@ -27,6 +27,95 @@ pub(crate) const OPEN_COMPLETION_CELLS: usize = 4096;
 /// The cells a session holds before a request sizes it.
 pub(crate) const INITIAL_CELLS: usize = CELL_GRANULE;
 
+/// The room a request gets beyond its prompt when it is admitted, whatever generation limit it
+/// names: a session holds the cells of the tokens it has and grows as it decodes, so a request
+/// that may generate 32K tokens does not reserve them up front.
+pub(crate) fn admission_room(completion_limit: Option<u32>) -> u32 {
+    let room = INITIAL_CELLS as u32;
+    completion_limit.map_or(room, |limit| limit.min(room))
+}
+
+/// The cells a session that holds `current` grows to when it needs room for `needed` positions:
+/// half again what it holds, so a long decode grows a few times and not at every
+/// token, rounded to whole granules, never more than `ceiling` and never fewer than it needs.
+pub(crate) fn grow_target(current: usize, needed: usize, ceiling: usize) -> usize {
+    let wanted = needed.max(current.saturating_add(current / 2));
+    wanted
+        .div_ceil(CELL_GRANULE)
+        .saturating_mul(CELL_GRANULE)
+        .min(ceiling)
+        .max(needed.min(ceiling))
+}
+
+/// Funds the growth of session `who`, which holds `held` cells, to room for `positions`: leases
+/// the cells of [`grow_target`] from the pool, or, when the pool cannot fund that much, only what
+/// the positions need. Returns the cells the lease now holds. A pool that cannot fund even that
+/// refuses with a memory-plan error naming the session and the shortfall and the lease is as it
+/// was; so is a request for more than one session can hold. The one rule of every family that
+/// grows its sessions on the pool.
+pub(crate) fn fund_growth(
+    lease: &mut CellLease,
+    who: impl std::fmt::Display,
+    held: usize,
+    positions: usize,
+    ceiling: usize,
+) -> Result<usize, EngError> {
+    if positions > ceiling {
+        return Err(EngError::ContextLimit(format!(
+            "session {who}: {positions} positions exceed the {ceiling} cells of one session"
+        )));
+    }
+    let target = grow_target(held, positions, ceiling);
+    if lease.resize_for(target, ceiling).is_ok() {
+        return Ok(target);
+    }
+    let least = grow_target(held, positions, positions);
+    lease.resize_for(least, ceiling).map_err(|_| {
+        EngError::MemoryPlan(format!(
+            "session {who} needs {} more cells to hold {positions} positions and the pool has {} \
+             of {} free; the request ends here and the others go on",
+            least.saturating_sub(held),
+            lease.pool.free(),
+            lease.pool.total()
+        ))
+    })?;
+    Ok(least)
+}
+
+/// Checks the card before session `who` re-lays its planes: the old planes stay until the copy
+/// ends, so the new ones (`bytes_of(cells)`) must fit in the free bytes beside them. When they do
+/// not, the session retries once at exactly the cells its positions need; when that does not fit
+/// either it is refused, naming the bytes it needs and the card has, and its lease goes back to
+/// `held`. `free` is `None` when the card cannot be read: the allocation decides then. Returns
+/// the cells the lease now holds.
+pub(crate) fn fit_planes(
+    lease: &mut CellLease,
+    who: impl std::fmt::Display,
+    held: usize,
+    cells: usize,
+    positions: usize,
+    free: Option<u64>,
+    bytes_of: impl Fn(usize) -> u64,
+) -> Result<usize, EngError> {
+    let Some(free) = free else {
+        return Ok(cells);
+    };
+    if free >= bytes_of(cells) {
+        return Ok(cells);
+    }
+    if positions < cells && free >= bytes_of(positions) {
+        lease.resize(positions);
+        return Ok(positions);
+    }
+    lease.resize(held);
+    Err(EngError::MemoryPlan(format!(
+        "session {who} cannot grow from {held} to {cells} cells: the new planes need {} B beside \
+         the old ones until the copy ends and the card has {free} B free; the request ends here \
+         and the others go on",
+        bytes_of(cells)
+    )))
+}
+
 /// The cells of an even share of a pool of `pool` cells among `sessions`, whole granules.
 pub(crate) fn even_share(pool: usize, sessions: usize) -> usize {
     (pool / sessions.max(1) / CELL_GRANULE * CELL_GRANULE).max(INITIAL_CELLS)
@@ -247,6 +336,22 @@ pub(crate) fn session_cells_or_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_grows_by_half_in_whole_granules_up_to_its_ceiling() {
+        assert_eq!(grow_target(1024, 1025, 65_536), 2048);
+        assert_eq!(grow_target(4096, 4097, 65_536), 6144);
+        assert_eq!(grow_target(60_000, 60_001, 65_536), 65_536);
+        // A need beyond half again is met, rounded up.
+        assert_eq!(grow_target(1024, 5000, 65_536), 5120);
+        // Never fewer than the need, never more than the ceiling.
+        assert_eq!(grow_target(1024, 1025, 1025), 1025);
+        assert_eq!(grow_target(1024, 1025, 1500), 1500);
+        for current in [1024, 3072, 40_960] {
+            let next = grow_target(current, current + 1, 262_144);
+            assert!(next > current && next.is_multiple_of(CELL_GRANULE));
+        }
+    }
 
     const CEILING: usize = 65_536;
 

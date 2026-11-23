@@ -1,6 +1,24 @@
 import { test } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { speedSummary, type SpeedRow } from "./speed.js";
+import { byteRate, cpuUtilization, speedSummary, type SpeedRow } from "./speed.js";
+
+test("CPU utilization excludes guest duplication and counts I/O wait as idle", () => {
+  const first = [100, 20, 30, 4000, 50, 0, 0, 10, 4, 0];
+  const second = [125, 20, 30, 4065, 60, 0, 0, 10, 24, 0];
+  strictEqual(cpuUtilization(first, second), 25);
+  strictEqual(cpuUtilization(first, first), null);
+  strictEqual(cpuUtilization(second, first), null);
+  strictEqual(cpuUtilization(first, [125, 20, 30, 4100, 49, 0, 0, 10, 4, 0]), null);
+  strictEqual(cpuUtilization([10, 0, 0, 10], [20, 0, 0, 10]), 100);
+  strictEqual(cpuUtilization(null, second), null);
+});
+
+test("disk rates distinguish idle from unavailable or reset", () => {
+  strictEqual(byteRate(1024, 3072, 2000), 1024);
+  strictEqual(byteRate(1024, 1024, 2000), 0);
+  strictEqual(byteRate(1024, 1, 2000), null);
+  strictEqual(byteRate(1024, 3072, 0), null);
+});
 
 function row(overrides: Partial<SpeedRow>): SpeedRow {
   return {

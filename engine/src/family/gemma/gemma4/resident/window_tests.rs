@@ -11,7 +11,6 @@ const CELLS: usize = 32_768;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
-use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
@@ -80,92 +79,6 @@ fn activation_columns(rng: &mut Lcg, columns: usize, k: usize) -> Vec<f32> {
         }
     }
     x
-}
-
-/// Every projection shape of the Bolt step: (rows, k).
-const PROJECTIONS: [(usize, usize); 11] = [
-    (2048, 2560),
-    (4096, 2560),
-    (512, 2560),
-    (1024, 2560),
-    (10240, 2560),
-    (2560, 10240),
-    (2560, 2048),
-    (2560, 4096),
-    (256, 2560),
-    (2560, 256),
-    (10752, 2560),
-];
-
-/// Column j of a launch of 2 to 8 columns is, byte for byte, the launch of that column alone,
-/// at every projection shape of the Bolt step.
-#[test]
-#[ignore = "requires a device; use --test-threads=1"]
-fn gemma_matvec_columns_equal_a_lone_column_at_every_bolt_shape() {
-    let (ctx, stream) = context();
-    let mut rng = Lcg(7);
-    const SCALES: [u16; 6] = [0x2800, 0x2c00, 0x3000, 0x3400, 0x1c00, 0x3800];
-    for (rows, k) in PROJECTIONS {
-        let qs: Vec<u8> = (0..rows * k).map(|_| rng.byte()).collect();
-        let scales: Vec<u8> = (0..rows * (k / 32))
-            .flat_map(|_| SCALES[rng.next() as usize % SCALES.len()].to_le_bytes())
-            .collect();
-        let w_qs = ctx.upload(&qs).expect("weights");
-        let w_scales = ctx.upload(&scales).expect("scales");
-        let x = ctx
-            .upload(&floats(&activation_columns(&mut rng, 8, k)))
-            .expect("activations");
-        let row_bytes = q8_1_bytes(k, 1).expect("row bytes");
-        let q8 = ctx.upload(&vec![0u8; row_bytes * 8]).expect("q8");
-        ctx.quantize_q8_1(
-            &stream,
-            QuantizeCall {
-                x: x.range(0, 8 * k * 4).expect("x"),
-                y: q8.range(0, row_bytes * 8).expect("y"),
-                k,
-                ncols: 8,
-            },
-        )
-        .expect("quantize");
-        let launch = |first: usize, columns: usize, y: &DeviceBuffer| {
-            ctx.gemma_matvec(
-                &stream,
-                GemmaMatvecCall {
-                    w_qs: w_qs.range(0, w_qs.bytes()).expect("qs"),
-                    w_scales: w_scales.range(0, w_scales.bytes()).expect("scales"),
-                    x_q8: q8
-                        .range(first * row_bytes, q8_1_bytes(k, columns).expect("bytes"))
-                        .expect("x"),
-                    y: y.range(0, rows * columns * 4).expect("y"),
-                    k,
-                    rows,
-                    ncols: columns,
-                },
-            )
-            .expect("launch");
-            stream.synchronize().expect("sync");
-        };
-        let single = ctx.upload(&vec![0u8; rows * 4]).expect("single");
-        let wide = ctx.upload(&vec![0u8; rows * 8 * 4]).expect("wide");
-        let alone: Vec<Vec<u8>> = (0..8)
-            .map(|column| {
-                launch(column, 1, &single);
-                download(&ctx, &single, rows * 4)
-            })
-            .collect();
-        for columns in 2..=8 {
-            launch(0, columns, &wide);
-            let got = download(&ctx, &wide, rows * 8 * 4);
-            for column in 0..columns {
-                assert_eq!(
-                    &got[column * rows * 4..(column + 1) * rows * 4],
-                    &alone[column][..],
-                    "rows {rows} k {k}: column {column} of {columns}"
-                );
-            }
-        }
-        eprintln!("gemma_matvec rows {rows} k {k}: columns 2 to 8 equal the lone column");
-    }
 }
 
 /// The head of a window runs the vendored Q8_0 matvec. Column j of a launch of up to
@@ -300,7 +213,7 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
     let positions = [0usize, 1, 37, 511, 512, 513, 4000, 30_000];
     let rows = positions.len();
     let part = ctx
-        .upload(&vec![0u8; attn_part_bytes(ATTN_SPLIT_MAX)])
+        .upload(&vec![0u8; attn_part_bytes(ATTN_SPLIT_MAX, 8)])
         .expect("part");
     for head in [256usize, 512] {
         let global = head == 512;
@@ -341,7 +254,7 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
             let split = |armed: bool| {
                 armed.then(|| AttnDecodeGemmaSplit {
                     part: part
-                        .range(0, attn_part_bytes(ATTN_SPLIT_MAX))
+                        .range(0, attn_part_bytes(ATTN_SPLIT_MAX, 8))
                         .expect("part"),
                     max_splits: ATTN_SPLIT_MAX,
                     min_keys: ATTN_SPLIT_MIN_KEYS,
@@ -532,7 +445,7 @@ fn bits(row: &[f32]) -> Vec<u32> {
 fn prefill(model: &mut Bolt, seq: &super::bolt::BoltSeq, prompt: &[u32]) {
     let (head, _) = prompt.split_at(prompt.len() - 1);
     let mut pos = 0;
-    for chunk in head.chunks(Bolt::PREFILL_BATCH) {
+    for chunk in head.chunks(Bolt::WINDOW_ROWS) {
         model
             .prefill_batch(seq, chunk, pos, false)
             .expect("prefill");
@@ -576,13 +489,33 @@ fn solo_run(model: &mut Bolt, seq: &super::bolt::BoltSeq, prompt: &[u32]) -> Vec
 #[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
 fn a_window_of_sessions_equals_the_solo_runs() {
     let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
-    let mut model = super::bolt::load(std::path::Path::new(&path)).expect("load");
+    // The cache is planned for a full window of sessions: a lone-session plan fills the card.
+    let file = crate::family::gguf_select::GgufFile {
+        path: std::path::PathBuf::from(&path),
+        bytes: std::fs::metadata(&path).expect("the Bolt file").len(),
+    };
+    let mut model = super::bolt::load_choosing(
+        &[file],
+        crate::family::gemma::gemma4::config::MaxSeqs::Count(Bolt::WINDOW_ROWS),
+        &|_| {},
+    )
+    .expect("load");
     model
-        .reserve_window(Bolt::PREFILL_BATCH)
+        .reserve_window(Bolt::WINDOW_ROWS)
         .expect("window buffers");
     let lengths = [5usize, 17, 1, 130, 40, 2, 9, 77];
-    let seqs: Vec<_> = (0..Bolt::PREFILL_BATCH)
-        .map(|_| model.new_seq().expect("sequence"))
+    let mut seqs: Vec<_> = (0..Bolt::WINDOW_ROWS)
+        .enumerate()
+        .map(|(slot, _)| {
+            // Sessions of different sizes share a window: each row reads its own cells. Slot 3
+            // starts at the sliding window and grows after its prompt, as a served session does.
+            let cells = match slot {
+                3 => 512,
+                _ if slot % 2 == 0 => 2048,
+                _ => 1536,
+            };
+            model.new_seq_cells(cells).expect("sequence")
+        })
         .collect();
     for width in [2usize, 3, 4, 5, 8] {
         let prompts: Vec<Vec<u32>> = (0..width)
@@ -598,6 +531,12 @@ fn a_window_of_sessions_equals_the_solo_runs() {
         for slot in 0..width {
             dirty(&mut model, &seqs[slot], slot + 20);
             prefill(&mut model, &seqs[slot], &prompts[slot]);
+        }
+        // The grown session keeps the cells it fed and runs in larger planes than its solo run.
+        if width > 3 {
+            model
+                .make_room(&mut seqs[3], prompts[3].len() - 1, 800)
+                .expect("the session grows");
         }
         let join: Vec<usize> = (0..width).map(|slot| slot % 3).collect();
         let last: Vec<usize> = (0..width).map(|slot| STEPS - slot % 4).collect();
@@ -647,4 +586,167 @@ fn a_window_of_sessions_equals_the_solo_runs() {
         );
         assert!(widest >= width.min(2));
     }
+}
+
+/// One word per row: the hash of the logits bits, so a long run keeps no rows.
+fn row_hash(row: &[f32]) -> u64 {
+    row.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+        (h ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// A sequence that grows while it sits in a window of others gives its row and leaves theirs as
+/// they are: three sessions decode together for 1600 positions, one on cells of one granule that
+/// grows through the window (past the sliding window of the local layers), one that stays on its
+/// one granule and leaves the window at 900, one sized for the run from the start. Every row of
+/// every step equals the row of the same session run alone on planes sized for the whole run.
+#[test]
+#[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
+fn a_sequence_grown_inside_a_window_leaves_every_row_as_its_solo_run() {
+    use crate::family::cell_pool::CELL_GRANULE;
+    let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
+    let file = crate::family::gguf_select::GgufFile {
+        path: std::path::PathBuf::from(&path),
+        bytes: std::fs::metadata(&path).expect("the Bolt file").len(),
+    };
+    let mut model = super::bolt::load_choosing(
+        &[file],
+        crate::family::gemma::gemma4::config::MaxSeqs::Count(Bolt::WINDOW_ROWS),
+        &|_| {},
+    )
+    .expect("load");
+    model.reserve_window(3).expect("window buffers");
+    let steps = [1600usize, 900, 1600];
+    let token_of =
+        |slot: usize, pos: usize| 2 + ((pos * (17 + 6 * slot) + slot * 101) % 5000) as u32;
+    // The solo runs, on planes sized for the whole run.
+    let mut solo: Vec<Vec<u64>> = Vec::new();
+    for (slot, &run) in steps.iter().enumerate() {
+        let seq = model
+            .new_seq_cells(2 * CELL_GRANULE)
+            .expect("whole-run sequence");
+        let mut rows = Vec::new();
+        for pos in 0..run {
+            model
+                .decode(&seq, token_of(slot, pos), pos)
+                .expect("solo step");
+            rows.push(row_hash(&model.capped_logits().expect("logits")));
+        }
+        solo.push(rows);
+    }
+    // The window run: slot 0 grows through the window, slot 1 never does, slot 2 never needs to.
+    let mut seqs = [
+        model.new_seq_cells(CELL_GRANULE).expect("small sequence"),
+        model.new_seq_cells(CELL_GRANULE).expect("small sequence"),
+        model
+            .new_seq_cells(2 * CELL_GRANULE)
+            .expect("whole-run sequence"),
+    ];
+    let mut growths = 0;
+    for pos in 0..steps[0] {
+        let live: Vec<usize> = (0..3).filter(|&slot| pos < steps[slot]).collect();
+        for &slot in &live {
+            let before = seqs[slot].cells();
+            model
+                .make_room(&mut seqs[slot], pos, pos + 1)
+                .expect("room");
+            growths += usize::from(seqs[slot].cells() != before);
+        }
+        let refs: Vec<&super::bolt::BoltSeq> = live.iter().map(|&slot| &seqs[slot]).collect();
+        let tokens: Vec<u32> = live.iter().map(|&slot| token_of(slot, pos)).collect();
+        let positions = [pos; 3];
+        let positions = &positions[..live.len()];
+        let rows = model
+            .decode_rows(&refs, &tokens, positions)
+            .expect("window step");
+        for (&slot, row) in live.iter().zip(&rows) {
+            let want = solo[slot].get(pos).copied();
+            assert_eq!(
+                Some(row_hash(row)),
+                want,
+                "slot {slot} position {pos} (window of {}, slot 0 holds {} cells)",
+                live.len(),
+                seqs[0].cells()
+            );
+        }
+    }
+    assert!(growths >= 1, "a sequence grew inside the window");
+    assert!(seqs[0].cells() >= steps[0]);
+    assert_eq!(
+        seqs[1].cells(),
+        CELL_GRANULE,
+        "the other small session never grew"
+    );
+}
+
+/// A window of sessions that has gone past the sliding layers' ring gives, at every step and bit
+/// for bit, the logits of the same window of sessions that keep every position in linear planes.
+/// Windows are the default decode at four or more sessions, and the other window test never
+/// writes a ring cell twice: here the prompts run past the ring's 519 cells (fed 700, 530, 900
+/// and 1,100 positions), so every row's append wraps, with windows of four, two and three rows
+/// and sessions that join and leave.
+#[test]
+#[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
+fn a_window_past_the_ring_equals_the_linear_control_window() {
+    let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
+    let file = crate::family::gguf_select::GgufFile {
+        path: std::path::PathBuf::from(&path),
+        bytes: std::fs::metadata(&path).expect("the Bolt file").len(),
+    };
+    let mut model = super::bolt::load_choosing(
+        &[file],
+        crate::family::gemma::gemma4::config::MaxSeqs::Count(4),
+        &|_| {},
+    )
+    .expect("load");
+    model.reserve_window(4).expect("window buffers");
+    let lengths = [700usize, 530, 900, 1_100];
+    let ring: Vec<_> = (0..4)
+        .map(|_| model.new_seq_cells(1_536).expect("ring session"))
+        .collect();
+    model.set_linear_local_layers(true);
+    let linear: Vec<_> = (0..4)
+        .map(|_| model.new_seq_cells(1_536).expect("linear session"))
+        .collect();
+    model.set_linear_local_layers(false);
+    let prompts: Vec<Vec<u32>> = (0..4).map(|slot| prompt_of(slot, lengths[slot])).collect();
+    for slot in 0..4 {
+        prefill(&mut model, &ring[slot], &prompts[slot]);
+        prefill(&mut model, &linear[slot], &prompts[slot]);
+    }
+    let mut token: Vec<u32> = prompts.iter().map(|p| *p.last().expect("prompt")).collect();
+    let mut at: Vec<usize> = prompts.iter().map(|p| p.len() - 1).collect();
+    // Which sessions are live at each step: four for twenty steps, then two, then three.
+    let schedule: Vec<Vec<usize>> = (0..20)
+        .map(|_| vec![0, 1, 2, 3])
+        .chain((0..6).map(|_| vec![0, 2]))
+        .chain((0..6).map(|_| vec![1, 2, 3]))
+        .collect();
+    for (step, live) in schedule.iter().enumerate() {
+        let tokens: Vec<u32> = live.iter().map(|&slot| token[slot]).collect();
+        let positions: Vec<usize> = live.iter().map(|&slot| at[slot]).collect();
+        let ring_refs: Vec<&super::bolt::BoltSeq> = live.iter().map(|&slot| &ring[slot]).collect();
+        let linear_refs: Vec<&super::bolt::BoltSeq> =
+            live.iter().map(|&slot| &linear[slot]).collect();
+        let got = model
+            .decode_rows(&ring_refs, &tokens, &positions)
+            .expect("ring window");
+        let want = model
+            .decode_rows(&linear_refs, &tokens, &positions)
+            .expect("linear window");
+        for (index, &slot) in live.iter().enumerate() {
+            assert_eq!(
+                bits(&got[index]),
+                bits(&want[index]),
+                "step {step} slot {slot} at position {}",
+                at[slot]
+            );
+            token[slot] = argmax(&got[index]);
+            at[slot] += 1;
+        }
+    }
+    assert!(
+        at.iter().all(|&position| position > 519 + 20),
+        "every row wrapped the ring"
+    );
 }

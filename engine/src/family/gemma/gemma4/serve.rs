@@ -10,20 +10,67 @@
 //! after the prefix write no cache cells and feed nothing but the final norm);
 //! the pending token's decode runs the head.
 
-#[cfg(any(feature = "native-cuda", test))]
-use std::{fs, path::Path};
+use std::path::Path;
 
-#[cfg(any(feature = "native-cuda", test))]
-use {super::config, crate::EngError};
+use crate::{EngError, capability::probe::CompiledBackends};
 
-/// Reads and validates the model directory's `config.json` against the Bolt
-/// descriptor; the server starter uses this to dispatch inside the gemma4
-/// family. A directory that is not a Bolt checkpoint fails the check.
-#[cfg(any(feature = "native-cuda", test))]
-pub(crate) fn bolt_configured(model_dir: &Path) -> Result<(), EngError> {
-    let json = fs::read(model_dir.join("config.json"))
-        .map_err(|error| EngError::Checkpoint(format!("gemma4 config.json: {error}")))?;
-    config::check_bolt_config(&json)
+/// Build eligibility only. A CUDA build still has to pass the Bolt checkpoint check at load.
+pub(crate) fn check_backend(model: &Path, backends: &CompiledBackends) -> Result<(), EngError> {
+    if backends.cuda {
+        Ok(())
+    } else {
+        Err(cuda_required(model))
+    }
+}
+
+pub(crate) fn cuda_required(model: &Path) -> EngError {
+    EngError::BadRequest(format!(
+        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+         this build has no CUDA engine (model directory {})",
+        model.display()
+    ))
+}
+
+/// Whether the weights file a model path names has the geometry the Bolt engine runs. The file's
+/// own header says so: no `config.json` or tokenizer file has to sit beside it. Serving and
+/// diagnostics share this gate; it is not a memory check.
+pub(crate) fn check_checkpoint(model_path: &Path) -> Result<(), EngError> {
+    bolt_geometry(model_path).map_err(|cause| {
+        EngError::BadRequest(format!(
+            "gemma4 serves only the Bolt geometry on the native-cuda build; \
+             {} is not a file of it: {}",
+            model_path.display(),
+            cause.describe()
+        ))
+    })
+}
+
+/// The weights files of a model path that the load's own opener (`open_bolt_weights`, called by
+/// `load_choosing`) accepts, largest first: the only files the load may choose among. When none
+/// is accepted, the error is the largest file's.
+pub(crate) fn bolt_files(
+    model_path: &Path,
+) -> Result<Vec<crate::family::gguf_select::GgufFile>, EngError> {
+    let (_, files) = crate::family::gguf_select::candidates(model_path)?;
+    let mut first_error = None;
+    let mut valid = Vec::with_capacity(files.len());
+    for file in files {
+        match super::open_bolt_weights(&file.path) {
+            Ok(_) => valid.push(file),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match (valid.is_empty(), first_error) {
+        (true, Some(error)) => Err(error),
+        _ => Ok(valid),
+    }
+}
+
+/// The header and tensor inventory check of every file the load may choose.
+pub(crate) fn bolt_geometry(model_path: &Path) -> Result<(), EngError> {
+    bolt_files(model_path).map(|_| ())
 }
 
 #[cfg(feature = "native-cuda")]
@@ -33,10 +80,7 @@ fn bad(message: &str) -> EngError {
 
 #[cfg(test)]
 mod tests {
-    use super::bolt_configured;
     use crate::family::gguf_select::candidates;
-
-    const BOLT_CONFIG: &[u8] = include_bytes!("../../../../testdata/gemma4/bolt-config.json");
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("gemma4-serve-{tag}-{}", std::process::id()));
@@ -57,42 +101,6 @@ mod tests {
         assert_eq!(files[1].path, dir.join("bolt.gguf"));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn the_config_gate_reads_the_directory_of_a_gguf_file_path() {
-        let dir = scratch("file-path");
-        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write config");
-        std::fs::write(dir.join("bolt-q4.gguf"), b"weights").expect("write weights");
-        std::fs::write(dir.join("bolt-q8.gguf"), b"weights-bigger").expect("write weights");
-        let (found, files) = candidates(&dir.join("bolt-q4.gguf")).expect("file path");
-        assert_eq!(found, dir);
-        assert_eq!(files.len(), 1);
-        bolt_configured(&found).expect("the Bolt config gate passes beside the file");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bolt_configured_reads_the_pinned_config_shape() {
-        let dir = scratch("config");
-        assert!(bolt_configured(&dir).is_err());
-        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write");
-        assert!(bolt_configured(&dir).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_bolt_directory_passes_the_config_gate_and_finds_its_gguf() {
-        // Checks the two helpers start_gemma4 dispatches on: bolt_configured
-        // accepts the pinned Bolt config, and the candidates are the single weights
-        // file. The server's engine start itself needs a device and is not run here.
-        let dir = scratch("dispatch");
-        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write config");
-        std::fs::write(dir.join("bolt-e4b-q8_0.gguf"), b"weights").expect("write weights");
-        bolt_configured(&dir).expect("the Bolt config gate passes");
-        let (_, files) = candidates(&dir).expect("the weights file is found");
-        assert_eq!(files[0].path, dir.join("bolt-e4b-q8_0.gguf"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(feature = "native-cuda")]
@@ -106,8 +114,13 @@ mod device {
     use crate::{
         EngError,
         family::{
+            cell_pool::{
+                CellRequest, CellRoom, INITIAL_CELLS, admission_room, even_share,
+                session_cells_or_queue,
+            },
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
+            host_store::{HostStorePlan, largest_entry_bytes},
             kv_disk::{
                 self as kv_cache, DiskOwner, DiskParts, HostStoreDisk, KvCacheSettings,
                 PUMP_EMIT_BYTES,
@@ -139,14 +152,15 @@ mod device {
     pub(crate) struct BoltServe {
         model: Bolt,
         eos: Vec<u32>,
-        /// One-tip prefix store (no roots, no periodic points). An entry is a copy of the saving
-        /// session's cache cells below its position, held in host memory: a restore writes it
-        /// into any session, so reuse works whatever the number of sessions and whichever
-        /// pooled session serves the next request. Host memory, not a device slab, because the
-        /// device memory belongs to the sessions' planes: an entry is at most one session's
-        /// cache (952 MiB at 32,768 cells, 30,464 bytes a position) and costs a transfer over
-        /// the bus (about 125 MB for a 4,000-token prefix), where recomputing the prefix costs
-        /// its whole prefill.
+        /// Prefix store with no roots and one entry for each session the host funds. An entry is a
+        /// copy of the saving session's cache below its position, held in host memory: every
+        /// position of the full-attention layers and the last window of the sliding layers. A
+        /// restore writes it into any session, so reuse works whatever the number of sessions and
+        /// whichever pooled session serves the next request. Host memory, not a device slab,
+        /// because the device memory belongs to the sessions' planes: an entry is at most one
+        /// session's kept cache (283 MiB at 32,768 positions: 8,704 bytes a position and the
+        /// 10.6 MiB window) and costs a transfer over the bus (about 46 MB for a 4,000-token
+        /// prefix), where recomputing the prefix costs its whole prefill.
         prefix: PrefixStore<BoltSnapshot, PrefixIdentity>,
         /// The load-time identity half of the prefix path: constant for one loaded Bolt, so
         /// live behaviour is unchanged; a persisted or cross-step store refuses entries another
@@ -154,8 +168,14 @@ mod device {
         /// but does not retain it, and threading it means widening `bolt::load`'s return; this
         /// seam takes it when that return widens.
         identity: PrefixIdentity,
+        /// The least free VRAM seen while serving, read at the first prefill and decode, at the
+        /// largest prefill piece and when more sessions are live (a throttled reading).
+        marks: crate::family::mem::fill::FreeMarks,
         /// The sessions the engine serves at once; the worker reads it after start.
         max_seqs: usize,
+        /// The even share of the pool among the sessions, for the start line: a session holds the
+        /// cells of its tokens and grows from there.
+        share: usize,
         /// The prompt rows the worker feeds per tick while sessions share the model.
         prompt_rows: usize,
         /// The kind of the entry the last restore used, the prompt tokens it shared beyond the
@@ -169,8 +189,9 @@ mod device {
         prefix_tier: PrefixTier,
     }
 
-    /// The store's explicit one-tip shape (no roots, no periodic points),
-    /// shared by the executor, the start wiring and the tests.
+    /// The store's one-tip shape (no roots, no periodic points), for the tests that drive the
+    /// executor with a fixed store.
+    #[cfg(test)]
     const ONE_TIP: StoreLimits = StoreLimits {
         roots: 0,
         entries: 1,
@@ -195,7 +216,7 @@ mod device {
         }
 
         fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
-            for chunk in tokens.chunks(Bolt::PREFILL_BATCH) {
+            for chunk in tokens.chunks(self.model.rows) {
                 self.model
                     .prefill_batch(self.seq, chunk, *self.pos, false)?;
                 *self.pos += chunk.len();
@@ -266,12 +287,15 @@ mod device {
         /// Whether the device has room for one more session's planes and the headroom. A probe
         /// that cannot read the device says yes, and the allocation decides.
         fn can_admit_session(&self) -> bool {
-            let Some(cost) = budget::bolt_seq_cost() else {
+            if self.model.pool().free() < INITIAL_CELLS {
+                return false;
+            }
+            let Some(cost) = budget::bolt_seq_cost(self.model.rows) else {
                 return true;
             };
             let per_session = cost
                 .per_position
-                .saturating_mul(self.model.cells() as u64)
+                .saturating_mul(INITIAL_CELLS as u64)
                 .saturating_add(cost.fixed)
                 .saturating_add(budget::BOLT_HEADROOM_BYTES);
             self.model
@@ -291,11 +315,48 @@ mod device {
         }
 
         fn new_session(&mut self) -> Result<Self::Session, EngError> {
-            Ok(BoltSession {
+            let session = BoltSession {
                 core: DecodeSession::default(),
                 pos: 0,
-                seq: self.model.new_seq()?,
-            })
+                seq: self.model.new_seq_cells(INITIAL_CELLS)?,
+            };
+            let (live, model) = (self.model.live_sessions(), &self.model);
+            if let Some(line) = self
+                .marks
+                .sample_sessions(live, std::time::Instant::now(), || model.free_vram())
+            {
+                eprintln!("bolt cuda: {line}");
+            }
+            Ok(session)
+        }
+
+        /// Sizes the session's cells to the request, leased from the pool: a request that names
+        /// its generation limit holds the prompt and the limit, one that names none holds the
+        /// even share, and a prompt above the share holds what it needs while the pool can
+        /// fund it. A pool that cannot fund the prompt yet refuses with a memory-plan error and
+        /// the worker queues the request until a session lets go. The planes are released
+        /// before the new ones are allocated and their contents are not kept: this runs before
+        /// any prefix restore.
+        fn reset_for_request(
+            &mut self,
+            st: &mut Self::Session,
+            prompt_tokens: usize,
+            completion_limit: Option<u32>,
+            _has_prefix_boundary: bool,
+        ) -> Result<(), EngError> {
+            let room = CellRoom {
+                reachable: st.seq.reachable(),
+                ceiling: self.model.cells(),
+                // A session holds the cells of its tokens and grows as it decodes.
+                share: INITIAL_CELLS,
+            };
+            let request = CellRequest {
+                prompt: prompt_tokens,
+                completion: Some(admission_room(completion_limit)),
+            };
+            let cells = session_cells_or_queue(request, room)?;
+            self.model.resize_seq(&mut st.seq, cells)?;
+            self.reset(st)
         }
 
         fn decode_window(
@@ -324,18 +385,25 @@ mod device {
         }
 
         fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
+            // The most one session holds: a prompt below it queues until the pool funds it.
             crate::family::session::check_prompt(prompt_tokens, self.model.cells())
         }
 
-        /// The store's explicit one-tip shape, so the worker's save-point
+        /// The limits of the store itself, so the worker's save-point
         /// planning sees what the store really keeps.
         fn prefix_limits(&self) -> StoreLimits {
-            ONE_TIP
+            self.prefix.limits()
         }
 
         fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<(), EngError> {
-            let cells = self.model.cells();
-            st.core.prefill(
+            // The prompt must stay below the cells the session holds: one more than its tokens.
+            self.model.make_room(
+                &mut st.seq,
+                st.pos,
+                st.core.history().len() + toks.len() + 1,
+            )?;
+            let cells = st.seq.cells();
+            let out = st.core.prefill(
                 &mut Step {
                     model: &mut self.model,
                     seq: &st.seq,
@@ -343,7 +411,15 @@ mod device {
                 },
                 toks,
                 cells,
-            )
+            );
+            let model = &self.model;
+            if let Some(line) =
+                self.marks
+                    .sample_prefill(toks.len(), std::time::Instant::now(), || model.free_vram())
+            {
+                eprintln!("bolt cuda: {line}");
+            }
+            out
         }
 
         fn decode(
@@ -351,12 +427,15 @@ mod device {
             st: &mut Self::Session,
             generation: &mut GenerationState,
         ) -> Result<DecodeBatch, EngError> {
+            // The pending token takes the position after the ones fed: one more cell than it has.
+            self.model
+                .make_room(&mut st.seq, st.pos, st.core.history().len())?;
             let limits = Limits {
                 eos: &self.eos,
                 sampler_vocab: VOCAB,
                 context_limit: self.model.cells(),
             };
-            st.core.decode(
+            let batch = st.core.decode(
                 &mut Step {
                     model: &mut self.model,
                     seq: &st.seq,
@@ -364,7 +443,17 @@ mod device {
                 },
                 generation,
                 &limits,
-            )
+            );
+            let model = &self.model;
+            if let Some(line) =
+                self.marks
+                    .sample("a decode batch", std::time::Instant::now(), || {
+                        model.free_vram()
+                    })
+            {
+                eprintln!("bolt cuda: {line}");
+            }
+            batch
         }
 
         fn boundary(&mut self, _st: &mut Self::Session) {}
@@ -517,6 +606,13 @@ mod device {
             )
         }
 
+        /// A row grows before the step that needs more cells, and a row the pool cannot fund is
+        /// refused alone.
+        fn activate_row(&mut self, session: &mut BoltSession) -> Result<(), EngError> {
+            self.model
+                .make_room(&mut session.seq, session.pos, session.core.history().len())
+        }
+
         fn check_row(&self, session: &BoltSession, token: u32) -> Result<(), EngError> {
             let cells = self.model.cells();
             if session.pos >= cells {
@@ -591,11 +687,11 @@ mod device {
         let inputs = SeqInputs {
             free,
             headroom: budget::BOLT_HEADROOM_BYTES,
-            cost: budget::bolt_seq_cost()
+            cost: budget::bolt_seq_cost(model.rows)
                 .ok_or_else(|| EngError::MemoryPlan("the Bolt sequence cost overflows".into()))?,
-            context: model.cells() as u64,
-            row_cap: Bolt::PREFILL_BATCH,
-            ceiling: Bolt::PREFILL_BATCH,
+            context: INITIAL_CELLS as u64,
+            row_cap: budget::BOLT_WINDOW_SEQS,
+            ceiling: budget::BOLT_WINDOW_SEQS.min((model.pool().total() / INITIAL_CELLS).max(1)),
         };
         plan_seqs(
             inputs,
@@ -604,6 +700,24 @@ mod device {
                 MaxSeqs::Auto => None,
             },
         )
+    }
+
+    /// The prefix store the start gives the executor, and the plan behind it. It holds host copies
+    /// of up to a whole session's cache, one entry for each conversation the engine serves at
+    /// once, as many as the host funds. A configuration that turns reuse off keeps nothing. No
+    /// roots: a prompt has no stable head to pin. `host` reads the host facts and runs only when
+    /// reuse is on.
+    fn prefix_store(
+        prefix_reuse: bool,
+        budget: impl FnOnce() -> Option<u64>,
+        sessions: usize,
+        cells: usize,
+    ) -> (PrefixStore<BoltSnapshot, PrefixIdentity>, HostStorePlan) {
+        // The full-attention layers keep every position; the sliding layers keep their last window.
+        let entry_bytes = largest_entry_bytes(budget::bolt_kv_bytes_per_position(), cells as u64)
+            .saturating_add(budget::bolt_window_snapshot_bytes().unwrap_or(u64::MAX));
+        let plan = HostStorePlan::for_start(prefix_reuse, entry_bytes, budget, sessions);
+        (PrefixStore::with_limits(plan.limits(0)), plan)
     }
 
     /// `model_path` is the model directory or one `.gguf` file in it. A directory with several
@@ -617,10 +731,12 @@ mod device {
         seqs: MaxSeqs,
         prompt_rows: Option<usize>,
         kv_cache: Option<KvCacheSettings>,
+        prefix_reuse: bool,
     ) -> Result<StartedEngine, EngError> {
         let tier_plan = kv_cache::plan_tier(kv_cache.as_ref(), "gemma4", TIER_LABEL)?;
-        let (_, files) = crate::family::gguf_select::candidates(model_path)?;
+        let files = super::bolt_files(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
+        let text_identity = *bundle.identity();
         let eos = bundle.eos_token_ids().to_vec();
         if eos.is_empty() || eos.iter().any(|&id| id as usize >= VOCAB) {
             return Err(super::bad(
@@ -636,13 +752,13 @@ mod device {
         // weights are uploaded; the server's request bound needs the figure before the engine is
         // ready.
         let (announce, resolved) = std::sync::mpsc::sync_channel::<Announcement<usize>>(1);
-        let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
+        let engine = spawn_engine_noted(budget::BOLT_PREFILL_LADDER[0], ready_note, move |_| {
             let loaded = bolt::load_choosing(&files, seqs, &|cells| {
                 let _ = announce.try_send(Ok(cells));
             });
             announce_failure(&loaded, Some(&announce));
             let mut model = loaded?;
-            let first = model.new_seq()?;
+            let first = model.new_seq_cells(INITIAL_CELLS)?;
             let ask = budget::session_ask(seqs, model.graph_mode.active());
             if let Some(note) = &ask.note {
                 eprintln!("gemma4 bolt: {note}");
@@ -666,7 +782,12 @@ mod device {
             // pinned tokenizer and template, the layout of a snapshot and the numeric path.
             let load = kv_tier::load_identity(
                 &model.weights_identity,
-                &model.snapshot_layer_bytes(1),
+                &text_identity,
+                // Taken twice the window in: a layout that keeps the whole prefix and one that keeps
+                // the window differ here, so an entry of the old layout is not read as the new one.
+                &model.snapshot_layer_bytes(
+                    2 * crate::family::spec::NEMOTRON_BOLT_E4B.sliding_window as usize,
+                ),
                 bolt::attn_split_wanted()?.then(|| model.attn_splits()),
             );
             let identity = PrefixIdentity {
@@ -674,16 +795,26 @@ mod device {
                 tokenizer: load.tokenizer.as_str().into(),
                 template: load.template.as_str().into(),
             };
+            let (prefix, store) = prefix_store(
+                prefix_reuse,
+                || kv_cache::default_host_budget(crate::family::mem::process_resident_bytes()),
+                plan.seqs,
+                model.cells(),
+            );
+            eprintln!("gemma4 bolt: {}", store.describe());
             let disk = tier_plan.as_ref().and_then(|(resolved, origin)| {
-                HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
+                HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, store.entries.max(1))
             });
+            let model_pool = model.pool().total();
             let mut serve = BoltServe {
+                prompt_rows: prompt_rows.unwrap_or(model.rows),
                 model,
                 eos: eos.clone(),
-                prefix: PrefixStore::with_limits(ONE_TIP),
+                prefix,
                 identity,
                 max_seqs: plan.seqs,
-                prompt_rows: prompt_rows.unwrap_or(budget::BOLT_AUTO_PROMPT_ROWS),
+                share: even_share(model_pool, plan.seqs),
+                marks: crate::family::mem::fill::FreeMarks::default(),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
@@ -692,6 +823,10 @@ mod device {
             };
             serve.log_host_budget();
             if plan.seqs > 1 {
+                eprintln!(
+                    "gemma4 bolt: one pool of {model_pool} cells, {} each when {} sessions are live; a session holds the cells of its tokens and grows as it decodes",
+                    serve.share, plan.seqs
+                );
                 eprintln!(
                     "gemma4 bolt: {} prompt rows per tick while sessions share the model ({})",
                     serve.prompt_rows,
@@ -724,12 +859,44 @@ mod device {
     mod prefix_tests {
         use super::*;
 
-        /// Panics when the pinned Bolt file is not configured: an explicit
+        const GIB: u64 = 1 << 30;
+
+        /// The start builds its store through `prefix_store`, so these cases are what a start does
+        /// with the flag, the host and the session count.
+        #[test]
+        fn the_start_gives_the_store_the_flag_the_sessions_and_the_host() {
+            let roomy = || Some(48 * GIB);
+            // Reuse off keeps no entries and never reads the host.
+            let (store, plan) = prefix_store(false, || panic!("the host is not read"), 4, 32_768);
+            assert_eq!((store.limits().roots, store.limits().entries), (0, 0));
+            assert!(plan.configured_off);
+            // Reuse on keeps one entry for each session, and no roots.
+            for sessions in [1, 2, 4, 8] {
+                let (store, _) = prefix_store(true, roomy, sessions, 32_768);
+                assert_eq!(
+                    (store.limits().roots, store.limits().entries),
+                    (0, sessions),
+                    "{sessions} sessions"
+                );
+            }
+            // A budget that funds two entries bounds a larger engine.
+            let two = || Some(2 * 952 * (1 << 20));
+            assert_eq!(prefix_store(true, two, 8, 32_768).0.limits().entries, 2);
+            // A budget under one entry keeps the store planned, with its saves waiting on the host.
+            let busy = || Some(GIB / 2);
+            let (store, plan) = prefix_store(true, busy, 4, 32_768);
+            assert_eq!(store.limits().entries, 1);
+            assert!(!plan.funded && plan.on());
+            // A machine whose memory is unknown keeps one entry.
+            assert_eq!(prefix_store(true, || None, 4, 32_768).0.limits().entries, 1);
+        }
+
+        /// Panics when no Bolt Q8_0 file is configured: an explicit
         /// `--ignored` run without `BOLT_Q8_FILE` is a setup error, not a pass.
-        fn pinned_bolt() -> std::path::PathBuf {
+        fn bolt_file() -> std::path::PathBuf {
             std::env::var("BOLT_Q8_FILE")
                 .map(std::path::PathBuf::from)
-                .expect("BOLT_Q8_FILE must point at the pinned Bolt q8 file")
+                .expect("BOLT_Q8_FILE must point at a Bolt Q8_0 file")
         }
 
         /// Greedy argmax of the capped logits after one decode step.
@@ -759,25 +926,25 @@ mod device {
             }
         }
 
-        /// A true cold replay of a restore past a decode. Turn 1 decodes 48
-        /// greedy tokens past the save point (cells P..P+48 now hold turn-1
-        /// tokens); the restore rewinds to P, the tail prefill overwrites only
-        /// the first cells of that span with DIFFERENT tokens, and the drawn
-        /// chain must equal the chain a cold run of prompt + tail draws after a
-        /// reset. A cache read above the position word (or a ring-buffer
-        /// window) would leak the surviving turn-1 cells into the restored run
-        /// and break the equality. The prompt is 3,000 tokens so turn 1 crosses
-        /// the 512-cell sliding window.
+        /// A true cold replay of a restore past a decode. A snapshot is taken at the save point;
+        /// turn 1 decodes 48 greedy tokens past it (cells P..P+48 now hold turn-1 tokens, and a
+        /// sliding layer's ring has wrapped over the oldest cells of the window); the restore
+        /// writes the snapshot back, the tail prefill overwrites the first cells of that span with
+        /// DIFFERENT tokens, and the drawn chain must equal the chain a cold run of prompt + tail
+        /// draws after a reset. A cache read above the position word would leak the surviving
+        /// turn-1 cells into the restored run and break the equality. The prompt is 3,000 tokens
+        /// so turn 1 crosses the 512-position sliding window.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_restore_past_a_decode_matches_the_cold_replay() {
-            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
+            let mut model: Bolt = bolt::load(&bolt_file()).expect("load");
             let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..3_000u32).map(|index| 100 + (index % 977)).collect();
             feed(&mut model, &seq, &prompt);
             // The save point mirrors the session's: `prompt.len() - 1` tokens
             // fed, the last token held pending.
             let saved = prompt.len() - 1;
+            let snapshot = model.snapshot_seq(&seq, saved).expect("snapshot");
             // Turn 1: 48 greedy tokens past the save point.
             let mut token = prompt[saved];
             for pos in (saved..).take(48) {
@@ -785,7 +952,7 @@ mod device {
             }
             // The restored branch: rewind to the save point, feed the held
             // token plus an extension whose tokens differ from turn 1's drawn
-            // tokens (one PREFILL_BATCH of rows), then draw greedily.
+            // tokens (one window of rows), then draw greedily.
             let extension: Vec<u32> = (0..7).map(|index| 90_000 + index).collect();
             let mut tail: Vec<u32> = vec![prompt[saved]];
             tail.extend_from_slice(&extension);
@@ -801,6 +968,7 @@ mod device {
                 }
                 drawn
             };
+            model.restore_seq(&seq, &snapshot).expect("restore");
             let restored = draw(&mut model);
             // The cold control: reset (position 0), re-feed the prompt, then
             // the same tail and greedy continuation.
@@ -821,18 +989,18 @@ mod device {
         /// mid-run prefill too — the restore flow feeds rows while the graph
         /// exists, and the next decode must still replay it.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_graphed_greedy_run_matches_the_eager_run() {
-            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
+            let mut model: Bolt = bolt::load(&bolt_file()).expect("load");
             let seq = model.new_seq().expect("sequence");
             assert!(
                 !model.graph_mode.active(),
                 "the graph stays off without FIFI_BOLT_DECODE_GRAPH"
             );
             // 1,000 prompt rows and 96 more drawn: every decode reads past
-            // the 512-cell sliding window of the local layers (Bolt's
-            // LOCAL_WINDOW is the spec's sliding_window), so the windowed
-            // attention of a replay is exercised over its full span.
+            // the 512-position sliding window of the local layers (the spec's
+            // sliding_window), so the windowed attention of a replay is
+            // exercised over its full span.
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             let extension: Vec<u32> = (0..8u32).map(|index| 90_000 + index).collect();
             let run = |model: &mut Bolt, prompt: &[u32]| -> Vec<u32> {
@@ -893,9 +1061,9 @@ mod device {
         /// as the unsplit parity test, at a shorter draw to keep the suite
         /// time bounded.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_graphed_split_run_matches_the_eager_split_run() {
-            let mut model: Bolt = bolt::load(&pinned_bolt()).expect("load");
+            let mut model: Bolt = bolt::load(&bolt_file()).expect("load");
             let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             // The chain AND the logits bits per step: matching the greedy
@@ -975,13 +1143,20 @@ mod device {
         /// A serve with room for three sessions and no tokenizer: the tests drive the executor
         /// seam and the model directly.
         fn serve_of(model: Bolt) -> BoltServe {
+            serve_with(model, 3)
+        }
+
+        fn serve_with(model: Bolt, sessions: usize) -> BoltServe {
+            let pool = model.pool().total();
             BoltServe {
+                prompt_rows: model.rows,
                 model,
                 eos: vec![0],
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
-                max_seqs: 3,
-                prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
+                max_seqs: sessions,
+                share: even_share(pool, sessions),
+                marks: crate::family::mem::fill::FreeMarks::default(),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
@@ -990,9 +1165,89 @@ mod device {
             }
         }
 
-        fn prompt(len: usize, salt: u32) -> Vec<u32> {
+        /// A new session sized to a request of `prompt_tokens` that names no generation limit.
+        fn sized_session(serve: &mut BoltServe, prompt_tokens: usize) -> BoltSession {
+            let mut session = serve.new_session().expect("session");
+            serve
+                .reset_for_request(&mut session, prompt_tokens, None, false)
+                .expect("sized for the request");
+            session
+        }
+
+        /// One prompt near the model's context takes the whole pool of a default start; eight
+        /// short sessions take an even share each and a long prompt queues while they are live.
+        /// The cells of every session are printed.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device; use --release --test-threads=1"]
+        fn one_long_prompt_or_eight_short_sessions_share_the_pool() {
+            let path = bolt_file();
+            let bytes = std::fs::metadata(&path).expect("model file").len();
+            let model = bolt::load_choosing(
+                &[crate::family::gguf_select::GgufFile { path, bytes }],
+                MaxSeqs::Auto,
+                &|_| {},
+            )
+            .expect("load");
+            let (pool, ceiling) = (model.pool().total(), model.cells());
+            let mut serve = serve_with(model, Bolt::WINDOW_ROWS);
+            let share = serve.share;
+            eprintln!("pool {pool} cells, one session up to {ceiling}, even share {share}");
+
+            // Eight short sessions run together, each holding the cells of its prompt and some room.
+            let short = prompt(40, 1);
+            let mut sessions: Vec<BoltSession> = (0..Bolt::WINDOW_ROWS)
+                .map(|_| sized_session(&mut serve, short.len()))
+                .collect();
+            for session in &sessions {
+                assert_eq!(session.seq.cells(), 2 * INITIAL_CELLS);
+            }
+            eprintln!(
+                "8 short sessions: {:?} cells each, {} pool cells free",
+                sessions.iter().map(|s| s.seq.cells()).collect::<Vec<_>>(),
+                serve.model.pool().free()
+            );
+            for session in &mut sessions {
+                serve.prefill(session, &short).expect("prefill");
+            }
+            let seqs: Vec<&BoltSeq> = sessions.iter().map(|session| &session.seq).collect();
+            serve.model.reserve_window(seqs.len()).expect("window rows");
+            let positions: Vec<usize> = sessions.iter().map(|session| session.pos).collect();
+            let rows = serve
+                .model
+                .decode_rows(&seqs, &vec![2u32; seqs.len()], &positions)
+                .expect("eight sessions decode together");
+            assert_eq!(rows.len(), Bolt::WINDOW_ROWS);
+
+            // A prompt above an even share queues while they are live: the pool cannot fund it.
+            let long_len = ceiling - 4_096;
+            let mut waiting = serve.new_session().expect("a ninth session");
+            assert!(matches!(
+                serve.reset_for_request(&mut waiting, long_len, None, false),
+                Err(EngError::MemoryPlan(_))
+            ));
+            drop(waiting);
+
+            // The sessions let go and the same prompt takes the pool.
+            drop(sessions);
+            let mut lone = sized_session(&mut serve, long_len);
+            eprintln!(
+                "1 long prompt of {long_len} tokens: {} cells, {} pool cells free",
+                lone.seq.cells(),
+                serve.model.pool().free()
+            );
+            assert_eq!(lone.seq.cells(), ceiling);
+            let started = std::time::Instant::now();
+            serve
+                .prefill(&mut lone, &prompt(long_len, 3))
+                .expect("the long prompt prefills");
+            eprintln!("prefill of {long_len} tokens took {:?}", started.elapsed());
+            // The last prompt token stays pending for the first decode step.
+            assert_eq!(lone.pos, long_len - 1);
+        }
+
+        fn prompt(len: usize, offset: u32) -> Vec<u32> {
             (0..len as u32)
-                .map(|index| 100 + salt + (index % 977))
+                .map(|index| 100 + offset + (index % 977))
                 .collect()
         }
 
@@ -1015,7 +1270,7 @@ mod device {
         /// continuation matches a cold run bit for bit, with the source session having moved on
         /// (decoded and reset) since the save.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_saved_prefix_restores_into_another_session_and_matches_a_cold_run() {
             restore_matches_a_cold_run(300);
         }
@@ -1025,18 +1280,18 @@ mod device {
         /// local one). The largest range a snapshot can copy is 16 MB (32,768 cells of 512), under
         /// the 64 MiB staging chunk of a device copy, so one copy never splits a range.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_long_saved_prefix_restores_bit_exact_past_the_window_and_the_copy_chunk() {
             restore_matches_a_cold_run(20_000);
         }
 
         fn restore_matches_a_cold_run(base_len: usize) {
-            let mut serve = serve_of(bolt::load(&pinned_bolt()).expect("load"));
-            let mut source = serve.new_session().expect("source");
-            let mut target = serve.new_session().expect("target");
-            let mut cold = serve.new_session().expect("cold");
+            let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
             let base = prompt(base_len, 0);
             let extended: Vec<u32> = base.iter().copied().chain(prompt(40, 5_000)).collect();
+            let mut source = sized_session(&mut serve, base.len());
+            let mut target = sized_session(&mut serve, extended.len());
+            let mut cold = sized_session(&mut serve, extended.len());
 
             serve.reset(&mut source).expect("reset");
             serve.prefill(&mut source, &base).expect("prefill");
@@ -1090,12 +1345,89 @@ mod device {
             );
         }
 
+        /// The greedy chain of `steps` tokens after the pending last token of a prefilled session.
+        fn draw_chain(serve: &mut BoltServe, session: &BoltSession, steps: usize) -> Vec<u32> {
+            let mut token = session.core.pending().expect("a pending token");
+            let mut chain = Vec::new();
+            for step in 0..steps {
+                serve
+                    .model
+                    .decode(&session.seq, token, session.pos + step)
+                    .expect("decode");
+                let logits = serve.model.capped_logits().expect("logits");
+                token = logits
+                    .iter()
+                    .enumerate()
+                    .fold((0u32, logits[0]), |(best, value), (index, &other)| {
+                        if other > value {
+                            (index as u32, other)
+                        } else {
+                            (best, value)
+                        }
+                    })
+                    .0;
+                chain.push(token);
+            }
+            chain
+        }
+
+        /// Prefix reuse on and off give the same text: a conversation of six turns grows from 350
+        /// to well past the 512-position window of the sliding layers, and at every turn the
+        /// session that restores the previous turn's saved prefix draws the chain a cold prefill
+        /// of the whole prompt draws.
+        #[test]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
+        fn reuse_on_and_off_draw_the_same_text_over_a_conversation_past_the_window() {
+            let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
+            let mut hot = sized_session(&mut serve, 2_048);
+            let mut cold = sized_session(&mut serve, 2_048);
+            let mut convo = prompt(200, 0);
+            let mut equal = 0;
+            for turn in 0..6u32 {
+                convo.extend(prompt(150 + 40 * turn as usize, 1_000 * (turn + 1)));
+                serve.reset(&mut cold).expect("reset");
+                serve.prefill(&mut cold, &convo).expect("cold prefill");
+                let cold_chain = draw_chain(&mut serve, &cold, 24);
+
+                serve.reset(&mut hot).expect("reset");
+                let covered = serve.restore_prefix(&mut hot, &convo).expect("restore");
+                assert!(
+                    turn == 0 || covered > 0,
+                    "turn {turn} restores the saved prefix"
+                );
+                serve
+                    .prefill(&mut hot, &convo[covered..])
+                    .expect("tail prefill");
+                assert_eq!(hot.pos, cold.pos, "turn {turn}");
+                assert!(
+                    serve
+                        .save_prefix(&hot, &convo, SaveKind::Tip)
+                        .expect("save"),
+                    "turn {turn} saves its prompt"
+                );
+                let hot_chain = draw_chain(&mut serve, &hot, 24);
+                assert_eq!(
+                    hot_chain,
+                    cold_chain,
+                    "turn {turn} at {} tokens",
+                    convo.len()
+                );
+                equal += 1;
+                convo.extend(&cold_chain);
+            }
+            assert_eq!(equal, 6);
+            assert!(
+                convo.len() > 1_200,
+                "the conversation passed the window twice"
+            );
+        }
+
         /// A different prompt saves over the tip, and the old key no longer restores: the store
         /// holds one entry and answers only for keys the prompt extends.
         #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn the_store_answers_only_for_a_key_the_prompt_extends() {
-            let mut serve = serve_of(bolt::load(&pinned_bolt()).expect("load"));
+            let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
             let mut first = serve.new_session().expect("first");
             let first_key = prompt(64, 0);
             let other_key = prompt(64, 300);

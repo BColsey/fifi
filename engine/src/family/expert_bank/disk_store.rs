@@ -739,10 +739,30 @@ impl std::fmt::Debug for DiskRoot {
     }
 }
 
+/// `path` with the symbolic links of its parent directories resolved and its last component kept:
+/// the real location of a root that is not itself a link.
+#[cfg(unix)]
+fn resolved_root(path: &Path) -> Result<PathBuf, DiskMiss> {
+    let name = path.file_name().ok_or_else(|| {
+        DiskMiss::Refused(format!("the cache root {} has no name", path.display()))
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|e| {
+        DiskMiss::Refused(format!(
+            "the directory above the cache root {} cannot be resolved: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(parent.join(name))
+}
+
 impl DiskRoot {
-    /// Opens an existing root or creates one. A path that resolves through
-    /// symlinks, or a marker whose credential scope does not match, is
-    /// refused: a different credential may not adopt a root just because
+    /// Opens an existing root or creates one. A root that is itself a symbolic link, or a marker
+    /// whose credential scope does not match, is refused (the error names the path, and the link
+    /// target): a different credential may not adopt a root just because
     /// the Unix UID matches.
     pub(crate) fn open_or_create(
         path: &Path,
@@ -753,20 +773,29 @@ impl DiskRoot {
         {
             use std::os::unix::fs::DirBuilderExt;
             let existed = path.is_dir();
-            if existed {
-                // A symlinked root (or one under one) is not openable:
-                // operations must be anchored to a real directory.
-                let resolved = std::fs::canonicalize(path)
-                    .map_err(|e| DiskMiss::Refused(format!("root unresolvable: {e}")))?;
-                if resolved != path {
-                    return Err(DiskMiss::Refused(
-                        "the root path resolves through a symlink".into(),
-                    ));
+            // The root itself must be a real directory; the directories above it may be
+            // symbolic links (macOS keeps /var and /tmp behind /private, and a user's cache or
+            // temp directory can sit behind one). They are resolved once here and every later
+            // operation uses the resolved path.
+            let root = if existed {
+                let link = std::fs::symlink_metadata(path)
+                    .map_err(|e| DiskMiss::Refused(format!("root stat {}: {e}", path.display())))?
+                    .file_type()
+                    .is_symlink();
+                if link {
+                    let target = std::fs::read_link(path)
+                        .map(|t| t.display().to_string())
+                        .unwrap_or_else(|_| "an unreadable target".into());
+                    return Err(DiskMiss::Refused(format!(
+                        "the cache root {} is a symbolic link to {target}; name the real directory",
+                        path.display()
+                    )));
                 }
+                resolved_root(path)?
             } else {
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| DiskMiss::Refused("root has no parent".into()))?;
+                let parent = path.parent().ok_or_else(|| {
+                    DiskMiss::Refused(format!("the cache root {} has no parent", path.display()))
+                })?;
                 let mut builder = std::fs::DirBuilder::new();
                 builder.mode(0o700).recursive(true);
                 match builder.create(parent) {
@@ -775,13 +804,16 @@ impl DiskRoot {
                     }
                     _ => {}
                 }
+                let root = resolved_root(path)?;
                 std::fs::DirBuilder::new()
                     .mode(0o700)
-                    .create(path)
+                    .create(&root)
                     .map_err(|e| DiskMiss::Refused(format!("root creation: {e}")))?;
                 // The parent's entry for the new root must be durable too.
                 fsync_dir(parent)?;
-            }
+                root
+            };
+            let path = root.as_path();
             // Verify the existing root BEFORE creating anything inside it:
             // the owner, mode and link checks name a root this process may
             // use, not one it would widen by adding directories to it.
@@ -2269,16 +2301,52 @@ mod tests {
     }
 
     #[test]
-    fn a_symlinked_root_is_refused() {
+    fn a_root_that_is_a_symlink_is_refused_naming_the_path_and_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("kv");
         DiskRoot::open_or_create(&real, scope(), engine()).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         match DiskRoot::open_or_create(&link, scope(), engine()) {
-            Err(DiskMiss::Refused(r)) => assert!(r.contains("symlink"), "{r}"),
+            Err(DiskMiss::Refused(r)) => {
+                assert!(r.contains("symbolic link"), "{r}");
+                assert!(
+                    r.contains(&link.display().to_string()),
+                    "names the root: {r}"
+                );
+                assert!(
+                    r.contains(&real.display().to_string()),
+                    "names the target: {r}"
+                );
+            }
             other => panic!("expected a symlink refusal, got {other:?}"),
         }
+    }
+
+    /// A temp or cache directory can sit behind a link (macOS keeps /var behind /private): the
+    /// root opens through it, records the real path, and a second open by either name finds the
+    /// same root.
+    #[test]
+    fn a_root_below_a_symlinked_directory_opens_at_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let link_parent = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let through_link = link_parent.join("kv");
+        let first = DiskRoot::open_or_create(&through_link, scope(), engine()).unwrap();
+        let real_root = std::fs::canonicalize(real_parent.join("kv")).unwrap();
+        assert_eq!(first.path, real_root);
+        let again = DiskRoot::open_or_create(&real_parent.join("kv"), scope(), engine()).unwrap();
+        assert_eq!(again.marker.root_id, first.marker.root_id);
+        let created_below =
+            DiskRoot::open_or_create(&link_parent.join("a/b/kv"), scope(), engine()).unwrap();
+        assert_eq!(
+            created_below.path,
+            std::fs::canonicalize(real_parent.join("a/b"))
+                .unwrap()
+                .join("kv")
+        );
     }
 
     #[test]

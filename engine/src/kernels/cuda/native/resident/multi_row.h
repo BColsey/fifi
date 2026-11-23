@@ -50,7 +50,11 @@ typedef struct inference_cuda_kv_row {
     void *v_codes;
     void *v_scales;
     void *step;
-    void *reserved[3];
+    long long cells;      /* plane cells per head of THIS row's planes (rows of one launch may differ):
+                           * every entry reads the row's own count for its bounds and plane strides;
+                           * the `cells` argument of an entry only has to be valid (set it to the
+                           * fewest of the rows) */
+    void *reserved[2];
 } inference_cuda_kv_row;
 
 typedef struct inference_cuda_gdn_conv_multi_args {
@@ -145,6 +149,49 @@ typedef struct inference_cuda_attn_decode_q8_multi_args {
 } inference_cuda_attn_decode_q8_multi_args;
 int inference_cuda_attn_decode_q8_multi_launch(const inference_cuda_attn_decode_q8_multi_args *args,
                                                void *stream, int *out_stage);
+
+/* attn_decode (the fp16 cache) for n rows of n sequences: row r sees the kv_len word of rows[r].step
+ * keys of its own planes; rows[r].k_codes and rows[r].v_codes name the fp16 K and V planes
+ * [cells][n_kv_head][head_dim] of attn_decode.h, 16-byte aligned as the single entry demands
+ * (the other row fields are not read; the table itself is 8-aligned). The fields
+ * beyond rows are those of attn_decode.h with m = n; `part` is
+ * inference_cuda_attn_decode_part_floats(n, ...) floats, 16-aligned. */
+typedef struct inference_cuda_attn_decode_multi_args {
+    const void *q;        /* f32 [n][n_head][head_dim] */
+    const void *proj;     /* NULL or f32 [n][ld] */
+    const inference_cuda_kv_row *rows;
+    void *part;
+    void *out;            /* f32 [n][n_head * head_dim] */
+    int n;
+    int ld;
+    int n_head;
+    int n_kv_head;
+    int head_dim;
+    int cache_rows;
+    int max_splits;
+    int min_keys;
+    int window;
+    int ring;
+    float scale;
+} inference_cuda_attn_decode_multi_args;
+int inference_cuda_attn_decode_multi_launch(const inference_cuda_attn_decode_multi_args *args,
+                                            void *stream, int *out_stage);
+
+/* The fp16 append for n rows of n sequences: row r writes its k and v rows (f32 [n][n_kv_head]
+ * [head_dim], rounded to nearest even) to cell *pos of rows[r].k_codes and rows[r].v_codes, the
+ * fp16 planes [cells][n_kv_head][head_dim], where pos is the position word of rows[r].step. A row
+ * whose position is outside [0, cells) writes nothing and ORs mask 4 into its own status word. */
+typedef struct inference_cuda_kv16_append_multi_args {
+    const void *k;        /* f32 [n][n_kv_head][head_dim] */
+    const void *v;
+    const inference_cuda_kv_row *rows;
+    int n;
+    int n_kv_head;
+    int head_dim;         /* 32..1024 */
+    int cells;
+} inference_cuda_kv16_append_multi_args;
+int inference_cuda_kv16_append_multi_launch(const inference_cuda_kv16_append_multi_args *args,
+                                            void *stream, int *out_stage);
 
 /* attn_decode_gemma for n rows of n sequences (Bolt: n_q_head 8, n_kv_head 2): row r sees the
  * kv_len word of rows[r].step keys of its own planes; no output gate. The fields beyond rows are

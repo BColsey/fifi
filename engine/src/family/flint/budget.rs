@@ -442,7 +442,7 @@ pub(crate) fn cache_prefill_floor(rows: usize) -> Result<usize, EngError> {
 }
 
 /// The load-line note for a banked load.
-pub(crate) fn bank_note(context: u32, slots: usize, reason: &str) -> String {
+pub(crate) fn budget_note(context: u32, slots: usize, reason: &str) -> String {
     let why = match reason {
         "auto" => format!("context {context} does not fit with every expert on the GPU"),
         "override" => "FIFI_FLINT_CUDA_EXPERT_SLOTS asks for a smaller bank".to_owned(),
@@ -773,25 +773,25 @@ mod tests {
         );
     }
 
-    /// c0 goldens (P4): `bank_note` verbatim, all three reason arms - the
+    /// c0 goldens (P4): `budget_note` verbatim, all three reason arms - the
     /// load line is a qualified surface; P4 adapters must reproduce these
     /// strings byte for byte.
     #[test]
     fn bank_note_golden_strings() {
         assert_eq!(
-            bank_note(131_072, 128, "auto"),
+            budget_note(131_072, 128, "auto"),
             "Flint expert bank: context 131072 does not fit with every expert on the GPU. \
              128 of 256 experts per layer stay on the GPU and all 256 sit in pinned host \
              memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
         );
         assert_eq!(
-            bank_note(65_536, 64, "forced"),
+            budget_note(65_536, 64, "forced"),
             "Flint expert bank: FIFI_FLINT_CUDA_EXPERT_CACHE=1 asks for the host buffer. \
              64 of 256 experts per layer stay on the GPU and all 256 sit in pinned host \
              memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
         );
         assert_eq!(
-            bank_note(32_768, 32, "override"),
+            budget_note(32_768, 32, "override"),
             "Flint expert bank: FIFI_FLINT_CUDA_EXPERT_SLOTS asks for a smaller bank. \
              32 of 256 experts per layer stay on the GPU and all 256 sit in pinned host \
              memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
@@ -952,7 +952,7 @@ mod tests {
 
     #[test]
     fn bank_note_names_the_reason_and_the_rollback() {
-        let note = bank_note(131_072, 226, "auto");
+        let note = budget_note(131_072, 226, "auto");
         assert!(note.contains("context 131072"), "{note}");
         assert!(note.contains("226 of 256"), "{note}");
         assert!(note.contains("FIFI_FLINT_CUDA_EXPERT_CACHE=0"), "{note}");

@@ -224,13 +224,13 @@ fn host_walk(logits: &[f32], temperature: f64, top_p: f64, top_k: u32, unit: f64
     }
 }
 
-/// The certificate bound `s = (keep_max + 4) * (2^-45 + 2^-52 * mass)`.
-fn certificate_bound(keep_max: usize, mass: f64) -> f64 {
+/// The roundoff bound `s = (keep_max + 4) * (2^-45 + 2^-52 * mass)`.
+fn roundoff_bound(keep_max: usize, mass: f64) -> f64 {
     (keep_max as f64 + 4.0) * (QUANTUM + f64::EPSILON * mass)
 }
 
 /// A mismatch is certified when the host's margin at the deciding boundary stays within the
-/// certificate bound. A non-finite margin or bound never certifies.
+/// roundoff bound. A non-finite margin or bound never certifies.
 fn certified(margin: f64, bound: f64) -> bool {
     margin.is_finite() && bound.is_finite() && margin <= bound
 }
@@ -347,8 +347,8 @@ fn spans_vanishing_tail(
 struct Counts {
     draws: u64,
     greedy: u64,
-    certified_token: u64,
-    certified_keep: u64,
+    in_bound_token: u64,
+    in_bound_keep: u64,
 }
 
 /// Fails loudly when the test's private recomputation of the host walk has drifted from the
@@ -427,7 +427,7 @@ fn check_draw(
     for value in [walk.total, walk.mass, walk.target] {
         assert!(value.is_finite(), "the host walk stays finite: {label}");
     }
-    let bound = certificate_bound(walk.keep.max(canonical_keep as usize), walk.mass);
+    let bound = roundoff_bound(walk.keep.max(canonical_keep as usize), walk.mass);
     if canonical_token != host_token {
         let margin = token_margin(&walk, canonical_token);
         assert!(
@@ -436,7 +436,7 @@ fn check_draw(
              (keep {canonical_keep}), host token {host_token} (keep {host_keep}), \
              margin {margin:e}, bound {bound:e}"
         );
-        counts.certified_token += 1;
+        counts.in_bound_token += 1;
     }
     if canonical_keep as usize != host_keep {
         if top_p == 1.0 {
@@ -453,7 +453,7 @@ fn check_draw(
                  host keep {host_keep}, margin {margin:e}, bound {bound:e}"
             );
         }
-        counts.certified_keep += 1;
+        counts.in_bound_keep += 1;
     }
     // The catch-all of possible answers, AFTER the specific guards above so their diagnostics
     // stay first: whatever a closed prefix judged by margin, the certificate's token must be
@@ -872,7 +872,7 @@ fn the_canonical_reference_draws_the_host_token_for_the_same_unit() {
     eprintln!(
         "P2 default grid: {} sampled draws, {} greedy cells, {} certified token mismatches, \
          {} certified keep mismatches",
-        counts.draws, counts.greedy, counts.certified_token, counts.certified_keep
+        counts.draws, counts.greedy, counts.in_bound_token, counts.in_bound_keep
     );
     assert!(
         counts.draws >= 630,
@@ -893,7 +893,7 @@ fn the_canonical_reference_draws_the_host_token_for_the_same_unit() {
     // 2.2e-14, 2 and 1 quanta) are invisible to the host but kept by the canonical side. The
     // keep does not depend on the unit, so each of the two cells counts at least once.
     assert!(
-        counts.certified_keep >= 2,
+        counts.in_bound_keep >= 2,
         "the vanishing-tail keep difference must really occur: {:?}",
         counts
     );
@@ -921,7 +921,7 @@ fn the_certificate_rejects_a_mismatch_far_from_the_boundary() {
         walk.target
     );
     let margin = token_margin(&walk, 1);
-    let bound = certificate_bound(2, walk.mass);
+    let bound = roundoff_bound(2, walk.mass);
     assert!(
         (margin - 0.1075).abs() < 1e-6,
         "the margin is the distance to the boundary 1: {margin}"
@@ -1058,8 +1058,8 @@ fn a_mismatch_across_the_one_boundary_next_to_the_target_is_certified() {
         (1, 4),
         "token 1 against the host token 2",
     );
-    assert_eq!(counts.certified_token, 1, "one certified token mismatch");
-    assert_eq!(counts.certified_keep, 0, "the keeps are equal");
+    assert_eq!(counts.in_bound_token, 1, "one certified token mismatch");
+    assert_eq!(counts.in_bound_keep, 0, "the keeps are equal");
 }
 
 // A canonical token that is no host candidate fails hard when the host walk is not closed:
@@ -1185,8 +1185,8 @@ fn a_keep_difference_over_a_weight_invisible_to_the_host_sum_is_certified() {
         unit53_near(0.5),
         "invisible weight",
     );
-    assert_eq!(counts.certified_keep, 1, "the keep difference is counted");
-    assert_eq!(counts.certified_token, 0, "the tokens agree");
+    assert_eq!(counts.in_bound_keep, 1, "the keep difference is counted");
+    assert_eq!(counts.in_bound_token, 0, "the tokens agree");
 }
 
 // M3 and M4: a canonical keep past the host's closed 1,024-entry prefix spans ranks the host
@@ -1210,8 +1210,8 @@ fn a_keep_difference_past_a_closed_host_prefix_is_certified() {
         unit53_near(0.5),
         "closed prefix",
     );
-    assert_eq!(counts.certified_keep, 1, "the keep difference is counted");
-    assert_eq!(counts.certified_token, 0, "the tokens agree");
+    assert_eq!(counts.in_bound_keep, 1, "the keep difference is counted");
+    assert_eq!(counts.in_bound_token, 0, "the tokens agree");
 }
 
 // M4: it is false when a spanned weight is above a quantum and visible to the host sum. Four
@@ -1269,7 +1269,7 @@ fn the_exhaustive_grid_draws_the_host_token_for_the_same_unit() {
     eprintln!(
         "P2 exhaustive grid: {} sampled draws, {} greedy cells, {} certified token mismatches, \
          {} certified keep mismatches",
-        counts.draws, counts.greedy, counts.certified_token, counts.certified_keep
+        counts.draws, counts.greedy, counts.in_bound_token, counts.in_bound_keep
     );
     assert!(counts.draws >= 70_000, "the grid must really run");
 }

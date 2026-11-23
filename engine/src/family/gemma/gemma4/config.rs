@@ -79,7 +79,7 @@ pub(crate) struct Gemma4Options {
     pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheOptions>,
 }
 
-/// A prompt share per tick: from one planned piece (`BOLT_PIECE_ROWS`) to 4,096 rows. The worker
+/// A prompt share per tick: from the smallest prefill chunk of the Bolt ladder to 4,096 rows. The worker
 /// feeds at least a whole piece per tick, so a smaller share is refused rather than raised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "RawPromptRows")]
@@ -96,7 +96,8 @@ impl TryFrom<RawPromptRows> for PromptRows {
     type Error = String;
 
     fn try_from(raw: RawPromptRows) -> Result<Self, String> {
-        let piece = super::budget::BOLT_PIECE_ROWS as u64;
+        let piece =
+            super::budget::BOLT_PREFILL_LADDER[super::budget::BOLT_PREFILL_LADDER.len() - 1] as u64;
         match raw {
             RawPromptRows::Rows(rows) if rows < piece => Err(format!(
                 "prompt_rows {rows} is below one planned piece of {piece} rows: the engine feeds at least a whole piece per tick, so the share is {piece} to 4096"
@@ -233,7 +234,12 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     }
     // The context and the window are the checkpoint's own: any positive window the resident
     // ring takes, and any context that holds it.
-    let window = u32_in(text, "sliding_window", 1, 4096)?;
+    let window = u32_in(
+        text,
+        "sliding_window",
+        1,
+        super::gguf::HUMANIZER_CELLS as u32,
+    )?;
     u32_in(text, "max_position_embeddings", window, u32::MAX)?;
     Ok(())
 }

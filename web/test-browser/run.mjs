@@ -35,11 +35,29 @@ const ROW = {
   status: 200, outcome: "ok", error_code: null, finish_reason: "stop",
   prompt_tokens: 100, completion_tokens: 20, reused_tokens: 10,
   queue_wait_ms: 3, prefill_ms: 40, time_to_first_token_ms: 120, decode_tokens_per_second: 55.5,
+  prefill_bank_passes: 4, prefill_bank_misses: 2, prefill_bank_upload_bytes: 1024,
 };
+let sample = 0;
+let logPoll = 0;
 const stub = (url) => {
   if (url.endsWith("/health") || url.endsWith("/ready")) return { body: { status: "ok" } };
   if (url.includes("/v1/models")) return { body: { object: "list", data: [{ id: "fake", object: "model", created: 1700000000, owned_by: "fifi", engines: [{ id: "e1", state: "ready", cache: { kv_bytes: 1024, prefix_hits: 3, prefix_misses: 1 } }] }] } };
-  if (url.includes("/v1/system")) return { body: { version: "test", backends_compiled: [], host: { cpu_threads: 8, mem_total_bytes: 8589934592, mem_available_bytes: 4294967296 }, engines: [{ id: "e1", model: "fake", state: "ready", queued: 1, context_limit: 4096, settings: [] }] } };
+  if (url.includes("/v1/system")) {
+    sample += 1;
+    return { body: { version: "test", backends_compiled: [], host: {
+      cpu_threads: 8, mem_total_bytes: 8589934592, mem_available_bytes: 4294967296,
+      cpu_times: [sample * 25, 0, 0, sample * 75],
+      proc_io: { read_bytes: sample * 10000, write_bytes: 0 },
+    }, engines: [{ id: "e1", model: "fake", state: "ready", queued: 1, context_limit: 4096, settings: [],
+      expert_placement: { mode: "disk_streamed", vram_bytes: 1024, ram_bytes: 0,
+        disk_bytes: 8 * 1024 ** 3, slots_per_layer: 8 } }] } };
+  }
+  if (url.includes("/v1/logs")) {
+    logPoll += 1;
+    return { body: { events: Array.from({ length: 30 + logPoll }, (_, i) => ({
+      ts_ms: now + i, line: i === 0 ? "engine e1 registered" : "Download finished " + i,
+    })) } };
+  }
   if (url.includes("/v1/telemetry")) return { body: { gpus: [{ index: 0, name: "Test GPU", util_percent: 42, mem_used_bytes: 1073741824, mem_total_bytes: 8589934592, temp_c: 50, power_w: 100 }], source: "nvidia-smi", error: null } };
   if (url.includes("/v1/recent-requests")) return { body: { requests: [ROW], active: [ACTIVE] } };
   if (url.includes("/v1/engines")) return { body: { engines: [] } };
@@ -179,11 +197,39 @@ try {
   }, "rates card with session group");
   check("rates groups render", mtext.includes("Session · web-test"), mtext.slice(0, 200));
   check("GPU table renders", mtext.includes("Test GPU"));
+  check("engine expert placement renders reported tiers",
+    mtext.includes("Disk streaming · VRAM bank 1 KiB · Pinned RAM store 0 B · Disk backing 8.0 GiB · 8 slots/layer"));
+
+  await waitFor(() => evaluate("document.querySelector('.log-tail')?.scrollTop > 0"), "event tail follows newest");
+  check("event tail starts at the bottom", await evaluate(`(() => {
+    const tail = document.querySelector(".log-tail");
+    return tail.scrollTop + tail.clientHeight >= tail.scrollHeight - 4;
+  })()`));
+  const eventCount = await evaluate(`(() => {
+    const tail = document.querySelector(".log-tail");
+    tail.scrollTop = 40;
+    tail.focus({ preventScroll: true });
+    document.querySelector(".monitor-refresh").click();
+    return tail.childElementCount;
+  })()`);
+  await waitFor(() => evaluate(`document.querySelector(".log-tail")?.childElementCount > ${eventCount}`), "new events after refresh");
+  check("event tail preserves reading position and keyboard focus", await evaluate(`(() => {
+    const tail = document.querySelector(".log-tail");
+    return tail.scrollTop === 40 && document.activeElement === tail;
+  })()`));
+  check("host CPU and process disk rates render after the next sample", await evaluate(`(() => {
+    const hero = document.querySelector(".monitor-hero").textContent;
+    return hero.includes("25%Host CPU") && hero.includes("↓ ") && hero.includes("/s · ↑ 0 B/sProcess disk");
+  })()`));
 
   await waitFor(() => evaluate("!!document.querySelector('.req-inspect')"), "request row");
   await evaluate("document.querySelector('.req-inspect').click(); true");
   await waitFor(() => evaluate("document.querySelector('#monitor-request-detail').open"), "detail drawer");
   check("request detail drawer shows request facts", await evaluate("document.querySelector('#monitor-request-detail').textContent.includes('Prompt tokens')"));
+  check("request detail shows measured prefill expert activity", await evaluate(
+    "document.querySelector('#monitor-request-detail').textContent.includes('4 admit passes · 2 experts moved · 1 KiB queued for copy')"
+  ));
+  await evaluate("document.querySelector('#monitor-request-detail button').click(); true");
 
   // Discovery: a search with no results can be retried with a format filter.
   await evaluate('location.hash = "#models"; true');

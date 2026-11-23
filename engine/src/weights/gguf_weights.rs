@@ -80,7 +80,6 @@ impl GgufWeights {
     /// [`Self::open`] without the check of tensor types: every type the header reader can
     /// size is accepted. A loader that maps the tensors itself and refuses the types its
     /// kernels lack uses this.
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
     pub(crate) fn open_any_type(
         path: &Path,
         limits: GgufLimits,

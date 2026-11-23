@@ -26,7 +26,7 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 
 /// Rows of the n-gram table, readable from any thread.
 #[derive(Debug)]
-pub(in super::super::super) struct GgufNgramRows {
+pub(in crate::family::qwen::flash_next) struct GgufNgramRows {
     file: File,
     /// Absolute file offset of row 0.
     base: u64,
@@ -41,7 +41,7 @@ impl GgufNgramRows {
     /// Opens the shard file that holds the table (through the local-storage guard) and checks
     /// the tensor's range against the file length. `table` is the mapped
     /// `per_layer_token_embd.weight`.
-    pub(in super::super::super) fn open(
+    pub(in crate::family::qwen::flash_next) fn open(
         weights: &GgufWeights,
         table: &Mapped,
         hash: NgramHash,
@@ -122,27 +122,27 @@ impl GgufNgramRows {
     }
 
     /// Rows in the table.
-    pub(in super::super::super) fn rows(&self) -> u64 {
+    pub(in crate::family::qwen::flash_next) fn rows(&self) -> u64 {
         self.rows
     }
 
     /// Values in one row.
-    pub(in super::super::super) fn row_dim(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn row_dim(&self) -> usize {
         self.row_dim
     }
 
     /// Stored bytes of one row.
-    pub(in super::super::super) fn row_bytes(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn row_bytes(&self) -> usize {
         self.row_bytes
     }
 
     /// The hash constants that map n-grams to rows.
-    pub(in super::super::super) fn hash(&self) -> &NgramHash {
+    pub(in crate::family::qwen::flash_next) fn hash(&self) -> &NgramHash {
         &self.hash
     }
 
     /// Reads and decodes global row `row` into `out` (`row_dim` values).
-    pub(in super::super::super) fn row_into(
+    pub(in crate::family::qwen::flash_next) fn row_into(
         &self,
         row: u64,
         out: &mut [f32],
@@ -168,7 +168,7 @@ impl GgufNgramRows {
     }
 
     /// Reads and decodes global row `row`.
-    pub(in super::super::super) fn row(&self, row: u64) -> Result<Vec<f32>, EngError> {
+    pub(in crate::family::qwen::flash_next) fn row(&self, row: u64) -> Result<Vec<f32>, EngError> {
         let mut out = vec![0f32; self.row_dim];
         self.row_into(row, &mut out)?;
         Ok(out)

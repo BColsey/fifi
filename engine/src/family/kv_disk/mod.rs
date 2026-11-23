@@ -30,13 +30,14 @@ mod slab;
 mod tier;
 
 pub(crate) use config::{KV_CACHE_DEFAULT_ON, KvCacheOptions, KvCacheSettings};
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use host_store::bounded_by_cap;
+pub(crate) use host_store::default_host_budget;
 #[cfg(test)]
 pub(crate) use host_store::object_per_part;
 pub(crate) use host_store::{
     DiskOwner, DiskParts, HostFamily, HostStoreDisk, SnapshotView, VecFamily, plan_tier,
 };
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use host_store::{bounded_by_cap, default_host_budget};
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use rows::{cut_rows, pad_rows};
 pub(crate) use slab::{ObjectRole, Put, Run, SlabLayout};

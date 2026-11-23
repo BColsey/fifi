@@ -184,14 +184,14 @@ pub(super) fn step_paged(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::super::super::load::FlashWeights;
-    use super::super::super::mlx::MlxProjector;
-    use super::super::super::moe;
     use super::super::fixtures::{Entry, config, tensors};
     use super::super::ops::f32_tensor;
     use super::super::slots::POOL_SETS;
     use super::super::weights::ResidentWeights;
     use super::*;
+    use crate::family::qwen::flash_next::load::FlashWeights;
+    use crate::family::qwen::flash_next::mlx::MlxProjector;
+    use crate::family::qwen::flash_next::moe;
     use crate::kernels::MlxKernels;
     use crate::weights::ShardIo;
     use std::io::Cursor;

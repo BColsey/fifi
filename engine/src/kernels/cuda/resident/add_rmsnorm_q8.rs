@@ -83,14 +83,27 @@ impl CudaContext {
         stream: &DeviceStream,
         call: AddNormQ8Call<'_>,
     ) -> Result<(), EngError> {
+        self.add_rmsnorm_q8_strided(stream, call, 0)
+    }
+
+    /// [`Self::add_rmsnorm_q8`] over rows of `h` that sit `h_stride` f32 elements apart (0 is `n`,
+    /// dense); `delta`, `norm_out` and `q8` stay dense. The rows of a strided `h` are the slices
+    /// one layer reads out of a wider per-row plane.
+    pub(crate) fn add_rmsnorm_q8_strided(
+        &self,
+        stream: &DeviceStream,
+        call: AddNormQ8Call<'_>,
+        h_stride: usize,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        let raw = self.plan_add_rmsnorm_q8(&call)?;
+        let raw = self.plan_add_rmsnorm_q8(&call, h_stride)?;
         self.launch_on(stream, |stream_raw| add_rmsnorm_q8_launch(stream_raw, &raw))
     }
 
     fn plan_add_rmsnorm_q8<'b>(
         &self,
         call: &AddNormQ8Call<'b>,
+        h_stride: usize,
     ) -> Result<AddNormQ8Raw<'b>, EngError> {
         let h = self.raw_range(&call.h)?;
         let delta = call.delta.as_ref().map(|r| self.raw_range(r)).transpose()?;
@@ -123,7 +136,22 @@ impl CudaContext {
         let need = add_rmsnorm_q8_needs(call.n, call.rows).ok_or_else(|| {
             EngError::BadRequest("the CUDA add_rmsnorm_q8 size overflows".to_owned())
         })?;
-        require_fit("h", &call.h, need.row, 4)?;
+        if h_stride != 0 && h_stride < call.n {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA add_rmsnorm_q8 needs h_stride 0 or at least n, got {h_stride}"
+            )));
+        }
+        let h_need = match h_stride {
+            0 => need.row,
+            stride => stride
+                .checked_mul(4)
+                .and_then(|row| row.checked_mul(call.rows - 1))
+                .and_then(|lead| lead.checked_add(call.n * 4))
+                .ok_or_else(|| {
+                    EngError::BadRequest("the CUDA add_rmsnorm_q8 size overflows".to_owned())
+                })?,
+        };
+        require_fit("h", &call.h, h_need, 4)?;
         if let Some(delta) = &call.delta {
             require_fit("delta", delta, need.row, 4)?;
         }
@@ -131,7 +159,7 @@ impl CudaContext {
         require_fit("norm_out", &call.norm_out, need.row, 16)?;
         require_fit("q8", &call.q8, need.q8, 4)?;
         let written = [
-            Claim::of("h", &call.h, need.row),
+            Claim::of("h", &call.h, h_need),
             Claim::of("norm_out", &call.norm_out, need.row),
             Claim::of("q8", &call.q8, need.q8),
         ];
@@ -155,6 +183,7 @@ impl CudaContext {
             n: call.n,
             eps: call.eps,
             rows: call.rows,
+            h_stride,
         })
     }
 }

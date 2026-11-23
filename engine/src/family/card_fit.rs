@@ -41,6 +41,10 @@ pub(crate) struct CardBytes {
     /// Slack that must remain after every charge: the measurement gap between the probe and the
     /// serving process.
     pub(crate) band: u64,
+    /// The device bytes a prefill needs beside the weights and the cache whatever the context: the
+    /// arena (and the attention work buffer) of the smallest chunk the family admits. A context
+    /// whose cache leaves less than this is no context: the start would have no prefill.
+    pub(crate) arena: u64,
 }
 
 /// The context limits of one start.
@@ -61,7 +65,10 @@ pub(crate) struct CardFit<K> {
 
 fn fits(card: CardBytes, charge: &dyn Fn(u32) -> Option<u64>, context: u32) -> bool {
     charge(context).is_some_and(|charge| {
-        i128::from(card.free) - i128::from(card.weights) - i128::from(charge)
+        i128::from(card.free)
+            - i128::from(card.weights)
+            - i128::from(charge)
+            - i128::from(card.arena)
             >= i128::from(card.band)
     })
 }
@@ -119,8 +126,58 @@ pub(crate) fn plan_card_fit<K: Copy>(
 /// planned session count survives them.
 pub(crate) const SESSION_PLAN_SLACK_BYTES: u64 = 256 << 20;
 
-/// The byte figures of a family whose cache is `per_position` bytes per cell and whose sessions
-/// each hold one cache of that many cells.
+/// The device bytes a plan keeps free beside its load for `sessions` sessions: every session
+/// after the first takes `part_bytes` (its state beyond the cache both consumers size
+/// separately), `idle_parts` more parts are built beside the sessions' own (the executor's idle
+/// part, which the step runs while no session does), and a plan that serves more than one keeps
+/// [`SESSION_PLAN_SLACK_BYTES`] for what the first session allocates beyond its listed demand.
+/// `None` when the byte count overflows. The one rule the Bolt cell pool (no idle part) and the
+/// Qwen3.6 tiered banks (one idle part) both plan against.
+pub(crate) fn session_reserve_bytes(
+    part_bytes: u64,
+    sessions: usize,
+    idle_parts: usize,
+) -> Option<u64> {
+    let extra = u64::try_from(sessions.max(1) - 1).ok()?;
+    let parts = extra.checked_add(u64::try_from(idle_parts).ok()?)?;
+    let slack = if extra == 0 {
+        0
+    } else {
+        SESSION_PLAN_SLACK_BYTES
+    };
+    part_bytes.checked_mul(parts)?.checked_add(slack)
+}
+
+/// The share of the one-session slots the sessions may take from the banks, in percent: a
+/// session is worth its reserve only while the banks keep three quarters of what one session
+/// would have had.
+pub(crate) const SESSION_SLOT_GIVE_UP_PERCENT: usize = 25;
+
+/// How many sessions a card funds beside its banks, at most `target`: the largest count whose
+/// reserve leaves the banks `slots_at(count)` slots, at least their share of the `slots_at(1)`
+/// the one session keeps. `slots_at` answers `None` for a count the card cannot carry at all.
+/// With `exact` the count is the target or nothing (a named `max_seqs`): the card funds it with
+/// whatever slots remain, or the answer is `None` and the caller refuses by name.
+pub(crate) fn funded_sessions(
+    target: usize,
+    exact: bool,
+    slots_at: &dyn Fn(usize) -> Option<usize>,
+) -> Option<usize> {
+    let one = slots_at(1)?;
+    if exact {
+        return slots_at(target.max(1)).map(|_| target.max(1));
+    }
+    let keep = one - one * SESSION_SLOT_GIVE_UP_PERCENT / 100;
+    let funded = (2..=target)
+        .rev()
+        .find(|&sessions| slots_at(sessions).is_some_and(|slots| slots >= keep));
+    Some(funded.unwrap_or(1))
+}
+
+/// The most cells a shared pool is planned for: far above any card's reach.
+const POOL_CELLS_LIMIT: u32 = 1 << 28;
+
+/// The byte figures of a family whose sessions lease their cache cells from one pool.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CellFigures {
     /// Cache bytes per cell, all layers.
@@ -131,80 +188,111 @@ pub(crate) struct CellFigures {
     pub(crate) headroom: u64,
     /// Fixed bytes of each session beyond its cache.
     pub(crate) seq_fixed: u64,
-    /// The most cells the model carries.
-    pub(crate) ceiling: usize,
-    /// The count a refusal is worded for when the card carries none, and the floor a card that
-    /// cannot fund every planned session serves.
-    pub(crate) fallback: usize,
 }
 
 impl CellFigures {
     /// The figures of a family, `None` when any of its byte counts overflowed. `fixed` is the
-    /// headroom and the per-session fixed bytes; `cells` the ceiling and the fallback.
+    /// headroom and the per-session fixed bytes.
     pub(crate) fn checked(
         per_position: Option<u64>,
         scratch: Option<u64>,
         fixed: (u64, u64),
-        cells: (usize, usize),
     ) -> Option<Self> {
         Some(Self {
             per_position: per_position?,
             scratch: scratch?,
             headroom: fixed.0,
             seq_fixed: fixed.1,
-            ceiling: cells.0,
-            fallback: cells.1,
         })
     }
 
-    /// The cells per layer a card carries beside `weights` while `sessions` sessions each hold
-    /// that many: the largest count up to the ceiling whose first session's cache, the shared
-    /// scratch, the headroom and the cache and fixed bytes of every further session fit `free`.
-    /// `None` when not even the smallest count fits.
-    pub(crate) fn plan(&self, free: u64, weights: u64, sessions: usize) -> Option<usize> {
-        let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
-        let unlisted = if extra > 0 {
-            SESSION_PLAN_SLACK_BYTES
-        } else {
-            0
-        };
+    /// The cells one session may hold and the cells every session shares, for a file of `weights`
+    /// bytes: the pool is what the card carries ([`CellFigures::pool`]), one session holds up to
+    /// the model's context (`ceiling`) of it. A card that carries none gets `fallback`, which the
+    /// admission then refuses with its own figures.
+    pub(crate) fn planned(
+        &self,
+        free: u64,
+        weights: u64,
+        sessions: usize,
+        (ceiling, fallback): (usize, usize),
+    ) -> (usize, usize) {
+        let pool = self.pool(free, weights, sessions).unwrap_or(fallback);
+        (pool.min(ceiling), pool)
+    }
+
+    /// The planned `pool` cut to what a card holding `held` free bytes carries now, after the load
+    /// allocated what its demand did not list.
+    pub(crate) fn held_pool(&self, pool: usize, held: u64, sessions: usize) -> usize {
+        pool.min(self.pool(held, 0, sessions).unwrap_or(0))
+    }
+
+    /// The cells every session shares: what the card carries beside `weights` once the shared
+    /// scratch, the headroom and the fixed bytes of `sessions` sessions are charged. A single
+    /// session is bounded by the model's context, not by this count. `None` when not even one
+    /// cell fits.
+    pub(crate) fn pool(&self, free: u64, weights: u64, sessions: usize) -> Option<usize> {
+        let reserve = session_reserve_bytes(self.seq_fixed, sessions, 0);
         let charge = |cells: u32| {
-            let cache = u64::from(cells).checked_mul(self.per_position)?;
-            let further = cache.checked_add(self.seq_fixed)?.checked_mul(extra)?;
-            cache
-                .checked_add(self.scratch)?
+            u64::from(cells)
+                .checked_mul(self.per_position)?
                 .checked_add(self.headroom)?
-                .checked_add(unlisted)?
-                .checked_add(further)
-        };
-        let ceiling = u32::try_from(self.ceiling).ok()?;
-        let band = 0;
-        let card = CardBytes {
-            free,
-            weights,
-            band,
+                .checked_add(reserve?)
         };
         let limits = ContextLimits {
-            ceiling,
-            sufficient: ceiling,
+            ceiling: POOL_CELLS_LIMIT,
+            sufficient: POOL_CELLS_LIMIT,
         };
         let form = CacheForm {
             form: (),
             charge: &charge,
         };
+        // The scratch every session shares is the prefill working set: the one arena charge.
+        let card = CardBytes {
+            free,
+            weights,
+            band: 0,
+            arena: self.scratch,
+        };
         plan_card_fit(card, &[form], limits).map(|fit| fit.context as usize)
     }
 
-    /// The cells a load serves: concurrency first, then context. The cache is widened beyond the
-    /// fallback only as far as the planned `sessions` all still fit; a card that cannot fund them
-    /// even at the fallback serves that many cells (or what one session carries, when less), so
-    /// the session planner finds at least the count the fixed size gave.
-    pub(crate) fn serve(&self, free: u64, weights: u64, sessions: usize) -> usize {
-        let Some(one) = self.plan(free, weights, 1) else {
-            return self.fallback;
-        };
-        let all = self.plan(free, weights, sessions).unwrap_or(0);
-        all.max(one.min(self.fallback))
+    /// The rows of one prefill chunk a card takes: the largest rung of `ladder` (largest first)
+    /// whose scratch, `scratch_for(rows)`, the shared prefill admission leaves room for beside the
+    /// weights, a cache of `cache_cells` and the headroom. A rung that does not fit is skipped; the
+    /// smallest rung is the floor. The variable `cap_var` may name one rung to cap the ladder.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn prefill_rows(
+        &self,
+        free: u64,
+        weights: u64,
+        (ladder, cache_cells): (&'static [usize], usize),
+        scratch_for: &dyn Fn(usize) -> Option<u64>,
+        cap_var: &str,
+    ) -> usize {
+        use crate::family::prefill::admission::{Admission, ChunkCost};
+        let cap = std::env::var(cap_var)
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .filter(|rows| ladder.contains(rows));
+        let cache = self.per_position.saturating_mul(cache_cells as u64);
+        let room = free
+            .saturating_sub(weights)
+            .saturating_sub(cache)
+            .saturating_sub(self.headroom);
+        let costs: Vec<ChunkCost> = ladder
+            .iter()
+            .filter_map(|&m| {
+                let arena = usize::try_from(scratch_for(m)?).ok()?;
+                Some(ChunkCost { m, arena, part: 0 })
+            })
+            .collect();
+        let budget = usize::try_from(room).unwrap_or(usize::MAX);
+        Admission::new(budget, 0, 0, ladder)
+            .admit(0, &costs, cap, cap_var)
+            .ok()
+            .flatten()
+            .unwrap_or(ladder[ladder.len() - 1])
     }
 }
 
@@ -213,21 +301,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cell_figures_widen_beyond_the_fallback_only_as_far_as_the_sessions_fit() {
-        let figures = CellFigures::checked(Some(1000), Some(0), (0, 0), (10_000, 4_000))
-            .expect("the figures");
-        assert_eq!(figures.plan(1 << 40, 0, 1), Some(10_000));
-        assert_eq!(figures.plan(10, 0, 1), None);
-        assert_eq!(figures.serve(10, 0, 1), 4_000);
-        // Eight sessions each hold their own cache beside the slack: fewer cells than one.
-        let free = 10_000_000 + SESSION_PLAN_SLACK_BYTES;
-        let one = figures.plan(free, 0, 1).expect("one session");
-        let eight = figures.plan(free * 8, 0, 8).expect("eight sessions");
-        assert_eq!(one, 10_000);
-        assert!(eight < one || eight == 10_000, "{eight}");
-        assert!(figures.plan(free, 0, 8).is_none_or(|cells| cells < 10_000));
-        assert!(figures.serve(free, 0, 8) >= figures.fallback.min(one));
-        assert!(CellFigures::checked(None, Some(0), (0, 0), (1, 1)).is_none());
+    fn the_pool_holds_every_cell_the_card_carries_beside_the_weights() {
+        let figures = CellFigures::checked(Some(1000), Some(7), (3, 100)).expect("the figures");
+        // One session: every step of 1,024 cells the card carries.
+        assert_eq!(figures.pool(1_024_000 + 10, 0, 1), Some(1_024));
+        assert_eq!(figures.pool(1_024_000 + 9, 0, 1), None);
+        assert_eq!(figures.pool(40_960_000 + 10, 0, 1), Some(40_960));
+        assert_eq!(
+            figures.pool(40_960_000 + 10 + 1_023_999, 0, 1),
+            Some(40_960)
+        );
+        // Further sessions cost their fixed bytes and the slack, not another cache.
+        let free = 40_960_000 + 10 + SESSION_PLAN_SLACK_BYTES + 700;
+        assert_eq!(figures.pool(free, 0, 8), Some(40_960));
+        assert_eq!(figures.pool(9, 0, 1), None);
+        // After the load, the pool is cut to what the card holds now, never raised.
+        assert_eq!(figures.held_pool(40_960, 20_480_000 + 10, 1), 20_480);
+        assert_eq!(figures.held_pool(10_240, 40_960_000 + 10, 1), 10_240);
+        assert_eq!(figures.held_pool(10_240, 9, 1), 0);
+        // One session holds up to the ceiling of the pool; a card that carries none is the fallback.
+        assert_eq!(
+            figures.planned(40_960_000 + 10, 0, 1, (10_000, 4_000)),
+            (10_000, 40_960)
+        );
+        assert_eq!(
+            figures.planned(1_024_000 + 10, 0, 1, (10_000, 4_000)),
+            (1_024, 1_024)
+        );
+        assert_eq!(figures.planned(9, 0, 1, (10_000, 4_000)), (4_000, 4_000));
+        assert!(CellFigures::checked(None, Some(0), (0, 0)).is_none());
+    }
+
+    #[test]
+    fn the_session_reserve_is_the_extra_parts_the_idle_parts_and_one_slack() {
+        // No idle part (Bolt): nothing for one session, extra parts and one slack beyond.
+        assert_eq!(session_reserve_bytes(1000, 0, 0), Some(0));
+        assert_eq!(session_reserve_bytes(1000, 1, 0), Some(0));
+        assert_eq!(
+            session_reserve_bytes(1000, 2, 0),
+            Some(1000 + SESSION_PLAN_SLACK_BYTES)
+        );
+        assert_eq!(
+            session_reserve_bytes(1000, 8, 0),
+            Some(7000 + SESSION_PLAN_SLACK_BYTES)
+        );
+        // One idle part (the Qwen executor): a lone session still builds it, so it is charged.
+        assert_eq!(session_reserve_bytes(1000, 1, 1), Some(1000));
+        assert_eq!(
+            session_reserve_bytes(1000, 4, 1),
+            Some(4000 + SESSION_PLAN_SLACK_BYTES)
+        );
+        assert_eq!(session_reserve_bytes(u64::MAX, 3, 0), None);
+    }
+
+    #[test]
+    fn sessions_are_funded_until_the_banks_would_lose_a_quarter() {
+        // 200 slots with one session, 2 slots lost to each further one.
+        let slots = |sessions: usize| Some(200 - 2 * (sessions - 1));
+        assert_eq!(funded_sessions(4, false, &slots), Some(4));
+        assert_eq!(funded_sessions(1, false, &slots), Some(1));
+        // 30 slots a session: 200, 170, 140, 110: the share is 150, so two are funded.
+        let heavy = |sessions: usize| Some(200 - 30 * (sessions - 1));
+        assert_eq!(funded_sessions(4, false, &heavy), Some(2));
+        // A card that carries one session only funds one; a card that carries none, none.
+        let one = |sessions: usize| (sessions == 1).then_some(8);
+        assert_eq!(funded_sessions(4, false, &one), Some(1));
+        assert_eq!(funded_sessions(4, false, &|_| None), None);
+        // A named count is funded whole or not at all, whatever the banks lose.
+        assert_eq!(funded_sessions(4, true, &heavy), Some(4));
+        assert_eq!(funded_sessions(4, true, &one), None);
     }
 
     const MIB: u64 = 1 << 20;
@@ -250,7 +392,31 @@ mod tests {
             free: 1000 * MIB + 128 * MIB + free_steps * MIB,
             weights: 1000 * MIB,
             band: 128 * MIB,
+            arena: 0,
         }
+    }
+
+    #[test]
+    fn the_arena_is_funded_before_the_context_is_sized() {
+        let bare = card(400);
+        let with = CardBytes {
+            arena: 40 * MIB,
+            ..bare
+        };
+        let ceiling = 262_144;
+        let at = |card| longest_context(card, &wide, ceiling).expect("a context");
+        // The arena takes its bytes from the cache: 40 MiB is 20,480 positions of `wide`.
+        assert_eq!(at(bare) - at(with), 20_480);
+        // A card that holds the cache and not the arena has no context at all.
+        let tight = CardBytes {
+            arena: 100_000 * MIB,
+            ..bare
+        };
+        assert_eq!(longest_context(tight, &wide, ceiling), None);
+        // The form rule sees the arena too: a thin form can reach what the wide one cannot.
+        let forms = forms();
+        let fit = plan_card_fit(with, &forms, LIMITS).expect("a fit");
+        assert!(fit.context >= at(with));
     }
 
     const LIMITS: ContextLimits = ContextLimits {

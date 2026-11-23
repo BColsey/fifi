@@ -1,5 +1,6 @@
 //! The Bolt engine's use of the shared on-disk prefix tier. A Bolt prefix is a host copy of the
-//! cache cells `0..fed` of every physical layer (`BoltSnapshot`); the family tells the shared
+//! kept positions of every physical layer (`BoltSnapshot`): positions `0..fed` of a full-attention
+//! layer and the last window of a sliding layer, in position order; the family tells the shared
 //! host-store adapter (`kv_disk::HostFamily`) how many cells a snapshot covers, how an entry is
 //! cut into one object per physical layer and how a snapshot is rebuilt from a verified read.
 //! The policy (when to write, how long a stop may wait, how a damaged entry falls back) is the
@@ -14,13 +15,15 @@ use crate::{
 pub(super) const TIER_LABEL: &str = "gemma4 bolt";
 
 /// Names the layout of a snapshot's bytes: bump it when `BoltSnapshot` stores them differently.
-const LAYOUT_TAG: &str = "bolt-kv8-snapshot-v1";
+/// Version 2 keeps only the last window of each sliding layer, in position order; an entry of
+/// version 1 holds every position of every layer and must never be read as one.
+const LAYOUT_TAG: &str = "bolt-kv8-snapshot-v2";
 
 /// What a Bolt single-card CUDA load fixes about the entries it writes.
 const CONTRACT: FamilyContract = FamilyContract {
     adapter: "gemma4.bolt",
     backend: "cuda.single-card",
-    snapshot_schema: "gemma4.bolt.kv8-cells.v1",
+    snapshot_schema: "gemma4.bolt.kv8-cells.v2",
     payload_abi: "kv8-planes-by-physical-layer.v1",
     position_policy: "absolute-rope-from-zero",
     render_mode: "chat",
@@ -71,14 +74,14 @@ impl VecFamily for BoltFamily<'_> {
 /// attention split count (see `split_path_name`).
 pub(super) fn load_identity(
     weights: &str,
+    text: &crate::tokenizer::TokenizerIdentity,
     layer_bytes: &[usize],
     attention_splits: Option<usize>,
 ) -> LoadIdentity {
-    let (tokenizer, template) = crate::tokenizer::gemma::pinned_digests();
     LoadIdentity {
         weights: weights.to_owned(),
-        tokenizer: crate::weights::sha256_hex(&tokenizer),
-        template: crate::weights::sha256_hex(&template),
+        tokenizer: crate::weights::sha256_hex(&text.tokenizer_json),
+        template: crate::weights::sha256_hex(&text.chat_template_jinja),
         numeric_path: crate::capability::tuning::split_path_name(
             "bolt-kv8",
             attention_splits,
@@ -96,6 +99,15 @@ pub(super) fn load_identity(
 mod tests {
     use super::*;
     use crate::family::kv_disk::{ObjectRole, Run};
+
+    fn text() -> crate::tokenizer::TokenizerIdentity {
+        crate::tokenizer::TokenizerIdentity {
+            tokenizer_json: [1; 32],
+            tokenizer_config_json: [2; 32],
+            chat_template_jinja: [3; 32],
+            generation_config_json: [4; 32],
+        }
+    }
 
     #[test]
     fn an_entry_has_one_object_per_physical_layer_back_to_back() {
@@ -122,12 +134,39 @@ mod tests {
     }
 
     #[test]
-    fn the_load_identity_names_the_weights_the_pinned_text_and_the_layout() {
-        let one = load_identity("w1", &[8, 16], Some(32));
+    fn an_entry_of_the_first_layout_is_not_found_by_this_load() {
+        let now = load_identity("w1", &text(), &[8, 16], Some(32));
+        // The identity the first layout wrote under: its layout tag and its schema name.
+        let first = LoadIdentity {
+            layout: now.layout.replace("snapshot-v2", "snapshot-v1"),
+            family: FamilyContract {
+                snapshot_schema: "gemma4.bolt.kv8-cells.v1",
+                ..now.family.clone()
+            },
+            ..now.clone()
+        };
+        assert_ne!(first.layout, now.layout);
+        assert_ne!(first.namespace(), now.namespace());
+        // Either change alone already separates the two, so a missed bump of one still fails.
+        let tag_only = LoadIdentity {
+            layout: first.layout.clone(),
+            ..now.clone()
+        };
+        let schema_only = LoadIdentity {
+            family: first.family.clone(),
+            ..now.clone()
+        };
+        assert_ne!(tag_only.namespace(), now.namespace());
+        assert_ne!(schema_only.namespace(), now.namespace());
+    }
+
+    #[test]
+    fn the_load_identity_names_the_weights_the_text_and_the_layout() {
+        let one = load_identity("w1", &text(), &[8, 16], Some(32));
         assert!(one.is_complete());
-        let other_weights = load_identity("w2", &[8, 16], Some(32));
-        let other_layout = load_identity("w1", &[8, 24], Some(32));
-        let other_split = load_identity("w1", &[8, 16], None);
+        let other_weights = load_identity("w2", &text(), &[8, 16], Some(32));
+        let other_layout = load_identity("w1", &text(), &[8, 24], Some(32));
+        let other_split = load_identity("w1", &text(), &[8, 16], None);
         let namespace = |load: &LoadIdentity| {
             format!("{:?}", (&load.weights, &load.layout, &load.numeric_path))
         };
@@ -137,7 +176,7 @@ mod tests {
         // The tuned card keeps the name entries were written under; another count is another
         // numeric path.
         assert_eq!(one.numeric_path, "bolt-kv8 attention-split true");
-        let small = load_identity("w1", &[8, 16], Some(8));
+        let small = load_identity("w1", &text(), &[8, 16], Some(8));
         assert_ne!(namespace(&one), namespace(&small));
     }
 }

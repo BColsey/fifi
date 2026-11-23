@@ -119,7 +119,9 @@ __global__ void kv8_append_k(Args a) {
     } else {
         base = a.pos_dev ? (long long)*a.pos_dev : (long long)a.pos0;
     }
-    if (base < 0 || base + (kMany ? 1 : a.m) > (a.ring > 0 ? (long long)kMaxCells : (long long)a.cells)) {
+    int cells = a.cells;
+    if constexpr (kMany) cells = (int)a.rows[t].cells;
+    if (base < 0 || base + (kMany ? 1 : a.m) > (a.ring > 0 ? (long long)kMaxCells : (long long)cells)) {
         if (status && blockIdx.x == 0 && threadIdx.x == 0 && (kMany || blockIdx.y == 0))
             atomicOr(status, kStatusInvalidStepState);
         return;
@@ -128,8 +130,8 @@ __global__ void kv8_append_k(Args a) {
     const size_t cell = (size_t)(kMany ? (a.ring > 0 ? base % a.ring : base)
                                        : (a.ring > 0 ? (base + t) % a.ring : base + t));
     const size_t in_at = ((size_t)t * a.n_kv_head + kvh) * a.head_dim + d;
-    const size_t code_at = (size_t)kvh * a.cells * a.head_dim + cell * a.head_dim + d;
-    const size_t scale_at = (size_t)kvh * a.cells * groups + cell * groups + d / kGroup;
+    const size_t code_at = (size_t)kvh * cells * a.head_dim + cell * a.head_dim + d;
+    const size_t scale_at = (size_t)kvh * cells * groups + cell * groups + d / kGroup;
     const float kx = a.k[in_at], vx = a.v[in_at];
     const float kmax = warp_max_a(fabsf(kx));
     const float vmax = warp_max_a(fabsf(vx));

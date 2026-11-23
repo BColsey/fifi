@@ -852,6 +852,14 @@ fn fixed_session_bytes(shape: &HostShape) -> Result<u64> {
     bytes().ok_or_else(|| EngError::MemoryPlan("live DeltaNet state bytes overflow".into()))
 }
 
+/// Whether a start runs its one-row products through the tiled kernel a window of rows takes. A
+/// start that admits more than one session is always a compiled MoE start (`admit`, and the
+/// settings before it, refuse windows without compile and for the dense family), so a row of a
+/// window and the same row alone meet the same kernel.
+fn tiles_one_row_products(shape: &HostShape, rules: &Q36Rules) -> bool {
+    rules.compile && shape.dense_inter.is_none()
+}
+
 /// Checks the rules against the model before any weight is imported.
 fn admit(shape: &HostShape, rules: &Q36Rules) -> Result<()> {
     if shape.dense_inter.is_some() && rules.max_seqs > 1 {
@@ -1066,10 +1074,11 @@ impl Q36Executor {
         device_plan: Option<ExpertDevicePlan>,
     ) -> Result<(Self, Q36Session)> {
         admit(host.shape(), &rules)?;
-        // A start that can run windows of rows gives a row the product kernel a window gives it,
-        // alone or not: set before anything traces, since compiled blocks keep the products they
-        // traced. A one-session start keeps the single-row kernels and their dispatch count.
-        kernels.set_row_invariant_products(rules.max_seqs > 1)?;
+        // A compiled MoE start decodes a row with the product kernel a window of rows takes, alone
+        // or not, which is also its faster kernel on the 35B model; the dense family and a start
+        // without compiled blocks keep the one-row kernels, which are faster there (measured on
+        // the Mac). Set before anything traces, since compiled blocks keep the products they traced.
+        kernels.set_row_invariant_products(tiles_one_row_products(host.shape(), &rules))?;
         kernels.set_program_limit(rules.compile_program_limit)?;
         let fixed_state_bytes = if rules.max_seqs > 1 {
             fixed_session_bytes(host.shape())?
@@ -2138,27 +2147,74 @@ mod tests {
     }
 
     #[test]
-    fn only_a_start_that_can_run_windows_tiles_the_one_row_products() {
-        let _serial = crate::native_test_lock();
-        let (single, _) = build(prefix_rules());
+    fn every_start_that_admits_a_window_tiles_the_one_row_products() {
+        let ckpt = tiny::checkpoint(&TINY_GQA);
+        let host = HostWeights::load(&ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap();
+        let moe = host.shape().clone();
+        let mut dense = moe.clone();
+        dense.dense_inter = Some(8);
+        let start = |compile, max_seqs| Q36Rules {
+            compile,
+            max_seqs,
+            session_cap: 1 << 40,
+            ..rules(vec![], VOCAB)
+        };
+        assert!(admit(&moe, &start(true, 2)).is_ok());
         assert!(
-            !single.decoder.kernels.row_invariant_products(),
-            "a one-session start keeps the single-row kernels"
+            admit(&moe, &start(false, 2)).is_err(),
+            "a window needs compile"
         );
-        drop(single);
+        assert!(
+            admit(&dense, &start(true, 2)).is_err(),
+            "a window needs MoE routing"
+        );
+        assert!(admit(&dense, &start(false, 2)).is_err());
+        for shape in [&moe, &dense] {
+            for compile in [false, true] {
+                for max_seqs in 2..=8 {
+                    let rules = start(compile, max_seqs);
+                    if admit(shape, &rules).is_ok() {
+                        assert!(
+                            tiles_one_row_products(shape, &rules),
+                            "a start of {max_seqs} sessions admitted without the tiled products"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_compiled_moe_start_tiles_the_one_row_products() {
+        let _serial = crate::native_test_lock();
+        let (plain, _) = build(prefix_rules());
+        assert!(
+            !plain.decoder.kernels.row_invariant_products(),
+            "a start without compiled blocks keeps the one-row kernels"
+        );
+        drop(plain);
         let ckpt = Box::leak(Box::new(tiny::checkpoint(&TINY_GQA)));
         let host = HostWeights::load(ckpt, &TINY_GQA, &tiny::config(&TINY_GQA)).unwrap();
-        let windowed = Q36Rules {
+        let compiled = Q36Rules {
             compile: true,
-            max_seqs: 2,
+            max_seqs: 1,
             session_cap: 1 << 30,
             ..rules(vec![], VOCAB)
         };
-        let (windows, _) =
-            Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host, windowed).unwrap();
+        let (executor, _) =
+            Q36Executor::from_parts(MlxKernels::try_new().unwrap(), ckpt, host, compiled).unwrap();
         assert!(
-            windows.decoder.kernels.row_invariant_products(),
-            "a start that can run windows tiles them"
+            executor.decoder.kernels.row_invariant_products(),
+            "a compiled MoE start tiles its one-row products, windows or not"
+        );
+        // A context of the same thread that goes away leaves the running engine's kernels alone;
+        // the last one to go restores the ordinary kernels.
+        drop(MlxKernels::try_new().unwrap());
+        assert!(executor.decoder.kernels.row_invariant_products());
+        drop(executor);
+        assert!(
+            !MlxKernels::try_new().unwrap().row_invariant_products(),
+            "the next context on the thread starts with the ordinary kernels"
         );
     }
 

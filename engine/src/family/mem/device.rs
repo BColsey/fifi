@@ -30,6 +30,11 @@ pub(crate) struct DevicePolicy {
     /// Qwen3.6 Q4_K_M server of the 2026-11-03 qualification (n=1); charged as one floor, never a
     /// precise term. Flash-Next borrows it for its own post-load allocations.
     pub(crate) runtime_overhead_floor: u64,
+    /// The device bytes a Qwen3.6 weight load takes beyond the tensor bytes it plans: the kernel
+    /// modules the start loads eagerly and the context's own workspace. Measured as the free bytes
+    /// before the load less after it, less the planned tensor bytes, on the UD-IQ4_XS file on a
+    /// 3090 (n=1): 269,850,112, rounded up to a whole MiB.
+    pub(crate) load_unplanned: u64,
     /// The device bytes a legacy (non-fixed) admission keeps free: the Qwen3.6 admission
     /// headroom, its free-after-load floor, and the tiered bank admission's reserve.
     pub(crate) load_headroom: u64,
@@ -58,6 +63,7 @@ pub(crate) const DEVICE: DevicePolicy = DevicePolicy {
     spare_min: 64 * MIB,
     uncertainty_band: 128 * MIB,
     runtime_overhead_floor: 384 * MIB,
+    load_unplanned: 258 * MIB,
     load_headroom: GIB,
     flint_headroom: 512 * MIB,
     flint_bank_margin: 160 * MIB,
@@ -81,6 +87,7 @@ mod tests {
         assert_eq!(DEVICE.spare_min, 67_108_864);
         assert_eq!(DEVICE.uncertainty_band, 134_217_728);
         assert_eq!(DEVICE.runtime_overhead_floor, 402_653_184);
+        assert_eq!(DEVICE.load_unplanned, 270_532_608);
         assert_eq!(DEVICE.load_headroom, 1_073_741_824);
         assert_eq!(DEVICE.flint_headroom, 536_870_912);
         assert_eq!(DEVICE.flint_bank_margin, 167_772_160);

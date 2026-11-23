@@ -545,13 +545,15 @@ pub(super) fn chunk_device_phased(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::moe::{step as decode_step, step_device as decode_step_device};
-    use super::super::super::ops::{assert_parity, values};
-    use super::super::super::weights::ResidentWeights;
     use super::*;
     use crate::family::qwen::qwen36::host::{self, MoeW};
     use crate::family::qwen::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen::qwen36::host_load::HostWeights;
+    use crate::family::qwen::qwen36::resident::moe::{
+        step as decode_step, step_device as decode_step_device,
+    };
+    use crate::family::qwen::qwen36::resident::ops::{assert_parity, values};
+    use crate::family::qwen::qwen36::resident::weights::ResidentWeights;
     use crate::family::qwen::qwen36::tiny::{self, TINY};
     use crate::kernels::MlxKernels;
     use crate::tensor::Dtype;

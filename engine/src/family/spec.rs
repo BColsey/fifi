@@ -484,44 +484,6 @@ pub const CHAT_TEMPLATE_FALLBACKS: &[TemplateFallback] = &[TemplateFallback {
     template: include_str!("../../testdata/gemma4/chat_template.jinja"),
 }];
 
-/// The integer keys a Bolt E4B weights file states in its header, for a directory with no
-/// `config.json`: the geometry of the spec, under the file's key names.
-pub const NEMOTRON_BOLT_E4B_GGUF_KEYS: &[(&str, u32)] = &[
-    ("gemma4.block_count", NEMOTRON_BOLT_E4B.layers),
-    ("gemma4.context_length", 65_536),
-    ("gemma4.embedding_length", NEMOTRON_BOLT_E4B.hidden),
-    ("gemma4.embedding_length_per_layer_input", 256),
-    ("gemma4.feed_forward_length", 10_240),
-    ("gemma4.attention.head_count", NEMOTRON_BOLT_E4B.heads_q),
-    (
-        "gemma4.attention.key_length",
-        NEMOTRON_BOLT_E4B.global_head_dim,
-    ),
-    (
-        "gemma4.attention.key_length_swa",
-        NEMOTRON_BOLT_E4B.head_dim,
-    ),
-    (
-        "gemma4.attention.value_length",
-        NEMOTRON_BOLT_E4B.global_head_dim,
-    ),
-    (
-        "gemma4.attention.value_length_swa",
-        NEMOTRON_BOLT_E4B.head_dim,
-    ),
-    (
-        "gemma4.attention.sliding_window",
-        NEMOTRON_BOLT_E4B.sliding_window,
-    ),
-    (
-        "gemma4.attention.shared_kv_layers",
-        NEMOTRON_BOLT_E4B.kv_shared_layers,
-    ),
-];
-
-/// The final logit soft cap key of the Bolt E4B header and its value.
-pub const NEMOTRON_BOLT_E4B_GGUF_SOFTCAP: (&str, f32) = ("gemma4.final_logit_softcapping", 30.0);
-
 /// The row for a `general.architecture`, if a spec names a template for it.
 pub fn chat_template_fallback(architecture: &str) -> Option<&'static TemplateFallback> {
     CHAT_TEMPLATE_FALLBACKS

@@ -18,10 +18,12 @@ use super::wire::state_name;
 use crate::EngError;
 use crate::family::flint;
 use crate::family::gemma::gemma4;
+use crate::family::inkling2_mini;
 use crate::family::nemotron::nemotron35::factory as nemotron_factory;
 use crate::family::qwen::flash_next::factory;
 use crate::family::qwen::qwen36::factory as q36_factory;
-use crate::family::sampler::SamplingDefaults;
+use crate::family::qwen::sensenova;
+use crate::family::sampler::{LoadedDefaults, SamplingDefaults};
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
 use crate::storage_guard;
 use crate::tokenizer::TokenizerBundle;
@@ -73,7 +75,8 @@ fn purge_kv_caches(_config: &Config) -> Result<(), StartupError> {
 }
 
 /// `args` are the command-line arguments after the program name.
-/// The call returns after a shutdown signal and the end of the running requests.
+/// The call returns after a shutdown signal, the end of the running requests
+/// and the end of the supervised workers.
 ///
 /// Diagnostic commands (`doctor`, `check`, `config validate`, `--help`,
 /// `--version`) are dispatched first and never start the server; see
@@ -95,14 +98,18 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         .filter(|arg| arg.as_str() != "--purge-kv-cache")
         .cloned()
         .collect();
-    let args: &[String] = match without_purge.first().map(String::as_str) {
-        Some("serve") => &without_purge[1..],
-        _ => &without_purge,
+    let served = without_purge.first().map(String::as_str) == Some("serve");
+    let args: &[String] = if served {
+        &without_purge[1..]
+    } else {
+        &without_purge
     };
     // The simplified startup is a front end to the same path: it builds
     // a normal in-memory `Config` and everything downstream (key check,
     // listen validation, engine start, serving) is the `--config` path.
-    let config = if args.first().map(String::as_str) == Some("--model") {
+    let simplified = !args.iter().any(|arg| arg == "--config")
+        && (served || args.first().map(String::as_str) == Some("--model"));
+    let config = if simplified {
         let parsed = crate::server::model_serve::parse_args(args)?;
         let config = crate::server::model_serve::build_config(&parsed)?;
         if parsed.print_config {
@@ -113,8 +120,19 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     } else {
         Config::from_file(&config_path(args)?)?
     };
-    let key = config.api_key(|name| std::env::var(name).ok())?;
-    let address = config.listen_address()?;
+    let (address, key) = super::loopback_key::listen_and_key(
+        &config,
+        simplified,
+        &super::loopback_key::Host {
+            env: &|name| std::env::var(name).ok(),
+            key_file: super::loopback_key::key_path(
+                std::env::var_os("XDG_CONFIG_HOME"),
+                std::env::var_os("HOME"),
+            ),
+            terminal: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        },
+        &mut |line| eprintln!("{line}"),
+    )?;
     if purge_kv_cache {
         purge_kv_caches(&config)?;
     }
@@ -142,6 +160,7 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         state.hf().sweep_partials();
     }
     state = state.with_sample_trace(config.sample_trace);
+    state.set_supervised_engines(config.supervised_engines);
     if let Some(web_dir) = &config.web_dir {
         // Refuse at startup, with the path named, rather than serving a
         // shell that 404s: a configured-but-missing frontend is a
@@ -156,6 +175,9 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         eprintln!("web UI: serving {} at /", web_dir.display());
         state = state.with_web_dir(web_dir.clone());
     }
+    // After every builder: the hub's download events land in the
+    // monitor's ring from the first job on.
+    state.wire_hub_events();
     let state = Arc::new(state);
     // One boot line for the warm-turn flip: the effective state and how to
     // roll it back. The polarity comes from the SAME function the request
@@ -296,6 +318,19 @@ pub(crate) fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
         .ok();
 }
 
+fn load_sampling_defaults(
+    config: &EngineConfig,
+) -> Result<(LoadedDefaults, std::path::PathBuf), EngError> {
+    let directory = if config.family == inkling2_mini::FAMILY {
+        // The publisher pin includes generation_config.json in the tokenizer bundle.
+        storage_guard::require_local(&config.tokenizer_dir, "Inkling tokenizer")?;
+        config.tokenizer_dir.clone()
+    } else {
+        crate::family::gguf_select::directory_of(&config.model_dir)
+    };
+    Ok((SamplingDefaults::from_model_dir(&directory)?, directory))
+}
+
 /// Starts every engine of the configuration. A failure names the engine. Every entry carries the
 /// `prefix_reuse` flag of the configuration file to the chat handler and to the Q36 engine
 /// start, whose session-cap rule reads it (`family::qwen::qwen36::settings::check_prefix_reuse_cap`),
@@ -303,22 +338,23 @@ pub(crate) fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    if crate::family::mlx_budget::enabled()
-        && file
-            .engines
-            .iter()
-            .filter(|entry| {
-                FAMILY_STARTERS
-                    .iter()
-                    .any(|&(family, _, metal)| metal && family == entry.family)
-            })
-            .count()
-            > 1
+    if crate::family::mlx_budget::enabled_with_default(file.engines.iter().any(|entry| {
+        entry.family == inkling2_mini::FAMILY && inkling2_mini::factory::check_backend().is_ok()
+    })) && file
+        .engines
+        .iter()
+        .filter(|entry| {
+            FAMILY_STARTERS
+                .iter()
+                .any(|&(family, _, metal)| metal && family == entry.family)
+        })
+        .count()
+        > 1
     {
         return Err(StartupError(
-            "FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB requires one MLX model per \
-             server; either variable alone activates automatic sizing, and Metal reports one \
-             shared working set"
+            "Automatic MLX sizing requires one MLX model per server. Metal reports one shared \
+             working set. FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB activates automatic \
+             sizing, and the opt-in Inkling backend uses it by default."
                 .into(),
         ));
     }
@@ -341,7 +377,7 @@ pub(crate) fn start_one(
     config: &crate::server::config::EngineConfig,
     file_prefix_reuse: Option<bool>,
 ) -> Result<(Engine, EngineEntry), StartupError> {
-    check_staged_family(&config.family).map_err(|error| {
+    check_family_backend(config).map_err(|error| {
         StartupError(format!(
             "engine {} failed to start: {}",
             config.id,
@@ -365,15 +401,24 @@ pub(crate) fn start_one(
             describe(&error)
         ))
     })?;
-    // A model path may name one `.gguf` file; its side files sit beside it.
-    let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-    let loaded = SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
-        StartupError(format!(
-            "engine {} failed to start: {}",
-            config.id,
-            describe(&error)
-        ))
-    })?;
+    // SenseNova and explicitly named GGUF files take no neighboring sampling configuration;
+    // the defaults line still names the directory a config file would live in.
+    let (loaded, defaults_directory) = if config.family == sensenova::FAMILY
+        || crate::family::gguf_select::is_gguf_file(&config.model_dir)
+    {
+        (
+            SamplingDefaults::of_lone_file(),
+            crate::family::gguf_select::directory_of(&config.model_dir),
+        )
+    } else {
+        load_sampling_defaults(config).map_err(|error| {
+            StartupError(format!(
+                "engine {} failed to start: {}",
+                config.id,
+                describe(&error)
+            ))
+        })?
+    };
     // Resolve the flag once, before anything consumes it: Flint's env
     // opt-in is checked first (it only reads the engine's own options),
     // then the family-aware decision covers the ready note, the starter
@@ -436,7 +481,7 @@ pub(crate) fn start_one(
     // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
     // the template already wins over anything set here.
     apply_replay_overrides(&config.id, &mut bundle, config)?;
-    let generation = model_directory.join("generation_config.json");
+    let generation = defaults_directory.join("generation_config.json");
     // The label comes from the loader result, not from a second `exists` call, so the file
     // cannot change between the read and the log line.
     eprintln!(
@@ -491,11 +536,16 @@ fn defaults_line(
     }
 }
 
-fn check_staged_family(family: &str) -> Result<(), EngError> {
-    if family == flint::FAMILY {
-        flint::factory::check_backend()?;
+fn check_family_backend(config: &EngineConfig) -> Result<(), EngError> {
+    match config.family.as_str() {
+        flint::FAMILY => flint::factory::check_backend(),
+        gemma4::FAMILY => gemma4::serve::check_backend(
+            &config.model_dir,
+            &crate::capability::probe::CompiledBackends::of_this_build(),
+        ),
+        inkling2_mini::FAMILY => inkling2_mini::factory::check_backend(),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// One family's start result: the uniform shape every factory already
@@ -510,10 +560,7 @@ pub(crate) struct StartedEngine {
 }
 
 /// The uniform starter signature: one config entry, the process-wide
-/// prefix_reuse flag, the ready note. A future family (Gemma4) is one new
-/// table entry with this same signature and no other registry edit;
-/// adding its name to the config's FAMILIES list is config surface, not
-/// registry.
+/// prefix_reuse flag, and the ready note.
 pub(crate) type Starter = fn(&EngineConfig, bool, ReadyNote) -> Result<StartedEngine, EngError>;
 
 fn start_flint(
@@ -527,16 +574,36 @@ fn start_flint(
         config.flint.as_ref(),
         ready_note,
     )?;
-    let effective = crate::capability::effective::flint_effective_for_build(
-        config.flint.as_ref(),
-        // The order the open actually served, so a retried load reports the token-major walk.
-        flint::prefill_order::served().as_ref(),
-    )?;
+    // CUDA stages the rows on its worker after the executor opens with its final order.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    let effective = Vec::new();
+    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+    let effective =
+        crate::capability::effective::flint_effective_for_build(config.flint.as_ref(), None)?;
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
         effective,
+    })
+}
+
+fn start_inkling(
+    config: &EngineConfig,
+    _prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    let (engine, bundle, context_limit) = inkling2_mini::factory::start_engine(
+        &config.model_dir,
+        &config.tokenizer_dir,
+        config.context_limit,
+        ready_note,
+    )?;
+    Ok(StartedEngine {
+        engine,
+        bundle: Arc::new(bundle),
+        context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -641,10 +708,7 @@ fn start_fake(
     })
 }
 
-/// The Gemma4 row. The Bolt E4B dispatches by its model directory's
-/// `config.json` (validated by `gemma4::serve::bolt_configured`) and starts
-/// on the CUDA build; any other model in the family reaches this refusal
-/// (the Starter doc above documents the one-row contract).
+/// The Gemma4 row serves a Bolt-geometry weights file on CUDA after the shared checkpoint check.
 fn start_gemma4(
     config: &EngineConfig,
     _prefix_reuse: bool,
@@ -652,77 +716,64 @@ fn start_gemma4(
 ) -> Result<StartedEngine, EngError> {
     #[cfg(feature = "native-cuda")]
     {
-        let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-        // A directory with no `config.json` is the weights file alone: its header states the
-        // same geometry.
-        let gate = gemma4::serve::bolt_configured(&model_directory).or_else(|error| {
-            if model_directory.join("config.json").exists() {
-                return Err(error);
-            }
-            crate::family::gguf_select::check_header_identity(
-                &config.model_dir,
-                "gemma4",
-                crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_KEYS,
-                Some(crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_SOFTCAP),
-            )
-        });
-        match gate {
-            Ok(()) => {
-                let started = gemma4::serve::start_bolt_engine(
-                    &config.model_dir,
-                    &config.tokenizer_dir,
-                    _ready_note,
-                    config.gemma4.clone().unwrap_or_default().seqs(),
-                    config
-                        .gemma4
-                        .as_ref()
-                        .and_then(gemma4::Gemma4Options::prompt_rows),
-                    config
-                        .gemma4
-                        .as_ref()
-                        .and_then(|options| options.kv_cache.as_ref())
-                        .map(crate::family::kv_disk::KvCacheOptions::checked)
-                        .transpose()
-                        .map_err(|message| {
-                            EngError::BadRequest(format!("engine config: {message}"))
-                        })?,
-                )?;
-                Ok(StartedEngine {
-                    engine: started.engine,
-                    bundle: Arc::new(started.bundle),
-                    context_limit: started.context_limit,
-                    effective: Vec::new(),
-                })
-            }
-            Err(cause) => Err(EngError::BadRequest(format!(
-                "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
-                     the model directory {} failed the Bolt configuration check: {}",
-                model_directory.display(),
-                cause.describe()
-            ))),
-        }
+        gemma4::serve::check_checkpoint(&config.model_dir)?;
+        let started = gemma4::serve::start_bolt_engine(
+            &config.model_dir,
+            &config.tokenizer_dir,
+            _ready_note,
+            config.gemma4.clone().unwrap_or_default().seqs(),
+            config
+                .gemma4
+                .as_ref()
+                .and_then(gemma4::Gemma4Options::prompt_rows),
+            config
+                .gemma4
+                .as_ref()
+                .and_then(|options| options.kv_cache.as_ref())
+                .map(crate::family::kv_disk::KvCacheOptions::checked)
+                .transpose()
+                .map_err(|message| EngError::BadRequest(format!("engine config: {message}")))?,
+            _prefix_reuse,
+        )?;
+        Ok(StartedEngine {
+            engine: started.engine,
+            bundle: Arc::new(started.bundle),
+            context_limit: started.context_limit,
+            effective: Vec::new(),
+        })
     }
     #[cfg(not(feature = "native-cuda"))]
-    Err(EngError::BadRequest(format!(
-        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
-         this build has no CUDA engine (model directory {})",
-        config.model_dir.display()
-    )))
+    Err(gemma4::serve::cuda_required(&config.model_dir))
 }
 
-/// The closed registry of families this build starts. Staged backends
-/// refuse inside their starter before model or tokenizer reads; the
-/// config gate owns the unknown-family rejection text.
+fn start_sensenova(
+    config: &EngineConfig,
+    _prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    let started = sensenova::serve::start_engine(&config.model_dir, ready_note)?;
+    Ok(StartedEngine {
+        engine: started.engine,
+        bundle: Arc::new(started.bundle),
+        context_limit: started.context_limit,
+        effective: Vec::new(),
+    })
+}
+
+/// Starter dispatch for recognized families, not a list of usable backends.
+/// The config gate owns the unknown-family rejection text.
 // The third column: the starter builds a Metal-resident executor on a
 // `native-mlx` build. The auto-budget one-model rule reads it, so the family
 // set it counts can never drift from this dispatch table.
 const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (flint::FAMILY, start_flint, true),
+    (inkling2_mini::FAMILY, start_inkling, true),
     (factory::FAMILY, start_flash, true),
     (q36_factory::FAMILY, start_q36, true),
     (q36_factory::DENSE_FAMILY, start_q36, true),
     (nemotron_factory::FAMILY, start_nemotron, false),
     (gemma4::FAMILY, start_gemma4, false),
+    (sensenova::FAMILY, start_sensenova, false),
     (fake::FAMILY, start_fake, false),
 ];
 
@@ -748,7 +799,8 @@ pub(crate) fn holds_memory_until_restart(family: &str) -> bool {
 /// load) because its snapshots are not qualified yet.
 fn entry_prefix_reuse(engine: &EngineConfig, file_flag: Option<bool>, flint_opt_in: bool) -> bool {
     let flag = file_flag.unwrap_or_else(|| default_prefix_reuse(engine));
-    flag && (engine.family != flint::FAMILY || flint_opt_in)
+    flag && engine.family != inkling2_mini::FAMILY
+        && (engine.family != flint::FAMILY || flint_opt_in)
 }
 
 /// The unset-key default: on only where reuse is qualified - the Flash-Next
@@ -931,10 +983,16 @@ pub(crate) async fn serve(
             eprintln!("enginesrv: cannot set TCP_NODELAY on an accepted connection: {error}");
         }
     });
-    axum::serve(listener, router(state))
+    let served = axum::serve(listener, router(Arc::clone(&state)))
         .with_graceful_shutdown(shutdown)
         .await
-        .map_err(|error| StartupError(format!("server failure: {error}")))
+        .map_err(|error| StartupError(format!("server failure: {error}")));
+    served?;
+    // The supervised workers are this server's own processes: a server
+    // that stops takes their memory off the card with it.
+    tokio::task::spawn_blocking(move || state.workers().stop_all())
+        .await
+        .map_err(|error| StartupError(format!("stopping the supervised workers: {error}")))
 }
 
 /// The call needs a running Tokio runtime. A signal that arrives before the first poll is not
@@ -1002,6 +1060,7 @@ mod tests {
             api_key_env: "UNUSED".to_string(),
             prefix_reuse,
             sample_trace: false,
+            supervised_engines: false,
             web_dir: None,
             engines,
         }
@@ -1026,6 +1085,36 @@ mod tests {
             gemma4: None,
             flint: None,
         }
+    }
+
+    #[test]
+    fn inkling_sampling_defaults_follow_the_pinned_tokenizer_directory() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("generation_config.json"),
+            r#"{"temperature":0.25}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tokenizer.path().join("generation_config.json"),
+            r#"{"temperature":1.0}"#,
+        )
+        .unwrap();
+        let mut config = engine_config("inkling", None);
+        config.model_dir = model.path().to_owned();
+        config.tokenizer_dir = tokenizer.path().to_owned();
+        config.family = crate::family::inkling2_mini::FAMILY.into();
+        let load = |config: &EngineConfig| {
+            super::load_sampling_defaults(config)
+                .unwrap()
+                .0
+                .values
+                .temperature
+        };
+        assert_eq!(load(&config), 1.0);
+        config.family = "fake".into();
+        assert_eq!(load(&config), 0.25);
     }
 
     /// A tokenizer dir carrying the PINNED qwen template, so an entry's
@@ -1341,6 +1430,30 @@ mod tests {
             ),
             Ok(_) => panic!("staged Flint must refuse before sampling-default reads"),
         }
+    }
+
+    #[cfg(not(feature = "native-cuda"))]
+    #[test]
+    fn gemma4_without_cuda_refuses_before_sampling_defaults() {
+        let dir = tempfile::tempdir().expect("temporary model directory");
+        std::fs::write(dir.path().join("generation_config.json"), "not JSON")
+            .expect("write malformed sampling defaults");
+        let mut config = engine_config("bolt", None);
+        config.family = crate::family::gemma::gemma4::FAMILY.into();
+        config.model_dir = dir.path().to_path_buf();
+        config.context_limit = None;
+
+        let error = start_engines(&file_with(vec![config], None))
+            .err()
+            .expect("unsupported Bolt must not start");
+        assert_eq!(
+            error.0,
+            format!(
+                "engine bolt failed to start: gemma4 serves only the Nemotron Bolt E4B on the \
+                 native-cuda build; this build has no CUDA engine (model directory {})",
+                dir.path().display()
+            )
+        );
     }
 
     // The real startup path on a real network mount: without the guard the
@@ -1797,6 +1910,7 @@ mod tests {
             metal,
             vec![
                 crate::family::flint::FAMILY,
+                crate::family::inkling2_mini::FAMILY,
                 crate::family::qwen::flash_next::factory::FAMILY,
                 crate::family::qwen::qwen36::factory::FAMILY,
                 crate::family::qwen::qwen36::factory::DENSE_FAMILY,

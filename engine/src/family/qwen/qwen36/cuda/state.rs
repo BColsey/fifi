@@ -42,10 +42,13 @@ use crate::{
 
 pub(super) mod device_tip;
 pub(super) mod export;
+pub(super) mod grow;
 pub(super) mod pinned;
 pub(super) mod prefix;
 pub(super) mod rollback;
 
+#[cfg(all(test, feature = "native-cuda"))]
+mod grow_tests;
 #[cfg(all(test, feature = "native-cuda"))]
 mod paged_prefix_tests;
 #[cfg(all(test, feature = "native-cuda"))]

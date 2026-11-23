@@ -43,10 +43,15 @@ pub(in crate::kernels::cuda) struct KvRowRaw {
     pub(in crate::kernels::cuda) v_codes: u64,
     pub(in crate::kernels::cuda) v_scales: u64,
     pub(in crate::kernels::cuda) step: u64,
-    pub(in crate::kernels::cuda) reserved: [u64; 3],
+    pub(in crate::kernels::cuda) cells: u64,
+    pub(in crate::kernels::cuda) reserved: [u64; 2],
 }
 
-const _: () = assert!(size_of::<KvRowRaw>() == KV_ROW_BYTES && offset_of!(KvRowRaw, step) == 32);
+const _: () = assert!(
+    size_of::<KvRowRaw>() == KV_ROW_BYTES
+        && offset_of!(KvRowRaw, step) == 32
+        && offset_of!(KvRowRaw, cells) == 40
+);
 
 #[repr(C)]
 struct ConvArgsRaw {
@@ -151,8 +156,21 @@ struct DecodeArgsRaw {
     scale: f32,
 }
 
+#[repr(C)]
+struct Append16ArgsRaw {
+    k: *const c_void,
+    v: *const c_void,
+    rows: *const c_void,
+    n: c_int,
+    n_kv_head: c_int,
+    head_dim: c_int,
+    cells: c_int,
+}
+
 const _: () = assert!(
-    size_of::<ConvArgsRaw>() == 48
+    size_of::<Append16ArgsRaw>() == 40
+        && offset_of!(Append16ArgsRaw, n) == 24
+        && size_of::<ConvArgsRaw>() == 48
         && offset_of!(ConvArgsRaw, n) == 32
         && size_of::<DeltaArgsRaw>() == 96
         && offset_of!(DeltaArgsRaw, n) == 56
@@ -184,6 +202,18 @@ unsafe extern "C" {
     fn gemma_raw(args: *const GemmaArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_attn_decode_q8_multi_launch"]
     fn decode_raw(args: *const DecodeArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_attn_decode_multi_launch"]
+    fn decode16_raw(
+        args: *const DecodeArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_kv16_append_multi_launch"]
+    fn append16_raw(
+        args: *const Append16ArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
@@ -470,6 +500,45 @@ pub(in crate::kernels::cuda) fn kv8_append_multi_launch(
     checked(status, stage)
 }
 
+pub(in crate::kernels::cuda) struct Append16MultiRaw<'a> {
+    pub(in crate::kernels::cuda) k: RawRange<'a>,
+    pub(in crate::kernels::cuda) v: RawRange<'a>,
+    pub(in crate::kernels::cuda) table: RawRange<'a>,
+    pub(in crate::kernels::cuda) n: usize,
+    pub(in crate::kernels::cuda) n_kv_head: usize,
+    pub(in crate::kernels::cuda) head_dim: usize,
+    pub(in crate::kernels::cuda) cells: usize,
+}
+
+pub(in crate::kernels::cuda) fn kv16_append_multi_launch(
+    stream: &RawStream,
+    call: Append16MultiRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let need = call.n * call.n_kv_head * call.head_dim * size_of::<f32>();
+    let sized = table_ok(&call.table, call.n, KV_ROW_BYTES)
+        && fits(&call.k, need, 4)
+        && fits(&call.v, need, 4);
+    if !sized {
+        return Err(invalid_argument());
+    }
+    let args = Append16ArgsRaw {
+        k: call.k.address().cast_const(),
+        v: call.v.address().cast_const(),
+        rows: call.table.address().cast_const(),
+        n: int(call.n)?,
+        n_kv_head: int(call.n_kv_head)?,
+        head_dim: int(call.head_dim)?,
+        cells: int(call.cells)?,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: the `k` and `v` rows and the table are proved live, sized and aligned above (rows to
+    // 4, the table to 8); the entry repeats the shape checks; the planes and step blocks the table
+    // names were proved, and proved apart, by the safe layer, which is the only writer of the
+    // table. `args` and `stage` are live for the call.
+    let status = unsafe { append16_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
 pub(in crate::kernels::cuda) struct DecodeMultiRaw<'a> {
     pub(in crate::kernels::cuda) q: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: Option<RawRange<'a>>,
@@ -486,9 +555,28 @@ pub(in crate::kernels::cuda) struct DecodeMultiRaw<'a> {
     pub(in crate::kernels::cuda) scale: f32,
 }
 
+/// The entry of one cache form: the KV8 planes (`inference_cuda_attn_decode_q8_multi_launch`) or the
+/// fp16 planes (`inference_cuda_attn_decode_multi_launch`); both take the same arguments.
+type DecodeEntry = unsafe extern "C" fn(*const DecodeArgsRaw, *mut c_void, *mut c_int) -> c_int;
+
 pub(in crate::kernels::cuda) fn attn_decode_q8_multi_launch(
     stream: &RawStream,
     call: DecodeMultiRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    decode_multi_launch(stream, call, decode_raw)
+}
+
+pub(in crate::kernels::cuda) fn attn_decode_multi_launch(
+    stream: &RawStream,
+    call: DecodeMultiRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    decode_multi_launch(stream, call, decode16_raw)
+}
+
+fn decode_multi_launch(
+    stream: &RawStream,
+    call: DecodeMultiRaw<'_>,
+    entry: DecodeEntry,
 ) -> Result<(), DeviceFailure> {
     let f = size_of::<f32>();
     let [n_head, n_kv_head] = call.heads;
@@ -556,7 +644,7 @@ pub(in crate::kernels::cuda) fn attn_decode_q8_multi_launch(
     // to 8, the rest to 4) with `out` and `part` apart from each other and from every read range;
     // the entry repeats the shape checks of the single-row entry; the plane and step addresses in
     // the table were proved by the safe layer; `args` and `stage` are live for the call.
-    let status = unsafe { decode_raw(&args, stream.as_ptr(), &mut stage) };
+    let status = unsafe { entry(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

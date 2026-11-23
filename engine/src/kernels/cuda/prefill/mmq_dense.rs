@@ -18,13 +18,6 @@
 //! ABI's `int`, and the destination reach (`dst reach`: `(m - 1) * ld + n` must not exceed
 //! `i32::MAX`, because the kernels index the destination in 32-bit `int`). The byte sizes are
 //! `mmq_size`'s: the q8_1 range `q8_1_bytes(K, M)` carries the one constant pad.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
 
 use std::ffi::c_int;
 
@@ -111,6 +104,11 @@ pub(crate) fn check_dense_rules(
     col_off: usize,
 ) -> Result<DenseInts, EngError> {
     check_dense_mmq_rules(mmq_type_of(ty)?, k, n, m, ld, col_off)
+}
+
+/// Whether the dense GEMM has a case for `ty`: the types whose weights it reads.
+pub(crate) fn has_dense_case(ty: QuantType) -> bool {
+    mmq_type_of(ty).is_ok()
 }
 
 pub(super) fn check_dense_mmq_rules(

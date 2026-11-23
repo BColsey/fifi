@@ -6,10 +6,55 @@ use crate::{
     EngError,
     family::{device_budget::DeviceReserve, mem::MacMemory},
 };
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+const AUTO_BUDGET: &str = "FIFI_MLX_AUTO_BUDGET";
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 pub(crate) const PRESSURE_MARGIN: u64 = crate::family::mem::DEVICE.unified_pressure_margin;
+
+/// Downward-only limit for disposable host cache entries. Staging, KV and
+/// other startup reservations are already deducted from `admitted_bytes`.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct PressureRetention {
+    admitted_bytes: usize,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+impl PressureRetention {
+    pub(crate) fn start_if_enabled(admitted_bytes: usize) -> Option<Self> {
+        if admitted_bytes == 0
+            || !std::env::var_os("FIFI_MLX_ADAPT_EXPERT_CACHE").is_some_and(|value| value == "1")
+        {
+            return None;
+        }
+        if !crate::kernels::mlx::native::start_memory_pressure() {
+            eprintln!("Metal memory pressure observer unavailable; retaining startup cache limit");
+            return None;
+        }
+        Some(Self { admitted_bytes })
+    }
+
+    pub(crate) fn poll(&self) -> (u32, usize) {
+        let severity = crate::kernels::mlx::native::memory_pressure();
+        (severity, pressure_limit(self.admitted_bytes, severity))
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn pressure_limit(admitted_bytes: usize, severity: u32) -> usize {
+    match severity {
+        0 => admitted_bytes,
+        1 => admitted_bytes / 2,
+        _ => 0,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceBudget {
@@ -47,7 +92,14 @@ impl DeviceBudget {
     /// The budget of a start that opted in (`FIFI_MLX_AUTO_BUDGET=1` or a ceiling variable).
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn detect() -> Result<Option<Self>, EngError> {
-        if !enabled() {
+        Self::detect_with_default(false)
+    }
+
+    /// Same budget, with a family-supplied default for the opt-in flag: Inkling text
+    /// serving turns automatic sizing on unless the operator sets `FIFI_MLX_AUTO_BUDGET=0`.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn detect_with_default(auto_default: bool) -> Result<Option<Self>, EngError> {
+        if !enabled_with_default(auto_default) {
             return Ok(None);
         }
         crate::family::mem::ceiling_from_env()?;
@@ -91,6 +143,18 @@ impl DeviceBudget {
             metal_working_set_bytes: self.recommended,
             effective_device_budget_bytes: self.bytes(),
             configured_device_ceiling_bytes: self.ceiling,
+        }
+    }
+
+    /// A family may supply a smaller default while keeping explicit ceilings.
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn with_default_ceiling(self, bytes: u64) -> Self {
+        Self {
+            ceiling: self.ceiling.or(Some(bytes)),
+            ..self
         }
     }
 
@@ -166,7 +230,12 @@ impl fmt::Display for DeviceBudget {
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enabled() -> bool {
-    std::env::var_os("FIFI_MLX_AUTO_BUDGET").is_some_and(|value| value == "1")
+    enabled_with_default(false)
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn enabled_with_default(auto_default: bool) -> bool {
+    std::env::var_os(AUTO_BUDGET).map_or(auto_default, |value| value == "1")
         || std::env::var_os(crate::family::mem::CEILING_MIB).is_some()
 }
 
@@ -189,11 +258,25 @@ pub(super) fn packed_payload_floor(
         })
 }
 
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn auto_budget_is_explicit() -> bool {
+    std::env::var_os(AUTO_BUDGET).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::family::mem::parse_ceiling;
     use std::ffi::OsStr;
+
+    #[test]
+    fn pressure_only_reduces_the_admitted_disposable_cache() {
+        for bytes in [0, 1, 100, usize::MAX] {
+            assert_eq!(pressure_limit(bytes, 0), bytes);
+            assert_eq!(pressure_limit(bytes, 1), bytes / 2);
+            assert_eq!(pressure_limit(bytes, 2), 0);
+        }
+    }
 
     #[test]
     fn metal_working_set_caps_explicit_budget_and_checks_base_charges() {

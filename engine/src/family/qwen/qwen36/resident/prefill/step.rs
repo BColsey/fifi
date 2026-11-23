@@ -730,18 +730,18 @@ pub(in super::super) fn fixture_embedding_imports() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::decoder::{
-        DECODE_RETIRE_CAP, MAX_CHUNK_ROWS, ResidentDecoder, StepMode, StepResult,
-    };
-    use super::super::super::kv_plan::KV_STEP;
-    use super::super::super::ops::{assert_parity, values};
-    use super::super::super::parity::{cosine, top5};
-    use super::super::super::state::{LayerState, kv_storage_bytes};
     use super::*;
     use crate::family::qwen::qwen36::host::{self, HostState, LayerState as HostLayer};
     use crate::family::qwen::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen::qwen36::host_load::HostWeights;
+    use crate::family::qwen::qwen36::resident::decoder::{
+        DECODE_RETIRE_CAP, MAX_CHUNK_ROWS, ResidentDecoder, StepMode, StepResult,
+    };
+    use crate::family::qwen::qwen36::resident::kv_plan::KV_STEP;
     use crate::family::qwen::qwen36::resident::moe::Routing;
+    use crate::family::qwen::qwen36::resident::ops::{assert_parity, values};
+    use crate::family::qwen::qwen36::resident::parity::{cosine, top5};
+    use crate::family::qwen::qwen36::resident::state::{LayerState, kv_storage_bytes};
     use crate::family::qwen::qwen36::settings::Activation;
     use crate::family::qwen::qwen36::tiny::{self, TINY_GQA};
     use crate::kernels::MlxKernels;
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn the_compiled_layer_flag_keeps_non_fused_dims_on_the_eager_chunk() {
         let _serial = crate::native_test_lock();
-        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use crate::family::qwen::qwen36::resident::executor::COMPILED_LAYER_TEST;
         use std::sync::atomic::Ordering;
         let ckpt = setup();
         let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
@@ -987,10 +987,10 @@ mod tests {
     /// One KV-form arm of the acceptance oracle above: `kv` fixes the cache form the
     /// decoder plans, and the byte comparison below covers that form's buffers.
     fn compiled_layer_chunk_parity_on(kv: KvDtype) {
-        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use crate::family::qwen::qwen36::resident::executor::COMPILED_LAYER_TEST;
         use std::sync::atomic::Ordering;
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1070,7 +1070,7 @@ mod tests {
             // is copied on write, never moved). F32 only - the Q8 form has no
             // non-F32 readback in the test support.
             let snapshot_f32 =
-                |snap: &super::super::super::state::ResidentSnapshot,
+                |snap: &crate::family::qwen::qwen36::resident::state::ResidentSnapshot,
                  kernels: &mut crate::kernels::MlxKernels| {
                     snap.attn_f32_values(kernels).unwrap()
                 };
@@ -1248,10 +1248,10 @@ mod tests {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
     fn compiled_layer_window_peak_at_large_cache() {
         let _serial = crate::native_test_lock();
-        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use crate::family::qwen::qwen36::resident::executor::COMPILED_LAYER_TEST;
         use std::sync::atomic::Ordering;
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1275,18 +1275,26 @@ mod tests {
         // plain append from the rebuild. The premise itself is asserted from the
         // capacity rule, not from the fill comments: at 65,536 the rule grows the
         // cache for 8 more rows, at 65,520 (cap 65,792) it does not.
-        let step = super::super::super::kv_plan::KV_STEP;
-        let cap_at =
-            |len: usize| super::super::super::kv_plan::next_capacity(len, 0, 0, step, 0).unwrap();
+        let step = crate::family::qwen::qwen36::resident::kv_plan::KV_STEP;
+        let cap_at = |len: usize| {
+            crate::family::qwen::qwen36::resident::kv_plan::next_capacity(len, 0, 0, step, 0)
+                .unwrap()
+        };
         let cap_65536 = cap_at(65_536);
         let cap_65520 = cap_at(65_520);
         assert!(
-            super::super::super::kv_plan::next_capacity(65_536, 8, cap_65536, step, 0).unwrap()
+            crate::family::qwen::qwen36::resident::kv_plan::next_capacity(
+                65_536, 8, cap_65536, step, 0
+            )
+            .unwrap()
                 > cap_65536,
             "the 65,536 fill must cross a growth boundary for 8 rows"
         );
         assert_eq!(
-            super::super::super::kv_plan::next_capacity(65_520, 8, cap_65520, step, 0).unwrap(),
+            crate::family::qwen::qwen36::resident::kv_plan::next_capacity(
+                65_520, 8, cap_65520, step, 0
+            )
+            .unwrap(),
             cap_65520,
             "the 65,520 fill must fit its 8 rows in spare capacity"
         );
@@ -1346,8 +1354,8 @@ mod tests {
     /// law's capacities or crossing positions.
     fn window_step_wall_at_capacity_boundaries() {
         let _serial = crate::native_test_lock();
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1419,8 +1427,8 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let _serial = crate::native_test_lock();
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1448,7 +1456,7 @@ mod tests {
         // A fn, not a closure: a closure would hold its borrow of `decoder.kernels`
         // across the `decoder.prefill` calls below.
         fn digest(
-            state: &mut super::super::super::state::ResidentState,
+            state: &mut crate::family::qwen::qwen36::resident::state::ResidentState,
             kernels: &mut crate::kernels::MlxKernels,
             kv_heads: u32,
             width: u32,
@@ -1474,9 +1482,11 @@ mod tests {
 
         // Both laws in one process: the quantum state from `zero`, the geometric state
         // from `zero_geometric`, regardless of the ambient Q36_KV_GEOMETRIC.
-        let mut quantum =
-            super::super::super::state::ResidentState::zero(&mut decoder.kernels, &decoder.weights)
-                .unwrap();
+        let mut quantum = crate::family::qwen::qwen36::resident::state::ResidentState::zero(
+            &mut decoder.kernels,
+            &decoder.weights,
+        )
+        .unwrap();
         ok(
             decoder.prefill(&mut quantum, &tokens, StepMode::Prompt),
             "quantum prompt",
@@ -1484,12 +1494,13 @@ mod tests {
         let (quantum_values, quantum_digest, quantum_cap) =
             digest(&mut quantum, &mut decoder.kernels, kv_heads, width, false);
 
-        let mut geometric = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            262_144,
-        )
-        .unwrap();
+        let mut geometric =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                262_144,
+            )
+            .unwrap();
         ok(
             decoder.prefill(&mut geometric, &tokens, StepMode::Prompt),
             "geometric prompt",
@@ -1527,9 +1538,11 @@ mod tests {
         // Quantum control: the charge is the valid length. Built with `zero`, so the
         // ambient Q36_KV_GEOMETRIC cannot flip the control's law.
         decoder.set_session_budget(SessionBudget::new(260 * GROWTH));
-        let mut quantum =
-            super::super::super::state::ResidentState::zero(&mut decoder.kernels, &decoder.weights)
-                .unwrap();
+        let mut quantum = crate::family::qwen::qwen36::resident::state::ResidentState::zero(
+            &mut decoder.kernels,
+            &decoder.weights,
+        )
+        .unwrap();
         ok(
             decoder.prefill(&mut quantum, &tokens, StepMode::Prompt),
             "quantum prompt",
@@ -1540,12 +1553,13 @@ mod tests {
         // cap, the third is refused before it allocates anything.
         let one = 512 * GROWTH;
         decoder.set_session_budget(SessionBudget::new(2 * one));
-        let mut first = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            1_024,
-        )
-        .unwrap();
+        let mut first =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                1_024,
+            )
+            .unwrap();
         ok(
             decoder.prefill(&mut first, &tokens, StepMode::Prompt),
             "first geometric prompt",
@@ -1560,23 +1574,25 @@ mod tests {
             one,
             "the charge is the allocated capacity, not the valid length"
         );
-        let mut second = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            1_024,
-        )
-        .unwrap();
+        let mut second =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                1_024,
+            )
+            .unwrap();
         ok(
             decoder.prefill(&mut second, &tokens, StepMode::Prompt),
             "second geometric prompt",
         );
         assert_eq!(decoder.session_used(), 2 * one);
-        let mut third = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            1_024,
-        )
-        .unwrap();
+        let mut third =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                1_024,
+            )
+            .unwrap();
         let refused = decoder.prefill(&mut third, &tokens, StepMode::Prompt);
         assert!(
             matches!(refused, Err(EngError::MemoryPlan(_))),
@@ -1598,8 +1614,8 @@ mod tests {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
     fn geometric_growth_holds_at_the_q8_form() {
         let _serial = crate::native_test_lock();
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1619,12 +1635,13 @@ mod tests {
         decoder.routing = Routing::Device;
         decoder.set_chunk_rows(256).unwrap();
         let tokens: Vec<u32> = (0..600u32).map(token).collect();
-        let mut state = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            262_144,
-        )
-        .unwrap();
+        let mut state =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                262_144,
+            )
+            .unwrap();
         ok(
             decoder.prefill(&mut state, &tokens, StepMode::Prompt),
             "q8 prompt",
@@ -1644,8 +1661,8 @@ mod tests {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
     fn a_reset_keeps_the_geometric_law() {
         let _serial = crate::native_test_lock();
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1665,12 +1682,13 @@ mod tests {
         decoder.routing = Routing::Device;
         decoder.set_chunk_rows(256).unwrap();
         let tokens: Vec<u32> = (0..600u32).map(token).collect();
-        let mut state = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            262_144,
-        )
-        .unwrap();
+        let mut state =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                262_144,
+            )
+            .unwrap();
         ok(
             decoder.prefill(&mut state, &tokens, StepMode::Prompt),
             "first prompt",
@@ -1697,8 +1715,8 @@ mod tests {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
     fn a_prompt_just_past_a_doubling_charges_the_allocated_storage() {
         let _serial = crate::native_test_lock();
-        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
-        let real = super::super::super::real::open(&dir);
+        let dir = crate::family::qwen::qwen36::resident::real::env_path("Q36_CKPT_DIR");
+        let real = crate::family::qwen::qwen36::resident::real::open(&dir);
         let host = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &real.ckpt,
             &crate::family::spec::QWEN3_6_35B_A3B,
@@ -1718,12 +1736,13 @@ mod tests {
         decoder.routing = Routing::Device;
         decoder.set_chunk_rows(256).unwrap();
         let tokens: Vec<u32> = (0..1_030u32).map(token).collect();
-        let mut state = super::super::super::state::ResidentState::zero_geometric(
-            &mut decoder.kernels,
-            &decoder.weights,
-            262_144,
-        )
-        .unwrap();
+        let mut state =
+            crate::family::qwen::qwen36::resident::state::ResidentState::zero_geometric(
+                &mut decoder.kernels,
+                &decoder.weights,
+                262_144,
+            )
+            .unwrap();
         ok(
             decoder.prefill(&mut state, &tokens, StepMode::Prompt),
             "prompt",
@@ -1733,7 +1752,7 @@ mod tests {
         // The charge is the ALLOCATED capacity: the stored bytes and the session charge
         // are equal, with no logical-vs-allocated gap to bound.
         let charged = state.charged_bytes().unwrap();
-        let stored = super::super::super::state::kv_storage_bytes(state.layers());
+        let stored = crate::family::qwen::qwen36::resident::state::kv_storage_bytes(state.layers());
         assert_eq!(
             stored, charged,
             "the geometric charge must equal the allocated storage"
