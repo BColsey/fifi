@@ -3,7 +3,8 @@
 
 use super::serve::LoopStep;
 use super::step::{
-    AttnView, DeltaView, LoopState, RouterView, apply_yarn, attn_step, delta_step, merge, mhc_route,
+    AttnView, DeltaView, LoopState, RouterView, apply_yarn, attn_step, delta_step, merge,
+    mhc_route, yarn_inv_freq,
 };
 use super::weights::LoopShape;
 use super::{LoopPlan, PHYSICAL_LAYERS, RopePlan, TRUNK_LAYERS};
@@ -113,6 +114,41 @@ fn yarn_rope_matches_the_vendor_formula() {
     // Dims past the rotary span are untouched.
     assert_eq!(head[4], 5.0);
     assert_eq!(head[5], 6.0);
+}
+
+#[test]
+fn yarn_table_rotation_matches_apply_yarn() {
+    let rope = RopePlan {
+        dims: 16,
+        sections: [0, 0, 4, 4],
+        freq_base: 1e7,
+        factor: 2.0,
+        original_context: 262_144,
+    };
+    let table = yarn_inv_freq(&rope);
+    assert_eq!(table.len(), 8);
+    // The fastest pair keeps its original frequency exactly.
+    assert_eq!(table[0], 1.0);
+    // The table is strictly decreasing: base powers shrink and the YaRN blend
+    // only pulls slow pairs further down.
+    assert!(table.windows(2).all(|pair| pair[0] > pair[1]));
+    // The same rotation through the table equals `apply_yarn` on every pair
+    // (up to float reassociation: the host folds pos into the angle first).
+    let head: Vec<f32> = (0..16).map(|i| (i as f32 - 3.5) * 0.25).collect();
+    let mut want = head.clone();
+    apply_yarn(&mut want, &rope, 97);
+    let mut got = head;
+    for i in 0..8 {
+        let angle = 97.0 * table[i];
+        let (sin, cos) = angle.sin_cos();
+        let a = got[i];
+        let b = got[i + 8];
+        got[i] = a * cos - b * sin;
+        got[i + 8] = b * cos + a * sin;
+    }
+    for (got, want) in got.iter().zip(want.iter()) {
+        assert!((got - want).abs() < 1e-5, "{} vs {}", got, want);
+    }
 }
 
 #[test]

@@ -265,6 +265,7 @@ impl FlashStep<'_> {
                 q,
                 pos: self.pos_word()?,
                 status: self.status_word()?,
+                inv_freq: None,
             },
         )?;
 

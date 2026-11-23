@@ -450,6 +450,7 @@ impl<'r> Fp16Run<'r> {
                 q: c.q_at(s)?,
                 pos: c.pos()?,
                 status: c.status()?,
+                inv_freq: None,
             },
         )?;
         ctx.attn_decode(
@@ -633,6 +634,7 @@ impl<'r> Kv8Run<'r> {
                 q: c.q_at(s)?,
                 pos: c.pos()?,
                 status: c.status()?,
+                inv_freq: None,
             },
         )?;
         let shape = Kv8Shape::linear(s.m, N_KV, D, rows, Kv8CodeScale::StoredHalf);

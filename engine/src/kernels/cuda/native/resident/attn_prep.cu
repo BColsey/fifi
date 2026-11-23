@@ -76,6 +76,7 @@ extern "C" int inference_cuda_attn_prep_launch(const inference_cuda_attn_prep_ar
         k.k_norm = (const float *)a->k_norm;
         k.eps = a->eps;
         k.rope_base = a->rope_base;
+        k.inv_freq = (const float *)a->inv_freq;
         k.k_cache = (__half *)a->k_cache;
         k.v_cache = (__half *)a->v_cache;
         k.q = (float *)a->q;
@@ -145,6 +146,7 @@ extern "C" int inference_cuda_attn_prep_rows_launch(const inference_cuda_attn_pr
         k.k_norm = (const float *)a->k_norm;
         k.eps = a->eps;
         k.rope_base = a->rope_base;
+        k.inv_freq = (const float *)a->inv_freq;
         k.k_rows = (float *)a->k_rows;
         k.v_rows = (float *)a->v_rows;
         k.q = (float *)a->q;

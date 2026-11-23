@@ -218,7 +218,8 @@ __global__ void attn_prep_k(AttnArgs a) {
   int half = a.n_rot / 2;
   if (d < a.n_rot) {
     int i = d % half;
-    float theta = pos * powf(a.rope_base, -2.f * i / a.n_rot), sn, cs;
+    float freq = a.inv_freq ? a.inv_freq[i] : powf(a.rope_base, -2.f * i / a.n_rot);
+    float theta = pos * freq, sn, cs;
     sincosf(theta, &sn, &cs);
     out = d < half ? x[d] * cs - x[d + half] * sn : x[d - half] * sn + x[d] * cs;
   }

@@ -403,6 +403,32 @@ pub(crate) fn apply_yarn(head: &mut [f32], rope: &RopePlan, pos: u32) {
     }
 }
 
+/// The per-pair inverse frequencies of the YaRN rope as a table: the same
+/// progressive powers and the same ramp blend [`apply_yarn`] computes inline,
+/// so a device table built here agrees with the host reference by construction
+/// (the kernel reads `pos * table[i]` where the host applies `theta * blend`).
+pub(crate) fn yarn_inv_freq(rope: &RopePlan) -> Vec<f32> {
+    let dims = rope.dims;
+    let half = dims / 2;
+    let base = rope.freq_base;
+    let freq_scale = 1.0 / rope.factor;
+    let low = corr_dim(dims, rope.original_context as f32, 32.0, base)
+        .floor()
+        .max(0.0);
+    let high = corr_dim(dims, rope.original_context as f32, 1.0, base)
+        .ceil()
+        .min(dims as f32 - 1.0);
+    let mut theta = 1.0f32;
+    let theta_scale = base.powf(-2.0 / dims as f32);
+    let mut table = Vec::with_capacity(half);
+    for i in 0..half {
+        let ramp = ((i as f32 - low) / (high - low).max(0.001)).clamp(0.0, 1.0);
+        table.push(theta * ((1.0 - ramp) + freq_scale * ramp));
+        theta *= theta_scale;
+    }
+    table
+}
+
 /// YaRN correction boundary: `dims * ln(orig / (beta * 2pi)) / (2 ln base)` —
 /// the dim index where a `beta`-wavelength fits the original context.
 /// `low` clamps at 0 and `high` at `dims - 1`, as in `ggml_rope_yarn_corr_dims`.

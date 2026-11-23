@@ -126,6 +126,9 @@ pub(crate) struct AttnPrepCall<'b> {
     pub(crate) q: DeviceRange<'b>,
     pub(crate) pos: DeviceRange<'b>,
     pub(crate) status: DeviceRange<'b>,
+    /// The YaRN inverse-frequency table (n_rot/2 f32), or `None` to derive the
+    /// frequencies from `rope_base` (every family before SenseNova-Loop).
+    pub(crate) inv_freq: Option<DeviceRange<'b>>,
 }
 
 fn rule(tag: &str, detail: &str) -> EngError {
@@ -264,7 +267,11 @@ fn check_fit(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
     require_fit("k_cache", &call.k_cache, cache, 16)?;
     require_fit("v_cache", &call.v_cache, cache, 16)?;
     require_fit("pos", &call.pos, 4, 4)?;
-    require_fit("status", &call.status, 4, 4)
+    require_fit("status", &call.status, 4, 4)?;
+    if let Some(inv_freq) = &call.inv_freq {
+        require_fit("inv_freq", inv_freq, shape.n_rot / 2 * 4, 4)?;
+    }
+    Ok(())
 }
 
 /// Disjointness of the touched extents: the four written ranges (`q`, both caches, `status`)
@@ -313,6 +320,9 @@ pub(crate) struct AttnPrepRowsCall<'b> {
     pub(crate) q: DeviceRange<'b>,
     pub(crate) pos: DeviceRange<'b>,
     pub(crate) status: DeviceRange<'b>,
+    /// The YaRN inverse-frequency table (n_rot/2 f32), or `None` to derive the
+    /// frequencies from `rope_base` (every family before SenseNova-Loop).
+    pub(crate) inv_freq: Option<DeviceRange<'b>>,
 }
 
 fn rows_rule(tag: &str, detail: &str) -> EngError {
@@ -387,7 +397,11 @@ fn check_rows_fit(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
         16,
     )?;
     require_fit("pos", &call.pos, 4, 4)?;
-    require_fit("status", &call.status, 4, 4)
+    require_fit("status", &call.status, 4, 4)?;
+    if let Some(inv_freq) = &call.inv_freq {
+        require_fit("inv_freq", inv_freq, shape.n_rot / 2 * 4, 4)?;
+    }
+    Ok(())
 }
 
 fn check_rows_apart(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
@@ -446,6 +460,11 @@ impl CudaContext {
         ensure_rows(call.admit_pos, call.shape.m, call.shape.rows)?;
         check_fit(&call)?;
         check_apart(&call)?;
+        let inv_freq = call
+            .inv_freq
+            .as_ref()
+            .map(|range| self.raw_range(range))
+            .transpose()?;
         let RopeParams { eps, rope_base } = call.rope;
         self.launch_on(stream, move |raw| {
             attn_prep_launch(
@@ -462,6 +481,7 @@ impl CudaContext {
                     ints,
                     eps,
                     rope_base,
+                    inv_freq,
                 },
             )
         })
@@ -498,6 +518,11 @@ impl CudaContext {
         ensure_rows(call.admit_pos, call.shape.m, call.shape.rows)?;
         check_rows_fit(&call)?;
         check_rows_apart(&call)?;
+        let inv_freq = call
+            .inv_freq
+            .as_ref()
+            .map(|range| self.raw_range(range))
+            .transpose()?;
         let RopeParams { eps, rope_base } = call.rope;
         self.launch_on(stream, move |raw| {
             attn_prep_rows_launch(
@@ -514,6 +539,7 @@ impl CudaContext {
                     ints,
                     eps,
                     rope_base,
+                    inv_freq,
                 },
             )
         })

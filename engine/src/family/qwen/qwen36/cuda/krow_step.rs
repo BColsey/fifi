@@ -830,6 +830,7 @@ impl<'a> QwenResidentStep<'a> {
                     q: self.kview(*q)?,
                     pos: self.state.step_field(StepField::Pos)?,
                     status: self.state.step_field(StepField::Status)?,
+                    inv_freq: None,
                 },
             ),
             RowsBlockOp::AttnDecode { q, proj, part, out } => ctx.attn_decode(

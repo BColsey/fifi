@@ -57,14 +57,15 @@ typedef struct inference_cuda_attn_prep_args {
     int slot_mode;  /* INFERENCE_CUDA_SLOT_POSITION */
     int slot_ring;  /* 0 */
     float eps;      /* finite, > 0 */
-    float rope_base;/* finite, > 1 */
+    float rope_base;/* finite, > 1; ignored when inv_freq is set */
+    const void *inv_freq; /* NULL = derive from rope_base; else n_rot/2 f32 YaRN entries, 4-aligned */
 } inference_cuda_attn_prep_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_attn_prep_args) == 112 && offsetof(inference_cuda_attn_prep_args, pos) == 48 && offsetof(inference_cuda_attn_prep_args, status) == 56 && offsetof(inference_cuda_attn_prep_args, ld) == 64 && offsetof(inference_cuda_attn_prep_args, slot_ring) == 100 && offsetof(inference_cuda_attn_prep_args, eps) == 104 && offsetof(inference_cuda_attn_prep_args, rope_base) == 108,
+static_assert(sizeof(inference_cuda_attn_prep_args) == 120 && offsetof(inference_cuda_attn_prep_args, pos) == 48 && offsetof(inference_cuda_attn_prep_args, status) == 56 && offsetof(inference_cuda_attn_prep_args, ld) == 64 && offsetof(inference_cuda_attn_prep_args, slot_ring) == 100 && offsetof(inference_cuda_attn_prep_args, eps) == 104 && offsetof(inference_cuda_attn_prep_args, rope_base) == 108 && offsetof(inference_cuda_attn_prep_args, inv_freq) == 112,
               "inference_cuda_attn_prep_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_attn_prep_args) == 112 && offsetof(inference_cuda_attn_prep_args, pos) == 48 && offsetof(inference_cuda_attn_prep_args, status) == 56 && offsetof(inference_cuda_attn_prep_args, ld) == 64 && offsetof(inference_cuda_attn_prep_args, slot_ring) == 100 && offsetof(inference_cuda_attn_prep_args, eps) == 104 && offsetof(inference_cuda_attn_prep_args, rope_base) == 108,
+_Static_assert(sizeof(inference_cuda_attn_prep_args) == 120 && offsetof(inference_cuda_attn_prep_args, pos) == 48 && offsetof(inference_cuda_attn_prep_args, status) == 56 && offsetof(inference_cuda_attn_prep_args, ld) == 64 && offsetof(inference_cuda_attn_prep_args, slot_ring) == 100 && offsetof(inference_cuda_attn_prep_args, eps) == 104 && offsetof(inference_cuda_attn_prep_args, rope_base) == 108 && offsetof(inference_cuda_attn_prep_args, inv_freq) == 112,
                "inference_cuda_attn_prep_args layout");
 #endif
 
@@ -98,11 +99,12 @@ typedef struct inference_cuda_attn_prep_rows_args {
     int slot_mode;  /* INFERENCE_CUDA_SLOT_POSITION */
     int slot_ring;  /* 0 */
     float eps;      /* finite, > 0 */
-    float rope_base;/* finite, > 1 */
+    float rope_base;/* finite, > 1; ignored when inv_freq is set */
+    const void *inv_freq; /* NULL = derive from rope_base; else n_rot/2 f32 YaRN entries, 4-aligned */
 } inference_cuda_attn_prep_rows_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_attn_prep_rows_args) == 112 && offsetof(inference_cuda_attn_prep_rows_args, k_rows) == 24 && offsetof(inference_cuda_attn_prep_rows_args, cells) == 88,
+static_assert(sizeof(inference_cuda_attn_prep_rows_args) == 120 && offsetof(inference_cuda_attn_prep_rows_args, k_rows) == 24 && offsetof(inference_cuda_attn_prep_rows_args, cells) == 88 && offsetof(inference_cuda_attn_prep_rows_args, inv_freq) == 112,
               "inference_cuda_attn_prep_rows_args layout");
 #endif
 

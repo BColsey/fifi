@@ -257,6 +257,7 @@ impl Fx {
             q: r(Q)?,
             pos: self.bufs[PARAMS_BUF].range(OFFSET_POS, 4)?,
             status: self.bufs[PARAMS_BUF].range(OFFSET_STATUS, 4)?,
+            inv_freq: None,
         })
     }
 

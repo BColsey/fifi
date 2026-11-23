@@ -104,6 +104,10 @@ struct AttnArgs {
   // is then the plane cell count that bounds the pos word.
   float* k_rows = nullptr;  // [m][n_kv_head][256] f32
   float* v_rows = nullptr;
+  // Null, or the n_rot/2 inverse-frequency entries of a YaRN-scaled rope. When non-null the
+  // kernel reads inv_freq[i] instead of deriving theta from rope_base; the host owns the exact
+  // blend (SenseNova: YaRN factor 2.0 from a 262144 trained context).
+  const float* inv_freq = nullptr;  // [n_rot/2]
 };
 cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
 

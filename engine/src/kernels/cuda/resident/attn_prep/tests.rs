@@ -323,6 +323,7 @@ impl Fx {
             q: r(Q)?,
             pos: r(POS)?,
             status: r(STATUS)?,
+            inv_freq: None,
         };
         self.rig.ctx.attn_prep(stream, call)
     }
@@ -1056,6 +1057,7 @@ impl RowsFx {
                 q: r(Q)?,
                 pos: r(POS)?,
                 status: r(STATUS)?,
+                inv_freq: None,
             },
         )
     }
@@ -1084,6 +1086,7 @@ impl RowsFx {
                 q: self.range(Q)?,
                 pos: self.range(POS)?,
                 status: self.range(STATUS)?,
+                inv_freq: None,
             },
         )?;
         self.rig.stream.synchronize()?;

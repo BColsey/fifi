@@ -508,6 +508,7 @@ fn chain_case(rig: &Rig, positions: &[i32], seed: u64) {
                     q: q.range(0, q_row).unwrap(),
                     pos: row.step.range(4, 4).unwrap(),
                     status: row.step.range(16, 4).unwrap(),
+                    inv_freq: None,
                 },
             )
             .expect("prep single");
@@ -1403,6 +1404,7 @@ fn rows_of_different_cells_on_the_qwen_entries_are_the_bytes_of_single_row_launc
                     q: q.range(0, q_row).unwrap(),
                     pos: row.step.range(4, 4).unwrap(),
                     status: row.step.range(16, 4).unwrap(),
+                    inv_freq: None,
                 },
             )
             .expect("prep single");

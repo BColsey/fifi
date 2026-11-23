@@ -1093,12 +1093,14 @@ struct AttnPrepRowsArgsRaw {
     slot_ring: c_int,
     eps: f32,
     rope_base: f32,
+    inv_freq: *const c_void,
 }
 
 const _: () = assert!(
-    size_of::<AttnPrepRowsArgsRaw>() == 112
+    size_of::<AttnPrepRowsArgsRaw>() == 120
         && offset_of!(AttnPrepRowsArgsRaw, k_rows) == 24
         && offset_of!(AttnPrepRowsArgsRaw, cells) == 88
+        && offset_of!(AttnPrepRowsArgsRaw, inv_freq) == 112
 );
 
 unsafe extern "C" {
@@ -1123,6 +1125,9 @@ pub(in crate::kernels::cuda) struct AttnPrepRowsRaw<'a> {
     pub(in crate::kernels::cuda) ints: attn_prep::AttnInts,
     pub(in crate::kernels::cuda) eps: f32,
     pub(in crate::kernels::cuda) rope_base: f32,
+    /// The YaRN inverse-frequency table (n_rot/2 f32), or `None` to derive the
+    /// frequencies from `rope_base` (every family before SenseNova-Loop).
+    pub(in crate::kernels::cuda) inv_freq: Option<RawRange<'a>>,
 }
 
 /// `ints.rows` sizes nothing here: the rows buffers hold `m` rows, not plane cells.
@@ -1149,7 +1154,11 @@ fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
         && fits(&io.k_rows, rows, 16)
         && fits(&io.v_rows, rows, 16)
         && fits(&io.pos, 4, 4)
-        && fits(&io.status, 4, 4))
+        && fits(&io.status, 4, 4)
+        && io
+            .inv_freq
+            .as_ref()
+            .is_none_or(|range| fits(range, mul(cvt(io.ints.n_rot)? / 2, 4)?, 4)))
     {
         return Err(invalid_argument());
     }
@@ -1165,6 +1174,13 @@ fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
         Span::of(&io.k_norm, norm),
         Span::of(&io.pos, 4),
     ];
+    if let Some(range) = &io.inv_freq {
+        let span = Span::of(range, mul(cvt(io.ints.n_rot)? / 2, 4)?);
+        // A read may overlap another read; only the written extents must stay apart.
+        if !written.iter().all(|other| span.apart(other)) {
+            return Err(invalid_argument());
+        }
+    }
     for (i, a) in written.iter().enumerate() {
         if !(written[i + 1..].iter().all(|b| a.apart(b)) && read.iter().all(|b| a.apart(b))) {
             return Err(invalid_argument());
@@ -1202,6 +1218,11 @@ pub(in crate::kernels::cuda) fn attn_prep_rows_launch(
         slot_ring: 0,
         eps: call.eps,
         rope_base: call.rope_base,
+        inv_freq: call
+            .inv_freq
+            .as_ref()
+            .map(|range| range.address().cast_const())
+            .unwrap_or(std::ptr::null()),
     };
     let mut stage = STAGE_NONE;
     // SAFETY: as the child `attn_prep`: `check_attn_prep_rows` proved every range inside its live

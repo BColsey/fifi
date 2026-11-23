@@ -47,16 +47,18 @@ struct AttnPrepArgsRaw {
     slot_ring: c_int,
     eps: f32,
     rope_base: f32,
+    inv_freq: *const c_void,
 }
 
 const _: () = assert!(
-    size_of::<AttnPrepArgsRaw>() == 112
+    size_of::<AttnPrepArgsRaw>() == 120
         && offset_of!(AttnPrepArgsRaw, pos) == 48
         && offset_of!(AttnPrepArgsRaw, status) == 56
         && offset_of!(AttnPrepArgsRaw, ld) == 64
         && offset_of!(AttnPrepArgsRaw, slot_ring) == 100
         && offset_of!(AttnPrepArgsRaw, eps) == 104
         && offset_of!(AttnPrepArgsRaw, rope_base) == 108
+        && offset_of!(AttnPrepArgsRaw, inv_freq) == 112
 );
 
 unsafe extern "C" {
@@ -92,6 +94,9 @@ pub(in crate::kernels::cuda) struct AttnPrepRaw<'a> {
     pub(in crate::kernels::cuda) ints: AttnInts,
     pub(in crate::kernels::cuda) eps: f32,
     pub(in crate::kernels::cuda) rope_base: f32,
+    /// The YaRN inverse-frequency table (n_rot/2 f32), or `None` to derive the
+    /// frequencies from `rope_base` (every family before SenseNova-Loop).
+    pub(in crate::kernels::cuda) inv_freq: Option<RawRange<'a>>,
 }
 
 struct Needs {
@@ -99,6 +104,7 @@ struct Needs {
     norm: usize,
     q: usize,
     cache: usize,
+    inv_freq: usize,
 }
 
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
@@ -124,6 +130,7 @@ fn needs(ints: &AttnInts) -> Result<Needs, DeviceFailure> {
         norm: HEAD_DIM * 4,
         q: product(&[m, heads, HEAD_DIM, 4])?,
         cache: product(&[rows, kv_heads, HEAD_DIM, 2])?,
+        inv_freq: product(&[size(ints.n_rot)? / 2, 4])?,
     })
 }
 
@@ -140,6 +147,10 @@ fn check_fit(io: &AttnPrepRaw<'_>, need: &Needs) -> bool {
         && fits(&io.v_cache, need.cache, 16)
         && fits(&io.pos, 4, 4)
         && fits(&io.status, 4, 4)
+        && io
+            .inv_freq
+            .as_ref()
+            .is_none_or(|range| fits(range, need.inv_freq, 4))
 }
 
 /// The touched extents are compared, not the whole ranges, so `pos` and `status` may sit in
@@ -161,6 +172,13 @@ fn check_attn_prep(io: &AttnPrepRaw<'_>) -> Result<(), DeviceFailure> {
         Span::of(&io.k_norm, need.norm),
         Span::of(&io.pos, 4),
     ];
+    if let Some(range) = &io.inv_freq {
+        let span = Span::of(range, need.inv_freq);
+        // A read may overlap another read; only the written extents must stay apart.
+        if !written.iter().all(|other| span.apart(other)) {
+            return Err(invalid_argument());
+        }
+    }
     for (i, a) in written.iter().enumerate() {
         let apart_from_written = written[i + 1..].iter().all(|b| a.apart(b));
         if !(apart_from_written && read.iter().all(|b| a.apart(b))) {
@@ -199,6 +217,11 @@ pub(in crate::kernels::cuda) fn attn_prep_launch(
         slot_ring: 0,
         eps: call.eps,
         rope_base: call.rope_base,
+        inv_freq: call
+            .inv_freq
+            .as_ref()
+            .map(|range| range.address().cast_const())
+            .unwrap_or(std::ptr::null()),
     };
     let mut stage = STAGE_NONE;
     // SAFETY: (a) `check_attn_prep` proved every range inside its live allocation and large enough

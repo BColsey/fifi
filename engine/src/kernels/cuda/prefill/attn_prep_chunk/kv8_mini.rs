@@ -187,6 +187,7 @@ impl Mini {
                 v_rows: self.v.range(row * kv_bytes, kv_bytes)?,
                 pos: self.params.range(OFFSET_POS, 4)?,
                 status: self.params.range(OFFSET_STATUS, 4)?,
+                inv_freq: None,
             },
         )?;
         self.ctx.kv8_append(

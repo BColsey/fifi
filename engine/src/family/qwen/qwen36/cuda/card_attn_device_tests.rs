@@ -295,6 +295,7 @@ fn run_two_context_pipeline(steps: usize, poison_v: bool) -> Result<Pipeline, En
                 q: ref_q.range(0, full.attn.q_width * F32)?,
                 pos: ref_pos.range(0, 4)?,
                 status: ref_status.range(0, 4)?,
+                inv_freq: None,
             },
         )?;
         reference_context.kv8_append(
@@ -379,6 +380,7 @@ fn run_two_context_pipeline(steps: usize, poison_v: bool) -> Result<Pipeline, En
                     q: sides[card].q.range(0, g.attn.q_width * F32)?,
                     pos: sides[card].pos.range(0, 4)?,
                     status: sides[card].status.range(0, 4)?,
+                    inv_freq: None,
                 },
             )?;
         }
@@ -676,6 +678,7 @@ fn run_two_context_f16_pipeline(steps: usize) -> Result<F16Pipeline, EngError> {
                 q: ref_q.range(0, full.attn.q_width * F32)?,
                 pos: ref_pos.range(0, 4)?,
                 status: ref_status.range(0, 4)?,
+                inv_freq: None,
             },
         )?;
     }
@@ -748,6 +751,7 @@ fn run_two_context_f16_pipeline(steps: usize) -> Result<F16Pipeline, EngError> {
                     q: sides[card].q.range(0, g.attn.q_width * F32)?,
                     pos: sides[card].pos.range(0, 4)?,
                     status: sides[card].status.range(0, 4)?,
+                    inv_freq: None,
                 },
             )?;
         }

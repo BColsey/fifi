@@ -680,6 +680,7 @@ impl<'a> Mixers<'a> {
                     q: self.view(q)?,
                     pos: run.state.step_field(pos)?,
                     status: run.state.step_field(status)?,
+                    inv_freq: None,
                 },
             ),
             BlockOp::AttnDecode {
@@ -733,6 +734,7 @@ impl<'a> Mixers<'a> {
                     q: self.view(q)?,
                     pos: run.state.step_field(pos)?,
                     status: run.state.step_field(status)?,
+                    inv_freq: None,
                 },
             ),
             BlockOp::Kv8Append {
@@ -1075,6 +1077,7 @@ impl<'a> Mixers<'a> {
                         q: self.view(q)?,
                         pos: run.state.step_field(pos)?,
                         status: run.state.step_field(status)?,
+                        inv_freq: None,
                     },
                 )
             }
