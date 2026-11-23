@@ -121,12 +121,13 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
-    #[link_name = "inference_cuda_gguf_q8_row_reuse_launch"]
+    #[link_name = "inference_cuda_gguf_q8_row_reuse_width_launch"]
     fn gguf_q8_row_reuse_raw(
         args: *const DenseGemvArgsRaw,
         stream: *mut c_void,
         out_stage: *mut c_int,
-        out_pair: *mut c_int,
+        out_width: *mut c_int,
+        prefer_four: c_int,
     ) -> c_int;
     #[link_name = "inference_cuda_gguf_exact_expert_tile_launch"]
     fn gguf_exact_expert_tile_raw(
@@ -266,13 +267,14 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
 }
 
 /// Same strided F32 extents and checks as ordinary GEMV. Native dispatch checks the active device.
-/// Returns whether a pair kernel was enqueued; a launch failure is never retried.
+/// Returns the row-reuse width, or zero for ordinary GEMV. Never retries a launch failure.
 pub(in crate::kernels::cuda) fn gguf_q8_row_reuse_launch(
     stream: &RawStream,
     call: DenseGemvRaw<'_>,
-) -> Result<bool, DeviceFailure> {
+    prefer_four: bool,
+) -> Result<c_int, DeviceFailure> {
     let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
-    projection_launch(stream, call, need, ProjectionEntry::Q8RowReuse).map(|pair| pair != 0)
+    projection_launch(stream, call, need, ProjectionEntry::Q8RowReuse(prefer_four))
 }
 
 /// Same operands as dense GEMV. The native entry selects the exact tile or ordinary GEMV
@@ -297,7 +299,7 @@ enum ProjectionEntry {
     Gemv,
     Wmma,
     ExactExpertTile,
-    Q8RowReuse,
+    Q8RowReuse(bool),
 }
 
 fn projection_launch(
@@ -335,9 +337,13 @@ fn projection_launch(
             ProjectionEntry::ExactExpertTile => {
                 gguf_exact_expert_tile_raw(&raw const args, stream, &mut stage, &mut selected)
             }
-            ProjectionEntry::Q8RowReuse => {
-                gguf_q8_row_reuse_raw(&raw const args, stream, &mut stage, &mut selected)
-            }
+            ProjectionEntry::Q8RowReuse(four) => gguf_q8_row_reuse_raw(
+                &raw const args,
+                stream,
+                &mut stage,
+                &mut selected,
+                four.into(),
+            ),
         }
     };
     checked(status, stage)?;

@@ -47,8 +47,13 @@ int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args,
 /* Opt-in: pair independent F32 activation rows sharing one dense Q8_0 matrix.
  * Same operand checks, strides and arithmetic as packed GEMV. Selects an active
  * SM75 device only, for (N,K)=(1024,2304) or (3072,2304) at M=7..12, or
- * (2304,3072) at M=63..64. Other valid calls use ordinary GEMV. Optional host
- * out_pair reports 1 after a paired enqueue, 0 otherwise. No retry on error. */
+ * (2304,3072) at M=63..64. Only the last shape honors prefer_four. Other valid
+ * calls use ordinary GEMV. Optional out_width reports 2, 4, or 0. No retry. */
+int inference_cuda_gguf_q8_row_reuse_width_launch(const inference_cuda_dense_gemv_args *args,
+                                                  void *stream, int *out_stage, int *out_width,
+                                                  int prefer_four);
+
+/* Compatibility entry used by the standalone pair probe; out_pair is boolean. */
 int inference_cuda_gguf_q8_row_reuse_launch(const inference_cuda_dense_gemv_args *args,
                                             void *stream, int *out_stage, int *out_pair);
 

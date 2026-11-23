@@ -48,14 +48,24 @@ pub(super) fn project_output(
     let (reuse, report) = flags();
     let shape = call.shape;
     let q8 = call.dtype == DenseDtype::PackedGguf(GgufType::Q80);
-    let paired = if reuse {
-        context.dense_gemv_with_q8_row_reuse(stream, call)?
+    let width = if reuse {
+        static FOUR: OnceLock<bool> = OnceLock::new();
+        let four = *FOUR.get_or_init(|| {
+            std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_OUTPUT_EXACT4").as_deref() == Ok("1")
+        });
+        context.dense_gemv_with_q8_row_reuse(stream, call, four)?
     } else {
         context.dense_gemv(stream, call)?;
-        false
+        0
     };
-    if report && q8 {
-        emit("attention_output", shape.m, 1, usize::from(paired));
+    if width == 4 {
+        static USED: std::sync::Once = std::sync::Once::new();
+        USED.call_once(|| eprintln!("Inkling CUDA used exact four-row Q8 attention output"));
+        if report {
+            eprintln!("Inkling CUDA Q8 output exact4 rows {}", shape.m);
+        }
+    } else if report && q8 {
+        emit("attention_output", shape.m, 1, usize::from(width == 2));
     }
     Ok(())
 }

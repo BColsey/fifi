@@ -174,18 +174,19 @@ impl CudaContext {
             .map(|counts| counts.q8_row_pairs)
     }
 
-    /// Opts a single dense attention projection (possibly multirow) into Q8_0 row pairing.
+    /// Selects Q8_0 row reuse for one attention projection; returns 0, 2, or 4.
     pub(crate) fn dense_gemv_with_q8_row_reuse(
         &self,
         stream: &DeviceStream,
         call: DenseGemvCall<'_>,
-    ) -> Result<bool, EngError> {
+        prefer_four: bool,
+    ) -> Result<i32, EngError> {
         self.ensure_usable()?;
         let (kernel, need) = group_kernel(call.shape, call.dtype, None, false, true)?;
         let raw = self.plan_dense_projection(&call, need)?;
         self.launch_on(stream, |raw_stream| match kernel {
-            GroupKernel::Q8RowPair => gguf_q8_row_reuse_launch(raw_stream, raw),
-            _ => dense_gemv_launch(raw_stream, raw).map(|()| false),
+            GroupKernel::Q8RowPair => gguf_q8_row_reuse_launch(raw_stream, raw, prefer_four),
+            _ => dense_gemv_launch(raw_stream, raw).map(|()| 0),
         })
     }
 
@@ -238,7 +239,7 @@ impl CudaContext {
                     GroupKernel::Gemv => dense_gemv_launch(raw_stream, call)?,
                     GroupKernel::Q8RowPair => {
                         counts.q8_row_pairs +=
-                            usize::from(gguf_q8_row_reuse_launch(raw_stream, call)?);
+                            usize::from(gguf_q8_row_reuse_launch(raw_stream, call, false)? == 2);
                     }
                     GroupKernel::Wmma => {
                         gguf_wmma_launch(raw_stream, call)?;
@@ -333,6 +334,67 @@ mod group_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn q8_output_exact_four_matches_pairs_and_preserves_strides() {
+        use crate::kernels::cuda::testkit::{device_present, read_bytes, upload_bytes};
+        if !device_present("Inkling Q8 output exact four") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        if ctx.device_attributes().unwrap().compute_capability != (7, 5) {
+            return;
+        }
+        let stream = ctx.stream().unwrap();
+        let [rows, cols] = [2304, 3072];
+        let mut weight = Vec::new();
+        for block in 0..rows * cols / 32 {
+            let scale = half::f16::from_f32((1 + block % 13) as f32 / 1024.0);
+            weight.extend(scale.to_bits().to_ne_bytes());
+            weight.extend((0..32).map(|i| ((i * 31 + block * 13) % 255) as u8));
+        }
+        let w = upload_bytes(&ctx, &weight);
+        for m in [63, 64] {
+            let mut shape = DenseGemvShape::packed(m, rows, cols);
+            shape.ld_x += 3;
+            shape.ld_y += 7;
+            let xs: Vec<_> = (0..m * shape.ld_x)
+                .map(|i| ((i as f32 * 0.071).sin() * (1.0 + (i % 19) as f32)).to_ne_bytes())
+                .collect();
+            let x = upload_bytes(&ctx, xs.as_flattened());
+            let sentinel = vec![0xa5; m * shape.ld_y * 4];
+            let run = |four| {
+                let y = upload_bytes(&ctx, &sentinel);
+                let width = ctx
+                    .dense_gemv_with_q8_row_reuse(
+                        &stream,
+                        DenseGemvCall {
+                            shape,
+                            dtype: DenseDtype::PackedGguf(GgufType::Q80),
+                            w: w.range(0, w.bytes()).unwrap(),
+                            x: x.range(0, x.bytes()).unwrap(),
+                            y: y.range(0, y.bytes()).unwrap(),
+                        },
+                        four,
+                    )
+                    .unwrap();
+                stream.synchronize().unwrap();
+                (width, read_bytes(&ctx, &y, y.bytes()))
+            };
+            let (pair, expected) = run(false);
+            let (four, actual) = run(true);
+            assert_eq!((pair, four), (2, 4));
+            assert!(
+                actual == expected,
+                "Q8 output differs at {m} activation rows"
+            );
+            assert!(
+                actual
+                    .chunks_exact(shape.ld_y * 4)
+                    .all(|row| row[rows * 4..].iter().all(|&b| b == 0xa5))
+            );
+        }
     }
 
     #[test]

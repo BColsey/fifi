@@ -701,6 +701,51 @@ __global__ void inkling_q8_reuse_pair(inference_cuda_dense_gemv_args a) {
     }
 }
 
+// Only the 2304 x 3072 attention-output projection uses this path. Stage
+// a third of K at a time (16 KiB/CTA), retaining four independent F32 chains.
+__global__ void inkling_q8_reuse_four(inference_cuda_dense_gemv_args a) {
+    constexpr int chunk = 1024;
+    constexpr int cols = 3072;
+    constexpr int block_bytes = 34;
+    __shared__ float4 staged[chunk];
+    const int first = blockIdx.y * 4;
+    const int live = min(a.m - first, 4);
+    const auto *x = static_cast<const float *>(a.x) + size_t(first) * a.ld_x;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    const auto *w = static_cast<const uint8_t *>(a.w) + size_t(row) * (cols / 32) * block_bytes;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int base = 0; base < cols; base += chunk) {
+        for (int i = threadIdx.x; i < chunk; i += blockDim.x) {
+            const float *p = x + base + i;
+            staged[i] = make_float4(p[0], live > 1 ? p[a.ld_x] : 0.f,
+                                     live > 2 ? p[2 * a.ld_x] : 0.f,
+                                     live > 3 ? p[3 * a.ld_x] : 0.f);
+        }
+        __syncthreads();
+        for (int k = 0; k < chunk / 32; ++k) {
+            const float value = fifi_gguf::decode<8>(w + (base / 32 + k) * block_bytes, lane);
+            const float4 input = staged[k * 32 + lane];
+            a0 = fmaf(value, input.x, a0);
+            a1 = fmaf(value, input.y, a1);
+            a2 = fmaf(value, input.z, a2);
+            a3 = fmaf(value, input.w, a3);
+        }
+        __syncthreads();
+    }
+    a0 = warp_sum(a0);
+    a1 = warp_sum(a1);
+    a2 = warp_sum(a2);
+    a3 = warp_sum(a3);
+    if (lane == 0) {
+        auto *y = static_cast<float *>(a.y) + size_t(first) * a.ld_y + row;
+        y[0] = a0;
+        if (live > 1) y[a.ld_y] = a1;
+        if (live > 2) y[2 * a.ld_y] = a2;
+        if (live > 3) y[3 * a.ld_y] = a3;
+    }
+}
+
 // Restrict production to the measured attention prefill M windows.
 constexpr bool q8_row_reuse_shape(int dtype, int m, int rows, int cols) {
     if (dtype != fifi_gguf::kDtypeBase + 8) return false;
@@ -743,11 +788,12 @@ cudaError_t current_is_sm75(bool &sm75) {
 
 }  // namespace
 
-extern "C" int inference_cuda_gguf_q8_row_reuse_launch(
-    const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage, int *out_pair) {
+extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
+    const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage, int *out_width,
+    int prefer_four) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (out_pair) *out_pair = 0;
+        if (out_width) *out_width = 0;
         if (!args || !valid(*args, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         const auto &a = *args;
         if (!q8_row_reuse_shape(a.weight_dtype, a.m, a.rows, a.cols)) {
@@ -762,16 +808,32 @@ extern "C" int inference_cuda_gguf_q8_row_reuse_launch(
             return (int)failure.err;
         }
         if (!sm75) return inference_cuda_dense_gemv_launch(args, stream, out_stage);
-        const dim3 grid((a.rows + kWarps - 1) / kWarps, (a.m + 1) / 2);
-        inkling_q8_reuse_pair<<<grid, kWarps * 32, size_t(a.cols) * sizeof(float2),
-                                static_cast<cudaStream_t>(stream)>>>(a);
+        constexpr int output_rows = 2304;
+        static_assert(output_rows % kWarps == 0);
+        const bool four = prefer_four && a.rows == output_rows && a.cols == 3072;
+        const int width = four ? 4 : 2;
+        const dim3 grid((a.rows + kWarps - 1) / kWarps, (a.m + width - 1) / width);
+        const auto s = static_cast<cudaStream_t>(stream);
+        if (four) {
+            inkling_q8_reuse_four<<<grid, kWarps * 32, 0, s>>>(a);
+        } else {
+            inkling_q8_reuse_pair<<<grid, kWarps * 32, size_t(a.cols) * sizeof(float2), s>>>(a);
+        }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        if (failure.ok() && out_pair) *out_pair = 1;
+        if (failure.ok() && out_width) *out_width = width;
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+extern "C" int inference_cuda_gguf_q8_row_reuse_launch(
+    const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage, int *out_pair) {
+    int width = 0;
+    const int error = inference_cuda_gguf_q8_row_reuse_width_launch(args, stream, out_stage, &width, 0);
+    if (out_pair) *out_pair = width == 2;
+    return error;
 }
 
 extern "C" int inference_cuda_gguf_exact_expert_tile_launch(
