@@ -2184,6 +2184,7 @@ pub(super) fn attn_prep(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resul
             q: run.v(ChunkSlot::Q)?,
             mode,
             status: Some(status),
+            inv_freq: None,
         },
     )?;
     if let Some(parts) = kv8 {

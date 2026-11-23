@@ -235,6 +235,7 @@ impl Fx {
             } else {
                 None
             },
+            inv_freq: None,
         })
     }
 

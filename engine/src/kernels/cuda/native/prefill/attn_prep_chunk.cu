@@ -39,6 +39,7 @@ struct ChunkArgs {
     int *status;  // optional prefill status word
     int ld, p0, m, n_head, n_kv_head, n_rot, rows, mode;
     float eps, rope_base;
+    const float *inv_freq;  // NULL, or the n_rot/2 rope frequencies in place of rope_base's
 };
 
 bool aligned_to(const void *p, uintptr_t a) { return ((uintptr_t)p & (a - 1)) == 0; }
@@ -50,7 +51,8 @@ bool valid_pointers(const inference_cuda_attn_prep_chunk_args *a) {
         return false;
     }
     if (!aligned_to(a->proj, 4) || !aligned_to(a->q_norm, 4) || !aligned_to(a->k_norm, 4) ||
-        !aligned_to(a->q, 16) || (a->status != NULL && !aligned_to(a->status, 4))) {
+        !aligned_to(a->q, 16) || (a->status != NULL && !aligned_to(a->status, 4)) ||
+        (a->inv_freq != NULL && !aligned_to(a->inv_freq, 4))) {
         return false;
     }
     if (a->mode == INFERENCE_CUDA_PREP_APPEND_FP16) {
@@ -151,7 +153,8 @@ __global__ void attn_prep_chunk_k(ChunkArgs a) {
     int half = a.n_rot / 2;
     if (d < a.n_rot) {
         int i = d % half;
-        float theta = pos * powf(a.rope_base, -2.f * i / a.n_rot), sn, cs;
+        float freq = a.inv_freq ? a.inv_freq[i] : powf(a.rope_base, -2.f * i / a.n_rot);
+        float theta = pos * freq, sn, cs;
         sincosf(theta, &sn, &cs);
         out = d < half ? x[d] * cs - x[d + half] * sn : x[d - half] * sn + x[d] * cs;
     }
@@ -185,6 +188,7 @@ ChunkArgs to_chunk_args(const inference_cuda_attn_prep_chunk_args *a) {
     k.mode = a->mode;
     k.eps = a->eps;
     k.rope_base = a->rope_base;
+    k.inv_freq = (const float *)a->inv_freq;
     return k;
 }
 

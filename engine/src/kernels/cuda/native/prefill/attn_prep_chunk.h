@@ -71,7 +71,8 @@ typedef struct inference_cuda_attn_prep_chunk_args {
     int rows;        /* cache rows, 1..2^30 - 1, with p0 + m <= rows */
     int mode;        /* INFERENCE_CUDA_PREP_APPEND_FP16 or INFERENCE_CUDA_PREP_ROWS_OUT */
     float eps;       /* finite, > 0 */
-    float rope_base; /* finite, > 1 */
+    float rope_base; /* finite, > 1; ignored when inv_freq is set */
+    const void *inv_freq; /* NULL = derive from rope_base; else n_rot/2 f32 YaRN entries, 4-aligned */
 } inference_cuda_attn_prep_chunk_args;
 
 int inference_cuda_attn_prep_chunk_launch(const inference_cuda_attn_prep_chunk_args *args,
@@ -91,7 +92,8 @@ int inference_cuda_attn_prep_chunk_fault_bad_bounds_launch(
 #endif
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_attn_prep_chunk_args) == 120 &&
+static_assert(sizeof(inference_cuda_attn_prep_chunk_args) == 128 &&
+              offsetof(inference_cuda_attn_prep_chunk_args, inv_freq) == 120 &&
               offsetof(inference_cuda_attn_prep_chunk_args, proj) == 0 &&
               offsetof(inference_cuda_attn_prep_chunk_args, k_cache) == 24 &&
               offsetof(inference_cuda_attn_prep_chunk_args, q) == 40 &&
@@ -106,7 +108,8 @@ static_assert(sizeof(inference_cuda_attn_prep_chunk_args) == 120 &&
               offsetof(inference_cuda_attn_prep_chunk_args, eps) == 108,
               "inference_cuda_attn_prep_chunk_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_attn_prep_chunk_args) == 120 &&
+_Static_assert(sizeof(inference_cuda_attn_prep_chunk_args) == 128 &&
+               offsetof(inference_cuda_attn_prep_chunk_args, inv_freq) == 120 &&
                offsetof(inference_cuda_attn_prep_chunk_args, proj) == 0 &&
                offsetof(inference_cuda_attn_prep_chunk_args, k_cache) == 24 &&
                offsetof(inference_cuda_attn_prep_chunk_args, q) == 40 &&

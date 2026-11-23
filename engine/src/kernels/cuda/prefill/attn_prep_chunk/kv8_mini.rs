@@ -150,6 +150,7 @@ impl Mini {
                     v_rows: self.v.range(0, self.v.bytes())?,
                 },
                 status: Some(self.status.range(0, 4)?),
+                inv_freq: None,
             },
         )?;
         self.ctx.kv8_chunk(

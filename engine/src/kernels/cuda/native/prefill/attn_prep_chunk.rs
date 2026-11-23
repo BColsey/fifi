@@ -57,10 +57,12 @@ struct AttnPrepChunkArgsRaw {
     mode: c_int,
     eps: f32,
     rope_base: f32,
+    inv_freq: *const c_void,
 }
 
 const _: () = assert!(
-    size_of::<AttnPrepChunkArgsRaw>() == 120
+    size_of::<AttnPrepChunkArgsRaw>() == 128
+        && offset_of!(AttnPrepChunkArgsRaw, inv_freq) == 120
         && offset_of!(AttnPrepChunkArgsRaw, proj) == 0
         && offset_of!(AttnPrepChunkArgsRaw, k_cache) == 24
         && offset_of!(AttnPrepChunkArgsRaw, q) == 40
@@ -133,6 +135,9 @@ pub(in crate::kernels::cuda) struct AttnPrepChunkRaw<'a> {
     pub(in crate::kernels::cuda) ints: AttnPrepChunkInts,
     pub(in crate::kernels::cuda) eps: f32,
     pub(in crate::kernels::cuda) rope_base: f32,
+    /// The YaRN inverse-frequency table (`n_rot / 2` f32), or `None` to derive the
+    /// frequencies from `rope_base`.
+    pub(in crate::kernels::cuda) inv_freq: Option<RawRange<'a>>,
 }
 
 struct Needs {
@@ -140,6 +145,7 @@ struct Needs {
     norm: usize,
     q: usize,
     kv: usize,
+    inv_freq: usize,
 }
 
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
@@ -170,6 +176,7 @@ fn needs(io: &AttnPrepChunkRaw<'_>) -> Result<Needs, DeviceFailure> {
         norm: product(&[dim, 4])?,
         q: product(&[m, heads, dim, 4])?,
         kv: per_mode,
+        inv_freq: product(&[size(ints.n_rot)? / 2, 4])?,
     })
 }
 
@@ -190,7 +197,11 @@ fn check_prep_chunk(io: &AttnPrepChunkRaw<'_>) -> Result<(), DeviceFailure> {
         && io.q.bytes() >= need.q
         && kv_a.bytes() >= need.kv
         && kv_b.bytes() >= need.kv
-        && io.status.as_ref().is_none_or(|s| s.bytes() >= 4);
+        && io.status.as_ref().is_none_or(|s| s.bytes() >= 4)
+        && io
+            .inv_freq
+            .as_ref()
+            .is_none_or(|range| range.bytes() >= need.inv_freq);
     let aligned = io.proj.offset().is_multiple_of(4)
         && io.q_norm.offset().is_multiple_of(4)
         && io.k_norm.offset().is_multiple_of(4)
@@ -200,7 +211,11 @@ fn check_prep_chunk(io: &AttnPrepChunkRaw<'_>) -> Result<(), DeviceFailure> {
         && io
             .status
             .as_ref()
-            .is_none_or(|s| s.offset().is_multiple_of(4));
+            .is_none_or(|s| s.offset().is_multiple_of(4))
+        && io
+            .inv_freq
+            .as_ref()
+            .is_none_or(|range| range.offset().is_multiple_of(4));
     // Only written ranges must be pairwise apart; the reads may overlap each other.
     let mut written = vec![
         Span::of(&io.q, need.q),
@@ -210,11 +225,14 @@ fn check_prep_chunk(io: &AttnPrepChunkRaw<'_>) -> Result<(), DeviceFailure> {
     if let Some(status) = &io.status {
         written.push(Span::of(status, 4));
     }
-    let reads = [
+    let mut reads = vec![
         Span::of(&io.proj, need.proj),
         Span::of(&io.q_norm, norm),
         Span::of(&io.k_norm, norm),
     ];
+    if let Some(range) = &io.inv_freq {
+        reads.push(Span::of(range, need.inv_freq));
+    }
     let apart = written.iter().enumerate().all(|(i, claim)| {
         written[i + 1..].iter().all(|other| claim.apart(other))
             && reads.iter().all(|read| claim.apart(read))
@@ -264,6 +282,10 @@ fn c_args(io: &AttnPrepChunkRaw<'_>) -> AttnPrepChunkArgsRaw {
         mode: io.ints.mode,
         eps: io.eps,
         rope_base: io.rope_base,
+        inv_freq: io
+            .inv_freq
+            .as_ref()
+            .map_or(std::ptr::null(), |range| range.address().cast_const()),
     }
 }
 

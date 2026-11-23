@@ -9,7 +9,9 @@
 //! decode-only: it reads the device `pos` word and ORs mask 4 of `StepParams.status`
 //! (`attn_prep.cu:23`). This chunk form takes `p0` and `m` as launch arguments (prefill reads
 //! and writes no `StepParams` field), and the row layout and byte helpers are `attn_prep`'s
-//! (shared, not duplicated).
+//! (shared, not duplicated). The optional `inv_freq` table replaces the derived rope frequency
+//! of every rotated pair with its `n_rot / 2` entries (SenseNova-Loop's YaRN rope); `None` keeps
+//! the `rope_base` form bit for bit.
 //!
 //! [`CudaContext::attn_prep_chunk`] queues one kernel on a [`DeviceStream`] and returns. The
 //! call allocates nothing, copies nothing and never synchronizes; a fault in the queued work
@@ -110,6 +112,9 @@ pub(crate) struct AttnPrepChunkCall<'b> {
     pub(crate) q: DeviceRange<'b>,
     pub(crate) mode: PrepChunkMode<'b>,
     pub(crate) status: Option<DeviceRange<'b>>,
+    /// The YaRN inverse-frequency table (`n_rot / 2` f32), or `None` to derive the
+    /// frequencies from `rope_base` (every family before SenseNova-Loop).
+    pub(crate) inv_freq: Option<DeviceRange<'b>>,
 }
 
 fn rule(tag: &str, detail: &str) -> EngError {
@@ -217,6 +222,9 @@ fn check_fit(call: &AttnPrepChunkCall<'_>) -> Result<(), EngError> {
     if let Some(status) = &call.status {
         require_fit("status", status, 4, 4)?;
     }
+    if let Some(inv_freq) = &call.inv_freq {
+        require_fit("inv_freq", inv_freq, shape.n_rot / 2 * 4, 4)?;
+    }
     Ok(())
 }
 
@@ -242,11 +250,14 @@ fn check_apart(call: &AttnPrepChunkCall<'_>) -> Result<(), EngError> {
     if let Some(status) = &call.status {
         written.push(Claim::of("status", status, 4));
     }
-    let read = [
+    let mut read = vec![
         Claim::of("proj", &call.proj, proj_bytes(shape.m, shape.ld, row_w)),
         Claim::of("q_norm", &call.q_norm, HEAD_DIM * 4),
         Claim::of("k_norm", &call.k_norm, HEAD_DIM * 4),
     ];
+    if let Some(inv_freq) = &call.inv_freq {
+        read.push(Claim::of("inv_freq", inv_freq, shape.n_rot / 2 * 4));
+    }
     for (i, claim) in written.iter().enumerate() {
         for other in written[i + 1..].iter().chain(read.iter()) {
             require_apart(claim, other)?;
@@ -282,6 +293,11 @@ impl CudaContext {
         let q_norm = self.raw_range(&call.q_norm)?;
         let k_norm = self.raw_range(&call.k_norm)?;
         let q = self.raw_range(&call.q)?;
+        let inv_freq = call
+            .inv_freq
+            .as_ref()
+            .map(|r| self.raw_range(r))
+            .transpose()?;
         let status = call
             .status
             .as_ref()
@@ -316,6 +332,7 @@ impl CudaContext {
                     ints,
                     eps,
                     rope_base,
+                    inv_freq,
                 },
             )
         })
