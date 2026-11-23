@@ -47,12 +47,7 @@ impl DenseStep {
         if output == 0 {
             return Ok(None);
         }
-        let Some(per_row) = hidden
-            .checked_mul(24)
-            .and_then(|n| rank.checked_mul(3).and_then(|r| n.checked_add(r)))
-            .and_then(|n| n.checked_add(3))
-            .and_then(|n| n.checked_add(output))
-        else {
+        let Some(per_row) = Self::controlled_attention_row_words([rank, hidden], output) else {
             return Ok(None);
         };
         let capacity =
@@ -60,6 +55,17 @@ impl DenseStep {
         Ok(Some(
             capacity.min(DenseGemvShape::MAX_ACTIVATION_ROWS).min(512),
         ))
+    }
+
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_row_words(
+        [rank, hidden]: [usize; 2],
+        output: usize,
+    ) -> Option<usize> {
+        hidden
+            .checked_mul(24)?
+            .checked_add(rank.checked_mul(3)?)?
+            .checked_add(3)?
+            .checked_add(output)
     }
 
     // Fused transaction for grouped prefill; the caller selects controller arithmetic.
@@ -104,8 +110,7 @@ impl DenseStep {
             .iter()
             .try_fold(0usize, |a, &b| a.checked_add(b))
             .ok_or_else(|| bad("batched CUDA attention output size overflows"))?;
-        let per_row = (24 * hidden + 3 * rank + 3)
-            .checked_add(output_width)
+        let per_row = Self::controlled_attention_row_words([rank, hidden], output_width)
             .ok_or_else(|| bad("batched CUDA attention workspace overflows"))?;
         let capacity =
             self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>() / per_row;

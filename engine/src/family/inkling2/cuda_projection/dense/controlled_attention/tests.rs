@@ -148,6 +148,53 @@ fn chained_attention_matches_host_and_checks_workspace_and_arithmetic() {
         .unwrap()
         .is_none()
     );
+    let long_raw: Vec<_> = (0..9)
+        .map(|row| std::array::from_fn(|i| fixture(hidden, 2 + 5 * row + 7 * i)))
+        .collect();
+    let long = make_rows(&long_raw, &gates, &messages, &gamma);
+    let wide = DensePlan::new(
+        [
+            8 * DenseStep::controlled_attention_row_words([rank, hidden], 36).unwrap(),
+            2 * hidden,
+        ],
+        hidden,
+        rank,
+    )
+    .unwrap();
+    let eight = DenseStep::new(&context, &wide).unwrap();
+    let compare = |step: &DenseStep, width| {
+        assert_eq!(
+            step.controlled_attention_batch_capacity([rank, hidden], weights)
+                .unwrap(),
+            Some(width)
+        );
+        let mut host_bits = Vec::new();
+        let mut side_bytes = Vec::new();
+        for chunk in long.chunks(width) {
+            let (host, side) = step
+                .controlled_attention_batch(
+                    &context,
+                    chunk,
+                    controllers,
+                    weights,
+                    (eps, Arithmetic::CpuParity, &[0, 2]),
+                )
+                .unwrap()
+                .unwrap();
+            host_bits.extend(host.into_iter().flatten().flatten().map(f32::to_bits));
+            let side = side.unwrap();
+            let mut bytes = vec![0; side.bytes()];
+            // The producer fenced the tile. Consume it from a different stream.
+            side.buffer()
+                .read_at(&context.stream().unwrap(), side.offset(), &mut bytes)
+                .unwrap();
+            side_bytes.extend(bytes);
+        }
+        assert_eq!(host_bits.len(), 9 * 12);
+        assert_eq!(side_bytes.len(), 9 * 24 * 4);
+        (host_bits, side_bytes)
+    };
+    assert_eq!(compare(&batch_step, 3), compare(&eight, 8));
     let small = DensePlan::new([24 * hidden - 32, 2 * hidden], hidden, rank).unwrap();
     assert!(
         run(&DenseStep::new(&context, &small).unwrap(), &raw)

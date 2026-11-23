@@ -27,6 +27,7 @@ pub(in crate::family::inkling2) mod attention;
 mod cache;
 mod cold_controller;
 mod controller_residency;
+mod controller_workspace;
 mod device_prefill;
 mod grouped_controller_arithmetic;
 mod residency;
@@ -39,6 +40,7 @@ use residency::{PackedBudget, ResidentExperts};
 
 pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
+    controlled_attention_step: Option<DenseStep>,
     draft_head: Option<DraftHead>,
     dense: Projections,
     packed_gguf: bool,
@@ -180,19 +182,13 @@ impl AttentionControllers<'_> {
         if keep.iter().any(|&i| weights[i].is_none()) {
             return Ok(false);
         }
-        let capacity = self
-            .cuda
-            .step
-            .controlled_attention_batch_capacity(self.shape, weights)?
-            .unwrap_or(0);
+        let (step, capacity) = self.chained_workspace(&weights, inputs.len(), !keep.is_empty())?;
         if capacity < 2 {
             return Ok(false);
         }
         let arithmetic = grouped_controller_arithmetic::select();
         for chunk in inputs.chunks(capacity) {
-            let (host, device) = self
-                .cuda
-                .step
+            let (host, device) = step
                 .controlled_attention_batch(
                     &self.cuda.context,
                     chunk,
@@ -208,7 +204,40 @@ impl AttentionControllers<'_> {
             }
             consume(host, device)?;
         }
+        if !keep.is_empty() && self.cuda.prefill_report.is_some() {
+            eprintln!(
+                "Inkling CUDA grouped query tiles {}",
+                serde_json::json!({"rows": inputs.len(), "tile_rows": capacity,
+                    "tiles": inputs.len().div_ceil(capacity),
+                    "wide": !std::ptr::eq(step, &self.cuda.step)})
+            );
+        }
         Ok(true)
+    }
+
+    fn chained_workspace<const N: usize>(
+        &self,
+        weights: &[Option<ResidentProjection<'_>>; N],
+        rows: usize,
+        resident_query: bool,
+    ) -> Result<(&DenseStep, usize), EngError> {
+        let step = &self.cuda.step;
+        let baseline = step
+            .controlled_attention_batch_capacity(self.shape, *weights)?
+            .unwrap_or(0);
+        if resident_query
+            && rows > baseline
+            && let Some(wide) = &self.cuda.controlled_attention_step
+        {
+            let capacity = wide
+                .controlled_attention_batch_capacity(self.shape, *weights)?
+                .unwrap_or(0);
+            let target = controller_workspace::TILE_ROWS;
+            if capacity >= target && target > baseline {
+                return Ok((wide, target));
+            }
+        }
+        Ok((step, baseline))
     }
 
     pub(in crate::family::inkling2) fn chained_projections<const N: usize>(
@@ -674,8 +703,27 @@ impl GgufCuda {
         } else {
             None
         };
+        // Allocate only after base placement and cold controller staging are final.
+        let controlled_attention_step = if full_expert_fit
+            && group_projections
+            && device_prefill
+            && resident_attention.is_some()
+            && controller_workspace::enabled()
+            && let Some(max_output) = attention_rows.checked_mul(8)
+            && let Some(expert_bytes) =
+                controller_residency::expert_workspace(spec, context_limit, true)
+        {
+            controller_workspace::admit(
+                &context,
+                [spec.core.gate_rank as usize, hidden, max_output],
+                expert_bytes,
+            )?
+        } else {
+            None
+        };
         Ok(Self {
             step,
+            controlled_attention_step,
             draft_head: None,
             dense,
             packed_gguf: packed,

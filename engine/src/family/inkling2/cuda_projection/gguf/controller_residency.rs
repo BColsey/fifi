@@ -76,12 +76,15 @@ fn is_missing_controller(group: &[GgufDenseUpload<'_>], dense: &Projections) -> 
             })
 }
 
-fn minimum_free(before: u64, original_floor: u64, expert_workspace: u64) -> Option<u64> {
-    let dynamic = expert_workspace
+pub(super) fn workspace_floor(expert_workspace: u64) -> Option<u64> {
+    expert_workspace
         .checked_mul(2)?
-        .checked_add(DEVICE_HEADROOM + LAZY_MARGIN)?;
+        .checked_add(DEVICE_HEADROOM + LAZY_MARGIN)
+}
+
+fn minimum_free(before: u64, original_floor: u64, expert_workspace: u64) -> Option<u64> {
     Some(
-        dynamic
+        workspace_floor(expert_workspace)?
             .max(original_floor.saturating_sub(MAX_CHARGE))
             .max(before.saturating_sub(MAX_CHARGE)),
     )
