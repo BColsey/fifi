@@ -731,11 +731,10 @@ impl VisitState {
         self.position
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn parity_fingerprint(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut hash = DefaultHasher::new();
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.position.hash(&mut hash);
         fn plane<'a>(rows: impl ExactSizeIterator<Item = &'a Vec<f32>>, hash: &mut DefaultHasher) {
             rows.len().hash(hash);
