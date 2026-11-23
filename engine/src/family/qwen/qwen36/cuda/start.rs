@@ -3051,4 +3051,32 @@ mod check_choice_tests {
         assert_eq!(checked, (served.variant.kv, served.variant.context_limit));
         assert_eq!(checked, (KvDtype::Q8, 242_688));
     }
+
+    #[test]
+    fn fp16_auto_context_keeps_room_for_chunk_prefill() {
+        let mut settings = Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&Q36Options::default()),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("the CUDA settings");
+        settings.kv = KvDtype::F32;
+        settings.kv_auto = false;
+        // Prefix reuse pins a device tip at start, the admission's most expensive prefix mode:
+        // a fit that holds it also holds the cheaper prefix modes the flag really serves.
+        settings.prefix_reuse = true;
+        let plan = startup_plan_of(&settings, false, false).expect("startup plan");
+        assert!(matches!(plan.modes.prefix, PrefixMemory::DeviceTip));
+        let free = 24_085_921_792;
+        let choice = card_choice(DeviceReading { free, nsm: NSM }, &settings, &plan, WEIGHTS)
+            .expect("the card choice")
+            .expect("a context with a chunk arena fits");
+        assert_eq!(choice.variant.kv, KvDtype::F32);
+        let context = choice.variant.context_limit;
+        assert!(context < 119_808, "the old fit left no arena");
+        let admits = prefill_admits_of(NSM, &settings, &plan, (free, WEIGHTS)).expect("the gate");
+        assert!(admits(KvDtype::F32, context).expect("check the fit"));
+    }
 }
