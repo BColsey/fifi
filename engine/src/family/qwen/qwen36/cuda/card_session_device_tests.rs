@@ -202,7 +202,19 @@ pub(super) fn build_rig_session_for_chunk(
     )
 }
 
-fn build_rig_session(
+pub(super) fn rig_options(context_tokens: usize) -> StepOptions {
+    StepOptions {
+        kv_mode: KvMode::Int8G32,
+        context_tokens,
+        delta_slots: 1,
+        forked_experts: false,
+        tiered: None,
+        layout: WeightLayout::Native,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_rig_session(
     devices: [usize; 2],
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
@@ -223,19 +235,78 @@ fn build_rig_session(
     let inv = Inventory::for_spec(&spec)?;
     let shape = HostShape::from_spec(&spec, 64)?;
     let d = StepDims::new(&shape, &inv)?;
-    let options = StepOptions {
-        kv_mode: KvMode::Int8G32,
-        context_tokens,
-        delta_slots: 1,
-        forked_experts: false,
-        tiered: None,
-        layout: WeightLayout::Native,
-    };
+    let options = rig_options(context_tokens);
     let table_layers = LayerTable::new(&d, &inv)?;
 
+    let (_dir, weights, names) = rig_weights(&d, &inv, &table_layers, centered_weights)?;
+    let vocab = d.shape.vocab;
+
+    // The stack and the per-card loads, through the production loaders on
+    // the cards' own contexts.
+    let admission = served_admission();
+    let shard = ShardTable::new(&d.shape, 2, 32)?;
+    let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
+    let payload = chunk_rows
+        .map(|rows| {
+            super::card_prefill::chunk_mailbox_values(rows, d.shape.hidden, d.shape.moe.top_k)
+        })
+        .transpose()?;
+    let (mut stack, states) =
+        CardStack::with_payload(&d, &options, &devices, &admission, &shard, payload)?;
+    stack.enable_broadcast_sync_for_test();
+    if prepare_async {
+        stack.prepare_async_broadcasts_for_test()?;
+    }
+    let load_options = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let mut owned: Vec<&'static mut crate::family::project::cuda::CudaWeights> = Vec::new();
+    for (card, load) in loads.iter().enumerate() {
+        let loader = BorrowedLoader::new(&stack.contexts()[card])?;
+        let weights = load_card_weights(&loader, &weights, load, card, load_options)?;
+        owned.push(Box::leak(Box::new(weights)));
+    }
+    // The leaked slice of shared refs: one per engine, like the start's
+    // leaks. The mut handles convert by consuming them.
+    let loaded: &'static [&'static crate::family::project::cuda::CudaWeights] = Box::leak(
+        owned
+            .into_iter()
+            .map(|weights| &*weights)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let stack: &'static CardStack = Box::leak(Box::new(stack));
+    let table_static: &'static LayerTable = Box::leak(Box::new(table_layers));
+    let eos: Arc<[u32]> = Arc::from(vec![7u32]);
+    let mut session = CardSession::new(
+        stack,
+        states,
+        loaded,
+        table_static,
+        &inv,
+        &d,
+        &options,
+        eos,
+        vocab,
+        Default::default(),
+        prefix_limits,
+        None,
+    )?;
+    session.set_skip_prefill_head_for_test(false);
+
+    Ok((session, stack, loaded, names, vocab))
+}
+
+pub(super) fn rig_weights(
+    d: &StepDims,
+    inv: &Inventory,
+    table_layers: &LayerTable,
+    centered_weights: bool,
+) -> Result<(tempfile::TempDir, GgufWeights, GlobalNames), EngError> {
     // The file: every mixer, MoE and global tensor of the spec, full-width.
-    let geometry = MixerGeometry::new(&d)?;
-    let moe_specs = MoeSpecs::new(&d)?;
+    let geometry = MixerGeometry::new(d)?;
+    let moe_specs = MoeSpecs::new(d)?;
     let mut rng = Rng::new(0x5E55);
     let mut entries: Vec<FileEntry> = Vec::new();
     for layer in 0..table_layers.len() {
@@ -341,7 +412,7 @@ fn build_rig_session(
     }
     // The globals: the q4_k embedding (card 0), the full head (sliced per
     // card at load), and the replicated final norm.
-    let names = GlobalNames::new(&inv)?;
+    let names = GlobalNames::new(inv)?;
     let (h, vocab) = (d.shape.hidden, d.shape.vocab);
     entries.push(FileEntry {
         name: names.embed.clone(),
@@ -372,7 +443,6 @@ fn build_rig_session(
             }
         }
     }
-
     let dir = tempfile::tempdir().map_err(|e| EngError::Checkpoint(e.to_string()))?;
     let path = write_gguf(dir.path(), "session.gguf", &entries);
     let weights = GgufWeights::open(
@@ -384,61 +454,7 @@ fn build_rig_session(
         None,
     )?;
 
-    // The stack and the per-card loads, through the production loaders on
-    // the cards' own contexts.
-    let admission = served_admission();
-    let shard = ShardTable::new(&d.shape, 2, 32)?;
-    let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
-    let payload = chunk_rows
-        .map(|rows| {
-            super::card_prefill::chunk_mailbox_values(rows, d.shape.hidden, d.shape.moe.top_k)
-        })
-        .transpose()?;
-    let (mut stack, states) =
-        CardStack::with_payload(&d, &options, &devices, &admission, &shard, payload)?;
-    stack.enable_broadcast_sync_for_test();
-    if prepare_async {
-        stack.prepare_async_broadcasts_for_test()?;
-    }
-    let load_options = LoadOptions {
-        layout: WeightLayout::Native,
-        ..LoadOptions::default()
-    };
-    let mut owned: Vec<&'static mut crate::family::project::cuda::CudaWeights> = Vec::new();
-    for (card, load) in loads.iter().enumerate() {
-        let loader = BorrowedLoader::new(&stack.contexts()[card])?;
-        let weights = load_card_weights(&loader, &weights, load, card, load_options)?;
-        owned.push(Box::leak(Box::new(weights)));
-    }
-    // The leaked slice of shared refs: one per engine, like the start's
-    // leaks. The mut handles convert by consuming them.
-    let loaded: &'static [&'static crate::family::project::cuda::CudaWeights] = Box::leak(
-        owned
-            .into_iter()
-            .map(|weights| &*weights)
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    );
-    let stack: &'static CardStack = Box::leak(Box::new(stack));
-    let table_static: &'static LayerTable = Box::leak(Box::new(table_layers));
-    let eos: Arc<[u32]> = Arc::from(vec![7u32]);
-    let mut session = CardSession::new(
-        stack,
-        states,
-        loaded,
-        table_static,
-        &inv,
-        &d,
-        &options,
-        eos,
-        vocab,
-        Default::default(),
-        prefix_limits,
-        None,
-    )?;
-    session.set_skip_prefill_head_for_test(false);
-
-    Ok((session, stack, loaded, names, vocab))
+    Ok((dir, weights, names))
 }
 
 fn run_session_rig(
