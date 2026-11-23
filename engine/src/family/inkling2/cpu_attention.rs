@@ -813,7 +813,7 @@ impl PrefillBridge<'_> {
         let stride = self.stride;
         let count = host.len();
         if count.checked_mul(stride) != Some(range.bytes()) {
-            return Err(bad(
+            return Err(super::bad(
                 "incorrect Inkling device prefill projection tile extent",
             ));
         }
