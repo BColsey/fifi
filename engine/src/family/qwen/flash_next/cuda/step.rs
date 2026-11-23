@@ -687,6 +687,16 @@ impl<'a> FlashStep<'a> {
             {
                 return project_q6_f32(self.ctx, self.stream, call);
             }
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            if crate::family::qwen::flash_next::load::gguf::native_f16::enabled() {
+                return crate::family::qwen::flash_next::load::gguf::native_f16::project(
+                    self.ctx,
+                    self.stream,
+                    weight,
+                    x,
+                    out,
+                );
+            }
             return project_native(self.ctx, self.stream, call);
         }
         if prefix.ends_with("self_attn.indexer.index_qk_proj")
@@ -927,6 +937,19 @@ impl<'a> FlashStep<'a> {
                 }
                 for call in calls {
                     project_q6_f32(self.ctx, self.stream, call)?;
+                }
+                return Ok(());
+            }
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            if crate::family::qwen::flash_next::load::gguf::native_f16::enabled() {
+                for call in calls {
+                    crate::family::qwen::flash_next::load::gguf::native_f16::project(
+                        self.ctx,
+                        self.stream,
+                        call.weight,
+                        call.input,
+                        call.output,
+                    )?;
                 }
                 return Ok(());
             }

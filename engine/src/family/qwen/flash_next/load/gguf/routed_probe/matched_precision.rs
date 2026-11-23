@@ -1,8 +1,7 @@
 //! Test-only precision and timing comparison on already resident routed expert slots.
 use super::*;
 use crate::{
-    family::qwen::flash_next::load::gguf::expert_f16_probe,
-    kernels::cuda::resident::matvec_q::QuantType,
+    family::qwen::flash_next::load::gguf::native_f16, kernels::cuda::resident::matvec_q::QuantType,
 };
 
 pub(super) struct Experiment<'a> {
@@ -72,9 +71,16 @@ pub(super) fn run(experiment: Experiment<'_>) {
     let poison = f32::NAN.to_ne_bytes().repeat(used * rows);
     f16_output.write_at(stream, 0, &poison).unwrap();
     q8_output.write_at(stream, 0, &poison).unwrap();
-    let calls =
-        expert_f16_probe::plan(&projection, &slot_ids, all(source), all(&f16_output)).unwrap();
-    let f16 = || expert_f16_probe::launch(ctx, stream, &calls).unwrap();
+    let calls = native_f16::plan(
+        &projection,
+        &slot_ids,
+        all(source),
+        all(&f16_output),
+        true,
+        rows,
+    )
+    .unwrap();
+    let f16 = || native_f16::launch(ctx, stream, projection.ty, &calls).unwrap();
     let q8_launch = |quantize: bool| {
         if quantize {
             ctx.quantize_q8_1_rows(

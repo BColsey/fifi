@@ -13,7 +13,8 @@ use std::ops::Range;
 use super::{
     GgufModel,
     expert_layout::{
-        ExpertDeviceStacks, ExpertLayout, ExpertProjectionInputs, ExpertStacks, PinnedDiskRefill,
+        ExpertDeviceStacks, ExpertLayout, ExpertProjection, ExpertProjectionInputs, ExpertStacks,
+        PinnedDiskRefill,
     },
 };
 use crate::{
@@ -247,10 +248,14 @@ impl<'a> PersistentRouted<'a> {
             bufs,
             dims,
             #[cfg(test)]
-            self.f16_down_probe
-                .as_ref()
-                .filter(|selected| selected.contains(&layer))
-                .map(|_| (layer, host_slots.as_slice())),
+            TestProbes {
+                layer,
+                slots: &host_slots,
+                iq4_down: self
+                    .f16_down_probe
+                    .as_ref()
+                    .is_some_and(|selected| selected.contains(&layer)),
+            },
         )?;
         Ok(copies)
     }
@@ -299,7 +304,7 @@ fn launch_experts(
     scratch: (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
-    #[cfg(test)] f16_down_probe: Option<(usize, &[i32])>,
+    #[cfg(test)] probes: TestProbes<'_>,
 ) -> Result<(), EngError> {
     let (ids, qx, qa) = scratch;
     let (gate, up, down) = (
@@ -313,6 +318,10 @@ fn launch_experts(
     {
         return Err(bad("expert projection shapes disagree with the model"));
     }
+    #[cfg(test)]
+    if super::native_f16::enabled() {
+        return launch_unquantized(ctx, stream, (gate, up, down), probes.slots, bufs, dims);
+    }
     ctx.quantize_q8_1(
         stream,
         QuantizeCall {
@@ -322,17 +331,7 @@ fn launch_experts(
             ncols: 1,
         },
     )?;
-    let up_offset = dims
-        .inter
-        .checked_mul(4)
-        .ok_or_else(|| bad("up offset overflows"))?;
-    if bufs.expert_gu.bytes() < up_offset {
-        return Err(bad("expert gate/up range is too short"));
-    }
-    let up_out = bufs.expert_gu.buffer().range(
-        bufs.expert_gu.offset() + up_offset,
-        bufs.expert_gu.bytes() - up_offset,
-    )?;
+    let up_out = up_range(bufs, dims.inter)?;
     for (projection, output) in [(gate, bufs.expert_gu), (up, up_out)] {
         projection.launch(
             ctx,
@@ -347,33 +346,32 @@ fn launch_experts(
             },
         )?;
     }
-    ctx.swiglu_rows(
-        stream,
-        SwigluRowsCall {
-            shape: SwigluRowsShape {
-                rows: dims.top_k,
-                n_ff: dims.inter,
-                up_off: dims.inter,
-                ld_in: dims.inter * 2,
-                ld_out: dims.inter,
-            },
-            gu: bufs.expert_gu,
-            act: bufs.expert_act,
-        },
-    )?;
+    swiglu(ctx, stream, bufs, dims)?;
     #[cfg(test)]
-    let f16_down = if let Some((layer, slots)) = f16_down_probe {
+    let f16_down = if probes.iq4_down {
         use crate::kernels::cuda::resident::matvec_q::QuantType;
         match down.ty {
             QuantType::Iq4Nl => {
-                let calls =
-                    super::expert_f16_probe::plan(&down, slots, bufs.expert_act, bufs.expert_down)?;
-                super::expert_f16_probe::launch(ctx, stream, &calls)?;
-                eprintln!("GGUF test-only expert down: layer={layer} IQ4_NL f16-intermediate");
+                let calls = super::native_f16::plan(
+                    &down,
+                    probes.slots,
+                    bufs.expert_act,
+                    bufs.expert_down,
+                    true,
+                    down.rows,
+                )?;
+                super::native_f16::launch(ctx, stream, down.ty, &calls)?;
+                eprintln!(
+                    "GGUF test-only expert down: layer={} IQ4_NL f16-intermediate",
+                    probes.layer
+                );
                 true
             }
             QuantType::Q20 => {
-                eprintln!("GGUF test-only expert down: layer={layer} Q2_0 native Q8 fallback");
+                eprintln!(
+                    "GGUF test-only expert down: layer={} Q2_0 native Q8 fallback",
+                    probes.layer
+                );
                 false
             }
             _ => {
@@ -410,6 +408,51 @@ fn launch_experts(
             },
         )?;
     }
+    combine(ctx, stream, bufs, dims)
+}
+
+/// The `up` half of the gate/up rows, which follow the interleaved `[used][gate | up]` layout.
+fn up_range<'a>(bufs: &'a Exl3MoeBufs<'a>, inter: usize) -> Result<DeviceRange<'a>, EngError> {
+    let up_offset = inter
+        .checked_mul(4)
+        .ok_or_else(|| bad("up offset overflows"))?;
+    if bufs.expert_gu.bytes() < up_offset {
+        return Err(bad("expert gate/up range is too short"));
+    }
+    bufs.expert_gu.buffer().range(
+        bufs.expert_gu.offset() + up_offset,
+        bufs.expert_gu.bytes() - up_offset,
+    )
+}
+
+fn swiglu(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
+    ctx.swiglu_rows(
+        stream,
+        SwigluRowsCall {
+            shape: SwigluRowsShape {
+                rows: dims.top_k,
+                n_ff: dims.inter,
+                up_off: dims.inter,
+                ld_in: dims.inter * 2,
+                ld_out: dims.inter,
+            },
+            gu: bufs.expert_gu,
+            act: bufs.expert_act,
+        },
+    )
+}
+
+fn combine(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
     ctx.moe_combine(
         stream,
         CombineCall {
@@ -429,6 +472,59 @@ fn launch_experts(
             out: CombineOut::To(bufs.route.resid_out),
         },
     )
+}
+
+/// Test-only selectors carried into the expert launch.
+#[cfg(test)]
+struct TestProbes<'s> {
+    layer: usize,
+    /// The bank slot holding each rank's expert.
+    slots: &'s [i32],
+    iq4_down: bool,
+}
+
+/// Test-only: gate, up and down of every routed expert through the dequantizing GEMM with
+/// unquantized activations, then the usual SwiGLU and combine.
+#[cfg(test)]
+fn launch_unquantized(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    (gate, up, down): (
+        ExpertProjection<'_>,
+        ExpertProjection<'_>,
+        ExpertProjection<'_>,
+    ),
+    slots: &[i32],
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
+    let up_out = up_range(bufs, dims.inter)?;
+    let twice = dims
+        .inter
+        .checked_mul(2)
+        .ok_or_else(|| bad("expert width overflows"))?;
+    for (projection, output) in [(gate, bufs.expert_gu), (up, up_out)] {
+        let calls = super::native_f16::plan(
+            &projection,
+            slots,
+            bufs.route.norm_row,
+            output,
+            false,
+            twice,
+        )?;
+        super::native_f16::launch(ctx, stream, projection.ty, &calls)?;
+    }
+    swiglu(ctx, stream, bufs, dims)?;
+    let calls = super::native_f16::plan(
+        &down,
+        slots,
+        bufs.expert_act,
+        bufs.expert_down,
+        true,
+        down.rows,
+    )?;
+    super::native_f16::launch(ctx, stream, down.ty, &calls)?;
+    combine(ctx, stream, bufs, dims)
 }
 
 #[cfg(test)]

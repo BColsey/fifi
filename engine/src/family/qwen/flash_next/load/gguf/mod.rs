@@ -29,13 +29,13 @@ mod delta_columns;
 mod delta_rows;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod delta_state;
-#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-mod expert_f16_probe;
 mod expert_layout;
 #[cfg(test)]
 mod host;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod hyper_weights;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+pub(in super::super::super) mod native_f16;
 pub(super) mod ngram;
 pub(super) mod plan;
 mod ple_weights;
