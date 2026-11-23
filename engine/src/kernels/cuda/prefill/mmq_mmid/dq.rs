@@ -2,11 +2,10 @@
 //! file's own blocks of one of the in-house dequantizing types (Q3_K, Q4_0, Q5_K, IQ4_XS, every
 //! codebook type and Q2_K), the activation is f32 rows, and no q8_1 quantize pass feeds it.
 //!
-//! The ids are taken only as an [`MmidIds`], like the vendored grouped launch, so the kernel
-//! never trusts caller-built id values: its constructors prove that `ids_dst` is a permutation of
-//! the token slots and that the expert bounds rise over them.
+//! Dense launches use a validated [`MmidIds`] permutation. Sparse launches use a validated
+//! [`GroupedDqRows`] selection that leaves other rows available to a separate kernel.
 
-use super::{MmidIds, MmidShape, MmidWeight, rule};
+use super::{GroupedDqRows, MmidIds, MmidShape, MmidWeight, rule};
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
@@ -39,6 +38,30 @@ pub(crate) struct DqMmidCall<'b, 'i> {
     pub(crate) col_tile: usize,
 }
 
+/// Replace only selected expert-major rows. `metadata` holds the plan's IDs followed by
+/// its bounds, enqueued earlier on the same stream as part of a checked arena upload.
+pub(crate) struct SparseDqCall<'b, 'p> {
+    pub(crate) weight: MmidWeight<'b>,
+    pub(crate) plan: &'p GroupedDqRows,
+    pub(crate) metadata: DeviceRange<'b>,
+    pub(crate) x: DeviceRange<'b>,
+    pub(crate) y: DeviceRange<'b>,
+}
+
+struct DqLaunch<'b> {
+    weight: MmidWeight<'b>,
+    ids_dst: DeviceRange<'b>,
+    expert_bounds: DeviceRange<'b>,
+    x: DeviceRange<'b>,
+    y: DeviceRange<'b>,
+    experts: usize,
+    total_cols: usize,
+    x_div: usize,
+    x_row_stride: usize,
+    ld: usize,
+    col_tile: usize,
+}
+
 impl CudaContext {
     /// Queues one grouped dequantizing GEMM of `call` on `stream` and returns when it is
     /// queued; `y` holds the products after the stream drained. The ids are read in stream
@@ -53,6 +76,58 @@ impl CudaContext {
         stream: &DeviceStream,
         call: DqMmidCall<'_, '_>,
     ) -> Result<(), EngError> {
+        if call.ids.shape != call.shape {
+            let detail = format!("ids of {:?} for a {:?} launch", call.ids.shape, call.shape);
+            return Err(rule("ids shape", &detail));
+        }
+        super::check_ids_shape(&call.shape)?;
+        self.launch_grouped_dq(
+            stream,
+            DqLaunch {
+                weight: call.weight,
+                ids_dst: call.ids.out.ids_dst,
+                expert_bounds: call.ids.out.expert_bounds,
+                x: call.x,
+                y: call.y,
+                experts: call.shape.n_experts,
+                total_cols: call.shape.ne_get_rows(),
+                x_div: if call.x_per_slot { 1 } else { call.shape.top_k },
+                x_row_stride: call.x_row_stride,
+                ld: call.ld,
+                col_tile: call.col_tile,
+            },
+        )
+    }
+
+    pub(crate) fn gemm_dq_sparse_rows(
+        &self,
+        stream: &DeviceStream,
+        call: SparseDqCall<'_, '_>,
+    ) -> Result<(), EngError> {
+        let id_bytes = call.plan.ids().len() * 4;
+        let bounds_bytes = call.plan.bounds().len() * 4;
+        let ids_dst = call.metadata.slice(0, id_bytes)?;
+        let expert_bounds = call.metadata.slice(id_bytes, bounds_bytes)?;
+        let (x_row_stride, ld) = (call.weight.k, call.weight.n);
+        self.launch_grouped_dq(
+            stream,
+            DqLaunch {
+                weight: call.weight,
+                ids_dst,
+                expert_bounds,
+                x: call.x,
+                y: call.y,
+                experts: call.plan.bounds().len() - 1,
+                total_cols: call.plan.ids().len(),
+                x_div: 1,
+                x_row_stride,
+                ld,
+                col_tile: 64,
+            },
+        )
+    }
+
+    fn launch_grouped_dq(&self, stream: &DeviceStream, call: DqLaunch<'_>) -> Result<(), EngError> {
         self.ensure_usable()?;
         let weight = &call.weight;
         let ty = weight.quant;
@@ -62,11 +137,6 @@ impl CudaContext {
                 &format!("the grouped dequantizing GEMM has no {ty:?} decoder"),
             ));
         }
-        if call.ids.shape != call.shape {
-            let detail = format!("ids of {:?} for a {:?} launch", call.ids.shape, call.shape);
-            return Err(rule("ids shape", &detail));
-        }
-        super::check_ids_shape(&call.shape)?;
         let (k, n) = (weight.k, weight.n);
         if k == 0 || !k.is_multiple_of(ty.block_size().max(64)) {
             return Err(rule(
@@ -98,13 +168,9 @@ impl CudaContext {
                 ),
             ));
         }
-        let total_cols = call.shape.ne_get_rows();
-        let x_rows = if call.x_per_slot {
-            total_cols
-        } else {
-            call.shape.m
-        };
-        let need_w = (call.shape.n_experts - 1)
+        let total_cols = call.total_cols;
+        let x_rows = total_cols.div_ceil(call.x_div);
+        let need_w = (call.experts - 1)
             .checked_mul(weight.stride_bytes)
             .and_then(|head| head.checked_add(expert_bytes))
             .ok_or_else(|| rule("size", "the weight stack size overflows"))?;
@@ -134,26 +200,30 @@ impl CudaContext {
         let written = Claim::of("y", &call.y, need_y);
         require_apart(&written, &Claim::of("w", &weight.base, need_w))?;
         require_apart(&written, &Claim::of("x", &call.x, need_x))?;
-        let ids = &call.ids.out;
         let ids_dst_bytes = total_cols * 4;
-        let bounds_bytes = (call.shape.n_experts + 1) * 4;
-        require_apart(&written, &Claim::of("ids_dst", &ids.ids_dst, ids_dst_bytes))?;
+        let bounds_bytes = (call.experts + 1) * 4;
+        require_fit("ids_dst", &call.ids_dst, ids_dst_bytes, 4)?;
+        require_fit("expert_bounds", &call.expert_bounds, bounds_bytes, 4)?;
         require_apart(
             &written,
-            &Claim::of("expert_bounds", &ids.expert_bounds, bounds_bytes),
+            &Claim::of("ids_dst", &call.ids_dst, ids_dst_bytes),
+        )?;
+        require_apart(
+            &written,
+            &Claim::of("expert_bounds", &call.expert_bounds, bounds_bytes),
         )?;
         let raw = GemmDqMmidRaw {
             ty,
             w: self.raw_range(&weight.base)?,
             x: self.raw_range(&call.x)?,
             y: self.raw_range(&call.y)?,
-            ids_dst: self.raw_range(&ids.ids_dst)?,
-            expert_bounds: self.raw_range(&ids.expert_bounds)?,
+            ids_dst: self.raw_range(&call.ids_dst)?,
+            expert_bounds: self.raw_range(&call.expert_bounds)?,
             k,
             rows: n,
-            n_experts: call.shape.n_experts,
+            n_experts: call.experts,
             total_cols,
-            x_div: if call.x_per_slot { 1 } else { call.shape.top_k },
+            x_div: call.x_div,
             x_row_stride: call.x_row_stride,
             y_row_stride: call.ld,
             expert_stride: weight.stride_bytes,

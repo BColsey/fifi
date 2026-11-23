@@ -617,9 +617,9 @@ pub(in crate::kernels::cuda) fn gemm_dq_mmid_launch(
     };
     // SAFETY: the checks above proved every range inside its live allocation, large enough for
     // the call, aligned, and `y`, the only range the kernel writes, disjoint from the others.
-    // The id values are the kernel's to trust: they come from an `MmidIds`, whose constructors
-    // prove them. `table` is a `'static` slice the adapter copies before it returns, `stream`
-    // is live for the call.
+    // The caller must preserve the validated metadata on the stream: either a dense MmidIds
+    // permutation or the compact subset and bounds from GroupedDqRows. The kernel never reads
+    // IDs beyond the last bound. `table` is static and the adapter copies it before returning.
     let status = unsafe {
         gemm_dq_mmid_launch_raw(
             &args,

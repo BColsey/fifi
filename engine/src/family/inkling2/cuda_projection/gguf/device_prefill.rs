@@ -13,11 +13,18 @@ use crate::{
     expert_tier::{ExpertId, ExpertPayloadSource},
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
-        prefill::row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
-        resident::dense_gemv::{
-            DenseDtype, DenseGemvCall, DenseGemvGroupCounts, DenseGemvShape, dense_gemv_bytes,
+        prefill::{
+            mmq_mmid::{GroupedDqRows, MmidWeight, SparseDqCall},
+            row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
+        },
+        resident::{
+            dense_gemv::{
+                DenseDtype, DenseGemvCall, DenseGemvGroupCounts, DenseGemvShape, dense_gemv_bytes,
+            },
+            matvec_q::QuantType,
         },
     },
+    weights::GgufType,
 };
 
 // The direct packed projection measurements favor GEMV for narrow expert groups.
@@ -28,6 +35,7 @@ struct Geometry {
     hidden: usize,
     middle: usize,
     rank: usize,
+    grouped_experts: usize,
 }
 
 struct Layout {
@@ -37,6 +45,7 @@ struct Layout {
     gate_scales: Range<usize>,
     down_scales: Range<usize>,
     weights: Range<usize>,
+    grouped: [Range<usize>; 2],
     flag: Range<usize>,
     output: Range<usize>,
     gathered: Range<usize>,
@@ -58,13 +67,30 @@ impl Layout {
             offset = start.checked_add(width.checked_mul(height)?.checked_mul(4)?)?;
             Some(start..offset)
         };
+        let input = span(if retained { 0 } else { rows }, shape.hidden)?;
+        let row_ids = span(slots, 1)?;
+        let inverse_ids = span(slots, 1)?;
+        let gate_scales = span(slots, 1)?;
+        let down_scales = span(slots, 1)?;
+        let weights = span(slots, 1)?;
+        let grouped = if shape.grouped_experts > 0 {
+            let words = slots.checked_add(shape.grouped_experts)?.checked_add(1)?;
+            let spans = [span(words, 1)?, span(words, 1)?];
+            // F32 vector loads in GEMM require packed operands at 16-byte alignment.
+            let align_words = (3 - (spans[1].end / 4 % 4)) % 4;
+            span(align_words, 1)?;
+            spans
+        } else {
+            [0..0, 0..0]
+        };
         Some(Self {
-            input: span(if retained { 0 } else { rows }, shape.hidden)?,
-            row_ids: span(slots, 1)?,
-            inverse_ids: span(slots, 1)?,
-            gate_scales: span(slots, 1)?,
-            down_scales: span(slots, 1)?,
-            weights: span(slots, 1)?,
+            input,
+            row_ids,
+            inverse_ids,
+            gate_scales,
+            down_scales,
+            weights,
+            grouped,
             flag: span(1, 1)?,
             output: span(rows, shape.hidden)?,
             gathered: span(slots, shape.hidden)?,
@@ -75,14 +101,17 @@ impl Layout {
     }
 
     fn fit(requested: usize, shape: Geometry, capacity: usize) -> Option<usize> {
-        let single = Self::new(1, shape)?;
-        let bytes_per_row = single.down.end - single.flag.len();
-        let admitted = capacity
-            .saturating_sub(single.flag.len())
-            .checked_div(bytes_per_row)?
-            .min(requested)
-            .min(DenseGemvShape::MAX_ACTIVATION_ROWS.checked_div(shape.rank)?);
-        (admitted >= 2).then_some(admitted)
+        let mut hi = requested.min(DenseGemvShape::MAX_ACTIVATION_ROWS.checked_div(shape.rank)?);
+        let mut lo = 0;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if Self::new(mid, shape).is_some_and(|layout| layout.down.end <= capacity) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        (lo >= 2).then_some(lo)
     }
 }
 
@@ -92,6 +121,7 @@ pub(super) fn device_workspace_bytes(spec: &super::super::TextSpec, context: usi
         hidden: usize::try_from(spec.hidden_size).ok()?,
         middle: usize::try_from(spec.intermediate_size).ok()?,
         rank: usize::try_from(spec.num_experts_per_tok).ok()?,
+        grouped_experts: 0,
     };
     let rows = context.min(DenseGemvShape::MAX_ACTIVATION_ROWS.checked_div(shape.rank)?);
     Some(u64::try_from(Layout::new(rows, shape)?.down.end).ok()?)
@@ -173,6 +203,7 @@ struct Projections<'a> {
     dtypes: [DenseDtype; 2],
     min_wmma_rows: [Option<usize>; 2],
     exact_tile: bool,
+    grouped_weights: [Option<MmidWeight<'a>>; 2],
     matrices: BTreeMap<ExpertId, [Matrix<'a>; 2]>,
 }
 
@@ -240,6 +271,7 @@ impl GgufCuda {
             retained.filter(|input| admits_router_input(routes.len(), hidden, input.bytes()));
         let mut output = Vec::with_capacity(routes.len());
         let mut counts = [DenseGemvGroupCounts::default(); 2];
+        let mut grouped_slots = [0; 2];
         for (window, routes) in routes.chunks(scratch.rows).enumerate() {
             let first = window * scratch.rows;
             // The checked full-batch extent bounds both products and every window.
@@ -259,6 +291,9 @@ impl GgufCuda {
                 total.wmma += count.wmma;
                 total.exact_tiles += count.exact_tiles;
             }
+            for (total, selection) in grouped_slots.iter_mut().zip(&plan.grouped) {
+                *total += selection.as_ref().map_or(0, GroupedDqRows::selected);
+            }
         }
         if self.prefill_report.is_some() {
             eprintln!(
@@ -267,6 +302,7 @@ impl GgufCuda {
                     "windows": routes.len().div_ceil(scratch.rows),
                     "router_input_h2d_bytes_saved": retained.map_or(0, |input| input.bytes()),
                     "wmma_gate_calls": counts[0].wmma, "wmma_down_calls": counts[1].wmma,
+                    "grouped_dq_gate_slots": grouped_slots[0], "grouped_dq_down_slots": grouped_slots[1],
                     "exact_tile_gate_calls": counts[0].exact_tiles,
                     "exact_tile_down_calls": counts[1].exact_tiles})
             );
@@ -310,19 +346,66 @@ impl GgufCuda {
         {
             return Ok(None);
         }
+        let shapes = [[2 * middle, hidden], [hidden, middle]];
+        let (grouped_weights, grouped_experts) =
+            if self.device_prefill_grouped_dq && self.device_prefill_wmma {
+                let stacks = self.resident.original_layer(layer)?;
+                let weights = std::array::from_fn(|stage| {
+                    grouped_weight(dtypes[stage], shapes[stage], stacks[stage])
+                });
+                let experts = weights
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map_or(0, |w| w.base.bytes() / w.stride_bytes);
+                (weights, experts)
+            } else {
+                ([None, None], 0)
+            };
         Ok(Some(Projections {
             geometry: Geometry {
                 hidden,
                 middle,
                 rank,
+                grouped_experts,
             },
             dtypes,
             min_wmma_rows: WMMA_MIN_ROWS.map(|rows| self.device_prefill_wmma.then_some(rows)),
             exact_tile: self.device_prefill_exact_tile,
+            grouped_weights,
             caps,
             matrices,
         }))
     }
+}
+
+fn grouped_weight(
+    dtype: DenseDtype,
+    [n, k]: [usize; 2],
+    base: DeviceRange<'_>,
+) -> Option<MmidWeight<'_>> {
+    let quant = match dtype {
+        DenseDtype::PackedGguf(GgufType::Iq2Xxs) => QuantType::Iq2Xxs,
+        DenseDtype::PackedGguf(GgufType::Q20) => QuantType::Q20,
+        _ => return None,
+    };
+    if !k.is_multiple_of(quant.block_size().max(64)) || !n.is_multiple_of(4) {
+        return None;
+    }
+    let stride_bytes = quant.weight_bytes(n, k)?;
+    if stride_bytes == 0
+        || !base.bytes().is_multiple_of(stride_bytes)
+        || !stride_bytes.is_multiple_of(2)
+    {
+        return None;
+    }
+    Some(MmidWeight {
+        base,
+        quant,
+        k,
+        n,
+        stride_bytes,
+    })
 }
 
 // The expert workspace is independent of the dense step arena. Consume only an
@@ -339,6 +422,7 @@ fn admits_router_input(rows: usize, hidden: usize, bytes: usize) -> bool {
 struct RoutedWindow {
     upload: Vec<[u8; 4]>,
     groups: Vec<(ExpertId, Range<usize>)>,
+    grouped: [Option<GroupedDqRows>; 2],
     layout: Layout,
     rows: usize,
 }
@@ -373,13 +457,44 @@ impl RoutedWindow {
             },
             weight,
         )?;
+        let grouped = pack_grouped_rows(projections, &layout, &groups, &mut upload);
         Ok(Self {
             upload,
             groups,
+            grouped,
             layout,
             rows: routes.len(),
         })
     }
+}
+
+fn pack_grouped_rows(
+    projections: &Projections<'_>,
+    layout: &Layout,
+    groups: &[(ExpertId, Range<usize>)],
+    upload: &mut [[u8; 4]],
+) -> [Option<GroupedDqRows>; 2] {
+    std::array::from_fn(|stage| {
+        projections.grouped_weights[stage]?;
+        let minimum = projections.min_wmma_rows[stage]?;
+        let experts = projections.geometry.grouped_experts;
+        let plan = GroupedDqRows::new(
+            experts,
+            layout.row_ids.len() / 4,
+            minimum,
+            groups
+                .iter()
+                .map(|(id, span)| (id.expert as usize, span.clone())),
+        )?;
+        let area = &layout.grouped[stage];
+        for (dst, &word) in upload[area.start / 4..area.end / 4]
+            .iter_mut()
+            .zip(plan.ids().iter().chain(plan.bounds()))
+        {
+            *dst = word.to_ne_bytes();
+        }
+        Some(plan)
+    })
 }
 
 fn pack_routes(
@@ -554,9 +669,26 @@ impl Scratch {
     ) -> Result<DenseGemvGroupCounts, EngError> {
         let l = &plan.layout;
         let pair = [(&l.gathered, &l.gate), (&l.middle, &l.down)][stage];
+        let (x_span, y_span) = pair;
+        let minimum = projections.min_wmma_rows[stage];
+        let selection = plan.grouped[stage].as_ref();
+        if let (Some(selection), Some(weight)) = (selection, projections.grouped_weights[stage]) {
+            let range = |span: &Range<usize>| self.buffer.range(span.start, span.len());
+            cuda.gemm_dq_sparse_rows(
+                &self.stream,
+                SparseDqCall {
+                    weight,
+                    plan: selection,
+                    metadata: range(&l.grouped[stage])?,
+                    x: range(x_span)?,
+                    y: range(y_span)?,
+                },
+            )?;
+        }
         let calls = plan
             .groups
             .iter()
+            .filter(|(id, _)| selection.is_none_or(|plan| !plan.includes(id.expert as usize)))
             .map(|(id, slots)| {
                 let matrix = &projections.matrices[id][stage];
                 let [rows, cols] = matrix.shape;
@@ -568,19 +700,14 @@ impl Scratch {
                 };
                 Ok(DenseGemvCall {
                     w: matrix.data,
-                    x: span(pair.0, cols)?,
-                    y: span(pair.1, rows)?,
+                    x: span(x_span, cols)?,
+                    y: span(y_span, rows)?,
                     shape: DenseGemvShape::packed(slots.len(), rows, cols),
                     dtype: projections.dtypes[stage],
                 })
             })
             .collect::<Result<Vec<_>, EngError>>()?;
-        cuda.dense_gemv_group_with_tiles(
-            &self.stream,
-            &calls,
-            projections.min_wmma_rows[stage],
-            projections.exact_tile,
-        )
+        cuda.dense_gemv_group_with_tiles(&self.stream, &calls, minimum, projections.exact_tile)
     }
 }
 
@@ -594,6 +721,7 @@ mod tests {
             hidden: 2304,
             middle: 512,
             rank: 8,
+            grouped_experts: 0,
         };
         for rows in [2, 8, 31, 512] {
             let original = Layout::new(rows, shape).unwrap();
@@ -615,6 +743,7 @@ mod tests {
             hidden: 2304,
             middle: 512,
             rank: 8,
+            grouped_experts: 0,
         };
         let single = Layout::new(1, shape).unwrap();
         let plan = Layout::new(512, shape).unwrap();
@@ -631,11 +760,36 @@ mod tests {
     }
 
     #[test]
+    fn grouped_expert_layout_accounts_for_metadata_and_vector_alignment() {
+        let shape = Geometry {
+            hidden: 2304,
+            middle: 1152,
+            rank: 8,
+            grouped_experts: 128,
+        };
+        for rows in [2, 31, 511, 512] {
+            let full = Layout::new(rows, shape).unwrap();
+            let retained = Layout::for_input(rows, shape, true).unwrap();
+            for l in [&full, &retained] {
+                assert_eq!(l.grouped[0].start, l.weights.end);
+                assert_eq!(l.grouped[0].end, l.grouped[1].start);
+                assert!(l.grouped[1].end <= l.flag.start);
+                assert_eq!(l.grouped[1].len(), (rows * 8 + 129) * 4);
+                assert_eq!(l.gathered.start % 16, 0);
+                assert_eq!(l.middle.start % 16, 0);
+            }
+            assert_eq!(Layout::fit(rows, shape, full.down.end), Some(rows));
+            assert_ne!(Layout::fit(rows, shape, full.down.end - 1), Some(rows));
+        }
+    }
+
+    #[test]
     fn device_prompt_routes_keep_original_rank_and_expert_scale() {
         let shape = Geometry {
             hidden: 2,
             middle: 2,
             rank: 2,
+            grouped_experts: 0,
         };
         let input = [0.0; 2];
         let routes = [
