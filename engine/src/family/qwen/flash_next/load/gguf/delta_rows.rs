@@ -10,7 +10,8 @@ pub(super) fn delta_rows(
     value_heads: usize,
     total_rows: usize,
 ) -> Result<Vec<usize>, &'static str> {
-    if head_dim == 0 || key_heads == 0 || value_heads == 0 || value_heads % key_heads != 0 {
+    if head_dim == 0 || key_heads == 0 || value_heads == 0 || !value_heads.is_multiple_of(key_heads)
+    {
         return Err("invalid DeltaNet head dimensions");
     }
     let rows = value_heads

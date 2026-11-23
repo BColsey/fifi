@@ -2963,8 +2963,11 @@ fn pinned_prefix_host_capture() {
     assert!(target < expected[0].len() && target < model.config().layers());
     let host = super::host::HostModel::load(&model, target + 1).unwrap();
     let run = super::host::run(&model, &host, &[9707], 8).unwrap();
-    for layer in 0..=target {
-        let (actual, want) = (&run.layer_out[0][layer], &expected[0][layer]);
+    for (layer, (actual, want)) in run.layer_out[0][..=target]
+        .iter()
+        .zip(&expected[0][..=target])
+        .enumerate()
+    {
         assert_eq!(actual.len(), want.len());
         let (err, norm) = actual
             .iter()

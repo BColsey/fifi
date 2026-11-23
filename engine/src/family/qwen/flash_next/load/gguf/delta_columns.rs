@@ -26,8 +26,8 @@ impl DeltaColumnReader {
             || block_elements == 0
             || block_bytes == 0
             || rows == 0
-            || value_heads % key_heads != 0
-            || head_dim % block_elements != 0
+            || !value_heads.is_multiple_of(key_heads)
+            || !head_dim.is_multiple_of(block_elements)
         {
             return Err("invalid DeltaNet column geometry");
         }
@@ -58,8 +58,8 @@ impl DeltaColumnReader {
     ) -> Result<(), crate::EngError> {
         let invalid =
             || crate::EngError::Checkpoint("Flash-Next GGUF: invalid DeltaNet column read".into());
-        if offset % self.row_bytes != 0
-            || output.len() % self.row_bytes != 0
+        if !offset.is_multiple_of(self.row_bytes)
+            || !output.len().is_multiple_of(self.row_bytes)
             || offset
                 .checked_add(output.len())
                 .is_none_or(|end| end > self.total_bytes)
