@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output', type=Path, help='fresh build directory on an executable filesystem')
 out = parser.parse_args().output.resolve()
 w = here.parents[2]
-rev = 'bf72f7d9541c21fb41bf9f35924db298cf67dca2'
+rev = subprocess.check_output(['git', '-C', str(w), 'rev-parse', 'HEAD'], text=True).strip()
 relative = 'engine/src/kernels/cuda/native/resident/dense_gemv.cu'
 native = w / 'engine/src/kernels/cuda/native'
 s = subprocess.check_output(['git', '-C', str(w), 'show', f'{rev}:{relative}']).decode()
