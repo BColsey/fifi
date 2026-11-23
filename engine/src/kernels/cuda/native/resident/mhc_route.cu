@@ -99,7 +99,7 @@ extern "C" int inference_cuda_mhc_route_launch(const inference_cuda_mhc_route_ar
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (in == NULL || in->logits == NULL || in->a == NULL || in->b == NULL ||
             in->input == NULL || in->route == NULL || !hidden_ok(in->hidden) ||
-            !isfinite(in->pre_scale) || in->iterations < 0 || in->iterations > 16) {
+            !isfinite(in->pre_scale) || in->iterations < 0 || in->iterations > 32) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const dim3 grid((in->hidden + kUnit - 1) / kUnit);

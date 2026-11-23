@@ -40,6 +40,7 @@ use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::gdn_delta::{DeltaCall, DeltaShape, DeltaWeights, GDN_EPS};
 use crate::kernels::cuda::resident::mhc_route::{MhcAverageCall, MhcMergeCall, MhcRouteCall};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
+use crate::kernels::cuda::resident::router::{RouterLogitsCall, RouterShape};
 use crate::kernels::cuda::resident::row_add::RowAddCall;
 use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::step_params::{
@@ -50,17 +51,19 @@ use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
 
 use super::super::step::yarn_inv_freq;
 use super::super::weights::LoopShape;
-use super::super::{LoopPlan, RopePlan, TRUNK_LAYERS};
+use super::super::{LoopPlan, PHYSICAL_LAYERS, RopePlan, TRUNK_LAYERS};
 
 const F32: usize = size_of::<f32>();
 const GROUP: usize = 4;
 const ATTN_SCALE: f32 = 0.0625; // 1/sqrt(256)
 const MAX_SPLITS: usize = 64;
 
-/// One physical layer's resolved device weights.
+/// One physical layer's resolved device weights: quantized matrices stay
+/// [`NativeWeight`] (the matvec kernels read the stored blocks), the small F32 side tensors
+/// ride their raw [`DeviceBuffer`] (the loader copies them as read).
 struct Phys<'a> {
-    attn_norm: &'a NativeWeight,
-    post_norm: &'a NativeWeight,
+    attn_norm: &'a DeviceBuffer,
+    post_norm: &'a DeviceBuffer,
     ffn_gate: &'a NativeWeight,
     ffn_up: &'a NativeWeight,
     ffn_down: &'a NativeWeight,
@@ -74,18 +77,18 @@ enum Mixer<'a> {
         qkvz: &'a NativeWeight,
         beta_alpha: &'a NativeWeight,
         out: &'a NativeWeight,
-        conv: &'a NativeWeight,
-        a: &'a NativeWeight,
-        dt_bias: &'a NativeWeight,
-        norm: &'a NativeWeight,
+        conv: &'a DeviceBuffer,
+        a: &'a DeviceBuffer,
+        dt_bias: &'a DeviceBuffer,
+        norm: &'a DeviceBuffer,
     },
     Attn {
         q: &'a NativeWeight,
         k: &'a NativeWeight,
         v: &'a NativeWeight,
         o: &'a NativeWeight,
-        q_norm: &'a NativeWeight,
-        k_norm: &'a NativeWeight,
+        q_norm: &'a DeviceBuffer,
+        k_norm: &'a DeviceBuffer,
     },
 }
 
@@ -97,7 +100,7 @@ pub(crate) struct LoopStep<'a> {
     weights: &'a CudaWeights,
     phys: Vec<Phys<'a>>,
     head: &'a NativeWeight,
-    output_norm: &'a NativeWeight,
+    output_norm: &'a DeviceBuffer,
     shape: LoopShape,
     plan: LoopPlan,
     rope: RopePlan,
@@ -140,7 +143,18 @@ fn native<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a NativeWeight, 
     match weights.get(name) {
         Some(CudaWeight::Native { weight, .. }) => Ok(weight),
         _ => Err(EngError::Checkpoint(format!(
-            "the device load is missing {name} in the Native layout"
+            "the device load is missing {name} in the Native layout ({} tensors held)",
+            weights.len()
+        ))),
+    }
+}
+
+/// An F32 tensor the loader copied as read: the conv, `ssm_a`, the biases and every norm.
+fn side<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a DeviceBuffer, EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Raw { buffer, .. }) => Ok(buffer),
+        _ => Err(EngError::Checkpoint(format!(
+            "the device load is missing {name} as a raw F32 tensor"
         ))),
     }
 }
@@ -188,20 +202,23 @@ impl<'a> LoopStep<'a> {
         let proj_floats = qkvz_row(shape) + 2 * shape.delta_value_heads.max(attn_row(shape));
         let cache_bytes = cache_rows * shape.heads_kv * shape.head_dim * 2;
         let attn_slot: Vec<usize> = (0..visits)
-            .filter(|&il| !plan.recurrent[plan.physical(il)])
+            .filter(|&il| !plan.recurrent[plan.block(plan.physical(il))])
             .collect();
-        let phys = (0..plan.recurrent.len())
+        // One Phys per PHYSICAL layer (a loop revisit reads the same weights through its
+        // own visit state); `recurrent` is block-indexed, so the mixer test goes through
+        // `block(p)` exactly as the load template does.
+        let phys = (0..PHYSICAL_LAYERS)
             .map(|p| {
                 let stem = format!("blk.{}", plan.block(p));
-                let mixer = if plan.recurrent[p] {
+                let mixer = if plan.recurrent[plan.block(p)] {
                     Mixer::Delta {
                         qkvz: native(weights, &format!("{stem}.attn_qkv_gate.weight"))?,
                         beta_alpha: native(weights, &format!("{stem}.ssm_beta_alpha.weight"))?,
                         out: native(weights, &format!("{stem}.ssm_out.weight"))?,
-                        conv: native(weights, &format!("{stem}.ssm_conv1d.weight"))?,
-                        a: native(weights, &format!("{stem}.ssm_a"))?,
-                        dt_bias: native(weights, &format!("{stem}.ssm_dt.bias"))?,
-                        norm: native(weights, &format!("{stem}.ssm_norm.weight"))?,
+                        conv: side(weights, &format!("{stem}.ssm_conv1d.weight"))?,
+                        a: side(weights, &format!("{stem}.ssm_a"))?,
+                        dt_bias: side(weights, &format!("{stem}.ssm_dt.bias"))?,
+                        norm: side(weights, &format!("{stem}.ssm_norm.weight"))?,
                     }
                 } else {
                     Mixer::Attn {
@@ -209,13 +226,13 @@ impl<'a> LoopStep<'a> {
                         k: native(weights, &format!("{stem}.attn_k.weight"))?,
                         v: native(weights, &format!("{stem}.attn_v.weight"))?,
                         o: native(weights, &format!("{stem}.attn_output.weight"))?,
-                        q_norm: native(weights, &format!("{stem}.attn_q_norm.weight"))?,
-                        k_norm: native(weights, &format!("{stem}.attn_k_norm.weight"))?,
+                        q_norm: side(weights, &format!("{stem}.attn_q_norm.weight"))?,
+                        k_norm: side(weights, &format!("{stem}.attn_k_norm.weight"))?,
                     }
                 };
                 Ok(Phys {
-                    attn_norm: native(weights, &format!("{stem}.attn_norm.weight"))?,
-                    post_norm: native(weights, &format!("{stem}.post_attention_norm.weight"))?,
+                    attn_norm: side(weights, &format!("{stem}.attn_norm.weight"))?,
+                    post_norm: side(weights, &format!("{stem}.post_attention_norm.weight"))?,
                     ffn_gate: native(weights, &format!("{stem}.ffn_gate.weight"))?,
                     ffn_up: native(weights, &format!("{stem}.ffn_up.weight"))?,
                     ffn_down: native(weights, &format!("{stem}.ffn_down.weight"))?,
@@ -229,7 +246,7 @@ impl<'a> LoopStep<'a> {
             stream: ctx.stream()?,
             phys,
             head: native(weights, "output.weight")?,
-            output_norm: native(weights, "output_norm.weight")?,
+            output_norm: side(weights, "output_norm.weight")?,
             rec: ctx.upload(&zeros(rec_floats * visits))?,
             ring: ctx.upload(&zeros(ring_floats * visits))?,
             k_cache: (0..attn_slot.len())
@@ -300,6 +317,25 @@ impl<'a> LoopStep<'a> {
     /// One token: `embed_row` is the gathered embedding row of the drawn token at `pos`.
     /// Enqueues the trunk and the head; the caller drains and reads [`Self::logits_row`].
     pub(crate) fn decode(&mut self, embed_row: &[f32], pos: usize) -> Result<(), EngError> {
+        self.decode_inner(embed_row, pos, None)
+    }
+
+    /// The parity rig's twin: also snapshots the residual row after every visit.
+    pub(crate) fn decode_traced(
+        &mut self,
+        embed_row: &[f32],
+        pos: usize,
+        trace: &mut Vec<Vec<f32>>,
+    ) -> Result<(), EngError> {
+        self.decode_inner(embed_row, pos, Some(trace))
+    }
+
+    fn decode_inner(
+        &mut self,
+        embed_row: &[f32],
+        pos: usize,
+        mut trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<(), EngError> {
         let h = self.shape.hidden;
         if embed_row.len() != h {
             return Err(EngError::BadRequest(
@@ -323,10 +359,32 @@ impl<'a> LoopStep<'a> {
             }
             if mhc {
                 self.route(p, "hc_attn_fn")?;
+                // The branch consumes the routed input the router just wrote, normed
+                // with this layer's attn_norm (the CPU's rms_plain(r.input, attn_norm)).
+                self.norm_and_q8(
+                    floats(&self.router_normed, 0, h)?,
+                    None,
+                    self.phys[p].attn_norm,
+                )?;
             } else {
                 self.norm_and_q8(self.resid_range()?, None, self.phys[p].attn_norm)?;
             }
             self.branch(il)?;
+            if let Some(trace) = trace.as_deref_mut() {
+                self.stream.synchronize()?;
+                let h = self.shape.hidden;
+                let mut bytes = vec![0u8; self.branch.bytes()];
+                self.ctx.download(&self.branch, &mut bytes)?;
+                trace.push(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .take(h)
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect(),
+                );
+            }
             if mhc {
                 self.merge_streams(false)?;
                 self.route(p, "hc_ffn_fn")?;
@@ -356,13 +414,14 @@ impl<'a> LoopStep<'a> {
                     self.phys[p].post_norm,
                 )?;
                 self.ffn(p)?;
-                // row_add writes a distinct out: rotate the residual pair.
-                let next = cur ^ 1;
+                // row_add writes a distinct out: rotate the residual pair. The read
+                // plane is the CURRENT residual, not the step's starting plane.
+                let next = self.cur_ix ^ 1;
                 self.ctx.row_add(
                     &self.stream,
                     RowAddCall {
                         out: floats(&self.resid[next], 0, h)?,
-                        x: floats(&self.resid[cur], 0, h)?,
+                        x: floats(&self.resid[self.cur_ix], 0, h)?,
                         y: floats(&self.ffn_out, 0, h)?,
                         n: h,
                         flag: None,
@@ -371,8 +430,22 @@ impl<'a> LoopStep<'a> {
                 )?;
                 self.cur_ix = next;
             }
+            if let Some(trace) = trace.as_deref_mut() {
+                self.stream.synchronize()?;
+                let h = self.shape.hidden;
+                let mut bytes = vec![0u8; self.resid[self.cur_ix].bytes()];
+                self.ctx.download(&self.resid[self.cur_ix], &mut bytes)?;
+                trace.push(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .take(h)
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect(),
+                );
+            }
         }
-        let _ = cur;
 
         // The output norm and the head.
         let h = self.shape.hidden;
@@ -432,8 +505,8 @@ impl<'a> LoopStep<'a> {
     fn route(&mut self, p: usize, part: &str) -> Result<(), EngError> {
         let h = self.shape.hidden;
         let stem = format!("blk.{}", self.plan.block(p));
-        let weight = native(self.weights, &format!("{stem}.{part}.weight"))?;
-        let bias = native(self.weights, &format!("{stem}.{part}.bias"))?;
+        let weight = side(self.weights, &format!("{stem}.{part}.weight"))?;
+        let bias = side(self.weights, &format!("{stem}.{part}.bias"))?;
         self.ctx.add_rmsnorm_q8(
             &self.stream,
             AddNormQ8Call {
@@ -447,12 +520,21 @@ impl<'a> LoopStep<'a> {
                 rows: 1,
             },
         )?;
-        self.ctx.matvec_native(
+        // The router matrix is a raw F32 tensor: the split router dot reads it as stored,
+        // no quantize and no new kernel (the bias folds into the logits inside mhc_route).
+        self.ctx.router_logits_rows(
             &self.stream,
-            weight,
-            bytes_range(&self.router_q8, q8_row(2 * h)?)?,
-            floats(&self.router_logits, 0, 8)?,
-            1,
+            RouterLogitsCall {
+                shape: RouterShape {
+                    m: 1,
+                    hidden: 2 * h,
+                    n_expert: 8,
+                    top_k: 1,
+                },
+                x: floats(&self.router_normed, 0, 2 * h)?,
+                w: floats(weight, 0, 8 * 2 * h)?,
+                logits: floats(&self.router_logits, 0, 8)?,
+            },
         )?;
         self.ctx.mhc_route(
             &self.stream,
@@ -462,7 +544,7 @@ impl<'a> LoopStep<'a> {
                 iterations: self.plan.mhc_iterations,
                 fixed_identity: self.plan.mhc_fixed_identity,
                 logits: floats(&self.router_logits, 0, 8)?,
-                bias: Some(floats(bias.buffer(), 0, 8)?),
+                bias: Some(floats(bias, 0, 8)?),
                 a: floats(&self.streams, 0, h)?,
                 b: floats(&self.streams, h, h)?,
                 // The routed input takes the router-normed row's first half (scratch the
@@ -499,7 +581,7 @@ impl<'a> LoopStep<'a> {
         &self,
         row: DeviceRange<'_>,
         delta: Option<DeviceRange<'_>>,
-        weight: &NativeWeight,
+        weight: &DeviceBuffer,
     ) -> Result<(), EngError> {
         let h = self.shape.hidden;
         self.ctx.add_rmsnorm_q8(
@@ -509,7 +591,7 @@ impl<'a> LoopStep<'a> {
                 eps: self.shape.eps,
                 h: row,
                 delta,
-                weight: floats(weight.buffer(), 0, h)?,
+                weight: floats(weight, 0, h)?,
                 norm_out: floats(&self.norm_out, 0, h)?,
                 q8: bytes_range(&self.norm_q8, q8_row(h)?)?,
                 rows: 1,
@@ -579,7 +661,7 @@ impl<'a> LoopStep<'a> {
                     ld: qkvz_row_len + ba_len,
                 },
                 proj: floats(&self.proj, 0, conv_dim)?,
-                weights: floats(conv.buffer(), 0, conv_dim * ck)?,
+                weights: floats(conv, 0, conv_dim * ck)?,
                 state: floats(&self.ring, ring_at, ring_floats)?,
                 out: floats(&self.conv_out, 0, conv_dim)?,
             },
@@ -603,9 +685,9 @@ impl<'a> LoopStep<'a> {
                 conv: floats(&self.conv_out, 0, conv_dim)?,
                 proj: floats(&self.proj, 0, qkvz_row_len + ba_len)?,
                 weights: DeltaWeights {
-                    a: floats(a.buffer(), 0, vh)?,
-                    dt_bias: floats(dt_bias.buffer(), 0, vh)?,
-                    norm_w: floats(norm.buffer(), 0, vd)?,
+                    a: floats(a, 0, vh)?,
+                    dt_bias: floats(dt_bias, 0, vh)?,
+                    norm_w: floats(norm, 0, vd)?,
                 },
                 state: floats(&self.rec, il * rec_floats, rec_floats)?,
                 out: floats(&self.delta_out, 0, vh * vd)?,
@@ -698,8 +780,8 @@ impl<'a> LoopStep<'a> {
                 },
                 admit_pos: 0,
                 proj: floats(&self.proj, 0, row_len)?,
-                q_norm: floats(q_norm.buffer(), 0, hd)?,
-                k_norm: floats(k_norm.buffer(), 0, hd)?,
+                q_norm: floats(q_norm, 0, hd)?,
+                k_norm: floats(k_norm, 0, hd)?,
                 k_cache: bytes_range(k_cache, k_cache.bytes())?,
                 v_cache: bytes_range(v_cache, v_cache.bytes())?,
                 q: floats(&self.q_out, 0, hq * hd)?,
@@ -773,7 +855,7 @@ impl<'a> LoopStep<'a> {
                 gu: floats(&self.gu, 0, 2 * ff)?,
                 q8: bytes_range(&self.gu_q8, q8_row(ff)?)?,
                 n_ff: ff,
-                y_slot_stride: q8_row(ff)?,
+                y_slot_stride: 2 * ff,
                 slots: 1,
                 glu_done: false,
             },

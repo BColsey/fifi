@@ -1822,6 +1822,7 @@ mod tests {
         slot_ring: 0,
         eps: 1e-6,
         rope_base: 1e7,
+        inv_freq: std::ptr::null(),
     };
 
     /// `(status, stage)` of the rows entry after `edit` of the base arguments.

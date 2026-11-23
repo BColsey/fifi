@@ -11,7 +11,7 @@
 //! mirror `valid()` of `mhc_route.cu`, so the native entry cannot return `INVALID_ARGUMENT`
 //! (which would latch the backend). In order: the backend is usable; `hidden` is a positive
 //! multiple of 256 at most 2^20 (the grid math); `pre_scale` is finite and `iterations` is at
-//! most 16 (route); every range holds its bytes at 4-byte alignment; the written ranges
+//! most 32 (route); every range holds its bytes at 4-byte alignment; the written ranges
 //! overlap no other range of the call. A refused call changes nothing.
 //!
 //! The caller of one visit sequences route -> (branch) -> merge -> ... -> average on ONE
@@ -100,9 +100,9 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         check_hidden(call.hidden)?;
-        if !call.pre_scale.is_finite() || call.iterations > 16 {
+        if !call.pre_scale.is_finite() || call.iterations > 32 {
             return Err(EngError::BadRequest(
-                "mhc_route: pre_scale is not finite or iterations is above 16".to_owned(),
+                "mhc_route: pre_scale is not finite or iterations is above 32".to_owned(),
             ));
         }
         let row = bytes("stream", call.hidden)?;

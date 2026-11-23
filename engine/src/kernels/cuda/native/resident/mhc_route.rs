@@ -141,7 +141,7 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
             && Span::of(&io.a, row_bytes).apart(&w.2)
             && Span::of(&io.b, row_bytes).apart(&w.2)
     }) && written[0].2.apart(&written[1].2);
-    let scalars = io.pre_scale.is_finite() && io.iterations <= 16;
+    let scalars = io.pre_scale.is_finite() && io.iterations <= 32;
     if !(logits_ok && a_ok && b_ok && apart && scalars) || !written.iter().all(|w| w.0 && w.1) {
         return Err(invalid_argument());
     }

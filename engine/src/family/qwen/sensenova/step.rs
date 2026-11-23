@@ -453,6 +453,29 @@ pub(super) fn trunk(
     token: u32,
     pos: u32,
 ) -> Result<Vec<f32>, EngError> {
+    trunk_inner(projector, weights, state, token, pos, None)
+}
+
+/// The parity rig's twin: also snapshots the residual row after every visit.
+pub(super) fn trunk_traced(
+    projector: &mut GgufProjector,
+    weights: &LoopWeights,
+    state: &mut LoopState,
+    token: u32,
+    pos: u32,
+    trace: &mut Vec<Vec<f32>>,
+) -> Result<Vec<f32>, EngError> {
+    trunk_inner(projector, weights, state, token, pos, Some(trace))
+}
+
+fn trunk_inner(
+    projector: &mut GgufProjector,
+    weights: &LoopWeights,
+    state: &mut LoopState,
+    token: u32,
+    pos: u32,
+    mut trace: Option<&mut Vec<Vec<f32>>>,
+) -> Result<Vec<f32>, EngError> {
     let shape = weights.shape();
     let plan = weights.plan();
     let rope = weights.rope();
@@ -503,6 +526,9 @@ pub(super) fn trunk(
                 attn_step(projector, shape, rope, &view, state, il, (&normed, pos))?
             }
         };
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(branch.clone());
+        }
 
         if mhc {
             merge(
@@ -537,6 +563,9 @@ pub(super) fn trunk(
             for (c, add) in cur.iter_mut().zip(&ffn_out) {
                 *c += add;
             }
+        }
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(cur.clone());
         }
     }
 
