@@ -900,7 +900,12 @@ bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
         a->m > kMaxGridY || a->cache_rows < 1 || a->cache_rows > kMaxRows)
         return false;
     if (!tagged)
-        return a->head_dim != 64 && (a->n_head == a->n_kv_head || a->n_head == kGroup * a->n_kv_head) &&
+        /* The fp16 linear cache path is compiled for groups 1 and 8 at head dims 128 and 256,
+         * and for group 4 at 256 only. */
+        return a->head_dim != 64 &&
+               (a->n_head == a->n_kv_head ||
+                (a->n_head == 4 * a->n_kv_head && a->head_dim == kHeadDim) ||
+                a->n_head == kGroup * a->n_kv_head) &&
                aligned_to(a->k_cache, 16) && aligned_to(a->v_cache, 16);
     const inference_cuda_attn_kv_pair &views = *a->kv_views;
     const size_t floats = inference_cuda_attn_prefill_part_floats(
@@ -1144,6 +1149,10 @@ Failure enqueue_typed(const Args &k, void *stream) {
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (!failure.ok() && cudaPeekAtLastError() == arm.err)
             (void)cudaGetLastError();  // consume the duplicate of the reported arm failure
+        /* The SIMT kernel lays its rows out as 8 head lanes per token; only the dsplit kernel
+         * reads kGroup, so a group of 4 is refused on a device that cannot fit dsplit. */
+        if (failure.ok() && kGroup == 4 && !arm.dsplit)
+            failure.record(cudaErrorInvalidConfiguration, INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.ok()) {
             const int q_tiles = (k.m + kQTile - 1) / kQTile;
             const int splits = k.mode == 1 ? 1 : k.max_splits;
@@ -1543,8 +1552,9 @@ Failure enqueue(const Args &k, void *stream, const inference_cuda_attn_kv_pair *
         return k.n_head == k.n_kv_head ? enqueue_typed<128, 1>(k, stream)
                                        : enqueue_typed<128, 8>(k, stream);
     }
-    return k.n_head == k.n_kv_head ? enqueue_typed<256, 1>(k, stream)
-                                   : enqueue_typed<256, 8>(k, stream);
+    if (k.n_head == k.n_kv_head) return enqueue_typed<256, 1>(k, stream);
+    return k.n_head == 4 * k.n_kv_head ? enqueue_typed<256, 4>(k, stream)
+                                       : enqueue_typed<256, 8>(k, stream);
 }
 
 }  // namespace

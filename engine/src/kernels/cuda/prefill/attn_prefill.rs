@@ -813,10 +813,15 @@ fn check_shape_mode(
         ));
     }
     let n_kv_head = shape.n_kv_head;
+    // The fp16 linear path is compiled for groups 1 and 8 at both head sizes, and for group 4
+    // at 256 only: the 128-wide entry has no group-4 instantiation.
     if !(1..=MAX_KV_HEADS).contains(&n_kv_head)
         || !(1..=MAX_TOKENS).contains(&shape.n_head)
         || !shape.n_head.is_multiple_of(n_kv_head)
-        || (!q8 && !(shape.n_head == n_kv_head || shape.n_head == GROUP * n_kv_head))
+        || (!q8
+            && !(shape.n_head == n_kv_head
+                || (shape.n_head == 4 * n_kv_head && shape.head_dim == HEAD_DIM)
+                || shape.n_head == GROUP * n_kv_head))
     {
         return Err(rule(
             "group",

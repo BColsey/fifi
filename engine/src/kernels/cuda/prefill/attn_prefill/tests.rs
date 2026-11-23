@@ -30,27 +30,26 @@ use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream}
 
 #[test]
 fn cpf_attn_row_block_accepts_first_shared_head_geometry_cells() {
+    // Every cell the fp16 linear path is compiled for; group 4 exists at 256 only.
     let mut refused = Vec::new();
-    for head_dim in [128, 256] {
-        for group in [1, 8] {
-            let shape = AttnPrefillShape {
-                m: 17,
-                n_head: 2 * group,
-                n_kv_head: 2,
-                head_dim,
-                cache_rows: 64,
-                ld: 0,
-                p0: 31,
-            };
-            match check_shape(&shape, CPF_ATTN_Q_TILE) {
-                Ok(ints) => {
-                    assert_eq!(ints.m, 17);
-                    assert_eq!(ints.n_head, 2 * group as i32);
-                    assert_eq!(ints.n_kv_head, 2);
-                    assert_eq!(ints.head_dim, head_dim as i32);
-                }
-                Err(error) => refused.push(format!("D={head_dim}, GQA={group}: {error:?}")),
+    for (head_dim, group) in [(128, 1), (128, 8), (256, 1), (256, 4), (256, 8)] {
+        let shape = AttnPrefillShape {
+            m: 17,
+            n_head: 2 * group,
+            n_kv_head: 2,
+            head_dim,
+            cache_rows: 64,
+            ld: 0,
+            p0: 31,
+        };
+        match check_shape(&shape, CPF_ATTN_Q_TILE) {
+            Ok(ints) => {
+                assert_eq!(ints.m, 17);
+                assert_eq!(ints.n_head, 2 * group as i32);
+                assert_eq!(ints.n_kv_head, 2);
+                assert_eq!(ints.head_dim, head_dim as i32);
             }
+            Err(error) => refused.push(format!("D={head_dim}, GQA={group}: {error:?}")),
         }
     }
     assert!(refused.is_empty(), "{}", refused.join("\n"));
@@ -58,7 +57,8 @@ fn cpf_attn_row_block_accepts_first_shared_head_geometry_cells() {
 
 #[test]
 fn cpf_attn_row_block_refuses_unimplemented_cells_before_launch() {
-    for (head_dim, group) in [(64, 1), (128, 3), (256, 4)] {
+    // (128, 4): the group-4 kernel is compiled for head dim 256 only.
+    for (head_dim, group) in [(64, 1), (128, 3), (128, 4)] {
         let shape = AttnPrefillShape {
             m: 17,
             n_head: 2 * group,
