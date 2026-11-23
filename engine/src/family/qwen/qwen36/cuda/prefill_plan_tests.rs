@@ -779,7 +779,8 @@ const TABLE: [(S, usize, usize, Phase, Phase); 33] = [
     (S::IdsG, 32, 0, Ids, Ids),
     (S::IdsSrc1, 32, 0, Ids, Scatter),
     (S::IdsDst, 36, 4 * 127, Ids, Down),
-    (S::ExpertBounds, 0, 4 * 257, Ids, Down),
+    // Every expert on the card plus the deepest cold staging, and the first: 256 + 78 + 1.
+    (S::ExpertBounds, 0, 4 * 335, Ids, Down),
     (S::Q8S, 18_432, Q8_1_PAD, Scatter, GateUp),
     (S::Gu, 32_768, 0, GateUp, Swiglu),
     (S::Act, 16_384, 0, Swiglu, Down),
