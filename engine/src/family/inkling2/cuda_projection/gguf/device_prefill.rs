@@ -38,6 +38,17 @@ struct Geometry {
     grouped_experts: usize,
 }
 
+impl Geometry {
+    // Each window recomputes its layout. For the same tensor shape, bounding the
+    // grouped metadata also bounds the padded prefix of the device and host arenas.
+    fn can_serve(self, shape: Self) -> bool {
+        self.hidden == shape.hidden
+            && self.middle == shape.middle
+            && self.rank == shape.rank
+            && self.grouped_experts >= shape.grouped_experts
+    }
+}
+
 struct Layout {
     input: Range<usize>,
     row_ids: Range<usize>,
@@ -141,6 +152,12 @@ struct Scratch {
 }
 
 impl Workspace {
+    fn cached(&mut self, shape: Geometry) -> Option<&mut Scratch> {
+        self.scratch
+            .as_mut()
+            .filter(|buffer| buffer.geometry.can_serve(shape))
+    }
+
     fn fit(
         &mut self,
         cuda: &CudaContext,
@@ -148,14 +165,10 @@ impl Workspace {
         shape: Geometry,
     ) -> Result<Option<&mut Scratch>, EngError> {
         if self
-            .scratch
-            .as_ref()
-            .is_some_and(|buffer| buffer.geometry == shape && buffer.rows >= requested)
+            .cached(shape)
+            .is_some_and(|buffer| buffer.rows >= requested)
         {
-            return Ok(self
-                .scratch
-                .as_mut()
-                .filter(|buffer| buffer.geometry == shape));
+            return Ok(self.cached(shape));
         }
         // This temporary work can consume the existing reserve above the family floor.
         // Check only after expert and optional projection placement has completed.
@@ -164,28 +177,15 @@ impl Workspace {
             .free
             .saturating_sub(DEVICE_HEADROOM as usize);
         let Some(rows) = Layout::fit(requested, shape, free) else {
-            return Ok(self
-                .scratch
-                .as_mut()
-                .filter(|buffer| buffer.geometry == shape));
+            return Ok(self.cached(shape));
         };
-        if self
-            .scratch
-            .as_ref()
-            .is_some_and(|buffer| buffer.geometry == shape && buffer.rows >= rows)
-        {
-            return Ok(self
-                .scratch
-                .as_mut()
-                .filter(|buffer| buffer.geometry == shape));
+        if self.cached(shape).is_some_and(|buffer| buffer.rows >= rows) {
+            return Ok(self.cached(shape));
         }
         let layout =
             Layout::new(rows, shape).ok_or_else(|| bad("expert prefill arena overflows"))?;
         let Some(scratch) = Scratch::allocate(cuda, rows, shape, &layout)? else {
-            return Ok(self
-                .scratch
-                .as_mut()
-                .filter(|buffer| buffer.geometry == shape));
+            return Ok(self.cached(shape));
         };
         eprintln!(
             "Inkling CUDA device expert workspace {}",
@@ -757,6 +757,45 @@ mod tests {
             Layout::fit(usize::MAX, shape, usize::MAX),
             Some(DenseGemvShape::MAX_ACTIVATION_ROWS / 8)
         );
+    }
+
+    #[test]
+    fn grouped_expert_workspace_serves_plain_and_smaller_grouped_layouts() {
+        let largest = Geometry {
+            hidden: 2304,
+            middle: 1152,
+            rank: 8,
+            grouped_experts: 128,
+        };
+        let plain = Geometry {
+            grouped_experts: 0,
+            ..largest
+        };
+        assert!(!plain.can_serve(largest));
+        assert!(!largest.can_serve(Geometry { rank: 4, ..plain }));
+        assert!(!largest.can_serve(Geometry {
+            hidden: 1152,
+            ..plain
+        }));
+        assert!(!largest.can_serve(Geometry {
+            middle: 512,
+            ..plain
+        }));
+        let capacity = Layout::new(511, largest).unwrap();
+        for experts in [0, 1, 31, 127, 128] {
+            let shape = Geometry {
+                grouped_experts: experts,
+                ..largest
+            };
+            assert!(largest.can_serve(shape));
+            for n in [2, 29, 511] {
+                for retained in [false, true] {
+                    let layout = Layout::for_input(n, shape, retained).unwrap();
+                    assert!(layout.output.end <= capacity.output.end);
+                    assert!(layout.down.end <= capacity.down.end);
+                }
+            }
+        }
     }
 
     #[test]
