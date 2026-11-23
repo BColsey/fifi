@@ -45,6 +45,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     group_projections: bool,
     group_attention: bool,
     batch_router: bool,
+    reuse_router_input: bool,
     resident_attention: Option<attention::ResidentAttention>,
     moe_scratch: Option<ResidentMoe>,
     route_scratch: Option<router::RouteScratch>,
@@ -691,6 +692,9 @@ impl GgufCuda {
             route_scratch,
             batch_streamed,
             prefill_resident,
+            reuse_router_input: device_prefill
+                && std::env::var("FIFI_INKLING_CUDA_PREFILL_ROUTER_INPUT_REUSE").as_deref()
+                    == Ok("1"),
             device_prefill: device_prefill.then(RefCell::default),
             device_prefill_wmma: device_prefill
                 && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_WMMA").as_deref()
@@ -823,12 +827,20 @@ impl GgufCuda {
         &self,
         name: &str,
         inputs: &[&[f32]],
-    ) -> Result<Vec<f32>, EngError> {
+        layer: u32,
+        prompt: bool,
+    ) -> Result<(Vec<f32>, Option<DeviceRange<'_>>), EngError> {
         let (weight, _) = self
             .dense
             .get(name)
             .ok_or_else(|| bad("missing resident prefill router projection"))?;
-        self.step.project_router_rows(&self.context, weight, inputs)
+        let reuse = prompt && self.reuse_router_input && self.prefills_device_layer(layer);
+        self.step.project_router_rows(
+            &self.context,
+            weight,
+            inputs,
+            reuse.then_some(&self.expert_codes),
+        )
     }
 
     pub(in crate::family::inkling2) fn attention_projections<const N: usize>(

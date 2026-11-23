@@ -7,6 +7,7 @@ use super::{
     controller_batch::{ChainedAttention, controller_batch_enabled, multirow_controllers_enabled},
     window::PendingRow,
 };
+use crate::kernels::cuda::DeviceRange;
 use crate::{
     EngError,
     family::inkling2::{
@@ -405,7 +406,7 @@ impl CpuForward {
                 self.finish_mlp_input(input, row.bank.as_ref(), physical, &layer)
             }
         });
-        let mlp = if batch_router {
+        let (mlp, retained) = if batch_router {
             let mut inputs = match batched {
                 Some(inputs) => inputs,
                 None => inputs.collect::<Result<Vec<_>, _>>()?,
@@ -415,15 +416,17 @@ impl CpuForward {
             }
             self.prompt_routes(weights, physical, &prefix, inputs)?
         } else {
-            inputs
+            let rows = inputs
                 .map(|input| {
                     let input = input?;
                     let route = self.moe_route(physical, &prefix, &input)?;
                     Ok(MlpRow { route, input })
                 })
-                .collect::<Result<_, EngError>>()?
+                .collect::<Result<_, EngError>>()?;
+            (rows, None)
         };
-        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp)?;
+        // The cold expert weight stage holds these rows until resident experts finish.
+        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp, retained)?;
         for (row, output) in rows.iter_mut().zip(outputs) {
             if let Some(journal) = &mut row.journal {
                 let attention = journal
@@ -507,17 +510,21 @@ impl CpuForward {
         Ok(())
     }
 
-    fn prompt_routes(
+    fn prompt_routes<'a>(
         &self,
-        weights: &GgufTextWeights,
+        weights: &'a GgufTextWeights,
         layer: usize,
         prefix: &str,
         inputs: Vec<Vec<f32>>,
-    ) -> Result<Vec<MlpRow>, EngError> {
+    ) -> Result<(Vec<MlpRow>, Option<DeviceRange<'a>>), EngError> {
         let _span = self.phase_span(super::Work::Router);
         let input_rows: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
-        let logits =
-            weights.prefill_router_logits(&format!("{prefix}.gate.weight"), &input_rows)?;
+        let (logits, retained) = weights.prefill_router_logits(
+            &format!("{prefix}.gate.weight"),
+            &input_rows,
+            layer as u32,
+            !self.draft_window_enabled(),
+        )?;
         let experts = self.spec.n_routed_experts as usize;
         let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
         let rows = inputs
@@ -535,7 +542,7 @@ impl CpuForward {
                 serde_json::json!({"layer":layer,"routes":routes})
             );
         }
-        Ok(rows)
+        Ok((rows, retained))
     }
 
     fn diagnose_chained_projections(
@@ -653,6 +660,7 @@ impl CpuForward {
         layer: usize,
         prefix: &str,
         mlp: &[MlpRow],
+        retained: Option<DeviceRange<'_>>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let span = self.phase_span(super::Work::Experts);
         let routes: Vec<_> = mlp
@@ -672,6 +680,7 @@ impl CpuForward {
             layer as u32,
             &routes,
             [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
+            retained,
             |row, id| mlp[row].route.weight(id, self.math.route_scale),
         )? {
             return Ok(output);

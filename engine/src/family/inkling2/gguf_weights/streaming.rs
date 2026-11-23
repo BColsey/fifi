@@ -1,5 +1,6 @@
 //! Borrow both matrices of each routed expert directly from the original GGUF.
 use super::{GgufTextWeights, Tensor, bad};
+use crate::kernels::cuda::DeviceRange;
 use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView},
@@ -107,11 +108,13 @@ impl GgufTextWeights {
         &self,
         name: &str,
         inputs: &[&[f32]],
-    ) -> Result<Vec<f32>, EngError> {
+        layer: u32,
+        prompt: bool,
+    ) -> Result<(Vec<f32>, Option<DeviceRange<'_>>), EngError> {
         self.cuda
             .as_ref()
             .ok_or_else(|| bad("prefill router requires a CUDA backend"))?
-            .prefill_router_logits(name, inputs)
+            .prefill_router_logits(name, inputs, layer, prompt)
     }
 
     pub(in crate::family::inkling2) fn observe_experts(&self, layer: usize, selected: &[usize]) {
@@ -150,6 +153,7 @@ impl GgufTextWeights {
         layer: u32,
         routes: &[PrefillRoute<'_>],
         caps: [f32; 2],
+        retained: Option<DeviceRange<'_>>,
         route_weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
         let Some(cuda) = self
@@ -162,7 +166,15 @@ impl GgufTextWeights {
         let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
             return Ok(None);
         };
-        cuda.prefill_device_experts(&mut source, layer, routes, dtypes, caps, route_weight)
+        cuda.prefill_device_experts(
+            &mut source,
+            layer,
+            routes,
+            dtypes,
+            caps,
+            retained,
+            route_weight,
+        )
     }
 
     pub(in crate::family::inkling2) fn prefill_bank_report(

@@ -100,6 +100,31 @@ pub(super) struct DenseStep {
     q8_activations: bool,
 }
 
+fn router_stage_bytes(
+    rows: usize,
+    hidden: usize,
+    tile_rows: usize,
+    available: usize,
+) -> Option<usize> {
+    let bytes = rows.checked_mul(hidden)?.checked_mul(size_of::<f32>())?;
+    (rows >= 2 && tile_rows >= 2 && bytes > 0 && bytes <= available).then_some(bytes)
+}
+
+#[test]
+fn router_stage_admits_complete_prompt_before_first_tile() {
+    let bytes = 511 * 2304 * 4;
+    for tile in [2, 32, 511, 512] {
+        assert_eq!(
+            router_stage_bytes(511, 2304, tile, 2 * 2304 * 2304),
+            Some(bytes)
+        );
+        assert_eq!(router_stage_bytes(511, 2304, tile, bytes - 1), None);
+    }
+    assert_eq!(router_stage_bytes(511, 2304, 1, bytes), None);
+    assert_eq!(router_stage_bytes(1, 2304, 8, bytes), None);
+    assert_eq!(router_stage_bytes(usize::MAX, 2, 8, usize::MAX), None);
+}
+
 impl DenseStep {
     pub(super) fn new(context: &CudaContext, plan: &DensePlan) -> Result<Self, EngError> {
         Ok(Self {
@@ -426,12 +451,13 @@ impl DenseStep {
         })
     }
 
-    pub(super) fn project_router_rows(
+    pub(super) fn project_router_rows<'a>(
         &self,
         context: &CudaContext,
         weight: &Resident,
         inputs: &[&[f32]],
-    ) -> Result<Vec<f32>, EngError> {
+        stage: Option<&'a DeviceBuffer>,
+    ) -> Result<(Vec<f32>, Option<DeviceRange<'a>>), EngError> {
         let [rows, cols] = weight.shape;
         if inputs.iter().any(|input| input.len() != cols) {
             return Err(bad("CUDA router input width differs"));
@@ -440,14 +466,30 @@ impl DenseStep {
         // The logits slot is idle while routing. Its capacity bounds both
         // matrices and the existing pinned transfer buffer.
         let capacity = (slot.bytes() / float_bytes(rows + cols)?).clamp(1, ROUTER_MAX_ROWS);
+        // Admit the complete input before submitting the first tile. Resident experts
+        // never stage weights here; each router tile writes a disjoint set of rows.
+        let retained = stage
+            .and_then(|stage| {
+                router_stage_bytes(inputs.len(), cols, capacity, stage.bytes())
+                    .map(|bytes| stage.range(0, bytes))
+            })
+            .transpose()?;
         let mut logits = Vec::with_capacity(inputs.len() * rows);
-        for tile in inputs.chunks(capacity) {
-            if let [only] = tile {
+        for (index, tile) in inputs.chunks(capacity).enumerate() {
+            if retained.is_none()
+                && let [only] = tile
+            {
                 logits.extend(self.project_router(context, weight, only)?);
                 continue;
             }
             let input_elements = tile.len() * cols;
-            let input = self.range(Slot::Output, 0, input_elements)?;
+            let input = match retained {
+                Some(batch) => batch.slice(
+                    float_bytes(index * capacity * cols)?,
+                    float_bytes(input_elements)?,
+                )?,
+                None => self.range(Slot::Output, 0, input_elements)?,
+            };
             let output = self.range(Slot::Output, input_elements, tile.len() * rows)?;
             logits.extend(
                 self.run_rows(context, &self.stream, tile, [input, output], || {
@@ -455,7 +497,7 @@ impl DenseStep {
                 })?,
             );
         }
-        Ok(logits)
+        Ok((logits, retained))
     }
 
     fn launch_router(

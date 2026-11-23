@@ -43,6 +43,16 @@ impl DeviceBuffer {
 }
 
 impl<'b> DeviceRange<'b> {
+    /// A checked slice relative to this range, not to the whole allocation.
+    pub(crate) fn slice(self, offset: usize, bytes: usize) -> Result<Self, EngError> {
+        if offset.checked_add(bytes).is_none_or(|end| end > self.bytes) {
+            return Err(EngError::BadRequest(
+                "CUDA slice exceeds its parent range".into(),
+            ));
+        }
+        self.buffer.range(self.offset + offset, bytes)
+    }
+
     pub(crate) fn offset(&self) -> usize {
         self.offset
     }

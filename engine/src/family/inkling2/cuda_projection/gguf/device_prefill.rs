@@ -47,6 +47,10 @@ struct Layout {
 
 impl Layout {
     fn new(rows: usize, shape: Geometry) -> Option<Self> {
+        Self::for_input(rows, shape, false)
+    }
+
+    fn for_input(rows: usize, shape: Geometry, retained: bool) -> Option<Self> {
         let slots = rows.checked_mul(shape.rank)?;
         let mut offset = 0usize;
         let mut span = |width: usize, height: usize| {
@@ -55,7 +59,7 @@ impl Layout {
             Some(start..offset)
         };
         Some(Self {
-            input: span(rows, shape.hidden)?,
+            input: span(if retained { 0 } else { rows }, shape.hidden)?,
             row_ids: span(slots, 1)?,
             inverse_ids: span(slots, 1)?,
             gate_scales: span(slots, 1)?,
@@ -199,6 +203,7 @@ impl GgufCuda {
         routes: &[PrefillRoute<'_>],
         dtypes: [DenseDtype; 2],
         caps: [f32; 2],
+        retained: Option<DeviceRange<'_>>,
         weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
         let Some(workspace) = &self.device_prefill else {
@@ -231,14 +236,24 @@ impl GgufCuda {
         let Some(scratch) = workspace.fit(cuda, routes.len(), projections.geometry)? else {
             return Ok(None);
         };
+        let retained =
+            retained.filter(|input| admits_router_input(routes.len(), hidden, input.bytes()));
         let mut output = Vec::with_capacity(routes.len());
         let mut counts = [DenseGemvGroupCounts::default(); 2];
         for (window, routes) in routes.chunks(scratch.rows).enumerate() {
             let first = window * scratch.rows;
-            let plan = RoutedWindow::prepare(&projections, layer, routes, |row, id| {
-                weight(first + row, id)
-            })?;
-            let (rows, launches) = scratch.execute(cuda, &projections, &plan)?;
+            // The checked full-batch extent bounds both products and every window.
+            let input = retained
+                .map(|batch| batch.slice(first * hidden * 4, routes.len() * hidden * 4))
+                .transpose()?;
+            let plan = RoutedWindow::prepare(
+                &projections,
+                layer,
+                routes,
+                retained.is_some(),
+                |row, id| weight(first + row, id),
+            )?;
+            let (rows, launches) = scratch.execute(cuda, &projections, &plan, input)?;
             output.extend(rows);
             for (total, count) in counts.iter_mut().zip(launches) {
                 total.wmma += count.wmma;
@@ -250,6 +265,7 @@ impl GgufCuda {
                 "Inkling CUDA device expert prefill {}",
                 serde_json::json!({"layer": layer, "rows": routes.len(),
                     "windows": routes.len().div_ceil(scratch.rows),
+                    "router_input_h2d_bytes_saved": retained.map_or(0, |input| input.bytes()),
                     "wmma_gate_calls": counts[0].wmma, "wmma_down_calls": counts[1].wmma,
                     "exact_tile_gate_calls": counts[0].exact_tiles,
                     "exact_tile_down_calls": counts[1].exact_tiles})
@@ -309,6 +325,17 @@ impl GgufCuda {
     }
 }
 
+// The expert workspace is independent of the dense step arena. Consume only an
+// exact whole-batch range after the producer's synchronous logits readback.
+fn admits_router_input(rows: usize, hidden: usize, bytes: usize) -> bool {
+    rows >= 2
+        && hidden != 0
+        && rows
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            == Some(bytes)
+}
+
 struct RoutedWindow {
     upload: Vec<[u8; 4]>,
     groups: Vec<(ExpertId, Range<usize>)>,
@@ -321,10 +348,11 @@ impl RoutedWindow {
         projections: &Projections<'_>,
         layer: u32,
         routes: &[PrefillRoute<'_>],
+        retained: bool,
         weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Self, EngError> {
         let shape = projections.geometry;
-        let layout = Layout::new(routes.len(), shape)
+        let layout = Layout::for_input(routes.len(), shape, retained)
             .ok_or_else(|| bad("expert prefill arena overflows"))?;
         let mut upload = vec![[0; 4]; layout.flag.end / 4];
         for (dst, value) in upload[..layout.input.end / 4]
@@ -417,19 +445,22 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
+        retained: Option<DeviceRange<'_>>,
     ) -> Result<(Vec<Vec<f32>>, [DenseGemvGroupCounts; 2]), EngError> {
         let l = &plan.layout;
         let upload = self.buffer.range(0, l.flag.end)?;
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(&self.stream, &mut self.host, 0, upload)?;
-        let result = self.enqueue(cuda, projections, plan).and_then(|counts| {
-            // The status word and reduced rows are contiguous; stage them in one copy.
-            let readback = self
-                .buffer
-                .range(l.flag.start, l.output.end - l.flag.start)?;
-            cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)?;
-            Ok(counts)
-        });
+        let result = self
+            .enqueue(cuda, projections, plan, retained)
+            .and_then(|counts| {
+                // The status word and reduced rows are contiguous; stage them in one copy.
+                let readback = self
+                    .buffer
+                    .range(l.flag.start, l.output.end - l.flag.start)?;
+                cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)?;
+                Ok(counts)
+            });
         // A launch can be refused after the upload has been queued.
         let waited = self.host.synchronize(&self.stream);
         let counts = result?;
@@ -455,6 +486,7 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
+        retained: Option<DeviceRange<'_>>,
     ) -> Result<[DenseGemvGroupCounts; 2], EngError> {
         let l = &plan.layout;
         let shape = projections.geometry;
@@ -464,7 +496,10 @@ impl Scratch {
         cuda.row_gather(
             &self.stream,
             RowGatherCall {
-                x: range(&l.input)?,
+                x: match retained {
+                    Some(input) => input,
+                    None => range(&l.input)?,
+                },
                 indices: range(&l.row_ids)?,
                 out: range(&l.gathered)?,
                 flag,
@@ -552,6 +587,27 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_router_rows_remove_only_input_from_expert_upload() {
+        let shape = Geometry {
+            hidden: 2304,
+            middle: 512,
+            rank: 8,
+        };
+        for rows in [2, 8, 31, 512] {
+            let original = Layout::new(rows, shape).unwrap();
+            let retained = Layout::for_input(rows, shape, true).unwrap();
+            let saved = rows * shape.hidden * size_of::<f32>();
+            assert!(admits_router_input(rows, shape.hidden, saved));
+            assert!(!admits_router_input(rows, shape.hidden, saved - 1));
+            assert!(retained.input.is_empty());
+            assert_eq!(retained.row_ids.start, 0);
+            assert_eq!(retained.flag.end + saved, original.flag.end);
+            assert_eq!(retained.down.end + saved, original.down.end);
+        }
+        assert!(!admits_router_input(usize::MAX, 2, 0));
+    }
 
     #[test]
     fn device_prompt_arena_fits_width_by_workspace_and_launch_bounds() {
