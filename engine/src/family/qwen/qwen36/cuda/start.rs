@@ -1571,11 +1571,12 @@ struct InitialCache {
     bank_credit: u64,
 }
 
-/// On-demand KV is the default of a pooled start; `Q36_TIERED_KV_ON_DEMAND=0` keeps the full
-/// ceiling funded at start. Token ids are identical either way (the 2026-11-23 check: twelve
-/// greedy runs of 256 tokens over a 4,021-token prompt, all one id sequence).
+/// On-demand KV is opt-in (`Q36_TIERED_KV_ON_DEMAND=1`); the default keeps the full ceiling
+/// funded at start. The 2026-11-23 default was withdrawn: its runs compared the flag with itself.
+/// The path needs a card-short verdict with bank credit, which `initial_cache` withholds from
+/// a 131072-cell ceiling, so it has no fidelity evidence.
 fn tiered_kv_on_demand(sessions: Option<usize>, flag: Option<&std::ffi::OsStr>) -> bool {
-    sessions.is_some() && flag != Some(std::ffi::OsStr::new("0"))
+    sessions.is_some() && flag == Some(std::ffi::OsStr::new("1"))
 }
 
 fn initial_cells(ceiling: u32) -> u32 {
@@ -2408,7 +2409,7 @@ mod initial_cache_tests {
     }
 
     #[test]
-    fn an_on_demand_pool_credits_only_bytes_not_needed_for_growth_and_is_the_default() {
+    fn an_opted_in_pool_credits_only_bytes_not_needed_for_growth() {
         let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
         let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).unwrap();
         let dims = StepDims::new(&shape, &inv).unwrap();
@@ -2436,15 +2437,10 @@ mod initial_cache_tests {
         );
 
         assert!(!tiered_kv_on_demand(session_plan(&pooled, true), flag));
-        // Off only when named: the default of a pooled start is on.
-        assert!(tiered_kv_on_demand(session_plan(&pooled, false), None));
+        assert!(!tiered_kv_on_demand(session_plan(&pooled, false), None));
         assert!(!tiered_kv_on_demand(
             session_plan(&pooled, false),
             Some(std::ffi::OsStr::new("0"))
-        ));
-        assert!(tiered_kv_on_demand(
-            session_plan(&pooled, false),
-            Some(std::ffi::OsStr::new("1"))
         ));
         // Device-first without a host quota can yield a normal plan, but start uses the plain executor.
         let disabled = tiered_kv_on_demand(session_plan(&pooled, true), flag);
