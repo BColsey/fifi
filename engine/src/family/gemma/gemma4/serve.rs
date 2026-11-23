@@ -879,11 +879,15 @@ mod device {
                     "{sessions} sessions"
                 );
             }
-            // A budget that funds two entries bounds a larger engine.
-            let two = || Some(2 * 952 * (1 << 20));
+            // A budget that funds two entries bounds a larger engine. The per-entry cost is
+            // the store's own: the full-attention positions plus one window snapshot.
+            let per_entry = largest_entry_bytes(budget::bolt_kv_bytes_per_position(), 32_768u64)
+                .saturating_add(budget::bolt_window_snapshot_bytes().unwrap_or(u64::MAX));
+            let two = || Some(2 * per_entry);
             assert_eq!(prefix_store(true, two, 8, 32_768).0.limits().entries, 2);
-            // A budget under one entry keeps the store planned, with its saves waiting on the host.
-            let busy = || Some(GIB / 2);
+            // A budget under one entry keeps the store planned, with its saves waiting on the
+            // host.
+            let busy = || Some(per_entry / 2);
             let (store, plan) = prefix_store(true, busy, 4, 32_768);
             assert_eq!(store.limits().entries, 1);
             assert!(!plan.funded && plan.on());

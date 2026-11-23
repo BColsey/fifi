@@ -2793,8 +2793,20 @@ mod tests {
         )
         .expect("plan");
         assert_eq!(cells, MAX_CELLS);
+        // The sliding layers' rings are charged once, not per session, so the pool carries the
+        // full-attention planes of many contexts. It must hold a lone session's whole context,
+        // and the planned pool itself must pass the shared admission against the same card.
+        assert!(pool >= MAX_CELLS, "{pool}");
+        let demand = bolt_demand(
+            weights,
+            Some(ATTN_SPLIT_MAX),
+            pool,
+            false,
+            Bolt::WINDOW_ROWS,
+        )
+        .expect("demand");
         assert!(
-            (MAX_CELLS..Bolt::WINDOW_ROWS * MAX_CELLS).contains(&pool),
+            crate::kernels::cuda::plan::admit(&demand, free).is_ok(),
             "{pool}"
         );
         eprintln!(
