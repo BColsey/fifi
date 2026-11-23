@@ -26,22 +26,26 @@ __device__ inline float sigmoidf_(float x) { return 1.f / (1.f + expf(-x)); }
 __device__ inline float softplus_(float x) { return fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))); }
 
 __global__ void __launch_bounds__(kUnit) mhc_route_k(
-    const float *__restrict__ logits, const float *__restrict__ a, const float *__restrict__ b,
-    float *__restrict__ input, float *__restrict__ route, int hidden, float pre_scale,
-    int iterations, int fixed_identity) {
+    const float *__restrict__ logits, const float *__restrict__ bias, const float *__restrict__ a,
+    const float *__restrict__ b, float *__restrict__ input, float *__restrict__ route, int hidden,
+    float pre_scale, int iterations, int fixed_identity) {
     const int j = blockIdx.x * kUnit + threadIdx.x;
+    float l[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        l[k] = logits[k] + (bias == NULL ? 0.f : bias[k]);
+    }
     if (j < hidden) {
-        input[j] =
-            (a[j] * sigmoidf_(logits[0]) + b[j] * sigmoidf_(logits[1])) * pre_scale;
+        input[j] = (a[j] * sigmoidf_(l[0]) + b[j] * sigmoidf_(l[1])) * pre_scale;
     }
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        route[0] = 2.f * sigmoidf_(logits[2]);
-        route[1] = 2.f * sigmoidf_(logits[3]);
+        route[0] = 2.f * sigmoidf_(l[2]);
+        route[1] = 2.f * sigmoidf_(l[3]);
         if (fixed_identity) {
             route[2] = 1.f; route[3] = 0.f; route[4] = 0.f; route[5] = 1.f;
             return;
         }
-        float m[4] = {logits[4], logits[5], logits[6], logits[7]};
+        float m[4] = {l[4], l[5], l[6], l[7]};
         for (int it = 0; it < iterations; ++it) {
             const float d01 = m[0] - m[1];
             m[0] = -softplus_(-d01);
@@ -85,8 +89,6 @@ __global__ void __launch_bounds__(kUnit) mhc_average_k(
     }
 }
 
-bool aligned_to(const void *p, size_t n) { return ((uintptr_t)p % n) == 0; }
-
 bool hidden_ok(int h) { return h >= kUnit && h % kUnit == 0 && h <= kMaxH; }
 
 }  // namespace
@@ -102,7 +104,7 @@ extern "C" int inference_cuda_mhc_route_launch(const inference_cuda_mhc_route_ar
         }
         const dim3 grid((in->hidden + kUnit - 1) / kUnit);
         mhc_route_k<<<grid, kUnit, 0, (cudaStream_t)stream>>>(
-            in->logits, in->a, in->b, in->input, in->route, in->hidden, in->pre_scale,
+            in->logits, in->bias, in->a, in->b, in->input, in->route, in->hidden, in->pre_scale,
             in->iterations, in->fixed_identity);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

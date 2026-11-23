@@ -66,6 +66,8 @@ pub(crate) struct MhcRouteCall<'b> {
     pub(crate) iterations: usize,
     pub(crate) fixed_identity: bool,
     pub(crate) logits: DeviceRange<'b>,
+    /// The router bias (8 f32), added to the logits before every use.
+    pub(crate) bias: Option<DeviceRange<'b>>,
     pub(crate) a: DeviceRange<'b>,
     pub(crate) b: DeviceRange<'b>,
     pub(crate) input: DeviceRange<'b>,
@@ -107,11 +109,15 @@ impl CudaContext {
         let logit_bytes = bytes("logits", LOGIT_FLOATS)?;
         let route_bytes = bytes("route cell", ROUTE_FLOATS)?;
         fit("logits", &call.logits, logit_bytes)?;
+        if let Some(bias) = &call.bias {
+            fit("bias", bias, logit_bytes)?;
+        }
         fit("a", &call.a, row)?;
         fit("b", &call.b, row)?;
         fit("input", &call.input, row)?;
         fit("route", &call.route, route_bytes)?;
         let logits = self.raw_range(&call.logits)?;
+        let bias = call.bias.as_ref().map(|r| self.raw_range(r)).transpose()?;
         let a = self.raw_range(&call.a)?;
         let b = self.raw_range(&call.b)?;
         let input = self.raw_range(&call.input)?;
@@ -121,6 +127,7 @@ impl CudaContext {
                 raw,
                 MhcRouteRaw {
                     logits,
+                    bias,
                     a,
                     b,
                     input,

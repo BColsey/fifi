@@ -19,6 +19,7 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 #[repr(C)]
 struct MhcRouteArgsRaw {
     logits: *const c_void,
+    bias: *const c_void,
     a: *const c_void,
     b: *const c_void,
     input: *mut c_void,
@@ -69,6 +70,7 @@ unsafe extern "C" {
 
 pub(in crate::kernels::cuda) struct MhcRouteRaw<'a> {
     pub(in crate::kernels::cuda) logits: RawRange<'a>,
+    pub(in crate::kernels::cuda) bias: Option<RawRange<'a>>,
     pub(in crate::kernels::cuda) a: RawRange<'a>,
     pub(in crate::kernels::cuda) b: RawRange<'a>,
     pub(in crate::kernels::cuda) input: RawRange<'a>,
@@ -113,6 +115,13 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
     let logits = 8 * F32;
     let route_bytes = ROUTE_FLOATS * F32;
     let logits_ok = io.logits.bytes >= logits && io.logits.offset.is_multiple_of(4);
+    let mut reads = vec![Span::of(&io.logits, logits)];
+    if let Some(bias) = &io.bias {
+        if bias.bytes < logits || !bias.offset.is_multiple_of(4) {
+            return Err(invalid_argument());
+        }
+        reads.push(Span::of(bias, logits));
+    }
     let a_ok = io.a.bytes >= row_bytes && io.a.offset.is_multiple_of(4);
     let b_ok = io.b.bytes >= row_bytes && io.b.offset.is_multiple_of(4);
     let written = [
@@ -128,7 +137,7 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
         ),
     ];
     let apart = written.iter().all(|w| {
-        Span::of(&io.logits, logits).apart(&w.2)
+        reads.iter().all(|read| read.apart(&w.2))
             && Span::of(&io.a, row_bytes).apart(&w.2)
             && Span::of(&io.b, row_bytes).apart(&w.2)
     }) && written[0].2.apart(&written[1].2);
@@ -138,6 +147,10 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
     }
     let args = MhcRouteArgsRaw {
         logits: io.logits.address().cast_const(),
+        bias: io
+            .bias
+            .as_ref()
+            .map_or(std::ptr::null(), |bias| bias.address().cast_const()),
         a: io.a.address().cast_const(),
         b: io.b.address().cast_const(),
         input: io.input.address(),

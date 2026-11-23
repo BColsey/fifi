@@ -29,9 +29,11 @@ extern "C" {
  *              m[j] = -softplus(m[i]-m[j]) with the ORIGINAL difference.
  * a and b are [hidden] f32, input is [hidden] f32, logits are 8 f32, route is 6 f32 written:
  * post at 0..2 and mix at 2..6. hidden is a positive multiple of 256 (grid math) and at most
- * 2^20. Returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch for a bad argument. */
+ * 2^20. bias is NULL or 8 f32 added to the logits once, before any sigmoid or Sinkhorn step.
+ * Returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch for a bad argument. */
 typedef struct inference_cuda_mhc_route_args {
     const float *logits;
+    const float *bias; /* NULL, or 8 f32 added to the logits before every use */
     const float *a;
     const float *b;
     float *input;
