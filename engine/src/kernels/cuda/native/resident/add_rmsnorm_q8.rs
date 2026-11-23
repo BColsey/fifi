@@ -235,7 +235,7 @@ mod tests {
             ("NULL norm_out", |a| a.norm_out = 0),
             ("NULL q8", |a| a.q8 = 0),
             ("NULL stream", |a| a.stream = 0),
-            ("n below one unit", |a| a.n = 128),
+            ("n below one unit", |a| a.n = 16),
             ("n off the 32 grid", |a| a.n = 2048 + 16),
             ("n above the width bound", |a| a.n = 32_768 + 256),
             ("eps zero", |a| a.eps = 0.0),
@@ -355,7 +355,7 @@ mod tests {
             // refuses one), and with a need of 0 every fit passes on the VALID bytes, so only
             // the width bound refuses.
             ("n zero", |l| l.n = 0),
-            ("n below one unit", |l| resized(l, 128)),
+            ("n below one unit", |l| resized(l, 16)),
             ("n above the width bound", |l| resized(l, 32_768 + 256)),
             ("n off the 32 grid", |l| resized(l, N + 16)),
             ("q8 over h", |l| l.q8.0 = 4_096),
