@@ -204,7 +204,7 @@ fn r5_format_token() {
     let mut step = QwenResidentStep::new(context, &res, &device, &options, rules).expect("step");
     if let Some((plan, _)) = &tiered {
         let source = (gguf.weights.header(), std::path::Path::new(&path));
-        attach_tiered_parts(&mut step, context, (source, &res.dims), plan, 1)
+        attach_tiered_parts(&mut step, context, (source, &res.dims), plan, (1, 0))
             .expect("attach tiered");
     }
 

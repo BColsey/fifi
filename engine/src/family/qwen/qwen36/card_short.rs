@@ -40,8 +40,7 @@ pub(crate) struct CardFigures {
     /// the planned tensors plus the free-after-load floor the start refuses below. The cache,
     /// the work and the headroom come after that check, so it bounds the weights alone.
     pub(crate) after_load_floor: u64,
-    /// Bytes of the cache the start builds at its ceiling and gives back before it serves: the
-    /// banks take them (zero when the executor keeps the whole cache).
+    /// Cache bytes the banks can use after leaving room for the initial allocation and growth.
     pub(crate) kv_credit: u64,
     /// Device bytes of one session's part (KV planes, DeltaNet and convolution state) at its
     /// initial cells: what each session after the first keeps on the card beside the banks.
@@ -67,9 +66,17 @@ impl CardFigures {
     /// second is short, and the lower rung is taken before any weight is uploaded rather than a
     /// refusal after it.
     pub(crate) fn needed(&self) -> Option<u64> {
-        let planned = [self.kv_cache, self.work, self.headroom]
-            .into_iter()
-            .try_fold(self.tensors, u64::checked_add)?;
+        self.needed_with_credit(0)
+    }
+
+    fn needed_with_credit(&self, credit: u64) -> Option<u64> {
+        let planned = [
+            self.kv_cache.saturating_sub(credit),
+            self.work,
+            self.headroom,
+        ]
+        .into_iter()
+        .try_fold(self.tensors, u64::checked_add)?;
         let after_load = self.tensors.checked_add(self.after_load_floor)?;
         Some(planned.max(after_load))
     }
@@ -180,7 +187,11 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
                     .tiered_headroom
                     .saturating_sub(figures.headroom)
                     .saturating_add(reserve),
-                kv_credit: figures.kv_credit,
+                kv_credit: needed.saturating_sub(
+                    figures
+                        .needed_with_credit(figures.kv_credit)
+                        .unwrap_or(needed),
+                ),
             }),
         })
     };
@@ -611,6 +622,11 @@ mod tests {
             "{gained} slots for {credit} bytes"
         );
         assert!(gained >= 8, "{gained}");
+        let floor = CardFigures {
+            after_load_floor: 8 * GIB,
+            ..figures(0)
+        };
+        assert_eq!(floor.needed_with_credit(credit), floor.needed());
         // The card is still short by the whole cache: the credit moves slots, not the verdict.
         assert!(matches!(
             decide(

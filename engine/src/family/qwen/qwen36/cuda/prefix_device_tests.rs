@@ -972,7 +972,7 @@ fn tiered_phase() -> Result<Turn, EngError> {
         projector.context(),
         ((model.weights.header(), gguf.as_path()), &res.dims),
         &plan,
-        1,
+        (1, 0),
     )?;
     let mut session = DecodeSession::default();
     let prompt = head(&p5_ids()?, 45)?.to_vec();

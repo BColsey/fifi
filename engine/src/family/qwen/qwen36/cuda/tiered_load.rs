@@ -313,17 +313,22 @@ pub(super) fn attach_tiered_parts(
     ctx: &CudaContext,
     (source, dims): ((&GgufHeader, &Path), &StepDims),
     plan: &TieredPlan,
-    sessions: usize,
+    (sessions, growth_reserve): (usize, u64),
 ) -> Result<usize, EngError> {
     let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
     // The banks leave the loader's headroom and the parts of the sessions beside them, by the
     // same rule the card-short planner used to size the slots.
     let sessions_reserve = super::super::card_short::tiered_session_reserve(
-        step.seq_bytes_at(crate::family::cell_pool::INITIAL_CELLS),
+        step.seq_bytes_at(
+            step.seq_cells()
+                .min(crate::family::cell_pool::INITIAL_CELLS),
+        ),
         sessions,
     )
     .ok_or_else(|| EngError::MemoryPlan("tiered: the sessions' reserve overflows".into()))?;
-    let reserve = ADMISSION_RESERVE.saturating_add(sessions_reserve);
+    let reserve = ADMISSION_RESERVE
+        .saturating_add(sessions_reserve)
+        .saturating_add(growth_reserve);
     let layers = dims.shape.kinds.len();
     let quants = expert_quant(source.0, dims)?;
     let geometry = planning_geometry(dims, &quants)?;

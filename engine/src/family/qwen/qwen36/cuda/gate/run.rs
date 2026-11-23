@@ -526,7 +526,7 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
             projector.context(),
             (source, &res.dims),
             &plan,
-            1,
+            (1, 0),
         )?;
     }
     run_all(&mut step, s, mode, identities)

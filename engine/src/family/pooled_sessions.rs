@@ -183,6 +183,8 @@ impl<E: PartHost> PooledSessions<E> {
             step.check_sessions()?;
         }
         let ceiling = step.ceiling_cells();
+        let initial = INITIAL_CELLS.min(ceiling);
+        let max_seqs = max_seqs.min(ceiling / initial.max(1));
         let pool = CellPool::new(ceiling);
         if single {
             // The step's own planes are the session's; the lease still follows the tokens it
@@ -219,7 +221,6 @@ impl<E: PartHost> PooledSessions<E> {
                 },
             ));
         }
-        let initial = INITIAL_CELLS.min(ceiling);
         let small = step.part_bytes_at(initial);
         let lease = pool.lease_for(initial, ceiling)?;
         let mut first = step.new_part(initial)?;
@@ -512,10 +513,11 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
             return self.resident.is_none() || self.orphaned();
         }
         // A dropped session's cells come back at the next admission.
-        if self.pool.free() < INITIAL_CELLS && !self.orphaned() {
+        let initial = INITIAL_CELLS.min(self.ceiling);
+        if self.pool.free() < initial && !self.orphaned() {
             return false;
         }
-        let per_session = self.step.part_bytes_at(INITIAL_CELLS);
+        let per_session = self.step.part_bytes_at(initial);
         self.free_device_bytes()
             .is_none_or(|free| free >= per_session.saturating_mul(2))
     }
