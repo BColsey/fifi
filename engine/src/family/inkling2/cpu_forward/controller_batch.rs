@@ -361,7 +361,9 @@ impl CpuForward {
         for (row, projections) in prepared.into_iter().zip(projections) {
             let mut inputs = AttentionInputs::default();
             for (index, (prepared, projection)) in row.into_iter().zip(projections).enumerate() {
-                let PreparedInput { mut input, control } = prepared;
+                let PreparedInput {
+                    mut input, control, ..
+                } = prepared;
                 let ControlInput { gate, message } = control;
                 let projection = match projection {
                     Some(projection) => projection,
