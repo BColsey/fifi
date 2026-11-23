@@ -79,6 +79,18 @@ pub(crate) struct DenseGemvGroupCounts {
     pub(crate) wmma: usize,
     pub(crate) exact_tiles: usize,
     pub(crate) q8_row_pairs: usize,
+    pub(crate) q6_row_pairs: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AttentionRowReuse {
+    pub(crate) q8: bool,
+    pub(crate) q6: bool,
+}
+
+fn q6_row_reuse(shape: DenseGemvShape, dtype: DenseDtype) -> bool {
+    dtype == DenseDtype::PackedGguf(GgufType::Q6K)
+        && matches!((shape.rows, shape.cols, shape.m), (3072, 2304, 8 | 63 | 64))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +99,7 @@ enum GroupKernel {
     Wmma,
     ExactTile,
     Q8RowPair,
+    Q6RowPair,
 }
 
 fn group_kernel(
@@ -160,18 +173,18 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
     ) -> Result<(), EngError> {
-        self.dense_gemv_group_impl(stream, calls, None, false, false)
+        self.dense_gemv_group_impl(stream, calls, None, false, AttentionRowReuse::default())
             .map(|_| ())
     }
 
-    /// Opts dense attention projections into SM75 Q8_0 row pairing; returns paired enqueues.
-    pub(crate) fn dense_gemv_group_with_q8_row_reuse(
+    /// Opts measured dense attention shapes into SM75 packed weight reuse.
+    pub(crate) fn dense_gemv_group_with_attention_reuse(
         &self,
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
-    ) -> Result<usize, EngError> {
-        self.dense_gemv_group_impl(stream, calls, None, false, true)
-            .map(|counts| counts.q8_row_pairs)
+        reuse: AttentionRowReuse,
+    ) -> Result<DenseGemvGroupCounts, EngError> {
+        self.dense_gemv_group_impl(stream, calls, None, false, reuse)
     }
 
     /// Selects Q8_0 row reuse for one attention projection; returns 0, 2, or 4.
@@ -202,7 +215,13 @@ impl CudaContext {
         min_wmma_rows: Option<usize>,
         exact_tile: bool,
     ) -> Result<DenseGemvGroupCounts, EngError> {
-        self.dense_gemv_group_impl(stream, calls, min_wmma_rows, exact_tile, false)
+        self.dense_gemv_group_impl(
+            stream,
+            calls,
+            min_wmma_rows,
+            exact_tile,
+            AttentionRowReuse::default(),
+        )
     }
 
     fn dense_gemv_group_impl(
@@ -211,23 +230,22 @@ impl CudaContext {
         calls: &[DenseGemvCall<'_>],
         min_wmma_rows: Option<usize>,
         exact_tile: bool,
-        q8_row_reuse: bool,
+        reuse: AttentionRowReuse,
     ) -> Result<DenseGemvGroupCounts, EngError> {
         self.check_launch_stream(stream)?;
         let min_wmma_rows = match min_wmma_rows {
             Some(rows) if self.mmq_device_facts()?.cc >= 700 => Some(rows),
             _ => None,
         };
+        let q6 = reuse.q6 && self.mmq_device_facts()?.cc == 750;
         let planned = calls
             .iter()
             .map(|call| {
-                let (kernel, need) = group_kernel(
-                    call.shape,
-                    call.dtype,
-                    min_wmma_rows,
-                    exact_tile,
-                    q8_row_reuse,
-                )?;
+                let (mut kernel, need) =
+                    group_kernel(call.shape, call.dtype, min_wmma_rows, exact_tile, reuse.q8)?;
+                if q6 && kernel == GroupKernel::Gemv && q6_row_reuse(call.shape, call.dtype) {
+                    kernel = GroupKernel::Q6RowPair;
+                }
                 self.plan_dense_projection(call, need)
                     .map(|raw| (kernel, raw))
             })
@@ -245,9 +263,13 @@ impl CudaContext {
                         gguf_wmma_launch(raw_stream, call)?;
                         counts.wmma += 1;
                     }
-                    GroupKernel::ExactTile => {
-                        counts.exact_tiles +=
-                            usize::from(gguf_exact_expert_tile_launch(raw_stream, call)?);
+                    GroupKernel::ExactTile | GroupKernel::Q6RowPair => {
+                        let count = if kernel == GroupKernel::ExactTile {
+                            &mut counts.exact_tiles
+                        } else {
+                            &mut counts.q6_row_pairs
+                        };
+                        *count += usize::from(gguf_exact_expert_tile_launch(raw_stream, call)?);
                     }
                 }
             }
@@ -293,6 +315,20 @@ mod tests;
 #[cfg(test)]
 mod group_tests {
     use super::*;
+
+    #[test]
+    fn q6_pair_admits_only_measured_projection_tiles() {
+        let q6 = DenseDtype::PackedGguf(GgufType::Q6K);
+        for m in [8, 63, 64] {
+            assert!(q6_row_reuse(DenseGemvShape::packed(m, 3072, 2304), q6));
+        }
+        for m in [1, 7, 9, 62, 65] {
+            assert!(!q6_row_reuse(DenseGemvShape::packed(m, 3072, 2304), q6));
+        }
+        let q8 = DenseDtype::PackedGguf(GgufType::Q80);
+        assert!(!q6_row_reuse(DenseGemvShape::packed(8, 3072, 2304), q8));
+        assert!(!q6_row_reuse(DenseGemvShape::packed(8, 2304, 3072), q6));
+    }
 
     #[test]
     fn exact_expert_tile_only_replaces_ordinary_eligible_gemv() {

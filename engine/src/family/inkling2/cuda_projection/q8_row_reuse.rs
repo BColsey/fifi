@@ -6,7 +6,7 @@ use crate::{
     EngError,
     kernels::cuda::{
         CudaContext, DeviceStream,
-        resident::dense_gemv::{DenseDtype, DenseGemvCall},
+        resident::dense_gemv::{AttentionRowReuse, DenseDtype, DenseGemvCall},
     },
     weights::GgufType,
 };
@@ -27,15 +27,33 @@ pub(super) fn project_group(
     calls: &[DenseGemvCall<'_>],
     stage: &str,
 ) -> Result<(), EngError> {
-    let (reuse, report) = flags();
-    let paired = if reuse {
-        context.dense_gemv_group_with_q8_row_reuse(stream, calls)?
+    static Q6: OnceLock<bool> = OnceLock::new();
+    let q6 = *Q6.get_or_init(|| {
+        std::env::var("FIFI_INKLING_CUDA_PREFILL_Q6_ROW_REUSE").as_deref() == Ok("1")
+    });
+    let (q8, report) = flags();
+    let counts = if q8 || q6 {
+        context.dense_gemv_group_with_attention_reuse(
+            stream,
+            calls,
+            AttentionRowReuse { q8, q6 },
+        )?
     } else {
         context.dense_gemv_group(stream, calls)?;
-        0
+        Default::default()
     };
+    if counts.q6_row_pairs != 0 {
+        static USED: std::sync::Once = std::sync::Once::new();
+        USED.call_once(|| eprintln!("Inkling CUDA used exact Q6_K attention row pairs"));
+        if report {
+            eprintln!(
+                "Inkling CUDA Q6 prefill {stage} rows {} pairs {}",
+                calls[0].shape.m, counts.q6_row_pairs
+            );
+        }
+    }
     if report {
-        report_counts(calls, stage, paired);
+        report_counts(calls, stage, counts.q8_row_pairs);
     }
     Ok(())
 }

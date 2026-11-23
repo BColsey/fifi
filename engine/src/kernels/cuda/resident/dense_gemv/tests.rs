@@ -431,6 +431,61 @@ fn a_projection_group_validates_before_writing_and_orders_dependencies() {
 }
 
 #[test]
+fn q6_attention_row_pairs_preserve_reference_bits_and_padding() {
+    if !testkit::device_present("Q6_K attention row pairs") {
+        return;
+    }
+    let rig = Rig::new();
+    let sm75 = rig.ctx.mmq_device_facts().unwrap().cc == 750;
+    let dtype = DenseDtype::PackedGguf(crate::weights::GgufType::Q6K);
+    let w = (0..3072 * 9)
+        .flat_map(|block| {
+            let mut raw = std::array::from_fn::<_, 210, _>(|i| ((block * 13 + i * 37) % 251) as u8);
+            raw[208..].copy_from_slice(&half::f16::from_f32(0.00025).to_bits().to_le_bytes());
+            raw
+        })
+        .collect::<Vec<_>>();
+    let weights = Padded::new(&rig.ctx, &w, 0);
+    for m in [1, 8, 63, 64] {
+        let shape = DenseGemvShape {
+            ld_x: 2311,
+            ld_y: 3077,
+            ..DenseGemvShape::packed(m, 3072, 2304)
+        };
+        let input = (0..m * shape.ld_x)
+            .map(|i| ((i * 109 % 1009) as f32 - 504.0) / 513.0)
+            .collect::<Vec<_>>();
+        let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+        let y = Padded::new(&rig.ctx, &sentinel(m * shape.ld_y * 4), 0);
+        let ordinary = Padded::new(&rig.ctx, &sentinel(m * shape.ld_y * 4), 0);
+        let call = |y| DenseGemvCall {
+            shape,
+            dtype,
+            w: weights.all(),
+            x: x.all(),
+            y,
+        };
+        rig.ctx
+            .dense_gemv(&rig.stream, call(ordinary.all()))
+            .unwrap();
+        let reuse = super::AttentionRowReuse {
+            q8: false,
+            q6: true,
+        };
+        let counts = rig
+            .ctx
+            .dense_gemv_group_with_attention_reuse(&rig.stream, &[call(y.all())], reuse)
+            .unwrap();
+        assert_eq!(counts.q6_row_pairs, usize::from(sm75 && m > 1));
+        rig.stream.synchronize().unwrap();
+        assert!(
+            y.read(&rig.ctx, "paired y") == ordinary.read(&rig.ctx, "ordinary y"),
+            "m={m}"
+        );
+    }
+}
+
+#[test]
 fn bad_arguments_are_refused_before_any_launch() {
     if !testkit::device_present("bad_arguments_are_refused_before_any_launch") {
         return;

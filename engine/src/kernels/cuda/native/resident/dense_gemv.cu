@@ -175,7 +175,7 @@ __global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a, Index index) 
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
 }
 
-// One expert matrix per call. Each warp owns the same weight row and lane
+// One shared matrix per call. Each warp owns the same weight row and lane
 // columns as gguf_packed_gemv, but reuses each decoded weight in Tile separate
 // F32 accumulators. Do not transpose the lane mapping or split K: the exact
 // packed-GEMV lane FMA sequence and XOR butterfly are the reference.
@@ -223,6 +223,10 @@ constexpr int kInklingGateWidth = 2304;
 
 // Called only after the ordinary GEMV operand and shape checks.
 constexpr int exact_expert_tile(int type, int m, int rows, int cols) {
+    if (type == 14) {
+        // Inkling attention projections at the measured narrow and wide tile shapes.
+        return rows == 3072 && cols == 2304 && (m == 8 || m == 63 || m == 64) ? 2 : 0;
+    }
     if (m < 2 || m > 512 || rows > kInklingGateWidth || cols > kInklingGateWidth ||
         (type != 16 && type != 42)) return 0;
     // At most 18 KiB of activation staging per CTA.
@@ -238,6 +242,12 @@ static_assert(exact_expert_tile(16, 1, 2304, 2304) == 0 &&
               exact_expert_tile(16, 2, 2305, 2304) == 0 &&
               exact_expert_tile(16, 2, 2304, 2560) == 0 &&
               exact_expert_tile(8, 2, 2304, 2304) == 0);
+static_assert(exact_expert_tile(14, 8, 3072, 2304) == 2 &&
+              exact_expert_tile(14, 63, 3072, 2304) == 2 &&
+              exact_expert_tile(14, 64, 3072, 2304) == 2 &&
+              exact_expert_tile(14, 1, 3072, 2304) == 0 &&
+              exact_expert_tile(14, 8, 3072, 2560) == 0 &&
+              exact_expert_tile(14, 64, 2304, 2304) == 0);
 
 // One lane owns each eight-value IQ2 group. Transpose each activation block
 // once per CTA so the eight inner FMA steps read shared memory without bank
@@ -849,7 +859,9 @@ extern "C" int inference_cuda_gguf_exact_expert_tile_launch(
         const dim3 grid((a.rows + kWarps - 1) / kWarps, (a.m + tile - 1) / tile);
         const size_t shared = size_t(tile) * a.cols * sizeof(float);
         const auto s = (cudaStream_t)stream;
-        if (type == 16) {
+        if (type == 14) {
+            gguf_exact_expert_tile<14, 256, 210, 2><<<grid, kWarps * 32, shared, s>>>(a);
+        } else if (type == 16) {
             gguf_exact_expert_tile<16, 256, 66, 2><<<grid, kWarps * 32, shared, s>>>(a);
         } else if (tile == 4) {
             gguf_exact_expert_tile<42, 64, 18, 4><<<grid, kWarps * 32, shared, s>>>(a);
