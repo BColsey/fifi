@@ -103,6 +103,7 @@ pub(crate) mod matvec_expert;
 mod matvec_gguf;
 pub(crate) mod matvec_native;
 pub(crate) mod matvec_q;
+pub(crate) mod mhc_route;
 pub(crate) mod moe_combine;
 pub(crate) mod multi_row;
 pub(crate) mod pack_rows;
