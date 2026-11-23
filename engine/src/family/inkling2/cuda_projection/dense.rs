@@ -125,6 +125,50 @@ fn router_stage_admits_complete_prompt_before_first_tile() {
     assert_eq!(router_stage_bytes(usize::MAX, 2, 8, usize::MAX), None);
 }
 
+#[test]
+fn resident_router_returns_exact_logits_without_host_activation_rows() {
+    use crate::kernels::cuda::device_present;
+    if !device_present("Inkling device-input router") {
+        return;
+    }
+    let context = CudaContext::new().unwrap();
+    let step = DenseStep::new(&context, &DensePlan::new([128, 64], 32, 1).unwrap()).unwrap();
+    let upload = |xs: &[f32]| {
+        let bytes: Vec<_> = xs.iter().flat_map(|x| x.to_ne_bytes()).collect();
+        super::upload_tensor(&context, &bytes).unwrap()
+    };
+    let kernel: Vec<_> = (0..8 * 32).map(|i| (i as f32 * 0.73).sin()).collect();
+    let weight = Resident {
+        codes: upload(&kernel),
+        shape: [8, 32],
+    };
+    let input: Vec<_> = (0..10 * 32).map(|i| (i as f32 * 0.27).cos()).collect();
+    let host: Vec<_> = input.chunks_exact(32).collect();
+    assert_eq!(step.router_tile_capacity(&weight).unwrap(), 3);
+    let (expected, _) = step
+        .project_router_rows(&context, &weight, &host, None)
+        .unwrap();
+    let source = upload(&input);
+    assert!(
+        step.project_resident_router_rows(
+            &context,
+            &weight,
+            source.range(0, source.bytes() - 4).unwrap()
+        )
+        .is_err()
+    );
+    let actual = step
+        .project_resident_router_rows(&context, &weight, source.range(0, source.bytes()).unwrap())
+        .unwrap();
+    assert_eq!(actual.len(), 80);
+    assert!(
+        actual
+            .iter()
+            .map(|x| x.to_bits())
+            .eq(expected.iter().map(|x| x.to_bits()))
+    );
+}
+
 impl DenseStep {
     pub(super) fn new(context: &CudaContext, plan: &DensePlan) -> Result<Self, EngError> {
         Ok(Self {
@@ -462,10 +506,7 @@ impl DenseStep {
         if inputs.iter().any(|input| input.len() != cols) {
             return Err(bad("CUDA router input width differs"));
         }
-        let slot = self.arena.tensor(Slot::Output as usize)?;
-        // The logits slot is idle while routing. Its capacity bounds both
-        // matrices and the existing pinned transfer buffer.
-        let capacity = (slot.bytes() / float_bytes(rows + cols)?).clamp(1, ROUTER_MAX_ROWS);
+        let capacity = self.router_tile_capacity(weight)?;
         // Admit the complete input before submitting the first tile. Resident experts
         // never stage weights here; each router tile writes a disjoint set of rows.
         let retained = stage
@@ -498,6 +539,51 @@ impl DenseStep {
             );
         }
         Ok((logits, retained))
+    }
+
+    /// Score packed FP32 rows already produced by a device stage. The producer
+    /// must have completed before this call; only scores cross back to the host.
+    #[allow(dead_code, reason = "the resident prefill visit is staged separately")]
+    pub(super) fn project_resident_router_rows(
+        &self,
+        context: &CudaContext,
+        weight: &Resident,
+        inputs: DeviceRange<'_>,
+    ) -> Result<Vec<f32>, EngError> {
+        let [experts, hidden] = weight.shape;
+        let stride = float_bytes(hidden)?;
+        if stride == 0 || !inputs.bytes().is_multiple_of(stride) {
+            return Err(bad("CUDA resident router input width differs"));
+        }
+        let rows = inputs.bytes() / stride;
+        let capacity = self.router_tile_capacity(weight)?;
+        let elements = rows
+            .checked_mul(experts)
+            .ok_or_else(|| bad("CUDA resident router output overflows"))?;
+        let mut logits = Vec::with_capacity(elements);
+        let mut transfer = self.transfer.borrow_mut();
+        for first in (0..rows).step_by(capacity) {
+            let count = (rows - first).min(capacity);
+            let input = inputs.slice(first * stride, count * stride)?;
+            let output = self.range(Slot::Output, 0, count * experts)?;
+            let queued = self
+                .launch_router(context, weight, count, [input, output])
+                .and_then(|()| context.copy_to_pinned(&self.stream, output, &mut transfer, 0));
+            transfer.synchronize_after_enqueue(&self.stream, queued)?;
+            logits.extend(read_projection_rows(&transfer, output.bytes())?);
+        }
+        Ok(logits)
+    }
+
+    fn router_tile_capacity(&self, weight: &Resident) -> Result<usize, EngError> {
+        let [experts, hidden] = weight.shape;
+        let words = experts
+            .checked_add(hidden)
+            .filter(|_| experts > 0 && hidden > 0)
+            .ok_or_else(|| bad("invalid CUDA router shape"))?;
+        let slot = self.arena.tensor(Slot::Output as usize)?;
+        // Keep tile boundaries identical for host and device input paths.
+        Ok((slot.bytes() / float_bytes(words)?).clamp(1, ROUTER_MAX_ROWS))
     }
 
     fn launch_router(
@@ -724,13 +810,7 @@ impl DenseStep {
         result?;
         waited?;
 
-        let mut bytes = vec![[0; size_of::<f32>()]; output.bytes() / size_of::<f32>()];
-        transfer.read(0, bytes.as_flattened_mut())?;
-        let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
-        if !values.iter().all(|value| value.is_finite()) {
-            return Err(bad("CUDA projection produced a nonfinite output"));
-        }
-        Ok(values)
+        read_projection_rows(&transfer, output.bytes())
     }
 
     fn range(&self, slot: Slot, skip: usize, len: usize) -> Result<DeviceRange<'_>, EngError> {
@@ -742,6 +822,15 @@ impl DenseStep {
         }
         slot.buffer().range(slot.offset() + skip, bytes)
     }
+}
+
+fn read_projection_rows(transfer: &PinnedBuf, bytes: usize) -> Result<Vec<f32>, EngError> {
+    let mut values = vec![0.0; bytes / size_of::<f32>()];
+    transfer.read_f32(0, &mut values)?;
+    if !values.iter().all(|value| value.is_finite()) {
+        return Err(bad("CUDA projection produced a nonfinite output"));
+    }
+    Ok(values)
 }
 
 fn split_projections<const N: usize>(
