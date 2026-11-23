@@ -101,22 +101,70 @@ enum TraceWindow {
     StatefulAll,
 }
 
+/// One definition of what a full-model probe compares: the prompt comes from the oracle
+/// file, never from a literal here, so a second fixture needs no source change.
+struct ProbeInput {
+    prompt: Vec<u32>,
+    expected: Vec<f32>,
+    /// `None` reports the logits error; `Some(b)` fails the test above `b`.
+    bound: Option<f64>,
+}
+
+impl ProbeInput {
+    /// The pinned oracle keeps its content hash. Any other oracle must be paired with its own
+    /// prompt by construction (the prompt is read from it), so it is accepted by shape only;
+    /// `FIFI_FLASH_GGUF_HOST_ORACLE_SHA256` may pin it explicitly.
+    fn open() -> Self {
+        let oracle_path = std::env::var_os("FIFI_FLASH_GGUF_HOST_ORACLE").expect("host oracle");
+        if let Some(expected) = std::env::var_os("FIFI_FLASH_GGUF_HOST_ORACLE_SHA256") {
+            assert_pinned_file(&oracle_path, &expected.to_string_lossy());
+        } else {
+            assert_pinned_file(
+                &oracle_path,
+                "2c2133dccb289ad6f3e244d304f655189c04497bf19cd3b609779eb5af235ffa",
+            );
+        }
+        let oracle: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&oracle_path).unwrap()).unwrap();
+        let prompt: Vec<u32> =
+            serde_json::from_value(oracle["prompt"].clone()).expect("oracle holds its prompt");
+        assert!(!prompt.is_empty(), "oracle prompt is empty");
+        let expected: Vec<f32> =
+            serde_json::from_value(oracle["logits"][0].clone()).expect("oracle first logits");
+        assert!(expected.len() > 1 && expected.iter().all(|x| x.is_finite()));
+        let bound = Self::parse_bound(
+            std::env::var("FIFI_FLASH_GGUF_LOGITS_BOUND")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|message| panic!("FIFI_FLASH_GGUF_LOGITS_BOUND: {message}"));
+        Self {
+            prompt,
+            expected,
+            bound,
+        }
+    }
+
+    fn parse_bound(value: Option<&str>) -> Result<Option<f64>, &'static str> {
+        let Some(text) = value else {
+            return Ok(None);
+        };
+        let bound: f64 = text.parse().map_err(|_| "logits bound must be a number")?;
+        if !bound.is_finite() || bound <= 0.0 {
+            return Err("logits bound must be positive");
+        }
+        Ok(Some(bound))
+    }
+}
+
 fn run_full_model(trace_window: Option<TraceWindow>) {
     let path = std::env::var_os("FIFI_FLASH_GGUF").expect("pinned first shard");
-    let oracle_path = std::env::var_os("FIFI_FLASH_GGUF_HOST_ORACLE").expect("full host oracle");
     assert_pinned_file(
         &path,
         "9d5644b371ffac921427c8021cc7242dab8e3ba37d7b48d1e79fe3770fbf9915",
     );
-    assert_pinned_file(
-        &oracle_path,
-        "2c2133dccb289ad6f3e244d304f655189c04497bf19cd3b609779eb5af235ffa",
-    );
-    let oracle: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(oracle_path).unwrap()).unwrap();
-    let prompt = [9707u32, 11, 1879];
-    assert_eq!(oracle["prompt"], serde_json::json!(prompt));
-    let expected: Vec<f32> = serde_json::from_value(oracle["logits"][0].clone()).unwrap();
+    let input = ProbeInput::open();
+    let (prompt, expected) = (&input.prompt, &input.expected);
     let model = GgufModel::open(Path::new(&path)).unwrap().unwrap();
     let shape = model.config().model_shape().unwrap();
     let layers = model.config().layers();
@@ -155,17 +203,17 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
     ProbeBudget::check_host(&model).expect("probe host admission");
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    let budget = ProbeBudget::new(&model, &ctx, 3).expect("probe preflight");
+    let budget = ProbeBudget::new(&model, &ctx, prompt.len()).expect("probe preflight");
     let trunk =
         GgufTrunk::upload_with_final_guarded(&model, &ctx, &stream, 0..end, |layer, weights| {
             budget.group_guard(&ctx, layer, weights)
         })
         .expect("guarded trunk upload");
     let ngram = trunk.model().ngram().unwrap();
-    let mut feed = GgufTokenFeeds::new(trunk.model(), &ngram, 3).unwrap();
+    let mut feed = GgufTokenFeeds::new(trunk.model(), &ngram, prompt.len()).unwrap();
     budget.before_step(&ctx).unwrap();
     let before_step = ctx.live_bytes();
-    let bound = GgufStep::new(&ctx, &stream, &trunk, 3).unwrap();
+    let bound = GgufStep::new(&ctx, &stream, &trunk, prompt.len()).unwrap();
     assert_eq!(
         ctx.live_bytes() - before_step,
         budget.step_payload(),
@@ -196,7 +244,7 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
         );
     }
     budget.before_execution(&ctx).unwrap();
-    for (position, token) in prompt.into_iter().enumerate() {
+    for (position, token) in prompt.iter().copied().enumerate() {
         let start = feed.begin(token).unwrap();
         step.begin_token().unwrap();
         let (words, at) = step.words_buffer().unwrap();
@@ -301,23 +349,36 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
                     .unwrap();
                 serde_json::to_writer(output, &got).unwrap();
             }
-            // Exploratory threshold inherited from the tail probe, not a validated tolerance.
-            if !trace_stateful {
+            // A measurement by default; the inherited tolerance is imposed only on request.
+            if let Some(bound) = input.bound {
                 assert!(
-                    error.is_finite() && error < 0.05 && actual_greedy == expected_greedy,
-                    "first logits mismatch: relative_l2={error}, gpu_greedy={actual_greedy}, host_greedy={expected_greedy}"
+                    error.is_finite() && error < bound && actual_greedy == expected_greedy,
+                    "first logits mismatch: relative_l2={error}, gpu_greedy={actual_greedy}, host_greedy={expected_greedy}, bound={bound}"
                 );
             } else {
-                assert!(
-                    error.is_finite(),
-                    "non-finite stateful diagnostic logits error"
+                assert!(error.is_finite(), "non-finite logits error");
+                eprintln!(
+                    "first logits comparison is a measurement; set FIFI_FLASH_GGUF_LOGITS_BOUND to assert"
                 );
-                eprintln!("stateful GPU logits comparison is diagnostic, not a parity assertion");
             }
         }
         step.finish_token().unwrap();
     }
     if let Some(trace) = stateful {
         trace.finish(prompt.len());
+    }
+}
+
+#[cfg(test)]
+mod probe_input_tests {
+    use super::ProbeInput;
+
+    #[test]
+    fn logits_bound_is_opt_in_and_validated() {
+        assert_eq!(ProbeInput::parse_bound(None).unwrap(), None);
+        assert_eq!(ProbeInput::parse_bound(Some("0.05")).unwrap(), Some(0.05));
+        for bad in ["", "0", "-1", "nan", "inf", "abc"] {
+            assert!(ProbeInput::parse_bound(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

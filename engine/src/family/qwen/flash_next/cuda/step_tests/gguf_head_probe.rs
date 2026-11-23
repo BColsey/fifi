@@ -163,9 +163,10 @@ fn pinned_prompt_final_mixer_and_head_match_host() {
         serde_json::from_reader(std::fs::File::open(streams_path).unwrap()).unwrap();
     let oracle: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(oracle_path).unwrap()).unwrap();
-    let prompt = [9707u32, 11, 1879];
+    // The prompt is defined by the fixtures, not here; the two must agree.
+    let prompt: Vec<u32> = serde_json::from_value(oracle["prompt"].clone()).unwrap();
+    assert!(!prompt.is_empty(), "oracle prompt is empty");
     assert_eq!(streams["prompt"], serde_json::json!(prompt));
-    assert_eq!(oracle["prompt"], serde_json::json!(prompt));
     let inputs: Vec<Vec<f32>> = serde_json::from_value(streams["streams"].clone()).unwrap();
     let oracle_logits: Vec<f32> = serde_json::from_value(oracle["logits"][0].clone()).unwrap();
     assert_eq!(inputs.len(), prompt.len());
