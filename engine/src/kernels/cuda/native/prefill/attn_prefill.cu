@@ -1068,57 +1068,78 @@ PartArm arm_part_turing() {
     return arm;
 }
 
-/* The legacy path retains its process-wide arm; adaptive successes are cached
- * by CUDA device and instantiated model geometry. Adaptive failures propagate
- * and are not cached. */
+/* The arm the flags select for `device`: the adaptive path's, or the legacy
+ * arm main armed once per process. */
+template <int kHeadDim, int kGroup>
+PartArm arm_selected(int device) {
+    return adaptive_attention_enabled() ? arm_part<kHeadDim, kGroup>(device)
+                                        : arm_part_legacy<kHeadDim, kGroup>();
+}
+
+/* The pilot's arm for a device of compute capability 7.5, else the selected
+ * arm. arm_part_turing reads the current device, and the caller launches on
+ * the device it queried, so the device is set for the arming and restored. */
+template <int kHeadDim, int kGroup>
+PartArm arm_turing_or_selected(int device) {
+    int major = 0, minor = 0;
+    cudaError_t err =
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    if (err == cudaSuccess)
+        err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (err != cudaSuccess) {
+        PartArm arm = {};
+        arm.err = err;
+        return arm;
+    }
+    if (major != 7 || minor != 5) return arm_selected<kHeadDim, kGroup>(device);
+    int previous = -1;
+    err = cudaGetDevice(&previous);
+    if (err == cudaSuccess) err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        PartArm arm = {};
+        arm.err = err;
+        return arm;
+    }
+    PartArm arm = arm_part_turing<kHeadDim, kGroup>();
+    (void)cudaSetDevice(previous);
+    return arm;
+}
+
+/* One arm per device and geometry, whichever path selects it. The Turing
+ * pilot, when enabled, keeps its measured Qwen geometry rule; otherwise the
+ * adaptive path selects from the device's limits and the legacy path keeps its
+ * original selection. Each arm's shared-memory opt-in is a device property, so
+ * the arm is built for the device it will launch on, never inherited. The
+ * constexpr guard keeps the other geometries from instantiating the pilot. */
+template <int kHeadDim, int kGroup>
+PartArm arm_part_for_device(int device) {
+    if constexpr (kHeadDim == 256 && kGroup == 8) {
+        if (turing_attention_enabled()) return arm_turing_or_selected<kHeadDim, kGroup>(device);
+    }
+    return arm_selected<kHeadDim, kGroup>(device);
+}
+/* Every attention path arms per device and geometry before the first launch.
+ * Successes cache by device so a failure on one card cannot poison another's
+ * selection; failures propagate and are not cached. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
+        int device = -1;
+        failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (!failure.ok()) return failure;
+        static std::mutex arms_mutex;
+        static std::map<int, PartArm> arms;
         PartArm arm;
-        int current = 0, major = 0, minor = 0;
-        if (turing_attention_enabled()) {
-            failure.record(cudaGetDevice(&current), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (failure.ok()) failure.record(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, current), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (failure.ok()) failure.record(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, current), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (!failure.ok()) return failure;
-        }
-        if (turing_attention_enabled() && major == 7 && minor == 5 && kHeadDim == 256 && kGroup == 8) {
-            /* Successes cache per device like the adaptive arm below; the arm
-             * queries device attributes and calls cudaFuncSetAttribute, which
-             * must not run on every layer of every chunk. Failures are not
-             * cached, matching the adaptive path. */
-            static std::mutex turing_mutex;
-            static std::map<int, PartArm> turing_arms;
-            {
-                std::lock_guard<std::mutex> lock(turing_mutex);
-                const auto it = turing_arms.find(current);
-                if (it != turing_arms.end()) {
-                    arm = it->second;
-                } else {
-                    arm = arm_part_turing<kHeadDim, kGroup>();
-                    if (arm.err == cudaSuccess) turing_arms.emplace(current, arm);
-                }
+        {
+            std::lock_guard<std::mutex> lock(arms_mutex);
+            const auto it = arms.find(device);
+            if (it != arms.end()) {
+                arm = it->second;
+            } else {
+                arm = arm_part_for_device<kHeadDim, kGroup>(device);
+                if (arm.err == cudaSuccess) arms.emplace(device, arm);
             }
-        } else if (adaptive_attention_enabled()) {
-            int device = -1;
-            failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (!failure.ok()) return failure;
-            static std::mutex arms_mutex;
-            static std::map<int, PartArm> arms;
-            {
-                std::lock_guard<std::mutex> lock(arms_mutex);
-                const auto it = arms.find(device);
-                if (it != arms.end()) {
-                    arm = it->second;
-                } else {
-                    arm = arm_part<kHeadDim, kGroup>(device);
-                    if (arm.err == cudaSuccess) arms.emplace(device, arm);
-                }
-            }
-        } else {
-            static const PartArm legacy = arm_part_legacy<kHeadDim, kGroup>();
-            arm = legacy;
         }
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (!failure.ok() && cudaPeekAtLastError() == arm.err)

@@ -1185,17 +1185,17 @@ fn make_multi(
             super::card_prefill::chunk_mailbox_values(rows, dims.shape.hidden, dims.shape.moe.top_k)
         })
         .transpose()?;
-    // The chunked session runs typed attention on both cards. Only the
-    // adaptive arm (FIFI_CUDA_ATTN_PREFILL_ADAPT=1) re-arms per device;
-    // the legacy arm is armed once per process and its launch fails on
-    // the second card, so the unsupported combination is refused here.
-    // The whole path is experimental and its two-card arms are unqualified.
+    // The chunked session runs typed attention on both cards. The whole path
+    // is experimental and its two-card arms are unqualified, so the start
+    // requires the adaptive arm (FIFI_CUDA_ATTN_PREFILL_ADAPT=1) as a
+    // qualification gate: attention arms per device on every path, but no
+    // two-card run has qualified the legacy arm here.
     if chunk_payload.is_some() {
         let adapt = std::env::var_os("FIFI_CUDA_ATTN_PREFILL_ADAPT");
         if !adapt.as_deref().is_some_and(|v| v == "1") {
             return Err(EngError::BadRequest(
-                "Q36_P2P_CHUNK requires FIFI_CUDA_ATTN_PREFILL_ADAPT=1: the two-card \
-                 launch arms its attention per device only on the adaptive path"
+                "Q36_P2P_CHUNK requires FIFI_CUDA_ATTN_PREFILL_ADAPT=1: the experimental \
+                 two-card path is gated to the adaptive attention arm"
                     .into(),
             ));
         }
