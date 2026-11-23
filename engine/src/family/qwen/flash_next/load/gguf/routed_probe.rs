@@ -230,7 +230,7 @@ fn matched_down(run: MatchedDown<'_>) {
             stream,
             ExpertProjectionInputs {
                 ids: slots,
-                x_q8: all(&q8),
+                x: all(&q8),
                 x_per_slot: true,
                 output: all(&output),
                 output_stride: hidden,
@@ -513,7 +513,7 @@ pub(in super::super::super) fn run(
                 stream,
                 ExpertProjectionInputs {
                     ids: all(ids),
-                    x_q8: all(&qx),
+                    x: all(&qx),
                     x_per_slot: false,
                     output: gu.range(offset, gu.bytes() - offset).unwrap(),
                     output_stride: 2 * inter,
@@ -555,7 +555,7 @@ pub(in super::super::super) fn run(
         stream,
         ExpertProjectionInputs {
             ids: all(ids),
-            x_q8: all(&qa),
+            x: all(&qa),
             x_per_slot: true,
             output: all(&outputs),
             output_stride: hidden,

@@ -66,7 +66,7 @@ use crate::{
             },
             load::model_shape,
             moe::context_budget::KvFormat,
-            step::ModelShape,
+            step::{GgufDecodePrecision, ModelShape},
         },
     },
     kernels::cuda::{
@@ -76,6 +76,7 @@ use crate::{
             hyper::{
                 HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
             },
+            matvec_gguf_f32::DenseF32Call,
             quantize_q8_1::QuantizeCall,
             step_params::{OFFSET_POS, OFFSET_STATUS},
         },
@@ -118,6 +119,34 @@ pub(super) fn project_native(
         },
     )?;
     ctx.matvec_native(stream, call.weight, call.scratch, call.output, 1)
+}
+
+/// One exact native GGUF decode projection ([`GgufDecodePrecision::Exact`]): the f32 activation
+/// against the exactly decoded weights of any type the window decoders serve. No scratch.
+pub(super) fn project_exact(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    weight: &NativeWeight,
+    input: DeviceRange<'_>,
+    output: DeviceRange<'_>,
+) -> Result<(), EngError> {
+    if weight.experts().is_some() {
+        return Err(refuse(
+            "exact projection requires a matrix, not an expert stack".into(),
+        ));
+    }
+    ctx.matvec_gguf_f32(
+        stream,
+        DenseF32Call {
+            ty: weight.quant(),
+            w: weight.buffer().range(0, weight.buffer().bytes())?,
+            x: input,
+            y: output,
+            k: weight.k(),
+            rows: weight.n_rows(),
+            ncols: 1,
+        },
+    )
 }
 
 /// Test-only experiment: retain the native Q6_K weights and use the existing dequantizing
@@ -196,6 +225,9 @@ pub(super) struct FlashStep<'a> {
     pub(super) state_plan: StatePlan,
     pub(super) step_plan: StepPlan,
     pub(super) options: StepOptions,
+    /// The arithmetic of the native GGUF decode projections: [`GgufDecodePrecision::default`]
+    /// until [`Self::set_gguf_decode_precision`].
+    gguf_decode: GgufDecodePrecision,
     state: DeviceArena,
     scratch: DeviceArena,
     /// f32 `[hidden]` zeros: the residual the shared MoE block adds to, since the hyper apply adds
@@ -358,6 +390,7 @@ impl<'a> FlashStep<'a> {
             state_plan,
             step_plan,
             options,
+            gguf_decode: GgufDecodePrecision::default(),
             state,
             scratch,
             zeros,
@@ -373,6 +406,17 @@ impl<'a> FlashStep<'a> {
     #[cfg(test)]
     pub(super) fn scratch_bytes_for_test(&self) -> usize {
         self.scratch.bytes()
+    }
+
+    /// Selects the arithmetic of the native GGUF decode projections ([`GgufDecodePrecision`]).
+    /// The scratch of both is planned either way, so an owner may switch between tokens.
+    pub(super) fn set_gguf_decode_precision(&mut self, precision: GgufDecodePrecision) {
+        self.gguf_decode = precision;
+    }
+
+    /// The arithmetic in force for the native GGUF decode projections.
+    pub(super) fn gguf_decode_precision(&self) -> GgufDecodePrecision {
+        self.gguf_decode
     }
 
     /// Zeroes the persistent state (the recurrent states, the rings, the caches) and clears the
@@ -697,7 +741,10 @@ impl<'a> FlashStep<'a> {
                     out,
                 );
             }
-            return project_native(self.ctx, self.stream, call);
+            return match self.gguf_decode {
+                GgufDecodePrecision::Q8 => project_native(self.ctx, self.stream, call),
+                GgufDecodePrecision::Exact => project_exact(self.ctx, self.stream, weight, x, out),
+            };
         }
         if prefix.ends_with("self_attn.indexer.index_qk_proj")
             && self.step_plan.index(Slot::GgufDecodeQ8).is_some()
@@ -950,6 +997,12 @@ impl<'a> FlashStep<'a> {
                         call.input,
                         call.output,
                     )?;
+                }
+                return Ok(());
+            }
+            if self.gguf_decode == GgufDecodePrecision::Exact {
+                for call in &calls {
+                    project_exact(self.ctx, self.stream, call.weight, call.input, call.output)?;
                 }
                 return Ok(());
             }

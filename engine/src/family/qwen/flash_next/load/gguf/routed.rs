@@ -34,6 +34,8 @@ use crate::{
     },
 };
 
+use crate::family::qwen::flash_next::step::GgufDecodePrecision;
+
 #[cfg(test)]
 use crate::family::expert_bank::BankStats;
 
@@ -105,6 +107,9 @@ pub(in super::super::super) struct PersistentRouted<'a> {
     qa: DeviceBuffer,
     #[cfg(test)]
     f16_down_probe: Option<Range<usize>>,
+    /// The arithmetic of the expert projections: the shipped `Q8` until
+    /// [`Self::set_decode_precision`].
+    precision: GgufDecodePrecision,
     poisoned: bool,
 }
 
@@ -189,8 +194,15 @@ impl<'a> PersistentRouted<'a> {
             qa: ctx.allocate(qa_bytes)?,
             #[cfg(test)]
             f16_down_probe,
+            precision: GgufDecodePrecision::default(),
             poisoned: false,
         })
+    }
+
+    /// Selects the arithmetic of the expert projections ([`GgufDecodePrecision`]). The q8_1
+    /// scratch stays allocated either way.
+    pub(in super::super::super) fn set_decode_precision(&mut self, precision: GgufDecodePrecision) {
+        self.precision = precision;
     }
 
     /// Consumes the caller's GPU router output in rank order; the shared expert output and gate
@@ -247,6 +259,7 @@ impl<'a> PersistentRouted<'a> {
             (&self.slots, &self.qx, &self.qa),
             bufs,
             dims,
+            self.precision,
             #[cfg(test)]
             TestProbes {
                 layer,
@@ -304,6 +317,7 @@ fn launch_experts(
     scratch: (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
+    precision: GgufDecodePrecision,
     #[cfg(test)] probes: TestProbes<'_>,
 ) -> Result<(), EngError> {
     let (ids, qx, qa) = scratch;
@@ -317,6 +331,9 @@ fn launch_experts(
         || (down.k, down.rows) != (dims.inter, dims.hidden)
     {
         return Err(bad("expert projection shapes disagree with the model"));
+    }
+    if precision == GgufDecodePrecision::Exact {
+        return launch_exact(ctx, stream, (gate, up, down), all(ids)?, bufs, dims);
     }
     #[cfg(test)]
     if super::native_f16::enabled() {
@@ -338,7 +355,7 @@ fn launch_experts(
             stream,
             ExpertProjectionInputs {
                 ids: all(ids)?,
-                x_q8: all(qx)?,
+                x: all(qx)?,
                 x_per_slot: false,
                 output,
                 output_stride: dims.inter * 2,
@@ -400,7 +417,7 @@ fn launch_experts(
             stream,
             ExpertProjectionInputs {
                 ids: all(ids)?,
-                x_q8: all(qa)?,
+                x: all(qa)?,
                 x_per_slot: true,
                 output: bufs.expert_down,
                 output_stride: dims.hidden,
@@ -423,6 +440,52 @@ fn up_range<'a>(bufs: &'a Exl3MoeBufs<'a>, inter: usize) -> Result<DeviceRange<'
         bufs.expert_gu.offset() + up_offset,
         bufs.expert_gu.bytes() - up_offset,
     )
+}
+
+/// The exact twin of the shipped launch ([`GgufDecodePrecision::Exact`]): the same launches,
+/// buffer layout, SwiGLU and combine, with unquantized activations and exactly decoded weights.
+fn launch_exact(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    (gate, up, down): (
+        ExpertProjection<'_>,
+        ExpertProjection<'_>,
+        ExpertProjection<'_>,
+    ),
+    ids: DeviceRange<'_>,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
+    let up_out = up_range(bufs, dims.inter)?;
+    let twice = dims
+        .inter
+        .checked_mul(2)
+        .ok_or_else(|| bad("expert width overflows"))?;
+    let inputs = |x, x_per_slot, output, output_stride| ExpertProjectionInputs {
+        ids,
+        x,
+        x_per_slot,
+        output,
+        output_stride,
+        used: dims.top_k,
+    };
+    gate.launch_exact(
+        ctx,
+        stream,
+        inputs(bufs.route.norm_row, false, bufs.expert_gu, twice),
+    )?;
+    up.launch_exact(
+        ctx,
+        stream,
+        inputs(bufs.route.norm_row, false, up_out, twice),
+    )?;
+    swiglu(ctx, stream, bufs, dims)?;
+    down.launch_exact(
+        ctx,
+        stream,
+        inputs(bufs.expert_act, true, bufs.expert_down, dims.hidden),
+    )?;
+    combine(ctx, stream, bufs, dims)
 }
 
 fn swiglu(

@@ -24,6 +24,7 @@ use crate::{
         exl3_pack::layer_name,
         project::cuda::{CudaWeight, CudaWeights},
         qwen::flash_next::load::gguf::{routed::PersistentRouted, trunk::GgufTrunk},
+        qwen::flash_next::step::GgufDecodePrecision,
     },
     kernels::cuda::{
         CudaContext, DeviceRange, DeviceStream,
@@ -61,6 +62,17 @@ impl<'a> GgufStep<'a> {
 
     pub(super) fn step(&self) -> &FlashStep<'a> {
         &self.step
+    }
+
+    /// Selects the arithmetic of the native GGUF decode projections on this trunk's step
+    /// ([`GgufDecodePrecision`]). An owner bound afterwards ([`GgufMoeOwner::new`]) gives its
+    /// routed experts the same arithmetic, so one trunk never mixes the two.
+    pub(super) fn set_decode_precision(&mut self, precision: GgufDecodePrecision) {
+        self.step.set_gguf_decode_precision(precision);
+    }
+
+    fn decode_precision(&self) -> GgufDecodePrecision {
+        self.step.gguf_decode_precision()
     }
 }
 
@@ -109,8 +121,9 @@ impl<'a> GgufMoeOwner<'a> {
         for layer in step.layers.clone() {
             validate_weights(step, layer, &dims)?;
         }
-        let routed =
+        let mut routed =
             PersistentRouted::new(step.ctx, step.stream, model, step.layers.clone(), slots)?;
+        routed.set_decode_precision(bound.decode_precision());
         Ok(Self {
             ctx: step.ctx,
             stream: step.stream,

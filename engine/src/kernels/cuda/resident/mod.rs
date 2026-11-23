@@ -100,6 +100,7 @@ pub(crate) mod matmul_expert;
 pub(crate) mod matvec_expert;
 #[cfg(test)]
 mod matvec_gguf;
+pub(crate) mod matvec_gguf_f32;
 pub(crate) mod matvec_native;
 pub(crate) mod matvec_q;
 pub(crate) mod moe_combine;

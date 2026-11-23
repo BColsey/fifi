@@ -15,6 +15,7 @@ use crate::family::qwen::flash_next::{
         gguf_moe::{GgufMoeOwner, GgufStep},
     },
     load::gguf::{GgufModel, token_feed::GgufTokenFeeds, trunk::GgufTrunk},
+    step::GgufDecodePrecision,
 };
 use crate::kernels::cuda::{CudaContext, resident::step_params::StepParams};
 use admission::ProbeBudget;
@@ -209,6 +210,17 @@ impl ProbeInput {
         }
         Ok(Some(bound))
     }
+
+    /// `FIFI_FLASH_GGUF_PROBE_PRECISION`: absent is the production default
+    /// ([`GgufDecodePrecision::default()`]); `exact` and `q8` each name one for a comparison.
+    fn parse_precision(value: Option<&str>) -> Result<GgufDecodePrecision, &'static str> {
+        match value {
+            None => Ok(GgufDecodePrecision::default()),
+            Some("q8") => Ok(GgufDecodePrecision::Q8),
+            Some("exact") => Ok(GgufDecodePrecision::Exact),
+            Some(_) => Err("probe precision must be `q8` or `exact`"),
+        }
+    }
 }
 
 fn run_full_model(trace_window: Option<TraceWindow>) {
@@ -268,7 +280,14 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
     let mut feed = GgufTokenFeeds::new(trunk.model(), &ngram, total).unwrap();
     budget.before_step(&ctx).unwrap();
     let before_step = ctx.live_bytes();
-    let bound = GgufStep::new(&ctx, &stream, &trunk, total).unwrap();
+    let precision = match std::env::var("FIFI_FLASH_GGUF_PROBE_PRECISION") {
+        Ok(value) => ProbeInput::parse_precision(Some(&value)),
+        Err(std::env::VarError::NotPresent) => ProbeInput::parse_precision(None),
+        Err(_) => panic!("FIFI_FLASH_GGUF_PROBE_PRECISION is not Unicode"),
+    }
+    .unwrap_or_else(|message| panic!("FIFI_FLASH_GGUF_PROBE_PRECISION: {message}"));
+    let mut bound = GgufStep::new(&ctx, &stream, &trunk, total).unwrap();
+    bound.set_decode_precision(precision);
     assert_eq!(
         ctx.live_bytes() - before_step,
         budget.step_payload(),
@@ -404,7 +423,7 @@ fn run_full_model(trace_window: Option<TraceWindow>) {
                 ProbeInput::comparable_so_far(&mut diverged, actual_greedy, expected_greedy);
             comparable_steps += usize::from(comparable);
             eprintln!(
-                "greedy step={step_index} position={position} comparable={comparable} logits count={} relative_l2={error:.9} gpu_greedy={actual_greedy} host_greedy={expected_greedy} gpu_max={} host_max={}",
+                "greedy step={step_index} position={position} comparable={comparable} precision={precision:?} logits count={} relative_l2={error:.9} gpu_greedy={actual_greedy} host_greedy={expected_greedy} gpu_max={} host_max={}",
                 got.len(),
                 got[actual_greedy],
                 host_row[expected_greedy]
@@ -490,5 +509,27 @@ mod probe_input_tests {
             })
             .collect();
         assert_eq!(flags, [true, false, false]);
+    }
+
+    #[test]
+    fn precision_follows_the_production_default_unless_named() {
+        use super::GgufDecodePrecision;
+        // Unconfigured, the probe measures what a new step runs: one definition of the default.
+        assert_eq!(GgufDecodePrecision::default(), GgufDecodePrecision::Q8);
+        assert_eq!(
+            ProbeInput::parse_precision(None),
+            Ok(GgufDecodePrecision::default())
+        );
+        assert_eq!(
+            ProbeInput::parse_precision(Some("q8")),
+            Ok(GgufDecodePrecision::Q8)
+        );
+        assert_eq!(
+            ProbeInput::parse_precision(Some("exact")),
+            Ok(GgufDecodePrecision::Exact)
+        );
+        for bad in ["f16", "", "Exact"] {
+            assert!(ProbeInput::parse_precision(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

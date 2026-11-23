@@ -106,7 +106,7 @@ pub(super) fn run(experiment: Experiment<'_>) {
             stream,
             ExpertProjectionInputs {
                 ids: slots,
-                x_q8: all(q8),
+                x: all(q8),
                 x_per_slot: true,
                 output: all(&q8_output),
                 output_stride: rows,

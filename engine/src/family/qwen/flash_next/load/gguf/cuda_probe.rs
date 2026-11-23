@@ -1175,7 +1175,7 @@ fn full_expert_device_stacks_match_host() {
                 &stream,
                 ExpertProjectionInputs {
                     ids: ids.range(0, 4).unwrap(),
-                    x_q8: q.range(0, qbytes).unwrap(),
+                    x: q.range(0, qbytes).unwrap(),
                     x_per_slot: false,
                     output: y.range(0, rows * 4).unwrap(),
                     output_stride: rows,
@@ -1230,7 +1230,7 @@ fn full_expert_device_stacks_match_host() {
                     &stream,
                     ExpertProjectionInputs {
                         ids: ids2.range(0, 8).unwrap(),
-                        x_q8: q2.range(0, q2bytes).unwrap(),
+                        x: q2.range(0, q2bytes).unwrap(),
                         x_per_slot: true,
                         output: y2.range(0, rows * 8).unwrap(),
                         output_stride: rows,
@@ -1475,7 +1475,7 @@ fn two_real_expert_slots_match_host() {
         &stream,
         ExpertProjectionInputs {
             ids: before.range(0, 8).unwrap(),
-            x_q8: q.range(0, qbytes).unwrap(),
+            x: q.range(0, qbytes).unwrap(),
             x_per_slot: false,
             output: y.range(0, rows * 8).unwrap(),
             output_stride: rows,
@@ -1520,7 +1520,7 @@ fn two_real_expert_slots_match_host() {
                         &stream,
                         ExpertProjectionInputs {
                             ids: $ids.range(0, count * 4).unwrap(),
-                            x_q8: q.range(0, qbytes).unwrap(),
+                            x: q.range(0, qbytes).unwrap(),
                             x_per_slot: false,
                             output: gu.range(off, (2 * count - 1) * rows * 4).unwrap(),
                             output_stride: 2 * rows,
@@ -1564,7 +1564,7 @@ fn two_real_expert_slots_match_host() {
                     &stream,
                     ExpertProjectionInputs {
                         ids: $ids.range(0, count * 4).unwrap(),
-                        x_q8: act_q.range(0, act_qbytes).unwrap(),
+                        x: act_q.range(0, act_qbytes).unwrap(),
                         x_per_slot: true,
                         output: repaired_down.range(0, count * hidden * 4).unwrap(),
                         output_stride: hidden,
@@ -1619,7 +1619,7 @@ fn two_real_expert_slots_match_host() {
             &stream,
             ExpertProjectionInputs {
                 ids: miss_id.range(0, 4).unwrap(),
-                x_q8: q.range(0, qbytes).unwrap(),
+                x: q.range(0, qbytes).unwrap(),
                 x_per_slot: false,
                 output: y.range(0, rows * 4).unwrap(),
                 output_stride: rows,
@@ -1721,7 +1721,7 @@ fn two_real_expert_slots_match_host() {
                 &stream,
                 ExpertProjectionInputs {
                     ids: ids.range(0, 8).unwrap(),
-                    x_q8: q.range(0, qbytes).unwrap(),
+                    x: q.range(0, qbytes).unwrap(),
                     x_per_slot: false,
                     output: y.range(0, rows * 8).unwrap(),
                     output_stride: rows,
@@ -1782,7 +1782,7 @@ fn two_real_expert_slots_match_host() {
                 &stream,
                 ExpertProjectionInputs {
                     ids: ids.range(0, 8).unwrap(),
-                    x_q8: q.range(0, qb).unwrap(),
+                    x: q.range(0, qb).unwrap(),
                     x_per_slot: false,
                     output: gu.range(offset, 3 * n_ff * 4).unwrap(),
                     output_stride: 2 * n_ff,
@@ -1848,7 +1848,7 @@ fn two_real_expert_slots_match_host() {
         &stream,
         ExpertProjectionInputs {
             ids: ids.range(0, 8).unwrap(),
-            x_q8: qa.range(0, qa_bytes).unwrap(),
+            x: qa.range(0, qa_bytes).unwrap(),
             x_per_slot: true,
             output: y_down.range(0, 2 * hidden * 4).unwrap(),
             output_stride: hidden,

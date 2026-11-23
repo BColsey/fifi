@@ -191,7 +191,9 @@ pub(in super::super::super) struct ExpertProjection<'a> {
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in super::super::super) struct ExpertProjectionInputs<'a> {
     pub(in super::super::super) ids: crate::kernels::cuda::DeviceRange<'a>,
-    pub(in super::super::super) x_q8: crate::kernels::cuda::DeviceRange<'a>,
+    /// The activation: q8_1 blocks for [`ExpertProjection::launch`], packed f32 rows (one, or
+    /// one per slot) for [`ExpertProjection::launch_exact`].
+    pub(in super::super::super) x: crate::kernels::cuda::DeviceRange<'a>,
     pub(in super::super::super) x_per_slot: bool,
     pub(in super::super::super) output: crate::kernels::cuda::DeviceRange<'a>,
     pub(in super::super::super) output_stride: usize,
@@ -214,7 +216,36 @@ impl<'a> ExpertProjection<'a> {
                 ty: self.ty,
                 w_stack: self.weights,
                 ids: inputs.ids,
-                x_q8: inputs.x_q8,
+                x_q8: inputs.x,
+                x_per_slot: inputs.x_per_slot,
+                y: inputs.output,
+                y_slot_stride: inputs.output_stride,
+                k: self.k,
+                rows: self.rows,
+                n_expert: self.slots,
+                n_used: inputs.used,
+                glu_gate: None,
+            },
+        )
+    }
+
+    /// The exact twin of [`Self::launch`]: the same slots and layout, the activation as packed
+    /// f32 rows (`4 * k` bytes each: one shared row, or one per slot) and every product the
+    /// decoded weight times the activation. One launch; `inputs.used` is at most 32.
+    pub(in super::super::super) fn launch_exact(
+        self,
+        ctx: &crate::kernels::cuda::CudaContext,
+        stream: &crate::kernels::cuda::DeviceStream,
+        inputs: ExpertProjectionInputs<'a>,
+    ) -> Result<(), EngError> {
+        use crate::kernels::cuda::resident::matvec_gguf_f32::ExpertF32Call;
+        ctx.matvec_gguf_f32_expert(
+            stream,
+            ExpertF32Call {
+                ty: self.ty,
+                w_stack: self.weights,
+                ids: inputs.ids,
+                x: inputs.x,
                 x_per_slot: inputs.x_per_slot,
                 y: inputs.output,
                 y_slot_stride: inputs.output_stride,
