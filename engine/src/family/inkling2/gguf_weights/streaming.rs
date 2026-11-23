@@ -4,8 +4,9 @@ use crate::kernels::cuda::DeviceRange;
 use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView},
-    family::inkling2::cuda_projection::gguf::streaming::{
-        ExpertGroup, ExpertRows, PrefillRoute, ResidentRoute, RoutedExperts,
+    family::inkling2::cuda_projection::gguf::{
+        ExpertPrefillRows,
+        streaming::{ExpertGroup, ExpertRows, PrefillRoute, ResidentRoute, RoutedExperts},
     },
     kernels::cuda::resident::dense_gemv::{DenseDtype, GgufMoePick},
 };
@@ -151,9 +152,8 @@ impl GgufTextWeights {
         &self,
         names: [&str; 2],
         layer: u32,
-        routes: &[PrefillRoute<'_>],
+        rows: ExpertPrefillRows<'_>,
         caps: [f32; 2],
-        retained: Option<DeviceRange<'_>>,
         route_weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
         let Some(cuda) = self
@@ -166,15 +166,7 @@ impl GgufTextWeights {
         let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
             return Ok(None);
         };
-        cuda.prefill_device_experts(
-            &mut source,
-            layer,
-            routes,
-            dtypes,
-            caps,
-            retained,
-            route_weight,
-        )
+        cuda.prefill_device_experts(&mut source, layer, rows, dtypes, caps, route_weight)
     }
 
     pub(in crate::family::inkling2) fn prefill_bank_report(

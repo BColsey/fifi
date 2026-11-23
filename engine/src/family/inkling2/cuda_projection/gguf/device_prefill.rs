@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     DEVICE_HEADROOM, GgufCuda, bad,
-    streaming::{Matrix, PrefillRoute, group_routes},
+    streaming::{Matrix, PrefillRoute, group_route_ids},
 };
 use crate::{
     EngError,
@@ -207,6 +207,71 @@ struct Projections<'a> {
     matrices: BTreeMap<ExpertId, [Matrix<'a>; 2]>,
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::family::inkling2) enum ExpertPrefillRows<'a> {
+    Host(&'a [PrefillRoute<'a>]),
+    Resident {
+        ids: &'a [&'a [usize]],
+        hidden: usize,
+        activations: DeviceRange<'a>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RowRoutes<'a> {
+    Host(&'a [PrefillRoute<'a>]),
+    Resident(&'a [&'a [usize]]),
+}
+
+impl<'a> RowRoutes<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Host(r) => r.len(),
+            Self::Resident(ids) => ids.len(),
+        }
+    }
+
+    fn ids(self) -> impl Iterator<Item = &'a [usize]> {
+        (0..self.len()).map(move |i| match self {
+            Self::Host(r) => r[i].ids,
+            Self::Resident(ids) => ids[i],
+        })
+    }
+
+    fn window(self, span: Range<usize>) -> Self {
+        match self {
+            Self::Host(r) => Self::Host(&r[span]),
+            Self::Resident(ids) => Self::Resident(&ids[span]),
+        }
+    }
+}
+
+impl<'a> ExpertPrefillRows<'a> {
+    fn prepare(self) -> Option<(RowRoutes<'a>, usize, Option<DeviceRange<'a>>)> {
+        match self {
+            Self::Host(routes) => {
+                let hidden = routes.first()?.input.len();
+                if hidden == 0 || routes.iter().any(|r| r.input.len() != hidden) {
+                    return None;
+                }
+                Some((RowRoutes::Host(routes), hidden, None))
+            }
+            Self::Resident {
+                ids,
+                hidden,
+                activations,
+            } => {
+                // There are no host rows to fall back to on a mismatched range.
+                admits_router_input(ids.len(), hidden, activations.bytes()).then_some((
+                    RowRoutes::Resident(ids),
+                    hidden,
+                    Some(activations),
+                ))
+            }
+        }
+    }
+}
+
 impl GgufCuda {
     pub(in crate::family::inkling2) fn supports_grouped_verify(&self, layers: usize) -> bool {
         self.device_prefill.is_some()
@@ -231,26 +296,22 @@ impl GgufCuda {
         &self,
         source: &mut impl ExpertPayloadSource,
         layer: u32,
-        routes: &[PrefillRoute<'_>],
+        batch: ExpertPrefillRows<'_>,
         dtypes: [DenseDtype; 2],
         caps: [f32; 2],
-        retained: Option<DeviceRange<'_>>,
         weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
         let Some(workspace) = &self.device_prefill else {
             return Ok(None);
         };
-        let Some(first) = routes.first() else {
+        let Some((routes, hidden, retained)) = batch.prepare() else {
             return Ok(None);
         };
-        let [rank, hidden] = [first.ids.len(), first.input.len()];
+        let rank = routes.ids().next().map_or(0, <[usize]>::len);
         if routes.len() < 2
-            || hidden == 0
             || !(1..=32).contains(&rank)
             || !caps.iter().all(|cap| cap.is_finite() && *cap > 0.0)
-            || routes
-                .iter()
-                .any(|route| route.ids.len() != rank || route.input.len() != hidden)
+            || routes.ids().any(|ids| ids.len() != rank)
             || dtypes
                 .iter()
                 .any(|&dtype| !dtype.is_packed_gguf() || self.step.uses_q8_activations(dtype))
@@ -267,13 +328,11 @@ impl GgufCuda {
         let Some(scratch) = workspace.fit(cuda, routes.len(), projections.geometry)? else {
             return Ok(None);
         };
-        let retained =
-            retained.filter(|input| admits_router_input(routes.len(), hidden, input.bytes()));
         let mut output = Vec::with_capacity(routes.len());
         let mut counts = [DenseGemvGroupCounts::default(); 2];
         let mut grouped_slots = [0; 2];
-        for (window, routes) in routes.chunks(scratch.rows).enumerate() {
-            let first = window * scratch.rows;
+        for first in (0..routes.len()).step_by(scratch.rows) {
+            let routes = routes.window(first..(first + scratch.rows).min(routes.len()));
             // The checked full-batch extent bounds both products and every window.
             let input = retained
                 .map(|batch| batch.slice(first * hidden * 4, routes.len() * hidden * 4))
@@ -314,12 +373,12 @@ impl GgufCuda {
         &'a self,
         source: &mut impl ExpertPayloadSource,
         layer: u32,
-        routes: &[PrefillRoute<'_>],
+        routes: RowRoutes<'_>,
         [rank, hidden]: [usize; 2],
         dtypes: [DenseDtype; 2],
         caps: [f32; 2],
     ) -> Result<Option<Projections<'a>>, EngError> {
-        let experts: BTreeSet<_> = routes.iter().flat_map(|route| route.ids).copied().collect();
+        let experts: BTreeSet<_> = routes.ids().flatten().copied().collect();
         let mut matrices = BTreeMap::new();
         let mut middle = 0;
         for expert in experts {
@@ -431,7 +490,7 @@ impl RoutedWindow {
     fn prepare(
         projections: &Projections<'_>,
         layer: u32,
-        routes: &[PrefillRoute<'_>],
+        routes: RowRoutes<'_>,
         retained: bool,
         weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Self, EngError> {
@@ -439,17 +498,22 @@ impl RoutedWindow {
         let layout = Layout::for_input(routes.len(), shape, retained)
             .ok_or_else(|| bad("expert prefill arena overflows"))?;
         let mut upload = vec![[0; 4]; layout.flag.end / 4];
-        for (dst, value) in upload[..layout.input.end / 4]
-            .iter_mut()
-            .zip(routes.iter().flat_map(|route| route.input))
-        {
-            *dst = value.to_ne_bytes();
+        if !retained {
+            let RowRoutes::Host(host) = routes else {
+                return Err(bad("missing resident expert prefill input"));
+            };
+            for (dst, value) in upload[..layout.input.end / 4]
+                .iter_mut()
+                .zip(host.iter().flat_map(|route| route.input))
+            {
+                *dst = value.to_ne_bytes();
+            }
         }
         let groups = pack_routes(
             &mut upload,
             &layout,
             shape.rank,
-            group_routes(layer, routes),
+            group_route_ids(layer, routes.ids()),
             |id| {
                 projections.matrices[&id]
                     .each_ref()
@@ -842,7 +906,11 @@ mod tests {
             },
         ];
         let layout = Layout::new(routes.len(), shape).unwrap();
-        let groups = group_routes(5, &routes);
+        let groups = group_route_ids(5, RowRoutes::Host(&routes).ids());
+        let ids: [&[usize]; 2] = [&[2, 0], &[1, 2]];
+        let resident = RowRoutes::Resident(&ids);
+        assert_eq!(group_route_ids(5, resident.ids()), groups);
+        assert_eq!(resident.window(1..2).ids().next(), Some(ids[1]));
         let mut upload = vec![[0; 4]; layout.flag.end / 4];
         let batches = pack_routes(
             &mut upload,

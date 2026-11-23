@@ -35,6 +35,7 @@ mod resident_prefill;
 pub(in crate::family::inkling2) mod router;
 pub(in crate::family::inkling2) mod streaming;
 
+pub(in crate::family::inkling2) use device_prefill::ExpertPrefillRows;
 pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
 use residency::{PackedBudget, ResidentExperts};
 

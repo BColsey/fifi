@@ -477,9 +477,16 @@ pub(super) fn group_routes(
     layer: u32,
     routes: &[PrefillRoute<'_>],
 ) -> BTreeMap<ExpertId, Vec<(usize, usize)>> {
+    group_route_ids(layer, routes.iter().map(|route| route.ids))
+}
+
+pub(super) fn group_route_ids<'a>(
+    layer: u32,
+    ids: impl IntoIterator<Item = &'a [usize]>,
+) -> BTreeMap<ExpertId, Vec<(usize, usize)>> {
     let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    for (row, route) in routes.iter().enumerate() {
-        for (rank, &expert) in route.ids.iter().enumerate() {
+    for (row, ids) in ids.into_iter().enumerate() {
+        for (rank, &expert) in ids.iter().enumerate() {
             groups
                 .entry(ExpertId {
                     layer,

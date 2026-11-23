@@ -12,7 +12,7 @@ use crate::{
     EngError,
     family::inkling2::{
         cpu_attention::{AttentionUndo, VisitUndo},
-        cuda_projection::gguf::{BatchController, streaming::PrefillRoute},
+        cuda_projection::gguf::{BatchController, ExpertPrefillRows, streaming::PrefillRoute},
         gguf_weights::GgufTextWeights,
     },
 };
@@ -675,12 +675,22 @@ impl CpuForward {
             format!("{prefix}.experts.w2_weight"),
         ];
         let names = names.each_ref().map(String::as_str);
+        let mut ids = Vec::new();
+        let batch = if let Some(activations) = retained {
+            ids.extend(routes.iter().map(|row| row.ids));
+            ExpertPrefillRows::Resident {
+                ids: &ids,
+                hidden: self.hidden(),
+                activations,
+            }
+        } else {
+            ExpertPrefillRows::Host(&routes)
+        };
         if let Some(output) = weights.prefill_device_experts(
             names,
             layer as u32,
-            &routes,
+            batch,
             [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
-            retained,
             |row, id| mlp[row].route.weight(id, self.math.route_scale),
         )? {
             return Ok(output);
