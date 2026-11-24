@@ -18,6 +18,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::super::step::LoopState;
+use super::super::step::{logits, trunk_traced};
 use super::super::weights::{Layer, LoopWeights, Mixer};
 use super::step::{Carried, LoopStep, bytes_range, floats, le_f32};
 use crate::EngError;
@@ -1354,7 +1355,7 @@ fn relative(a: &[f32], b: &[f32]) -> (f32, f32) {
 
 /// The size of the q8_1 activation step on the rows the position probe saved, CPU only: the
 /// projections of the two visits before the departure, over the f32 normed row and over the
-/// same row after the quantizers' rule. The row is the traced residual before the visit; an
+/// same row after the quantizers' rule. The row is the traced residual after the visit before it, the visit's input; an
 /// mHC visit's routed input is not in the trace. One line per projection.
 #[test]
 fn q8_1_activation_effect_on_the_saved_rows() {
@@ -1374,7 +1375,7 @@ fn q8_1_activation_effect_on_the_saved_rows() {
                 let block = weights.plan().block(weights.plan().physical(il));
                 let layer = &weights.layers()[block];
                 for (ffn, norm) in [(false, &layer.attn_norm), (true, &layer.post_norm)] {
-                    let row = rms_plain(&trace[2 * il + 1], norm, shape.eps).unwrap();
+                    let row = rms_plain(&trace[2 * (il - 1) + 1], norm, shape.eps).unwrap();
                     let (stepped, scales) = cpu_q8_1(&row);
                     let (at, step) = scales
                         .iter()
@@ -1453,6 +1454,44 @@ fn dequant_mmq(pack: &[u8], k: usize, ncols: usize, q6: bool) -> Vec<Vec<f32>> {
                 .collect()
         })
         .collect()
+}
+
+/// MMQ's pack against the matvec's bytes for the same f32 row, block by block. If both
+/// quantizers applied one rule every block would match; where they differ, the gap of the two
+/// quantized rows is the quantizers', and the rest is MMQ's arithmetic.
+fn pack_against_matvec(
+    label: &str,
+    pack: &[u8],
+    matvec: &[u8],
+    dq: &[f32],
+    pack_dq: &[f32],
+    q6: bool,
+) {
+    let (mut scales, mut codes, mut first) = (0, 0, String::new());
+    for b in 0..matvec.len() / 36 {
+        let (kb, sb) = (b / 4, b % 4);
+        let block = &pack[144 * kb..144 * (kb + 1)];
+        let pack_scale = if q6 {
+            f32::from_le_bytes(block[4 * sb..4 * sb + 4].try_into().unwrap())
+        } else {
+            le_f16_vec(&block[4 * sb..4 * sb + 2])[0]
+        };
+        let matvec_scale = le_f16_vec(&matvec[36 * b..36 * b + 2])[0];
+        let differing = (0..32)
+            .filter(|i| block[16 + 32 * sb + i] != matvec[36 * b + 4 + i])
+            .count();
+        scales += usize::from(pack_scale != matvec_scale);
+        codes += usize::from(differing > 0);
+        if first.is_empty() && (pack_scale != matvec_scale || differing > 0) {
+            first = format!(
+                "; first at block {b}: scale pack {pack_scale:e} matvec {matvec_scale:e}, {differing} of 32 codes differ"
+            );
+        }
+    }
+    eprintln!(
+        "  {label}: MMQ's pack against the matvec's bytes per 32-value block: scale differs in {scales}, codes in {codes}; the two quantized rows {:.3e} rms apart{first}",
+        relative(dq, pack_dq).0
+    );
 }
 
 /// One f32 row as the card quantized it: the normed row and its q8_1 bytes.
@@ -1590,6 +1629,7 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
         let dq = dequant_q8_1(&row.bytes, weight.k());
         let q6 = matches!(weight.quant(), QuantType::Q6K);
         let pack_dq = dequant_mmq(&pack, weight.k(), 1, q6).remove(0);
+        pack_against_matvec(label, &pack, &row.bytes, &dq, &pack_dq, q6);
         let exact = projector.linear(cpu_weight, &row.normed).unwrap();
         let over_dq = projector.linear(cpu_weight, &dq).unwrap();
         let over_pack = projector.linear(cpu_weight, &pack_dq).unwrap();
@@ -1627,7 +1667,7 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
                 let stem = format!("blk.{block}");
                 let row = card_q8_row(
                     &ctx,
-                    &card[2 * il + 1],
+                    &card[2 * (il - 1) + 1],
                     raw(&loaded, &format!("{stem}.{norm}.weight")),
                     shape.eps,
                 );
@@ -1662,6 +1702,193 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
         eprintln!(
             "pos {pos} head replay against the saved logits row: max abs {:.2e}",
             max_abs_diff(&saved, &y_card)
+        );
+    }
+}
+
+// ---- The reference walk over the quantized model's activations ----------------------------------
+
+/// The reference walk as the card's decode step quantizes: every projection but the routers
+/// reads the q8_1 step of its row ([`cpu_q8_1`]), as `decode_inner` feeds `matvec_native`. The
+/// routers are F32 and read the normed row as it is; their handles are told by identity.
+struct Q8Projector<'a> {
+    plain: &'a mut GgufProjector,
+    plain_weights: Vec<usize>,
+    /// Projections behind the step, taken or not, and router calls that read the row.
+    stepped: usize,
+    routed: usize,
+    /// Whether a projection takes the step; off, the walk through the wrapper is the
+    /// reference walk.
+    step: bool,
+}
+
+impl<'a> Q8Projector<'a> {
+    fn new(plain: &'a mut GgufProjector, weights: &LoopWeights) -> Self {
+        let plain_weights = weights
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.mhc_attn.iter().chain(&layer.mhc_ffn))
+            .map(|router| std::ptr::from_ref(&router.weight) as usize)
+            .collect();
+        Q8Projector {
+            plain,
+            plain_weights,
+            stepped: 0,
+            routed: 0,
+            step: true,
+        }
+    }
+}
+
+impl Projector for Q8Projector<'_> {
+    type Weight = GgufMatrix;
+
+    fn linear(&mut self, weight: &GgufMatrix, x: &[f32]) -> Result<Vec<f32>, EngError> {
+        if self
+            .plain_weights
+            .contains(&(std::ptr::from_ref(weight) as usize))
+        {
+            self.routed += 1;
+            return self.plain.linear(weight, x);
+        }
+        self.stepped += 1;
+        if !self.step {
+            return self.plain.linear(weight, x);
+        }
+        self.plain.linear(weight, &cpu_q8_1(x).0)
+    }
+
+    fn expert_linear(
+        &mut self,
+        stack: &GgufMatrix,
+        expert: u32,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        self.plain.expert_linear(stack, expert, x)
+    }
+
+    fn rows(&mut self, table: &GgufMatrix, wanted: &[u32]) -> Result<Vec<f32>, EngError> {
+        self.plain.rows(table, wanted)
+    }
+}
+
+/// The prompt's positions 0 to 16 over `projector`: every position's logits row and every
+/// visit's branch and residual row, each token at its own position into one fresh state, as the
+/// position probe's reference went.
+fn saved_prompt_walk<P: Projector<Weight = GgufMatrix>>(
+    projector: &mut P,
+    weights: &LoopWeights,
+) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>) {
+    let mut state = LoopState::new(weights.shape(), weights.plan());
+    (0..=16)
+        .map(|pos| {
+            let mut trace = Vec::new();
+            let hidden = trunk_traced(
+                projector,
+                weights,
+                &mut state,
+                PROMPT[pos],
+                pos as u32,
+                &mut trace,
+            )
+            .unwrap();
+            (logits(projector, weights, &hidden).unwrap(), trace)
+        })
+        .unzip()
+}
+
+/// The identity run: the wrapper with the step off is the reference walk. Through position 16
+/// its logits rows and its visits must give the position probe's saved reference rows; then
+/// whatever the emulated walk changes comes from the step alone. CPU only; needs the saved rows
+/// and the model, and skips without them. About 36 min.
+#[test]
+fn identity_walk_is_the_reference_walk() {
+    let Ok(dir) = std::env::var("SENSENOVA_PROBE_ROWS") else {
+        eprintln!("skipped: set SENSENOVA_PROBE_ROWS to the position probe's saved rows");
+        return;
+    };
+    let Some((_, weights)) = open_host() else {
+        return;
+    };
+    let vocab = weights.shape().vocab;
+    let hidden = weights.shape().hidden;
+    let mut projector = weights.projector();
+    let mut identity = Q8Projector::new(&mut projector, &weights);
+    identity.step = false;
+    let (rows, traces) = saved_prompt_walk(&mut identity, &weights);
+    assert!(
+        identity.stepped > 0 && identity.routed > 0,
+        "the wrapper saw no projection"
+    );
+    let mut worst = 0.0f32;
+    for pos in 12..=16 {
+        let saved = load_rows(&dir, &format!("ref-{pos}"), vocab).remove(0);
+        let diff = max_abs_diff(&saved, &rows[pos]);
+        let visits = (14..=16).contains(&pos).then(|| {
+            load_rows(&dir, &format!("visits-ref-{pos}"), hidden)
+                .iter()
+                .zip(&traces[pos])
+                .map(|(a, b)| max_abs_diff(a, b))
+                .fold(0.0, f32::max)
+        });
+        eprintln!(
+            "pos {pos} identity walk against the saved reference row: max abs {diff:e}{}",
+            visits.map_or_else(String::new, |v| format!("; over its visit rows {v:e}"))
+        );
+        worst = worst.max(diff).max(visits.unwrap_or(0.0));
+    }
+    assert!(
+        worst < 1e-2,
+        "the wrapper moved the reference: max abs {worst:e}"
+    );
+}
+
+/// The reference walk over the quantized model's activations, CPU only, on the prompt the
+/// position probe traced. If the card's departure at 16 is what the quantizers' step does to
+/// this input, the emulated row stands as far from the reference as the card's; if it stands
+/// with the reference, the card adds something the rule does not have. Reports, and saves its
+/// logits rows as `emulated-{pos}` and its visits as `visits-emulated-{pos}` beside the others.
+#[test]
+fn emulated_walk_over_the_saved_prompt() {
+    let Ok(dir) = std::env::var("SENSENOVA_PROBE_ROWS") else {
+        eprintln!("skipped: set SENSENOVA_PROBE_ROWS to the position probe's saved rows");
+        return;
+    };
+    let Some((_, weights)) = open_host() else {
+        return;
+    };
+    let vocab = weights.shape().vocab;
+    let mut projector = weights.projector();
+    let mut emulated = Q8Projector::new(&mut projector, &weights);
+    let (rows, traces) = saved_prompt_walk(&mut emulated, &weights);
+    assert!(
+        emulated.stepped > 0 && emulated.routed > 0,
+        "the wrapper saw no projection"
+    );
+    eprintln!(
+        "{} projections read the q8_1 step, {} router calls the row",
+        emulated.stepped, emulated.routed
+    );
+    for pos in 12..=16 {
+        let reference = load_rows(&dir, &format!("ref-{pos}"), vocab).remove(0);
+        save_rows(&dir, &format!("emulated-{pos}"), one(&rows[pos]));
+        save_rows(&dir, &format!("visits-emulated-{pos}"), &traces[pos]);
+        let to_reference = max_abs_diff(&reference, &rows[pos]);
+        let card = (14..=16)
+            .contains(&pos)
+            .then(|| load_rows(&dir, &format!("logits-card-{pos}"), vocab).remove(0));
+        let to_card = match &card {
+            Some(card) => format!(
+                "{:9.4} (id {})",
+                max_abs_diff(card, &rows[pos]),
+                argmax(card)
+            ),
+            None => "        ---".to_string(),
+        };
+        eprintln!(
+            "pos {pos:2} emulated against the reference row: max abs {to_reference:9.4} (ids reference {} emulated {}); against the card's row: {to_card}",
+            argmax(&reference),
+            argmax(&rows[pos])
         );
     }
 }
