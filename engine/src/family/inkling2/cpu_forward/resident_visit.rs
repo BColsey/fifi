@@ -82,6 +82,7 @@ struct Controls {
 #[derive(Clone, Copy)]
 struct Shape {
     widths: LocalDecodeWidths,
+    global: bool,
     blocks: usize,
     bank_blocks: usize,
     bank_first: usize,
@@ -109,6 +110,7 @@ struct Layout {
     log: Region,
     mlp_raw: Region,
     attention_input: Region,
+    global_scratch: Option<([Region; 2], [Region; 2])>,
     messages: [Region; 4],
     attention_out: Region,
     mlp_input: Region,
@@ -135,6 +137,9 @@ impl Layout {
             log: take(4 * kv),
             mlp_raw: take(h),
             attention_input: take(h),
+            global_scratch: shape
+                .global
+                .then(|| ([h; 2].map(&mut take), [kv / 128 * 4; 2].map(&mut take))),
             messages: [h; 4].map(&mut take),
             attention_out: take(h),
             mlp_input: take(h),
@@ -154,6 +159,7 @@ impl Layout {
 struct Constants {
     device: DeviceBuffer,
     attention_query: Option<Region>,
+    global_roles: Option<([Region; 2], [Region; 2])>,
     bank_queries: [Region; 4],
     mlp_query: Region,
     attention: [Region; 6],
@@ -187,6 +193,22 @@ impl Constants {
                     .map(|row| pack(&row))
             })
             .transpose()?;
+        let global_roles = if plan.shape.global {
+            let query = physical
+                .checked_sub(1)
+                .ok_or_else(|| bad("banked global depth needs an attention query"))?;
+            let name = format!("model.llm.attn_res.attn_queries.{query}");
+            let [k, v] = [1, 2].map(|i| forward.weights.row(&name, i, h).map(|row| pack(&row)));
+            let [kg, vg] = ["k", "v"].map(|r| {
+                forward
+                    .weights
+                    .vec(&format!("{layer}.{r}_input_norm.weight"), h)
+                    .map(|row| pack(&row))
+            });
+            Some(([k?, v?], [kg?, vg?]))
+        } else {
+            None
+        };
         let [q, k, v, m] = [Role::Query, Role::Key, Role::Value, Role::Mlp]
             .map(|role| forward.control_query(physical, role).map(|row| pack(&row)));
         let mlp_query = pack(
@@ -216,6 +238,7 @@ impl Constants {
         Ok(Self {
             bank_queries: [q?, k?, v?, m?],
             attention_query,
+            global_roles,
             mlp_query,
             attention: [a?, b?, c?, d?, e?, f?],
             mlp: [gamma?, bias?, conv?],
@@ -310,6 +333,7 @@ impl Workspace {
         };
         let shape = Shape {
             widths,
+            global: visit.attention == Attention::Global,
             blocks,
             bank_blocks: bank.stream.block_count(),
             bank_first: bank.first_block,
@@ -593,32 +617,49 @@ impl Execution<'_> {
         let l = self.layout;
         let [gamma, q_scale, rel_scale, k_conv, v_conv, conv] = self.weights.attention;
         let [q, k, v, _] = l.messages;
-        cuda.enqueue_local_decode(
-            self.stream,
-            ResidentLocalDecode {
-                visit: self.plan.visit,
-                position,
-                math: self.plan.math,
-                input: self.row(input)?,
-                messages: Some([self.row(q)?, self.row(k)?, self.row(v)?]),
-                gammas: [self.weights.row(gamma)?; 3],
-                weights: PrepWeights {
-                    query_scale: self.weights.row(q_scale)?,
-                    relative_scale: self.weights.row(rel_scale)?,
-                    key_kernel: self.weights.row(k_conv)?,
-                    value_kernel: self.weights.row(v_conv)?,
-                },
-                raw_history: [self.row(l.histories[0])?, self.row(l.histories[1])?],
-                attn_conv: ConvRows {
-                    kernel: self.weights.row(conv)?,
-                    history: self.row(l.histories[2])?,
-                },
-                pos: self.row(l.pos)?,
-                out: self.row(l.attention_out)?,
-                log: self.row(l.log)?,
-                status: self.row(l.attention_status)?,
+        let mut request = ResidentLocalDecode {
+            visit: self.plan.visit,
+            position,
+            math: self.plan.math,
+            input: self.row(input)?,
+            messages: Some([self.row(q)?, self.row(k)?, self.row(v)?]),
+            gammas: [self.weights.row(gamma)?; 3],
+            weights: PrepWeights {
+                query_scale: self.weights.row(q_scale)?,
+                relative_scale: self.weights.row(rel_scale)?,
+                key_kernel: self.weights.row(k_conv)?,
+                value_kernel: self.weights.row(v_conv)?,
             },
-        )
+            raw_history: [self.row(l.histories[0])?, self.row(l.histories[1])?],
+            attn_conv: ConvRows {
+                kernel: self.weights.row(conv)?,
+                history: self.row(l.histories[2])?,
+            },
+            pos: self.row(l.pos)?,
+            out: self.row(l.attention_out)?,
+            log: self.row(l.log)?,
+            status: self.row(l.attention_status)?,
+        };
+        if let Some((queries, gammas)) = self.weights.global_roles {
+            let (inputs, coeff) = l
+                .global_scratch
+                .ok_or_else(|| bad("global decode lacks scratch"))?;
+            for (query, out) in queries.into_iter().zip(inputs) {
+                self.mix((l.depth, 0), self.plan.shape.blocks, query, out)?;
+            }
+            request.gammas = [
+                self.weights.row(gamma)?,
+                self.weights.row(gammas[0])?,
+                self.weights.row(gammas[1])?,
+            ];
+            return cuda.enqueue_banked_global(
+                self.stream,
+                request,
+                [self.row(inputs[0])?, self.row(inputs[1])?],
+                [self.row(coeff[0])?, self.row(coeff[1])?],
+            );
+        }
+        cuda.enqueue_local_decode(self.stream, request)
     }
 
     fn advance_depth(&self) -> Result<usize, EngError> {

@@ -84,7 +84,7 @@ pub(super) struct CpuForward {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     resident_visit: std::cell::RefCell<Option<resident_visit::Workspace>>,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    resident_pair: std::cell::RefCell<Option<resident_visit::Pair>>,
+    resident_pair: [std::cell::RefCell<Option<resident_visit::Pair>>; 2],
 }
 
 pub(super) struct PrefixState {

@@ -422,6 +422,7 @@ pub(super) struct ResidentWorkspace {
 /// The status sub-ranges the dense side writes into, with the zero gain and forget rows
 /// of a visit without a bank.
 pub(in crate::family::inkling2) struct ResidentStatus<'a> {
+    pub effective: [DeviceRange<'a>; 2],
     pub controller_health: DeviceRange<'a>,
     /// The six gate half health words; `None` without a bank.
     pub gate_health: Option<DeviceRange<'a>>,
@@ -633,6 +634,10 @@ impl ResidentAttention {
         dense(
             [qr, relative, sinks, gates],
             ResidentStatus {
+                effective: [
+                    AuxLayout::new(shape).range(2, aux)?,
+                    AuxLayout::new(shape).range(3, aux)?,
+                ],
                 controller_health: health.controller,
                 gate_health: health.gates,
                 zeros: store

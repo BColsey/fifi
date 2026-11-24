@@ -143,16 +143,17 @@ pub(in crate::family::inkling2::cuda_projection) enum ResidentLocalInputs<'a> {
 
 /// One resident visit: its rows, the three controllers (a bank only), the norm eps and
 /// the six attention projections.
-pub(in crate::family::inkling2::cuda_projection) struct ResidentLocal<'a> {
+pub(in crate::family::inkling2::cuda_projection) struct ResidentLocal<'a, const N: usize = 6> {
     pub inputs: ResidentLocalInputs<'a>,
     pub controllers: Option<[ControllerWeights<'a>; 3]>,
     pub eps: f32,
-    pub weights: [ResidentProjection<'a>; 6],
+    pub weights: [ResidentProjection<'a>; N],
 }
 
-pub(in crate::family::inkling2::cuda_projection) struct ResidentLocalTargets<'a> {
-    /// Query, raw K, raw V, relative, sinks and gates: the packed rows of one visit.
-    pub projections: [DeviceRange<'a>; 6],
+pub(in crate::family::inkling2::cuda_projection) struct ResidentLocalTargets<'a, const N: usize = 6>
+{
+    /// Q, raw K/V, relative, sinks, gates; global also projects dynamic K/V taps.
+    pub projections: [DeviceRange<'a>; N],
     /// `roles` health words of the controller norm.
     pub controller_health: DeviceRange<'a>,
     /// The six gate half health words; `None` without a bank.
@@ -229,6 +230,20 @@ impl DenseStep {
         local: ResidentLocal<'a>,
         targets: ResidentLocalTargets<'a>,
     ) -> Result<(), EngError> {
+        self.enqueue_roles_resident(context, stream, local, targets, None)
+    }
+
+    pub(in crate::family::inkling2::cuda_projection) fn enqueue_roles_resident<
+        'a,
+        const N: usize,
+    >(
+        &'a self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        local: ResidentLocal<'a, N>,
+        targets: ResidentLocalTargets<'a, N>,
+        role_inputs: Option<[DeviceRange<'a>; 3]>,
+    ) -> Result<(), EngError> {
         let ResidentLocal {
             inputs,
             controllers,
@@ -286,14 +301,16 @@ impl DenseStep {
                 for role in 0..3 {
                     require_rows("role", &[&messages[role], &gammas[role]], hidden)?;
                 }
-                self.norm_gates(context, stream, (input, messages, gate_health), hidden)?;
+                let roles = role_inputs.unwrap_or([*input; 3]);
+                require_rows("role input", &roles.each_ref(), hidden)?;
+                self.norm_gates(context, stream, (&roles, messages, gate_health), hidden)?;
                 for role in 0..3 {
                     let at = RAW_AT + 3 * role;
                     self.copy_rows(
                         context,
                         stream,
                         &[
-                            (input, at),
+                            (&roles[role], at),
                             (&messages[role], at + 1),
                             (&gammas[role], at + 2),
                         ],
@@ -352,11 +369,15 @@ impl DenseStep {
         &self,
         context: &CudaContext,
         stream: &DeviceStream,
-        (input, messages, health): (&DeviceRange<'_>, &[DeviceRange<'_>; 3], DeviceRange<'_>),
+        (inputs, messages, health): (
+            &[DeviceRange<'_>; 3],
+            &[DeviceRange<'_>; 3],
+            DeviceRange<'_>,
+        ),
         hidden: usize,
     ) -> Result<(), EngError> {
         for role in 0..3 {
-            for (half, src) in [input, &messages[role]].into_iter().enumerate() {
+            for (half, src) in [&inputs[role], &messages[role]].into_iter().enumerate() {
                 let at = (2 * role + half) * hidden;
                 let dst = self.range(Slot::Output, at, hidden)?;
                 let health =

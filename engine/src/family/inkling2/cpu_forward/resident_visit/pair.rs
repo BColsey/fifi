@@ -34,14 +34,21 @@ impl CpuForward {
         let Some(cuda) = weights.cuda() else {
             return Ok(false);
         };
-        let mut cached = self.resident_pair.borrow_mut();
+        if visits[0].attention != Attention::Local {
+            return Ok(false);
+        }
+        let global = visits[1].attention == Attention::Global;
+        let mut cached = self.resident_pair[usize::from(global)].borrow_mut();
         let pos = states[visits[0].state_slot].position();
         if cached
             .as_ref()
             .is_some_and(|p| p.visits[0].plan.visit.state_slot != visits[0].state_slot)
             || visits.iter().any(|v| {
                 states[v.state_slot].position() != pos
-                    || !cuda.resident_local_decode_supported(*v, pos)
+                    || !match v.attention {
+                        Attention::Local => cuda.resident_local_decode_supported(*v, pos),
+                        Attention::Global => cuda.resident_global_supported(*v, pos),
+                    }
             })
         {
             return Ok(false);
@@ -64,14 +71,14 @@ impl CpuForward {
                 output.history,
                 (
                     self.math.sconv_kernel_size - 1,
-                    self.kv_capacity(Attention::Local),
+                    self.kv_capacity(visit.attention),
                 ),
             );
             depth.publish_resident_current(output.current, workspace.plan.shape.seal);
         }
         pair.lineage = visits.map(|v| states[v.state_slot].resident_history_identity());
-        static USED: Once = Once::new();
-        USED.call_once(|| {
+        static USED: [Once; 2] = [Once::new(), Once::new()];
+        USED[usize::from(global)].call_once(|| {
             eprintln!(
                 "Inkling CUDA used resident decode pair: slots {} and {}, one completion fence",
                 visits[0].state_slot, visits[1].state_slot

@@ -254,6 +254,19 @@ impl CudaContext {
         })
     }
 
+    pub(crate) fn inkling_effective_taps(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 3],
+        width: usize,
+    ) -> Result<(), EngError> {
+        let [a, b, c] = ranges.each_ref().map(|r| self.raw_range(r));
+        let rows = [a?, b?, c?];
+        self.launch_on(stream, |s| {
+            resident::inkling_local_prep::effective_taps(s, rows, width)
+        })
+    }
+
     pub(crate) fn inkling_local_prep(
         &self,
         stream: &DeviceStream,

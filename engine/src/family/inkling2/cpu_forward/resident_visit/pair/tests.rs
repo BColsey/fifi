@@ -7,6 +7,16 @@ use crate::family::inkling2::cpu_forward::TapRow;
 #[test]
 #[ignore = "requires leased CUDA, packed resident Inkling Mini and FIFI_INKLING_MODEL_DIR"]
 fn real_consecutive_banked_rows() {
+    compare(0);
+}
+
+#[test]
+#[ignore = "requires leased CUDA, packed resident Inkling Mini and FIFI_INKLING_MODEL_DIR"]
+fn real_consecutive_banked_global_rows() {
+    compare(4);
+}
+
+fn compare(skip: usize) {
     let run = |candidate| {
         let path = std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap();
         let mut f = CpuForward::open(std::path::Path::new(&path), 768).unwrap();
@@ -39,7 +49,12 @@ fn real_consecutive_banked_rows() {
             first_block: depth.block_count() + 1,
             stream: first_pass,
         };
-        let pair = [f.visits[core.core_end], f.visits[core.core_end + 1]];
+        for &v in &f.visits[core.core_end..core.core_end + skip] {
+            f.layer(v, &mut state[v.state_slot], &mut depth, Some(&bank), true)
+                .unwrap();
+        }
+        let first = core.core_end + skip;
+        let pair = [f.visits[first], f.visits[first + 1]];
         if candidate {
             assert!(
                 f.try_resident_pair(pair, &mut state, &mut depth, &bank)

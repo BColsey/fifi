@@ -3,7 +3,9 @@
 //! device memory. Nothing here uploads, downloads or synchronizes; non-finite values
 //! surface in the request's status words, which the caller reads once per token.
 //!
-//! Global visits keep the host-entry chain.
+//! The banked global variant uses separate role rows and dynamic taps.
+
+mod global;
 
 use crate::{
     EngError,
@@ -187,6 +189,14 @@ impl GgufCuda {
         if visit.attention != Attention::Local {
             return Err(bad("resident local decode needs an Attention::Local visit"));
         }
+        self.resident_decode_parts(visit, position)
+    }
+
+    fn resident_decode_parts(
+        &self,
+        visit: LayerVisit,
+        position: usize,
+    ) -> Result<(&ResidentAttention, LocalShape, OutputProjection<'_>), EngError> {
         let attention = self
             .resident_attention
             .as_ref()
@@ -291,12 +301,34 @@ impl GgufCuda {
         let widths = self
             .resident_local_decode_widths(visit)
             .ok_or_else(|| bad("resident local decode needs resident attention"))?;
+        let global = visit.attention == Attention::Global;
         let rows = [
-            ("attn_norm.weight", widths.hidden),
+            (
+                if global {
+                    "q_input_norm.weight"
+                } else {
+                    "attn_norm.weight"
+                },
+                widths.hidden,
+            ),
             ("attn.q_l2_clip.scale", widths.query_channels),
             ("attn.rel_l2_clip.scale", widths.relative_words),
-            ("attn.k_sconv.weight", widths.kv_channels * widths.taps),
-            ("attn.v_sconv.weight", widths.kv_channels * widths.taps),
+            (
+                if global {
+                    "attn.k_sconv.static_w"
+                } else {
+                    "attn.k_sconv.weight"
+                },
+                widths.kv_channels * widths.taps,
+            ),
+            (
+                if global {
+                    "attn.v_sconv.static_w"
+                } else {
+                    "attn.v_sconv.weight"
+                },
+                widths.kv_channels * widths.taps,
+            ),
             ("attn_sconv.weight", widths.hidden * widths.taps),
         ];
         Ok(rows.map(|(name, words)| (format!("{layer}.{name}"), words)))

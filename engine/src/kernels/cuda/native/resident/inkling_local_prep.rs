@@ -6,6 +6,12 @@ use crate::kernels::cuda::resident::inkling_local_prep::{
 };
 
 unsafe extern "C" {
+    fn inference_cuda_inkling_effective_taps(
+        ranges: *const *mut c_void,
+        width: c_int,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_inkling_weighted_norm(
         ranges: *const *mut c_void,
         rows: c_int,
@@ -186,6 +192,29 @@ pub(in crate::kernels::cuda) fn output_conv(
             shape.width as c_int,
             shape.history as c_int,
             scale,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+pub(in crate::kernels::cuda) fn effective_taps(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 3],
+    width: usize,
+) -> Result<(), DeviceFailure> {
+    if !(128..=128 * 128).contains(&width) || !width.is_multiple_of(128) {
+        return Err(invalid_argument());
+    }
+    validate_f32_ranges(&ranges, [4 * width, 4 * (width / 128), 4 * width])?;
+    let ptrs = ranges.map(|r| r.address());
+    let mut stage = STAGE_NONE;
+    // SAFETY: lengths, alignment and disjointness were checked above; ptrs lives across the call.
+    let status = unsafe {
+        inference_cuda_inkling_effective_taps(
+            ptrs.as_ptr(),
+            width as c_int,
             stream.0.as_ptr(),
             &mut stage,
         )
