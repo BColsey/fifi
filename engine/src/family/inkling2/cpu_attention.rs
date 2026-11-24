@@ -71,6 +71,11 @@ pub(super) struct VisitState {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     position: usize,
     conv: VisitConvs,
+    /// Set while the K/V rows and the four convolution histories of this visit exist only in
+    /// the device ring and the resident token arenas, so the deques above are empty. Every
+    /// host-orchestrated consumer calls `CpuForward::materialize_resident` first.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    resident: bool,
 }
 
 /// The parts of one visit overwritten by one forward row.
@@ -732,6 +737,51 @@ impl VisitState {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn is_resident(&self) -> bool {
+        self.resident
+    }
+
+    /// The device committed the row at `position`; the host keeps the cursor only.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn advance_resident(&mut self) {
+        self.keys.clear();
+        self.values.clear();
+        self.conv = VisitConvs::default();
+        self.position += 1;
+        self.resident = true;
+    }
+
+    /// Adopts rows read back from the device. `keys` and `values` run oldest last, as the
+    /// ring yields them; each history plane runs newest first, as its arena holds it (the
+    /// device keeps the raw samples, newest in row 0). The deques are newest first.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn adopt_resident(
+        &mut self,
+        (keys, values): (Vec<Vec<f32>>, Vec<Vec<f32>>),
+        [k, v, attn, mlp]: [Vec<Vec<f32>>; 4],
+        (past, capacity): (usize, usize),
+    ) {
+        debug_assert!(self.resident && self.keys.is_empty() && self.conv.k.0.is_empty());
+        self.keys = keys.into_iter().rev().map(Arc::new).collect();
+        self.values = values.into_iter().rev().map(Arc::new).collect();
+        self.keys.truncate(capacity);
+        self.values.truncate(capacity);
+        for (history, rows) in [
+            &mut self.conv.k.0,
+            &mut self.conv.v.0,
+            &mut self.conv.attn.0,
+            &mut self.conv.mlp.0,
+        ]
+        .into_iter()
+        .zip([k, v, attn, mlp])
+        {
+            *history = rows.into_iter().collect();
+            history.truncate(past);
+        }
+        self.resident = false;
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_history_identity(&self) -> Option<std::sync::Weak<Vec<f32>>> {
         self.keys.front().map(Arc::downgrade)
     }
@@ -776,6 +826,25 @@ impl VisitState {
                     .flat_map(|rows| rows.iter().map(Vec::as_slice)),
             )
             .collect()
+    }
+
+    /// `shadow_rows` by plane: keys, values, then the four convolution histories.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn shadow_planes(&self) -> [Vec<&[f32]>; 6] {
+        fn owned<'a>(rows: &'a VecDeque<Arc<Vec<f32>>>) -> Vec<&'a [f32]> {
+            rows.iter().map(|row| row.as_slice()).collect()
+        }
+        fn conv<'a>(rows: &'a VecDeque<Vec<f32>>) -> Vec<&'a [f32]> {
+            rows.iter().map(Vec::as_slice).collect()
+        }
+        [
+            owned(&self.keys),
+            owned(&self.values),
+            conv(&self.conv.k.0),
+            conv(&self.conv.v.0),
+            conv(&self.conv.attn.0),
+            conv(&self.conv.mlp.0),
+        ]
     }
 
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -838,6 +907,9 @@ impl VisitState {
         {
             self.position -= 1;
         }
+        // A resident state has no host rows to undo; its first host consumer materializes.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        debug_assert!(!self.resident);
         self.conv = VisitConvs {
             k,
             v,
@@ -854,6 +926,7 @@ impl VisitState {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         {
             self.position += 1;
+            self.resident = false;
         }
     }
 }

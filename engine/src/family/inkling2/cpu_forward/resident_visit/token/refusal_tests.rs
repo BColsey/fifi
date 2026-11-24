@@ -12,7 +12,7 @@ fn warm() -> CpuForward {
 #[ignore = "leased real GGUF; bracketed CUDA events for no-launch trace"]
 fn refusals_before_work() {
     let mut f = warm();
-    let saved = f.snapshot();
+    let saved = f.snapshot().unwrap();
     let Weights::Gguf(w) = &f.weights else {
         panic!("expected GGUF")
     };
@@ -55,7 +55,7 @@ fn refusals_before_work() {
 #[ignore = "leased real GGUF"]
 fn partial_enqueue_invalidates_work_without_host_retry() {
     let mut f = warm();
-    let saved = f.snapshot();
+    let saved = f.snapshot().unwrap();
     assert!(f.admit_resident_token().unwrap());
     let ws = f.resident_token.as_mut().unwrap();
     let before = ws.stream.enqueued();

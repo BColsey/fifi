@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Default)]
-struct Error {
+pub(super) struct Error {
     n: usize,
     exact: usize,
     max: f64,
@@ -9,7 +9,7 @@ struct Error {
     norm: f64,
 }
 impl Error {
-    fn rows(&mut self, a: &[f32], b: &[f32]) {
+    pub(super) fn rows(&mut self, a: &[f32], b: &[f32]) {
         assert_eq!(a.len(), b.len());
         for (&a, &b) in a.iter().zip(b) {
             assert!(a.is_finite() && b.is_finite());
@@ -21,7 +21,10 @@ impl Error {
             self.norm += f64::from(a).powi(2);
         }
     }
-    fn check(self, what: &str, max: f64, l2: f64) {
+    pub(super) fn max_abs(&self) -> f64 {
+        self.max
+    }
+    pub(super) fn check(self, what: &str, max: f64, l2: f64) {
         let rel = (self.diff / self.norm).sqrt();
         eprintln!(
             "{what}: exact={}/{} max_abs={} rel_l2={rel} limits={max},{l2}",
@@ -44,7 +47,7 @@ fn shadow_snapshot_restore_and_resume() {
         f.token(1, false).unwrap();
         let mut logits = Vec::new();
         logits.push(f.token(2, true).unwrap().unwrap());
-        let saved = f.snapshot();
+        let saved = f.snapshot().unwrap();
         logits.push(f.token(3, true).unwrap().unwrap());
         logits.push(f.token(4, true).unwrap().unwrap());
         f.restore(&saved);
@@ -62,6 +65,10 @@ fn shadow_snapshot_restore_and_resume() {
         );
         logits.push(f.token(6, true).unwrap().unwrap());
         assert_eq!(f.resident_token.is_some(), !oracle);
+        // A committed chain token leaves its rows on the device; the host reads them back on demand.
+        assert_eq!(f.state.iter().any(VisitState::is_resident), !oracle);
+        f.materialize_resident().unwrap();
+        assert!(!f.state.iter().any(VisitState::is_resident));
         (logits, saved.visits, f.state)
     };
     let (reference, sa, fa) = run(true);

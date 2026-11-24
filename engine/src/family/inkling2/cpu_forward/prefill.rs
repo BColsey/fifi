@@ -194,6 +194,9 @@ impl CpuForward {
                 "a previous Inkling forward invalidated the sequence state",
             ));
         }
+        // Prefill reads host rows; a chain token left them on the device.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.materialize_resident()?;
         if tokens.len() < 2
             || tokens.len() > self.context.saturating_sub(self.position)
             || tokens
@@ -806,10 +809,10 @@ fn grouped_draft_prefill_matches_serial_taps_and_restored_state() {
     assert!(!model.supports_grouped_prefill());
 
     model.feed_rows(&[1, 2, 3]).unwrap();
-    let prefix = model.snapshot();
+    let prefix = model.snapshot().unwrap();
     let suffix = [4, 5, 6, 7, 8, 9];
     model.feed_rows(&suffix).unwrap();
-    let serial = model.snapshot();
+    let serial = model.snapshot().unwrap();
     let logits = model.logits(10).unwrap();
     assert_eq!(serial.features.len(), serial.position);
     assert!(
@@ -894,7 +897,7 @@ fn grouped_prefill_matches_serial_logits_and_restored_state() {
         for &token in &tokens[..3] {
             model.token(token, false).unwrap();
         }
-        let prefix = model.snapshot();
+        let prefix = model.snapshot().unwrap();
         for _ in 0..2 {
             model.restore(&prefix);
             for chunk in tokens[3..].chunks(width + 1) {
@@ -945,7 +948,7 @@ fn device_grouped_prefill_last_logits() {
     assert!(model.supports_grouped_prefill());
     let (prefix, tail) = tokens.split_at(prefix_rows);
     model.prefill_grouped(prefix).unwrap();
-    let saved = model.snapshot();
+    let saved = model.snapshot().unwrap();
     let trace = env::var("FIFI_INKLING_TEST_VISIT_FINGERPRINT").as_deref() == Ok("1");
     if trace {
         eprintln!(

@@ -315,7 +315,7 @@ mod tests {
             assert!(target.prefill_grouped(&[1, 2]).is_err());
         }
         target.feed_rows(&[1, 2]).unwrap();
-        let base = target.snapshot();
+        let base = target.snapshot().unwrap();
         let mut sampler = Sampler::greedy();
         let vocab = target.vocab_size() as usize;
 
@@ -332,7 +332,7 @@ mod tests {
             );
             input = sampler.sample(&logits).unwrap();
             solo_draws.push(input);
-            solo_states.push(target.snapshot());
+            solo_states.push(target.snapshot().unwrap());
         }
 
         for (drafts, kept) in [

@@ -1,7 +1,9 @@
 //! Whole-token transaction. Depth writes are in-place on alternating pass
-//! planes. Sealed prelude, previous-pass bank, and each visit's convolution
-//! state never cross PCIe during the chain. One coalesced receipt contains
-//! logits, status words, and the raw rows needed to rebuild host state.
+//! planes. Sealed prelude, previous-pass bank, and each visit's K/V rows and
+//! convolution state never cross PCIe during the chain. One coalesced readback
+//! holds the logits and every status word. A committed token leaves the device
+//! owning the rows; the host keeps cursors until an explicit event calls
+//! [`TokenWorkspace::materialize`].
 mod admission;
 mod shadow;
 use super::*;
@@ -12,10 +14,20 @@ struct Slot {
     active: usize,
     save: bool,
     restart: bool,
+    /// Journal copy of the arena status words that run up to `layout.log`.
     receipt: Region,
-    attn_raw: Region,
-    attention: Region,
-    residual: Region,
+    status_bytes: usize,
+}
+
+/// What the host needs to adopt rows read back from the device.
+pub(in super::super) struct Cursor<'a> {
+    pub(super) states: &'a mut [VisitState],
+    /// Committed rows: `0..position` are in each ring.
+    pub(super) position: usize,
+    /// Rows kept per convolution history.
+    pub(super) past: usize,
+    /// K/V ring capacity per visit slot.
+    pub(super) capacities: &'a [usize],
 }
 
 pub(in super::super) struct TokenWorkspace {
@@ -31,9 +43,10 @@ pub(in super::super) struct TokenWorkspace {
     journal: DeviceBuffer,
     pinned: PinnedBuf,
     logits: Region,
-    initial: Region,
     health: Region,
-    lineage: Vec<Option<std::sync::Weak<Vec<f32>>>>,
+    /// Per slot: the arenas hold the histories of the slot's last committed token, so the next
+    /// chain token skips the boot upload. Cleared when the host materializes rows.
+    warm: Vec<bool>,
 }
 
 impl TokenWorkspace {
@@ -106,8 +119,10 @@ impl TokenWorkspace {
         let geometry = Self::layout(f);
         if f.visits.iter().zip(&geometry).any(|(&v, g)| {
             states[v.state_slot].position() != f.position
+                || states[v.state_slot].is_resident()
                 || !Self::eligible(cuda, v, f.position, g.3.is_some())
         }) {
+            // A resident state has no host rows to boot from; the host path materializes first.
             return Ok(None);
         }
         let Weights::Gguf(weights) = &f.weights else {
@@ -120,7 +135,6 @@ impl TokenWorkspace {
         let mut end = 0;
         let logits = reserve(&mut end, vocab);
         let health = reserve(&mut end, 4);
-        let initial = reserve(&mut end, h);
         let (mut slots, mut depth_bytes, mut prelude_bytes, mut cold_bytes) = (Vec::new(), 0, 0, 8);
         for (&visit, (save, restart, blocks, bank, active)) in f.visits.iter().zip(geometry) {
             let Some(w) = Workspace::open_geometry(f, cuda, visit, blocks, bank)? else {
@@ -131,16 +145,15 @@ impl TokenWorkspace {
                 prelude_bytes = (blocks + 1) * h * WORD;
             }
             cold_bytes += w.layout.histories.iter().map(|r| r.bytes).sum::<usize>();
-            let receipt = reserve(&mut end, w.layout.receipts().bytes / WORD);
+            let status_bytes = w.layout.log.start - w.layout.attention_status.start;
+            let receipt = reserve(&mut end, status_bytes / WORD);
             slots.push(Slot {
                 w,
                 active,
                 save,
                 restart,
                 receipt,
-                attn_raw: reserve(&mut end, h),
-                attention: reserve(&mut end, h),
-                residual: reserve(&mut end, h),
+                status_bytes,
             });
         }
         let mut c = Vec::new();
@@ -154,7 +167,7 @@ impl TokenWorkspace {
         let constants = ctx.upload(&c)?;
         let zeros = slots
             .iter()
-            .map(|s| s.w.layout.log.start - s.w.layout.attention_status.start)
+            .map(|s| s.status_bytes)
             .max()
             .unwrap_or(0)
             .max(health.bytes);
@@ -176,7 +189,7 @@ impl TokenWorkspace {
             return Ok(None);
         }
         Ok(Some(Self {
-            lineage: vec![None; slots.len()],
+            warm: vec![false; slots.len()],
             slots,
             stream,
             depth,
@@ -188,7 +201,6 @@ impl TokenWorkspace {
             scratch,
             journal,
             pinned,
-            initial,
             logits,
             health,
         }))
@@ -223,15 +235,14 @@ impl TokenWorkspace {
         let mut input = Vec::new();
         input.extend(id.to_ne_bytes());
         input.extend(pos.to_ne_bytes());
-        for (slot, identity) in self.slots.iter().zip(&mut self.lineage) {
+        for (slot, warm) in self.slots.iter().zip(&mut self.warm) {
             let w = &slot.w;
             let s = &states[w.plan.visit.state_slot];
-            let warm = identity
-                .take()
-                .zip(s.resident_history_identity())
-                .is_some_and(|(a, b)| a.ptr_eq(&b));
-            if warm {
+            if std::mem::take(warm) && s.is_resident() {
                 continue;
+            }
+            if s.is_resident() {
+                return Err(bad("resident token rows have no device lineage"));
             }
             let at = input.len();
             for (region, history) in w
@@ -296,11 +307,6 @@ impl TokenWorkspace {
                 h,
                 f.math.rms_norm_eps,
             )?;
-            ctx.copy_device(
-                stream,
-                self.depth[0].range(0, row)?,
-                self.initial.device(&self.journal)?,
-            )?;
             for s in &self.slots {
                 let w = &s.w;
                 let l = &w.layout;
@@ -319,12 +325,8 @@ impl TokenWorkspace {
                         d.range(0, self.prelude_bytes)?,
                     )?;
                 }
-                let bytes = l.log.start - l.attention_status.start;
-                ctx.copy_device(
-                    stream,
-                    params.range(8, bytes)?,
-                    w.arena.range(l.attention_status.start, bytes)?,
-                )?;
+                let status = w.arena.range(l.attention_status.start, s.status_bytes)?;
+                ctx.copy_device(stream, params.range(8, s.status_bytes)?, status)?;
                 let b = &self.depth[s.active ^ 1];
                 Execution {
                     plan: &w.plan,
@@ -340,14 +342,7 @@ impl TokenWorkspace {
                     }),
                 }
                 .enqueue(cuda, f.position)?;
-                for (from, to) in [
-                    (l.receipts(), s.receipt),
-                    (l.histories[2].row(h), s.attn_raw),
-                    (l.attention_out, s.attention),
-                    (l.mlp_conv, s.residual),
-                ] {
-                    ctx.copy_device(stream, from.device(&w.arena)?, to.device(&self.journal)?)?;
-                }
+                ctx.copy_device(stream, status, s.receipt.device(&self.journal)?)?;
             }
             let last = self.slots.last().ok_or_else(|| bad("empty token chain"))?;
             let shape = last.w.plan.shape;
@@ -398,7 +393,7 @@ impl TokenWorkspace {
         for s in &self.slots {
             check(Region {
                 start: s.receipt.start,
-                bytes: s.w.layout.log.start - s.w.layout.attention_status.start,
+                bytes: s.status_bytes,
             })?;
         }
         let logits = self.logits.read(&self.pinned)?;
@@ -407,8 +402,88 @@ impl TokenWorkspace {
         }
         Ok(logits)
     }
+
+    /// Makes the device the owner of the committed rows. Call only after `run` returned its
+    /// logits, so every status word and the fence passed before a host cursor moves.
+    pub(in super::super) fn commit(
+        &mut self,
+        f: &CpuForward,
+        cuda: &GgufCuda,
+        states: &mut [VisitState],
+    ) {
+        for (index, s) in self.slots.iter().enumerate() {
+            states[s.w.plan.visit.state_slot].advance_resident();
+            cuda.publish_local_decode(s.w.plan.visit, f.position);
+            self.warm[index] = true;
+        }
+    }
+
+    /// Reads the K/V rows and the four convolution histories of every resident visit back
+    /// into the host state. Explicit events only: a snapshot, the host-orchestrated path, or a
+    /// prefill after a chain token. `restore` and `reset` replace the sequence instead.
+    pub(in super::super) fn materialize(
+        &mut self,
+        cuda: &GgufCuda,
+        cursor: Cursor<'_>,
+    ) -> Result<(), EngError> {
+        let Cursor {
+            mut states,
+            position,
+            past,
+            capacities,
+        } = cursor;
+        let arenas: Vec<usize> = self
+            .slots
+            .iter()
+            .map(|s| s.w.plan.visit.state_slot)
+            .collect();
+        if states
+            .iter()
+            .enumerate()
+            .any(|(slot, state)| state.is_resident() && !arenas.contains(&slot))
+        {
+            return Err(bad("resident visit rows have no token arena"));
+        }
+        let Some((_, attention)) = cuda.resident_attention() else {
+            return Err(bad("resident visit rows have no device attention"));
+        };
+        for s in &self.slots {
+            let slot = s.w.plan.visit.state_slot;
+            if !states[slot].is_resident() {
+                continue;
+            }
+            let (keys, values) = attention.download_ring(&self.stream, slot, position)?;
+            let rows = position.min(past);
+            let mut histories = Vec::with_capacity(s.w.layout.histories.len());
+            for region in s.w.layout.histories {
+                let width = region.bytes / WORD / past;
+                let mut bytes = vec![0u8; region.bytes];
+                s.w.arena.read_at(&self.stream, region.start, &mut bytes)?;
+                let plane: Vec<Vec<f32>> = bytes
+                    .chunks_exact(width * WORD)
+                    .take(rows)
+                    .map(|row| {
+                        row.chunks_exact(WORD)
+                            .map(|w| f32::from_ne_bytes(w.try_into().unwrap()))
+                            .collect()
+                    })
+                    .collect();
+                histories.push(plane);
+            }
+            let [k, v, attn, mlp] = <[Vec<Vec<f32>>; 4]>::try_from(histories).unwrap();
+            states[slot].adopt_resident(
+                (keys, values),
+                [k, v, attn, mlp],
+                (past, capacities[slot]),
+            );
+        }
+        self.warm.fill(false);
+        Ok(())
+    }
 }
 
+#[cfg(test)]
+mod materialize_tests;
 #[cfg(test)]
 mod refusal_tests;
 #[cfg(test)]

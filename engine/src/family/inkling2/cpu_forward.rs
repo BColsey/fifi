@@ -296,17 +296,22 @@ impl CpuForward {
             .ok_or_else(|| EngError::MemoryPlan("Inkling host state size overflows".into()))
     }
 
-    pub(super) fn snapshot(&self) -> PrefixState {
-        PrefixState {
+    pub(super) fn snapshot(&mut self) -> Result<PrefixState, EngError> {
+        self.materialize_resident()?;
+        Ok(PrefixState {
             position: self.position,
             visits: self.state.clone(),
             features: self.features.clone(),
-        }
+        })
     }
 
     pub(super) fn restore(&mut self, saved: &PrefixState) {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.invalidate_device_attention();
+        // The saved host rows replace the sequence wholesale; device-only rows are dropped with
+        // their cursors, so no visit stays resident.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        debug_assert!(saved.visits.iter().all(|state| !state.is_resident()));
         self.window = None;
         self.features.clone_from(&saved.features);
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -359,6 +364,9 @@ impl CpuForward {
         if collect_logits && self.admit_resident_token()? {
             return self.commit_resident_token(id).map(Some);
         }
+        // The host-orchestrated path below reads host rows; a chain token left them on the device.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.materialize_resident()?;
         self.window = None;
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);

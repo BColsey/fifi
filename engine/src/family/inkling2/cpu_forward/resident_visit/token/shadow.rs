@@ -51,7 +51,7 @@ impl CpuForward {
                 .cuda_projection()
                 .and_then(|p| p.begin_token().map(|start| (p, start)));
             let logits = ws.run(self, cuda, &states, id)?;
-            ws.replay(self, cuda, &mut states)?;
+            ws.commit(self, cuda, &mut states);
             if let Some((p, start)) = profile {
                 p.end_token(start, self.position, true);
             }
@@ -73,60 +73,47 @@ impl CpuForward {
     }
 }
 
-impl TokenWorkspace {
-    fn replay(
+impl CpuForward {
+    /// Brings rows that only the device holds after a chain token back to the host state.
+    /// Every host-orchestrated consumer calls it first; it is a no-op while no visit is resident.
+    pub(in crate::family::inkling2::cpu_forward) fn materialize_resident(
         &mut self,
-        f: &CpuForward,
-        cuda: &GgufCuda,
-        states: &mut [VisitState],
     ) -> Result<(), EngError> {
-        // All device status words and the logits have passed before a single
-        // host cursor is advanced. Decode the journal only after that fence.
-        let mut depth = Stream::new(self.initial.read(&self.pinned)?, f.cache_depth_mix);
-        let mut prelude = None;
-        for (index, s) in self.slots.iter().enumerate() {
-            let w = &s.w;
-            let visit = w.plan.visit;
-            let l = &w.layout;
-            if s.save {
-                prelude = Some(depth.clone());
-            }
-            if s.restart {
-                depth = prelude.as_ref().expect("saved prelude").clone();
-            }
-            let attention = s.attention.read(&self.pinned)?;
-            if w.plan.shape.seal {
-                depth.seal(attention);
-            } else {
-                depth.add_current(&attention);
-            }
-            depth.add_current(&s.residual.read(&self.pinned)?);
-            let receipt_row = |start, bytes| {
-                Region {
-                    start: s.receipt.start + (start - l.attention_status.start),
-                    bytes,
-                }
-                .read(&self.pinned)
-            };
-            let kv = w.plan.shape.widths.kv_channels * WORD;
-            let [raw_k, raw_v, k, v] = [0, 1, 2, 3].map(|i| receipt_row(l.log.start + i * kv, kv));
-            let state = &mut states[visit.state_slot];
-            state.publish_resident_visit(
-                [
-                    raw_k?,
-                    raw_v?,
-                    k?,
-                    v?,
-                    s.attn_raw.read(&self.pinned)?,
-                    receipt_row(l.mlp_raw.start, l.mlp_raw.bytes)?,
-                ],
-                (f.math.sconv_kernel_size - 1, f.kv_capacity(visit.attention)),
-            );
-            self.lineage[index] = state.resident_history_identity();
+        if !self.state.iter().any(VisitState::is_resident) {
+            return Ok(());
         }
-        for s in &self.slots {
-            cuda.publish_local_decode(s.w.plan.visit, f.position);
-        }
-        Ok(())
+        let Weights::Gguf(w) = &self.weights else {
+            return Err(bad("resident rows without GGUF weights"));
+        };
+        let Some(cuda) = w.cuda() else {
+            return Err(bad("resident rows without the CUDA projection"));
+        };
+        let past = self.math.sconv_kernel_size - 1;
+        let capacities: Vec<usize> = (0..self.state.len())
+            .map(|slot| {
+                self.visits
+                    .iter()
+                    .find(|v| v.state_slot == slot)
+                    .map_or(0, |v| self.kv_capacity(v.attention))
+            })
+            .collect();
+        let mut states = std::mem::take(&mut self.state);
+        let position = self.position;
+        let outcome = self.resident_token.as_mut().map_or(
+            Err(bad("resident rows without the token arenas")),
+            |ws| {
+                ws.materialize(
+                    cuda,
+                    Cursor {
+                        states: &mut states,
+                        position,
+                        past,
+                        capacities: &capacities,
+                    },
+                )
+            },
+        );
+        self.state = states;
+        outcome
     }
 }

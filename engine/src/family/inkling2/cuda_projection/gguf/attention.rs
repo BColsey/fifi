@@ -353,6 +353,55 @@ impl ResidentAttention {
         }
     }
 
+    /// The K and V rows of one visit's ring at `position`, oldest last, read behind the work
+    /// queued on `stream`, which must be the stream that appended the rows. Only explicit host
+    /// events call it; a chain token keeps these rows on the device.
+    pub(in crate::family::inkling2) fn download_ring(
+        &self,
+        stream: &DeviceStream,
+        slot: usize,
+        position: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), EngError> {
+        let visit = self
+            .visits
+            .get(slot)
+            .ok_or_else(|| bad("unknown visit slot"))?;
+        let capacity = visit.shape.capacity;
+        let row_bytes = visit.cache_bytes / capacity;
+        let first = position.saturating_sub(capacity);
+        let rows = position - first;
+        let row_words = row_bytes / size_of::<f32>();
+        let mut planes = Vec::with_capacity(2);
+        for plane in 0..2 {
+            let base = visit.cache_at + plane * visit.cache_bytes;
+            let mut bytes = vec![0u8; rows * row_bytes];
+            let mut read = 0;
+            for (at, count) in ring_splits(first % capacity, rows, capacity) {
+                if count > 0 {
+                    self.arena.read_at(
+                        stream,
+                        base + at * row_bytes,
+                        &mut bytes[read..read + count * row_bytes],
+                    )?;
+                    read += count * row_bytes;
+                }
+            }
+            planes.push(
+                bytes
+                    .chunks_exact(row_bytes)
+                    .map(|row| {
+                        row.chunks_exact(size_of::<f32>())
+                            .map(|word| f32::from_ne_bytes(word.try_into().unwrap()))
+                            .collect::<Vec<f32>>()
+                    })
+                    .collect::<Vec<Vec<f32>>>(),
+            );
+            debug_assert_eq!(planes[plane].len(), rows);
+        }
+        let [keys, values]: [Vec<Vec<f32>>; 2] = planes.try_into().unwrap();
+        Ok((keys, values))
+    }
+
     pub(in crate::family::inkling2) fn step(
         &self,
         context: &CudaContext,
