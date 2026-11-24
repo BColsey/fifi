@@ -67,7 +67,10 @@ __global__ void inkling_conv_kernel(const float *input, const float *kernel, flo
     // The host norm, (taps + 1) as f32 then sqrt then recip, each step rounded to nearest even.
     const float norm = __frcp_rn(__fsqrt_rn(__fadd_rn(static_cast<float>(taps), 1.0f)));
     int invalid = 0;
-    for (int c = threadIdx.x; c < width; c += threads) {
+    // Blocks tile the channels: each one advances its own channels' history in place.
+    const int first = blockIdx.x * blockDim.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int c = first + threadIdx.x; c < width; c += stride) {
         convolve(input, kernel, history, out, c, width, taps, norm, invalid);
     }
     report(health, invalid);
@@ -101,7 +104,11 @@ extern "C" int inference_cuda_inkling_conv(const float *input, const float *kern
         overlaps(health, health_bytes, input, row)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_conv_kernel<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+    // One channel per thread: with one block a thread walked up to nine channels and every
+    // walk serialized its loads. A channel's accumulation order does not depend on the block
+    // that owns it. Every block that saw a non-finite value writes the same NaN.
+    const int blocks = (width + threads - 1) / threads;
+    inkling_conv_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         input, kernel, history, out, health, width, taps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

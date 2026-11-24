@@ -350,6 +350,73 @@ mod tests {
         result.into_iter().map(|x| (x / mass).to_bits()).collect()
     }
 
+    /// `ordered_rms_scale` and the scaled output, op for op in scalar order.
+    fn ordered_norm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<u32> {
+        let squares = x.iter().fold(-0.0f32, |sum, v| sum + v * v);
+        let scale = 1.0 / (squares / x.len() as f32 + eps).sqrt();
+        x.iter()
+            .zip(gamma)
+            .map(|(v, g)| ((v * scale) * g).to_bits())
+            .collect()
+    }
+
+    #[test]
+    fn weighted_norm_matches_the_scalar_order_bit_for_bit() {
+        if !device_present("Inkling CUDA weighted norm") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let mut seed = 41_u32;
+        let mut generate = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 8) as f32 * (1.0 / 8388608.0) - 1.0
+                })
+                .collect::<Vec<_>>()
+        };
+        for [rows, width] in [[1, 129], [1, 1536], [1, 2304], [1, 4096], [3, 2304]] {
+            let shape = DepthShape {
+                rows,
+                width,
+                depth: 1,
+            };
+            let [plane, ..] = shape.words().unwrap();
+            let input = generate(plane);
+            let gamma = generate(width);
+            let x = upload_bytes(&ctx, bytes(&input).as_flattened());
+            let g = upload_bytes(&ctx, bytes(&gamma).as_flattened());
+            let y = ctx.allocate(plane * 4).unwrap();
+            let status = ctx.allocate(rows * 4).unwrap();
+            let mut transfer = ctx.pinned_buf(rows * 4).unwrap();
+            let eps = 1.0e-6f32;
+            ctx.inkling_weighted_norm(
+                &stream,
+                &mut transfer,
+                [
+                    x.range(0, x.bytes()).unwrap(),
+                    g.range(0, g.bytes()).unwrap(),
+                    y.range(0, y.bytes()).unwrap(),
+                    status.range(0, status.bytes()).unwrap(),
+                ],
+                [rows, width],
+                eps,
+            )
+            .unwrap();
+            let actual = read_bytes(&ctx, &y, y.bytes());
+            for (r, row) in actual.chunks_exact(width * 4).enumerate() {
+                let row = row
+                    .chunks_exact(4)
+                    .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
+                assert!(
+                    row.eq(ordered_norm(&input[r * width..][..width], &gamma, eps)),
+                    "{rows} rows, width {width}, row {r}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn depth_mix_round_trips_only_compact_rows_and_matches_scalar_bits() {
         if !device_present("Inkling CUDA depth mix") {
