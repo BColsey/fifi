@@ -2,6 +2,7 @@
 //! planes. Sealed prelude, previous-pass bank, and each visit's convolution
 //! state never cross PCIe during the chain. One coalesced receipt contains
 //! logits, status words, and the raw rows needed to rebuild host state.
+mod shadow;
 use super::*;
 use crate::kernels::cuda::{NativeWeight, resident::embed::EmbedNativeCall};
 
@@ -29,6 +30,7 @@ pub(in super::super) struct TokenWorkspace {
     journal: DeviceBuffer,
     pinned: PinnedBuf,
     logits: Region,
+    initial: Region,
     health: Region,
     lineage: Vec<Option<std::sync::Weak<Vec<f32>>>>,
 }
@@ -104,6 +106,7 @@ impl TokenWorkspace {
         let mut end = 0;
         let logits = reserve(&mut end, vocab);
         let health = reserve(&mut end, 4);
+        let initial = reserve(&mut end, h);
         let (mut slots, mut depth_bytes, mut prelude_bytes, mut cold_bytes) = (Vec::new(), 0, 0, 8);
         for (&visit, (save, restart, blocks, bank, active)) in f.visits.iter().zip(geometry) {
             let Some(w) = Workspace::open_geometry(f, cuda, visit, blocks, bank)? else {
@@ -163,6 +166,7 @@ impl TokenWorkspace {
             scratch,
             journal,
             pinned,
+            initial,
             logits,
             health,
         }))
@@ -269,6 +273,11 @@ impl TokenWorkspace {
                 ],
                 h,
                 f.math.rms_norm_eps,
+            )?;
+            ctx.copy_device(
+                stream,
+                self.depth[0].range(0, row)?,
+                self.initial.device(&self.journal)?,
             )?;
             for s in &self.slots {
                 let w = &s.w;
@@ -378,5 +387,7 @@ impl TokenWorkspace {
     }
 }
 
+#[cfg(test)]
+mod shadow_tests;
 #[cfg(test)]
 mod tests;

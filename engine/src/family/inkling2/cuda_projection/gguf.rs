@@ -890,7 +890,6 @@ impl GgufCuda {
         )
     }
 
-    #[cfg(test)]
     pub(in crate::family::inkling2) fn resident_head_supported(&self, shape: [usize; 2]) -> bool {
         self.dense
             .get(crate::family::inkling2::OUTPUT_HEAD)
@@ -899,7 +898,6 @@ impl GgufCuda {
             })
     }
 
-    #[cfg(test)]
     pub(in crate::family::inkling2) fn enqueue_resident_head(
         &self,
         stream: &crate::kernels::cuda::DeviceStream,

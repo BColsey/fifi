@@ -798,7 +798,6 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    #[cfg(test)]
     pub(super) fn resident_embedding(
         &self,
         ctx: &crate::kernels::cuda::CudaContext,

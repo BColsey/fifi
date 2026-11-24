@@ -84,6 +84,8 @@ pub(super) struct CpuForward {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     resident_visit: std::cell::RefCell<Option<resident_visit::Workspace>>,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    resident_token: Option<resident_visit::TokenWorkspace>,
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     resident_pair: [std::cell::RefCell<Option<resident_visit::Pair>>; 2],
 }
 
@@ -215,6 +217,8 @@ impl CpuForward {
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             resident_visit: Default::default(),
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            resident_token: None,
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
             resident_pair: Default::default(),
         })
     }
@@ -351,6 +355,10 @@ impl CpuForward {
             return Err(bad("token or sequence is outside the Inkling text limits"));
         }
 
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if collect_logits && self.admit_resident_token()? {
+            return self.commit_resident_token(id).map(Some);
+        }
         self.window = None;
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);
@@ -516,18 +524,7 @@ impl CpuForward {
         taps: &mut TapRow<'_>,
         decode: bool,
     ) -> Result<(), EngError> {
-        let mut pending = visits.iter();
-        while let Some(&visit) = pending.next() {
-            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            if decode
-                && self.taps.is_empty()
-                && let Some(bank) = bank
-                && let Some(&next) = pending.as_slice().first()
-                && self.try_resident_pair([visit, next], state, stream, bank)?
-            {
-                pending.next();
-                continue;
-            }
+        for &visit in visits {
             taps.capture(visit.state_slot, stream.current());
             self.layer(visit, &mut state[visit.state_slot], stream, bank, decode)?;
         }

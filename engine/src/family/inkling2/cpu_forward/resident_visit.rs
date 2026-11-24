@@ -28,10 +28,12 @@ use crate::{
     },
 };
 
-mod pair;
 #[cfg(test)]
+mod pair;
 mod token;
+#[cfg(test)]
 pub(super) use pair::Pair;
+pub(super) use token::TokenWorkspace;
 
 const WORD: usize = size_of::<f32>();
 

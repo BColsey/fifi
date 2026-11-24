@@ -765,6 +765,20 @@ impl VisitState {
     }
 
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn shadow_rows(&self) -> Vec<&[f32]> {
+        self.keys
+            .iter()
+            .chain(&self.values)
+            .map(|v| v.as_slice())
+            .chain(
+                self.resident_conv_histories()
+                    .into_iter()
+                    .flat_map(|rows| rows.iter().map(Vec::as_slice)),
+            )
+            .collect()
+    }
+
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn parity_fingerprint(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut hash = DefaultHasher::new();

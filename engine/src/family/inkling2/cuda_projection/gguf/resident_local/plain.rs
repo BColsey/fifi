@@ -4,7 +4,6 @@
 use super::*;
 use crate::kernels::cuda::resident::dense_gemv::{DenseGemvCall, DenseGemvShape};
 impl GgufCuda {
-    #[cfg(test)]
     pub(in crate::family::inkling2) fn resident_plain_supported(
         &self,
         v: LayerVisit,
