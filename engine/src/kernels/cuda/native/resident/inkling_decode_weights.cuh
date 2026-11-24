@@ -75,6 +75,7 @@ __global__ void decode_nv_down(inference_cuda_dense_gemv_args a, DeviceSelectedW
 
 #include "resident/inkling_vocab_iq4.cuh"
 #include "resident/inkling_decode_kblock.cuh"
+#include "resident/inkling_decode_q8_word.cuh"
 #include "resident/inkling_decode_kwindow.cuh"
 #include "resident/inkling_decode_iq3.cuh"
 
@@ -98,12 +99,16 @@ bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cud
         decode_q8_kblock<<<a.rows,288,0,s>>>(a);
         return true;
     }
+    if (type == 8 && a.cols == 3072 && a.rows == 2304 && aligned(a.x,16)) {
+        decode_q8_word<2><<<a.rows/2,128,0,s>>>(a);
+        return true;
+    }
     if (type == 18 && a.cols == 2304 && a.rows == 3072 && aligned(a.x,16)) {
         decode_iq3_words<<<a.rows/2,192,0,s>>>(a);
         return true;
     }
     if (a.rows != 200064 && aligned(a.x,16) && aligned(a.w,4)) {
-#define KW(t,b) case t: if(a.cols==2304) decode_kwindow<t,b,2304><<<a.rows/2,192,0,s>>>(a); else decode_kwindow<t,b,3072><<<a.rows/2,192,0,s>>>(a); return true;
+#define KW(t,b) case t: launch_kwindow<t,b>(a,s); return true;
         switch(type) { KW(12,144) KW(13,176) KW(14,210) }
 #undef KW
     }

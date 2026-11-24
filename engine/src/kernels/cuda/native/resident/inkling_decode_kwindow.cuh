@@ -1,20 +1,20 @@
 // Each thread owns eight contiguous activations, so the window scale and
-// minimum apply once per partial sum. Three warps split the K blocks evenly.
+// minimum apply once per partial sum. Two or three warps split the K blocks.
 __device__ __forceinline__ unsigned kw_read32(const uint8_t *p) {
     const auto *v = reinterpret_cast<const uint16_t *>(p);
     return unsigned(v[0]) | (unsigned(v[1]) << 16);
 }
 
-template<int Type, int Bytes, int Cols>
+template<int Type, int Bytes, int Cols, int Kw>
 __global__ void decode_kwindow(inference_cuda_dense_gemv_args a) {
-    __shared__ float part[2][3];
+    __shared__ float part[2][Kw];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int row = 2*blockIdx.x + warp/3, win = lane/4, c = 8*(lane%4);
+    const int row = 2*blockIdx.x + warp/Kw, win = lane/4, c = 8*(lane%4);
     const auto *w = static_cast<const uint8_t *>(a.w) + size_t(row)*(Cols/256)*Bytes;
     const auto *x = static_cast<const float4 *>(a.x) + 2*lane;
     float acc = 0;
 #pragma unroll
-    for (int k = warp%3; k < Cols/256; k += 3) {
+    for (int k = warp%Kw; k < Cols/256; k += Kw) {
         const auto *b = w + k*Bytes;
         unsigned codes[2];
         float scale, minimum;
@@ -58,9 +58,19 @@ __global__ void decode_kwindow(inference_cuda_dense_gemv_args a) {
         if constexpr(Type!=14) acc=fmaf(-minimum,sum,acc);
     }
     acc=warp_sum(acc);
-    if(!lane) part[warp/3][warp%3]=acc;
+    if(!lane) part[warp/Kw][warp%Kw]=acc;
     __syncthreads();
-    if(warp%3==0 && !lane) {
-        auto *p=part[warp/3]; static_cast<float *>(a.y)[row]=(p[0]+p[1])+p[2];
+    if(warp%Kw==0 && !lane) {
+        auto *p=part[warp/Kw];
+        float s=p[0]+p[1];
+        if constexpr (Kw==3) s+=p[2];
+        static_cast<float *>(a.y)[row]=s;
     }
+}
+
+template<int Type, int Bytes>
+void launch_kwindow(inference_cuda_dense_gemv_args a, cudaStream_t stream) {
+    if (a.rows == 384) decode_kwindow<Type,Bytes,2304,3><<<a.rows/2,192,0,stream>>>(a);
+    else if (a.cols == 2304) decode_kwindow<Type,Bytes,2304,2><<<a.rows/2,128,0,stream>>>(a);
+    else decode_kwindow<Type,Bytes,3072,2><<<a.rows/2,128,0,stream>>>(a);
 }
