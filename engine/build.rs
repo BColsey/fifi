@@ -144,6 +144,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_local_prep.cu",
     "src/kernels/cuda/native/resident/draft_attention_bf16.cu",
     "src/kernels/cuda/native/resident/correct_draft_logits_bf16.cu",
+    "src/kernels/cuda/native/resident/inkling_stream.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -297,6 +298,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/gguf_gemv.cuh",
     "src/kernels/cuda/native/resident/inkling_gate_dot.cuh",
     "src/kernels/cuda/native/resident/inkling_q2_down.cuh",
+    "src/kernels/cuda/native/resident/inkling_stream.h",
     "src/kernels/cuda/native/resident/hyper.h",
     "src/kernels/cuda/native/resident/qsa_attn.h",
     "src/kernels/cuda/native/resident/qsa_index.h",
