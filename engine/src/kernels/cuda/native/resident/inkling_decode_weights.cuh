@@ -76,6 +76,7 @@ __global__ void decode_nv_down(inference_cuda_dense_gemv_args a, DeviceSelectedW
 #include "resident/inkling_vocab_iq4.cuh"
 #include "resident/inkling_decode_kblock.cuh"
 #include "resident/inkling_decode_kwindow.cuh"
+#include "resident/inkling_decode_iq3.cuh"
 
 template<typename Index>
 bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cudaStream_t s) {
@@ -95,6 +96,10 @@ bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cud
     }
     if (type == 8 && a.cols == 2304 && a.rows != 200064 && aligned(a.x,16)) {
         decode_q8_kblock<<<a.rows,288,0,s>>>(a);
+        return true;
+    }
+    if (type == 18 && a.cols == 2304 && a.rows == 3072 && aligned(a.x,16)) {
+        decode_iq3_words<<<a.rows/2,192,0,s>>>(a);
         return true;
     }
     if (a.rows != 200064 && aligned(a.x,16) && aligned(a.w,4)) {
