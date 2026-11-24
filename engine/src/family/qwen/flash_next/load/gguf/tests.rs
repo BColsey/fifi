@@ -683,6 +683,109 @@ fn a_file_that_says_the_expert_weights_are_not_normalised_is_refused_by_key() {
     );
 }
 
+/// The real GGUF's shard offsets and tensor lengths reach the same staging slot bytes
+/// from file and pinned sources. Read back every byte, in bounded chunks.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[test]
+#[ignore = "requires CUDA (2 GiB) and a real split Flash-Next GGUF at FIFI_FLASH_GGUF"]
+fn real_gguf_expert_stacks_stage_byte_exact_from_file_and_pinned_memory() {
+    use crate::family::expert_bank::{
+        layer_stream::{ExpertTransport, UploadSet},
+        layer_stream_card::{CardTransport, StackHome, StackSpan},
+    };
+    use crate::kernels::cuda::{CudaContext, device_present};
+    use std::sync::Arc;
+
+    let model = real_model().expect("set FIFI_FLASH_GGUF to a split Flash-Next checkpoint");
+    assert!(model.weights.is_split(), "a split checkpoint is required");
+    assert!(device_present("real Flash-Next stacks"), "CUDA is required");
+    let experts = model.config().dims.experts as usize;
+    let layer = (0..model.config().layers())
+        .find(|&layer| {
+            model
+                .map()
+                .get(Wanted::ExpertGate, Some(layer))
+                .is_some_and(|s| s.shard != 0)
+        })
+        .expect("an expert gate stack outside the first shard");
+    let stacks = [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown].map(|role| {
+        let mapped = model.map().get(role, Some(layer)).expect("expert stack");
+        model
+            .weights
+            .header()
+            .tensor(&mapped.name)
+            .expect("GGUF tensor")
+    });
+    let total = stacks.iter().map(|tensor| tensor.byte_len()).sum::<u64>();
+    assert!(total <= 2 * GIB, "staging exceeds the 2 GiB test budget");
+    let ctx = CudaContext::new().expect("CUDA context");
+    let compute = ctx.stream().expect("compute stream");
+
+    let mut want = vec![0u8; 8 << 20];
+    let mut got = vec![0u8; want.len()];
+    for pinned in [false, true] {
+        let mut store = Vec::new();
+        let mut spans = Vec::new();
+        for tensor in stacks {
+            let bytes = usize::try_from(tensor.byte_len()).expect("stack size");
+            let home = if pinned {
+                let mut buf = ctx.pinned_buf(bytes).expect("pinned stack");
+                buf.fill(bytes, |out| model.weights.read_range(tensor.name(), 0, out))
+                    .expect("fill pinned stack");
+                let index = store.len();
+                store.push(buf);
+                StackHome::Pinned {
+                    buf: index,
+                    offset: 0,
+                }
+            } else {
+                StackHome::File {
+                    file: Arc::new(model.weights.file_of(tensor).try_clone().expect("shard")),
+                    direct: None,
+                    offset: tensor.abs_offset(),
+                }
+            };
+            spans.push(StackSpan {
+                bytes,
+                home,
+                shape: None,
+            });
+        }
+        let mut transport =
+            CardTransport::new(&ctx, &compute, experts, vec![spans], store, 1).expect("transport");
+        let ticket = transport.begin(0, &UploadSet::Whole, 0).expect("upload");
+        let report = transport.wait(ticket).expect("copy complete");
+        assert_eq!(report.bytes, total, "pinned={pinned}");
+        for (stack, tensor) in stacks.into_iter().enumerate() {
+            let staged = transport.stack(0, 0, stack).expect("staged stack");
+            assert_eq!(
+                staged.bytes() as u64,
+                tensor.byte_len(),
+                "{}",
+                tensor.name()
+            );
+            for offset in (0..staged.bytes()).step_by(want.len()) {
+                let len = want.len().min(staged.bytes() - offset);
+                model
+                    .weights
+                    .read_range(tensor.name(), offset as u64, &mut want[..len])
+                    .expect("GGUF bytes");
+                staged
+                    .buffer()
+                    .read_at(&compute, staged.offset() + offset, &mut got[..len])
+                    .expect("device bytes");
+                assert!(
+                    got[..len] == want[..len],
+                    "{} at byte {offset}, pinned={pinned}",
+                    tensor.name()
+                );
+            }
+        }
+        transport.release(0).expect("release staging slot");
+        eprintln!("layer {layer}: {total} bytes verified, pinned={pinned}");
+    }
+}
+
 /// The rate of the real file's expert extents: one buffered `pread` of a stack against the
 /// direct parallel reads of every candidate plan, on a layer far from the ones other runs read
 /// (`FIFI_FLASH_EXTENT_LAYER`, default 40), and the bytes of the best plan against the buffered
