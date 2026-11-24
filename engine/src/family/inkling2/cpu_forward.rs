@@ -297,6 +297,8 @@ impl CpuForward {
     }
 
     pub(super) fn snapshot(&mut self) -> Result<PrefixState, EngError> {
+        // The method exists only in CUDA builds; without the feature no row is ever device-only.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.materialize_resident()?;
         Ok(PrefixState {
             position: self.position,
