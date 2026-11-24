@@ -1290,20 +1290,27 @@ fn f16_round(v: f32) -> f32 {
     (v / ulp).round_ties_even() * ulp
 }
 
-/// The activation quantizers' rule, per 32 values: `d = amax / 127` kept in binary16 and
-/// `q = round(x / d)`. Returns the row as a matvec reads it back (`d * q`) and the scales.
+/// The activation quantizers' rule, per 32 values, as `store_q8_1_block` applies it: `d = amax / 127`
+/// in f32, `q = round(x / d)` (0 when `amax` is 0), `d` kept in binary16. Returns the row as a
+/// matvec reads it back (the binary16 `d` times `q`) and the kept scales.
 fn cpu_q8_1(row: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut back = vec![0.0; row.len()];
     let mut scales = Vec::with_capacity(row.len() / 32);
     for (values, out) in row.chunks_exact(32).zip(back.chunks_exact_mut(32)) {
         let amax = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let d = f16_round(amax / 127.0);
-        scales.push(d);
+        let d = amax / 127.0;
+        let kept = f16_round(d);
+        scales.push(kept);
         for (v, o) in values.iter().zip(out) {
-            *o = if d == 0.0 { 0.0 } else { d * (v / d).round() };
-            // shortcut: the bound admits the f32 rounding of `v / d`, about 1e-7 relative
+            *o = if amax == 0.0 {
+                0.0
+            } else {
+                kept * (v / d).round()
+            };
+            // the f32 rounding of `v / d`, and the binary16 scale the matvec reads back against
+            // the f32 one the codes were rounded with (at most 127 * 2^-11 of `d` at the top code)
             debug_assert!(
-                (*o - v).abs() <= 0.501 * d + 4e-6,
+                (*o - v).abs() <= 0.57 * d + 4e-6,
                 "the model left the rule's bound"
             );
         }
@@ -1412,13 +1419,14 @@ fn raw<'a>(loaded: &'a CudaWeights, name: &str) -> &'a DeviceBuffer {
     }
 }
 
-/// A q8_1 row as the matvec reads it: per 32 values the codes, then the binary16 scale.
+/// A q8_1 row as the matvec reads it: per 32 values the binary16 scale and the binary16 sum of
+/// the values first, the codes after (the vendored `block_q8_1`).
 fn dequant_q8_1(bytes: &[u8], k: usize) -> Vec<f32> {
     bytes[..36 * (k / 32)]
         .chunks_exact(36)
         .flat_map(|b| {
-            let d = le_f16_vec(&b[32..34])[0];
-            b[..32].iter().map(move |q| d * (*q as i8) as f32)
+            let d = le_f16_vec(&b[..2])[0];
+            b[4..36].iter().map(move |q| d * (*q as i8) as f32)
         })
         .collect()
 }
@@ -1592,6 +1600,18 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
             (&exact, &y_mmq),
         ]
         .map(|(a, b)| relative(a, b));
+        // A correct matvec sits at f32 accumulation error against this product; a wrong one is
+        // whole percent off. MMQ takes the block's binary16 value sum for the Q4_K offset term.
+        assert!(
+            matvec.0 < 1e-4,
+            "{label}: the matvec is {:.2e} from the CPU product over its own bytes",
+            matvec.0
+        );
+        assert!(
+            mmq.0 < 2e-2,
+            "{label}: MMQ is {:.2e} from the CPU product over its own pack",
+            mmq.0
+        );
         eprintln!(
             "  {label}: matvec against CPU over its bytes {:.2e} rms {:.2e} max; MMQ against CPU over its pack {:.2e} rms {:.2e} max; step from f32: matvec {:.4} rms {:.4} max, MMQ {:.4} rms {:.4} max",
             matvec.0, matvec.1, mmq.0, mmq.1, step.0, step.1, mmq_step.0, mmq_step.1
