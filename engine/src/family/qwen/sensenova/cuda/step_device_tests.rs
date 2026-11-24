@@ -1286,7 +1286,9 @@ fn f16_round(v: f32) -> f32 {
     if v == 0.0 {
         return 0.0;
     }
-    let exponent = v.abs().log2().floor() as i32;
+    // The binary32 exponent field is floor(log2 |v|) exactly. f32 `log2` can round up to the
+    // next power of two for a value just below it, which picks the coarser grid.
+    let exponent = ((v.abs().to_bits() >> 23) & 0xff) as i32 - 127;
     let ulp = 2f32.powi(exponent.max(-14) - 10);
     (v / ulp).round_ties_even() * ulp
 }
