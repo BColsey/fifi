@@ -15,7 +15,7 @@ pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, 
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
     dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_q8_row_reuse_launch, gguf_wmma_launch,
-    typed_gemv_need, typed_wmma_need,
+    try_control_pair, typed_gemv_need, typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 use crate::weights::GgufType;
@@ -252,7 +252,18 @@ impl CudaContext {
             .collect::<Result<Vec<_>, _>>()?;
         self.launch_on(stream, |raw_stream| {
             let mut counts = DenseGemvGroupCounts::default();
-            for (kernel, call) in planned {
+            let pair = std::env::var_os("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+            let mut planned = planned.into_iter().peekable();
+            while let Some((kernel, call)) = planned.next() {
+                if pair
+                    && kernel == GroupKernel::Gemv
+                    && let Some((GroupKernel::Gemv, next)) = planned.peek()
+                    && try_control_pair(raw_stream, &call, next)?
+                {
+                    let _ = planned.next();
+                    continue;
+                }
                 match kernel {
                     GroupKernel::Gemv => dense_gemv_launch(raw_stream, call)?,
                     GroupKernel::Q8RowPair => {

@@ -44,6 +44,12 @@ typedef struct inference_cuda_dense_gemv_args {
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
 
+/* Internal opt-in paired controller projections. Independent F32 matrices and
+ * disjoint outputs, both M=1, K=64, N=2304, sharing the same input. */
+int inference_cuda_decode_control_pair(const inference_cuda_dense_gemv_args *a,
+                                       const inference_cuda_dense_gemv_args *b,
+                                       void *stream, int *out_stage);
+
 /* Opt-in: pair independent F32 activation rows sharing one dense Q8_0 matrix.
  * Same operand checks, strides and arithmetic as packed GEMV. Selects an active
  * SM75 device only, for (N,K)=(1024,2304) or (3072,2304) at M=7..12, or

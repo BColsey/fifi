@@ -16,6 +16,9 @@ use crate::EngError;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
+#[path = "decode_control_tests.rs"]
+mod decode_control_tests;
+
 /// Unit roundoff of f32.
 const U: f64 = 1.0 / 16_777_216.0;
 const SLACK: f64 = 2.0;

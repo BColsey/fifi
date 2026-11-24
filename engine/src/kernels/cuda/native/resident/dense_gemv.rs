@@ -27,7 +27,9 @@ pub(in crate::kernels::cuda) const GEMV_MAX_ROWS: usize = 1 << 20;
 pub(in crate::kernels::cuda) const GEMV_MAX_COLS: usize = 12288;
 pub(in crate::kernels::cuda) const GEMV_MAX_LD: usize = 1 << 20;
 
+mod decode_control_pair;
 pub(in crate::kernels::cuda) mod moe;
+pub(in crate::kernels::cuda) use decode_control_pair::try_control_pair;
 
 const FLOAT: usize = 4;
 const HALF: usize = 2;

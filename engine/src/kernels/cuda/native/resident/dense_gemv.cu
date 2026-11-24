@@ -303,6 +303,7 @@ bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelect
 }
 
 #include "resident/inkling_decode_weights.cuh"
+#include "resident/inkling_decode_control_pair.cuh"
 #include "resident/inkling_gate_dot.cuh"
 #include "resident/inkling_q2_down.cuh"
 
@@ -686,6 +687,28 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_decode_control_pair(const inference_cuda_dense_gemv_args *a,
+        const inference_cuda_dense_gemv_args *b, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        const auto eligible = [stream](const inference_cuda_dense_gemv_args *p) {
+            return p && p->weight_dtype == kDtypeF32 && p->m == 1 && p->rows == 2304 &&
+                   p->cols == 64 && aligned(p->w, 16) && valid(*p, stream);
+        };
+        if (!eligible(a) || !eligible(b) || a->x != b->x ||
+            !apart({a->y,2304*4},{b->y,2304*4}) ||
+            !apart({a->y,2304*4},{b->w,2304*64*4}) ||
+            !apart({b->y,2304*4},{a->w,2304*64*4})) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure f;
+        decode_control_pair<<<dim3(144,2),256,0,(cudaStream_t)stream>>>(*a,*b);
+        f.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, f.stage);
+        return (int)f.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
