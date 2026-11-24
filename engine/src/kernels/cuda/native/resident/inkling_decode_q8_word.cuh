@@ -1,14 +1,15 @@
-// 9 or 12 warps per row underutilize the 3072-column Q8 matrix.
-// Instead, let a few warps enumerate tile indices, with two rows per CTA.
-template<int Kw>
+// Two K warps per row and two independent output rows per CTA amortize
+// the reduction and coalesce eight-sample chunks of Q8_0 blocks.
+template<int Cols>
 __global__ void decode_q8_word(inference_cuda_dense_gemv_args a) {
+    constexpr int Kw=2;
     __shared__ float part[2][Kw];
     int warp=threadIdx.x/32,lane=threadIdx.x%32,row=2*blockIdx.x+warp/Kw;
-    auto *w=static_cast<const uint8_t *>(a.w)+size_t(row)*96*34;
+    auto *w=static_cast<const uint8_t *>(a.w)+size_t(row)*(Cols/32)*34;
     auto *x=static_cast<const float4 *>(a.x);
     float acc=0;
 #pragma unroll
-    for(int tile=warp%Kw; tile<12; tile+=Kw) {
+    for(int tile=warp%Kw; tile<Cols/256; tile+=Kw) {
         int blk=tile*8+lane/4, j=lane%4;
         auto *b=w+blk*34;
         auto *q=reinterpret_cast<const uint16_t *>(b+2+8*j);

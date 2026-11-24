@@ -74,7 +74,6 @@ __global__ void decode_nv_down(inference_cuda_dense_gemv_args a, DeviceSelectedW
 }
 
 #include "resident/inkling_vocab_iq4.cuh"
-#include "resident/inkling_decode_kblock.cuh"
 #include "resident/inkling_decode_q8_word.cuh"
 #include "resident/inkling_decode_kwindow.cuh"
 #include "resident/inkling_decode_iq3.cuh"
@@ -99,12 +98,9 @@ bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cud
     }
     if (!((a.cols == 2304 && (a.rows == 384 || a.rows == 1024 || a.rows == 3072 || a.rows == 200064)) ||
           (a.cols == 3072 && a.rows == 2304))) return false;
-    if (type == 8 && a.cols == 2304 && a.rows != 200064 && aligned(a.x,16)) {
-        decode_q8_kblock<<<a.rows,288,0,s>>>(a);
-        return true;
-    }
-    if (type == 8 && a.cols == 3072 && a.rows == 2304 && aligned(a.x,16)) {
-        decode_q8_word<2><<<a.rows/2,128,0,s>>>(a);
+    if (type == 8 && a.rows != 200064 && aligned(a.x,16)) {
+        if (a.cols == 2304) decode_q8_word<2304><<<a.rows/2,128,0,s>>>(a);
+        else decode_q8_word<3072><<<a.rows/2,128,0,s>>>(a);
         return true;
     }
     if (type == 18 && a.cols == 2304 && a.rows == 3072 && aligned(a.x,16)) {
