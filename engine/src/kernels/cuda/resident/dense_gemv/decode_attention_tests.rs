@@ -59,14 +59,18 @@ fn decode_attention_group_checks_all_cross_call_writes_before_launch() {
                     (4, 1) => bf.all(),
                     _ => dst[i].all(),
                 };
-                rig.ctx.plan_dense_gemv(&make(i, input, y)).unwrap()
+                let mut call = make(i, input, y);
+                if mode == 5 && i == 4 {
+                    call.w = bf.range(2, 24 * 2304 * 2);
+                }
+                rig.ctx.plan_dense_gemv(&call).unwrap()
             })
             .collect::<Vec<_>>();
         rig.ctx
             .launch_on(&rig.stream, |s| try_attention_group(s, calls.iter()))
             .unwrap()
     };
-    for mode in 1..=4 {
+    for mode in 1..=5 {
         assert!(!attempt(mode, 8));
     }
     assert!(!attempt(0, 5));
@@ -76,6 +80,9 @@ fn decode_attention_group_checks_all_cross_call_writes_before_launch() {
     for i in 0..8 {
         let r = reference[i].read(&rig.ctx, "serial");
         let d = dst[i].read(&rig.ctx, "group");
+        if rows[i] <= 32 {
+            assert_eq!(r, d, "the BF16 logical lane order must match serial GEMV");
+        }
         for (a, b) in r.chunks_exact(4).zip(d.chunks_exact(4)) {
             let a = f32::from_le_bytes(a.try_into().unwrap());
             let b = f32::from_le_bytes(b.try_into().unwrap());

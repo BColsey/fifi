@@ -24,7 +24,7 @@ pub(in crate::kernels::cuda) fn try_attention_group<'a, 'b: 'a>(
     let rows = [3072, 1024, 1024, 384, 24, 3072, 32, 32];
     for (i, p) in calls.clone().enumerate() {
         let dtype_ok = if matches!(i, 4 | 6 | 7) {
-            p.dtype == DenseDtype::Bf16
+            p.dtype == DenseDtype::Bf16 && p.w.address().addr().is_multiple_of(16)
         } else {
             match p.dtype {
                 DenseDtype::PackedGguf(Q80) => true,

@@ -27,22 +27,14 @@ __global__ void decode_attention_group(const __grid_constant__ DecodeAttentionGr
         case fifi_gguf::kDtypeBase+13: decode_group_kw<13,176>(a,block); break;
         case fifi_gguf::kDtypeBase+14: decode_group_kw<14,210>(a,block); break;
         case fifi_gguf::kDtypeBase+18: decode_iq3_rows<true>(a,block); break;
-        case kDtypeBf16: {
-            const auto *row=static_cast<const __nv_bfloat16 *>(a.w)+size_t(block)*2304;
-            const auto *x=static_cast<const float *>(a.x);
-            float sum=0;
-#pragma unroll 2
-            for (int c=threadIdx.x;c<2304;c+=128) sum=fmaf(widen(row[c]),x[c],sum);
-            decode_split_store(sum,static_cast<float *>(a.y)+block);
-            break;
-        }
+        case kDtypeBf16: decode_bf16_exact_row(a,block); break;
     }
 }
 
 // Called after validating compact matrix extents, before any kernel launch.
 int decode_attention_blocks(const inference_cuda_dense_gemv_args &a) {
     if (a.m != 1 || a.cols != 2304 || !aligned(a.x,16)) return 0;
-    if (a.weight_dtype == kDtypeBf16) return (a.rows == 24 || a.rows == 32) ? a.rows : 0;
+    if (a.weight_dtype == kDtypeBf16) return aligned(a.w,16) && (a.rows == 24 || a.rows == 32) ? a.rows : 0;
     if (a.rows != 384 && a.rows != 1024 && a.rows != 3072) return 0;
     switch (a.weight_dtype-fifi_gguf::kDtypeBase) {
         case 8: return a.rows/2;

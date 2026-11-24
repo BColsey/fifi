@@ -13,14 +13,7 @@ __device__ void decode_split_store(float acc, float *out) {
     if (threadIdx.x == 0) *out = (partial[0] + partial[2]) + (partial[1] + partial[3]);
 }
 
-template<typename W>
-__global__ void decode_split_dense(inference_cuda_dense_gemv_args a) {
-    const W *row = static_cast<const W *>(a.w) + size_t(blockIdx.x) * a.cols;
-    const auto *x = static_cast<const float *>(a.x);
-    float sum = 0;
-    for (int c = threadIdx.x; c < a.cols; c += 128) sum = fmaf(widen(row[c]), x[c], sum);
-    decode_split_store(sum, static_cast<float *>(a.y) + blockIdx.x);
-}
+#include "resident/inkling_decode_exact_dense.cuh"
 
 template<int Type, int Block, int Bytes, typename Index>
 __global__ void decode_split_packed(inference_cuda_dense_gemv_args a, Index index) {

@@ -301,6 +301,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_decode_experts.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_control_pair.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_attention_group.cuh",
+    "src/kernels/cuda/native/resident/inkling_decode_exact_dense.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_iq3.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_q8_word.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_kwindow.cuh",

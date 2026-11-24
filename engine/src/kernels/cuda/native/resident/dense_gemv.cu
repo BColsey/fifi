@@ -473,8 +473,9 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
     const bool vector = a.cols % (sizeof(uint4) / sizeof(W)) == 0 && aligned(a.w, 16);
     if (a.m == 1 && ((a.cols == 4608 && a.rows == 64 && a.weight_dtype == kDtypeF32) ||
                      (a.cols == 2304 && (a.rows == 24 || a.rows == 32) && a.weight_dtype == kDtypeBf16)) &&
-        decode_split_enabled()) {
-        decode_split_dense<W><<<a.rows, 128, 0, s>>>(a);
+        decode_split_enabled() && vector && aligned(a.x,16)) {
+        if constexpr (std::is_same_v<W,float>) decode_controller_down_exact<<<a.rows,256,0,s>>>(a);
+        else decode_bf16_exact<<<a.rows,32,0,s>>>(a);
     } else if (vector) {
         dense_gemv_k<W, true><<<grid, kWarps * 32, shared, s>>>(
             (const W *)a.w, (const float *)a.x, (float *)a.y, a.rows, a.cols, a.ld_x, a.ld_y);
