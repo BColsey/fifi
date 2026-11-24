@@ -1297,6 +1297,13 @@ fn f16_round(v: f32) -> f32 {
 fn cpu_q8_1(row: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut back = vec![0.0; row.len()];
     let mut scales = Vec::with_capacity(row.len() / 32);
+    // as_chunks drops a tail shorter than a block, and a dropped tail would read as zeros.
+    assert_eq!(
+        row.len() % 32,
+        0,
+        "a q8_1 row is whole 32-value blocks, got {}",
+        row.len()
+    );
     let (blocks, _) = row.as_chunks::<32>();
     let (outs, _) = back.as_chunks_mut::<32>();
     for (values, out) in blocks.iter().zip(outs) {
@@ -1357,8 +1364,12 @@ fn relative(a: &[f32], b: &[f32]) -> (f32, f32) {
 
 /// The size of the q8_1 activation step on the rows the position probe saved, CPU only: the
 /// projections of the two visits before the departure, over the f32 normed row and over the
-/// same row after the quantizers' rule. The row is the traced residual after the visit before it, the visit's input; an
-/// mHC visit's routed input is not in the trace. One line per projection.
+/// same row after the quantizers' rule. The row is the traced residual after the visit before
+/// it, the visit's input, under the mixer's norm or under the post norm. Under the post norm it
+/// is a stand-in: the FFN reads the visit's input plus its mixer branch (a plain visit) or the
+/// second router's output (an mHC visit), and an mHC visit's routed mixer input is not in the
+/// trace either. The FFN lines measure the rule on that row, not the FFN's own step. One line
+/// per projection.
 #[test]
 fn q8_1_activation_effect_on_the_saved_rows() {
     let Ok(dir) = std::env::var("SENSENOVA_PROBE_ROWS") else {
@@ -1386,7 +1397,11 @@ fn q8_1_activation_effect_on_the_saved_rows() {
                         .unwrap();
                     eprintln!(
                         "pos {pos} {side} visit {il:2} {}: max |x| {:6.1}; largest step {:.3} over values {}..{}",
-                        if ffn { "post norm" } else { "mixer norm" },
+                        if ffn {
+                            "post norm (a stand-in row for the FFN)"
+                        } else {
+                            "mixer norm"
+                        },
                         worst_abs(&row),
                         step,
                         32 * at,
@@ -1613,7 +1628,10 @@ fn card_products(
 /// The card's quantize, matvec and MMQ on the rows the position probe saved: each kernel
 /// against the CPU product over the bytes that kernel itself wrote, which needs no model of
 /// the quantizer, and the step each takes from the f32 row. Then the head from the saved final
-/// row, which must give the saved logits row.
+/// row, which must give the saved logits row. The row is the visit's input under the mixer's
+/// norm or under the post norm; under the post norm it is a stand-in for the FFN's input, which
+/// the trace does not hold, so the FFN lines' step is that of the stand-in row. The kernel
+/// checks hold for any row.
 #[test]
 fn card_projection_kernels_over_their_own_q8_1_bytes() {
     let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova projection replay")
@@ -1676,7 +1694,12 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
                     shape.eps,
                 );
                 eprintln!(
-                    "pos {pos} visit {il:2} {stem}.{norm}: CPU rule equals the card's q8_1 values in {} of {h}",
+                    "pos {pos} visit {il:2} {stem}.{norm}{}: CPU rule equals the card's q8_1 values in {} of {h}",
+                    if ffn {
+                        ", the visit's input, a stand-in row for the FFN"
+                    } else {
+                        ""
+                    },
                     row.equal
                 );
                 for (name, cpu_weight) in row_projections(layer, ffn) {
