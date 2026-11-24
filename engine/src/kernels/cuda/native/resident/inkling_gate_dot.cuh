@@ -102,6 +102,15 @@ __global__ void inkling_gate_dot(const GateDigits *packed, const uint8_t *gate,
 }
 
 #include "resident/inkling_decode_experts.cuh"
+#include "resident/inkling_gate_cached.cuh"
+
+template<int Type, int Bytes>
+void launch_decode_gate(const GateDigits *packed, const uint8_t *gate, float *out,
+                        DeviceSelectedWeights index, cudaStream_t stream) {
+    const dim3 grid(2304 / 16, 8);
+    if constexpr (Type == 19) decode_gate_pair<Type, Bytes><<<grid,256,0,stream>>>(packed,gate,out,index);
+    else decode_gate_cached<Type, Bytes><<<grid,256,0,stream>>>(packed,gate,out,index);
+}
 
 bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
                              float *temporary, cudaStream_t stream, Failure &failure) {
@@ -118,8 +127,7 @@ bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelect
     const dim3 grid(width / kWarps, a.count);
 #define GATE_DOT(id, bytes) \
     case id: if (decode_split_enabled()) \
-        decode_gate_pair<id, bytes><<<dim3(width/16, a.count), 256, 0, stream>>>( \
-            packed, static_cast<const uint8_t *>(a.gate), a.scratch, index); \
+        launch_decode_gate<id,bytes>(packed, static_cast<const uint8_t *>(a.gate), a.scratch, index, stream); \
         else inkling_gate_dot<id, bytes><<<grid, kWarps * 32, 0, stream>>>( \
             packed, static_cast<const uint8_t *>(a.gate), a.scratch, index); break;
     switch (type) {

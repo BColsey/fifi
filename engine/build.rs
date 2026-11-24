@@ -302,6 +302,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_decode_weights.cuh",
     "src/kernels/cuda/native/resident/inkling_vocab_iq4.cuh",
     "src/kernels/cuda/native/resident/inkling_gate_dot.cuh",
+    "src/kernels/cuda/native/resident/inkling_gate_cached.cuh",
     "src/kernels/cuda/native/resident/inkling_q2_down.cuh",
     "src/kernels/cuda/native/resident/inkling_stream.h",
     "src/kernels/cuda/native/resident/hyper.h",

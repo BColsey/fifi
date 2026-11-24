@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
                 inference_cuda_dense_gemv_args a{w,x,y,picks,r,c,gate?0:c,r,dtype};
                 Failure f;
                 if (gate) {
-#define G(id,n) case id: if (arm) decode_gate_pair<id,n><<<dim3(r/16,8),256,0,stream>>>(digits,w,y,idx); else inkling_gate_dot<id,n><<<dim3(r/8,8),256,0,stream>>>(digits,w,y,idx); break;
+#define G(id,n) case id: if (arm) launch_decode_gate<id,n>(digits,w,y,idx,stream); else inkling_gate_dot<id,n><<<dim3(r/8,8),256,0,stream>>>(digits,w,y,idx); break;
                     switch(t) { G(16,66) G(17,74) G(19,50) G(22,82) default: exit(3); }
 #undef G
                 } else if (t==42 && arm) decode_q2_pair<<<dim3(r/32,8),256,0,stream>>>(w,x,y,idx);
