@@ -166,6 +166,20 @@ __global__ void inkling_stream_add(float *state, const float *row, float *health
 
 bool aligned(const void *pointer) { return reinterpret_cast<uintptr_t>(pointer) % alignof(float) == 0; }
 
+__global__ void inkling_stream_norm(const float *src, float *dst, float *health, int width,
+                                    float eps) {
+    __shared__ float scratch[threads];
+    const int lane = threadIdx.x;
+    int invalid = 0;
+    const float scale = rms_scale(src, width, eps, scratch, invalid);
+    for (int i = lane; i < width; i += threads) {
+        const float value = __fmul_rn(src[i], scale);
+        dst[i] = value;
+        invalid |= !isfinite(value);
+    }
+    report(health, invalid);
+}
+
 bool overlaps(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
     const uintptr_t x = reinterpret_cast<uintptr_t>(a);
     const uintptr_t y = reinterpret_cast<uintptr_t>(b);
@@ -240,6 +254,27 @@ extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row,
     }
     inkling_stream_add<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         state, row, health, width);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return static_cast<int>(failure.err);
+}
+
+extern "C" int inference_cuda_inkling_stream_norm(const float *src, float *dst, float *health,
+                                                   int width, float eps, void *stream,
+                                                   int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    if (!src || !dst || !health || !stream || !aligned(src) || !aligned(dst) ||
+        !aligned(health) || !valid_shape(width, eps)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const size_t row = static_cast<size_t>(width) * sizeof(float);
+    if (overlaps(dst, row, src, row) || overlaps(health, sizeof(float), src, row) ||
+        overlaps(health, sizeof(float), dst, row)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    inkling_stream_norm<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        src, dst, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

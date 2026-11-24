@@ -2,7 +2,7 @@ use std::mem::size_of;
 
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
-use super::{AddCall, MAX_BLOCKS, MixCall, MixShape, SealCall, StreamShape};
+use super::{AddCall, MAX_BLOCKS, MixCall, MixShape, NormCall, SealCall, StreamShape};
 
 const EPS: f32 = 1e-5;
 
@@ -50,6 +50,13 @@ mod host {
         let mut previous = std::mem::replace(current, next);
         rms_norm(&mut previous, eps);
         previous
+    }
+
+    /// `rms_norm_with_scale` of the host: the normalized copy of `src`.
+    pub fn norm(src: &[f32], eps: f32) -> Vec<f32> {
+        let mut row = src.to_vec();
+        rms_norm(&mut row, eps);
+        row
     }
 
     /// `Stream::mix(first_block, query)` of a state with normalized sealed rows.
@@ -490,6 +497,59 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
         .unwrap_err();
     assert!(
         error.contains("the CUDA Inkling stream add takes"),
+        "{error}"
+    );
+}
+
+#[test]
+fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
+    if !device_present("Inkling stream norm") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let width = 2304;
+    let row = row_bytes(width);
+    let word = size_of::<f32>();
+    let buffers = Buffers::new(&ctx, width);
+    let src = normal_row(&mut Rng::new(0x5eed_5730), width);
+    upload(&buffers.row, &stream, &src);
+    buffers.clear_health(&stream);
+    ctx.inkling_stream_norm(
+        &stream,
+        NormCall {
+            src: buffers.row.range(0, row).unwrap(),
+            dst: buffers.out.range(0, row).unwrap(),
+            health: buffers.health.range(0, word).unwrap(),
+        },
+        (width, EPS),
+    )
+    .unwrap();
+    let expected = host::norm(&src, EPS);
+    for (a, b) in download(&buffers.out, &stream, 0, width)
+        .iter()
+        .zip(&expected)
+    {
+        assert!((a - b).abs() <= 1e-6 * (1.0 + b.abs()), "{a} vs {b}");
+    }
+    assert_eq!(buffers.health(&stream).to_bits(), 0);
+
+    let error = ctx
+        .inkling_stream_norm(
+            &stream,
+            NormCall {
+                src: buffers.out.range(0, row).unwrap(),
+                dst: buffers.out.range(0, row).unwrap(),
+                health: buffers.health.range(0, word).unwrap(),
+            },
+            (width, EPS),
+        )
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(
+        error.contains(
+            "the CUDA Inkling stream norm output and Inkling stream norm source ranges overlap"
+        ),
         "{error}"
     );
 }

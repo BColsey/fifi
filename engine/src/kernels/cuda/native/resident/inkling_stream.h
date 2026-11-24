@@ -18,6 +18,10 @@
  * inference_cuda_inkling_stream_add
  *   current = current + row, each sum rounded to nearest even. This is `Stream::add_current(row)`.
  *
+ * inference_cuda_inkling_stream_norm
+ *   dst = src * rms_scale(src): one row normalized into another range, the gate halves of a
+ *   cross-pass controller (`rms_norm_with_scale` of the host). `dst` shares no byte with `src`.
+ *
  * RMS scale: (dot(x, x) / width + eps).sqrt().recip(), every operation rounded to nearest even.
  * Reductions are reordered against the host's ordered sums, so results agree with the host
  * within floating-point error and are not bit-identical.
@@ -43,6 +47,9 @@ int inference_cuda_inkling_stream_seal(float *state, const float *next, float *h
 
 int inference_cuda_inkling_stream_add(float *state, const float *row, float *health, int width,
                                       void *stream, int *out_stage);
+
+int inference_cuda_inkling_stream_norm(const float *src, float *dst, float *health, int width,
+                                       float eps, void *stream, int *out_stage);
 
 #ifdef __cplusplus
 }

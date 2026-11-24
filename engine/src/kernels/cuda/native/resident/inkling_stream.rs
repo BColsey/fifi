@@ -43,6 +43,16 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+
+    fn inference_cuda_inkling_stream_norm(
+        src: *const c_void,
+        dst: *mut c_void,
+        health: *mut c_void,
+        width: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 fn shape(blocks: usize, width: usize, eps: f32) -> bool {
@@ -194,6 +204,49 @@ pub(in crate::kernels::cuda) fn add(
             row.address() as *const c_void,
             health.address(),
             width as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// `dst = src * rms_scale(src)`: one gate half of a cross-pass controller.
+pub(in crate::kernels::cuda) fn norm(
+    stream: &RawStream,
+    src: RawRange<'_>,
+    dst: RawRange<'_>,
+    health: RawRange<'_>,
+    width: usize,
+    eps: f32,
+) -> Result<(), DeviceFailure> {
+    let row = width * size_of::<f32>();
+    let health_bytes = size_of::<f32>();
+    if !shape(0, width, eps)
+        || !sized(&src, row)
+        || !sized(&dst, row)
+        || !sized(&health, health_bytes)
+    {
+        return Err(invalid_argument());
+    }
+    let (src_span, dst_span, health_span) = (
+        Span::of(&src, row),
+        Span::of(&dst, row),
+        Span::of(&health, health_bytes),
+    );
+    if !dst_span.apart(&src_span) || !health_span.apart(&src_span) || !health_span.apart(&dst_span)
+    {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: the ranges are aligned, hold the extents above and share no byte.
+    let status = unsafe {
+        inference_cuda_inkling_stream_norm(
+            src.address() as *const c_void,
+            dst.address(),
+            health.address(),
+            width as c_int,
+            eps,
             stream.0.as_ptr(),
             &mut stage,
         )
