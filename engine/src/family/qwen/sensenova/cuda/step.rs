@@ -519,6 +519,58 @@ impl<'a> LoopStep<'a> {
             + self.head.bytes()
     }
 
+    /// Device microbenchmark, not a gate: every matvec the decode walk issues, at `ncols`
+    /// activation columns, so the weights are read once for `ncols` tokens the way a batched
+    /// step would read them. Returns the microseconds of each group of `sweeps` sweeps, queued
+    /// ahead and drained once; the first group warms the card up and is dropped.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(super) fn sweep_micros(
+        &self,
+        ncols: usize,
+        sweeps: usize,
+        groups: usize,
+    ) -> Result<Vec<f64>, EngError> {
+        let mut weights: Vec<&NativeWeight> = Vec::new();
+        for il in 0..TRUNK_LAYERS {
+            let phys = &self.phys[self.plan.physical(il)];
+            match &phys.mixer {
+                Mixer::Delta {
+                    qkvz,
+                    beta_alpha,
+                    out,
+                    ..
+                } => weights.extend([*qkvz, *beta_alpha, *out]),
+                Mixer::Attn { q, k, v, o, .. } => weights.extend([*q, *k, *v, *o]),
+            }
+            weights.extend([&phys.ffn_gate, &phys.ffn_up, &phys.ffn_down]);
+        }
+        weights.push(self.head);
+        let (k_max, rows_max) = weights
+            .iter()
+            .fold((0, 0), |(k, n), w| (k.max(w.k()), n.max(w.n_rows())));
+        let x = self.ctx.upload(&vec![0u8; ncols * q8_row(k_max)?])?;
+        let y = self.ctx.upload(&le_f32(&vec![0.0; ncols * rows_max]))?;
+        let mut out = Vec::with_capacity(groups);
+        for _ in 0..=groups {
+            let t0 = std::time::Instant::now();
+            for _ in 0..sweeps {
+                for w in &weights {
+                    self.ctx.matvec_native(
+                        &self.stream,
+                        w,
+                        x.range(0, ncols * q8_row(w.k())?)?,
+                        y.range(0, ncols * w.n_rows() * F32)?,
+                        ncols,
+                    )?;
+                }
+            }
+            self.stream.synchronize()?;
+            out.push(t0.elapsed().as_secs_f64() * 1e6 / sweeps as f64);
+        }
+        out.remove(0);
+        Ok(out)
+    }
+
     /// The carried state for the parity rigs, as (piece, buffer, byte offset, byte length):
     /// the hidden row, every attention visit's K and V planes over the first `rows` rows
     /// (fp16), and every GDN visit's record and conv ring (f32).

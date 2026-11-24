@@ -1006,3 +1006,29 @@ fn card_decode_trace() {
     );
     assert!(serialized.is_finite() && pipelined.is_finite());
 }
+
+/// Device microbenchmark, not a gate: the decode step's weight sweep at 1, 2, 4 and 8
+/// activation columns. A batched step reads the weights once for all of its tokens, so
+/// this is the weight term of one token of a batch on this card. The glue, the launch gaps
+/// and the per-sequence attention state of a real batched step are not in it.
+#[test]
+fn card_decode_sweep_columns() {
+    let Some((ctx, loaded, weights, _projector)) = open_rig("sensenova decode sweep columns")
+    else {
+        return;
+    };
+    let card = open_card(&ctx, &loaded, &weights, CACHE_ROWS);
+    let gib = card.step_weight_bytes() as f64 / 1e9;
+    eprintln!("sweep reads {gib:.2} GB per pass: median and minimum of 5 groups of 5 sweeps");
+    for ncols in [1, 2, 4, 8] {
+        let mut sorted = card.sweep_micros(ncols, 5, 5).unwrap();
+        sorted.sort_by(f64::total_cmp);
+        let (mid, min) = (sorted[sorted.len() / 2], sorted[0]);
+        eprintln!(
+            "sweep {ncols} column(s): median {mid:.0} us, min {min:.0} us = {:.0} GB/s; weight term {:.2} ms per token = {:.0} tok/s from this term alone",
+            gib / (mid * 1e-6),
+            mid * 1e-6 * 1e3 / ncols as f64,
+            ncols as f64 / (mid * 1e-6),
+        );
+    }
+}
