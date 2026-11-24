@@ -11,10 +11,7 @@
 use crate::{
     EngError,
     family::math::{delta_rule, dot, expect_len, rms_plain, rms_unit, sigmoid, silu, softplus},
-    family::project::{
-        Projector,
-        gguf::{GgufMatrix as TensorRef, GgufProjector},
-    },
+    family::project::{Projector, gguf::GgufMatrix as TensorRef},
 };
 
 use super::weights::{Layer, LoopShape, LoopWeights, Mixer};
@@ -443,8 +440,8 @@ fn corr_dim(dims: usize, orig: f32, beta: f32, base: f32) -> f32 {
     dims as f32 * (orig / (beta * std::f32::consts::TAU)).ln() / (2.0 * base.ln())
 }
 
-pub(super) fn logits(
-    projector: &mut GgufProjector,
+pub(super) fn logits<P: Projector<Weight = TensorRef>>(
+    projector: &mut P,
     weights: &LoopWeights,
     hidden: &[f32],
 ) -> Result<Vec<f32>, EngError> {
@@ -452,9 +449,10 @@ pub(super) fn logits(
     projector.linear(weights.output(), &normed)
 }
 
-/// Embeds a token and feeds all 56 logical visits, leaving the head to the caller.
-pub(super) fn trunk(
-    projector: &mut GgufProjector,
+/// Embeds a token and feeds all 56 logical visits, leaving the head to the caller. Any
+/// projector over the weights: the parameter exists so a test can emulate the quantized model.
+pub(super) fn trunk<P: Projector<Weight = TensorRef>>(
+    projector: &mut P,
     weights: &LoopWeights,
     state: &mut LoopState,
     token: u32,
@@ -468,8 +466,8 @@ pub(super) fn trunk(
     not(all(test, feature = "native-cuda", target_os = "linux")),
     expect(dead_code, reason = "used by the CUDA device parity rig")
 )]
-pub(super) fn trunk_traced(
-    projector: &mut GgufProjector,
+pub(super) fn trunk_traced<P: Projector<Weight = TensorRef>>(
+    projector: &mut P,
     weights: &LoopWeights,
     state: &mut LoopState,
     token: u32,
@@ -479,8 +477,8 @@ pub(super) fn trunk_traced(
     trunk_inner(projector, weights, state, token, pos, Some(trace))
 }
 
-fn trunk_inner(
-    projector: &mut GgufProjector,
+fn trunk_inner<P: Projector<Weight = TensorRef>>(
+    projector: &mut P,
     weights: &LoopWeights,
     state: &mut LoopState,
     token: u32,
@@ -583,8 +581,8 @@ fn trunk_inner(
     Ok(cur)
 }
 
-fn ffn(
-    projector: &mut GgufProjector,
+fn ffn<P: Projector<Weight = TensorRef>>(
+    projector: &mut P,
     layer: &super::weights::Layer,
     shape: &LoopShape,
     x: &[f32],
