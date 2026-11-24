@@ -873,7 +873,9 @@ fn work_loop<E: ExecutorOps>(
         };
         // While streams decode, an executor that sets a prompt share feeds that many rows per
         // tick beside the decode rows, never fewer than one planned piece, in as many pieces as
-        // the rows need. Without a share the cold prompt takes the piece less the decode rows.
+        // the rows need. Without a share the tick's budget is the iteration's rows less the
+        // decode rows: the cold prompts are dealt whole pieces from it, at least one a tick and
+        // at most one each, and they take turns.
         let decoding_share = share
             .filter(|_| decode_rows > 0)
             .map(|rows| rows.max(prefill_chunk));

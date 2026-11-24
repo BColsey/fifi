@@ -1050,12 +1050,15 @@ fn a_cold_prompt_beside_a_stream_is_fed_one_whole_piece_a_tick_in_either_arrival
             } else if call == "window" {
                 let window = windows.next().unwrap();
                 if streaming && !cold_decoded {
-                    assert!(rows <= 4, "more than one whole piece beside {window:?}");
                     if window.iter().any(|history| history[0] == 1) {
+                        // No piece is due in the tick the cold prompt joins the window.
                         cold_decoded = true;
+                        assert_eq!(rows, 0, "a piece was fed in the tick the cold prompt joins");
                         assert_eq!(window.len(), 2, "cold client finished during streaming");
                     } else {
-                        assert!(rows > 0, "cold prompt starved");
+                        // While the cold prompt is still prefilling beside the stream, each shared
+                        // tick feeds it exactly one whole piece.
+                        assert_eq!(rows, 4, "not one whole piece beside {window:?}");
                         shared_ticks += 1;
                     }
                 }
@@ -2626,6 +2629,33 @@ fn a_prompts_pieces_do_not_depend_on_the_prompts_that_share_its_ticks() {
 }
 
 #[test]
+fn cold_prompts_take_turns_at_the_piece_the_tick_buys() {
+    // Three cold prompts and no stream, with the budget buying one piece a tick: the piece is
+    // dealt to the next cold slot every tick, so no prompt is fed a second piece before each of
+    // the others has had its first.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 4;
+    fake.idle_pieces = 1;
+    let (engine, release) = start_with_budget(fake, 4);
+    let mut events = Vec::new();
+    for marker in [5, 6, 7] {
+        let (cold, cold_events) = job(&[marker; 8], 1);
+        engine.handle().try_submit(cold).expect("cold");
+        events.push(cold_events);
+    }
+    release.send(()).expect("load");
+    for cold_events in events {
+        assert_eq!(usage(&collect(cold_events)).completion_tokens, 1);
+    }
+    engine.shutdown();
+    assert_eq!(
+        lock(&log).fed,
+        vec![(5, 4), (6, 4), (7, 4), (5, 4), (6, 4), (7, 4)]
+    );
+}
+
+#[test]
 fn a_prompt_share_feeds_several_pieces_in_one_tick_while_a_stream_decodes() {
     // The fake plans pieces of four rows. A cold prompt beside a decoding stream feeds one piece
     // per tick by the worker's rule; with a share of 24 rows it feeds the rest of its prompt in
@@ -3383,10 +3413,20 @@ fn a_restored_prompt_with_its_tail_in_shared_pieces_reaches_the_cold_rows_tokens
             .try_submit(first.with_prefix_boundary(seed_prompt.len()).expect("tip"))
             .expect("turn one");
         collect(first_events);
-        // A long stream decodes while turn two restores and prefills its tail.
+        // A long stream decodes while turn two restores and prefills its tail. Turn one has already
+        // logged a window, so the wait counts the stream's own: when both arrive in one tick, the
+        // stream's one-row prompt is fed after the restore and lands among the tail's pieces.
+        let windows = |log: &Log| {
+            lock(log)
+                .calls
+                .iter()
+                .filter(|call| *call == "window")
+                .count()
+        };
+        let before = windows(&log);
         let (stream, stream_events) = job(&[1], 150);
         engine.handle().try_submit(stream).expect("stream");
-        wait(|| lock(&log).calls.iter().any(|call| call == "window"));
+        wait(|| windows(&log) > before);
         let (second, second_events) = job(&turn_two, 3);
         engine
             .handle()
@@ -3433,7 +3473,12 @@ fn a_restored_prompt_with_its_tail_in_shared_pieces_reaches_the_cold_rows_tokens
     // four rows from the restored position, cut only at the save point before the last token and
     // at the end of the prompt.
     let want: Vec<usize> = [4, 4, 4, 4, 4, 4, 4, 1, 1].to_vec();
-    assert_eq!(pieces, want, "the tail runs in the prompt's own pieces");
+    assert_eq!(
+        pieces,
+        want,
+        "the tail runs in the prompt's own pieces; the first calls after the restore: {:?}",
+        &calls[at..(at + 14).min(calls.len())]
+    );
     assert!(
         lock(&cold_log)
             .calls

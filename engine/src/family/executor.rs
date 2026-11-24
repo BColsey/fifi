@@ -136,12 +136,13 @@ pub(crate) trait ExecutorOps {
         BatchPolicy::default()
     }
     /// The prompt rows the batch worker feeds per tick, over all cold slots together, while a
-    /// stream decodes, beside the decode rows. `None` keeps the worker's rule: the planned piece
-    /// less one row per ready slot, shared among the cold slots, one piece each. `Some(n)` makes
-    /// the share independent of the piece size: the worker feeds at least one planned piece and
-    /// at most `n` rows when `n` is larger, and a cold slot may run several pieces in a tick
-    /// until its part is spent. With no stream decoding every cold prompt takes whole pieces
-    /// whatever the share. Only the batch worker reads it.
+    /// stream decodes, beside the decode rows. `None` keeps the worker's rule: the iteration's
+    /// rows, never below one row per live slot, less the decode rows; the cold prompts are
+    /// dealt whole pieces from that budget, at least one a tick and at most one each, and they
+    /// take turns. `Some(n)` makes the share independent of the piece size: the worker feeds at
+    /// least one planned piece and at most `n` rows when `n` is larger, and a cold slot may run
+    /// several pieces in a tick until its part is spent. With no stream decoding every cold
+    /// prompt takes whole pieces whatever the share. Only the batch worker reads it.
     fn prompt_rows_per_tick(&self) -> Option<usize> {
         None
     }
