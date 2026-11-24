@@ -45,8 +45,8 @@ const ROUTE_FLOATS: usize = 6;
 const MAX_ROWS: usize = 4096;
 
 /// Checks the row count and the stream stride, and returns the bytes one stream half covers:
-/// `rows` rows whose first is a full row and whose rest step `ld_ab`. A chunk's halves
-/// interleave inside their `[a || b]` rows; `ld_ab >= 2 * hidden` keeps every element apart.
+/// `rows` rows whose first is a full row and whose rest step `ld_ab`. The stride rule alone
+/// does not keep `a` off `b`: `mhc_merge` proves that from their starts ([`streams_apart`]).
 fn stream_bytes(rows: usize, ld_ab: usize, hidden: usize) -> Result<usize, EngError> {
     if rows == 0 || rows > MAX_ROWS || ld_ab < 2 * hidden {
         return Err(EngError::BadRequest(format!(
