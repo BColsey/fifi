@@ -298,6 +298,8 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/dense_gemv.h",
     "src/kernels/cuda/native/resident/gguf_gemv.cuh",
     "src/kernels/cuda/native/resident/inkling_conv.h",
+    "src/kernels/cuda/native/resident/inkling_decode_experts.cuh",
+    "src/kernels/cuda/native/resident/inkling_decode_weights.cuh",
     "src/kernels/cuda/native/resident/inkling_gate_dot.cuh",
     "src/kernels/cuda/native/resident/inkling_q2_down.cuh",
     "src/kernels/cuda/native/resident/inkling_stream.h",

@@ -6,6 +6,8 @@
 #include <mma.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <type_traits>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -300,6 +302,7 @@ bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelect
     return true;
 }
 
+#include "resident/inkling_decode_weights.cuh"
 #include "resident/inkling_gate_dot.cuh"
 #include "resident/inkling_q2_down.cuh"
 
@@ -466,7 +469,11 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
     const size_t shared = (size_t)a.cols * sizeof(float);
     const bool vector = a.cols % (sizeof(uint4) / sizeof(W)) == 0 && aligned(a.w, 16);
-    if (vector) {
+    if (a.m == 1 && ((a.cols == 4608 && a.rows == 64 && a.weight_dtype == kDtypeF32) ||
+                     (a.cols == 2304 && (a.rows == 24 || a.rows == 32) && a.weight_dtype == kDtypeBf16)) &&
+        decode_split_enabled()) {
+        decode_split_dense<W><<<a.rows, 128, 0, s>>>(a);
+    } else if (vector) {
         dense_gemv_k<W, true><<<grid, kWarps * 32, shared, s>>>(
             (const W *)a.w, (const float *)a.x, (float *)a.y, a.rows, a.cols, a.ld_x, a.ld_y);
     } else {
@@ -481,6 +488,10 @@ void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
                    Failure &failure, Index index) {
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
     const size_t shared = size_t(a.cols) * sizeof(float);
+    if (decode_split_enabled() && launch_decode_split(a, index, stream)) {
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        return;
+    }
     if (a.weight_dtype == kDtypeGgufNvfp4) {
         gguf_nvfp4_gemv<Index><<<grid, kWarps * 32, 0, stream>>>(a, index);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -600,8 +611,13 @@ bool launch_inkling_q2_down(const inference_cuda_gguf_moe_args &a, DeviceSelecte
                             const float *middle, float *down, cudaStream_t stream, Failure &failure) {
     if (!inkling_q2_down_shape(a.hidden, a.middle, a.count, a.down_dtype)) return false;
     const dim3 grid(kInklingDownRows / kQ2RowsPerCta, kInklingDownPicks);
-    inkling_q2_down<<<grid, kWarps * 32, 0, stream>>>(
-        static_cast<const uint8_t *>(a.down), middle, down, index);
+    if (decode_split_enabled() && aligned(middle, 16)) {
+        decode_q2_pair<<<grid, kWarps * 32, 0, stream>>>(
+            static_cast<const uint8_t *>(a.down), middle, down, index);
+    } else {
+        inkling_q2_down<<<grid, kWarps * 32, 0, stream>>>(
+            static_cast<const uint8_t *>(a.down), middle, down, index);
+    }
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     return true;
 }
