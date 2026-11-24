@@ -373,6 +373,12 @@ impl NativeWeight {
         &self.buffer
     }
 
+    /// The stored bytes of the weight.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn bytes(&self) -> usize {
+        self.buffer.bytes()
+    }
+
     /// Records the stack depth of a rank-3 tensor (`None` for a plain matrix). The upload
     /// reads only the tensor's flattened shape, so the loader writes the depth it read from
     /// the GGUF dims here.

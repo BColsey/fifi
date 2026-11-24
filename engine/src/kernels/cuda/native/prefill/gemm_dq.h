@@ -40,6 +40,16 @@ typedef struct inference_cuda_gemm_dq_args {
 int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_args *args, void *stream,
                                       int *out_stage);
 
+/* The same launch with the Q4_K decoder: w holds rows * k/256 * 144 bytes and must be 16-byte
+ * aligned (the staging moves blocks as 16-byte words); every other rule is the Q5_K one. */
+int inference_cuda_gemm_dq_q4k_launch(const inference_cuda_gemm_dq_args *args, void *stream,
+                                      int *out_stage);
+
+/* The same launch with the Q6_K decoder: w holds rows * k/256 * 210 bytes and needs only
+ * 2-byte alignment (the staging moves whole bytes); every other rule is the Q5_K one. */
+int inference_cuda_gemm_dq_q6k_launch(const inference_cuda_gemm_dq_args *args, void *stream,
+                                      int *out_stage);
+
 /* The same launch with the Q4_0 decoder: k must be a multiple of 64, w holds
  * rows * k/32 * 18 bytes (2-byte aligned is enough), x and y as above. */
 int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_args *args, void *stream,

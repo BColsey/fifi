@@ -84,6 +84,18 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_gemm_dq_q4k_launch"]
+    fn gemm_dq_q4k_launch_raw(
+        args: *const GemmDqArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gemm_dq_q6k_launch"]
+    fn gemm_dq_q6k_launch_raw(
+        args: *const GemmDqArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_gemm_dq_q3k_launch"]
     fn gemm_dq_q3k_launch_raw(
         args: *const GemmDqArgsRepr,
@@ -137,6 +149,45 @@ struct GemmDqGeom {
     qk: usize,
     block_bytes: usize,
     w_align: usize,
+}
+
+/// One K-quant block type behind the geometry-parameterised entry of the dequantizing GEMM
+/// (Q4_K and Q6_K): the block geometry of the weight and the kernel entry that decodes it.
+/// The per-type entries spell their own call, check and launch; a type that rides this one
+/// differs from its sibling only here.
+#[derive(Clone, Copy)]
+pub(in crate::kernels::cuda) struct DqKGeometry {
+    pub(in crate::kernels::cuda) name: &'static str,
+    /// Bytes of one 256-value block.
+    pub(in crate::kernels::cuda) block_bytes: usize,
+    /// The alignment `w` must have: 16 for block sizes the quad staging reads, else 2.
+    pub(in crate::kernels::cuda) w_align: usize,
+    launch: unsafe extern "C" fn(*const GemmDqArgsRepr, *mut c_void, *mut c_int) -> c_int,
+}
+
+pub(in crate::kernels::cuda) const GEMM_DQ_Q4K: DqKGeometry = DqKGeometry {
+    name: "Q4_K",
+    block_bytes: 144,
+    w_align: 16,
+    launch: gemm_dq_q4k_launch_raw,
+};
+pub(in crate::kernels::cuda) const GEMM_DQ_Q6K: DqKGeometry = DqKGeometry {
+    name: "Q6_K",
+    block_bytes: 210,
+    w_align: 2,
+    launch: gemm_dq_q6k_launch_raw,
+};
+
+/// The call of a [`DqKGeometry`] type: the fields of [`GemmDqQ5kRaw`] plus the geometry.
+pub(in crate::kernels::cuda) struct GemmDqKRaw<'a> {
+    pub(in crate::kernels::cuda) w: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) y: RawRange<'a>,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ncols: usize,
+    pub(in crate::kernels::cuda) layout: GemmDqLayout,
+    pub(in crate::kernels::cuda) geometry: DqKGeometry,
 }
 
 /// The x and y layouts: 0/0 keeps the row-major [k][ncols] and [rows][ncols]
@@ -302,6 +353,44 @@ pub(in crate::kernels::cuda) fn gemm_dq_q5k_launch(
         &call.layout,
     )?;
     let status = unsafe { gemm_dq_q5k_launch_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// One launch for every [`DqKGeometry`] type: the size and apartness contract of
+/// [`check_gemm_dq_q5k`] with the type's block size and alignment, then the type's entry.
+pub(in crate::kernels::cuda) fn gemm_dq_k_launch(
+    stream: &RawStream,
+    call: &GemmDqKRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_gemm_dq(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+        &GemmDqGeom {
+            qk: 256,
+            block_bytes: call.geometry.block_bytes,
+            w_align: call.geometry.w_align,
+        },
+    )?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the check above proved the `w`, `x` and `y` ranges inside their live
+    // allocations, large enough for the call, aligned, and `y` disjoint from the ranges the
+    // kernel reads; the adapter repeats the checks on the addresses. `stream` is live for the
+    // call.
+    let args = gemm_dq_args(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+    )?;
+    let status = unsafe { (call.geometry.launch)(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

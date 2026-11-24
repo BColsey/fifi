@@ -518,6 +518,36 @@ extern "C" int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_ar
     }
 }
 
+extern "C" int inference_cuda_gemm_dq_q4k_launch(const inference_cuda_gemm_dq_args *args,
+                                                 void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
+            args->y == NULL || !aligned(args->w, 16) || !aligned(args->x, 2) ||
+            !aligned(args->y, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        return launch<gemm_dq::Q4kDecoder>(args, stream, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gemm_dq_q6k_launch(const inference_cuda_gemm_dq_args *args,
+                                                 void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
+            args->y == NULL || !aligned(args->w, 2) || !aligned(args->x, 2) ||
+            !aligned(args->y, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        return launch<gemm_dq::Q6kDecoder>(args, stream, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
 extern "C" int inference_cuda_gemm_dq_q3k_launch(const inference_cuda_gemm_dq_args *args,
                                                  void *stream, int *out_stage) {
     try {

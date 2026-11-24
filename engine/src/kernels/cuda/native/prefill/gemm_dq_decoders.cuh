@@ -93,6 +93,84 @@ struct Q5kDecoder {
     }
 };
 
+/* Q4_K block layout (144 bytes for 256 values, 8 groups of 32): an f16 value scale at +0, an
+ * f16 offset scale at +2, the same 12 packed 6-bit group factors as Q5_K at +4, and 128 code
+ * bytes at +16 whose byte j holds the codes of values j (low nibble) and j + 128 (high
+ * nibble). Value i of group g weighs (value_scale * mult[g]) * code - offset_scale * offs[g]. */
+struct Q4kDecoder {
+    static const int kQK = 256;
+    static const int kBlockBytes = 144;
+    static const int kChunkBlocks = 1;
+    static const int kTabWords = 4;
+    static const int kHostTabWords = 0;
+    static const int kParts = 1;
+
+    __device__ static int chunk_block_off(int c) { return c >> 2; }
+
+    /* Chunk c (0..3) carries values [64c, 64c+64): the low nibbles of bytes [16+32c,
+     * 16+32c+32) against group 2c, then the high nibbles against group 2c+1. */
+    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst,
+                                             const uint32_t *, int) {
+        c &= 3;
+        const float d = half_at(block);
+        const float dmin = half_at(block + 2);
+        float mult[8];
+        float offs[8];
+        q5k_group_factors(block + 4, mult, offs);
+        const float mul1 = d * mult[2 * c];
+        const float off1 = dmin * offs[2 * c];
+        const float mul2 = d * mult[2 * c + 1];
+        const float off2 = dmin * offs[2 * c + 1];
+        const unsigned char *codes = block + 16 + 32 * c;
+        for (int l = 0; l < 32; ++l) {
+            const unsigned char code = codes[l];
+            dst[l] = __float2half(fmaf(mul1, (float)(code & 0x0f), -off1));
+            dst[32 + l] = __float2half(fmaf(mul2, (float)(code >> 4), -off2));
+        }
+    }
+};
+
+/* Q6_K block layout (210 bytes for 256 values, 16 groups of 16): 128 code bytes at +0 (the
+ * low 4 bits of values [0,128), then of [128,256)), 32 bytes at +128 holding bits 4-5 of value
+ * l and bits 6-7 of value l+16 of each 32-value quarter q at byte 32q + l, 16 signed 8-bit
+ * group scales at +192 and an f16 value scale at +208. Value i weighs value_scale *
+ * scales[i / 16] * (code - 32). */
+struct Q6kDecoder {
+    static const int kQK = 256;
+    static const int kBlockBytes = 210;
+    static const int kChunkBlocks = 1;
+    static const int kTabWords = 4;
+    static const int kHostTabWords = 0;
+    static const int kParts = 1;
+
+    __device__ static int chunk_block_off(int c) { return c >> 2; }
+
+    /* Chunk c (0..3) carries values [64c, 64c+64): the low or the high nibbles of the c/2-th
+     * 128-value half, the second chunk of a half reading the high nibbles. */
+    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst,
+                                             const uint32_t *, int) {
+        c &= 3;
+        const int half = c >> 1;
+        const int nibble = c & 1;
+        const float d = half_at(block + 208);
+        const unsigned char *ql = block + 64 * half;
+        const unsigned char *qh = block + 128 + 32 * half;
+        const signed char *scales =
+            reinterpret_cast<const signed char *>(block + 192 + 8 * half + 4 * nibble);
+        const unsigned shift = 4 * nibble;
+        for (int l = 0; l < 32; ++l) {
+            const int is = l >> 4;
+            const unsigned h = qh[l];
+            const int lo1 = nibble ? (ql[l] >> 4) : (ql[l] & 0x0f);
+            const int lo2 = nibble ? (ql[l + 32] >> 4) : (ql[l + 32] & 0x0f);
+            const float q1 = (float)(lo1 | (int)((h >> shift) & 3) << 4) - 32.0f;
+            const float q2 = (float)(lo2 | (int)((h >> (shift + 2)) & 3) << 4) - 32.0f;
+            dst[l] = __float2half(d * (float)scales[is] * q1);
+            dst[32 + l] = __float2half(d * (float)scales[is + 2] * q2);
+        }
+    }
+};
+
 /* Q4_0 block layout (18 bytes for 32 values): an f16 scale d at +0, then 16 code bytes at
  * +2 whose byte j holds the codes of values j (low nibble) and j + 16 (high nibble); value i
  * of the block is d * (code_i - 8). A 64-value chunk is exactly two whole blocks, so the

@@ -15,8 +15,9 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::gemm_dq::{
-    GemmDqCodebookRaw, GemmDqLayout, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw,
-    gemm_dq_codebook_launch, gemm_dq_q3k_launch, gemm_dq_q5k_launch, gemm_dq_q40_launch,
+    DqKGeometry, GEMM_DQ_Q4K, GEMM_DQ_Q6K, GemmDqCodebookRaw, GemmDqKRaw, GemmDqLayout,
+    GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_codebook_launch, gemm_dq_k_launch,
+    gemm_dq_q3k_launch, gemm_dq_q5k_launch, gemm_dq_q40_launch,
 };
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 
@@ -137,6 +138,13 @@ impl CudaContext {
         quant: QuantType,
         call: GemmDqTypedCall<'_>,
     ) -> Result<(), EngError> {
+        // Q4_K and Q6_K ride the geometry-parameterised entry: their blocks differ from each
+        // other's only in size and decoder.
+        match quant {
+            QuantType::Q4K => return self.gemm_dq_k(stream, call, GEMM_DQ_Q4K),
+            QuantType::Q6K => return self.gemm_dq_k(stream, call, GEMM_DQ_Q6K),
+            _ => {}
+        }
         let GemmDqTypedCall {
             w,
             x,
@@ -191,11 +199,9 @@ impl CudaContext {
                     x_f32,
                 },
             ),
-            QuantType::Q80 | QuantType::Q50 | QuantType::Q4K | QuantType::Q6K => {
-                Err(EngError::BadRequest(format!(
-                    "{quant:?} rides the vendored MMQ pair, not the in-house dequantizing GEMM"
-                )))
-            }
+            QuantType::Q80 | QuantType::Q50 => Err(EngError::BadRequest(format!(
+                "{quant:?} rides the vendored MMQ pair, not the in-house dequantizing GEMM"
+            ))),
             ty if ty.is_codebook() => self.gemm_dq_codebook(
                 stream,
                 ty,
@@ -222,6 +228,7 @@ impl CudaContext {
             | QuantType::Q2K
             | QuantType::Iq1S
             | QuantType::Iq1M => unreachable!("covered by is_codebook"),
+            QuantType::Q4K | QuantType::Q6K => unreachable!("returns at the geometry dispatch"),
         }
     }
 
@@ -304,6 +311,19 @@ impl CudaContext {
         self.ensure_usable()?;
         let raw = self.plan_gemm_dq_q5k(&call)?;
         self.launch_on(stream, |stream_raw| gemm_dq_q5k_launch(stream_raw, &raw))
+    }
+
+    /// The dequantizing GEMM for the K-quant types behind the geometry-parameterised entry
+    /// (Q4_K, Q6_K): the contract of [`Self::gemm_dq_q5k`] with the block size of the type.
+    fn gemm_dq_k(
+        &self,
+        stream: &DeviceStream,
+        call: GemmDqTypedCall<'_>,
+        geometry: DqKGeometry,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.plan_gemm_dq_k(&call, geometry)?;
+        self.launch_on(stream, |stream_raw| gemm_dq_k_launch(stream_raw, &raw))
     }
 
     pub(crate) fn gemm_dq_q3k(
@@ -488,6 +508,70 @@ impl CudaContext {
                 y_col_stride: call.y_col_stride,
                 x_f32: call.x_f32,
             },
+        })
+    }
+
+    /// [`Self::plan_gemm_dq_q5k`] for a [`DqKGeometry`] type, with its block size.
+    fn plan_gemm_dq_k<'b>(
+        &self,
+        call: &GemmDqTypedCall<'b>,
+        geometry: DqKGeometry,
+    ) -> Result<GemmDqKRaw<'b>, EngError> {
+        let (w_raw, x_raw, y_raw) = (
+            self.raw_range(&call.w)?,
+            self.raw_range(&call.x)?,
+            self.raw_range(&call.y)?,
+        );
+        let name = geometry.name;
+        if call.k == 0 || !call.k.is_multiple_of(256) {
+            return Err(EngError::BadRequest(format!(
+                "the {name} dequantizing GEMM needs k as a positive multiple of 256, got {}",
+                call.k
+            )));
+        }
+        if call.rows == 0 || call.ncols == 0 {
+            return Err(EngError::BadRequest(format!(
+                "the {name} dequantizing GEMM needs rows and columns above zero"
+            )));
+        }
+        let blocks = call.rows.checked_mul(call.k / 256).ok_or_else(|| {
+            EngError::BadRequest(format!("the {name} GEMM weight size overflows"))
+        })?;
+        let need_w = blocks.checked_mul(geometry.block_bytes).ok_or_else(|| {
+            EngError::BadRequest(format!("the {name} GEMM weight size overflows"))
+        })?;
+        let (need_x, need_y) = gemm_dq_layout_spans(
+            call.k,
+            call.rows,
+            call.ncols,
+            call.x_col_stride,
+            call.y_col_stride,
+            call.x_f32,
+        )
+        .ok_or_else(|| {
+            EngError::BadRequest(format!(
+                "the {name} GEMM size overflows for the layout strides"
+            ))
+        })?;
+        require_fit("w", &call.w, need_w, 4)?;
+        require_fit("x", &call.x, need_x, if call.x_f32 { 4 } else { 2 })?;
+        require_fit("y", &call.y, need_y, 4)?;
+        let written = Claim::of("y", &call.y, need_y);
+        require_apart(&written, &Claim::of("w", &call.w, need_w))?;
+        require_apart(&written, &Claim::of("x", &call.x, need_x))?;
+        Ok(GemmDqKRaw {
+            w: w_raw,
+            x: x_raw,
+            y: y_raw,
+            k: call.k,
+            rows: call.rows,
+            ncols: call.ncols,
+            layout: GemmDqLayout {
+                x_col_stride: call.x_col_stride,
+                y_col_stride: call.y_col_stride,
+                x_f32: call.x_f32,
+            },
+            geometry,
         })
     }
 }

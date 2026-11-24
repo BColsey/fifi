@@ -1265,3 +1265,140 @@ fn gemm_dq_inhouse_matches_the_reference_at_serve_offsets() {
     }
     println!("{NAME}: q5k and q40 match the CPU reference at serve offsets");
 }
+
+/// One K-quant block type behind the geometry-parameterised entry: its oracle entry, its
+/// block size, and the offsets of the f16 halves a random block must keep sane.
+#[derive(Clone, Copy)]
+struct KType {
+    quant: QuantType,
+    gguf: GgufType,
+    block_bytes: usize,
+    f16_at: &'static [usize],
+}
+
+const Q4K: KType = KType {
+    quant: QuantType::Q4K,
+    gguf: GgufType::Q4K,
+    block_bytes: 144,
+    f16_at: &[0, 2],
+};
+const Q6K: KType = KType {
+    quant: QuantType::Q6K,
+    gguf: GgufType::Q6K,
+    block_bytes: 210,
+    f16_at: &[208],
+};
+
+/// Random-but-valid blocks of a [`KType`]: sane scales at `f16_at`, every other byte random
+/// (the layout decodes any bits; the oracle reads the same bytes).
+fn build_weight_k(ty: KType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut rng = testkit::Rng::new(seed);
+    let mut bytes: Vec<u8> = (0..rows * (k / 256) * ty.block_bytes)
+        .map(|_| (rng.next_u64() & 0xFF) as u8)
+        .collect();
+    for block in bytes.chunks_mut(ty.block_bytes) {
+        for &at in ty.f16_at {
+            let d = 0.05 + rng.below(190) as f64 / 100.0;
+            block[at..at + 2].copy_from_slice(&testkit::f64_to_f16_bits(d).to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// [`reference`] over a [`KType`]'s oracle entry and block size.
+fn reference_k(
+    ty: KType,
+    w: &[u8],
+    x: &[u16],
+    rows: usize,
+    k: usize,
+    ncols: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut dequant_row = vec![0.0f32; k];
+    let mut y = vec![0.0f64; rows * ncols];
+    let mut abs = vec![0.0f64; rows * ncols];
+    for r in 0..rows {
+        let blocks = &w[r * (k / 256) * ty.block_bytes..];
+        for b in 0..k / 256 {
+            let block = &blocks[b * ty.block_bytes..(b + 1) * ty.block_bytes];
+            let full = dequantize(ty.gguf, block).expect("dequant");
+            dequant_row[b * 256..(b + 1) * 256].copy_from_slice(&full);
+        }
+        for n in 0..ncols {
+            let mut sum = 0.0f64;
+            let mut terms = 0.0f64;
+            for c in 0..k {
+                let term = f64::from(dequant_row[c]) * f64::from(f16_of(x[c * ncols + n]));
+                sum += term;
+                terms += term.abs();
+            }
+            y[r * ncols + n] = sum;
+            abs[r * ncols + n] = terms;
+        }
+    }
+    (y, abs)
+}
+
+/// Q4_K and Q6_K through the geometry-parameterised entry, against the oracle, with the
+/// activations as f16 and as the f32 rows a prefill hands over (the kernel rounds those to the
+/// same f16, so one reference serves both).
+#[test]
+fn gemm_dq_q4k_q6k_match_the_cpu_dequant_matmul() {
+    if !testkit::device_present("gemm_dq_q4k_q6k_match_the_cpu_dequant_matmul") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut max_ratio = 0.0f64;
+    for (ty, tag, seed) in [(Q4K, "q4k", 0x4b4b_0001u64), (Q6K, "q6k", 0x6b6b_0001u64)] {
+        for x_f32 in [false, true] {
+            for (rows, k, ncols) in [(64usize, 512usize, 64usize), (100, 1024, 40), (13, 256, 7)] {
+                let w_bytes = build_weight_k(ty, rows, k, seed);
+                let mut rng = testkit::Rng::new(seed ^ 0xa5a5);
+                let x: Vec<u16> = (0..k * ncols)
+                    .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+                    .collect();
+                let (y_ref, abs) = reference_k(ty, &w_bytes, &x, rows, k, ncols);
+                let w = testkit::upload_bytes(&ctx, &w_bytes);
+                let x_bytes: Vec<u8> = if x_f32 {
+                    x.iter().flat_map(|b| f16_of(*b).to_le_bytes()).collect()
+                } else {
+                    x.iter().flat_map(|b| b.to_le_bytes()).collect()
+                };
+                let xb = testkit::upload_bytes(&ctx, &x_bytes);
+                let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
+                ctx.gemm_dq(
+                    &stream,
+                    ty.quant,
+                    GemmDqTypedCall {
+                        w: w.range(0, w_bytes.len()).expect("w"),
+                        x: xb.range(0, x_bytes.len()).expect("x"),
+                        y: y.range(0, rows * ncols * 4).expect("y"),
+                        k,
+                        rows,
+                        ncols,
+                        x_col_stride: 0,
+                        y_col_stride: 0,
+                        x_f32,
+                    },
+                )
+                .expect("gemm dq");
+                stream.synchronize().expect("drain");
+                let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
+                for idx in 0..rows * ncols {
+                    // The Q5_K bound: f16 staging of each weight term, f32 accumulation over k.
+                    let tolerance = 4.0
+                        * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24))
+                        * abs[idx].max(1e-30);
+                    let error = (f64::from(got[idx]) - y_ref[idx]).abs();
+                    max_ratio = max_ratio.max(error / tolerance);
+                    assert!(
+                        error <= tolerance,
+                        "{tag} x_f32 {x_f32} rows {rows} k {k} ncols {ncols} idx {idx}: error {error} over tol {tolerance}"
+                    );
+                }
+            }
+        }
+    }
+    println!("gemm dq q4k/q6k: max tolerance ratio {max_ratio:.3}");
+}
