@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use crate::EngError;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
+use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
 use crate::kernels::cuda::resident::attn_decode_loop::{
@@ -46,12 +47,13 @@ use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, STEP_PARAMS_BYTES, StepParams, ensure_rows,
 };
-use crate::kernels::cuda::resident::swiglu_q8::SwigluQ8Call;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 
 use super::super::step::yarn_inv_freq;
 use super::super::weights::LoopShape;
 use super::super::{LoopPlan, PHYSICAL_LAYERS, RopePlan, TRUNK_LAYERS};
+
+mod prefill;
 
 const F32: usize = size_of::<f32>();
 const GROUP: usize = 4;
@@ -90,6 +92,17 @@ enum Mixer<'a> {
         q_norm: &'a DeviceBuffer,
         k_norm: &'a DeviceBuffer,
     },
+}
+
+/// A piece of the trunk's carried state, for the parity rigs.
+#[cfg(all(test, feature = "native-cuda"))]
+#[derive(Debug)]
+pub(crate) enum Carried {
+    Hidden,
+    K(usize),
+    V(usize),
+    Rec(usize),
+    Ring(usize),
 }
 
 /// The trunk executor: the resolved weights, the per-visit state and the scratch rows.
@@ -137,6 +150,8 @@ pub(crate) struct LoopStep<'a> {
     logits: DeviceBuffer,
     ones_router: DeviceBuffer,
     inv_freq: DeviceBuffer,
+    /// The prefill scratch, sized for `PREFILL_ROWS` rows.
+    rows: prefill::Rows,
 }
 
 fn native<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a NativeWeight, EngError> {
@@ -159,11 +174,15 @@ fn side<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a DeviceBuffer, En
     }
 }
 
-fn floats(buffer: &DeviceBuffer, at: usize, len: usize) -> Result<DeviceRange<'_>, EngError> {
+pub(super) fn floats(
+    buffer: &DeviceBuffer,
+    at: usize,
+    len: usize,
+) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(at * F32, len * F32)
 }
 
-fn bytes_range(buffer: &DeviceBuffer, len: usize) -> Result<DeviceRange<'_>, EngError> {
+pub(super) fn bytes_range(buffer: &DeviceBuffer, len: usize) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, len)
 }
 
@@ -171,7 +190,7 @@ fn q8_row(k: usize) -> Result<usize, EngError> {
     q8_1_bytes(k, 1).ok_or_else(|| EngError::BadRequest("a q8 row size overflows".to_owned()))
 }
 
-fn le_f32(values: &[f32]) -> Vec<u8> {
+pub(super) fn le_f32(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
@@ -278,6 +297,7 @@ impl<'a> LoopStep<'a> {
             logits: ctx.upload(&zeros(shape.vocab))?,
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
+            rows: prefill::open_rows(&ctx, shape, ctx.sm_count() as usize)?,
             shape: shape.clone(),
             plan: plan.clone(),
             rope: rope.clone(),
@@ -466,6 +486,64 @@ impl<'a> LoopStep<'a> {
     /// The logits row (device floats); valid after the stream drained.
     pub(crate) fn logits_row(&self) -> &DeviceBuffer {
         &self.logits
+    }
+
+    /// The stored block and head weight bytes one decode step reads: every visit's dense
+    /// weights (the loop layers once per revisit) and the head.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(super) fn step_weight_bytes(&self) -> usize {
+        let mixer_bytes = |mixer: &Mixer<'_>| match mixer {
+            Mixer::Delta {
+                qkvz,
+                beta_alpha,
+                out,
+                ..
+            } => qkvz.bytes() + beta_alpha.bytes() + out.bytes(),
+            Mixer::Attn { q, k, v, o, .. } => q.bytes() + k.bytes() + v.bytes() + o.bytes(),
+        };
+        (0..TRUNK_LAYERS)
+            .map(|il| {
+                let phys = &self.phys[self.plan.physical(il)];
+                phys.ffn_gate.bytes()
+                    + phys.ffn_up.bytes()
+                    + phys.ffn_down.bytes()
+                    + mixer_bytes(&phys.mixer)
+            })
+            .sum::<usize>()
+            + self.head.bytes()
+    }
+
+    /// The carried state for the parity rigs, as (piece, buffer, byte offset, byte length):
+    /// the hidden row, every attention visit's K and V planes over the first `rows` rows
+    /// (fp16), and every GDN visit's record and conv ring (f32).
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn carried(
+        &self,
+        rows: usize,
+    ) -> Result<Vec<(Carried, &DeviceBuffer, usize, usize)>, EngError> {
+        let shape = &self.shape;
+        let mut out = Vec::new();
+        let mut slot = 0;
+        for il in 0..TRUNK_LAYERS {
+            if self.attn_slot.get(slot) == Some(&il) {
+                let plane = rows * shape.heads_kv * shape.head_dim * 2;
+                out.push((Carried::K(il), &self.k_cache[slot], 0, plane));
+                out.push((Carried::V(il), &self.v_cache[slot], 0, plane));
+                slot += 1;
+            } else {
+                let rec = shape.delta_value_heads * shape.delta_key_dim * shape.delta_value_dim;
+                let ring = shape.conv_dim() * (shape.conv_kernel - 1);
+                out.push((Carried::Rec(il), &self.rec, il * rec * 4, rec * 4));
+                out.push((Carried::Ring(il), &self.ring, il * ring * 4, ring * 4));
+            }
+        }
+        out.push((
+            Carried::Hidden,
+            &self.resid[self.cur_ix],
+            0,
+            shape.hidden * 4,
+        ));
+        Ok(out)
     }
 
     /// The executor's stream, for the caller's drain.
@@ -838,7 +916,8 @@ impl<'a> LoopStep<'a> {
     }
 
     /// The FFN of physical layer `p`: the gate and up matvecs into one strided row, the
-    /// SwiGLU with its q8 quantize, the down matvec into `ffn_out`.
+    /// SwiGLU (the column-split rows kernel: `swiglu_q8` is one block for the whole row), its
+    /// q8 quantize, the down matvec into `ffn_out`.
     fn ffn(&mut self, p: usize) -> Result<(), EngError> {
         let phys = &self.phys[p];
         let (h, ff) = (self.shape.hidden, self.shape.feed_forward);
@@ -856,15 +935,27 @@ impl<'a> LoopStep<'a> {
             floats(&self.gu, ff, ff)?,
             1,
         )?;
-        self.ctx.swiglu_q8(
+        self.ctx.swiglu_rows(
             &self.stream,
-            SwigluQ8Call {
+            SwigluRowsCall {
+                shape: SwigluRowsShape {
+                    rows: 1,
+                    n_ff: ff,
+                    up_off: ff,
+                    ld_in: 2 * ff,
+                    ld_out: ff,
+                },
                 gu: floats(&self.gu, 0, 2 * ff)?,
-                q8: bytes_range(&self.gu_q8, q8_row(ff)?)?,
-                n_ff: ff,
-                y_slot_stride: 2 * ff,
-                slots: 1,
-                glu_done: false,
+                act: floats(&self.rows.act, 0, ff)?,
+            },
+        )?;
+        self.ctx.quantize_q8_1(
+            &self.stream,
+            crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
+                x: floats(&self.rows.act, 0, ff)?,
+                y: bytes_range(&self.gu_q8, q8_row(ff)?)?,
+                k: ff,
+                ncols: 1,
             },
         )?;
         self.ctx.matvec_native(
