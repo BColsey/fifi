@@ -68,7 +68,7 @@ fn product(factors: &[usize]) -> Result<usize, EngError> {
 }
 
 /// Every pair of the named claims must share no byte.
-fn all_apart(claims: &[(&str, &DeviceRange<'_>, usize)]) -> Result<(), EngError> {
+fn all_apart(claims: &[(&'static str, &DeviceRange<'_>, usize)]) -> Result<(), EngError> {
     for (i, (name_a, range_a, bytes_a)) in claims.iter().enumerate() {
         for (name_b, range_b, bytes_b) in &claims[..i] {
             require_apart(

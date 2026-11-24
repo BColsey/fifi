@@ -3,8 +3,12 @@
 
 use super::*;
 use crate::family::math::{dot, rms0, silu};
-use crate::kernels::cuda::{CudaContext, testkit};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, testkit};
 use crate::weights::{GgufType, dequantize};
+
+fn byte_range(buffer: &DeviceBuffer, offset: usize, bytes: usize) -> DeviceRange<'_> {
+    buffer.range(offset, bytes).expect("range")
+}
 
 /// A uniform value in `[-scale, scale)`.
 fn spread(rng: &mut testkit::Rng, scale: f32) -> f32 {
@@ -98,18 +102,18 @@ fn the_gate_follows_the_host_step() {
     let (nk_d, nq_d, nc_d) = (up(&nk), up(&nq), up(&nc));
     let gated_d = testkit::upload_filled(&ctx, 0xff, width * 4);
     let normed_d = testkit::upload_filled(&ctx, 0xff, width * 4);
-    let r = |b: &crate::kernels::cuda::DeviceBuffer, n: usize| b.range(0, n * 4).expect("range");
+    let width_bytes = width * 4;
     ctx.ple_gate(
         &stream,
         PleGateCall {
-            keys: r(&keys_d, width),
-            hyper: r(&hyper_d, width),
-            value: r(&value_d, hidden),
-            norm_key: r(&nk_d, width),
-            norm_query: r(&nq_d, width),
-            norm_conv: r(&nc_d, width),
-            gated: r(&gated_d, width),
-            normed: r(&normed_d, width),
+            keys: byte_range(&keys_d, 0, width_bytes),
+            hyper: byte_range(&hyper_d, 0, width_bytes),
+            value: byte_range(&value_d, 0, hidden * 4),
+            norm_key: byte_range(&nk_d, 0, width_bytes),
+            norm_query: byte_range(&nq_d, 0, width_bytes),
+            norm_conv: byte_range(&nc_d, 0, width_bytes),
+            gated: byte_range(&gated_d, 0, width_bytes),
+            normed: byte_range(&normed_d, 0, width_bytes),
             eps,
             branches,
             hidden,
@@ -245,18 +249,15 @@ fn an_overlapping_written_range_is_refused_by_name_before_any_native_call() {
     let normed = testkit::upload_filled(&ctx, 0, width * 4);
     let shared = testkit::upload_filled(&ctx, 0, 2 * width * 4);
     let weights = testkit::upload_filled(&ctx, 0, conv_bytes + ring_bytes);
-    let r = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, bytes: usize| {
-        buffer.range(start, bytes).expect("range")
-    };
     let error = ctx
         .ple_conv(
             &stream,
             PleConvCall {
-                gated: r(&shared, 0, width * 4),
-                normed: r(&normed, 0, width * 4),
-                conv: r(&weights, 0, conv_bytes),
-                ring: r(&weights, conv_bytes, ring_bytes),
-                out: r(&shared, width * 2, width * 4),
+                gated: byte_range(&shared, 0, width * 4),
+                normed: byte_range(&normed, 0, width * 4),
+                conv: byte_range(&weights, 0, conv_bytes),
+                ring: byte_range(&weights, conv_bytes, ring_bytes),
+                out: byte_range(&shared, width * 2, width * 4),
                 width,
                 conv_kernel,
                 ngram,
