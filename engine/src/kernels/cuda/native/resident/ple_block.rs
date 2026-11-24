@@ -18,7 +18,7 @@
 use std::ffi::{c_int, c_void};
 use std::mem::offset_of;
 
-use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, checked, invalid_argument};
+use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
 unsafe extern "C" {
     #[link_name = "inference_cuda_ple_rows_launch"]
@@ -138,20 +138,31 @@ fn int(value: usize) -> Result<c_int, DeviceFailure> {
     c_int::try_from(value).map_err(|_| invalid_argument())
 }
 
+/// Proves the shape, the sizes and the alignment, and that `out` shares no byte with `raw`.
+fn check_rows(call: &PleRowsRaw<'_>) -> Result<(), DeviceFailure> {
+    if !call.head_dim.is_multiple_of(32)
+        || !(32..=8192).contains(&call.head_dim)
+        || !(1..=65_536).contains(&call.rows)
+        || !call.scale.is_finite()
+    {
+        return Err(invalid_argument());
+    }
+    // The shape is bounded above, so the products cannot overflow.
+    let out_bytes = call.rows * call.head_dim * 4;
+    let raw_bytes = call.rows * (call.head_dim / 32 * 18);
+    let out = Span::of(&call.out, out_bytes);
+    let raw = Span::of(&call.raw, raw_bytes);
+    if !(holds(&call.out, out_bytes, 4) && holds(&call.raw, raw_bytes, 2) && out.apart(&raw)) {
+        return Err(invalid_argument());
+    }
+    Ok(())
+}
+
 pub(in crate::kernels::cuda) fn ple_rows_launch(
     stream: &RawStream,
     call: &PleRowsRaw<'_>,
 ) -> Result<(), DeviceFailure> {
-    let row_bytes = call.head_dim / 32 * 18;
-    let sized = holds(&call.out, call.rows * call.head_dim * 4, 4)
-        && holds(&call.raw, call.rows * row_bytes, 2)
-        && call.head_dim.is_multiple_of(32)
-        && (32..=8192).contains(&call.head_dim)
-        && (1..=65_536).contains(&call.rows)
-        && call.scale.is_finite();
-    if !sized {
-        return Err(invalid_argument());
-    }
+    check_rows(call)?;
     let args = PleRowsArgsRepr {
         out: call.out.address(),
         raw: call.raw.address().cast_const(),
@@ -160,23 +171,35 @@ pub(in crate::kernels::cuda) fn ple_rows_launch(
         head_dim: int(call.head_dim)?,
     };
     let mut stage = STAGE_NONE;
-    // SAFETY: the ranges were proved inside their live allocations, large enough and aligned
-    // above; the adapter repeats the null and alignment checks on the addresses. The
+    // SAFETY: the ranges were proved inside their live allocations, large enough, aligned and
+    // apart above; the adapter repeats the null and alignment checks on the addresses. The
     // allocations stay valid until the queued launch finishes because inference_cuda_free
     // synchronizes the device first. stream is live for the call and args is a plain value.
     let status = unsafe { ple_rows_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 
-pub(in crate::kernels::cuda) fn ple_gate_launch(
-    stream: &RawStream,
-    call: &PleGateRaw<'_>,
-) -> Result<(), DeviceFailure> {
-    let width = call
-        .branches
-        .checked_mul(call.hidden)
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(invalid_argument)?;
+/// True when every written extent shares no byte with another written extent or with a read.
+fn written_apart(written: &[Span<'_>], read: &[Span<'_>]) -> bool {
+    written.iter().enumerate().all(|(i, span)| {
+        written[i + 1..].iter().all(|other| span.apart(other))
+            && read.iter().all(|other| span.apart(other))
+    })
+}
+
+/// Proves the shape, the sizes and the alignment, and that each written range shares no byte
+/// with any other range; the read ranges may overlap.
+fn check_gate(call: &PleGateRaw<'_>) -> Result<(), DeviceFailure> {
+    if !(1..=64).contains(&call.branches)
+        || !(1..=(1 << 20)).contains(&call.hidden)
+        || !call.eps.is_finite()
+        || call.eps < 0.0
+    {
+        return Err(invalid_argument());
+    }
+    // The shape is bounded above, so the products cannot overflow.
+    let width = call.branches * call.hidden * 4;
+    let value = call.hidden * 4;
     let sized = [
         &call.keys,
         &call.hyper,
@@ -188,14 +211,27 @@ pub(in crate::kernels::cuda) fn ple_gate_launch(
     ]
     .iter()
     .all(|range| holds(range, width, 4))
-        && holds(&call.value, call.hidden * 4, 4)
-        && (1..=64).contains(&call.branches)
-        && (1..=(1 << 20)).contains(&call.hidden)
-        && call.eps.is_finite()
-        && call.eps >= 0.0;
-    if !sized {
+        && holds(&call.value, value, 4);
+    let written = [Span::of(&call.gated, width), Span::of(&call.normed, width)];
+    let read = [
+        Span::of(&call.keys, width),
+        Span::of(&call.hyper, width),
+        Span::of(&call.value, value),
+        Span::of(&call.norm_key, width),
+        Span::of(&call.norm_query, width),
+        Span::of(&call.norm_conv, width),
+    ];
+    if !(sized && written_apart(&written, &read)) {
         return Err(invalid_argument());
     }
+    Ok(())
+}
+
+pub(in crate::kernels::cuda) fn ple_gate_launch(
+    stream: &RawStream,
+    call: &PleGateRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_gate(call)?;
     let args = PleGateArgsRepr {
         keys: call.keys.address().cast_const(),
         hyper: call.hyper.address().cast_const(),
@@ -210,41 +246,47 @@ pub(in crate::kernels::cuda) fn ple_gate_launch(
         hidden: int(call.hidden)?,
     };
     let mut stage = STAGE_NONE;
-    // SAFETY: as for ple_rows_launch; every range was proved large enough and aligned above.
+    // SAFETY: as for ple_rows_launch; every range was proved large enough and aligned above,
+    // and each written range apart from every other range.
     let status = unsafe { ple_gate_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
+}
+
+/// Proves the shape, the sizes and the alignment, and that `out` and `ring` share no byte
+/// with each other or with a read range. The ring is read and written, so it counts as written.
+fn check_conv(call: &PleConvRaw<'_>) -> Result<(), DeviceFailure> {
+    if !(1..=(1 << 22)).contains(&call.width)
+        || !(2..=16).contains(&call.conv_kernel)
+        || !(1..=16).contains(&call.ngram)
+    {
+        return Err(invalid_argument());
+    }
+    // The shape is bounded above, so the products cannot overflow.
+    let width = call.width * 4;
+    let conv = call.width * call.conv_kernel * 4;
+    let ring = call.width * (call.conv_kernel - 1) * call.ngram * 4;
+    let sized = holds(&call.gated, width, 4)
+        && holds(&call.normed, width, 4)
+        && holds(&call.out, width, 4)
+        && holds(&call.conv, conv, 4)
+        && holds(&call.ring, ring, 4);
+    let written = [Span::of(&call.out, width), Span::of(&call.ring, ring)];
+    let read = [
+        Span::of(&call.gated, width),
+        Span::of(&call.normed, width),
+        Span::of(&call.conv, conv),
+    ];
+    if !(sized && written_apart(&written, &read)) {
+        return Err(invalid_argument());
+    }
+    Ok(())
 }
 
 pub(in crate::kernels::cuda) fn ple_conv_launch(
     stream: &RawStream,
     call: &PleConvRaw<'_>,
 ) -> Result<(), DeviceFailure> {
-    let taps = call
-        .conv_kernel
-        .checked_sub(1)
-        .ok_or_else(invalid_argument)?;
-    let ring = call
-        .width
-        .checked_mul(taps)
-        .and_then(|v| v.checked_mul(call.ngram))
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(invalid_argument)?;
-    let conv = call
-        .width
-        .checked_mul(call.conv_kernel)
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(invalid_argument)?;
-    let sized = holds(&call.gated, call.width * 4, 4)
-        && holds(&call.normed, call.width * 4, 4)
-        && holds(&call.out, call.width * 4, 4)
-        && holds(&call.conv, conv, 4)
-        && holds(&call.ring, ring, 4)
-        && (1..=(1 << 22)).contains(&call.width)
-        && (2..=16).contains(&call.conv_kernel)
-        && (1..=16).contains(&call.ngram);
-    if !sized {
-        return Err(invalid_argument());
-    }
+    check_conv(call)?;
     let args = PleConvArgsRepr {
         gated: call.gated.address().cast_const(),
         normed: call.normed.address().cast_const(),
@@ -256,7 +298,159 @@ pub(in crate::kernels::cuda) fn ple_conv_launch(
         ngram: int(call.ngram)?,
     };
     let mut stage = STAGE_NONE;
-    // SAFETY: as for ple_rows_launch; every range was proved large enough and aligned above.
+    // SAFETY: as for ple_rows_launch; every range was proved large enough and aligned above,
+    // and each written range apart from every other range.
     let status = unsafe { ple_conv_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::cuda::native::{RawDevice, poison_test_raw};
+
+    /// A range of one made-up allocation. The checks read offsets and sizes only, so no
+    /// pointer is dereferenced and nothing is launched.
+    fn range(device: &RawDevice, offset: usize, bytes: usize) -> RawRange<'_> {
+        RawRange::new(device, offset, bytes).expect("the range lies inside the allocation")
+    }
+
+    /// The rows call of five rows of 128 values: `out` is 2560 bytes and `raw` 360.
+    fn rows(device: &RawDevice, out: usize, raw: usize) -> PleRowsRaw<'_> {
+        PleRowsRaw {
+            out: range(device, out, 2560),
+            raw: range(device, raw, 360),
+            scale: 0.5,
+            rows: 5,
+            head_dim: 128,
+        }
+    }
+
+    #[test]
+    fn the_rows_launch_refuses_an_output_over_its_input() {
+        let device = poison_test_raw(1 << 15);
+        let other = poison_test_raw(1 << 15);
+        assert!(check_rows(&rows(&device, 0, 4096)).is_ok(), "apart");
+        assert!(
+            check_rows(&rows(&device, 3584, 4096)).is_err(),
+            "out over raw"
+        );
+        assert!(check_rows(&rows(&device, 0, 0)).is_err(), "raw inside out");
+        let apart = PleRowsRaw {
+            raw: range(&other, 0, 360),
+            ..rows(&device, 0, 0)
+        };
+        assert!(check_rows(&apart).is_ok(), "two allocations share no byte");
+    }
+
+    /// The offsets of the gate's eight ranges: keys, hyper, value, norm_key, norm_query,
+    /// norm_conv, gated, normed. Four branches of 256 values make a wide range 4096 bytes and
+    /// `value` 1024.
+    const GATE_APART: [usize; 8] = [0, 4096, 8192, 12288, 16384, 20480, 24576, 28672];
+
+    fn gate(device: &RawDevice, at: [usize; 8]) -> PleGateRaw<'_> {
+        let [
+            keys,
+            hyper,
+            value,
+            norm_key,
+            norm_query,
+            norm_conv,
+            gated,
+            normed,
+        ] = at;
+        let wide = |offset| range(device, offset, 4096);
+        PleGateRaw {
+            keys: wide(keys),
+            hyper: wide(hyper),
+            value: range(device, value, 1024),
+            norm_key: wide(norm_key),
+            norm_query: wide(norm_query),
+            norm_conv: wide(norm_conv),
+            gated: wide(gated),
+            normed: wide(normed),
+            eps: 1e-6,
+            branches: 4,
+            hidden: 256,
+        }
+    }
+
+    #[test]
+    fn the_gate_launch_refuses_a_written_range_over_any_other() {
+        let device = poison_test_raw(1 << 15);
+        assert!(check_gate(&gate(&device, GATE_APART)).is_ok(), "apart");
+        // keys, hyper, value, norm_key, norm_query, norm_conv, gated, normed
+        assert!(
+            check_gate(&gate(
+                &device,
+                [0, 4096, 8192, 12288, 16384, 20480, 2048, 28672]
+            ))
+            .is_err(),
+            "gated over keys"
+        );
+        assert!(
+            check_gate(&gate(
+                &device,
+                [0, 4096, 8192, 12288, 16384, 20480, 24576, 25088]
+            ))
+            .is_err(),
+            "normed over gated"
+        );
+        assert!(
+            check_gate(&gate(
+                &device,
+                [0, 4096, 8192, 12288, 16384, 20480, 24576, 8448]
+            ))
+            .is_err(),
+            "normed over value"
+        );
+        assert!(
+            check_gate(&gate(
+                &device,
+                [0, 0, 8192, 12288, 16384, 20480, 24576, 28672]
+            ))
+            .is_ok(),
+            "two reads may overlap"
+        );
+    }
+
+    /// The offsets of the convolution's five ranges: gated, normed, conv, ring, out, for 96
+    /// channels, a kernel of 4 and an n-gram of 3 (384, 384, 1536, 3456 and 384 bytes).
+    const CONV_APART: [usize; 5] = [0, 1024, 2048, 4096, 8192];
+
+    fn conv(device: &RawDevice, at: [usize; 5]) -> PleConvRaw<'_> {
+        let [gated, normed, conv, ring, out] = at;
+        PleConvRaw {
+            gated: range(device, gated, 384),
+            normed: range(device, normed, 384),
+            conv: range(device, conv, 1536),
+            ring: range(device, ring, 3456),
+            out: range(device, out, 384),
+            width: 96,
+            conv_kernel: 4,
+            ngram: 3,
+        }
+    }
+
+    #[test]
+    fn the_convolution_launch_refuses_its_written_ranges_over_any_other() {
+        let device = poison_test_raw(1 << 14);
+        assert!(check_conv(&conv(&device, CONV_APART)).is_ok(), "apart");
+        assert!(
+            check_conv(&conv(&device, [0, 1024, 2048, 4096, 192])).is_err(),
+            "out over gated"
+        );
+        assert!(
+            check_conv(&conv(&device, [0, 1024, 2048, 3072, 8192])).is_err(),
+            "ring over conv"
+        );
+        assert!(
+            check_conv(&conv(&device, [0, 1024, 2048, 4096, 5120])).is_err(),
+            "out inside ring"
+        );
+        assert!(
+            check_conv(&conv(&device, [0, 1024, 2048, 4096, 7552])).is_ok(),
+            "out starts where the ring ends"
+        );
+    }
 }

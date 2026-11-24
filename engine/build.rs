@@ -104,7 +104,6 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/rope_gemma.cu",
     "src/kernels/cuda/native/resident/expert_activation.cu",
     "src/kernels/cuda/native/resident/row_scale.cu",
-    "src/kernels/cuda/native/resident/ple_block.cu",
     "src/kernels/cuda/native/resident/softcap.cu",
     "src/kernels/cuda/native/resident/row_add.cu",
     "src/kernels/cuda/native/resident/sample.cu",
@@ -141,6 +140,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/pack_rows.cu",
     "src/kernels/cuda/native/resident/dense_gemv.cu",
     "src/kernels/cuda/native/resident/block_ops.cu",
+    "src/kernels/cuda/native/resident/ple_block.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -245,6 +245,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/moe_combine.h",
     "src/kernels/cuda/native/resident/pack_rows.h",
     "src/kernels/cuda/native/resident/paged_position.h",
+    "src/kernels/cuda/native/resident/ple_block.h",
     "src/kernels/cuda/native/resident/quantize_q8_1.h",
     "src/kernels/cuda/native/resident/row_add.h",
     "src/kernels/cuda/native/resident/sample.h",
@@ -285,7 +286,6 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/rope_gemma.h",
     "src/kernels/cuda/native/resident/expert_activation.h",
     "src/kernels/cuda/native/resident/row_scale.h",
-    "src/kernels/cuda/native/resident/ple_block.h",
     "src/kernels/cuda/native/nemotron_gemv.h",
     "src/kernels/cuda/native/nvfp4_gemv.h",
     "src/kernels/cuda/native/prefill/flint_qk.h",

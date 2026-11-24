@@ -6,20 +6,14 @@ use crate::family::math::{dot, rms0, silu};
 use crate::kernels::cuda::{CudaContext, testkit};
 use crate::weights::{GgufType, dequantize};
 
-struct Lcg(u64);
+/// A uniform value in `[-scale, scale)`.
+fn spread(rng: &mut testkit::Rng, scale: f32) -> f32 {
+    ((rng.unit() * 2.0 - 1.0) * f64::from(scale)) as f32
+}
 
-impl Lcg {
-    fn next(&mut self, scale: f32) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 2.0 * scale
-    }
-
-    fn vec(&mut self, len: usize, scale: f32) -> Vec<f32> {
-        (0..len).map(|_| self.next(scale)).collect()
-    }
+/// `len` values of [`spread`].
+fn spread_vec(rng: &mut testkit::Rng, len: usize, scale: f32) -> Vec<f32> {
+    (0..len).map(|_| spread(rng, scale)).collect()
 }
 
 fn close(got: f32, want: f32) -> bool {
@@ -34,13 +28,15 @@ fn the_rows_decode_like_the_host_dequantizer() {
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
     let (rows, head_dim) = (5usize, 128usize);
-    let mut rng = Lcg(7);
+    let mut rng = testkit::Rng::new(7);
     let mut raw = Vec::new();
     for _ in 0..rows * head_dim / 32 {
-        let d = 0.05 + rng.next(0.02).abs();
-        raw.extend_from_slice(&half_bits(d).to_le_bytes());
+        let d = 0.05 + spread(&mut rng, 0.02).abs();
+        raw.extend_from_slice(&testkit::f16_bits(d).to_le_bytes());
         for _ in 0..16 {
-            raw.push((rng.next(8.0) as i32 + 8) as u8 | (((rng.next(8.0) as i32 + 8) as u8) << 4));
+            let low = (spread(&mut rng, 8.0) as i32 + 8) as u8;
+            let high = (spread(&mut rng, 8.0) as i32 + 8) as u8;
+            raw.push(low | (high << 4));
         }
     }
     let want: Vec<f32> = dequantize(GgufType::Iq4Nl, &raw)
@@ -68,18 +64,6 @@ fn the_rows_decode_like_the_host_dequantizer() {
     }
 }
 
-/// The f16 bits of `value`, round to nearest.
-fn half_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mantissa = bits & 0x7f_ffff;
-    if exp <= 0 {
-        return sign;
-    }
-    sign | ((exp as u16) << 10) | ((mantissa + 0x1000) >> 13) as u16
-}
-
 #[test]
 fn the_gate_follows_the_host_step() {
     if !testkit::device_present("ple gate") {
@@ -89,13 +73,13 @@ fn the_gate_follows_the_host_step() {
     let stream = ctx.stream().expect("stream");
     let (branches, hidden, eps) = (4usize, 256usize, 1e-6f32);
     let width = branches * hidden;
-    let mut rng = Lcg(11);
-    let keys = rng.vec(width, 2.0);
-    let hyper = rng.vec(width, 3.0);
-    let value = rng.vec(hidden, 1.5);
-    let nk = rng.vec(width, 0.3);
-    let nq = rng.vec(width, 0.3);
-    let nc = rng.vec(width, 0.3);
+    let mut rng = testkit::Rng::new(11);
+    let keys = spread_vec(&mut rng, width, 2.0);
+    let hyper = spread_vec(&mut rng, width, 3.0);
+    let value = spread_vec(&mut rng, hidden, 1.5);
+    let nk = spread_vec(&mut rng, width, 0.3);
+    let nq = spread_vec(&mut rng, width, 0.3);
+    let nc = spread_vec(&mut rng, width, 0.3);
     let (mut gated, mut normed) = (vec![0f32; width], vec![0f32; width]);
     for b in 0..branches {
         let (lo, hi) = (b * hidden, (b + 1) * hidden);
@@ -160,15 +144,15 @@ fn the_convolution_and_its_ring_follow_the_host_over_three_tokens() {
     let stream = ctx.stream().expect("stream");
     let (width, conv_kernel, ngram) = (96usize, 4usize, 3usize);
     let (taps, stride) = (conv_kernel - 1, (conv_kernel - 1) * ngram);
-    let mut rng = Lcg(23);
-    let conv = rng.vec(width * conv_kernel, 0.7);
-    let mut ring = rng.vec(width * stride, 1.0);
+    let mut rng = testkit::Rng::new(23);
+    let conv = spread_vec(&mut rng, width * conv_kernel, 0.7);
+    let mut ring = spread_vec(&mut rng, width * stride, 1.0);
     let conv_d = testkit::upload_f32(&ctx, &conv);
     let ring_d = testkit::upload_f32(&ctx, &ring);
     let out_d = testkit::upload_filled(&ctx, 0xff, width * 4);
     for token in 0..3 {
-        let gated = rng.vec(width, 1.0);
-        let normed = rng.vec(width, 1.0);
+        let gated = spread_vec(&mut rng, width, 1.0);
+        let normed = spread_vec(&mut rng, width, 1.0);
         let mut want = vec![0f32; width];
         for c in 0..width {
             let kernel = &conv[c * conv_kernel..(c + 1) * conv_kernel];
@@ -213,7 +197,7 @@ fn the_convolution_and_its_ring_follow_the_host_over_three_tokens() {
 }
 
 #[test]
-fn a_launch_with_a_short_buffer_is_refused_before_any_native_call() {
+fn a_short_range_is_refused_by_name_before_any_native_call() {
     if !testkit::device_present("ple refusal") {
         return;
     }
@@ -235,6 +219,55 @@ fn a_launch_with_a_short_buffer_is_refused_before_any_native_call() {
                 ngram: 3,
             },
         )
-        .expect_err("ranges overlap and are short");
-    assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
+        .expect_err("every range is short");
+    assert!(
+        matches!(
+            &error,
+            EngError::BadRequest(text)
+                if text.as_str() == "the CUDA gated range holds 64 bytes but the call needs 256"
+        ),
+        "{error:?}"
+    );
+}
+
+/// Every range is large enough and aligned; `out` starts halfway through `gated`. The pair
+/// is reported later name first, as `all_apart` visits it.
+#[test]
+fn an_overlapping_written_range_is_refused_by_name_before_any_native_call() {
+    if !testkit::device_present("ple overlap refusal") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (width, conv_kernel, ngram) = (64usize, 4usize, 3usize);
+    let conv_bytes = width * conv_kernel * 4;
+    let ring_bytes = width * (conv_kernel - 1) * ngram * 4;
+    let normed = testkit::upload_filled(&ctx, 0, width * 4);
+    let shared = testkit::upload_filled(&ctx, 0, 2 * width * 4);
+    let weights = testkit::upload_filled(&ctx, 0, conv_bytes + ring_bytes);
+    let r = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, bytes: usize| {
+        buffer.range(start, bytes).expect("range")
+    };
+    let error = ctx
+        .ple_conv(
+            &stream,
+            PleConvCall {
+                gated: r(&shared, 0, width * 4),
+                normed: r(&normed, 0, width * 4),
+                conv: r(&weights, 0, conv_bytes),
+                ring: r(&weights, conv_bytes, ring_bytes),
+                out: r(&shared, width * 2, width * 4),
+                width,
+                conv_kernel,
+                ngram,
+            },
+        )
+        .expect_err("out shares bytes with gated");
+    assert!(
+        matches!(
+            &error,
+            EngError::BadRequest(text) if text.as_str() == "the CUDA out and gated ranges overlap"
+        ),
+        "{error:?}"
+    );
 }
