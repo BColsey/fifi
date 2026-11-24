@@ -70,10 +70,11 @@ __device__ inline float warp_sum_a(float v) {
 }
 __device__ inline float h2f(unsigned short bits) { return __half2float(__ushort_as_half(bits)); }
 
-// Reduces four per-lane partial sums (one per query head) over the 32 lanes: each level halves
-// the values a lane keeps and doubles the lanes that share a head, the reduce8 of attn_decode.cu
-// with one level less. On return, lane l with (l & 1) == 0 holds the full sum of head
-// ((l >> 3) & 1) * 2 + ((l >> 2) & 1); the order is fixed.
+// Reduces four per-lane partial sums (one per query head) over the 32 lanes. A head owns the
+// 8 lanes that share lane bits 3 and 2, so bits 4, 1 and 0 are summed: the first two
+// exchanges route the heads (as the reduce8 of attn_decode.cu), then three levels sum each
+// head's 8 lanes. On return every lane holds the full sum of head ((l >> 3) & 1) * 2 +
+// ((l >> 2) & 1); the order is fixed.
 __device__ inline float reduce4(const float (&a)[4], int lane, int &head) {
     const unsigned full = 0xffffffffu;
     const bool h8 = lane & 8, h4 = lane & 4;
@@ -85,6 +86,7 @@ __device__ inline float reduce4(const float (&a)[4], int lane, int &head) {
     }
     const float keep = h4 ? b[1] : b[0], give = h4 ? b[0] : b[1];
     float d = keep + __shfl_xor_sync(full, give, 4);
+    d += __shfl_xor_sync(full, d, 16);
     d += __shfl_xor_sync(full, d, 2);
     d += __shfl_xor_sync(full, d, 1);
     head = (h8 ? 2 : 0) + (h4 ? 1 : 0);
@@ -167,7 +169,8 @@ __global__ void __launch_bounds__(256, 2) attn_loop_part_k(Args a) {
                 }
                 int head;
                 const float sum = reduce4(dots, lane, head);
-                if ((lane & 1) == 0) {
+                // One writer per head: lanes 0, 4, 8 and 12.
+                if ((lane & (16 | 2 | 1)) == 0) {
                     s_sc[head][j] = sum;
                 }
             }

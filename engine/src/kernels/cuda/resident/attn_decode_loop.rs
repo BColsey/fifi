@@ -279,3 +279,6 @@ impl CudaContext {
         })
     }
 }
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod tests;
