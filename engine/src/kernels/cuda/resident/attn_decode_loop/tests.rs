@@ -255,7 +255,7 @@ fn attn_decode_loop_matches_the_host_reference_over_many_keys() {
         return;
     }
     let (rig, mut rng) = (Rig::new(), Rng::new(0x100e_0001));
-    let mut specs: Vec<Spec> = [1, 2, 31, 32, 33, 70, 100, 1000]
+    let mut specs: Vec<Spec> = [1, 2, 16, 17, 31, 32, 33, 70, 100, 1000]
         .map(|kv| Spec::loop9b(1, kv))
         .to_vec();
     for m in [2, 3, 16] {
