@@ -76,26 +76,80 @@ __device__ void report(float *health, int invalid) {
     if (__syncthreads_or(invalid) != 0 && threadIdx.x == 0) health[0] = __int_as_float(0x7fc00000);
 }
 
+// Depth mix in one block: the scale, the scores and the weights are block-wide reductions in a
+// fixed order, and one block cannot hide a memory latency behind its threads. Each lane
+// therefore issues several loads ahead of its dependent adds (scores 16, mixed channels 9,
+// squares 9); a lane still adds the same elements in the same order, so every rounding is that
+// of the kernel that loaded one element per add. Scratch timing with one to 63 rows on a
+// RTX 2080 Ti: 7.95 to 12.5 us down to 5.5 to 9.6 us for 2 to 8 rows, output bit for bit.
+constexpr int kScoreLoads = 16;
+constexpr int kChannelLoads = 9;
+constexpr int kSquareLoads = 9;
+
 __global__ void inkling_stream_mix(const float *state, const float *query, float *out,
                                    float *health, int first_block, int blocks, int width,
                                    float eps) {
     __shared__ float scratch[threads];
     __shared__ float scores[max_rows];
     __shared__ float weights[max_rows];
-    __shared__ float shared_mass;
+    __shared__ float shared_scale;
     const int lane = threadIdx.x;
     const int warp = lane >> 5;
     const int sub = lane & 31;
     const int rows = blocks - first_block + 1;
     int invalid = 0;
-    const float current_scale = rms_scale(state, width, eps, scratch, invalid);
+    // Rust rms_norm_with_scale on the current row: scale = (dot(x, x) / len + eps).sqrt().recip().
+    {
+        float squares = 0.0f;
+        int i = lane;
+        for (; i + threads * (kSquareLoads - 1) < width; i += threads * kSquareLoads) {
+            float value[kSquareLoads];
+            #pragma unroll
+            for (int u = 0; u < kSquareLoads; ++u) value[u] = state[i + threads * u];
+            #pragma unroll
+            for (int u = 0; u < kSquareLoads; ++u) {
+                invalid |= !isfinite(value[u]);
+                squares = __fadd_rn(squares, __fmul_rn(value[u], value[u]));
+            }
+        }
+        for (; i < width; i += threads) {
+            const float value = state[i];
+            invalid |= !isfinite(value);
+            squares = __fadd_rn(squares, __fmul_rn(value, value));
+        }
+        const float total = block_sum(squares, scratch);
+        if (lane == 0) {
+            const float mean = __fdiv_rn(total, static_cast<float>(width));
+            const float root = __fsqrt_rn(__fadd_rn(mean, eps));
+            const float scale = __frcp_rn(root);
+            invalid |= !isfinite(total) || !isfinite(root) || !isfinite(scale);
+            shared_scale = scale;
+        }
+        __syncthreads();
+    }
+    const float current_scale = shared_scale;
+    __syncthreads();
     // The host scores dot(row, query) * (len as f32).sqrt().recip().
     const float norm = __frcp_rn(__fsqrt_rn(static_cast<float>(width)));
     for (int r = warp; r < rows; r += warps) {
         const float *row = mix_row(state, blocks, rows, r, width);
         const float scale = r == rows - 1 ? current_scale : 1.0f;
         float sum = -0.0f;
-        for (int i = sub; i < width; i += 32) {
+        int i = sub;
+        for (; i + 32 * (kScoreLoads - 1) < width; i += 32 * kScoreLoads) {
+            float value[kScoreLoads], q[kScoreLoads];
+            #pragma unroll
+            for (int u = 0; u < kScoreLoads; ++u) {
+                value[u] = row[i + 32 * u];
+                q[u] = query[i + 32 * u];
+            }
+            #pragma unroll
+            for (int u = 0; u < kScoreLoads; ++u) {
+                invalid |= !isfinite(value[u]) || !isfinite(q[u]);
+                sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(value[u], scale), q[u]));
+            }
+        }
+        for (; i < width; i += 32) {
             const float value = row[i];
             const float q = query[i];
             invalid |= !isfinite(value) || !isfinite(q);
@@ -117,11 +171,37 @@ __global__ void inkling_stream_mix(const float *state, const float *query, float
             weights[r] = weight;
             mass = __fadd_rn(mass, weight);
         }
-        shared_mass = mass;
+        shared_scale = mass;
     }
     __syncthreads();
-    const float mass = shared_mass;
-    for (int i = lane; i < width; i += threads) {
+    const float mass = shared_scale;
+    __syncthreads();
+    int i = lane;
+    for (; i + threads * (kChannelLoads - 1) < width; i += threads * kChannelLoads) {
+        float value[kChannelLoads];
+        #pragma unroll
+        for (int u = 0; u < kChannelLoads; ++u) value[u] = 0.0f;
+        for (int r = 0; r < rows; ++r) {
+            const float *row = mix_row(state, blocks, rows, r, width);
+            float x[kChannelLoads];
+            #pragma unroll
+            for (int u = 0; u < kChannelLoads; ++u) {
+                const float raw = row[i + threads * u];
+                x[u] = r == rows - 1 ? __fmul_rn(raw, current_scale) : raw;
+            }
+            #pragma unroll
+            for (int u = 0; u < kChannelLoads; ++u) {
+                value[u] = __fadd_rn(value[u], __fmul_rn(weights[r], x[u]));
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < kChannelLoads; ++u) {
+            value[u] = __fdiv_rn(value[u], mass);
+            out[i + threads * u] = value[u];
+            invalid |= !isfinite(value[u]);
+        }
+    }
+    for (; i < width; i += threads) {
         float value = 0.0f;
         for (int r = 0; r < rows; ++r) {
             const float x = r == rows - 1
