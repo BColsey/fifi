@@ -41,6 +41,15 @@ impl AuxStore {
         let Some(scratch_at) = slot_bytes.checked_mul(visits.len()) else {
             return Ok(None);
         };
+        // The local projection row uses aligned offsets relative to this base.
+        let scratch_at = if decode_split_enabled() {
+            let Some(at) = scratch_at.checked_next_multiple_of(16) else {
+                return Ok(None);
+            };
+            at
+        } else {
+            scratch_at
+        };
         let Some(bytes) = scratch_at.checked_add(device) else {
             return Ok(None);
         };
@@ -95,6 +104,10 @@ pub(in crate::family::inkling2) struct LocalResult {
     pub rows: [Vec<f32>; 4],
 }
 
+fn decode_split_enabled() -> bool {
+    std::env::var("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref() == Ok("1")
+}
+
 struct Layout {
     prep: PrepShape,
     shape: RelativeAttentionShape,
@@ -125,6 +138,11 @@ impl Layout {
             end += words[i];
         }
         let attention_at = if output_rows.is_some() {
+            // A restored prefix takes the arena path on its first visit. Match
+            // that path's aligned projection input (and hence its arithmetic).
+            if decode_split_enabled() {
+                end = end.next_multiple_of(16);
+            }
             let at = end;
             end += words[0];
             at
