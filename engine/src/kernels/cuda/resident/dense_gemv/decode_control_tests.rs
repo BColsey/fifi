@@ -49,4 +49,17 @@ fn decode_control_pair_is_exact_and_refuses_cross_call_aliases() {
     // Bitwise comparison (not an epsilon); Padded::read also checks guards.
     assert_eq!(a.read(&rig.ctx, "gain ref"), u.read(&rig.ctx, "gain"));
     assert_eq!(b.read(&rig.ctx, "forget ref"), t.read(&rig.ctx, "forget"));
+    let [g, f] = [output(), output()];
+    rig.ctx
+        .dense_gemv_group(
+            &rig.stream,
+            &[call(w.all(), g.all()), call(v.all(), f.all())],
+        )
+        .unwrap();
+    rig.stream.synchronize().unwrap();
+    assert_eq!(a.read(&rig.ctx, "gain ref"), g.read(&rig.ctx, "group gain"));
+    assert_eq!(
+        b.read(&rig.ctx, "forget ref"),
+        f.read(&rig.ctx, "group forget")
+    );
 }

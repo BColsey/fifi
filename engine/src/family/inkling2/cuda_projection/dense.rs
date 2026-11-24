@@ -654,6 +654,15 @@ impl DenseStep {
         let first = self.range(Slot::Output, 0, width)?;
         let second = self.range(Slot::Output, width, forget.shape[0])?;
         let mut values = self.run(context, &self.stream, x, all, |input| {
+            if std::env::var_os("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                let calls = self.controller_calls(
+                    [(down, down_type), (gain, gain_type), (forget, forget_type)],
+                    [input, reduced, first, second],
+                )?;
+                return context.dense_gemv_group(&self.stream, &calls);
+            }
             self.launch(
                 context,
                 (&down.codes, down.shape, down_type),

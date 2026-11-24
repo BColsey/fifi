@@ -88,13 +88,17 @@ bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cud
             return true;
         }
     }
-    if (!std::is_same_v<Index, SharedWeights> || a.m != 1 ||
-        !((a.cols == 2304 && (a.rows == 384 || a.rows == 1024 || a.rows == 3072 || a.rows == 200064)) ||
-          (a.cols == 3072 && a.rows == 2304))) return false;
-    if (type == 23 && a.cols == 2304 && a.rows == 200064 && aligned(a.x, 16) && aligned(a.w, 4)) {
+    if (!std::is_same_v<Index, SharedWeights> || a.m != 1) return false;
+    // The old eight-rows/CTA grid rounds the unpadded head up to 200064.
+    // Both the exact model width and the archived benchmark width are safe:
+    // each persistent warp tests its actual row against a.rows.
+    if (type == 23 && a.cols == 2304 && (a.rows == 200058 || a.rows == 200064) &&
+        aligned(a.x, 16) && aligned(a.w, 4)) {
         decode_vocab_iq4<<<544, 256, 0, s>>>(a);
         return true;
     }
+    if (!((a.cols == 2304 && (a.rows == 384 || a.rows == 1024 || a.rows == 3072 || a.rows == 200064)) ||
+          (a.cols == 3072 && a.rows == 2304))) return false;
     if (type == 8 && a.cols == 2304 && a.rows != 200064 && aligned(a.x,16)) {
         decode_q8_kblock<<<a.rows,288,0,s>>>(a);
         return true;
