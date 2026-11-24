@@ -5,11 +5,6 @@
 //! (`native/resident/inkling_stream.h`). `health` is one float per launch: left alone, or quiet
 //! NaN when an input or an output of that launch was not finite.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
-
 #[cfg(test)]
 mod tests;
 

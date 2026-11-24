@@ -18,11 +18,13 @@ mod controller_batch;
 mod depth_mix;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prefill;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod resident_visit;
 mod window;
 
 use depth_mix::Stream;
 
-const MIX_EPS: f32 = 1e-6;
+pub(super) const MIX_EPS: f32 = 1e-6;
 pub(super) const ROUTE_NORMALIZATION_FLOOR: f32 = 1.0 / 16384.0;
 
 #[derive(Deserialize)]
@@ -79,6 +81,8 @@ pub(super) struct CpuForward {
     grouped_verify: bool,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     grouped_draft_prefill: bool,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    resident_visit: std::cell::RefCell<Option<resident_visit::Workspace>>,
 }
 
 pub(super) struct PrefixState {
@@ -206,6 +210,8 @@ impl CpuForward {
             grouped_verify: false,
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             grouped_draft_prefill: false,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            resident_visit: Default::default(),
         })
     }
 
@@ -521,6 +527,13 @@ impl CpuForward {
         bank: Option<&MessageBank>,
         decode: bool,
     ) -> Result<(), EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if decode
+            && let Some(bank) = bank
+            && self.try_resident_visit(visit, state, stream, bank)?
+        {
+            return Ok(());
+        }
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let residual = self.mlp_residual(

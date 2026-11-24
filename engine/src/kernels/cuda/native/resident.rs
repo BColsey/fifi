@@ -69,6 +69,7 @@ pub(in crate::kernels::cuda) mod gelu_ffn;
 pub(in crate::kernels::cuda) mod graph;
 pub(in crate::kernels::cuda) mod hyper;
 pub(in crate::kernels::cuda) mod inkling_controller;
+pub(in crate::kernels::cuda) mod inkling_conv;
 pub(in crate::kernels::cuda) mod inkling_local_prep;
 pub(in crate::kernels::cuda) mod inkling_stream;
 pub(in crate::kernels::cuda) mod kv8_append;

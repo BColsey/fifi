@@ -262,7 +262,7 @@ fn check_tokens(m: usize) -> Result<(), EngError> {
 /// `BadRequest` unless `range` holds the `need` bytes the call uses and starts at
 /// a multiple of `align`. Every allocation starts 256-byte aligned, so the offset
 /// decides the alignment of the address.
-pub(in crate::kernels::cuda) fn require_fit(
+pub(crate) fn require_fit(
     name: &str,
     range: &DeviceRange<'_>,
     need: usize,
@@ -288,7 +288,7 @@ pub(in crate::kernels::cuda) fn require_fit(
 /// The kernel wrappers of `kernels::cuda::resident` build their claims with [`Claim::of`] and
 /// compare them with [`require_apart`]; they must not keep a local copy of the overlap rule.
 /// (The native children use `native::resident::Span` instead.)
-pub(in crate::kernels::cuda) struct Claim<'a> {
+pub(crate) struct Claim<'a> {
     name: &'static str,
     buffer: &'a DeviceBuffer,
     start: usize,
@@ -297,11 +297,7 @@ pub(in crate::kernels::cuda) struct Claim<'a> {
 
 impl<'a> Claim<'a> {
     /// The claim on `bytes` bytes of `range`, named `name` in the rejection text.
-    pub(in crate::kernels::cuda) fn of(
-        name: &'static str,
-        range: &DeviceRange<'a>,
-        bytes: usize,
-    ) -> Self {
+    pub(crate) fn of(name: &'static str, range: &DeviceRange<'a>, bytes: usize) -> Self {
         Self {
             name,
             buffer: range.buffer(),
@@ -312,10 +308,7 @@ impl<'a> Claim<'a> {
 }
 
 /// `BadRequest` when the two claims share a byte of one allocation.
-pub(in crate::kernels::cuda) fn require_apart(
-    a: &Claim<'_>,
-    b: &Claim<'_>,
-) -> Result<(), EngError> {
+pub(crate) fn require_apart(a: &Claim<'_>, b: &Claim<'_>) -> Result<(), EngError> {
     let apart = !std::ptr::eq(a.buffer, b.buffer)
         || a.start.saturating_add(a.bytes) <= b.start
         || b.start.saturating_add(b.bytes) <= a.start;

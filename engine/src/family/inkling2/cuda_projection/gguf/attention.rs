@@ -29,7 +29,9 @@ use super::{super::state_headroom, bad};
 
 mod local;
 pub(in crate::family::inkling2) mod prefill;
-pub(in crate::family::inkling2) use local::{LocalPrep, LocalReadWeights, LocalResult};
+pub(in crate::family::inkling2) use local::{
+    LocalPrep, LocalReadWeights, LocalResult, ResidentParts, ResidentStatus,
+};
 
 #[derive(Clone, Copy)]
 pub(in crate::family::inkling2) struct Config {
@@ -45,6 +47,26 @@ struct Visit {
     table_bytes: usize,
     cache_at: usize,
     cache_bytes: usize,
+}
+
+/// The local visit geometry as the resident decode chain uses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family::inkling2) struct LocalShape {
+    pub query_heads: usize,
+    pub kv_heads: usize,
+    pub relative_dims: usize,
+}
+
+impl LocalShape {
+    pub(in crate::family::inkling2) fn query_channels(self) -> usize {
+        self.query_heads * HEAD_DIM
+    }
+    pub(in crate::family::inkling2) fn kv_channels(self) -> usize {
+        self.kv_heads * HEAD_DIM
+    }
+    pub(in crate::family::inkling2) fn relative_words(self) -> usize {
+        self.query_heads * self.relative_dims
+    }
 }
 
 pub(in crate::family::inkling2) struct Plan {
@@ -89,6 +111,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     state: RefCell<Runtime>,
     prefill: RefCell<Option<prefill::Workspace>>,
     local_aux: RefCell<Option<local::AuxStore>>,
+    resident: RefCell<Option<local::ResidentWorkspace>>,
 }
 
 struct Runtime {
@@ -253,6 +276,7 @@ impl Plan {
             query_tiles: self.projected_rows.is_some() && prefill::query_tiles_enabled(context),
             prefill: RefCell::default(),
             local_aux: RefCell::default(),
+            resident: RefCell::default(),
             state: RefCell::new(Runtime {
                 transfer,
                 encoded: Vec::with_capacity(self.scratch_bytes),
@@ -294,6 +318,21 @@ impl ResidentAttention {
 
     pub(in crate::family::inkling2) fn reserve_credit(&self) -> u64 {
         self.reserve_credit
+    }
+
+    /// The geometry of a visit slot; `None` for an unknown slot.
+    pub(super) fn local_shape(&self, slot: usize) -> Option<LocalShape> {
+        let visit = self.visits.get(slot)?;
+        Some(LocalShape {
+            query_heads: visit.shape.query_heads,
+            kv_heads: visit.shape.kv_heads,
+            relative_dims: visit.shape.relative_dims,
+        })
+    }
+
+    /// The taps of every local short convolution, fixed by the prep kernel.
+    pub(super) fn local_taps(&self) -> usize {
+        crate::kernels::cuda::resident::inkling_local_prep::PrepShape::TAPS
     }
 
     pub(super) fn projected_rows(&self) -> Option<usize> {

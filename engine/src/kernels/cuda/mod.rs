@@ -83,9 +83,9 @@ pub(crate) use context::{
     )
 )]
 pub(crate) use context::{
-    ArenaHold, CapturePlan, DeviceArena, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
+    ArenaHold, CapturePlan, Claim, DeviceArena, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
     ExpertBankGeometry, GraphExec, MatmulIo, PackCall, PinnedWord, Projection, TimingEvent,
-    WordValue, is_capture_refusal,
+    WordValue, is_capture_refusal, require_apart, require_fit,
 };
 #[cfg(test)]
 pub(crate) use context::{Nvfp4GroupedPlan, Nvfp4LaunchStatus};

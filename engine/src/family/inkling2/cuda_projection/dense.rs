@@ -32,9 +32,13 @@ mod draft_head;
 mod local_attention;
 mod resident_controller;
 pub(super) use local_attention::{LocalInputs, LocalProjection, LocalTargets};
+pub(in crate::family::inkling2::cuda_projection) use local_attention::{
+    ResidentLocal, ResidentLocalInputs, ResidentLocalTargets,
+};
 pub(in crate::family::inkling2) use resident_controller::ResidentController;
 
 pub(in crate::family::inkling2) use controlled_attention::ControlledAttentionInput;
+pub(in crate::family::inkling2::cuda_projection) use controlled_mlp::RoutedRows;
 
 pub(super) use draft_head::DraftHead;
 

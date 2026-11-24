@@ -31,9 +31,15 @@ mod controller_workspace;
 mod device_prefill;
 mod grouped_controller_arithmetic;
 mod residency;
+mod resident_local;
+pub(in crate::family::inkling2) mod resident_mlp;
 mod resident_prefill;
 pub(in crate::family::inkling2) mod router;
 pub(in crate::family::inkling2) mod streaming;
+
+pub(in crate::family::inkling2) use resident_local::{
+    ConvRows, LocalDecodeWidths, PrepWeights, ResidentLocalDecode,
+};
 
 pub(in crate::family::inkling2) use device_prefill::ExpertPrefillRows;
 pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
@@ -50,6 +56,8 @@ pub(in crate::family::inkling2) struct GgufCuda {
     batch_router: bool,
     reuse_router_input: bool,
     resident_attention: Option<attention::ResidentAttention>,
+    hidden: usize,
+    gate_rank: usize,
     moe_scratch: Option<ResidentMoe>,
     route_scratch: Option<router::RouteScratch>,
     decode_exact_q2_down: bool,
@@ -758,6 +766,8 @@ impl GgufCuda {
             group_attention,
             batch_router: std::env::var("FIFI_INKLING_CUDA_BATCH_ROUTER").as_deref() == Ok("1"),
             resident_attention,
+            hidden,
+            gate_rank: spec.core.gate_rank as usize,
             moe_scratch,
             decode_exact_q2_down: route_scratch.is_some()
                 && std::env::var("FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN").as_deref() == Ok("1")

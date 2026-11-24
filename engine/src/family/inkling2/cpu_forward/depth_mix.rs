@@ -47,6 +47,29 @@ impl Stream {
         self.current
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn append_device_state(&self, bytes: &mut Vec<u8>) {
+        let mut append = |row: &[f32]| bytes.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
+        append(&self.current);
+        match &self.blocks {
+            Blocks::Raw(rows) => rows.iter().for_each(|row| append(&normalize(row))),
+            Blocks::Normalized { sealed, .. } => sealed.iter().for_each(|row| append(row)),
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn publish_resident_current(&mut self, next: Vec<f32>, seal: bool) {
+        if seal {
+            // Keep the host's sealed blocks canonical for the next host visit.
+            self.seal(next);
+        } else {
+            if let Blocks::Normalized { current, .. } = &mut self.blocks {
+                current.take();
+            }
+            self.current = next;
+        }
+    }
+
     pub(super) fn add_current(&mut self, row: &[f32]) {
         if let Blocks::Normalized { current, .. } = &mut self.blocks {
             current.take();

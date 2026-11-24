@@ -731,6 +731,34 @@ impl VisitState {
         self.position
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn resident_conv_histories(&self) -> [&VecDeque<Vec<f32>>; 4] {
+        [
+            &self.conv.k.0,
+            &self.conv.v.0,
+            &self.conv.attn.0,
+            &self.conv.mlp.0,
+        ]
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn publish_resident_visit(
+        &mut self,
+        [raw_k, raw_v, k, v, attn, mlp]: [Vec<f32>; 6],
+        (past, capacity): (usize, usize),
+    ) {
+        for (history, input) in [
+            (&mut self.conv.k.0, raw_k),
+            (&mut self.conv.v.0, raw_v),
+            (&mut self.conv.attn.0, attn),
+            (&mut self.conv.mlp.0, mlp),
+        ] {
+            history.push_front(input);
+            history.truncate(past);
+        }
+        self.push(k, v, capacity);
+    }
+
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn parity_fingerprint(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
