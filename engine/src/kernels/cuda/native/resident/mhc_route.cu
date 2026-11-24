@@ -104,8 +104,8 @@ __global__ void __launch_bounds__(kUnit) mhc_average_k(
 
 bool hidden_ok(int h) { return h >= kUnit && h % kUnit == 0 && h <= kMaxH; }
 
-// One decode step is one row; a prefill chunk is at most kMaxRows. The halves of a row never
-// share an element because ld_ab >= 2 * hidden.
+// One decode step is one row; a prefill chunk is at most kMaxRows. The stride rule alone does
+// not keep the halves of a row apart: the launch boundary proves that from the two starts.
 constexpr int kMaxRows = 4096;
 
 bool rows_ok(int rows, int ld_ab, int h) { return rows >= 1 && rows <= kMaxRows && ld_ab >= 2 * h; }

@@ -130,15 +130,43 @@ fn rows_extent(rows: usize, stride: usize, row_bytes: usize) -> Result<usize, De
         .ok_or_else(invalid_argument)
 }
 
-/// Checks the row count and the stream stride; returns the bytes one stream half covers. A
-/// chunk's halves interleave inside their `[a || b]` rows, and `ld_ab >= 2 * hidden` keeps every
-/// element of `a` off every element of `b`.
+/// Checks the row count and the stream stride; returns the bytes one stream half covers. The
+/// stride rule alone does not keep the two streams apart: [`streams_apart`] proves that from
+/// their starts.
 fn streams(rows: usize, ld_ab: usize, hidden: usize) -> Result<usize, DeviceFailure> {
     if rows == 0 || rows > MAX_ROWS || ld_ab < 2 * hidden {
         return Err(invalid_argument());
     }
     let stride = ld_ab.checked_mul(F32).ok_or_else(invalid_argument)?;
     rows_extent(rows, stride, row(hidden)?)
+}
+
+/// True when no element of `a`'s rows is an element of `b`'s rows. Each stream is `rows` rows
+/// of `hidden` f32 `ld_ab` apart from its start, and the starts are byte offsets inside one
+/// allocation (two allocations never share an element). The rows repeat every `ld_ab`, so the
+/// streams are apart exactly when the upper start lies past the lower stream's last row, or
+/// when the gap between the starts, taken mod `ld_ab`, is at least `hidden` and leaves at
+/// least `hidden` before the next row: the `[a || b]` rows of a chunk, with or without
+/// padding. The callers hold `rows >= 1` and `ld_ab >= 2 * hidden`.
+pub(in crate::kernels::cuda) fn streams_apart(
+    same_allocation: bool,
+    first: usize,
+    second: usize,
+    rows: usize,
+    ld_ab: usize,
+    hidden: usize,
+) -> bool {
+    if !same_allocation {
+        return true;
+    }
+    let (low, high) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let gap = (high - low) / F32;
+    let last = (rows - 1) * ld_ab + hidden;
+    gap >= last || (hidden..=ld_ab - hidden).contains(&(gap % ld_ab))
 }
 
 pub(in crate::kernels::cuda) fn mhc_route_launch(
@@ -230,9 +258,16 @@ pub(in crate::kernels::cuda) fn mhc_merge_launch(
         || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.b, stream_bytes))
         || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.branch, branch_bytes))
         // a and b are written in place after one read of both, so no element may be both:
-        // one row's halves are two apart ranges, and a chunk's halves only interleave inside
-        // their [a || b] rows, where ld_ab >= 2 * hidden keeps every element of a off b.
-        || (io.rows == 1 && !Span::of(&io.a, row_bytes).apart(&Span::of(&io.b, row_bytes)))
+        // one row's halves are two apart ranges, and a chunk's halves interleave inside their
+        // [a || b] rows.
+        || !streams_apart(
+            std::ptr::eq(io.a.device, io.b.device),
+            io.a.offset,
+            io.b.offset,
+            io.rows,
+            io.ld_ab,
+            io.hidden,
+        )
     {
         return Err(invalid_argument());
     }

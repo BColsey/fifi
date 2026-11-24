@@ -35,7 +35,8 @@ extern "C" {
  * rows is 1 (one decode step) or a prefill chunk's row count, at most 4096. Every buffer then
  * holds that many rows back to back (logits 8 and route 6 floats per row) except a and b: they
  * are the halves of one ld_ab-wide [a || b] row with ld_ab >= 2 * hidden, so consecutive rows
- * step ld_ab and the two halves never share an element. */
+ * step ld_ab. The entry cannot see allocation extents or overlap: the launch boundary proves
+ * that no element of a's rows is an element of b's rows (merge writes both in place). */
 typedef struct inference_cuda_mhc_route_args {
     const float *logits;
     const float *bias; /* NULL, or 8 f32 added to the logits before every use */

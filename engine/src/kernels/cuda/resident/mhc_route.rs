@@ -13,13 +13,18 @@
 //! multiple of 256 at most 2^20 (the grid math); `pre_scale` is finite and `iterations` is at
 //! most 32 (route); `rows` is 1..=4096 and `ld_ab` at least two `hidden`; every range holds
 //! the bytes of all its rows at 4-byte alignment; the written ranges
-//! overlap no other range of the call. A refused call changes nothing.
+//! overlap no other range of the call; in a merge no element of `a`'s rows is an element of
+//! `b`'s rows. A refused call changes nothing.
 //!
 //! The caller of one visit sequences route -> (branch) -> merge -> ... -> average on ONE
-//! stream, so every kernel reads what the previous one wrote; `a` and `b` must hold distinct
+//! stream, so every kernel reads what the previous one wrote. `a` and `b` must hold distinct
 //! elements (merge writes both in place after one read of each, per thread): two ranges for
-//! one row, or the halves of `ld_ab`-wide `[a || b]` rows for a chunk; and the 6-float route
-//! cell written by route is the cell merge reads.
+//! one row, or the halves of `ld_ab`-wide `[a || b]` rows for a chunk. The wrapper proves that
+//! for every row count, at this boundary and again at the raw one: two allocations are always
+//! apart, and in one allocation the streams are apart when one starts past the other's last
+//! row, or when the gap between their starts leaves at least `hidden` on both sides of the
+//! second half inside each row. The 6-float route cell written by route is the cell merge
+//! reads.
 //!
 //! One call serves one decode step (`rows: 1`) or one prefill chunk (`rows` rows): every range
 //! then holds its rows back to back.
@@ -27,7 +32,8 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
 use crate::kernels::cuda::native::resident::mhc_route::{
-    MhcAverageRaw, MhcMergeRaw, MhcRouteRaw, mhc_average_launch, mhc_merge_launch, mhc_route_launch,
+    MhcAverageRaw, MhcMergeRaw, MhcRouteRaw, mhc_average_launch, mhc_merge_launch,
+    mhc_route_launch, streams_apart,
 };
 
 const FLOAT: usize = size_of::<f32>();
@@ -178,6 +184,8 @@ impl CudaContext {
     }
 
     /// Queues the merge kernel of `call` on `stream`.
+    ///
+    /// Returns `BadRequest`, before any native call, when `a` and `b` share an element.
     pub(crate) fn mhc_merge(
         &self,
         stream: &DeviceStream,
@@ -192,6 +200,18 @@ impl CudaContext {
         fit("b", &call.b, half)?;
         fit("branch", &call.branch, branch)?;
         fit("route", &call.route, route_bytes)?;
+        if !streams_apart(
+            std::ptr::eq(call.a.buffer(), call.b.buffer()),
+            call.a.offset(),
+            call.b.offset(),
+            call.rows,
+            call.ld_ab,
+            call.hidden,
+        ) {
+            return Err(EngError::BadRequest(
+                "mhc_merge: the a and b ranges share an element of their rows".to_owned(),
+            ));
+        }
         let a = self.raw_range(&call.a)?;
         let b = self.raw_range(&call.b)?;
         let branch = self.raw_range(&call.branch)?;
@@ -243,3 +263,6 @@ impl CudaContext {
         })
     }
 }
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod tests;
