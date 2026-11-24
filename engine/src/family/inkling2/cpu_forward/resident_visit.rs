@@ -28,6 +28,9 @@ use crate::{
     },
 };
 
+mod pair;
+pub(super) use pair::Pair;
+
 const WORD: usize = size_of::<f32>();
 
 #[derive(Clone, Copy)]
@@ -267,7 +270,7 @@ impl CpuForward {
             return Ok(false);
         }
         if workspace.is_none() {
-            match Workspace::open(self, cuda, visit, (depth, bank)) {
+            match Workspace::open(self, cuda, visit, (depth.block_count(), bank)) {
                 Ok(Some(prepared)) => *workspace = Some(prepared),
                 Ok(None) | Err(EngError::MemoryPlan(_)) => return Ok(false),
                 Err(error) => return Err(error),
@@ -300,14 +303,14 @@ impl Workspace {
         forward: &CpuForward,
         cuda: &GgufCuda,
         visit: LayerVisit,
-        (depth, bank): (&Stream, &MessageBank),
+        (blocks, bank): (usize, &MessageBank),
     ) -> Result<Option<Self>, EngError> {
         let Some(widths) = cuda.resident_local_decode_widths(visit) else {
             return Ok(None);
         };
         let shape = Shape {
             widths,
-            blocks: depth.block_count(),
+            blocks,
             bank_blocks: bank.stream.block_count(),
             bank_first: bank.first_block,
             seal: visit
@@ -381,7 +384,7 @@ impl Workspace {
         (depth, bank): (&Stream, &MessageBank),
     ) -> Result<Output, EngError> {
         let position = state.position();
-        self.encode(state, depth, bank)?;
+        self.encode(state, Some(depth), bank, true)?;
         self.transfer.write(0, &self.encoded)?;
         let context = cuda.context();
         let layout = &self.layout;
@@ -418,18 +421,19 @@ impl Workspace {
         })();
         self.transfer
             .synchronize_after_enqueue(&self.stream, queued)?;
-        self.readback()
+        self.readback(&self.transfer, 0)
     }
 
     fn encode(
         &mut self,
         state: &VisitState,
-        depth: &Stream,
+        depth: Option<&Stream>,
         bank: &MessageBank,
+        bootstrap_history: bool,
     ) -> Result<(), EngError> {
         let shape = self.plan.shape;
         if (
-            depth.block_count(),
+            depth.map_or(shape.blocks, Stream::block_count),
             bank.stream.block_count(),
             bank.first_block,
         ) != (shape.blocks, shape.bank_blocks, shape.bank_first)
@@ -441,9 +445,19 @@ impl Workspace {
         let position = i32::try_from(state.position())
             .map_err(|_| bad("resident visit position overflows"))?;
         bytes.extend_from_slice(&position.to_ne_bytes());
-        depth.append_device_state(bytes);
+        if let Some(depth) = depth {
+            depth.append_device_state(bytes);
+        }
         bytes.resize(self.layout.depth.end(), 0);
-        bank.stream.append_device_state(bytes);
+        if depth.is_some() {
+            bank.stream.append_device_state(bytes);
+        } else {
+            bytes.resize(self.layout.bank.end(), 0);
+        }
+        if !bootstrap_history {
+            bytes.resize(self.layout.log.start, 0);
+            return Ok(());
+        }
         let past = shape.widths.taps - 1;
         for (span, history) in self
             .layout
@@ -467,13 +481,19 @@ impl Workspace {
         Ok(())
     }
 
-    fn readback(&self) -> Result<Output, EngError> {
+    fn readback(&self, pinned: &PinnedBuf, offset: usize) -> Result<Output, EngError> {
+        let read = |span: Region| {
+            Region {
+                start: offset + span.start,
+                ..span
+            }
+            .read(pinned)
+        };
         let layout = &self.layout;
-        let status = Region {
+        let status = read(Region {
             start: layout.attention_status.start,
             bytes: layout.log.start - layout.attention_status.start,
-        }
-        .read(&self.transfer)?;
+        })?;
         if let Some(i) = status.iter().position(|word| word.to_bits() != 0) {
             return Err(bad(format!(
                 "resident visit {} reported nonzero status word {i}: {:#x}",
@@ -484,21 +504,20 @@ impl Workspace {
         let kv = self.plan.shape.widths.kv_channels;
         let h = self.plan.shape.widths.hidden;
         let log = |i: usize| {
-            Region {
+            read(Region {
                 start: layout.log.start + i * kv * WORD,
                 bytes: kv * WORD,
-            }
-            .read(&self.transfer)
+            })
         };
         Ok(Output {
-            current: layout.depth.row(h).read(&self.transfer)?,
+            current: read(layout.depth.row(h))?,
             history: [
                 log(0)?,
                 log(1)?,
                 log(2)?,
                 log(3)?,
-                layout.histories[2].row(h).read(&self.transfer)?,
-                layout.mlp_raw.read(&self.transfer)?,
+                read(layout.histories[2].row(h))?,
+                read(layout.mlp_raw)?,
             ],
         })
     }

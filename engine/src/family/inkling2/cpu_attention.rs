@@ -732,6 +732,11 @@ impl VisitState {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn resident_history_identity(&self) -> Option<std::sync::Weak<Vec<f32>>> {
+        self.keys.front().map(Arc::downgrade)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_conv_histories(&self) -> [&VecDeque<Vec<f32>>; 4] {
         [
             &self.conv.k.0,
