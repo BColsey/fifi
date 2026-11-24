@@ -104,6 +104,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     scratch_at: usize,
     local_workspace: Option<(usize, usize)>,
     projected_rows: Option<usize>,
+    align_projected_input: bool,
     projection_headroom: u64,
     reserve_credit: u64,
     stream: DeviceStream,
@@ -221,8 +222,13 @@ impl Plan {
         let spare = |bytes: u64| {
             before.saturating_sub(state_headroom(if charge_reserve { bytes } else { 0 }))
         };
+        // Keep status and the returned projection contiguous. Only the internal
+        // attention row, consumed by the single-row weight kernel, needs padding.
+        let align_projected_input = self.projected_rows.is_some()
+            && std::env::var("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref() == Ok("1");
         let bytes = scratch_at
             .checked_add(self.scratch_bytes)
+            .and_then(|n| n.checked_add(if align_projected_input { 12 } else { 0 }))
             .ok_or_else(|| bad("CUDA relative attention arena overflows"))?;
         let proposed_credit = if charge_reserve { bytes as u64 } else { 0 };
         let spare = spare(bytes as u64);
@@ -270,6 +276,7 @@ impl Plan {
             scratch_at,
             local_workspace: self.local_workspace,
             projected_rows: self.projected_rows,
+            align_projected_input,
             projection_headroom,
             reserve_credit: credit,
             stream,
@@ -381,6 +388,11 @@ impl ResidentAttention {
         // Put the final result immediately after the status word for one readback.
         let chained = projection.is_some();
         let attention_at = out + if chained { output_bytes } else { 0 };
+        let attention_at = if chained && self.align_projected_input {
+            attention_at.next_multiple_of(16)
+        } else {
+            attention_at
+        };
         let attention_out = self.arena.range(attention_at, attention_bytes)?;
         let call = RelativeAttentionCall {
             shape: visit.shape,
