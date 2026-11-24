@@ -3,7 +3,8 @@
 //! `docs/plans/flash-next-cuda.md`, and the bookkeeping book at the plan's capacity.
 
 use super::state::{
-    FlashGeometry, StatePlan, StateSlot, WORD_PREFILL_STATUS, WORD_RESULT_PAIR, WORDS_BYTES,
+    FlashGeometry, QsaCacheStorage, StatePlan, StateSlot, WORD_PREFILL_STATUS, WORD_RESULT_PAIR,
+    WORDS_BYTES,
 };
 use crate::{
     EngError,
@@ -289,6 +290,10 @@ fn a_format_without_a_kernel_is_refused() {
     assert!(!KvFormat::Int8.has_kernels());
     let error = StatePlan::new(&g, 32_768, KvFormat::Int8).expect_err("Int8 has no QSA kernel");
     assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
+    // f32 QSA caches are an fp16 layout: they do not make int8 readable.
+    let error = StatePlan::with_qsa_cache(&g, 32_768, KvFormat::Int8, QsaCacheStorage::F32)
+        .expect_err("Int8 has no f32 attention");
+    assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
 }
 
 /// The shape the config gives after `edit` of its `text_config`.
@@ -357,6 +362,43 @@ fn the_qsa_state_matches_the_kernel_sizes_and_covers_every_position() {
         assert!(blocks * 4 >= positions, "{positions}");
         assert!((blocks - 1) * 4 < positions, "{positions}");
     }
+}
+
+#[test]
+fn f32_qsa_planes_are_twice_the_f16_and_nothing_else_moves() {
+    let (_, g) = real();
+    let layer = 3;
+    let f16 = StatePlan::new(&g, 4096, KvFormat::F16).unwrap();
+    let f32 = StatePlan::with_qsa_cache(&g, 4096, KvFormat::F16, QsaCacheStorage::F32).unwrap();
+    fn size(plan: &StatePlan, slot: StateSlot) -> usize {
+        plan.placement(slot).unwrap().1
+    }
+    // The same rows x kv heads x 256, four bytes an element: what `qsa_attn_exact` reads.
+    assert_eq!(size(&f32, StateSlot::QsaK(layer)), cache_bytes(4096, 4));
+    assert_eq!(size(&f32, StateSlot::QsaV(layer)), cache_bytes(4096, 4));
+    for slot in [
+        StateSlot::QsaIndexKeys(layer),
+        StateSlot::QsaRawRing(layer),
+        StateSlot::DeltaRec(0),
+        StateSlot::DeltaConv(0),
+    ] {
+        assert_eq!(size(&f32, slot), size(&f16, slot), "{slot:?}");
+    }
+    let (a, b) = (f16.bytes().unwrap(), f32.bytes().unwrap());
+    assert_eq!(b.kv_bytes, 2 * a.kv_bytes);
+    assert_eq!(b.arena_bytes, a.arena_bytes + a.kv_bytes);
+    assert_eq!(
+        b.bytes_per_position,
+        a.bytes_per_position + a.kv_bytes / a.positions
+    );
+    assert_eq!(
+        (b.delta_state_bytes, b.other_fixed_bytes),
+        (a.delta_state_bytes, a.other_fixed_bytes)
+    );
+    assert_eq!(
+        (b.index_key_bytes, b.cap_blocks, b.positions),
+        (a.index_key_bytes, a.cap_blocks, a.positions)
+    );
 }
 
 #[test]

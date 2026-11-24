@@ -42,6 +42,7 @@
 #![cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
+use crate::kernels::cuda::resident::attn_prep::MAX_DECODE_ROWS;
 use std::cell::Cell;
 
 use crate::{
@@ -61,7 +62,7 @@ use crate::{
         qwen::flash_next::{
             cuda::{
                 moe_block::{SplitMoe, SplitMoeTrunk},
-                state::{FlashGeometry, StatePlan, StateSlot, WORD_STEP_PARAMS},
+                state::{FlashGeometry, QsaCacheStorage, StatePlan, StateSlot, WORD_STEP_PARAMS},
                 step_plan::{PREFILL_TILE_ROWS, Site, Slot, StepOptions, StepPlan},
             },
             load::model_shape,
@@ -228,6 +229,11 @@ pub(super) struct FlashStep<'a> {
     /// The arithmetic of the native GGUF decode projections: [`GgufDecodePrecision::default`]
     /// until [`Self::set_gguf_decode_precision`].
     gguf_decode: GgufDecodePrecision,
+    /// True when the QSA attention caches are f32 ([`QsaCacheStorage::F32`]): the mixer writes the key
+    /// and value rows in f32 and reads them with `qsa_attn_exact`, so nothing is rounded at the
+    /// store. The GGUF decode owner's choice ([`FlashStep::new_gguf_decode`], from
+    /// [`gguf_qsa_cache_storage`]); every other step has fp16 caches.
+    pub(super) qsa_cache_f32: bool,
     state: DeviceArena,
     scratch: DeviceArena,
     /// f32 `[hidden]` zeros: the residual the shared MoE block adds to, since the hyper apply adds
@@ -241,6 +247,49 @@ pub(super) struct FlashStep<'a> {
     pub(super) prefill_window: Cell<bool>,
     /// Set by any error of a launch call; cleared by [`Self::reset`].
     poisoned: Cell<bool>,
+}
+
+/// What the GGUF decode owner adds to the step: the exact scratch plan's `max_k` and the
+/// storage of the QSA attention caches.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GgufDecode {
+    pub(super) max_k: usize,
+    pub(super) qsa_cache: QsaCacheStorage,
+}
+
+/// The storage of the QSA attention caches of the GGUF decode owner
+/// ([`FlashStep::new_gguf_decode`]): fp16, unless `FIFI_FLASH_GGUF_QSA_CACHE` is `f32`, which
+/// rounds nothing at the store and takes twice the cache bytes. An opt-in setting until the f32
+/// caches are qualified, so that every step the owner builds follows it; any other value is
+/// refused.
+pub(super) fn gguf_qsa_cache_storage() -> Result<QsaCacheStorage, EngError> {
+    let value = match std::env::var("FIFI_FLASH_GGUF_QSA_CACHE") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_GGUF_QSA_CACHE is not valid UTF-8: {error}"
+            )));
+        }
+    };
+    parse_qsa_cache_storage(value.as_deref()).map_err(|rule| {
+        EngError::BadRequest(format!(
+            "FIFI_FLASH_GGUF_QSA_CACHE {rule}, got {:?}",
+            value.as_deref().unwrap_or("")
+        ))
+    })
+}
+
+/// The storage the setting names: unset or `f16` is fp16, `f32` is f32. Anything else breaks the
+/// rule the error names.
+pub(super) fn parse_qsa_cache_storage(
+    value: Option<&str>,
+) -> Result<QsaCacheStorage, &'static str> {
+    match value {
+        None | Some("f16") => Ok(QsaCacheStorage::F16),
+        Some("f32") => Ok(QsaCacheStorage::F32),
+        Some(_) => Err("must be f16 or f32"),
+    }
 }
 
 impl<'a> FlashStep<'a> {
@@ -318,7 +367,8 @@ impl<'a> FlashStep<'a> {
         )
     }
 
-    /// Construct a single-token GGUF decode owner with its exact scratch plan.
+    /// Construct a single-token GGUF decode owner with its exact scratch plan. The QSA caches
+    /// are stored as [`gguf_qsa_cache_storage`] says: fp16 unless the setting opts into f32.
     #[expect(clippy::too_many_arguments)]
     pub(super) fn new_gguf_decode(
         ctx: &'a CudaContext,
@@ -328,6 +378,35 @@ impl<'a> FlashStep<'a> {
         kinds: &[bool],
         positions: usize,
         max_k: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::new_gguf_decode_in(
+            ctx,
+            stream,
+            weights,
+            model,
+            kinds,
+            positions,
+            max_k,
+            gguf_qsa_cache_storage()?,
+            layers,
+        )
+    }
+
+    /// [`Self::new_gguf_decode`] with the QSA caches stored in `qsa_cache`, whatever the setting
+    /// says: fp16, or [`QsaCacheStorage::F32`], which rounds nothing at the store and takes twice
+    /// the cache bytes. The f32 rows entry of the attention preparation takes at most
+    /// [`MAX_DECODE_ROWS`] rows a step.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn new_gguf_decode_in(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model: ModelShape,
+        kinds: &[bool],
+        positions: usize,
+        max_k: usize,
+        qsa_cache: QsaCacheStorage,
         layers: std::ops::Range<usize>,
     ) -> Result<Self, EngError> {
         Self::build_shape(
@@ -340,7 +419,7 @@ impl<'a> FlashStep<'a> {
             1,
             layers,
             false,
-            Some(max_k),
+            Some(GgufDecode { max_k, qsa_cache }),
         )
     }
 
@@ -355,7 +434,7 @@ impl<'a> FlashStep<'a> {
         rows: usize,
         layers: std::ops::Range<usize>,
         shared_prefill: bool,
-        gguf_max_k: Option<usize>,
+        gguf: Option<GgufDecode>,
     ) -> Result<Self, EngError> {
         let geometry = FlashGeometry::new(&model, kinds)?;
         if layers.start >= layers.end || layers.end > geometry.layers.len() {
@@ -364,10 +443,16 @@ impl<'a> FlashStep<'a> {
                 geometry.layers.len()
             )));
         }
-        let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
+        let qsa_cache = gguf.map_or(QsaCacheStorage::F16, |decode| decode.qsa_cache);
+        if qsa_cache == QsaCacheStorage::F32 && rows > MAX_DECODE_ROWS {
+            return Err(refuse(format!(
+                "f32 QSA caches take at most {MAX_DECODE_ROWS} rows a step, got {rows}"
+            )));
+        }
+        let state_plan = StatePlan::with_qsa_cache(&geometry, positions, KvFormat::F16, qsa_cache)?;
         let options = StepOptions::for_sm_count(ctx.sm_count());
-        let step_plan = if let Some(max_k) = gguf_max_k {
-            StepPlan::gguf_decode(&geometry, positions, &options, max_k)?
+        let step_plan = if let Some(decode) = gguf {
+            StepPlan::gguf_decode(&geometry, positions, &options, decode.max_k)?
         } else if shared_prefill {
             StepPlan::new_prefill(&geometry, rows, positions, &options)?
         } else {
@@ -391,6 +476,7 @@ impl<'a> FlashStep<'a> {
             step_plan,
             options,
             gguf_decode: GgufDecodePrecision::default(),
+            qsa_cache_f32: qsa_cache == QsaCacheStorage::F32,
             state,
             scratch,
             zeros,

@@ -510,6 +510,75 @@ fn qsa_attn_refuses_bad_calls_and_writes_nothing() {
     assert_eq!(rig.status(), 0, "a refusal raised a status bit");
 }
 
+/// The exact reader takes f32 caches: an fp16-sized cache is refused before any native call, by
+/// name, and writes nothing; over f32 caches of values fp16 holds exactly it runs, leaves the
+/// status alone, and is compared with the fp16 reader float for float.
+#[test]
+fn qsa_attn_exact_takes_f32_caches_and_is_compared_with_the_fp16_reader() {
+    let test = "qsa_attn_exact_takes_f32_caches_and_is_compared_with_the_fp16_reader";
+    if !device_present(test) {
+        return;
+    }
+    let rig = Rig::new(ROWS - 1, &[0, 1, 2, 3, 0, 1, 2, 3]);
+    // The rig's whole cache buffer, its spare bytes included: half of what the exact reader reads.
+    let expect = format!(
+        "the CUDA k_cache range holds {} bytes but the call needs {}",
+        CACHE_BYTES + SPARE,
+        2 * CACHE_BYTES
+    );
+    refused(
+        rig.ctx.qsa_attn_exact(&rig.stream, rig.host(10)),
+        &expect,
+        "exact over an fp16 cache",
+    );
+    assert!(
+        rig.out()
+            .iter()
+            .all(|v| v.to_bits() == u32::from_le_bytes([SENT; 4])),
+        "the refused exact call wrote the output"
+    );
+    assert_eq!(rig.status(), 0, "the refusal raised a status bit");
+
+    // The rig's cache values, which fp16 holds exactly, stored as f32.
+    let mut f32_cache: Vec<u8> = (0..ROWS * N_KV * HEAD)
+        .flat_map(|i| (((i % 7) as f32 - 3.0) / 8.0).to_le_bytes())
+        .collect();
+    f32_cache.extend([0u8; SPARE]);
+    let k32 = rig.ctx.upload(&f32_cache).expect("k32");
+    let v32 = rig.ctx.upload(&f32_cache).expect("v32");
+    let exact = QsaAttnCall {
+        k_cache: k32.range(0, 2 * CACHE_BYTES).expect("range"),
+        v_cache: v32.range(0, 2 * CACHE_BYTES).expect("range"),
+        ..rig.host(10)
+    };
+    rig.ctx.qsa_attn(&rig.stream, rig.host(10)).expect("fp16");
+    let fp16 = rig.out();
+    assert_eq!(rig.status(), 0, "the fp16 reader raised a status bit");
+    rig.out
+        .write_at(&rig.stream, 0, &vec![SENT; TOKENS * Q_BYTES])
+        .expect("reset");
+    rig.ctx.qsa_attn_exact(&rig.stream, exact).expect("exact");
+    let exact_out = rig.out();
+    assert_eq!(rig.status(), 0, "the exact reader raised a status bit");
+    let (differing, worst) =
+        exact_out
+            .iter()
+            .zip(&fp16)
+            .fold((0usize, 0.0f64), |(n, worst), (a, b)| {
+                let d = (f64::from(*a) - f64::from(*b)).abs();
+                (n + usize::from(a.to_bits() != b.to_bits()), worst.max(d))
+            });
+    println!(
+        "REPORTED: QSA attention, f32 and fp16 readers on values fp16 holds exactly: \
+         {differing} of {} floats differ, worst {worst:.3e}",
+        fp16.len()
+    );
+    assert_eq!(
+        differing, 0,
+        "the readers disagree on values fp16 holds exactly"
+    );
+}
+
 #[test]
 fn qsa_attn_reads_no_row_past_the_position_and_poisons_bad_input() -> Result<(), EngError> {
     if !device_present("qsa_attn_reads_no_row_past_the_position_and_poisons_bad_input") {

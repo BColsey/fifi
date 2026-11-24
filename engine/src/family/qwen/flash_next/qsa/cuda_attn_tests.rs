@@ -151,12 +151,24 @@ struct Gpu<'a> {
     host_kv: (&'a [f32], &'a [f32]),
 }
 
-/// The device output of one call of `tokens` at `position`, f32 `[m][n_head][256]`.
+/// The device output of one call of `tokens` at `position`, f32 `[m][n_head][256]`, through
+/// `qsa_attn`.
 fn device_chunk(
     gpu: &Gpu<'_>,
     geom: Geom,
     tokens: &[&Token],
     position: QsaPosition<'_>,
+) -> Result<Vec<f32>, EngError> {
+    device_chunk_in(gpu, geom, tokens, position, false)
+}
+
+/// [`device_chunk`] through `qsa_attn_exact` when `exact`: the caches are then f32.
+fn device_chunk_in(
+    gpu: &Gpu<'_>,
+    geom: Geom,
+    tokens: &[&Token],
+    position: QsaPosition<'_>,
+    exact: bool,
 ) -> Result<Vec<f32>, EngError> {
     let ctx = gpu.ctx;
     let m = tokens.len();
@@ -173,23 +185,25 @@ fn device_chunk(
     let chosen = ctx.upload(&chosen_bytes)?;
     let part = ctx.upload(&vec![0xFF; shape.part_bytes()?])?;
     let out = ctx.upload(&vec![0xFF; m * geom.n_head * HEAD * 4])?;
-    ctx.qsa_attn(
-        gpu.stream,
-        QsaAttnCall {
-            shape,
-            ld: geom.ld(),
-            scale: 1.0 / 16.0,
-            position,
-            q: whole(&q)?,
-            proj: whole(&proj)?,
-            k_cache: whole(gpu.k)?,
-            v_cache: whole(gpu.v)?,
-            chosen: whole(&chosen)?,
-            part: whole(&part)?,
-            out: whole(&out)?,
-            status: None,
-        },
-    )?;
+    let call = QsaAttnCall {
+        shape,
+        ld: geom.ld(),
+        scale: 1.0 / 16.0,
+        position,
+        q: whole(&q)?,
+        proj: whole(&proj)?,
+        k_cache: whole(gpu.k)?,
+        v_cache: whole(gpu.v)?,
+        chosen: whole(&chosen)?,
+        part: whole(&part)?,
+        out: whole(&out)?,
+        status: None,
+    };
+    if exact {
+        ctx.qsa_attn_exact(gpu.stream, call)?;
+    } else {
+        ctx.qsa_attn(gpu.stream, call)?;
+    }
     gpu.stream.synchronize()?;
     Ok(download(ctx, &out, m * geom.n_head * HEAD))
 }
@@ -268,6 +282,100 @@ fn random_cache(ctx: &CudaContext, geom: Geom, rng: &mut Rng) -> Result<Cache, E
         k_host,
         v_host,
     })
+}
+
+/// Random values as f32 bits: ones that fp16 does not hold exactly.
+fn f32_bits(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// The same values rounded to fp16, as fp16 bits.
+fn rounded_to_half(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn cuda_qsa_attention_exact_of_f32_caches_matches_the_host_float_attention() -> Result<(), EngError>
+{
+    if !device_present("cuda_qsa_attention_exact_of_f32_caches_matches_the_host_float_attention") {
+        return Ok(());
+    }
+    let mut rng = Rng(0xe4ac_70f1);
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    // Caches of values fp16 does not hold: the host reads them as they are.
+    let count = FLASH_NEXT.rows * FLASH_NEXT.n_kv * HEAD;
+    let k_host = uniform(&mut rng, -1.0, 1.0, count);
+    let v_host = uniform(&mut rng, -1.0, 1.0, count);
+    let (k, v) = (
+        ctx.upload(&f32_bits(&k_host))?,
+        ctx.upload(&f32_bits(&v_host))?,
+    );
+    // The control's copies: the same values rounded to fp16, as `qsa_attn` reads them.
+    let (k_half, v_half) = (
+        ctx.upload(&rounded_to_half(&k_host))?,
+        ctx.upload(&rounded_to_half(&v_host))?,
+    );
+    let host_kv: (&[f32], &[f32]) = (&k_host, &v_host);
+    let exact_gpu = Gpu {
+        ctx: &ctx,
+        stream: &stream,
+        k: &k,
+        v: &v,
+        host_kv,
+    };
+    let rounded_gpu = Gpu {
+        ctx: &ctx,
+        stream: &stream,
+        k: &k_half,
+        v: &v_half,
+        host_kv,
+    };
+    let q_norm = uniform(&mut rng, -0.5, 0.5, HEAD);
+    // (position, budget blocks, splits)
+    let cases = [
+        (0, 16, 32),
+        (3, 16, 32),
+        (67, 16, 32),
+        (600, 16, 32),
+        (1099, 512, 32),
+        (1097, 16, 1),
+        (1097, 16, 128),
+    ];
+    let (mut worst, mut smallest_control) = (0.0f64, f64::INFINITY);
+    for (pos, budget_blocks, splits) in cases {
+        let geom = Geom {
+            budget_blocks,
+            splits,
+            ..FLASH_NEXT
+        };
+        let t = token(geom, host_kv, &q_norm, pos, &mut rng)?;
+        let exact = device_chunk_in(&exact_gpu, geom, &[&t], QsaPosition::Host(pos), true)?;
+        let rounded = device_chunk(&rounded_gpu, geom, &[&t], QsaPosition::Host(pos))?;
+        let (err, control) = (worst_row(&exact, &t.host), worst_row(&rounded, &t.host));
+        println!(
+            "REPORTED: flash-next qsa attention position {pos} budget {budget_blocks} splits {splits}: \
+             f32 caches {err:.3e}, the same rounded to fp16 {control:.3e} (class {CLASS:.3e})"
+        );
+        worst = worst.max(err);
+        smallest_control = smallest_control.min(control);
+    }
+    println!(
+        "REPORTED: flash-next qsa attention, worst over the cases: f32 caches {worst:.3e}, the same \
+         rounded to fp16 at least {smallest_control:.3e} (class {CLASS:.3e})"
+    );
+    assert!(worst <= CLASS, "f32 caches: {worst:.3e} above the class");
+    // Rounding the stored keys and values to fp16 is, at its smallest here, dozens of times the
+    // exact reader's error and several times the class. It is smallest at the long position with
+    // the wide budget, where the rounded values average out in the attention.
+    assert!(
+        smallest_control > 20.0 * worst && smallest_control > 3.0 * CLASS,
+        "the fp16 control {smallest_control:.3e} does not separate the storages from {worst:.3e}"
+    );
+    Ok(())
 }
 
 #[test]

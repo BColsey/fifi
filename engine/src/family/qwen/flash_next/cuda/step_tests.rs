@@ -37,7 +37,7 @@ use super::{
         upload::{layer_weights, root_weights},
     },
     moe_block::SplitMoe,
-    state::StateSlot,
+    state::{QsaCacheStorage, StateSlot},
     step::{AllResidentMoe, FlashStep, MIXER, MoeBlock, SplitMoeAt, bank_key, split_trunk},
     step_plan::{PREFILL_TILE_ROWS, Site, Slot},
 };
@@ -221,6 +221,53 @@ fn gguf_qsa_mixer_tracks_synthetic_token_history() {
 #[test]
 #[ignore = "requires an admitted CUDA device and CPU host reference"]
 fn gguf_qsa_mixer_matches_synthetic_host_history() {
+    run_qsa_mixer(QsaCacheStorage::F16);
+}
+
+/// The same mixer with f32 QSA caches: every stored key is the f32 value the fp16 step rounds
+/// (bit for bit once rounded), and nearly none is a number fp16 holds.
+#[test]
+#[ignore = "requires an admitted CUDA device and CPU host reference"]
+fn gguf_qsa_mixer_with_f32_caches_stores_the_unrounded_keys() {
+    let exact = run_qsa_mixer(QsaCacheStorage::F32);
+    let rounded = run_qsa_mixer(QsaCacheStorage::F16);
+    // The plane is `[positions][n_kv][256]`: four bytes a key against two.
+    assert_eq!(exact.len(), 2 * rounded.len());
+    let keys = exact
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| f32::from_le_bytes(*w))
+        .collect::<Vec<_>>();
+    let halves = rounded
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|w| u16::from_le_bytes(*w));
+    let mut unrounded = 0;
+    for (key, stored) in keys.iter().zip(halves) {
+        let half = half::f16::from_f32(*key);
+        assert_eq!(
+            half.to_bits(),
+            stored,
+            "the f32 key {key} is not the value the fp16 step stored"
+        );
+        unrounded += usize::from(half.to_f32() != *key);
+    }
+    eprintln!(
+        "synthetic GGUF QSA: {unrounded} of {} stored keys are not fp16 numbers",
+        keys.len()
+    );
+    assert!(
+        unrounded * 10 > keys.len() * 9,
+        "only {unrounded} of {} keys are not fp16 numbers",
+        keys.len()
+    );
+}
+
+/// Runs the five synthetic tokens of layer 3 through a step whose QSA caches are `storage` and
+/// returns the layer's final key plane, raw: f32 values, or fp16 bits.
+fn run_qsa_mixer(storage: QsaCacheStorage) -> Vec<u8> {
     use crate::kernels::cuda::{CudaContext, resident::step_params::StepParams};
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
@@ -239,8 +286,18 @@ fn gguf_qsa_mixer_matches_synthetic_host_history() {
     let weights = CudaWeights::from_native(uploaded).unwrap();
     let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
     let (model, kinds) = model_shape(config).unwrap();
-    let step =
-        FlashStep::new_gguf_decode(&ctx, &stream, &weights, model, &kinds, 5, 6144, 3..4).unwrap();
+    let step = FlashStep::new_gguf_decode_in(
+        &ctx,
+        &stream,
+        &weights,
+        model,
+        &kinds,
+        5,
+        6144,
+        storage,
+        3..4,
+    )
+    .unwrap();
     for (pos, (input, want)) in inputs.iter().zip(&reference).enumerate() {
         step.begin_token().unwrap();
         let (words, at) = step.words_buffer().unwrap();
@@ -271,6 +328,29 @@ fn gguf_qsa_mixer_matches_synthetic_host_history() {
         let error = relative_l2(&got, want);
         eprintln!("synthetic GGUF QSA position {pos}: relative L2 {error:.6}");
         assert!(error < 0.03, "position {pos}: relative L2 {error}");
+    }
+    step.read_state_bytes(StateSlot::QsaK(3)).unwrap()
+}
+
+/// The setting the GGUF decode owner's constructor reads: fp16 unless it names `f32`; anything
+/// else is refused, so a misspelling never silently keeps fp16.
+#[test]
+fn the_qsa_cache_setting_names_f16_or_f32_and_refuses_the_rest() {
+    use super::step::parse_qsa_cache_storage;
+    assert_eq!(parse_qsa_cache_storage(None), Ok(QsaCacheStorage::F16));
+    assert_eq!(
+        parse_qsa_cache_storage(Some("f16")),
+        Ok(QsaCacheStorage::F16)
+    );
+    assert_eq!(
+        parse_qsa_cache_storage(Some("f32")),
+        Ok(QsaCacheStorage::F32)
+    );
+    for other in ["", "F32", "f32 ", "int8", "bf16", "fp16"] {
+        assert!(
+            parse_qsa_cache_storage(Some(other)).is_err(),
+            "{other:?} must be refused"
+        );
     }
 }
 

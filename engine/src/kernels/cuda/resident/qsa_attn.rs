@@ -69,12 +69,13 @@ impl QsaAttnShape {
 
     /// The scratch `part` of a call, in bytes.
     pub(crate) fn part_bytes(self) -> Result<usize, EngError> {
-        Ok(check_shape(self)?.part)
+        Ok(check_shape(self, F16)?.part)
     }
 }
 
 /// One call: `q` f32 `[m][n_head][256]`, `proj` the f32 projection rows `[m][ld]` (head `h`'s
-/// gate at column `h * 512 + 256`), the fp16 caches `[rows][n_kv_head][256]`, `chosen` i32
+/// gate at column `h * 512 + 256`), the caches `[rows][n_kv_head][256]` (fp16 for `qsa_attn`, f32
+/// for `qsa_attn_exact`), `chosen` i32
 /// `[m][budget_blocks]`; `part` is scratch and `out` f32 `[m][n_head][256]` is written.
 pub(crate) struct QsaAttnCall<'b> {
     pub(crate) shape: QsaAttnShape,
@@ -91,9 +92,14 @@ pub(crate) struct QsaAttnCall<'b> {
     pub(crate) status: Option<DeviceRange<'b>>,
 }
 
-fn check_shape(shape: QsaAttnShape) -> Result<QsaAttnBytes, EngError> {
+/// One stored key or value of the QSA caches, in bytes.
+const F16: usize = 2;
+/// The f32 caches of [`CudaContext::qsa_attn_exact`].
+const F32: usize = 4;
+
+fn check_shape(shape: QsaAttnShape, cache_element: usize) -> Result<QsaAttnBytes, EngError> {
     check_tokens(shape.m)?;
-    shape.dims().bytes().ok_or_else(|| {
+    shape.dims().bytes(cache_element).ok_or_else(|| {
         EngError::BadRequest(format!(
             "the CUDA QSA attention takes 1 to {QSA_ATTN_MAX_KV_HEADS} kv heads, at most \
              {QSA_ATTN_MAX_GROUP} query heads per kv head, 1 to {QSA_ATTN_MAX_ROWS} cache rows, \
@@ -136,14 +142,38 @@ impl CudaContext {
         stream: &DeviceStream,
         call: QsaAttnCall<'_>,
     ) -> Result<(), EngError> {
+        self.qsa_attn_in(stream, call, F16)
+    }
+
+    /// Queues the QSA attention of `qsa_attn` over f32 caches `[rows][n_kv_head][256]`: the same
+    /// arithmetic on keys and values that were not rounded at the store. The same refusals as
+    /// `qsa_attn`, with the caches sized as f32.
+    pub(crate) fn qsa_attn_exact(
+        &self,
+        stream: &DeviceStream,
+        call: QsaAttnCall<'_>,
+    ) -> Result<(), EngError> {
+        self.qsa_attn_in(stream, call, F32)
+    }
+
+    fn qsa_attn_in(
+        &self,
+        stream: &DeviceStream,
+        call: QsaAttnCall<'_>,
+        cache_element: usize,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        let raw = self.plan_qsa_attn(&call)?;
+        let raw = self.plan_qsa_attn(&call, cache_element)?;
         self.launch_on(stream, move |stream_raw| qsa_attn_launch(stream_raw, raw))
     }
 
-    fn plan_qsa_attn<'b>(&self, call: &QsaAttnCall<'b>) -> Result<QsaAttnRaw<'b>, EngError> {
+    fn plan_qsa_attn<'b>(
+        &self,
+        call: &QsaAttnCall<'b>,
+        cache_element: usize,
+    ) -> Result<QsaAttnRaw<'b>, EngError> {
         let shape = call.shape;
-        let need = check_shape(shape)?;
+        let need = check_shape(shape, cache_element)?;
         let proj = shape.dims().proj_bytes(call.ld).ok_or_else(|| {
             EngError::BadRequest(format!(
                 "the CUDA QSA attention row of {} floats cannot hold {} heads of query and gate, \
@@ -201,6 +231,7 @@ impl CudaContext {
                 .as_ref()
                 .map(|s| self.raw_range(s))
                 .transpose()?,
+            kv_f32: cache_element == F32,
         })
     }
 }

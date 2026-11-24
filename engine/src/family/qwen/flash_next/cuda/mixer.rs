@@ -32,7 +32,7 @@ use crate::{
             GDN_SCAN_EPS, GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes,
         },
         resident::{
-            attn_prep::{AttnPrepCall, AttnPrepShape, RopeParams, SlotMode},
+            attn_prep::{AttnPrepCall, AttnPrepRowsCall, AttnPrepShape, RopeParams, SlotMode},
             gdn_conv::{ConvCall, ConvShape, conv_bytes},
             head_tile::{HeadTileCall, HeadTileShape},
             qsa_attn::{QsaAttnCall, QsaAttnShape},
@@ -268,35 +268,63 @@ impl FlashStep<'_> {
         let k_cache = self.state_slot(StateSlot::QsaK(layer))?;
         let v_cache = self.state_slot(StateSlot::QsaV(layer))?;
         let q = self.slot(Slot::AttnQ)?;
-        self.ctx.attn_prep(
-            self.stream,
-            AttnPrepCall {
-                shape: AttnPrepShape {
-                    m,
-                    n_head: qsa.heads_q,
-                    n_kv_head: qsa.heads_kv,
-                    head_dim: qsa.head_dim,
-                    n_rot: dims.rotary_dim as usize,
-                    has_gate: true,
-                    slot: SlotMode::Position,
-                    rows: positions,
-                    ld,
+        let shape = AttnPrepShape {
+            m,
+            n_head: qsa.heads_q,
+            n_kv_head: qsa.heads_kv,
+            head_dim: qsa.head_dim,
+            n_rot: dims.rotary_dim as usize,
+            has_gate: true,
+            slot: SlotMode::Position,
+            rows: positions,
+            ld,
+        };
+        let rope = RopeParams {
+            eps: dims.eps,
+            rope_base: dims.theta,
+        };
+        let q_norm = self.float(&at("self_attn.q_norm.weight"))?;
+        let k_norm = self.float(&at("self_attn.k_norm.weight"))?;
+        if self.qsa_cache_f32 {
+            // The f32 rows entry writes its m rows from the start of the range it is given, so
+            // each range is the plane from this step's position, in bytes. The slots live in one
+            // arena: a buffer range counts from the arena, so each starts at its slot's offset.
+            let plane_row = qsa.heads_kv * qsa.head_dim * std::mem::size_of::<f32>();
+            let (start, len) = (pos * plane_row, m * plane_row);
+            self.ctx.attn_prep_rows(
+                self.stream,
+                AttnPrepRowsCall {
+                    shape,
+                    rope,
+                    admit_pos: pos,
+                    proj: row,
+                    q_norm,
+                    k_norm,
+                    k_rows: k_cache.buffer().range(k_cache.offset() + start, len)?,
+                    v_rows: v_cache.buffer().range(v_cache.offset() + start, len)?,
+                    q,
+                    pos: self.pos_word()?,
+                    status: self.status_word()?,
                 },
-                rope: RopeParams {
-                    eps: dims.eps,
-                    rope_base: dims.theta,
+            )?;
+        } else {
+            self.ctx.attn_prep(
+                self.stream,
+                AttnPrepCall {
+                    shape,
+                    rope,
+                    admit_pos: pos,
+                    proj: row,
+                    q_norm,
+                    k_norm,
+                    k_cache,
+                    v_cache,
+                    q,
+                    pos: self.pos_word()?,
+                    status: self.status_word()?,
                 },
-                admit_pos: pos,
-                proj: row,
-                q_norm: self.float(&at("self_attn.q_norm.weight"))?,
-                k_norm: self.float(&at("self_attn.k_norm.weight"))?,
-                k_cache,
-                v_cache,
-                q,
-                pos: self.pos_word()?,
-                status: self.status_word()?,
-            },
-        )?;
+            )?;
+        }
 
         let indexer = QsaIndexer {
             heads: qsa.idx_heads,
@@ -359,31 +387,33 @@ impl FlashStep<'_> {
             },
         )?;
         let core = self.slot(Slot::AttnCore)?;
-        self.ctx.qsa_attn(
-            self.stream,
-            QsaAttnCall {
-                shape: QsaAttnShape {
-                    m,
-                    n_head: qsa.heads_q,
-                    n_kv_head: qsa.heads_kv,
-                    rows: positions,
-                    ratio: qsa.ratio,
-                    budget_blocks,
-                    max_splits: self.options.qsa_splits,
-                },
-                ld,
-                scale: 1.0 / (qsa.head_dim as f32).sqrt(),
-                position: position()?,
-                q,
-                proj: row,
-                k_cache,
-                v_cache,
-                chosen,
-                part: self.slot(Slot::AttnPart)?,
-                out: core,
-                status: Some(self.status_word()?),
+        let attend = QsaAttnCall {
+            shape: QsaAttnShape {
+                m,
+                n_head: qsa.heads_q,
+                n_kv_head: qsa.heads_kv,
+                rows: positions,
+                ratio: qsa.ratio,
+                budget_blocks,
+                max_splits: self.options.qsa_splits,
             },
-        )?;
+            ld,
+            scale: 1.0 / (qsa.head_dim as f32).sqrt(),
+            position: position()?,
+            q,
+            proj: row,
+            k_cache,
+            v_cache,
+            chosen,
+            part: self.slot(Slot::AttnPart)?,
+            out: core,
+            status: Some(self.status_word()?),
+        };
+        if self.qsa_cache_f32 {
+            self.ctx.qsa_attn_exact(self.stream, attend)
+        } else {
+            self.ctx.qsa_attn(self.stream, attend)
+        }?;
         self.project(
             &at("self_attn.o_proj"),
             core,

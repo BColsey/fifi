@@ -140,7 +140,14 @@ impl ProbeBudget {
             .ok_or_else(|| bad("slots overflow"))?;
         let routed = routed_budget(model, 0..layers, slots)?;
         let geometry = FlashGeometry::new(&shape, model.config().kinds())?;
-        let state = StatePlan::new(&geometry, positions, KvFormat::F16)?;
+        // The QSA caches as the step this budget admits stores them (`GgufStep::new` reads the
+        // setting): with f32 caches the state arena is larger.
+        let state = StatePlan::with_qsa_cache(
+            &geometry,
+            positions,
+            KvFormat::F16,
+            super::super::super::step::gguf_qsa_cache_storage()?,
+        )?;
         let step = StepPlan::gguf_decode(
             &geometry,
             positions,
