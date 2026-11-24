@@ -443,7 +443,8 @@ fn card_trunk_matches_the_cpu_reference() {
 /// fresh card prefills rows 0..=N for each of those five N and its row stands against the
 /// reference row at N. With `SENSENOVA_PROBE_CARD_ONLY` set no CPU step runs: the rows come
 /// from that directory, so the prefill runs on the default route in one process and on
-/// `FIFI_SENSENOVA_PREFILL_GEMM=dq` in the next. The decode step follows
+/// `FIFI_SENSENOVA_PREFILL_GEMM=dq` in the next. Given the directory, each prefill row is
+/// saved there as `prefill-<route>-<n>.bin`. The decode step follows
 /// `FIFI_SENSENOVA_DECODE_GEMM`: by default every projection in it, the head included, takes
 /// the q8_1 row and the matvec. Nothing is asserted beyond the shapes.
 #[test]
@@ -472,6 +473,9 @@ fn card_position_probe() {
             argmax(reference),
             argmax(row)
         );
+        if !rows_dir.is_empty() {
+            save_rows(&rows_dir, &format!("prefill-{route}-{n}"), &[row]);
+        }
     }
 }
 
