@@ -1341,7 +1341,7 @@ fn reference_k(
 
 /// Q4_K and Q6_K through the geometry-parameterised entry, against the oracle, with the
 /// activations as f16 and as the f32 rows a prefill hands over (the kernel rounds those to the
-/// same f16, so one reference serves both).
+/// same f16, so one reference serves both). One column is the decode step's row.
 #[test]
 fn gemm_dq_q4k_q6k_match_the_cpu_dequant_matmul() {
     if !testkit::device_present("gemm_dq_q4k_q6k_match_the_cpu_dequant_matmul") {
@@ -1352,7 +1352,12 @@ fn gemm_dq_q4k_q6k_match_the_cpu_dequant_matmul() {
     let mut max_ratio = 0.0f64;
     for (ty, tag, seed) in [(Q4K, "q4k", 0x4b4b_0001u64), (Q6K, "q6k", 0x6b6b_0001u64)] {
         for x_f32 in [false, true] {
-            for (rows, k, ncols) in [(64usize, 512usize, 64usize), (100, 1024, 40), (13, 256, 7)] {
+            for (rows, k, ncols) in [
+                (64usize, 512usize, 64usize),
+                (100, 1024, 40),
+                (13, 256, 7),
+                (100, 1024, 1),
+            ] {
                 let w_bytes = build_weight_k(ty, rows, k, seed);
                 let mut rng = testkit::Rng::new(seed ^ 0xa5a5);
                 let x: Vec<u16> = (0..k * ncols)
