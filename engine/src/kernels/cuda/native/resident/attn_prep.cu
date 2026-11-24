@@ -28,7 +28,8 @@ bool valid_pointers(const inference_cuda_attn_prep_args *a) {
            a->v_cache != NULL && a->q != NULL && a->pos != NULL && a->status != NULL && aligned_to(a->proj, 4) &&
            aligned_to(a->q_norm, 4) && aligned_to(a->k_norm, 4) && aligned_to(a->pos, 4) &&
            aligned_to(a->status, 4) &&
-           aligned_to(a->q, 16) && aligned_to(a->k_cache, 16) && aligned_to(a->v_cache, 16);
+           aligned_to(a->q, 16) && aligned_to(a->k_cache, 16) && aligned_to(a->v_cache, 16) &&
+           (a->inv_freq == NULL || aligned_to(a->inv_freq, 4));
 }
 
 /* The configurations the vendored kernel does not support (the Mellum ones) are refused here. */
@@ -112,7 +113,8 @@ bool valid_attn_prep_rows(const inference_cuda_attn_prep_rows_args *a) {
                           a->status != NULL && aligned_to(a->proj, 4) && aligned_to(a->q_norm, 4) &&
                           aligned_to(a->k_norm, 4) && aligned_to(a->pos, 4) &&
                           aligned_to(a->status, 4) && aligned_to(a->q, 16) &&
-                          aligned_to(a->k_rows, 16) && aligned_to(a->v_rows, 16);
+                          aligned_to(a->k_rows, 16) && aligned_to(a->v_rows, 16) &&
+                          (a->inv_freq == NULL || aligned_to(a->inv_freq, 4));
     const bool config = a->head_dim == kHead && a->has_gate == 1 &&
                         a->slot_mode == INFERENCE_CUDA_SLOT_POSITION && a->slot_ring == 0;
     const bool heads = a->n_head >= 1 && a->n_head <= kMaxHeads && a->n_kv_head >= 1 &&

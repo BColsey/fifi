@@ -275,9 +275,9 @@ fn check_fit(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
 }
 
 /// Disjointness of the touched extents: the four written ranges (`q`, both caches, `status`)
-/// pairwise (6 pairs) and each against the four read ranges (16 pairs). The read ranges may
-/// overlap each other. The claims on `pos` and `status` are their 4 bytes, not the whole
-/// `StepParams` block.
+/// pairwise (6 pairs), each against the four read ranges (16 pairs) and, when given, against
+/// the rope table (4 pairs). The read ranges may overlap each other. The claims on `pos` and
+/// `status` are their 4 bytes, not the whole `StepParams` block.
 fn check_apart(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
     let shape = &call.shape;
     let row_w = row_width(shape.n_head, shape.n_kv_head);
@@ -297,6 +297,12 @@ fn check_apart(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
     for (i, claim) in written.iter().enumerate() {
         for other in written[i + 1..].iter().chain(read.iter()) {
             require_apart(claim, other)?;
+        }
+    }
+    if let Some(inv_freq) = &call.inv_freq {
+        let table = Claim::of("inv_freq", inv_freq, shape.n_rot / 2 * 4);
+        for claim in &written {
+            require_apart(claim, &table)?;
         }
     }
     Ok(())
@@ -423,6 +429,12 @@ fn check_rows_apart(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
     for (i, claim) in written.iter().enumerate() {
         for other in written[i + 1..].iter().chain(read.iter()) {
             require_apart(claim, other)?;
+        }
+    }
+    if let Some(inv_freq) = &call.inv_freq {
+        let table = Claim::of("inv_freq", inv_freq, shape.n_rot / 2 * 4);
+        for claim in &written {
+            require_apart(claim, &table)?;
         }
     }
     Ok(())

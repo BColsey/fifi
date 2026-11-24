@@ -210,8 +210,8 @@ fn data(s: &AttnPrepShape, seed: u64, scale: f64) -> Data {
 
 /// One range of a call: buffer index, byte offset, bytes.
 type Slot = (usize, usize, usize);
-const NAMES: [&str; 8] = [
-    "proj", "q_norm", "k_norm", "q", "k_cache", "v_cache", "pos", "status",
+const NAMES: [&str; 9] = [
+    "proj", "q_norm", "k_norm", "q", "k_cache", "v_cache", "pos", "status", "inv_freq",
 ];
 const PROJ: usize = 0;
 const QN: usize = 1;
@@ -221,6 +221,8 @@ const KC: usize = 4;
 const VC: usize = 5;
 const POS: usize = 6;
 const STATUS: usize = 7;
+/// The optional rope table: buffer 8, absent while its bytes are 0.
+const INV: usize = 8;
 const Q_BUF: usize = 3;
 const KC_BUF: usize = 4;
 const PARAMS_BUF: usize = 6;
@@ -246,8 +248,8 @@ impl Cfg {
 struct Fx {
     rig: Rig,
     bufs: Vec<DeviceBuffer>,
-    slots: [Slot; 8],
-    base: [Slot; 8],
+    slots: [Slot; 9],
+    base: [Slot; 9],
     shape: AttnPrepShape,
     rope: RopeParams,
     admit: usize,
@@ -294,7 +296,7 @@ impl Fx {
         ];
         let off = CANARY_ROWS * row_bytes;
         let proj = proj_bytes(s.m, s.ld, row_width(s.n_head, s.n_kv_head));
-        let slots = [(0, 0, proj), (1, 0, D * 4), (2, 0, D * 4), (3, 0, q_len), (4, off, cache), (5, off, cache), (PARAMS_BUF, OFFSET_POS, 4), (PARAMS_BUF, OFFSET_STATUS, 4)];
+        let slots = [(0, 0, proj), (1, 0, D * 4), (2, 0, D * 4), (3, 0, q_len), (4, off, cache), (5, off, cache), (PARAMS_BUF, OFFSET_POS, 4), (PARAMS_BUF, OFFSET_STATUS, 4), (8, 0, 0)];
         let rope = RopeParams { eps: EPS, rope_base: BASE };
         Self { rig, bufs, slots, base: slots, shape: s, rope, admit: usize::try_from(cfg.word).unwrap_or(0), data }
     }
@@ -323,7 +325,7 @@ impl Fx {
             q: r(Q)?,
             pos: r(POS)?,
             status: r(STATUS)?,
-            inv_freq: None,
+            inv_freq: (self.slots[INV].2 != 0).then(|| r(INV)).transpose()?,
         };
         self.rig.ctx.attn_prep(stream, call)
     }
@@ -672,7 +674,7 @@ fn fit_rows() -> Vec<Row> {
 
 fn overlap_rows() -> Vec<Row> {
     let written = [Q, KC, VC, STATUS];
-    let read = [PROJ, QN, KN, POS];
+    let read = [PROJ, QN, KN, POS, INV];
     let mut rows = Vec::new();
     for (i, &w) in written.iter().enumerate() {
         for &o in written[i + 1..].iter().chain(&read) {
@@ -689,7 +691,12 @@ fn overlap_rows() -> Vec<Row> {
                     } else {
                         target.1
                     };
-                    fx.slots[o] = (target.0, aligned, fx.base[o].2);
+                    let need = if o == INV {
+                        fx.shape.n_rot / 2 * 4
+                    } else {
+                        fx.base[o].2
+                    };
+                    fx.slots[o] = (target.0, aligned, need);
                 },
             ));
         }
@@ -712,7 +719,7 @@ fn attn_prep_rejects_bad_arguments_before_any_launch() {
     let mut rows = shape_rows();
     rows.extend(fit_rows());
     rows.extend(overlap_rows());
-    assert_eq!(rows.len(), 83);
+    assert_eq!(rows.len(), 87);
     let saved = (fx.slots, fx.shape, fx.rope, fx.admit);
     for (label, text, edit) in &rows {
         edit(&mut fx);
@@ -741,6 +748,11 @@ fn attn_prep_rejects_bad_arguments_before_any_launch() {
     }
     assert!(before == (fx.bytes(PARAMS_BUF), fx.bytes(KC_BUF)));
     fx.run().expect("a good call after the refusals");
+    // A table apart from every written range is admitted (its zero words give the angle 0).
+    fx.slots[INV] = (8, 16, fx.shape.n_rot / 2 * 4);
+    fx.run()
+        .expect("a rope table apart from the written ranges");
+    fx.slots[INV] = fx.base[INV];
     controls(&mut fx);
 }
 
@@ -989,8 +1001,8 @@ const VC_FP16: usize = 10;
 struct RowsFx {
     rig: Rig,
     bufs: Vec<DeviceBuffer>,
-    slots: [Slot; 8],
-    base: [Slot; 8],
+    slots: [Slot; 9],
+    base: [Slot; 9],
     shape: AttnPrepShape,
     rope: RopeParams,
     admit: usize,
@@ -1029,7 +1041,7 @@ impl RowsFx {
             testkit::upload_bytes(ctx, &cache_buf),
         ];
         let proj = proj_bytes(m, shape.ld, row_width(shape.n_head, shape.n_kv_head));
-        let slots = [(0, 0, proj), (1, 0, D * 4), (2, 0, D * 4), (3, 0, q_len), (4, 0, rows_len), (5, 0, rows_len), (PARAMS_BUF, OFFSET_POS, 4), (PARAMS_BUF, OFFSET_STATUS, 4)];
+        let slots = [(0, 0, proj), (1, 0, D * 4), (2, 0, D * 4), (3, 0, q_len), (4, 0, rows_len), (5, 0, rows_len), (PARAMS_BUF, OFFSET_POS, 4), (PARAMS_BUF, OFFSET_STATUS, 4), (8, 0, 0)];
         Self { rig, bufs, slots, base: slots, shape, rope: RopeParams { eps: EPS, rope_base: BASE }, admit: usize::try_from(word).unwrap_or(0), data }
     }
 
@@ -1057,7 +1069,7 @@ impl RowsFx {
                 q: r(Q)?,
                 pos: r(POS)?,
                 status: r(STATUS)?,
-                inv_freq: None,
+                inv_freq: (self.slots[INV].2 != 0).then(|| r(INV)).transpose()?,
             },
         )
     }
@@ -1368,6 +1380,16 @@ fn rows_c_phase(mut fx: RowsFx) -> Result<RowsCOut, EngError> {
                 fx.slots[VR] = (8, 0, fx.base[VR].2);
             },
         ),
+        ("inv_freq inside q", "q and inv_freq ranges overlap", |fx| {
+            fx.slots[INV] = (fx.base[Q].0, fx.base[Q].1, fx.shape.n_rot / 2 * 4);
+        }),
+        (
+            "inv_freq over status",
+            "status and inv_freq ranges overlap",
+            |fx| {
+                fx.slots[INV] = (fx.base[STATUS].0, fx.base[STATUS].1, fx.shape.n_rot / 2 * 4);
+            },
+        ),
     ] {
         rows.push((label, text, edit));
     }
@@ -1380,6 +1402,9 @@ fn rows_c_phase(mut fx: RowsFx) -> Result<RowsCOut, EngError> {
     }
     let after = (fx.pull(PARAMS_BUF)?, fx.pull(KR)?);
     fx.run_rows()?;
+    fx.slots[INV] = (8, 16, fx.shape.n_rot / 2 * 4);
+    fx.run_rows()?;
+    fx.slots[INV] = fx.base[INV];
     Ok(RowsCOut {
         before,
         after,
