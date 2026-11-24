@@ -536,15 +536,21 @@ struct Data {
 }
 
 fn data(m: usize, rows: usize, seed: u64, qsd: f64, csd: f64) -> Data {
+    data_for(2, m, rows, seed, qsd, csd)
+}
+
+/// [`data`] for a cache of `kv_heads` kv heads per row.
+fn data_for(kv_heads: usize, m: usize, rows: usize, seed: u64, qsd: f64, csd: f64) -> Data {
     let mut rng = Rng::new(seed);
     let q = (0..m * 16 * D)
         .map(|_| (rng.normal() * qsd) as f32)
         .collect();
-    // Each plane holds rows * n_kv_head * D halves: the [rows][n_kv_head][D] cache layout.
-    let kv: Vec<u16> = (0..2 * rows * 2 * D)
+    // Each plane holds rows * kv_heads * D halves: the [rows][kv_heads][D] cache layout.
+    let plane = rows * kv_heads * D;
+    let kv: Vec<u16> = (0..2 * plane)
         .map(|_| f16_bits((rng.normal() * csd) as f32))
         .collect();
-    let (k, v) = kv.split_at(rows * 2 * D);
+    let (k, v) = kv.split_at(plane);
     let ld = 16 * 2 * D;
     let proj = (0..m * ld).map(|_| (rng.normal() * 0.4) as f32).collect();
     Data {
@@ -1324,12 +1330,25 @@ fn ref_row_in(
     keys: Range<usize>,
     scale: f64,
 ) -> Vec<f64> {
+    ref_row_kv(2, q_row, k, v, kvh, keys, scale)
+}
+
+/// [`ref_row_in`] over a cache of `kv_heads` kv heads per row.
+fn ref_row_kv(
+    kv_heads: usize,
+    q_row: &[f32],
+    k: &[u16],
+    v: &[u16],
+    kvh: usize,
+    keys: Range<usize>,
+    scale: f64,
+) -> Vec<f64> {
     let q_hat: Vec<f64> = q_row
         .iter()
         .map(|&x| f64::from(f16_to_f32(f16_bits(x))))
         .collect();
-    let kf = |j: usize, d: usize| f64::from(f16_to_f32(k[(j * 2 + kvh) * D + d]));
-    let vf = |j: usize, d: usize| f64::from(f16_to_f32(v[(j * 2 + kvh) * D + d]));
+    let kf = |j: usize, d: usize| f64::from(f16_to_f32(k[(j * kv_heads + kvh) * D + d]));
+    let vf = |j: usize, d: usize| f64::from(f16_to_f32(v[(j * kv_heads + kvh) * D + d]));
     let scores: Vec<f64> = keys
         .clone()
         .map(|j| scale * (0..D).map(|d| q_hat[d] * kf(j, d)).sum::<f64>())
@@ -1517,22 +1536,24 @@ fn attn_prefill_matches_one_row_attn_decode_on_the_same_cache() {
 ///
 /// A debug build checks the 3,968-key case on every 8th row plus the last (the f64
 /// reference is too slow unoptimized for every row in one hold); release checks every row.
-#[test]
-fn attn_prefill_matches_the_f64_host_reference() {
-    if !testkit::device_present("attn_prefill_matches_the_f64_host_reference") {
-        return;
-    }
+/// Test 7 at one geometry: `shape_of` builds the chunk shape and `kv_heads` counts the kv
+/// heads of its cache (16 query heads at both geometries).
+fn check_matches_the_f64_host_reference(
+    shape_of: impl Fn(usize, usize, i64) -> AttnPrefillShape,
+    kv_heads: usize,
+) {
+    let group = 16 / kv_heads;
     let phase = |p0: i64,
                  m: usize,
                  seed: u64,
                  late_score: bool|
      -> Result<(Vec<f32>, Data, f64), EngError> {
-        let shape = qwen(m, p0 as usize + m, p0);
+        let shape = shape_of(m, p0 as usize + m, p0);
         let split = CpfAttnSplit {
             max_splits: 4,
             min_keys: 32,
         };
-        let mut data = data(shape.m, shape.cache_rows, seed, 0.2, 0.4);
+        let mut data = data_for(kv_heads, shape.m, shape.cache_rows, seed, 0.2, 0.4);
         if late_score {
             // The row of token m - 1, head 5, gets its OWN last key (position p0 + m - 1,
             // visible to no other row) aligned with its q̂: a much larger score than the
@@ -1540,7 +1561,8 @@ fn attn_prefill_matches_the_f64_host_reference() {
             let t = m - 1;
             let qh = &data.q[(t * 16 + 5) * D..][..D];
             for (d, &value) in qh.iter().enumerate() {
-                data.k[((p0 as usize + m - 1) * 2) * D + d] = f16_bits(value * 3.0);
+                data.k[((p0 as usize + m - 1) * kv_heads + 5 / group) * D + d] =
+                    f16_bits(value * 3.0);
             }
         }
         let fx = Fx::with_data(shape, split, false, false, &data)?;
@@ -1571,12 +1593,13 @@ fn attn_prefill_matches_the_f64_host_reference() {
         };
         for t in (0..m).filter(|&t| t % stride == 0 || t == m - 1) {
             for h in 0..16 {
-                let reference = ref_row(
+                let reference = ref_row_kv(
+                    kv_heads,
                     &data.q[(t * 16 + h) * D..][..D],
                     &data.k,
                     &data.v,
-                    h / GROUP,
-                    p0 as usize + t + 1,
+                    h / group,
+                    0..(p0 as usize + t + 1),
                     f64::from(SCALE),
                 );
                 for d in 0..D {
@@ -1604,6 +1627,16 @@ fn attn_prefill_matches_the_f64_host_reference() {
         );
     }
 }
+
+#[test]
+fn attn_prefill_matches_the_f64_host_reference() {
+    if !testkit::device_present("attn_prefill_matches_the_f64_host_reference") {
+        return;
+    }
+    check_matches_the_f64_host_reference(qwen, 2);
+}
+
+mod group4;
 
 /// A typed part launch must arm the current device even after the same
 /// geometry has already been used on another device in this process.
