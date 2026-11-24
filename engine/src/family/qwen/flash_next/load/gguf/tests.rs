@@ -700,21 +700,26 @@ fn real_gguf_expert_stacks_stage_byte_exact_from_file_and_pinned_memory() {
     assert!(model.weights.is_split(), "a split checkpoint is required");
     assert!(device_present("real Flash-Next stacks"), "CUDA is required");
     let experts = model.config().dims.experts as usize;
+    let roles = [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown];
     let layer = (0..model.config().layers())
         .find(|&layer| {
-            model
-                .map()
-                .get(Wanted::ExpertGate, Some(layer))
-                .is_some_and(|s| s.shard != 0)
+            roles.iter().all(|&role| {
+                model
+                    .map()
+                    .get(role, Some(layer))
+                    .is_some_and(|stack| stack.shard != 0)
+            })
         })
-        .expect("an expert gate stack outside the first shard");
-    let stacks = [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown].map(|role| {
+        .expect("a layer with all three expert stacks outside the first shard");
+    let stacks = roles.map(|role| {
         let mapped = model.map().get(role, Some(layer)).expect("expert stack");
-        model
+        let tensor = model
             .weights
             .header()
             .tensor(&mapped.name)
-            .expect("GGUF tensor")
+            .expect("GGUF tensor");
+        assert_eq!(tensor.shard(), mapped.shard, "{}", mapped.name);
+        tensor
     });
     let total = stacks.iter().map(|tensor| tensor.byte_len()).sum::<u64>();
     assert!(total <= 2 * GIB, "staging exceeds the 2 GiB test budget");
