@@ -1,8 +1,7 @@
-//! Tests of the PLE block launches against the host reference (`family::math` and the
-//! dequantizer of `weights`). Device runs need a card; without one each test returns.
+//! Tests of the PLE block launches against host arithmetic and the GGUF dequantizer.
+//! Device runs need a card; without one each test returns.
 
 use super::*;
-use crate::family::math::{dot, rms0, silu};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, testkit};
 use crate::weights::{GgufType, dequantize};
 
@@ -68,6 +67,17 @@ fn the_rows_decode_like_the_host_dequantizer() {
     }
 }
 
+fn zero_centered_rms_ref(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    assert!(!x.is_empty());
+    assert_eq!(x.len(), weight.len());
+    let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let denom = (mean + eps).sqrt();
+    x.iter()
+        .zip(weight)
+        .map(|(v, w)| v * (1.0 + w) / denom)
+        .collect()
+}
+
 #[test]
 fn the_gate_follows_the_host_step() {
     if !testkit::device_present("ple gate") {
@@ -87,15 +97,16 @@ fn the_gate_follows_the_host_step() {
     let (mut gated, mut normed) = (vec![0f32; width], vec![0f32; width]);
     for b in 0..branches {
         let (lo, hi) = (b * hidden, (b + 1) * hidden);
-        let kn = rms0(&keys[lo..hi], &nk[lo..hi], eps).unwrap();
-        let qn = rms0(&hyper[lo..hi], &nq[lo..hi], eps).unwrap();
-        let d = f64::from(dot(&kn, &qn).unwrap() / (hidden as f32).sqrt());
+        let kn = zero_centered_rms_ref(&keys[lo..hi], &nk[lo..hi], eps);
+        let qn = zero_centered_rms_ref(&hyper[lo..hi], &nq[lo..hi], eps);
+        let dot = kn.iter().zip(&qn).map(|(k, q)| k * q).sum::<f32>();
+        let d = f64::from(dot / (hidden as f32).sqrt());
         let shaped = d.abs().max(1e-6).sqrt().copysign(d);
         let g = (1.0 / (1.0 + (-shaped).exp())) as f32;
         for (out, v) in gated[lo..hi].iter_mut().zip(&value) {
             *out = g * v;
         }
-        normed[lo..hi].copy_from_slice(&rms0(&gated[lo..hi], &nc[lo..hi], eps).unwrap());
+        normed[lo..hi].copy_from_slice(&zero_centered_rms_ref(&gated[lo..hi], &nc[lo..hi], eps));
     }
     let up = |v: &[f32]| testkit::upload_f32(&ctx, v);
     let (keys_d, hyper_d, value_d) = (up(&keys), up(&hyper), up(&value));
@@ -165,7 +176,8 @@ fn the_convolution_and_its_ring_follow_the_host_over_three_tokens() {
             for (k, w) in kernel[..taps].iter().enumerate() {
                 a += w * slot[k * ngram];
             }
-            want[c] = gated[c] + silu(a);
+            let sigmoid = 1.0 / (1.0 + (-a).exp());
+            want[c] = gated[c] + a * sigmoid;
             slot.copy_within(1.., 0);
             slot[stride - 1] = normed[c];
         }
