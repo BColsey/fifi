@@ -1,16 +1,17 @@
 // IQ3_XXS: gather each four-level dictionary word once, not once per
 // activation. A lane dots two code words against two contiguous float4s.
-__global__ void decode_iq3_words(inference_cuda_dense_gemv_args a) {
+template<bool OneRow>
+__device__ __forceinline__ void decode_iq3_rows(inference_cuda_dense_gemv_args a,int block) {
     __shared__ unsigned table[256];
     __shared__ float part[2][3];
     for (int i=threadIdx.x; i<256; i+=blockDim.x) table[i]=iq3xxs_grid[i];
     __syncthreads();
-    int warp=threadIdx.x/32, lane=threadIdx.x%32, row=2*blockIdx.x+warp/3;
+    int warp=threadIdx.x/32, lane=threadIdx.x%32, row=OneRow ? block : 2*block+warp/3;
     auto *w=static_cast<const uint8_t *>(a.w)+size_t(row)*9*98;
     auto *x=static_cast<const float4 *>(a.x)+2*lane;
     float acc=0;
 #pragma unroll
-    for(int k=warp%3;k<9;k+=3) {
+    for(int k=warp%3;k<9 && (!OneRow || warp<3);k+=3) {
         auto *b=w+k*98;
         auto tag=kw_read32(b+66+4*(lane/4));
         unsigned signs=(tag>>(7*(lane%4)))&127;
@@ -32,7 +33,11 @@ __global__ void decode_iq3_words(inference_cuda_dense_gemv_args a) {
     acc=warp_sum(acc);
     if(!lane) part[warp/3][warp%3]=acc;
     __syncthreads();
-    if(warp%3==0 && !lane) {
+    if(warp%3==0 && !lane && (!OneRow || !warp)) {
         auto *p=part[warp/3]; static_cast<float *>(a.y)[row]=(p[0]+p[1])+p[2];
     }
+}
+
+__global__ void decode_iq3_words(inference_cuda_dense_gemv_args a) {
+    decode_iq3_rows<false>(a,blockIdx.x);
 }

@@ -304,6 +304,7 @@ bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelect
 
 #include "resident/inkling_decode_weights.cuh"
 #include "resident/inkling_decode_control_pair.cuh"
+#include "resident/inkling_decode_attention_group.cuh"
 #include "resident/inkling_gate_dot.cuh"
 #include "resident/inkling_q2_down.cuh"
 
@@ -687,6 +688,40 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_decode_attention_group(const inference_cuda_dense_gemv_args *calls,
+        int count, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!calls || (count != 6 && count != 8)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        DecodeAttentionGroup group{};
+        int blocks=0;
+        for (int i=0;i<count;++i) {
+            const auto &a=calls[i];
+            int n=decode_attention_blocks(a);
+            if (!n || !valid(a,stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            group.calls[i]=a;
+            group.limits[i]=blocks+=n;
+        }
+        for (int i=count;i<8;++i) group.limits[i]=blocks;
+        for (int i=0;i<count;++i) {
+            Span dst={calls[i].y,size_t(calls[i].rows)*4};
+            for (int j=0;j<count;++j) if (j!=i) {
+                const auto &b=calls[j];
+                if (!apart(dst,{b.y,size_t(b.rows)*4}) || !apart(dst,{b.x,2304*4}) ||
+                    !apart(dst,{b.w,size_t(b.rows)*weight_row_bytes(b.weight_dtype,2304)}))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
+        Failure f;
+        decode_attention_group<<<blocks,128,0,(cudaStream_t)stream>>>(group);
+        f.record(cudaGetLastError(),INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage,f.stage);
+        return (int)f.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }

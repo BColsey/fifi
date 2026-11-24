@@ -15,7 +15,7 @@ pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, 
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
     dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_q8_row_reuse_launch, gguf_wmma_launch,
-    try_control_pair, typed_gemv_need, typed_wmma_need,
+    try_attention_group, try_control_pair, typed_gemv_need, typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 use crate::weights::GgufType;
@@ -254,6 +254,15 @@ impl CudaContext {
             let mut counts = DenseGemvGroupCounts::default();
             let pair = std::env::var_os("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref()
                 == Some(std::ffi::OsStr::new("1"));
+            if pair
+                && matches!(planned.len(), 6 | 8)
+                && planned
+                    .iter()
+                    .all(|(kernel, _)| *kernel == GroupKernel::Gemv)
+                && try_attention_group(raw_stream, planned.iter().map(|(_, p)| p))?
+            {
+                return Ok(counts);
+            }
             let mut planned = planned.into_iter().peekable();
             while let Some((kernel, call)) = planned.next() {
                 if pair

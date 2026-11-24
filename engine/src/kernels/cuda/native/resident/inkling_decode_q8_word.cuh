@@ -1,10 +1,10 @@
 // Two K warps per row and two independent output rows per CTA amortize
 // the reduction and coalesce eight-sample chunks of Q8_0 blocks.
 template<int Cols>
-__global__ void decode_q8_word(inference_cuda_dense_gemv_args a) {
+__device__ __forceinline__ void decode_q8_rows(inference_cuda_dense_gemv_args a,int block) {
     constexpr int Kw=2;
     __shared__ float part[2][Kw];
-    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=2*blockIdx.x+warp/Kw;
+    int warp=threadIdx.x/32,lane=threadIdx.x%32,row=2*block+warp/Kw;
     auto *w=static_cast<const uint8_t *>(a.w)+size_t(row)*(Cols/32)*34;
     auto *x=static_cast<const float4 *>(a.x);
     float acc=0;
@@ -32,4 +32,9 @@ __global__ void decode_q8_word(inference_cuda_dense_gemv_args a) {
         for(int i=1;i<Kw;i++) s+=part[warp/Kw][i];
         static_cast<float *>(a.y)[row]=s;
     }
+}
+
+template<int Cols>
+__global__ void decode_q8_word(inference_cuda_dense_gemv_args a) {
+    decode_q8_rows<Cols>(a,blockIdx.x);
 }

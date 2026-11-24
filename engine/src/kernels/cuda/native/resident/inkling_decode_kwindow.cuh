@@ -5,16 +5,16 @@ __device__ __forceinline__ unsigned kw_read32(const uint8_t *p) {
     return unsigned(v[0]) | (unsigned(v[1]) << 16);
 }
 
-template<int Type, int Bytes, int Cols, int Kw>
-__global__ void decode_kwindow(inference_cuda_dense_gemv_args a) {
+template<int Type, int Bytes, int Cols, int Kw, bool OneRow=false>
+__device__ __forceinline__ void decode_kw_rows(inference_cuda_dense_gemv_args a,int block) {
     __shared__ float part[2][Kw];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int row = 2*blockIdx.x + warp/Kw, win = lane/4, c = 8*(lane%4);
+    const int row = OneRow ? block : 2*block + warp/Kw, win = lane/4, c = 8*(lane%4);
     const auto *w = static_cast<const uint8_t *>(a.w) + size_t(row)*(Cols/256)*Bytes;
     const auto *x = static_cast<const float4 *>(a.x) + 2*lane;
     float acc = 0;
 #pragma unroll
-    for (int k = warp%Kw; k < Cols/256; k += Kw) {
+    for (int k = warp%Kw; k < Cols/256 && (!OneRow || warp<Kw); k += Kw) {
         const auto *b = w + k*Bytes;
         unsigned codes[2];
         float scale, minimum;
@@ -60,12 +60,17 @@ __global__ void decode_kwindow(inference_cuda_dense_gemv_args a) {
     acc=warp_sum(acc);
     if(!lane) part[warp/Kw][warp%Kw]=acc;
     __syncthreads();
-    if(warp%Kw==0 && !lane) {
+    if(warp%Kw==0 && !lane && (!OneRow || !warp)) {
         auto *p=part[warp/Kw];
         float s=p[0]+p[1];
         if constexpr (Kw==3) s+=p[2];
         static_cast<float *>(a.y)[row]=s;
     }
+}
+
+template<int Type, int Bytes, int Cols, int Kw>
+__global__ void decode_kwindow(inference_cuda_dense_gemv_args a) {
+    decode_kw_rows<Type,Bytes,Cols,Kw>(a,blockIdx.x);
 }
 
 template<int Type, int Bytes>

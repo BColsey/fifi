@@ -44,6 +44,10 @@ typedef struct inference_cuda_dense_gemv_args {
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
 
+/* Internal independent single-row Inkling attention projections (6 or 8). */
+int inference_cuda_decode_attention_group(const inference_cuda_dense_gemv_args *calls,
+                                          int count, void *stream, int *out_stage);
+
 /* Internal opt-in paired controller projections. Independent F32 matrices and
  * disjoint outputs, both M=1, K=64, N=2304, sharing the same input. */
 int inference_cuda_decode_control_pair(const inference_cuda_dense_gemv_args *a,
