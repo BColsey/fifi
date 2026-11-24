@@ -109,7 +109,7 @@ void launch_decode_gate(const GateDigits *packed, const uint8_t *gate, float *ou
                         DeviceSelectedWeights index, cudaStream_t stream) {
     const dim3 grid(2304 / 16, 8);
     if constexpr (Type == 19) decode_gate_pair<Type, Bytes><<<grid,256,0,stream>>>(packed,gate,out,index);
-    else decode_gate_cached<Type, Bytes><<<grid,256,0,stream>>>(packed,gate,out,index);
+    else decode_gate_cached<Type, Bytes><<<dim3(48,8),256,0,stream>>>(packed,gate,out,index);
 }
 
 bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
