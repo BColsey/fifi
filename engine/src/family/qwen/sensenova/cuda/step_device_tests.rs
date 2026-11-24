@@ -18,17 +18,26 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::super::step::LoopState;
-use super::super::weights::LoopWeights;
+use super::super::weights::{Layer, LoopWeights, Mixer};
 use super::step::{Carried, LoopStep, bytes_range, floats, le_f32};
 use crate::EngError;
+use crate::family::math::rms_plain;
 use crate::family::project::Projector;
-use crate::family::project::cuda::{BorrowedLoader, CudaWeights, LoadOptions, WeightLayout};
-use crate::family::project::gguf::GgufProjector;
+use crate::family::project::cuda::{
+    BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, WeightLayout,
+};
+use crate::family::project::gguf::{GgufMatrix, GgufProjector};
 use crate::kernels::cuda::prefill::attn_prep_chunk::{
     AttnPrepChunkCall, AttnPrepChunkShape, PrepChunkMode,
 };
+use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
+use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
+use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
+use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_prep::RopeParams;
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, device_present};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, NativeWeight, device_present};
 use crate::weights::{GgufLimits, GgufWeights};
 
 /// The smoke prompt's exact ids (the vendor-oracle run of the CPU lane).
@@ -97,6 +106,25 @@ fn open_rig(what: &str) -> Option<Rig> {
     if !device_present(what) {
         return None;
     }
+    let (file, weights) = open_host()?;
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded = super::load::load(
+        &BorrowedLoader::new(&ctx).unwrap(),
+        &file,
+        weights.plan(),
+        LoadOptions {
+            layout: WeightLayout::Native,
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let projector = weights.projector();
+    Some((ctx, loaded, weights, projector))
+}
+
+/// The released checkpoint's CPU side: the file and the Loop weights over it. `None` (with a
+/// note) when the file is not named here.
+fn open_host() -> Option<(Arc<GgufWeights>, LoopWeights)> {
     let Ok(path) = std::env::var("SENSENOVA_GGUF") else {
         eprintln!("skipped: set SENSENOVA_GGUF to the released Loop-9B GGUF");
         return None;
@@ -113,19 +141,7 @@ fn open_rig(what: &str) -> Option<Rig> {
         .unwrap(),
     );
     let weights = LoopWeights::open(file.clone()).unwrap();
-    let ctx = Rc::new(CudaContext::new().unwrap());
-    let loaded = super::load::load(
-        &BorrowedLoader::new(&ctx).unwrap(),
-        &file,
-        weights.plan(),
-        LoadOptions {
-            layout: WeightLayout::Native,
-            ..LoadOptions::default()
-        },
-    )
-    .unwrap();
-    let projector = weights.projector();
-    Some((ctx, loaded, weights, projector))
+    Some((file, weights))
 }
 
 fn open_card<'a>(
@@ -1257,6 +1273,375 @@ fn card_decode_sweep_columns() {
             gib / (mid * 1e-6),
             mid * 1e-6 * 1e3 / ncols as f64,
             ncols as f64 / (mid * 1e-6),
+        );
+    }
+}
+
+// ---- The q8_1 activation step on the position probe's saved rows ----------------------
+
+/// `v` at binary16 precision, round to nearest with ties to even, as the quantizers keep
+/// their scale; a binary16 subnormal keeps its own spacing.
+fn f16_round(v: f32) -> f32 {
+    if v == 0.0 {
+        return 0.0;
+    }
+    let exponent = v.abs().log2().floor() as i32;
+    let ulp = 2f32.powi(exponent.max(-14) - 10);
+    (v / ulp).round_ties_even() * ulp
+}
+
+/// The activation quantizers' rule, per 32 values: `d = amax / 127` kept in binary16 and
+/// `q = round(x / d)`. Returns the row as a matvec reads it back (`d * q`) and the scales.
+fn cpu_q8_1(row: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let mut back = vec![0.0; row.len()];
+    let mut scales = Vec::with_capacity(row.len() / 32);
+    for (values, out) in row.chunks_exact(32).zip(back.chunks_exact_mut(32)) {
+        let amax = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = f16_round(amax / 127.0);
+        scales.push(d);
+        for (v, o) in values.iter().zip(out) {
+            *o = if d == 0.0 { 0.0 } else { d * (v / d).round() };
+            // shortcut: the bound admits the f32 rounding of `v / d`, about 1e-7 relative
+            debug_assert!(
+                (*o - v).abs() <= 0.501 * d + 4e-6,
+                "the model left the rule's bound"
+            );
+        }
+    }
+    (back, scales)
+}
+
+/// The rows of one file the position probe saved: little-endian f32, `width` to a row.
+fn load_rows(dir: &str, name: &str, width: usize) -> Vec<Vec<f32>> {
+    le_f32_vec(&std::fs::read(format!("{dir}/{name}.bin")).unwrap())
+        .chunks_exact(width)
+        .map(<[f32]>::to_vec)
+        .collect()
+}
+
+/// The projections of `layer` that read the row under the post norm (`ffn`) or under the
+/// mixer's norm: the tensor's name in the block and its CPU weight.
+fn row_projections(layer: &Layer, ffn: bool) -> Vec<(&'static str, &GgufMatrix)> {
+    if ffn {
+        return vec![("ffn_gate", &layer.ffn_gate), ("ffn_up", &layer.ffn_up)];
+    }
+    match &layer.mixer {
+        Mixer::Attn { q, k, v, .. } => vec![("attn_q", q), ("attn_k", k), ("attn_v", v)],
+        Mixer::Delta {
+            qkvz, beta_alpha, ..
+        } => {
+            vec![("attn_qkv_gate", qkvz), ("ssm_beta_alpha", beta_alpha)]
+        }
+    }
+}
+
+fn rms(row: &[f32]) -> f32 {
+    (row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32).sqrt()
+}
+
+/// `b` against `a`: the relative root mean square of the gap and its relative largest value.
+fn relative(a: &[f32], b: &[f32]) -> (f32, f32) {
+    let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    (rms(&diff) / rms(a), max_abs_diff(a, b) / worst_abs(a))
+}
+
+/// The size of the q8_1 activation step on the rows the position probe saved, CPU only: the
+/// projections of the two visits before the departure, over the f32 normed row and over the
+/// same row after the quantizers' rule. The row is the traced residual before the visit; an
+/// mHC visit's routed input is not in the trace. One line per projection.
+#[test]
+fn q8_1_activation_effect_on_the_saved_rows() {
+    let Ok(dir) = std::env::var("SENSENOVA_PROBE_ROWS") else {
+        eprintln!("skipped: set SENSENOVA_PROBE_ROWS to the position probe's saved rows");
+        return;
+    };
+    let Some((_, weights)) = open_host() else {
+        return;
+    };
+    let mut projector = weights.projector();
+    let shape = weights.shape();
+    for pos in [16, 15, 14] {
+        for side in ["card", "ref"] {
+            let trace = load_rows(&dir, &format!("visits-{side}-{pos}"), shape.hidden);
+            for il in [10, 11] {
+                let block = weights.plan().block(weights.plan().physical(il));
+                let layer = &weights.layers()[block];
+                for (ffn, norm) in [(false, &layer.attn_norm), (true, &layer.post_norm)] {
+                    let row = rms_plain(&trace[2 * il + 1], norm, shape.eps).unwrap();
+                    let (stepped, scales) = cpu_q8_1(&row);
+                    let (at, step) = scales
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .unwrap();
+                    eprintln!(
+                        "pos {pos} {side} visit {il:2} {}: max |x| {:6.1}; largest step {:.3} over values {}..{}",
+                        if ffn { "post norm" } else { "mixer norm" },
+                        worst_abs(&row),
+                        step,
+                        32 * at,
+                        32 * at + 32
+                    );
+                    for (name, weight) in row_projections(layer, ffn) {
+                        let exact = projector.linear(weight, &row).unwrap();
+                        let (l2, max) =
+                            relative(&exact, &projector.linear(weight, &stepped).unwrap());
+                        eprintln!(
+                            "  blk.{block}.{name:<16} q8_1 step: relative rms {l2:.4}, largest {max:.4}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The device weight of `name` in the Native layout.
+fn native_weight<'a>(loaded: &'a CudaWeights, name: &str) -> &'a NativeWeight {
+    match loaded.get(name) {
+        Some(CudaWeight::Native { weight, .. }) => weight,
+        _ => panic!("the device load is missing {name} in the Native layout"),
+    }
+}
+
+/// The device copy of the F32 tensor `name`.
+fn raw<'a>(loaded: &'a CudaWeights, name: &str) -> &'a DeviceBuffer {
+    match loaded.get(name) {
+        Some(CudaWeight::Raw { buffer, .. }) => buffer,
+        _ => panic!("the device load is missing {name} as a raw F32 tensor"),
+    }
+}
+
+/// A q8_1 row as the matvec reads it: per 32 values the codes, then the binary16 scale.
+fn dequant_q8_1(bytes: &[u8], k: usize) -> Vec<f32> {
+    bytes[..36 * (k / 32)]
+        .chunks_exact(36)
+        .flat_map(|b| {
+            let d = le_f16_vec(&b[32..34])[0];
+            b[..32].iter().map(move |q| d * (*q as i8) as f32)
+        })
+        .collect()
+}
+
+/// The MMQ pack's rows as the GEMM reads them: per 128 values a 144-byte block holding four
+/// scales first (f32 under a Q6_K weight, binary16 under a Q4_K one) and the codes after.
+fn dequant_mmq(pack: &[u8], k: usize, ncols: usize, q6: bool) -> Vec<Vec<f32>> {
+    (0..ncols)
+        .map(|col| {
+            (0..k / 128)
+                .flat_map(|kb| {
+                    let b = &pack[144 * (kb * ncols + col)..144 * (kb * ncols + col + 1)];
+                    (0..4).flat_map(|sb| {
+                        let d = if q6 {
+                            f32::from_le_bytes(b[4 * sb..4 * sb + 4].try_into().unwrap())
+                        } else {
+                            le_f16_vec(&b[4 * sb..4 * sb + 2])[0]
+                        };
+                        b[16 + 32 * sb..48 + 32 * sb]
+                            .iter()
+                            .map(move |q| d * (*q as i8) as f32)
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// One f32 row as the card quantized it: the normed row and its q8_1 bytes.
+struct CardQ8 {
+    normed: Vec<f32>,
+    bytes: Vec<u8>,
+    /// How many of the row's values the CPU rule reproduces exactly.
+    equal: usize,
+}
+
+/// The card's norm and q8_1 quantize of `row` under `norm`, read back.
+fn card_q8_row(ctx: &CudaContext, row: &[f32], norm: &DeviceBuffer, eps: f32) -> CardQ8 {
+    let h = row.len();
+    let q8_bytes = q8_1_bytes(h, 1).unwrap();
+    let (row_dev, normed_dev, q8) = (
+        ctx.upload(&le_f32(row)).unwrap(),
+        ctx.upload(&vec![0u8; 4 * h]).unwrap(),
+        ctx.upload(&vec![0u8; q8_bytes]).unwrap(),
+    );
+    let stream = ctx.stream().unwrap();
+    ctx.add_rmsnorm_q8_wide(
+        &stream,
+        AddNormQ8Call {
+            n: h,
+            eps,
+            h: floats(&row_dev, 0, h).unwrap(),
+            delta: None,
+            weight: floats(norm, 0, h).unwrap(),
+            norm_out: floats(&normed_dev, 0, h).unwrap(),
+            q8: bytes_range(&q8, q8_bytes).unwrap(),
+            rows: 1,
+        },
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    let normed = download_f32(ctx, &normed_dev).unwrap();
+    let mut bytes = vec![0u8; q8_bytes];
+    ctx.download(&q8, &mut bytes).unwrap();
+    let (model, _) = cpu_q8_1(&normed);
+    let dq = dequant_q8_1(&bytes, h);
+    let equal = dq
+        .iter()
+        .zip(&model)
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    CardQ8 {
+        normed,
+        bytes,
+        equal,
+    }
+}
+
+/// The card's matvec over a q8_1 row and its MMQ over a fresh pack of the same f32 row, with
+/// the pack's bytes.
+fn card_products(
+    ctx: &CudaContext,
+    fixup: &DeviceBuffer,
+    weight: &NativeWeight,
+    row: &CardQ8,
+) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
+    let stream = ctx.stream().unwrap();
+    let (k, rows) = (weight.k(), weight.n_rows());
+    let f32_out = || ctx.upload(&vec![0u8; 4 * rows]).unwrap();
+    let (row_dev, q8_dev) = (
+        ctx.upload(&le_f32(&row.normed)).unwrap(),
+        ctx.upload(&row.bytes).unwrap(),
+    );
+    let (y, y_mmq) = (f32_out(), f32_out());
+    ctx.matvec_native(
+        &stream,
+        weight,
+        bytes_range(&q8_dev, row.bytes.len()).unwrap(),
+        floats(&y, 0, rows).unwrap(),
+        1,
+    )
+    .unwrap();
+    let pack_bytes = mmq_q8_1_bytes(k, 1).unwrap();
+    let pack = ctx.upload(&vec![0u8; pack_bytes]).unwrap();
+    ctx.mmq_dense_input(
+        &stream,
+        MmqDenseInputCall {
+            packing: MmqPacking::CpuReference,
+            weight,
+            m: 1,
+            row_stride: k,
+            x: floats(&row_dev, 0, k).unwrap(),
+            y: bytes_range(&pack, pack_bytes).unwrap(),
+        },
+    )
+    .unwrap();
+    ctx.mmq_dense(
+        &stream,
+        MmqDenseCall {
+            weight,
+            w_seg: None,
+            m: 1,
+            q8_1: bytes_range(&pack, pack_bytes).unwrap(),
+            dst: floats(&y_mmq, 0, rows).unwrap(),
+            ld: rows,
+            col_off: 0,
+            fixup: bytes_range(fixup, fixup.bytes()).unwrap(),
+        },
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    let mut pack_host = vec![0u8; pack_bytes];
+    ctx.download(&pack, &mut pack_host).unwrap();
+    (
+        download_f32(ctx, &y).unwrap(),
+        download_f32(ctx, &y_mmq).unwrap(),
+        pack_host,
+    )
+}
+
+/// The card's quantize, matvec and MMQ on the rows the position probe saved: each kernel
+/// against the CPU product over the bytes that kernel itself wrote, which needs no model of
+/// the quantizer, and the step each takes from the f32 row. Then the head from the saved final
+/// row, which must give the saved logits row.
+#[test]
+fn card_projection_kernels_over_their_own_q8_1_bytes() {
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova projection replay")
+    else {
+        return;
+    };
+    let Ok(dir) = std::env::var("SENSENOVA_PROBE_ROWS") else {
+        eprintln!("skipped: set SENSENOVA_PROBE_ROWS to the position probe's saved rows");
+        return;
+    };
+    let shape = *weights.shape();
+    let (h, plan) = (shape.hidden, weights.plan());
+    let fixup_bytes = 4 * fixup_floats_max(ctx.sm_count() as usize).unwrap();
+    let fixup = ctx.upload(&vec![0u8; fixup_bytes]).unwrap();
+    let mut replay = |label: &str, cpu_weight: &GgufMatrix, weight: &NativeWeight, row: &CardQ8| {
+        let (y_card, y_mmq, pack) = card_products(&ctx, &fixup, weight, row);
+        let dq = dequant_q8_1(&row.bytes, weight.k());
+        let q6 = matches!(weight.quant(), QuantType::Q6K);
+        let pack_dq = dequant_mmq(&pack, weight.k(), 1, q6).remove(0);
+        let exact = projector.linear(cpu_weight, &row.normed).unwrap();
+        let over_dq = projector.linear(cpu_weight, &dq).unwrap();
+        let over_pack = projector.linear(cpu_weight, &pack_dq).unwrap();
+        let [matvec, mmq, step, mmq_step] = [
+            (&over_dq, &y_card),
+            (&over_pack, &y_mmq),
+            (&exact, &over_dq),
+            (&exact, &y_mmq),
+        ]
+        .map(|(a, b)| relative(a, b));
+        eprintln!(
+            "  {label}: matvec against CPU over its bytes {:.2e} rms {:.2e} max; MMQ against CPU over its pack {:.2e} rms {:.2e} max; step from f32: matvec {:.4} rms {:.4} max, MMQ {:.4} rms {:.4} max",
+            matvec.0, matvec.1, mmq.0, mmq.1, step.0, step.1, mmq_step.0, mmq_step.1
+        );
+        y_card
+    };
+    for pos in [16, 14] {
+        let card = load_rows(&dir, &format!("visits-card-{pos}"), h);
+        for il in [10, 11] {
+            let block = plan.block(plan.physical(il));
+            let layer = &weights.layers()[block];
+            for (ffn, norm) in [(false, "attn_norm"), (true, "post_attention_norm")] {
+                let stem = format!("blk.{block}");
+                let row = card_q8_row(
+                    &ctx,
+                    &card[2 * il + 1],
+                    raw(&loaded, &format!("{stem}.{norm}.weight")),
+                    shape.eps,
+                );
+                eprintln!(
+                    "pos {pos} visit {il:2} {stem}.{norm}: CPU rule equals the card's q8_1 values in {} of {h}",
+                    row.equal
+                );
+                for (name, cpu_weight) in row_projections(layer, ffn) {
+                    let weight = native_weight(&loaded, &format!("{stem}.{name}.weight"));
+                    replay(&format!("{stem}.{name}"), cpu_weight, weight, &row);
+                }
+            }
+        }
+        let final_row = load_rows(&dir, &format!("final-card-{pos}"), h).remove(0);
+        let head = card_q8_row(
+            &ctx,
+            &final_row,
+            raw(&loaded, "output_norm.weight"),
+            shape.eps,
+        );
+        eprintln!(
+            "pos {pos} output_norm: CPU rule equals the card's q8_1 values in {} of {h}",
+            head.equal
+        );
+        let y_card = replay(
+            "output.weight",
+            weights.output(),
+            native_weight(&loaded, "output.weight"),
+            &head,
+        );
+        let saved = load_rows(&dir, &format!("logits-card-{pos}"), shape.vocab).remove(0);
+        eprintln!(
+            "pos {pos} head replay against the saved logits row: max abs {:.2e}",
+            max_abs_diff(&saved, &y_card)
         );
     }
 }
