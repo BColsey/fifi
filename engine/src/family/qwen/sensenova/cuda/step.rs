@@ -521,8 +521,14 @@ impl<'a> LoopStep<'a> {
 
     /// Device microbenchmark, not a gate: every matvec the decode walk issues, at `ncols`
     /// activation columns, so the weights are read once for `ncols` tokens the way a batched
-    /// step would read them. Returns the microseconds of each group of `sweeps` sweeps, queued
-    /// ahead and drained once; the first group warms the card up and is dropped.
+    /// step would read them. Returns the microseconds of one sweep for each of `groups`
+    /// groups: a group queues `sweeps` sweeps (about 1,825 host launches for five) and
+    /// synchronizes once, and its elapsed time is divided by `sweeps`. The first group warms
+    /// the card up and is dropped. The inputs are zero and the outputs are never read. The
+    /// figure leaves out the step's drain points and its norm and mHC glue kernels. It does
+    /// include any device idle where the host launch stream falls behind inside a group,
+    /// which is most likely for the small matrices. Above four columns `matvec_native` takes
+    /// the vendored MMVQ geometry that the decode, at one column, never takes.
     #[cfg(all(test, feature = "native-cuda"))]
     pub(super) fn sweep_micros(
         &self,

@@ -1010,7 +1010,8 @@ fn card_decode_trace() {
 /// Device microbenchmark, not a gate: the decode step's weight sweep at 1, 2, 4 and 8
 /// activation columns. A batched step reads the weights once for all of its tokens, so
 /// this is the weight term of one token of a batch on this card. The glue, the launch gaps
-/// and the per-sequence attention state of a real batched step are not in it.
+/// and the per-sequence attention state of a real batched step are not in it. The GB/s it
+/// prints is weight bytes per second, not measured HBM traffic.
 #[test]
 fn card_decode_sweep_columns() {
     let Some((ctx, loaded, weights, _projector)) = open_rig("sensenova decode sweep columns")
