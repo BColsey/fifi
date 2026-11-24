@@ -344,10 +344,11 @@ impl<'a> LoopStep<'a> {
         }
         ensure_rows(pos, 1, self.cache_rows)?;
         let cur = self.cur_ix;
-        self.ctx
-            .upload_at(&self.resid[cur], 0, &le_f32(embed_row))?;
+        // Behind the last step's kernels, which still read both.
+        self.resid[cur].write_at_enqueue(&self.stream, 0, &le_f32(embed_row))?;
         let params = StepParams::new(0, pos as i32)?;
-        self.ctx.upload_at(&self.params, 0, &params.to_bytes())?;
+        self.params
+            .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
         self.ctx
             .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
 
