@@ -14,6 +14,7 @@
 //! Needs a device and `SENSENOVA_GGUF` (the released SenseNova-Loop-9B GGUF); without
 //! either the rig skips with a note.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use super::super::step::LoopState;
@@ -90,7 +91,7 @@ fn download_f32(context: &CudaContext, buffer: &DeviceBuffer) -> Result<Vec<f32>
 
 /// The released checkpoint opened for both paths: the context, the device weights, the
 /// CPU-side weights and the projector. `None` (with a note) when the rig cannot run here.
-type Rig = (Arc<CudaContext>, CudaWeights, LoopWeights, GgufProjector);
+type Rig = (Rc<CudaContext>, CudaWeights, LoopWeights, GgufProjector);
 
 fn open_rig(what: &str) -> Option<Rig> {
     if !device_present(what) {
@@ -112,7 +113,7 @@ fn open_rig(what: &str) -> Option<Rig> {
         .unwrap(),
     );
     let weights = LoopWeights::open(file.clone()).unwrap();
-    let ctx = Arc::new(CudaContext::new().unwrap());
+    let ctx = Rc::new(CudaContext::new().unwrap());
     let loaded = super::load::load(
         &BorrowedLoader::new(&ctx).unwrap(),
         &file,
@@ -128,7 +129,7 @@ fn open_rig(what: &str) -> Option<Rig> {
 }
 
 fn open_card<'a>(
-    ctx: &Arc<CudaContext>,
+    ctx: &Rc<CudaContext>,
     loaded: &'a CudaWeights,
     weights: &LoopWeights,
     cache_rows: usize,

@@ -14,6 +14,10 @@ use crate::family::host_shape::{AttnDims, DeltaDims, HostShape, MoeDims};
 /// The attention kind of every PHYSICAL layer, in physical order. A revisit carries
 /// the kind of the weight set it shares; the plan constructor already rejects a visit
 /// whose kind disagrees with its physical layer.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only this module's tests read it today")
+)]
 pub(crate) fn physical_kinds(plan: &LoopPlan) -> Vec<AttentionKind> {
     (0..PHYSICAL_LAYERS)
         .map(|p| {
@@ -30,6 +34,10 @@ pub(crate) fn physical_kinds(plan: &LoopPlan) -> Vec<AttentionKind> {
 /// dims zeroed), DeltaNet and attention dims from the model, rotary width and base
 /// from the rope plan. `check()` inside validates the kernel contract (head ratio,
 /// conv kernel, nonzero dims).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only this module's tests read it today")
+)]
 pub(crate) fn host_shape(
     shape: &LoopShape,
     kinds: Vec<AttentionKind>,
@@ -71,12 +79,20 @@ pub(crate) fn host_shape(
 /// the shared kernels bake plain NTK-style rotary; SenseNova scales by `factor` from
 /// `original_context` (see CUDA-PLAN §math, divergence 3).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only this module's tests read it today")
+)]
 pub(crate) struct YarnPlan {
     pub(crate) factor: f32,
     pub(crate) original_context: usize,
 }
 
 impl YarnPlan {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only this module's tests read it today")
+    )]
     pub(crate) fn of(rope: &RopePlan) -> Self {
         Self {
             factor: rope.factor,

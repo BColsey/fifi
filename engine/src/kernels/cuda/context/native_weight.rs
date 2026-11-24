@@ -375,6 +375,10 @@ impl NativeWeight {
 
     /// The stored bytes of the weight.
     #[cfg(feature = "native-cuda")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the SenseNova decode trace rig")
+    )]
     pub(crate) fn bytes(&self) -> usize {
         self.buffer.bytes()
     }

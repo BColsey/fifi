@@ -56,7 +56,7 @@ fn stream_bytes(rows: usize, ld_ab: usize, hidden: usize) -> Result<usize, EngEr
 }
 
 fn check_hidden(hidden: usize) -> Result<(), EngError> {
-    if hidden % UNIT != 0 || hidden > MAX_HIDDEN {
+    if !hidden.is_multiple_of(UNIT) || hidden > MAX_HIDDEN {
         return Err(EngError::BadRequest(format!(
             "mhc_route: hidden is {hidden}, not a multiple of 256 up to 2^20"
         )));
@@ -71,7 +71,7 @@ fn bytes(what: &str, floats: usize) -> Result<usize, EngError> {
 }
 
 fn fit(what: &str, range: &DeviceRange<'_>, need: usize) -> Result<(), EngError> {
-    if range.bytes() < need || range.offset() % 4 != 0 {
+    if range.bytes() < need || !range.offset().is_multiple_of(4) {
         return Err(EngError::BadRequest(format!(
             "mhc_route: {what} holds {} bytes at offset {}, not {need} bytes at a 4-byte alignment",
             range.bytes(),

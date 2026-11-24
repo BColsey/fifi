@@ -12,6 +12,11 @@
 //! token is gathered on the host, and the card spends its bytes on `output.weight`
 //! (≈0.5 GB Q4_K_M) which every step needs.
 
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the serve wiring slice constructs load")
+)]
+
 use super::super::{LoopPlan, PHYSICAL_LAYERS};
 
 /// Every tensor the device holds, in load order: the root head, then each physical

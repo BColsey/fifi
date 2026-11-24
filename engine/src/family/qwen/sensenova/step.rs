@@ -407,6 +407,13 @@ pub(crate) fn apply_yarn(head: &mut [f32], rope: &RopePlan, pos: u32) {
 /// progressive powers and the same ramp blend [`apply_yarn`] computes inline,
 /// so a device table built here agrees with the host reference by construction
 /// (the kernel reads `pos * table[i]` where the host applies `theta * blend`).
+#[cfg_attr(
+    all(not(test), not(feature = "native-cuda")),
+    expect(
+        dead_code,
+        reason = "read by the native-cuda step and the family tests"
+    )
+)]
 pub(crate) fn yarn_inv_freq(rope: &RopePlan) -> Vec<f32> {
     let dims = rope.dims;
     let half = dims / 2;
@@ -457,6 +464,10 @@ pub(super) fn trunk(
 }
 
 /// The parity rig's twin: also snapshots the residual row after every visit.
+#[cfg_attr(
+    not(all(test, feature = "native-cuda", target_os = "linux")),
+    expect(dead_code, reason = "used by the CUDA device parity rig")
+)]
 pub(super) fn trunk_traced(
     projector: &mut GgufProjector,
     weights: &LoopWeights,

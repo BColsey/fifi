@@ -21,10 +21,14 @@
 //! list is what a later capture slice replays.
 
 // Staged: the serve-path slice constructs LoopStep; until then the dead-code lint
-// fires on every item here, and the expect flips to an error the day it is wired.
-#![expect(dead_code, reason = "constructed by the serve wiring slice")]
+// fires on every item here in the library build, and the expect flips to an error
+// the day it is wired. The tests construct it, so the mark stands down under cfg(test).
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "constructed by the serve wiring slice")
+)]
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::EngError;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
@@ -70,8 +74,6 @@ struct Phys<'a> {
     ffn_up: &'a NativeWeight,
     ffn_down: &'a NativeWeight,
     mixer: Mixer<'a>,
-    /// The physical layer is in the mHC range (its routers resolve by part in `route`).
-    mhc: bool,
 }
 
 enum Mixer<'a> {
@@ -94,8 +96,13 @@ enum Mixer<'a> {
     },
 }
 
-/// A piece of the trunk's carried state, for the parity rigs.
+/// A piece of the trunk's carried state, for the parity rigs; the visit index is what
+/// names a row of their tables, through the derived `Debug` alone.
 #[cfg(all(test, feature = "native-cuda"))]
+#[expect(
+    dead_code,
+    reason = "read by the derived Debug, which dead code analysis ignores"
+)]
 #[derive(Debug)]
 pub(crate) enum Carried {
     Hidden,
@@ -108,7 +115,7 @@ pub(crate) enum Carried {
 /// The trunk executor: the resolved weights, the per-visit state and the scratch rows.
 /// Built once per session; `decode` runs one token.
 pub(crate) struct LoopStep<'a> {
-    ctx: Arc<CudaContext>,
+    ctx: Rc<CudaContext>,
     stream: DeviceStream,
     weights: &'a CudaWeights,
     phys: Vec<Phys<'a>>,
@@ -207,7 +214,7 @@ impl<'a> LoopStep<'a> {
     /// Builds the executor over a completed device load. `cache_rows` is the session's
     /// attention cache depth; the GDN state and the conv rings follow the shape.
     pub(crate) fn open(
-        ctx: Arc<CudaContext>,
+        ctx: Rc<CudaContext>,
         weights: &'a CudaWeights,
         shape: &LoopShape,
         plan: &LoopPlan,
@@ -256,7 +263,6 @@ impl<'a> LoopStep<'a> {
                     ffn_up: native(weights, &format!("{stem}.ffn_up.weight"))?,
                     ffn_down: native(weights, &format!("{stem}.ffn_down.weight"))?,
                     mixer,
-                    mhc: (plan.mhc_start..plan.mhc_end).contains(&p),
                 })
             })
             .collect::<Result<Vec<Phys<'a>>, EngError>>()?;
@@ -274,7 +280,7 @@ impl<'a> LoopStep<'a> {
             v_cache: (0..attn_slot.len())
                 .map(|_| ctx.upload(&vec![0u8; cache_bytes]))
                 .collect::<Result<Vec<_>, _>>()?,
-            params: ctx.upload(&vec![0u8; STEP_PARAMS_BYTES])?,
+            params: ctx.upload(&[0u8; STEP_PARAMS_BYTES])?,
             resid: [ctx.upload(&zeros(h))?, ctx.upload(&zeros(h))?],
             cur_ix: 0,
             streams: ctx.upload(&zeros(2 * h))?,
@@ -298,7 +304,7 @@ impl<'a> LoopStep<'a> {
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
             rows: prefill::open_rows(&ctx, shape, ctx.sm_count() as usize)?,
-            shape: shape.clone(),
+            shape: *shape,
             plan: plan.clone(),
             rope: rope.clone(),
             cache_rows,
@@ -563,7 +569,7 @@ impl<'a> LoopStep<'a> {
             &self.stream,
             RowScaleCall {
                 out: floats(&self.streams, 0, h)?,
-                x: cur.clone(),
+                x: cur,
                 scale: 1.0,
                 m: 1,
                 n: h,

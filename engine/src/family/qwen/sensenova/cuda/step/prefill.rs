@@ -12,9 +12,9 @@
 //! last row.
 
 // Staged as the parent module: the serve wiring slice is the first caller of `prefill`.
-#![expect(
-    dead_code,
-    reason = "constructed with LoopStep; the serve wiring slice calls prefill"
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the serve wiring slice calls prefill first")
 )]
 
 use super::*;
@@ -136,7 +136,7 @@ pub(super) fn open_rows(
     let zeros = |floats: usize| le_f32(&vec![0.0; floats]);
     let floats = |width: usize| ctx.upload(&zeros(PREFILL_ROWS * width));
     let mmq = |k: usize| -> Result<DeviceBuffer, EngError> {
-        Ok(ctx.upload(&vec![0u8; mmq_q8_1_bytes(k, PREFILL_ROWS)?])?)
+        ctx.upload(&vec![0u8; mmq_q8_1_bytes(k, PREFILL_ROWS)?])
     };
     Ok(Rows {
         resid: [floats(h)?, floats(h)?],
@@ -250,7 +250,7 @@ impl LoopStep<'_> {
                 // Fused residual add and post norm: the branch lands in the residual.
                 let cur = self.resid_rows(m)?;
                 self.norm_chunk(
-                    cur.clone(),
+                    cur,
                     Some(floats(&self.rows.mix_out, 0, m * h)?),
                     self.phys[p].post_norm,
                     m,
@@ -304,7 +304,7 @@ impl LoopStep<'_> {
                     dst: floats(&self.rows.streams, at * 2 * h, rows * 2 * h)?,
                     segments: vec![
                         PackSegment {
-                            src: src.clone(),
+                            src,
                             n: h,
                             dst_off: 0,
                         },
@@ -439,7 +439,7 @@ impl LoopStep<'_> {
                 m,
                 row_stride: x_stride,
                 x,
-                y: y.clone(),
+                y,
             },
         )?;
         Ok(y)
@@ -574,7 +574,7 @@ impl LoopStep<'_> {
             normed.clone(),
             Out {
                 m,
-                dst: dst.clone(),
+                dst,
                 ld,
                 col_off: 0,
             },
@@ -687,7 +687,7 @@ impl LoopStep<'_> {
                 normed.clone(),
                 Out {
                     m,
-                    dst: dst.clone(),
+                    dst,
                     ld: row_len,
                     col_off,
                 },
@@ -726,10 +726,7 @@ impl LoopStep<'_> {
                 q_norm: floats(q_norm, 0, hd)?,
                 k_norm: floats(k_norm, 0, hd)?,
                 q: floats(&self.rows.q_out, 0, m * hq * hd)?,
-                mode: PrepChunkMode::AppendFp16 {
-                    k_cache: k_cache.clone(),
-                    v_cache: v_cache.clone(),
-                },
+                mode: PrepChunkMode::AppendFp16 { k_cache, v_cache },
                 status: None,
                 inv_freq: Some(floats(&self.inv_freq, 0, self.rope.dims / 2)?),
             },
@@ -813,7 +810,7 @@ impl LoopStep<'_> {
             normed.clone(),
             Out {
                 m,
-                dst: dst.clone(),
+                dst,
                 ld: 2 * ff,
                 col_off: 0,
             },
