@@ -12,7 +12,10 @@ use crate::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes},
             matvec_q::{MatvecCall, QuantType, ROWS_MULTIPLE},
             quantize_q8_1::{QuantizeCall, q8_1_bytes},
-            router::{MAX_ROWS as ROUTER_MAX_ROWS, RouterLogitsCall, RouterShape},
+            router::{
+                MAX_ROWS as ROUTER_MAX_ROWS, RouterLogitsCall, RouterShape,
+                router_packed_logits_bytes,
+            },
         },
     },
     weights::GgufType,
@@ -27,7 +30,9 @@ mod controlled_mlp;
 mod controller_prefill;
 mod draft_head;
 mod local_attention;
+mod resident_controller;
 pub(super) use local_attention::{LocalInputs, LocalProjection, LocalTargets};
+pub(in crate::family::inkling2) use resident_controller::ResidentController;
 
 pub(in crate::family::inkling2) use controlled_attention::ControlledAttentionInput;
 
@@ -541,9 +546,31 @@ impl DenseStep {
         Ok((logits, retained))
     }
 
+    pub(super) fn admits_resident_router(&self, weight: &Resident, rows: usize) -> bool {
+        let [n_expert, hidden] = weight.shape;
+        let Ok(capacity) = self.router_tile_capacity(weight) else {
+            return false;
+        };
+        let shape = RouterShape {
+            m: rows.min(capacity),
+            hidden,
+            n_expert,
+            top_k: 1,
+        };
+        let Ok(logits) = router_packed_logits_bytes(shape) else {
+            return false;
+        };
+        // Shape validation above bounds the weight product. Output shares the
+        // same fixed-range capacity as the consumer's pinned transfer.
+        weight.codes.bytes() >= n_expert * hidden * size_of::<f32>()
+            && self
+                .arena
+                .tensor(Slot::Output as usize)
+                .is_ok_and(|out| logits <= out.bytes())
+    }
+
     /// Score packed FP32 rows already produced by a device stage. The producer
     /// must have completed before this call; only scores cross back to the host.
-    #[allow(dead_code, reason = "the resident prefill visit is staged separately")]
     pub(super) fn project_resident_router_rows(
         &self,
         context: &CudaContext,

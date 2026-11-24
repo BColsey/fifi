@@ -7,7 +7,7 @@ use crate::EngError;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
 pub(crate) use super::super::native::resident::inkling_controller::Arithmetic;
-use super::super::native::resident::inkling_controller::{launch, rebuild_gates};
+use super::super::native::resident::inkling_controller::{launch, prepare, rebuild_gates};
 
 impl CudaContext {
     /// Rebuild gates from the host's exact RMS scales. The workspace is packed
@@ -21,6 +21,21 @@ impl CudaContext {
         self.ensure_usable()?;
         let workspace = self.raw_range(&workspace)?;
         self.launch_on(stream, |raw| rebuild_gates(raw, workspace, shape))
+    }
+
+    /// Enqueue gate-half RMS normalization and broadcast the shared gamma into
+    /// the controller's raw triples. The five ranges are `[pairs, gamma, triples,
+    /// gate_pairs, half_health]`; health is written separately from controller apply.
+    pub(crate) fn inkling_prepare_controller(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 5],
+        shape_eps: ([usize; 2], f32),
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let [a, b, c, d, e] = ranges.each_ref().map(|r| self.raw_range(r));
+        let raw = [a?, b?, c?, d?, e?];
+        self.launch_on(stream, |stream| prepare(stream, raw, shape_eps))
     }
 
     /// The workspace packs three [input, message, gamma] triples, three

@@ -122,10 +122,11 @@ impl GgufTextWeights {
         &self,
         layer: u32,
         name: &str,
+        rows: usize,
     ) -> Option<[usize; 2]> {
         self.cuda
             .as_ref()?
-            .resident_prefill_router_shape(layer, name)
+            .resident_prefill_router_shape(layer, name, rows)
     }
 
     pub(in crate::family::inkling2) fn resident_prefill_router_logits(

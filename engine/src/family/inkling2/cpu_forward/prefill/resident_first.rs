@@ -169,7 +169,8 @@ impl CpuForward {
         let names = names.each_ref().map(String::as_str);
         let caps = [self.math.mlp_gate_softcap, self.math.mlp_up_softcap];
         if !width.is_multiple_of(4)
-            || weights.resident_prefill_router_shape(0, &router) != Some([experts, width])
+            || weights.resident_prefill_router_shape(0, &router, rows.len())
+                != Some([experts, width])
         {
             return Ok(false);
         }
@@ -202,7 +203,7 @@ impl CpuForward {
         let Some(mut conv) = bridge.admit_conv(self, state, rows.len())? else {
             return Ok(false);
         };
-        let mut mlp_conv = if device_conv {
+        let mlp_conv = if device_conv {
             let Some(conv) = bridge.admit_mlp_conv(self, state, rows.len())? else {
                 return Ok(false);
             };

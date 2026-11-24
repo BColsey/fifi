@@ -20,6 +20,19 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
+    fn inference_cuda_inkling_prepare_controller(
+        pairs: *const c_void,
+        gamma: *const c_void,
+        triples: *mut c_void,
+        gates: *mut c_void,
+        health: *mut c_void,
+        width: c_int,
+        roles: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
     fn inference_cuda_inkling_controller_norm(
         workspace: *mut c_void,
         health: *mut c_void,
@@ -51,6 +64,55 @@ pub(in crate::kernels::cuda) fn rebuild_gates(
             workspace.address(),
             width as c_int,
             roles as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+pub(in crate::kernels::cuda) fn prepare(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 5],
+    ([width, roles], eps): ([usize; 2], f32),
+) -> Result<(), DeviceFailure> {
+    if !(1..=4096).contains(&width)
+        || !(1..=1536).contains(&roles)
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
+        return Err(invalid_argument());
+    }
+    let row = width * size_of::<f32>();
+    let bytes = [
+        2 * roles * row,
+        row,
+        3 * roles * row,
+        2 * roles * row,
+        2 * roles * size_of::<f32>(),
+    ];
+    let spans = std::array::from_fn::<_, 5, _>(|i| Span::of(&ranges[i], bytes[i]));
+    for (i, range) in ranges.iter().enumerate() {
+        if range.bytes() != bytes[i]
+            || !range.offset.is_multiple_of(4)
+            || spans[..i].iter().any(|prev| !prev.apart(&spans[i]))
+        {
+            return Err(invalid_argument());
+        }
+    }
+    let [pairs, gamma, triples, gates, health] = ranges.map(|range| range.address());
+    let mut stage = STAGE_NONE;
+    // SAFETY: all five live ranges are aligned, sized, and disjoint.
+    let status = unsafe {
+        inference_cuda_inkling_prepare_controller(
+            pairs,
+            gamma,
+            triples,
+            gates,
+            health,
+            width as c_int,
+            roles as c_int,
+            eps,
             stream.0.as_ptr(),
             &mut stage,
         )

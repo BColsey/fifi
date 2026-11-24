@@ -1,6 +1,6 @@
 //! Text execution for Inkling 2 Mini, including CUDA-backed projections.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{borrow::Cow, fs, path::Path, sync::Arc};
 
 use serde::Deserialize;
 
@@ -826,18 +826,7 @@ impl CpuForward {
         physical: usize,
         role: Role,
     ) -> Result<(ControlInput, [f32; 2]), EngError> {
-        let (kind, offset) = match role {
-            Role::Query => ("cross_pass_queries", 0),
-            Role::Key => ("cross_pass_kv_queries", 0),
-            Role::Value => ("cross_pass_kv_queries", 1),
-            Role::Mlp => ("cross_pass_queries", 1),
-        };
-        let row = 2 * (physical - self.spec.core.core_start) + offset;
-        let query = self.weights.row(
-            &format!("model.llm.middle_cycle_{kind}"),
-            row,
-            self.hidden(),
-        )?;
+        let query = self.control_query(physical, role)?;
         let message = bank.stream.mix(bank.first_block, &query);
         let mut gate = input.to_vec();
         gate.extend_from_slice(&message);
@@ -847,6 +836,21 @@ impl CpuForward {
             rms_norm_with_scale(right, MIX_EPS),
         ];
         Ok((ControlInput { gate, message }, scales))
+    }
+
+    fn control_query(&self, physical: usize, role: Role) -> Result<Cow<'_, [f32]>, EngError> {
+        let (kind, offset) = match role {
+            Role::Query => ("cross_pass_queries", 0),
+            Role::Key => ("cross_pass_kv_queries", 0),
+            Role::Value => ("cross_pass_kv_queries", 1),
+            Role::Mlp => ("cross_pass_queries", 1),
+        };
+        let row = 2 * (physical - self.spec.core.core_start) + offset;
+        self.weights.row(
+            &format!("model.llm.middle_cycle_{kind}"),
+            row,
+            self.hidden(),
+        )
     }
 
     fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {

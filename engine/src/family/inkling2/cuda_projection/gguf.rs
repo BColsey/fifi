@@ -79,7 +79,9 @@ type Projections = BTreeMap<String, (Resident, DenseDtype)>;
 
 type ControllerOutput = Option<[Vec<f32>; 2]>;
 
-pub(in crate::family::inkling2) use super::dense::{ControlledAttentionInput, PrefillProjection};
+pub(in crate::family::inkling2) use super::dense::{
+    ControlledAttentionInput, PrefillProjection, ResidentController,
+};
 use super::dense::{LocalInputs, LocalProjection};
 
 pub(in crate::family::inkling2) struct LocalDecode<'a> {
@@ -140,6 +142,22 @@ impl BatchController<'_> {
             eprintln!("Inkling CUDA multirow controller tile report {}", receipt());
         }
         Ok(values)
+    }
+}
+
+pub(in crate::family::inkling2) struct ResidentMlpController<'a> {
+    context: &'a CudaContext,
+    weights: ControllerWeights<'a>,
+}
+
+impl ResidentMlpController<'_> {
+    pub(in crate::family::inkling2) fn run<'a>(
+        &self,
+        scratch: &'a mut ResidentController,
+        rows: (&[Vec<f32>], &[Vec<f32>], &[f32]),
+        eps: (f32, f32),
+    ) -> Result<DeviceRange<'a>, EngError> {
+        scratch.run(self.context, self.weights, rows, eps)
     }
 }
 
@@ -910,9 +928,10 @@ impl GgufCuda {
         &self,
         layer: u32,
         name: &str,
+        rows: usize,
     ) -> Option<[usize; 2]> {
         let (weight, _) = self.dense.get(name)?;
-        self.batch_prefill_router(layer, name)
+        (self.batch_prefill_router(layer, name) && self.step.admits_resident_router(weight, rows))
             .then_some(weight.shape)
     }
 
@@ -1119,6 +1138,21 @@ impl GgufCuda {
             return Some(Err(bad("bad GGUF CUDA controller projection shape")));
         }
         Some(Ok(weights.map(|(w, dtype)| (w, *dtype))))
+    }
+
+    pub(in crate::family::inkling2) fn resident_mlp_controller(
+        &self,
+        names: [&str; 3],
+        shape @ [_, hidden, rank]: [usize; 3],
+    ) -> Result<Option<ResidentMlpController<'_>>, EngError> {
+        Ok(self
+            .controller_weights(names, 2 * hidden, [rank, hidden])
+            .transpose()?
+            .filter(|&weights| ResidentController::admits(shape, weights))
+            .map(|weights| ResidentMlpController {
+                context: &self.context,
+                weights,
+            }))
     }
 
     pub(in crate::family::inkling2) fn stages_prefill_controllers(&self) -> bool {
