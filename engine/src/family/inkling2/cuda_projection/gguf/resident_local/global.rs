@@ -3,7 +3,7 @@
 use super::*;
 
 impl GgufCuda {
-    fn dynamic_weights(
+    pub(super) fn dynamic_weights(
         &self,
         visit: LayerVisit,
         shape: LocalShape,
@@ -42,7 +42,7 @@ impl GgufCuda {
     ) -> bool {
         visit.attention == Attention::Global
             && self
-                .resident_decode_parts(visit, pos)
+                .resident_decode_parts(visit, pos, true)
                 .is_ok_and(|(_, s, _)| self.dynamic_weights(visit, s).is_ok())
     }
     pub(in crate::family::inkling2) fn enqueue_banked_global(
@@ -59,7 +59,7 @@ impl GgufCuda {
             .messages
             .ok_or_else(|| bad("global decode requires a message bank"))?;
         let (attention, shape, projection) =
-            self.resident_decode_parts(request.visit, request.position)?;
+            self.resident_decode_parts(request.visit, request.position, true)?;
         let mut claims = request_rows(&request, (shape, self.hidden, 4));
         claims
             .reads

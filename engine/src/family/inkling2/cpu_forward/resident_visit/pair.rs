@@ -195,6 +195,7 @@ impl Pair {
                     layout: &w.layout,
                     weights: &w.weights,
                     arena: &w.arena,
+                    shared: None,
                     stream,
                     context: ctx,
                 }

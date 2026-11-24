@@ -797,6 +797,46 @@ impl GgufTextWeights {
         Ok((tensor, bytes))
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(test)]
+    pub(super) fn resident_embedding(
+        &self,
+        ctx: &crate::kernels::cuda::CudaContext,
+    ) -> Result<Option<crate::kernels::cuda::NativeWeight>, EngError> {
+        use crate::kernels::cuda::{CHUNK_LIMIT, QuantTensor};
+        let name = "model.llm.embed.weight";
+        let (t, bytes) = self.tensor(name)?;
+        if t.planes != 1
+            || t.kind != GgufType::Iq4Xs
+            || !matches!(t.vector_order, VectorOrder::Stored)
+        {
+            return Ok(None);
+        }
+        // Leave the normal device reserve intact even during lazy admission.
+        if ctx.memory_info()?.free.saturating_sub(bytes.len()) < 256 * 1024 * 1024 {
+            return Ok(None);
+        }
+        ctx.upload_native(
+            QuantTensor {
+                name,
+                ty: t.kind,
+                n_rows: t.rows,
+                k: t.columns,
+                source_len: bytes.len(),
+            },
+            CHUNK_LIMIT,
+            &mut |at, dst| {
+                dst.copy_from_slice(
+                    bytes
+                        .get(at..at + dst.len())
+                        .ok_or_else(|| bad("embedding chunk escapes tensor"))?,
+                );
+                Ok(())
+            },
+        )
+        .map(Some)
+    }
+
     pub(super) fn vec(&self, name: &str, len: usize) -> Result<Cow<'_, [f32]>, EngError> {
         let (tensor, bytes) = self.tensor(name)?;
         if tensor.columns * tensor.rows != len || tensor.planes != 1 {

@@ -152,6 +152,32 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Launch-only, single-row RMSNorm/gamma. The transaction owns the status
+    /// word until its final fence; validation still precedes the launch.
+    pub(crate) fn enqueue_row_weighted_norm(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 4],
+        width: usize,
+        eps: f32,
+    ) -> Result<(), EngError> {
+        if !(1..=4096).contains(&width) || !eps.is_finite() || eps <= 0. {
+            return Err(EngError::BadRequest(
+                "invalid resident row norm geometry".into(),
+            ));
+        }
+        validate_planes(
+            ["input", "gamma", "output", "status"],
+            &ranges,
+            [width, width, width, 1],
+        )?;
+        let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
+        let raw = [a?, b?, c?, d?];
+        self.launch_on(stream, |s| {
+            resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps)
+        })
+    }
+
     /// Form the next raw residual and its normalized scoring plane from
     /// `[prior, convolved_attention, next_raw, next_normalized]` on one stream.
     /// At a block boundary the caller retains the sealed prior separately.

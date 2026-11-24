@@ -29,6 +29,8 @@ use crate::{
 };
 
 mod pair;
+#[cfg(test)]
+mod token;
 pub(super) use pair::Pair;
 
 const WORD: usize = size_of::<f32>();
@@ -83,6 +85,7 @@ struct Controls {
 struct Shape {
     widths: LocalDecodeWidths,
     global: bool,
+    banked: bool,
     blocks: usize,
     bank_blocks: usize,
     bank_first: usize,
@@ -140,7 +143,16 @@ impl Layout {
             global_scratch: shape
                 .global
                 .then(|| ([h; 2].map(&mut take), [kv / 128 * 4; 2].map(&mut take))),
-            messages: [h; 4].map(&mut take),
+            messages: {
+                // Plain projection and expert kernels require their normalized
+                // FP32 inputs on 16-byte boundaries (Mini rows have width 2304).
+                let span = take(4 * h + 3);
+                let aligned = span.start.next_multiple_of(16);
+                std::array::from_fn(|i| Region {
+                    start: aligned + i * h * WORD,
+                    bytes: h * WORD,
+                })
+            },
             attention_out: take(h),
             mlp_input: take(h),
             mlp_conv: take(h),
@@ -160,7 +172,7 @@ struct Constants {
     device: DeviceBuffer,
     attention_query: Option<Region>,
     global_roles: Option<([Region; 2], [Region; 2])>,
-    bank_queries: [Region; 4],
+    bank_queries: Option<[Region; 4]>,
     mlp_query: Region,
     attention: [Region; 6],
     mlp: [Region; 3],
@@ -209,8 +221,13 @@ impl Constants {
         } else {
             None
         };
-        let [q, k, v, m] = [Role::Query, Role::Key, Role::Value, Role::Mlp]
-            .map(|role| forward.control_query(physical, role).map(|row| pack(&row)));
+        let bank_queries = if plan.shape.banked {
+            let [q, k, v, m] = [Role::Query, Role::Key, Role::Value, Role::Mlp]
+                .map(|role| forward.control_query(physical, role).map(|row| pack(&row)));
+            Some([q?, k?, v?, m?])
+        } else {
+            None
+        };
         let mlp_query = pack(
             &forward
                 .weights
@@ -236,7 +253,7 @@ impl Constants {
         let [a, b, c, d, e, f] = attention;
         let [gamma, bias, conv] = mlp;
         Ok(Self {
-            bank_queries: [q?, k?, v?, m?],
+            bank_queries,
             attention_query,
             global_roles,
             mlp_query,
@@ -328,6 +345,22 @@ impl Workspace {
         visit: LayerVisit,
         (blocks, bank): (usize, &MessageBank),
     ) -> Result<Option<Self>, EngError> {
+        Self::open_geometry(
+            forward,
+            cuda,
+            visit,
+            blocks,
+            Some((bank.stream.block_count(), bank.first_block)),
+        )
+    }
+
+    fn open_geometry(
+        forward: &CpuForward,
+        cuda: &GgufCuda,
+        visit: LayerVisit,
+        blocks: usize,
+        bank: Option<(usize, usize)>,
+    ) -> Result<Option<Self>, EngError> {
         let Some(widths) = cuda.resident_local_decode_widths(visit) else {
             return Ok(None);
         };
@@ -335,8 +368,9 @@ impl Workspace {
             widths,
             global: visit.attention == Attention::Global,
             blocks,
-            bank_blocks: bank.stream.block_count(),
-            bank_first: bank.first_block,
+            banked: bank.is_some(),
+            bank_blocks: bank.map_or(0, |b| b.0),
+            bank_first: bank.map_or(0, |b| b.1),
             seal: visit
                 .weight_layer
                 .is_multiple_of(forward.spec.n_layers_per_attn_res_block),
@@ -357,14 +391,22 @@ impl Workspace {
         };
         let names = control_names(&layer, Role::Mlp);
         let rank = forward.spec.core.gate_rank as usize;
-        if !cuda.resident_mlp_supported(
-            visit.weight_layer as u32,
-            names.each_ref().map(String::as_str),
-            [rank, widths.hidden],
-        ) {
+        if bank.is_some()
+            && !cuda.resident_mlp_supported(
+                visit.weight_layer as u32,
+                names.each_ref().map(String::as_str),
+                [rank, widths.hidden],
+            )
+        {
             return Ok(None);
         }
-        let Some(status_words) = cuda.resident_local_decode_status_words(visit, true) else {
+        if bank.is_none()
+            && !cuda.resident_plain_mlp_supported(visit.weight_layer as u32, widths.hidden)
+        {
+            return Ok(None);
+        }
+        let Some(status_words) = cuda.resident_local_decode_status_words(visit, bank.is_some())
+        else {
             return Ok(None);
         };
         let plan = Plan {
@@ -389,7 +431,11 @@ impl Workspace {
         let arena = context.allocate(layout.bytes)?;
         let stream = context.stream()?;
         let weights = Constants::load(forward, cuda, &plan, &layer)?;
-        cuda.prepare_local_decode(visit)?;
+        if bank.is_some() {
+            cuda.prepare_local_decode(visit)?;
+        } else {
+            cuda.prepare_token_decode(visit, false)?;
+        }
         Ok(Some(Self {
             plan,
             layout,
@@ -424,6 +470,7 @@ impl Workspace {
                 layout,
                 weights: &self.weights,
                 arena: &self.arena,
+                shared: None,
                 stream: &self.stream,
                 context,
             };
@@ -553,7 +600,15 @@ struct Output {
     history: [Vec<f32>; 6],
 }
 
+#[derive(Clone, Copy)]
+struct Shared<'a> {
+    depth: DeviceRange<'a>,
+    bank: DeviceRange<'a>,
+    pos: DeviceRange<'a>,
+}
+
 struct Execution<'a> {
+    shared: Option<Shared<'a>>,
     plan: &'a Plan,
     layout: &'a Layout,
     weights: &'a Constants,
@@ -564,6 +619,17 @@ struct Execution<'a> {
 
 impl Execution<'_> {
     fn row(&self, span: Region) -> Result<DeviceRange<'_>, EngError> {
+        if let Some(s) = self.shared {
+            for (slot, row) in [
+                (self.layout.depth, s.depth),
+                (self.layout.bank, s.bank),
+                (self.layout.pos, s.pos),
+            ] {
+                if span.start == slot.start {
+                    return row.slice(0, span.bytes);
+                }
+            }
+        }
         span.device(self.arena)
     }
 
@@ -571,7 +637,13 @@ impl Execution<'_> {
         let l = self.layout;
         let shape = self.plan.shape;
         let (depth, bank) = ((l.depth, 0), (l.bank, shape.bank_first));
-        for (query, out) in self.weights.bank_queries.into_iter().zip(l.messages) {
+        for (query, out) in self
+            .weights
+            .bank_queries
+            .into_iter()
+            .flatten()
+            .zip(l.messages)
+        {
             self.mix(bank, shape.bank_blocks, query, out)?;
         }
         let input = match self.weights.attention_query {
@@ -622,7 +694,11 @@ impl Execution<'_> {
             position,
             math: self.plan.math,
             input: self.row(input)?,
-            messages: Some([self.row(q)?, self.row(k)?, self.row(v)?]),
+            messages: self
+                .plan
+                .shape
+                .banked
+                .then_some([self.row(q)?, self.row(k)?, self.row(v)?]),
             gammas: [self.weights.row(gamma)?; 3],
             weights: PrepWeights {
                 query_scale: self.weights.row(q_scale)?,
@@ -652,11 +728,30 @@ impl Execution<'_> {
                 self.weights.row(gammas[0])?,
                 self.weights.row(gammas[1])?,
             ];
+            if !self.plan.shape.banked {
+                return cuda.enqueue_plain_decode(
+                    self.stream,
+                    request,
+                    [self.row(q)?, self.row(k)?, self.row(v)?],
+                    Some((
+                        [self.row(inputs[0])?, self.row(inputs[1])?],
+                        [self.row(coeff[0])?, self.row(coeff[1])?],
+                    )),
+                );
+            }
             return cuda.enqueue_banked_global(
                 self.stream,
                 request,
                 [self.row(inputs[0])?, self.row(inputs[1])?],
                 [self.row(coeff[0])?, self.row(coeff[1])?],
+            );
+        }
+        if !self.plan.shape.banked {
+            return cuda.enqueue_plain_decode(
+                self.stream,
+                request,
+                [self.row(q)?, self.row(k)?, self.row(v)?],
+                None,
             );
         }
         cuda.enqueue_local_decode(self.stream, request)
@@ -702,26 +797,28 @@ impl Execution<'_> {
         let l = self.layout;
         let [gamma, bias, conv] = self.weights.mlp;
         let controls = &self.plan.controls;
-        cuda.enqueue_controlled_mlp(
-            self.stream,
-            ResidentMlpRequest {
-                layer: self.plan.visit.weight_layer as u32,
-                caps: controls.caps,
-                scale: controls.scale,
-                dtypes: controls.dtypes,
-                controller: controls.names.each_ref().map(String::as_str),
-                rank: controls.rank,
-                eps: self.plan.math.eps,
-                input: self.row(l.mlp_input)?,
-                message: self.row(l.messages[3])?,
-                gamma: self.weights.row(gamma)?,
-                bias: self.weights.row(bias)?,
-                out: self.row(l.mlp_raw)?,
-                health: self.row(l.mlp_health)?,
-                gate_health: self.row(l.glue_health)?,
-                status: self.row(l.mlp_status)?,
-            },
-        )?;
+        let request = ResidentMlpRequest {
+            layer: self.plan.visit.weight_layer as u32,
+            caps: controls.caps,
+            scale: controls.scale,
+            dtypes: controls.dtypes,
+            controller: controls.names.each_ref().map(String::as_str),
+            rank: controls.rank,
+            eps: self.plan.math.eps,
+            input: self.row(l.mlp_input)?,
+            message: self.row(l.messages[3])?,
+            gamma: self.weights.row(gamma)?,
+            bias: self.weights.row(bias)?,
+            out: self.row(l.mlp_raw)?,
+            health: self.row(l.mlp_health)?,
+            gate_health: self.row(l.glue_health)?,
+            status: self.row(l.mlp_status)?,
+        };
+        if self.plan.shape.banked {
+            cuda.enqueue_controlled_mlp(self.stream, request)?;
+        } else {
+            cuda.enqueue_plain_mlp(self.stream, request)?;
+        }
         let shape = self.plan.shape.widths;
         self.context.inkling_conv(
             self.stream,

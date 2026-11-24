@@ -890,6 +890,42 @@ impl GgufCuda {
         )
     }
 
+    #[cfg(test)]
+    pub(in crate::family::inkling2) fn resident_head_supported(&self, shape: [usize; 2]) -> bool {
+        self.dense
+            .get(crate::family::inkling2::OUTPUT_HEAD)
+            .is_some_and(|(w, d)| {
+                w.shape == shape && d.is_packed_gguf() && !self.step.uses_q8_activations(*d)
+            })
+    }
+
+    #[cfg(test)]
+    pub(in crate::family::inkling2) fn enqueue_resident_head(
+        &self,
+        stream: &crate::kernels::cuda::DeviceStream,
+        x: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+        cap: f32,
+    ) -> Result<(), EngError> {
+        use crate::kernels::cuda::resident::dense_gemv::{DenseGemvCall, DenseGemvShape};
+        let (w, d) = self
+            .dense
+            .get(crate::family::inkling2::OUTPUT_HEAD)
+            .ok_or_else(|| bad("missing resident head"))?;
+        let [rows, cols] = w.shape;
+        self.context.dense_gemv(
+            stream,
+            DenseGemvCall {
+                shape: DenseGemvShape::packed(1, rows, cols),
+                dtype: *d,
+                w: w.codes.range(0, w.codes.bytes())?,
+                x,
+                y,
+            },
+        )?;
+        self.context.softcap_in_place(stream, y, rows, cap)
+    }
+
     pub(in crate::family::inkling2) fn capped_head(
         &self,
         x: &[f32],

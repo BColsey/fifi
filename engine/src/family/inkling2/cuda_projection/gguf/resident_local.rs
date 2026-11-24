@@ -6,6 +6,7 @@
 //! The banked global variant uses separate role rows and dynamic taps.
 
 mod global;
+mod plain;
 
 use crate::{
     EngError,
@@ -121,6 +122,14 @@ impl GgufCuda {
         &self,
         visit: LayerVisit,
     ) -> Result<(), EngError> {
+        self.prepare_token_decode(visit, true)
+    }
+
+    pub(in crate::family::inkling2) fn prepare_token_decode(
+        &self,
+        visit: LayerVisit,
+        bank: bool,
+    ) -> Result<(), EngError> {
         let attention = self
             .resident_attention
             .as_ref()
@@ -128,7 +137,7 @@ impl GgufCuda {
         let shape = attention
             .local_shape(visit.state_slot)
             .ok_or_else(|| bad("unknown resident local visit slot"))?;
-        attention.prepare_resident_workspace(&self.context, (shape, self.hidden), true)
+        attention.prepare_resident_workspace(&self.context, (shape, self.hidden), bank)
     }
 
     pub(in crate::family::inkling2) fn publish_local_decode(
@@ -189,13 +198,14 @@ impl GgufCuda {
         if visit.attention != Attention::Local {
             return Err(bad("resident local decode needs an Attention::Local visit"));
         }
-        self.resident_decode_parts(visit, position)
+        self.resident_decode_parts(visit, position, true)
     }
 
     fn resident_decode_parts(
         &self,
         visit: LayerVisit,
         position: usize,
+        banked: bool,
     ) -> Result<(&ResidentAttention, LocalShape, OutputProjection<'_>), EngError> {
         let attention = self
             .resident_attention
@@ -209,7 +219,7 @@ impl GgufCuda {
                 "resident local decode needs the device cursor at the position",
             ));
         }
-        if !self.step.local_inputs_fit(self.hidden, true) {
+        if !self.step.local_inputs_fit(self.hidden, banked) {
             return Err(bad("resident local decode exceeds the projection arena"));
         }
         let layer = format!("model.llm.layers.{}", visit.weight_layer);
@@ -225,7 +235,9 @@ impl GgufCuda {
             hidden: self.hidden,
         };
         self.resident_projections(parts)?;
-        self.resident_controllers(parts)?;
+        if banked {
+            self.resident_controllers(parts)?;
+        }
         Ok((attention, shape, projection))
     }
 

@@ -184,6 +184,37 @@ impl GgufCuda {
         )
     }
 
+    pub(in crate::family::inkling2) fn resident_plain_mlp_supported(
+        &self,
+        layer: u32,
+        hidden: usize,
+    ) -> bool {
+        self.has_resident_route(layer) && self.routed(layer).is_ok_and(|r| r.shape.hidden == hidden)
+    }
+
+    /// Unbanked MLP: the unused message row is the norm target. The caller
+    /// supplies disjoint exact rows from the pre-admitted visit layout.
+    pub(in crate::family::inkling2) fn enqueue_plain_mlp(
+        &self,
+        stream: &DeviceStream,
+        r: ResidentMlpRequest<'_>,
+    ) -> Result<(), EngError> {
+        require_packed(r.dtypes)?;
+        let routed = self.routed(r.layer)?;
+        self.context.enqueue_row_weighted_norm(
+            stream,
+            [r.input, r.gamma, r.message, r.health],
+            routed.shape.hidden,
+            r.eps,
+        )?;
+        self.enqueue_routed(
+            stream,
+            &routed,
+            (r.dtypes, (r.caps, r.scale)),
+            [r.message, r.bias, r.status, r.out],
+        )
+    }
+
     fn enqueue_routed(
         &self,
         stream: &DeviceStream,
