@@ -1,0 +1,13 @@
+// Cold-ish cache sensitivity test, not a DRAM counter. Alternates off/on and
+// evicts with 32 MiB of unrelated memory reads before each sampled kernel.
+#define main full_probe_main
+#include "probe.cu"
+#undef main
+__global__ void sweep_cache(const uint4 *v,unsigned *out,int count){int t=blockIdx.x*blockDim.x+threadIdx.x;unsigned s=0;for(int i=t;i<count;i+=gridDim.x*blockDim.x){uint4 u=v[i];s^=u.x+u.y+u.z+u.w;}out[t]=s;}
+void cold(const char *dir,int c,int m,int n,int k){int b=c==8?32:c==42?64:256;int z=c==8?34:c==14?210:c==16?66:c==42?18:c==17?74:50;size_t bytes=size_t(n)*k/b*z;auto w=load(std::string(dir)+"/"+(c==8?"q8-":"extra-"+std::to_string(c)+"-")+std::to_string(k)+"-"+std::to_string(n)+".bin",bytes);Stream s;Buffer<uint8_t>dw(bytes);Buffer<float>x(m*k),y(m*n);constexpr int Q=32*1024*1024/16,T=128*256;Buffer<uint4>ev(Q);Buffer<unsigned>sum(T);check(cudaMemset(ev.p,37,Q*16));std::vector<float>v(m*k),ref,out(m*n);for(size_t i=0;i<v.size();i++)v[i]=float(int(i%239)-117)/163.f;check(cudaMemcpy(dw.p,w.data(),bytes,cudaMemcpyHostToDevice));check(cudaMemcpy(x.p,v.data(),v.size()*4,cudaMemcpyHostToDevice));inference_cuda_dense_gemv_args a{dw.p,x.p,y.p,m,n,k,k,n,256+c};
+    auto run=[&](int on){int stage=0,tile=0,rc=0;if(c==8 || c==14)rc=on?inference_cuda_inkling_packed_visit_launch(&a,s.id,&stage,3):inference_cuda_dense_gemv_launch(&a,s.id,&stage);
+        else if(c==16 || c==42)rc=on?inference_cuda_gguf_q8_row_reuse_width_launch(&a,s.id,&stage,&tile,-1):inference_cuda_gguf_exact_expert_tile_launch(&a,s.id,&stage,&tile);
+        else rc=on?inference_cuda_inkling_iq2_visit_launch(&a,s.id,&stage):inference_cuda_gguf_wmma_launch(&a,s.id,&stage);require(!rc,"cold launch");};
+    for(int i=0;i<4;i++){run(0);run(1);}Event st,ed;for(int i=0;i<16;i++)for(int j=0;j<2;j++){int on=(i%2)^j;for(int flush=0;flush<2;flush++){if(flush)sweep_cache<<<128,256,0,s.id>>>(ev.p,sum.p,Q);else run(on);check(cudaEventRecord(st.id,s.id));run(on);check(cudaEventRecord(ed.id,s.id));check(cudaEventSynchronize(ed.id));float ms;check(cudaEventElapsedTime(&ms,st.id,ed.id));if(i==0){check(cudaMemcpy(out.data(),y.p,out.size()*4,cudaMemcpyDeviceToHost));if(!j && !flush)ref=out;require(!memcmp(ref.data(),out.data(),out.size()*4),"cold parity");}printf("%d,%d,%d,%d,%d,%d,%d,%.3f\n",c,m,n,k,i,on,flush,ms*1000.);}}
+}
+int main(int argc,char **argv){try{require(argc==2,"weights");puts("codec,m,n,k,round,on,flush,us");cold(argv[1],8,8,1024,2304);cold(argv[1],8,8,2304,3072);cold(argv[1],8,64,3072,2304);cold(argv[1],14,64,3072,2304);cold(argv[1],16,8,2304,2304);cold(argv[1],42,16,2304,1152);cold(argv[1],17,64,2304,2304);cold(argv[1],19,64,2304,2304);return 0;}catch(const std::exception &e){fprintf(stderr,"%s\n",e.what());return 1;}}
