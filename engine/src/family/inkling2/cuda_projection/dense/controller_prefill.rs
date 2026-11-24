@@ -24,14 +24,25 @@ impl DenseStep {
             .min(DenseGemvShape::MAX_ACTIVATION_ROWS))
     }
 
+    #[cfg(test)]
     pub(in crate::family::inkling2::cuda_projection) fn project_controller_batch(
         &self,
         context: &CudaContext,
         inputs: &[&[f32]],
         weights: ControllerWeights<'_>,
-        shape @ [rank, hidden]: [usize; 2],
+        shape: [usize; 2],
     ) -> Result<Option<Vec<[Vec<f32>; 2]>>, EngError> {
-        let capacity = self.controller_batch_capacity(shape)?;
+        self.project_controller_batch_bounded(context, inputs, weights, shape, usize::MAX)
+    }
+    pub(in crate::family::inkling2::cuda_projection) fn project_controller_batch_bounded(
+        &self,
+        context: &CudaContext,
+        inputs: &[&[f32]],
+        weights: ControllerWeights<'_>,
+        shape @ [rank, hidden]: [usize; 2],
+        limit: usize,
+    ) -> Result<Option<Vec<[Vec<f32>; 2]>>, EngError> {
+        let capacity = self.controller_batch_capacity(shape)?.min(limit);
         if inputs.len() < 2 || capacity < 2 {
             return Ok(None);
         }

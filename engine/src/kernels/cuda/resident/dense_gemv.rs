@@ -15,7 +15,8 @@ pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, 
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
     dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_q8_row_reuse_launch, gguf_wmma_launch,
-    try_attention_group, try_control_pair, typed_gemv_need, typed_wmma_need,
+    inkling_q8_visit_enabled, try_attention_group, try_control_pair, try_controller_pair,
+    try_expert_panel, try_qkv_pair, try_ragged_pair, typed_gemv_need, typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 use crate::weights::GgufType;
@@ -80,6 +81,7 @@ pub(crate) struct DenseGemvGroupCounts {
     pub(crate) exact_tiles: usize,
     pub(crate) q8_row_pairs: usize,
     pub(crate) q6_row_pairs: usize,
+    pub(crate) q8_grouped_visits: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -173,8 +175,15 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
     ) -> Result<(), EngError> {
-        self.dense_gemv_group_impl(stream, calls, None, false, AttentionRowReuse::default())
-            .map(|_| ())
+        self.dense_gemv_group_impl(
+            stream,
+            calls,
+            None,
+            false,
+            AttentionRowReuse::default(),
+            None,
+        )
+        .map(|_| ())
     }
 
     /// Opts measured dense attention shapes into SM75 packed weight reuse.
@@ -184,7 +193,7 @@ impl CudaContext {
         calls: &[DenseGemvCall<'_>],
         reuse: AttentionRowReuse,
     ) -> Result<DenseGemvGroupCounts, EngError> {
-        self.dense_gemv_group_impl(stream, calls, None, false, reuse)
+        self.dense_gemv_group_impl(stream, calls, None, false, reuse, None)
     }
 
     /// Selects Q8_0 row reuse for one attention projection; returns 0, 2, or 4.
@@ -221,6 +230,41 @@ impl CudaContext {
             min_wmma_rows,
             exact_tile,
             AttentionRowReuse::default(),
+            None,
+        )
+    }
+
+    /// `scratch` is a dead arena span throughout this expert stage, never another
+    /// call's operand. Decline the optimization if any range aliases it.
+    pub(crate) fn dense_gemv_group_with_panels(
+        &self,
+        stream: &DeviceStream,
+        calls: &[DenseGemvCall<'_>],
+        min_wmma_rows: Option<usize>,
+        exact_tile: bool,
+        scratch: DeviceRange<'_>,
+    ) -> Result<DenseGemvGroupCounts, EngError> {
+        let overlaps = |a: DeviceRange<'_>| {
+            std::ptr::eq(a.buffer(), scratch.buffer())
+                && a.offset() < scratch.offset() + scratch.bytes()
+                && scratch.offset() < a.offset() + a.bytes()
+        };
+        let tmp = if inkling_q8_visit_enabled()
+            && !calls
+                .iter()
+                .any(|c| overlaps(c.w) || overlaps(c.x) || overlaps(c.y))
+        {
+            Some(scratch)
+        } else {
+            None
+        };
+        self.dense_gemv_group_impl(
+            stream,
+            calls,
+            min_wmma_rows,
+            exact_tile,
+            AttentionRowReuse::default(),
+            tmp,
         )
     }
 
@@ -231,8 +275,10 @@ impl CudaContext {
         min_wmma_rows: Option<usize>,
         exact_tile: bool,
         reuse: AttentionRowReuse,
+        panel: Option<DeviceRange<'_>>,
     ) -> Result<DenseGemvGroupCounts, EngError> {
         self.check_launch_stream(stream)?;
+        let panel = panel.as_ref().map(|r| self.raw_range(r)).transpose()?;
         let min_wmma_rows = match min_wmma_rows {
             Some(rows) if self.mmq_device_facts()?.cc >= 700 => Some(rows),
             _ => None,
@@ -265,6 +311,32 @@ impl CudaContext {
             }
             let mut planned = planned.into_iter().peekable();
             while let Some((kernel, call)) = planned.next() {
+                if kernel == GroupKernel::ExactTile
+                    && inkling_q8_visit_enabled()
+                    && let Some((GroupKernel::ExactTile, next)) = planned.peek()
+                    && try_ragged_pair(raw_stream, &call, next)?
+                {
+                    planned.next();
+                    counts.exact_tiles += 1;
+                    continue;
+                }
+                if kernel == GroupKernel::Q8RowPair
+                    && inkling_q8_visit_enabled()
+                    && let Some((GroupKernel::Q8RowPair, next)) = planned.peek()
+                    && try_qkv_pair(raw_stream, &call, next)?
+                {
+                    planned.next();
+                    counts.q8_grouped_visits += 1;
+                    continue;
+                }
+                if kernel == GroupKernel::Gemv
+                    && inkling_q8_visit_enabled()
+                    && let Some((GroupKernel::Gemv, next)) = planned.peek()
+                    && try_controller_pair(raw_stream, &call, next)?
+                {
+                    planned.next();
+                    continue;
+                }
                 if pair
                     && kernel == GroupKernel::Gemv
                     && let Some((GroupKernel::Gemv, next)) = planned.peek()
@@ -280,7 +352,13 @@ impl CudaContext {
                             usize::from(gguf_q8_row_reuse_launch(raw_stream, call, false)? == 2);
                     }
                     GroupKernel::Wmma => {
-                        gguf_wmma_launch(raw_stream, call)?;
+                        let used = match panel {
+                            Some(tmp) => try_expert_panel(raw_stream, &call, tmp)?,
+                            None => false,
+                        };
+                        if !used {
+                            gguf_wmma_launch(raw_stream, call)?;
+                        }
                         counts.wmma += 1;
                     }
                     GroupKernel::ExactTile | GroupKernel::Q6RowPair => {

@@ -140,6 +140,57 @@ unsafe extern "C" {
         out_stage: *mut c_int,
         out_tile: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_inkling_ragged_pair_launch"]
+    fn inkling_ragged_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        used: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_inkling_down_launch"]
+    fn inkling_down_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_inkling_panel_launch"]
+    fn inkling_panel_raw(
+        args: *const DenseGemvArgsRaw,
+        tmp: *mut c_void,
+        bytes: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        used: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_inkling_qkv_visit_launch"]
+    fn inkling_qkv_raw(
+        args: *const DenseGemvArgsRaw,
+        count: c_int,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        used: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_inkling_packed_visit_launch"]
+    fn inkling_packed_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        variant: c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_inkling_controller_pair_launch"]
+    fn inkling_heads_raw(
+        a: *const DenseGemvArgsRaw,
+        b: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        used: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_inkling_iq2_visit_launch"]
+    fn inkling_iq2_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_gguf_wmma_launch"]
     fn gguf_wmma_raw(
         args: *const DenseGemvArgsRaw,
@@ -267,7 +318,28 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
     call: DenseGemvRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
-    projection_launch(stream, call, need, ProjectionEntry::Gemv).map(|_| ())
+    use GgufType::{Iq1S, Iq2S, Iq2Xs, Iq3Xxs, Q4K, Q5K, Q6K, Q80};
+    let (m, n, k) = (call.dims.m, call.dims.rows, call.dims.cols);
+    let attn = matches!(
+        call.dtype,
+        DenseDtype::PackedGguf(Q80 | Q4K | Q5K | Q6K | Iq3Xxs)
+    ) && matches!(m, 6 | 7 | 8 | 63 | 64 | 127 | 128 | 255 | 256)
+        && matches!((n, k), (384 | 1024 | 3072, 2304) | (2304, 3072))
+        && !(n == 384 && m <= 8 && call.dtype != DenseDtype::PackedGguf(Q80));
+    let expert = matches!(call.dtype, DenseDtype::PackedGguf(Iq2Xs | Iq1S | Iq2S))
+        && (5..=15).contains(&m)
+        && (n, k) == (2304, 2304);
+    let down = call.dtype == DenseDtype::F32
+        && (n, k) == (64, 4608)
+        && matches!(m, 7 | 8 | 21 | 63 | 64 | 127 | 128 | 255 | 256);
+    let entry = if down && inkling_q8_visit_enabled() {
+        ProjectionEntry::ControllerDown
+    } else if (attn || expert) && inkling_q8_visit_enabled() {
+        ProjectionEntry::PackedVisit(3)
+    } else {
+        ProjectionEntry::Gemv
+    };
+    projection_launch(stream, call, need, entry).map(|_| ())
 }
 
 /// Same strided F32 extents and checks as ordinary GEMV. Native dispatch checks the active device.
@@ -288,7 +360,19 @@ pub(in crate::kernels::cuda) fn gguf_exact_expert_tile_launch(
     call: DenseGemvRaw<'_>,
 ) -> Result<bool, DeviceFailure> {
     let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
-    projection_launch(stream, call, need, ProjectionEntry::ExactExpertTile).map(|tile| tile != 0)
+    let dims = call.dims;
+    let visit = match (call.dtype, dims.rows, dims.cols, dims.m) {
+        (DenseDtype::PackedGguf(GgufType::Q6K), 3072, 2304, 8 | 63 | 64)
+        | (DenseDtype::PackedGguf(GgufType::Iq2Xxs), 2304, 2304, 4..=16)
+        | (DenseDtype::PackedGguf(GgufType::Q20), 2304, 1152, 4..=32) => inkling_q8_visit_enabled(),
+        _ => false,
+    };
+    let entry = if visit {
+        ProjectionEntry::Q8RowReuse(false)
+    } else {
+        ProjectionEntry::ExactExpertTile
+    };
+    projection_launch(stream, call, need, entry).map(|tile| tile != 0)
 }
 
 pub(in crate::kernels::cuda) fn gguf_wmma_launch(
@@ -296,26 +380,50 @@ pub(in crate::kernels::cuda) fn gguf_wmma_launch(
     call: DenseGemvRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let need = typed_wmma_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
-    projection_launch(stream, call, need, ProjectionEntry::Wmma).map(|_| ())
+    let eligible = matches!(
+        (call.dtype, call.dims.rows, call.dims.cols),
+        (
+            DenseDtype::PackedGguf(GgufType::Iq2Xs | GgufType::Iq1S | GgufType::Iq2S),
+            2304,
+            2304
+        ) | (DenseDtype::GgufNvfp4, 2304, 1152)
+    );
+    let entry = if eligible
+        && call.dims.m <= 512
+        && call.dims.ld_x <= GEMV_MAX_LD
+        && call.dims.ld_y <= GEMV_MAX_LD
+        && inkling_q8_visit_enabled()
+    {
+        ProjectionEntry::Iq2Visit
+    } else {
+        ProjectionEntry::Wmma
+    };
+    projection_launch(stream, call, need, entry).map(|_| ())
+}
+
+pub(in crate::kernels::cuda) fn inkling_q8_visit_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_VISIT").as_deref() == Ok("1"))
 }
 
 enum ProjectionEntry {
     Gemv,
     Wmma,
+    Iq2Visit,
+    PackedVisit(c_int),
+    ControllerDown,
     ExactExpertTile,
     Q8RowReuse(bool),
 }
 
-fn projection_launch(
-    stream: &RawStream,
-    call: DenseGemvRaw<'_>,
+fn projection_args(
+    call: &DenseGemvRaw<'_>,
     need: DenseGemvBytes,
-    entry: ProjectionEntry,
-) -> Result<c_int, DeviceFailure> {
-    check(&call, need)?;
+) -> Result<DenseGemvArgsRaw, DeviceFailure> {
+    check(call, need)?;
     let dims = call.dims;
     let as_int = |v: usize| c_int::try_from(v).map_err(|_| invalid_argument());
-    let args = DenseGemvArgsRaw {
+    Ok(DenseGemvArgsRaw {
         w: call.w.address().cast_const(),
         x: call.x.address().cast_const(),
         y: call.y.address(),
@@ -325,7 +433,174 @@ fn projection_launch(
         ld_x: as_int(dims.ld_x)?,
         ld_y: as_int(dims.ld_y)?,
         weight_dtype: call.dtype.code(),
+    })
+}
+
+pub(in crate::kernels::cuda) fn try_expert_panel(
+    stream: &RawStream,
+    call: &DenseGemvRaw<'_>,
+    tmp: RawRange<'_>,
+) -> Result<bool, DeviceFailure> {
+    if !(33..=512).contains(&call.dims.m)
+        || call.dims.rows != 2304
+        || !matches!(
+            (call.dtype, call.dims.cols),
+            (DenseDtype::GgufNvfp4, 1152)
+                | (
+                    // IQ1_S direct WMMA with a CTA-local codebook beats two stages.
+                    DenseDtype::PackedGguf(GgufType::Iq2Xs | GgufType::Iq2S),
+                    2304
+                )
+        )
+    {
+        return Ok(false);
+    }
+    let bytes = call.dims.rows * call.dims.cols * 2;
+    if !fits(&tmp, bytes, 16) || call.dims.ld_x > GEMV_MAX_LD || call.dims.ld_y > GEMV_MAX_LD {
+        return Ok(false);
+    }
+    let need = typed_wmma_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+    let scratch = Span::of(&tmp, bytes);
+    if !scratch.apart(&Span::of(&call.w, need.w))
+        || !scratch.apart(&Span::of(&call.x, need.x))
+        || !scratch.apart(&Span::of(&call.y, need.y))
+    {
+        return Ok(false);
+    }
+    let args = projection_args(call, need)?;
+    let (mut stage, mut used) = (STAGE_NONE, 0);
+    // SAFETY: operands and scratch are validated live ranges and disjoint. The
+    // caller reserved this span exclusively until the stream-ordered stage ends.
+    let status = unsafe {
+        inkling_panel_raw(
+            &raw const args,
+            tmp.address(),
+            bytes,
+            stream.0.as_ptr(),
+            &mut stage,
+            &mut used,
+        )
     };
+    checked(status, stage)?;
+    Ok(used != 0)
+}
+
+pub(in crate::kernels::cuda) fn try_ragged_pair(
+    stream: &RawStream,
+    a: &DenseGemvRaw<'_>,
+    b: &DenseGemvRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    if a.dtype != b.dtype
+        || a.dims.rows != 2304
+        || a.dims.rows != b.dims.rows
+        || a.dims.cols != b.dims.cols
+    {
+        return Ok(false);
+    }
+    let max = match (a.dtype, a.dims.cols) {
+        (DenseDtype::PackedGguf(GgufType::Iq2Xxs), 2304) => 16,
+        (DenseDtype::PackedGguf(GgufType::Q20), 1152) => 32,
+        _ => return Ok(false),
+    };
+    let bin = |m| match m {
+        4 => Some(0),
+        5..=8 => Some(1),
+        9.. if m <= max => Some(2),
+        _ => None,
+    };
+    if bin(a.dims.m).is_none() || bin(a.dims.m) != bin(b.dims.m) {
+        return Ok(false);
+    }
+    let raw = |c: &DenseGemvRaw<'_>| {
+        projection_args(
+            c,
+            typed_gemv_need(c.dims, c.dtype).ok_or_else(invalid_argument)?,
+        )
+    };
+    let args = [raw(a)?, raw(b)?];
+    let (mut stage, mut used) = (STAGE_NONE, 0);
+    // SAFETY: two validated, live single-call operand sets. The native entry
+    // rechecks all five cross-call write hazards before enqueueing a joint grid.
+    let status =
+        unsafe { inkling_ragged_raw(args.as_ptr(), stream.0.as_ptr(), &mut stage, &mut used) };
+    checked(status, stage)?;
+    Ok(used != 0)
+}
+
+pub(in crate::kernels::cuda) fn try_qkv_pair(
+    stream: &RawStream,
+    a: &DenseGemvRaw<'_>,
+    b: &DenseGemvRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    if a.dims.rows != 1024
+        || b.dims.rows != 1024
+        || a.dims.cols != 2304
+        || b.dims.cols != 2304
+        || !matches!(a.dims.m, 7 | 8)
+        || b.dims.m != a.dims.m
+        || a.dtype != DenseDtype::PackedGguf(GgufType::Q80)
+        || a.dtype != b.dtype
+    {
+        return Ok(false);
+    }
+    let args = [
+        projection_args(
+            a,
+            typed_gemv_need(a.dims, a.dtype).ok_or_else(invalid_argument)?,
+        )?,
+        projection_args(
+            b,
+            typed_gemv_need(b.dims, b.dtype).ok_or_else(invalid_argument)?,
+        )?,
+    ];
+    let (mut stage, mut used) = (STAGE_NONE, 0);
+    // SAFETY: projection_args proved both per-call ranges; the native admission
+    // checks every cross-call output conflict before submitting a single kernel.
+    let status =
+        unsafe { inkling_qkv_raw(args.as_ptr(), 2, stream.0.as_ptr(), &mut stage, &mut used) };
+    checked(status, stage)?;
+    Ok(used != 0)
+}
+
+pub(in crate::kernels::cuda) fn try_controller_pair(
+    stream: &RawStream,
+    a: &DenseGemvRaw<'_>,
+    b: &DenseGemvRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    if a.dtype != DenseDtype::F32
+        || b.dtype != a.dtype
+        || a.dims.cols != 64
+        || a.dims.rows != 2304
+        || b.dims != a.dims
+        || a.x.address() != b.x.address()
+    {
+        return Ok(false);
+    }
+    let need = || typed_gemv_need(a.dims, a.dtype).ok_or_else(invalid_argument);
+    let (a, b) = (projection_args(a, need()?)?, projection_args(b, need()?)?);
+    let (mut stage, mut used) = (STAGE_NONE, 0);
+    // SAFETY: projection_args validated both live ranges. Native checks cross-call
+    // overlap, strides and alignment before treating the two calls as independent.
+    let status = unsafe {
+        inkling_heads_raw(
+            &raw const a,
+            &raw const b,
+            stream.0.as_ptr(),
+            &mut stage,
+            &mut used,
+        )
+    };
+    checked(status, stage)?;
+    Ok(used != 0)
+}
+
+fn projection_launch(
+    stream: &RawStream,
+    call: DenseGemvRaw<'_>,
+    need: DenseGemvBytes,
+    entry: ProjectionEntry,
+) -> Result<c_int, DeviceFailure> {
+    let args = projection_args(&call, need)?;
     let mut stage = STAGE_NONE;
     let mut selected = 0;
     let stream = stream.0.as_ptr();
@@ -337,6 +612,13 @@ fn projection_launch(
     let status = unsafe {
         match entry {
             ProjectionEntry::Gemv => dense_gemv_raw(&raw const args, stream, &mut stage),
+            ProjectionEntry::ControllerDown => {
+                inkling_down_raw(&raw const args, stream, &mut stage)
+            }
+            ProjectionEntry::PackedVisit(variant) => {
+                inkling_packed_raw(&raw const args, stream, &mut stage, variant)
+            }
+            ProjectionEntry::Iq2Visit => inkling_iq2_raw(&raw const args, stream, &mut stage),
             ProjectionEntry::Wmma => gguf_wmma_raw(&raw const args, stream, &mut stage),
             ProjectionEntry::ExactExpertTile => {
                 gguf_exact_expert_tile_raw(&raw const args, stream, &mut stage, &mut selected)
@@ -346,7 +628,11 @@ fn projection_launch(
                 stream,
                 &mut stage,
                 &mut selected,
-                four.into(),
+                if inkling_q8_visit_enabled() {
+                    -1
+                } else {
+                    four.into()
+                },
             ),
         }
     };

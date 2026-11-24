@@ -107,6 +107,7 @@ enum BatchWeights<'a> {
 
 pub(in crate::family::inkling2) struct BatchController<'a> {
     cuda: &'a GgufCuda,
+    step: &'a DenseStep,
     weights: BatchWeights<'a>,
     shape: [usize; 2],
     capacity: usize,
@@ -125,9 +126,14 @@ impl BatchController<'_> {
             }
         };
         let values = self
-            .cuda
             .step
-            .project_controller_batch(&self.cuda.context, inputs, weights, self.shape)?
+            .project_controller_batch_bounded(
+                &self.cuda.context,
+                inputs,
+                weights,
+                self.shape,
+                self.capacity,
+            )?
             .ok_or_else(|| bad("CUDA controller batch was not admitted"))?;
         if staged {
             static USED: std::sync::Once = std::sync::Once::new();
@@ -267,7 +273,11 @@ impl AttentionControllers<'_> {
             let capacity = wide
                 .controlled_attention_batch_capacity(self.shape, *weights)?
                 .unwrap_or(0);
-            let target = controller_workspace::TILE_ROWS;
+            let desired = controller_workspace::target_rows();
+            let target = [256, 128, 64, controller_workspace::TILE_ROWS]
+                .into_iter()
+                .find(|&r| r <= capacity && r <= desired)
+                .unwrap_or(controller_workspace::TILE_ROWS);
             if capacity >= target && target > baseline {
                 return Ok((wide, target));
             }
@@ -321,6 +331,7 @@ impl AttentionControllers<'_> {
                 let controllers = self.weights.map(|weights| {
                     weights.map(|weights| BatchController {
                         cuda: self.cuda,
+                        step: &self.cuda.step,
                         weights: BatchWeights::Resident(weights),
                         shape: self.shape,
                         capacity,
@@ -1195,11 +1206,28 @@ impl GgufCuda {
                 BatchWeights::Cold(staging, payload)
             }
         };
+        // The chained attention tile was synchronously consumed before the
+        // MLP controller. Borrow its workspace, not any resident weights.
+        static WIDE_MLP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let target = controller_workspace::target_rows();
+        let mut selected = (&self.step, capacity);
+        if target > capacity
+            && *WIDE_MLP.get_or_init(|| {
+                std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_MLP").as_deref() == Ok("1")
+            })
+            && let Some(wide) = &self.controlled_attention_step
+        {
+            let cap = wide.controller_batch_capacity(shape)?.min(target);
+            if cap > capacity {
+                selected = (wide, cap);
+            }
+        }
         Ok(Some(BatchController {
             cuda: self,
+            step: selected.0,
             weights,
             shape,
-            capacity,
+            capacity: selected.1,
         }))
     }
 

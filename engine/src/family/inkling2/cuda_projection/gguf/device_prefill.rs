@@ -840,6 +840,25 @@ impl Scratch {
                 })
             })
             .collect::<Result<Vec<_>, EngError>>()?;
+        static PANELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PANELS.get_or_init(|| {
+            std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_PANELS").as_deref() == Ok("1")
+        }) {
+            // Down is unwritten during gate; gate is dead after row_clipped_expert.
+            // Both stages and all users of these spans are ordered on self.stream.
+            let dead = if stage == 0 { &l.down } else { &l.gate };
+            let pad = (16 - dead.start % 16) % 16;
+            if dead.len() > pad {
+                let tmp = self.buffer.range(dead.start + pad, dead.len() - pad)?;
+                return cuda.dense_gemv_group_with_panels(
+                    &self.stream,
+                    &calls,
+                    minimum,
+                    projections.exact_tile,
+                    tmp,
+                );
+            }
+        }
         cuda.dense_gemv_group_with_tiles(&self.stream, &calls, minimum, projections.exact_tile)
     }
 }

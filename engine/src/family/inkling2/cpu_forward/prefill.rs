@@ -21,6 +21,9 @@ use crate::{
 mod resident_first;
 mod resident_mlp;
 
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod weight_visit_tests;
+
 struct PromptRow<'a> {
     stream: Stream,
     prelude: Option<Stream>,
