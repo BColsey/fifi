@@ -170,7 +170,7 @@ impl ProbeInput {
 
     /// One oracle row covers the prompt's own logits; each continuation step needs one more.
     fn continuation_fits_oracle(continuation: usize, oracle_steps: usize) -> bool {
-        continuation + 1 <= oracle_steps
+        continuation < oracle_steps
     }
 
     /// The token a position consumes: the prompt's own, or once the prompt is exhausted the

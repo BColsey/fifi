@@ -30,7 +30,21 @@ impl Projection<'_> {
         QuantType::from_gguf(ty).is_some()
     }
 
+    /// What a decode step computes by default: the f32 activation against the exactly decoded
+    /// weights.
     pub(super) fn run(&self, ty: GgufType, blocks: &[u8], x: &[f32]) -> Result<Vec<f32>, EngError> {
+        let out = project_exact(self.ctx, self.stream, ty, blocks, x)?;
+        self.launches.set(self.launches.get() + 1);
+        Ok(out)
+    }
+
+    /// The 8-bit-activation arithmetic, for an explicit comparison only.
+    pub(super) fn run_q8(
+        &self,
+        ty: GgufType,
+        blocks: &[u8],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
         let out = project(self.ctx, self.stream, ty, blocks, x)?;
         self.launches.set(self.launches.get() + 1);
         Ok(out)
@@ -89,6 +103,7 @@ impl Projection<'_> {
     }
 }
 
+/// The 8-bit form: the activation quantized to q8_1, then the native integer matvec.
 fn project(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -142,6 +157,56 @@ fn project(
         },
     )?;
     let mut out = vec![0_u8; live * size_of::<f32>()];
+    y.read_at(stream, 0, &mut out)?;
+    Ok(out
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| f32::from_ne_bytes(bytes))
+        .collect())
+}
+
+/// The exact form: the f32 activation against the exactly decoded weights, in one launch.
+fn project_exact(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    ty: GgufType,
+    blocks: &[u8],
+    x: &[f32],
+) -> Result<Vec<f32>, EngError> {
+    use crate::kernels::cuda::resident::matvec_gguf_f32::DenseF32Call;
+    let bad = |message: &str| {
+        EngError::BadRequest(format!("Flash-Next CUDA exact projection probe: {message}"))
+    };
+    let ty = QuantType::from_gguf(ty).ok_or_else(|| bad("no native quantized matvec"))?;
+    let k = x.len();
+    let row_bytes = ty
+        .weight_bytes(1, k)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| bad("invalid input width"))?;
+    if blocks.is_empty() || !blocks.len().is_multiple_of(row_bytes) {
+        return Err(bad("expected whole weight rows"));
+    }
+    let rows = blocks.len() / row_bytes;
+    let x_host: Vec<u8> = x.iter().flat_map(|value| value.to_ne_bytes()).collect();
+    let w = ctx.allocate(blocks.len())?;
+    let input = ctx.allocate(x_host.len())?;
+    let y = ctx.allocate(rows * size_of::<f32>())?;
+    w.write_at(stream, 0, blocks)?;
+    input.write_at(stream, 0, &x_host)?;
+    ctx.matvec_gguf_f32(
+        stream,
+        DenseF32Call {
+            ty,
+            w: w.range(0, blocks.len())?,
+            x: input.range(0, x_host.len())?,
+            y: y.range(0, rows * size_of::<f32>())?,
+            k,
+            rows,
+            ncols: 1,
+        },
+    )?;
+    let mut out = vec![0_u8; rows * size_of::<f32>()];
     y.read_at(stream, 0, &mut out)?;
     Ok(out
         .as_chunks::<4>()

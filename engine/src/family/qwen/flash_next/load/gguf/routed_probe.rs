@@ -15,6 +15,7 @@ use super::{
 use crate::{
     family::{
         expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
+        qwen::flash_next::step::GgufDecodePrecision,
         recipe::Role,
     },
     kernels::cuda::{
@@ -29,6 +30,8 @@ use crate::{
 
 pub(in super::super::super) struct Inputs<'a> {
     pub layer: usize,
+    /// The arithmetic the step under test runs; the probe's experts run the same one.
+    pub precision: GgufDecodePrecision,
     pub host_capture: &'a std::path::Path,
     pub x: DeviceRange<'a>,
     pub route_ids: DeviceRange<'a>,
@@ -128,6 +131,29 @@ fn read_f32(stream: &DeviceStream, buffer: &DeviceBuffer) -> Vec<f32> {
         .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
         .collect()
 }
+/// `ncols` activation rows of `k` values, quantized to q8_1: the opt-out's input.
+fn quantized(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    x: DeviceRange<'_>,
+    k: usize,
+    ncols: usize,
+) -> DeviceBuffer {
+    let q = ctx.allocate(q8_1_bytes(k, ncols).unwrap()).unwrap();
+    let call = QuantizeCall {
+        x,
+        y: all(&q),
+        k,
+        ncols,
+    };
+    if ncols == 1 {
+        ctx.quantize_q8_1(stream, call).unwrap();
+    } else {
+        ctx.quantize_q8_1_rows(stream, call).unwrap();
+    }
+    q
+}
+
 fn relative_l2(got: &[f32], want: &[f32]) -> f64 {
     assert_eq!(got.len(), want.len());
     let (err, norm) = got.iter().zip(want).fold((0f64, 0f64), |(e, n), (&a, &b)| {
@@ -494,33 +520,24 @@ pub(in super::super::super) fn run(
     assert_eq!((gate.k, gate.rows), (up.k, up.rows));
     let (hidden, inter) = (gate.k, gate.rows);
     assert_eq!((down.k, down.rows), (inter, hidden));
-    let qx = ctx.allocate(q8_1_bytes(hidden, 1).unwrap()).unwrap();
-    ctx.quantize_q8_1(
-        stream,
-        QuantizeCall {
-            x: input.x,
-            y: all(&qx),
-            k: hidden,
-            ncols: 1,
-        },
-    )
-    .unwrap();
+    // The arithmetic the step runs: the f32 row for Exact, its q8_1 form only for the opt-out.
+    let exact = input.precision == GgufDecodePrecision::Exact;
+    let row = (!exact).then(|| quantized(ctx, stream, input.x, hidden, 1));
     let gu = ctx.allocate(used * 2 * inter * 4).unwrap();
     for (projection, offset) in [(gate, 0), (up, inter * 4)] {
-        projection
-            .launch(
-                ctx,
-                stream,
-                ExpertProjectionInputs {
-                    ids: all(ids),
-                    x: all(&qx),
-                    x_per_slot: false,
-                    output: gu.range(offset, gu.bytes() - offset).unwrap(),
-                    output_stride: 2 * inter,
-                    used,
-                },
-            )
-            .unwrap();
+        let inputs = ExpertProjectionInputs {
+            ids: all(ids),
+            x: row.as_ref().map_or(input.x, |q| all(q)),
+            x_per_slot: false,
+            output: gu.range(offset, gu.bytes() - offset).unwrap(),
+            output_stride: 2 * inter,
+            used,
+        };
+        if exact {
+            projection.launch_exact(ctx, stream, inputs).unwrap();
+        } else {
+            projection.launch(ctx, stream, inputs).unwrap();
+        }
     }
     let act = ctx.allocate(used * inter * 4).unwrap();
     ctx.swiglu_rows(
@@ -538,31 +555,21 @@ pub(in super::super::super) fn run(
         },
     )
     .unwrap();
-    let qa = ctx.allocate(q8_1_bytes(inter, used).unwrap()).unwrap();
-    ctx.quantize_q8_1_rows(
-        stream,
-        QuantizeCall {
-            x: all(&act),
-            y: all(&qa),
-            k: inter,
-            ncols: used,
-        },
-    )
-    .unwrap();
+    let rows_q = (!exact).then(|| quantized(ctx, stream, all(&act), inter, used));
     let outputs = ctx.allocate(used * hidden * 4).unwrap();
-    down.launch(
-        ctx,
-        stream,
-        ExpertProjectionInputs {
-            ids: all(ids),
-            x: all(&qa),
-            x_per_slot: true,
-            output: all(&outputs),
-            output_stride: hidden,
-            used,
-        },
-    )
-    .unwrap();
+    let inputs = ExpertProjectionInputs {
+        ids: all(ids),
+        x: rows_q.as_ref().map_or(all(&act), |q| all(q)),
+        x_per_slot: true,
+        output: all(&outputs),
+        output_stride: hidden,
+        used,
+    };
+    if exact {
+        down.launch_exact(ctx, stream, inputs).unwrap();
+    } else {
+        down.launch(ctx, stream, inputs).unwrap();
+    }
     let routed_buffer = ctx.allocate(hidden * 4).unwrap();
     let routed = combine(
         ctx,
@@ -642,8 +649,8 @@ pub(in super::super::super) fn run(
     let total_error = relative_l2(&total, &expected);
     if compared > 0 {
         eprintln!(
-            "pinned composed layer={layer} routed MoE initial misses={} common_experts={compared}/{used} max per-expert relative L2 gate={:.6} up={:.6} act={:.6} down={:.6}; routed={routed_error:.6} combined={total_error:.6}",
-            input.initial_misses, maxima[0], maxima[1], maxima[2], maxima[3]
+            "pinned composed layer={layer} precision={:?} routed MoE initial misses={} common_experts={compared}/{used} max per-expert relative L2 gate={:.6} up={:.6} act={:.6} down={:.6}; routed={routed_error:.6} combined={total_error:.6}",
+            input.precision, input.initial_misses, maxima[0], maxima[1], maxima[2], maxima[3]
         );
     } else {
         eprintln!(

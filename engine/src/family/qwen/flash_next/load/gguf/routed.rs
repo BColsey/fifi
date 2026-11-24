@@ -235,8 +235,8 @@ impl<'a> PersistentRouted<'a> {
         }
         let picks = read_picks(self.stream, bufs.route.ids, dims)?;
         let index = layer - self.layers.start;
-        let bank = &mut self.banks[index];
-        let copies = self.refills[index].step(bank, &mut self.state, &picks)?;
+        let copies = self.refills[index].step(&mut self.banks[index], &mut self.state, &picks)?;
+        let bank = &self.banks[index];
         let row = self.state.slot_row(layer);
         let mut slot_bytes = Vec::with_capacity(dims.top_k * 4);
         #[cfg(test)]
@@ -252,14 +252,10 @@ impl<'a> PersistentRouted<'a> {
         }
         self.slots.write_at(self.stream, 0, &slot_bytes)?;
         launch_experts(
-            self.ctx,
-            self.stream,
+            self,
             bank,
-            &self.state,
-            (&self.slots, &self.qx, &self.qa),
             bufs,
             dims,
-            self.precision,
             #[cfg(test)]
             TestProbes {
                 layer,
@@ -309,18 +305,19 @@ fn read_picks(
     Ok(picks)
 }
 
+/// The expert launches of one routed call, on the owner's stream, from its bank state and
+/// scratch, with its arithmetic.
 fn launch_experts(
-    ctx: &CudaContext,
-    stream: &DeviceStream,
+    owner: &PersistentRouted<'_>,
     bank: &ExpertDeviceStacks<'_>,
-    state: &ExpertBankState<ReplaceOnMissLru>,
-    scratch: (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
-    precision: GgufDecodePrecision,
     #[cfg(test)] probes: TestProbes<'_>,
 ) -> Result<(), EngError> {
-    let (ids, qx, qa) = scratch;
+    let (ctx, stream) = (owner.ctx, owner.stream);
+    let state = &owner.state;
+    let (ids, qx, qa) = (&owner.slots, &owner.qx, &owner.qa);
+    let precision = owner.precision;
     let (gate, up, down) = (
         bank.projection(state, Role::ExpertGate)?,
         bank.projection(state, Role::ExpertUp)?,

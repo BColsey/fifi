@@ -207,8 +207,12 @@ impl<'a> HostProjector<'a> {
                     && matches!(part.ty, GgufType::Q80 | GgufType::Q6K)
                     && std::env::var_os("FIFI_FLASH_GGUF_TRUNK_F16").is_some();
                 let use_f16 = expert_f16 || trunk_f16;
+                // The 8-bit-activation arithmetic only when a comparison asks for it by name.
+                let q8 = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_Q8").is_some();
                 out.extend(if use_f16 {
                     cuda.run_f16(part.ty, &bytes, x)?
+                } else if q8 {
+                    cuda.run_q8(part.ty, &bytes, x)?
                 } else {
                     cuda.run(part.ty, &bytes, x)?
                 });

@@ -568,6 +568,7 @@ fn gguf_first_layer_moe_matches_pinned_host() {
             &stream,
             routed_probe::Inputs {
                 layer: 0,
+                precision: step.gguf_decode_precision(),
                 host_capture: std::path::Path::new(&capture),
                 x: step.slot(Slot::Mixed(Site::Mlp)).unwrap(),
                 route_ids: step.slot(Slot::TopkId).unwrap(),
@@ -774,6 +775,7 @@ fn gguf_two_layers_with_ple_match_pinned_host() {
                 &stream,
                 routed_probe::Inputs {
                     layer,
+                    precision: step.gguf_decode_precision(),
                     host_capture: std::path::Path::new(capture),
                     x: step.slot(Slot::Mixed(Site::Mlp)).unwrap(),
                     route_ids: step.slot(Slot::TopkId).unwrap(),

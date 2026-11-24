@@ -277,6 +277,7 @@ fn run_layer<'a>(step: &FlashStep<'a>, reference: &LayerReference, host: &[f32],
             step.stream,
             routed_probe::Inputs {
                 layer,
+                precision: step.gguf_decode_precision(),
                 host_capture: &reference.capture,
                 x: step.slot(Slot::Mixed(Site::Mlp)).unwrap(),
                 route_ids: step.slot(Slot::TopkId).unwrap(),
@@ -435,6 +436,7 @@ fn pinned_matched_layer_zero_moe_diagnostic() {
         &stream,
         routed_probe::Inputs {
             layer: 0,
+            precision: step.gguf_decode_precision(),
             host_capture: &capture,
             x: mixed,
             route_ids: step.slot(Slot::TopkId).unwrap(),
