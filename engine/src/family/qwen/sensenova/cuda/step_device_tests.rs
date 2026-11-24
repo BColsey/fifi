@@ -1470,7 +1470,7 @@ fn q8_1_activation_effect_on_the_saved_rows() {
                         if ffn {
                             "post norm (a stand-in row for the FFN)"
                         } else {
-                            "mixer norm"
+                            "mixer norm (a stand-in row on an mHC visit)"
                         },
                         worst_abs(&row),
                         step,
@@ -1700,7 +1700,8 @@ fn card_products(
 /// the quantizer, and the step each takes from the f32 row. Then the head from the saved final
 /// row, which must give the saved logits row. The row is the visit's input under the mixer's
 /// norm or under the post norm; under the post norm it is a stand-in for the FFN's input, which
-/// the trace does not hold, so the FFN lines' step is that of the stand-in row. The kernel
+/// the trace does not hold, and on an mHC visit it is a stand-in for the routed mixer input
+/// too, so the FFN lines' step is that of the stand-in row. The kernel
 /// checks hold for any row.
 #[test]
 fn card_projection_kernels_over_their_own_q8_1_bytes() {
@@ -1768,7 +1769,7 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
                     if ffn {
                         ", the visit's input, a stand-in row for the FFN"
                     } else {
-                        ""
+                        ", the visit's input, a stand-in row on an mHC visit"
                     },
                     row.equal
                 );
