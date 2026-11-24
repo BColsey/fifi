@@ -418,6 +418,233 @@ fn card_trunk_matches_the_cpu_reference() {
     );
 }
 
+/// The position probe (the lane's diagnostic): the prompt through position
+/// `SENSENOVA_PROBE_POS` (default 16) on the card against the CPU reference, every
+/// position traced; the last three print their per-visit dump and their head split, and
+/// every row of those three is saved raw under `SENSENOVA_PROBE_ROWS`, with the reference
+/// rows of the last five. Then a
+/// fresh card prefills rows 0..=N for each of those five N and its row stands against the
+/// reference row at N. With `SENSENOVA_PROBE_CARD_ONLY` set no CPU step runs: the rows come
+/// from that directory, so the prefill runs on the default route in one process and on
+/// `FIFI_SENSENOVA_PREFILL_GEMM=dq` in the next. The decode step has no route: every
+/// projection in it, the head included, takes the q8_1 row and the matvec. Nothing is
+/// asserted beyond the shapes.
+#[test]
+fn card_position_probe() {
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova position probe") else {
+        return;
+    };
+    let probe = std::env::var("SENSENOVA_PROBE_POS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| (5..PROMPT.len()).contains(n))
+        .unwrap_or(16);
+    let rows_dir = std::env::var("SENSENOVA_PROBE_ROWS").unwrap_or_default();
+    let prefilled = prefill_rows(&ctx, &loaded, &weights, &mut projector, probe);
+    let reference: Vec<Vec<f32>> = if std::env::var_os("SENSENOVA_PROBE_CARD_ONLY").is_some() {
+        prefilled
+            .iter()
+            .map(|(n, _)| load_row(&rows_dir, *n))
+            .collect()
+    } else {
+        decode_walk(&ctx, &loaded, &weights, &mut projector, probe, &rows_dir)
+    };
+    let route = std::env::var("FIFI_SENSENOVA_PREFILL_GEMM").unwrap_or("default".to_owned());
+    for ((n, row), reference) in prefilled.iter().zip(&reference) {
+        assert_eq!(row.len(), reference.len(), "the vocab widths differ");
+        eprintln!(
+            "prefill 0..={n:2} route {route:<7} diff {:9.4} margin {:-8.3} ids {} {}",
+            max_abs_diff(reference, row),
+            top2_margin(reference),
+            argmax(reference),
+            argmax(row)
+        );
+    }
+}
+
+/// The prompt through `probe` on the card against the CPU reference, one position per
+/// line. Returns the reference rows of the last five positions; given a directory, saves
+/// those and every row of the last three there as little-endian f32.
+fn decode_walk(
+    ctx: &Rc<CudaContext>,
+    loaded: &CudaWeights,
+    weights: &LoopWeights,
+    projector: &mut GgufProjector,
+    probe: usize,
+    rows_dir: &str,
+) -> Vec<Vec<f32>> {
+    let mut state = LoopState::new(weights.shape(), weights.plan());
+    let mut card = open_card(ctx, loaded, weights, CACHE_ROWS);
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    let save = !rows_dir.is_empty();
+    if save {
+        std::fs::create_dir_all(rows_dir).unwrap();
+    }
+    for (pos, &token) in PROMPT.iter().take(probe + 1).enumerate() {
+        let mut cpu_trace = Vec::new();
+        let mut card_trace = Vec::new();
+        let (reference, drawn, cpu_us, card_us) = both(
+            ctx,
+            projector,
+            weights,
+            &mut state,
+            &mut card,
+            token,
+            pos as u32,
+            Some(&mut cpu_trace),
+            Some(&mut card_trace),
+        )
+        .unwrap();
+        assert_eq!(
+            cpu_trace.len(),
+            2 * super::super::TRUNK_LAYERS,
+            "the trace is not whole"
+        );
+        eprintln!(
+            "pos {pos:2} diff {:9.4} margin {:-8.3} cpu_ms {:6} card_ms {:6} ids {} {}",
+            max_abs_diff(&reference, &drawn),
+            top2_margin(&reference),
+            cpu_us / 1000,
+            card_us / 1000,
+            argmax(&reference),
+            argmax(&drawn)
+        );
+        if pos + 3 > probe {
+            visit_dump(&cpu_trace, &card_trace);
+            let (cpu_final, card_final) = (cpu_trace.last().unwrap(), card_trace.last().unwrap());
+            let (normed_ref, normed_card) = head_split(
+                projector, weights, &reference, &drawn, cpu_final, card_final,
+            );
+            if save {
+                save_rows(rows_dir, &format!("visits-ref-{pos}"), &cpu_trace);
+                save_rows(rows_dir, &format!("visits-card-{pos}"), &card_trace);
+                save_rows(rows_dir, &format!("final-ref-{pos}"), one(cpu_final));
+                save_rows(rows_dir, &format!("final-card-{pos}"), one(card_final));
+                save_rows(rows_dir, &format!("normed-ref-{pos}"), one(&normed_ref));
+                save_rows(rows_dir, &format!("normed-card-{pos}"), one(&normed_card));
+                save_rows(rows_dir, &format!("logits-card-{pos}"), one(&drawn));
+            }
+        }
+        if pos + 5 > probe {
+            if save {
+                save_rows(rows_dir, &format!("ref-{pos}"), one(&reference));
+            }
+            rows.push(reference);
+        }
+    }
+    rows
+}
+
+/// One row as a row list, for `save_rows`.
+fn one<T>(row: &T) -> &[T] {
+    std::slice::from_ref(row)
+}
+
+/// Rows saved raw: little-endian f32 words in one file per name, the rows concatenated.
+fn save_rows<T: AsRef<[f32]>>(dir: &str, name: &str, rows: &[T]) {
+    let flat: Vec<f32> = rows.iter().flat_map(|row| row.as_ref()).copied().collect();
+    std::fs::write(format!("{dir}/{name}.bin"), le_f32(&flat)).unwrap();
+}
+
+/// The per-visit residual diffs of one traced step beside the magnitude of the CPU's rows:
+/// an outlier activation shows as a row whose largest element dwarfs the others.
+fn visit_dump(cpu_trace: &[Vec<f32>], card_trace: &[Vec<f32>]) {
+    for (il, (cpu, card)) in cpu_trace.chunks(2).zip(card_trace.chunks(2)).enumerate() {
+        eprintln!(
+            "  visit {il:2} branch {:9.4} resid {:9.4} cpu_abs {:9.3} {:9.3}",
+            max_abs_diff(&cpu[0], &card[0]),
+            max_abs_diff(&cpu[1], &card[1]),
+            worst_abs(&cpu[0]),
+            worst_abs(&cpu[1])
+        );
+    }
+}
+
+/// The head split: the CPU head over the card's final residual row stands between the two
+/// logits rows. `trunk` is the reference's row against it (what the 56 visits added), `head`
+/// is it against the card's row (what the output norm, the q8_1 step and the head matvec
+/// added). The final residual's and the normed row's magnitudes and the normed rows' diff
+/// say how far the head's input already was; the card's largest 32-block step there says
+/// how coarse its q8_1 step is. Returns the two normed rows, before any quantization.
+fn head_split(
+    projector: &mut GgufProjector,
+    weights: &LoopWeights,
+    reference: &[f32],
+    drawn: &[f32],
+    cpu_final: &[f32],
+    card_final: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let over_card = super::super::step::logits(projector, weights, card_final).unwrap();
+    let normed = |row: &[f32]| {
+        crate::family::math::rms_plain(row, weights.output_norm(), weights.shape().eps).unwrap()
+    };
+    let (normed_ref, normed_card) = (normed(cpu_final), normed(card_final));
+    let (at, big) = argmax_abs(&normed_card);
+    let block = (at / 32 * 32..at / 32 * 32 + 32)
+        .map(|j| normed_card[j].abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "  head split: total {:9.4} = trunk {:9.4} + head {:9.4}; ids \
+         reference {} over-card {} card {}",
+        max_abs_diff(reference, drawn),
+        max_abs_diff(reference, &over_card),
+        max_abs_diff(&over_card, drawn),
+        argmax(reference),
+        argmax(&over_card),
+        argmax(drawn)
+    );
+    eprintln!(
+        "  final residual: largest reference {:.3}, card {:.3}; normed row: \
+         diff {:9.4}, largest reference {:.3}, card {:.3} at {at}; \
+         its 32-block step {:.5}",
+        worst_abs(cpu_final),
+        worst_abs(card_final),
+        max_abs_diff(&normed_ref, &normed_card),
+        worst_abs(&normed_ref),
+        big,
+        block / 127.0
+    );
+    (normed_ref, normed_card)
+}
+
+/// The index and the magnitude of a row's largest element.
+fn argmax_abs(row: &[f32]) -> (usize, f32) {
+    row.iter()
+        .enumerate()
+        .fold((0, 0.0f32), |(at, big), (i, &v)| {
+            if v.abs() > big {
+                (i, v.abs())
+            } else {
+                (at, big)
+            }
+        })
+}
+
+/// The prompt's rows 0..=N prefilled as one chunk on a fresh card, for the last five N up
+/// to `probe`; each row is position N's.
+fn prefill_rows(
+    ctx: &Rc<CudaContext>,
+    loaded: &CudaWeights,
+    weights: &LoopWeights,
+    projector: &mut GgufProjector,
+    probe: usize,
+) -> Vec<(usize, Vec<f32>)> {
+    let h = weights.shape().hidden;
+    let embed = projector.rows(weights.token_embd(), &PROMPT).unwrap();
+    (probe - 4..=probe)
+        .map(|n| {
+            let mut card = open_card(ctx, loaded, weights, CACHE_ROWS);
+            card.prefill(&embed[..(n + 1) * h], 0).unwrap();
+            (n, drain_row(ctx, &card))
+        })
+        .collect()
+}
+
+/// A reference row [`decode_walk`] saved: little-endian f32 words.
+fn load_row(dir: &str, pos: usize) -> Vec<f32> {
+    le_f32_vec(&std::fs::read(format!("{dir}/ref-{pos}.bin")).unwrap())
+}
+
 /// The slice-D prefill gate, device-internal: the decode walk that the rig above
 /// validated is the reference, so the same prompt through `prefill` on a fresh card, cut
 /// into consecutive chunks, must land where the walk lands at every cut. Then both cards
