@@ -168,7 +168,11 @@ impl GgufCuda {
         self.step.enqueue_controlled_routed_layer(
             &self.context,
             stream,
-            (rows, (weights, eps)),
+            (
+                rows,
+                (weights, eps),
+                [routed.shape.n_expert, routed.shape.hidden],
+            ),
             |stream, [x, bias, status, y]| {
                 self.enqueue_routed(
                     stream,

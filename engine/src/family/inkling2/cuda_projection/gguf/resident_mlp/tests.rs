@@ -417,11 +417,25 @@ fn resident_mlp_refuses_before_any_launch_and_reports_support() {
         );
     }
     let rows = Rows::new(cuda.context(), &input(), &message());
-    let refused = |request: ResidentMlpRequest<'_>| {
+    let refused = |request: ResidentMlpRequest<'_>, checkpoint: bool, expected: &str| {
+        let enqueued = rows.stream.enqueued();
         let error = cuda
             .enqueue_controlled_mlp(&rows.stream, request)
             .unwrap_err();
-        assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
+        match &error {
+            EngError::Checkpoint(message) if checkpoint => {
+                assert!(message.contains(expected), "{error:?}")
+            }
+            EngError::BadRequest(message) if !checkpoint => {
+                assert!(message.contains(expected), "{error:?}")
+            }
+            _ => panic!("{error:?}"),
+        }
+        assert_eq!(
+            rows.stream.enqueued(),
+            enqueued,
+            "a rejected call enqueued work"
+        );
         let (out, health, status) = rows.read_out();
         assert!(
             out.iter().all(|&v| v == 7.0) && health == [7.0; 2] && status == 0,
@@ -430,17 +444,26 @@ fn resident_mlp_refuses_before_any_launch_and_reports_support() {
     };
     let mut request = rows.request();
     request.layer = LAYER + 1;
-    refused(request);
+    refused(request, true, "no resident F32 CUDA router");
     let mut request = rows.request();
     request.dtypes = [DenseDtype::F32; 2];
-    refused(request);
+    refused(request, true, "experts are not packed GGUF");
+    let mut request = rows.request();
+    request.bias = request
+        .bias
+        .slice(0, (EXPERTS - 1) * size_of::<f32>())
+        .unwrap();
+    refused(request, false, "controlled MLP router bias range");
+    let mut request = rows.request();
+    request.eps = f32::NAN;
+    refused(request, false, "invalid CUDA controlled MLP epsilon");
     let mut request = rows.request();
     request.out = rows.range(3, HIDDEN - 1);
-    refused(request);
+    refused(request, false, "controlled MLP output range");
     let mut request = rows.request();
     request.health = rows.range(3, 1);
-    refused(request);
+    refused(request, false, "ranges overlap");
     let mut request = rows.request();
     request.controller = ["a", "b", "c"];
-    refused(request);
+    refused(request, true, "no resident CUDA MLP controller");
 }

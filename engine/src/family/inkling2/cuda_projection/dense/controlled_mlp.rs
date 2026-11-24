@@ -153,7 +153,7 @@ fn check_rows(rows: &RoutedRows<'_>, layout: &Layout) -> Result<(), EngError> {
     ] {
         require_fit(name, range, need, align_of::<f32>())?;
         if range.bytes() != need {
-            return Err(bad(format!(
+            return Err(EngError::BadRequest(format!(
                 "the CUDA {name} range holds {} bytes but the call needs exactly {need}",
                 range.bytes()
             )));
@@ -238,11 +238,19 @@ impl DenseStep {
         &self,
         context: &CudaContext,
         stream: &DeviceStream,
-        (rows, (weights, eps)): (RoutedRows<'_>, (ControllerWeights<'_>, f32)),
+        (rows, (weights, eps), [experts, width]): (
+            RoutedRows<'_>,
+            (ControllerWeights<'_>, f32),
+            [usize; 2],
+        ),
         enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
     ) -> Result<(), EngError> {
-        let [width, experts] =
-            [rows.input.bytes(), rows.bias.bytes()].map(|bytes| bytes / size_of::<f32>());
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err(EngError::BadRequest(
+                "invalid CUDA controlled MLP epsilon".into(),
+            ));
+        }
+        // Use the loaded router geometry, not lengths from unvalidated caller rows.
         let layout = Layout::new(experts, width)?;
         check_rows(&rows, &layout)?;
         let work = self.routed_workspace(&layout, weights)?;
@@ -601,7 +609,7 @@ mod enqueue_tests {
             self.step.enqueue_controlled_routed_layer(
                 &self.context,
                 &stream,
-                (rows, (self.controller(), EPS)),
+                (rows, (self.controller(), EPS), [EXPERTS, self.width]),
                 |stream, ranges| self.chain(&self.context, stream, ranges),
             )
         }
@@ -721,10 +729,10 @@ mod enqueue_tests {
         // The arena of a small step has no room for the gate halves and the workspace.
         let small = DenseStep::new(
             &fixture.context,
-            &DensePlan::new([512, 64], 2304, RANK).unwrap(),
+            &DensePlan::new([64, 64], 32, RANK).unwrap(),
         )
         .unwrap();
-        assert!(!small.controlled_routed_fits((EXPERTS, 2304), fixture.controller()));
+        assert!(!small.controlled_routed_fits((EXPERTS, 32), fixture.controller()));
         assert!(
             !fixture
                 .step
@@ -736,11 +744,19 @@ mod enqueue_tests {
             .enqueue_controlled_routed_layer(
                 &fixture.context,
                 &stream,
-                (fixture.routed_rows(), (fixture.controller(), EPS)),
-                |_, _| Ok(()),
+                (
+                    fixture.routed_rows(),
+                    (fixture.controller(), EPS),
+                    [EXPERTS, 32],
+                ),
+                |_, _| panic!("an undersized arena must not invoke the router"),
             )
             .unwrap_err();
-        assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
+        assert!(
+            matches!(&error, EngError::Checkpoint(message)
+            if message.contains("projection exceeds its arena slot")),
+            "{error:?}"
+        );
         assert_eq!(fixture.read_out(), (vec![7.0; 32], [7.0; 2]));
     }
 }
