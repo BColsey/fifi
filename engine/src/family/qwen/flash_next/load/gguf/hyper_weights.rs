@@ -1,4 +1,7 @@
-//! Staged GGUF hyper-connection weights for the existing half-precision resident kernel.
+//! Staged GGUF hyper-connection weights for the resident kernel. A vector (`norm`, `inject`)
+//! and any F16, BF16 or F32 tensor is widened to F16. A Q8_0 matrix (`down`, `up`) is kept as
+//! stored, 34 bytes a block of 32 values, which the kernels of dtype `Q80AndF16` decode value by
+//! value; an F16 copy of the decoded matrix would round every weight a second time.
 //! The expanded F16 allocations need their own admission charge before production use.
 
 use super::{
@@ -19,17 +22,26 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-struct HalfPlan<'a> {
+/// How one hyper tensor reaches the device.
+struct Staging<'a> {
     entry: &'a Mapped,
     blocks: usize,
     block_elements: usize,
     block_bytes: usize,
     output_bytes: usize,
     centered: bool,
+    /// A Q8_0 matrix kept as stored (`GgufType::Q80` on the device); any other tensor is F16.
+    stored: bool,
 }
 
-impl<'a> HalfPlan<'a> {
-    fn new(entry: &'a Mapped, dims: &[u64], centered: bool) -> Result<Self, EngError> {
+impl<'a> Staging<'a> {
+    /// `matrix`: a `down` or `up` tensor, the two a Q8_0 storage keeps as stored.
+    fn new(
+        entry: &'a Mapped,
+        dims: &[u64],
+        centered: bool,
+        matrix: bool,
+    ) -> Result<Self, EngError> {
         let bad = || {
             EngError::Checkpoint(format!(
                 "Flash-Next GGUF: invalid hyper tensor {}",
@@ -74,7 +86,12 @@ impl<'a> HalfPlan<'a> {
         if usize::try_from(entry.bytes).map_err(|_| bad())? != source_bytes {
             return Err(bad());
         }
-        let output_bytes = elements.checked_mul(size_of::<u16>()).ok_or_else(bad)?;
+        let stored = matrix && entry.ty == GgufType::Q80;
+        let output_bytes = if stored {
+            source_bytes
+        } else {
+            elements.checked_mul(size_of::<u16>()).ok_or_else(bad)?
+        };
         Ok(Self {
             entry,
             blocks,
@@ -82,6 +99,7 @@ impl<'a> HalfPlan<'a> {
             block_bytes,
             output_bytes,
             centered,
+            stored,
         })
     }
 
@@ -92,6 +110,9 @@ impl<'a> HalfPlan<'a> {
         ctx: &CudaContext,
         stream: &DeviceStream,
     ) -> Result<CudaWeight, EngError> {
+        if self.stored {
+            return self.upload_stored(model, name, ctx, stream);
+        }
         let block_footprint = self
             .block_elements
             .checked_mul(size_of::<f32>())
@@ -130,6 +151,36 @@ impl<'a> HalfPlan<'a> {
             buffer,
         })
     }
+
+    /// The stored blocks, copied as they are.
+    fn upload_stored(
+        &self,
+        model: &GgufModel,
+        name: String,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+    ) -> Result<CudaWeight, EngError> {
+        let chunk_blocks = (CHUNK_LIMIT / self.block_bytes).max(1).min(self.blocks);
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(chunk_blocks * self.block_bytes)
+            .map_err(|_| EngError::MemoryPlan("GGUF hyper staging allocation failed".into()))?;
+        let buffer = ctx.allocate(self.output_bytes)?;
+        for first in (0..self.blocks).step_by(chunk_blocks) {
+            let count = chunk_blocks.min(self.blocks - first);
+            raw.resize(count * self.block_bytes, 0);
+            model.weights.read_range(
+                &self.entry.name,
+                (first * self.block_bytes) as u64,
+                &mut raw,
+            )?;
+            buffer.write_at(stream, first * self.block_bytes, &raw)?;
+        }
+        Ok(CudaWeight::Raw {
+            name,
+            ty: GgufType::Q80,
+            buffer,
+        })
+    }
 }
 
 fn half_bytes(values: &[f32], centered: bool) -> Result<Vec<u8>, EngError> {
@@ -154,8 +205,9 @@ fn half_bytes(values: &[f32], centered: bool) -> Result<Vec<u8>, EngError> {
 }
 
 impl GgufModel {
-    /// Stage one hyper site as F16, subtracting the stored norm's one before rounding.
-    /// This expands quantized matrices and does not enable GGUF execution.
+    /// Stage one hyper site: the vectors as F16, the norm's stored one subtracted before the
+    /// rounding, and a Q8_0 pair of matrices as stored. This expands every other quantized tensor
+    /// and does not enable GGUF execution.
     pub(in super::super::super) fn upload_hyper(
         &self,
         site: Site,
@@ -215,9 +267,17 @@ impl GgufModel {
                     .ok_or_else(|| {
                         EngError::Checkpoint(format!("Flash-Next GGUF: missing {site:?} {part:?}"))
                     })?;
-                Ok((name, HalfPlan::new(entry, &dims, centered)?))
+                let matrix = part.q80_stays_stored();
+                Ok((name, Staging::new(entry, &dims, centered, matrix)?))
             })
             .collect::<Result<Vec<_>, EngError>>()?;
+        // One dtype serves both matrices: a Q8_0 matrix needs the other one Q8_0 too.
+        let stored = |index: usize| plans[index].1.stored;
+        if stored(1) != stored(2) {
+            return Err(EngError::Checkpoint(format!(
+                "Flash-Next GGUF: the hyper matrices of {prefix} are not both Q8_0"
+            )));
+        }
         plans
             .into_iter()
             .map(|(name, plan)| plan.upload(self, format!("{prefix}.{name}"), ctx, stream))

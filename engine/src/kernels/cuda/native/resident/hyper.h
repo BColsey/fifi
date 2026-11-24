@@ -4,8 +4,11 @@
  *
  * The residual stream of a token is f32 [branches][hidden] (width = branches * hidden), one row
  * per token. The weights of one hyper-connection site are dense, all in one dtype (0: binary16,
- * 1: bfloat16): norm_w [width], down [rank][width], up [width][rank], and inject
+ * 1: bfloat16, 2: GGUF Q8_0 matrices `down` and `up`, as stored, with binary16 `norm_w` and
+ * `inject`): norm_w [width], down [rank][width], up [width][rank], and inject
  * [branches][width] (NULL for the final mixer, which has none). Every product accumulates in f32.
+ * A Q8_0 read decodes each weight in the kernel, fp16 scale times int8 lane, exact in f32: its
+ * ranges hold 34 bytes per block of 32 values, and the width and the rank take whole blocks.
  *
  * read, per token t and with C = branches:
  *   normed[t][b][d] = x[t][b][d] * (1 + norm_w[b][d]) / sqrt(mean_d(x[t][b][d]^2) + eps)

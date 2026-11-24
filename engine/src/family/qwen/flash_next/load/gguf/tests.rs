@@ -385,12 +385,10 @@ pub(in super::super::super) fn pinned_hyper_host_reference(
         .iter()
         .map(|w| match w {
             crate::family::project::cuda::CudaWeight::Raw { buffer, .. } => buffer.bytes(),
-            _ => panic!("raw F16 hyper weight"),
+            _ => panic!("a raw hyper weight"),
         })
         .sum();
-    eprintln!(
-        "pinned hyper {site:?}: encoded bytes={source_bytes}, staged F16 bytes={device_bytes}"
-    );
+    eprintln!("pinned hyper {site:?}: encoded bytes={source_bytes}, staged bytes={device_bytes}");
     (weights, input, host)
 }
 
@@ -1669,10 +1667,14 @@ fn the_device_trunk_counts_each_tensor_in_the_form_the_executor_holds_it() {
     // Quantized matrices stay as stored blocks.
     let qkv = at(Slot::Layer(Wanted::DeltaQkv), Some(0));
     assert_eq!(qkv.device_bytes(), qkv.bytes);
-    // Hyper-connection matrices are widened to half precision: 10240 x 320 elements.
+    // A Q8_0 hyper-connection matrix stays as stored, 34 bytes a block of 32 values (10240 x 320
+    // values, 7.0 MB a site against 13.1 MB widened); its inject row, F32 here, is widened to F16.
+    let down = at(Slot::hyper(Site::Mixer, SiteTensor::Down), Some(0));
+    assert_eq!(down.ty, GgufType::Q80);
+    assert_eq!(down.device_bytes(), 10240 * 320 / 32 * 34);
     assert_eq!(
-        at(Slot::hyper(Site::Mixer, SiteTensor::Down), Some(0)).device_bytes(),
-        10240 * 320 * 2
+        at(Slot::hyper(Site::Mixer, SiteTensor::Inject), Some(0)).device_bytes(),
+        4 * 10240 * 2
     );
     // The router is F32 as stored.
     assert_eq!(

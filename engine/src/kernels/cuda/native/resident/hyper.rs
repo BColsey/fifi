@@ -22,6 +22,10 @@ use std::ptr;
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
+/// Values of a Q8_0 block. A site of [`HyperDtype::Q80AndF16`] takes a width and a rank that are
+/// multiples of it: its rows start on a block.
+pub(in crate::kernels::cuda) const HYPER_Q80_BLOCK: usize = 32;
+
 /// Limits of `hyper.h`.
 pub(in crate::kernels::cuda) const HYPER_MAX_M: usize = 32768;
 pub(in crate::kernels::cuda) const HYPER_MAX_BRANCHES: usize = 16;
@@ -31,12 +35,16 @@ pub(in crate::kernels::cuda) const HYPER_MAX_RANK: usize = 4096;
 
 const FLOAT: usize = 4;
 const HALF: usize = 2;
+const Q80_BYTES: usize = 34;
 
-/// Element type of every weight of one hyper-connection site.
+/// Element type of the weights of one hyper-connection site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HyperDtype {
     F16,
     Bf16,
+    /// GGUF Q8_0 matrices (`down`, `up`), as stored: the kernels decode them, 34 bytes a block of
+    /// 32 values, so a decoded weight is not rounded again. `norm` and `inject` are F16.
+    Q80AndF16,
 }
 
 impl HyperDtype {
@@ -44,6 +52,7 @@ impl HyperDtype {
         match self {
             Self::F16 => 0,
             Self::Bf16 => 1,
+            Self::Q80AndF16 => 2,
         }
     }
 }
@@ -184,7 +193,11 @@ pub(crate) struct HyperReadBytes {
 }
 
 /// `None` outside the limits of `hyper.h` or when a size overflows.
-pub(in crate::kernels::cuda) fn read_need(dims: HyperDims, rank: usize) -> Option<HyperReadBytes> {
+pub(in crate::kernels::cuda) fn read_need(
+    dims: HyperDims,
+    rank: usize,
+    dtype: HyperDtype,
+) -> Option<HyperReadBytes> {
     let width = dims_width(dims)?;
     if !(1..=HYPER_MAX_RANK).contains(&rank) {
         return None;
@@ -192,11 +205,21 @@ pub(in crate::kernels::cuda) fn read_need(dims: HyperDims, rank: usize) -> Optio
     let rows = |count: usize, per_row: usize, element: usize| {
         count.checked_mul(per_row)?.checked_mul(element)
     };
+    // A Q8_0 row starts on a block, so a width or a rank that leaves one out has no read.
+    let matrix = match dtype {
+        HyperDtype::F16 | HyperDtype::Bf16 => rows(width, rank, HALF),
+        HyperDtype::Q80AndF16
+            if width.is_multiple_of(HYPER_Q80_BLOCK) && rank.is_multiple_of(HYPER_Q80_BLOCK) =>
+        {
+            rows(width / HYPER_Q80_BLOCK, rank, Q80_BYTES)
+        }
+        HyperDtype::Q80AndF16 => None,
+    }?;
     Some(HyperReadBytes {
         x: rows(dims.m, width, FLOAT)?,
         norm_w: width.checked_mul(HALF)?,
-        down: rows(rank, width, HALF)?,
-        up: rows(width, rank, HALF)?,
+        down: matrix,
+        up: matrix,
         inject: rows(dims.branches, width, HALF)?,
         normed: rows(dims.m, width, FLOAT)?,
         low: rows(dims.m, rank, FLOAT)?,
@@ -230,7 +253,7 @@ fn ints(dims: HyperDims) -> Option<(c_int, c_int, c_int)> {
 /// Written ranges are apart from each other and from every read range; read ranges may share
 /// bytes.
 fn check_read(call: &HyperReadRaw<'_>) -> Result<HyperReadBytes, DeviceFailure> {
-    let need = read_need(call.dims, call.rank).ok_or_else(invalid_argument)?;
+    let need = read_need(call.dims, call.rank, call.dtype).ok_or_else(invalid_argument)?;
     let paired = call.inject.is_some() == call.gate.is_some();
     let eps_ok = call.eps.is_finite() && call.eps >= 0.0;
     let optional_fits = |range: &Option<RawRange<'_>>, bytes: usize, align: usize| {

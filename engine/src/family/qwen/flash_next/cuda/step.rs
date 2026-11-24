@@ -704,13 +704,15 @@ impl<'a> FlashStep<'a> {
         }
     }
 
-    /// A tensor kept as stored (F16 or BF16) with its dtype.
+    /// A tensor kept as stored: F16 or BF16 with its dtype, or the Q8_0 blocks of a hyper matrix
+    /// with `Q80AndF16`, which only the hyper-connection kernels read.
     pub(super) fn half(&self, name: &str) -> Result<(DeviceRange<'a>, HyperDtype), EngError> {
         match self.weights.get(name) {
             Some(CudaWeight::Raw { ty, buffer, .. }) => {
                 let dtype = match ty {
                     GgufType::F16 => HyperDtype::F16,
                     GgufType::Bf16 => HyperDtype::Bf16,
+                    GgufType::Q80 => HyperDtype::Q80AndF16,
                     other => return Err(refuse(format!("{name} is stored as {other:?}"))),
                 };
                 Ok((buffer.range(0, buffer.bytes())?, dtype))
@@ -1181,6 +1183,16 @@ impl<'a> FlashStep<'a> {
         row.buffer().range(row.offset() + col * F32, width * F32)
     }
 
+    /// Whether a hyper site's weights pair other than by one dtype: its vectors (`norm`, `inject`)
+    /// F16 and its two matrices Q8_0, which the kernels of dtype `Q80AndF16` read as stored.
+    fn stored_q80(vectors: HyperDtype, matrices: [HyperDtype; 2], inject: HyperDtype) -> bool {
+        let [down, up] = matrices;
+        inject == vectors
+            && down == up
+            && down == HyperDtype::Q80AndF16
+            && vectors == HyperDtype::F16
+    }
+
     fn hyper_shape(&self, m: usize) -> HyperShape {
         HyperShape {
             m,
@@ -1203,12 +1215,15 @@ impl<'a> FlashStep<'a> {
         } else {
             (None, dtype)
         };
-        if [down_dtype, up_dtype, inject_dtype] != [dtype; 3] {
+        if [down_dtype, up_dtype, inject_dtype] != [dtype; 3]
+            && !Self::stored_q80(dtype, [down_dtype, up_dtype], inject_dtype)
+        {
             return Err(refuse(format!(
                 "the weights of {prefix} are not of one dtype: norm {dtype:?}, down {down_dtype:?}, \
                  up {up_dtype:?}, inject {inject_dtype:?}"
             )));
         }
+        let dtype = down_dtype;
         self.ctx.hyper_read(
             self.stream,
             HyperReadCall {

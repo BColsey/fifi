@@ -5,6 +5,10 @@
 //!
 //! The weights are drawn as f32 and rounded to binary16 or bfloat16 by the `half` crate; the
 //! reference widens the same bits, so a comparison measures the kernels and not the weight dtype.
+//! For `Q80AndF16` the matrices are encoded as Q8_0 blocks (an fp16 scale and int8 lanes) and the
+//! reference takes the decoded values, fp16 scale times lane: a stage bound is some 1e-6 relative,
+//! where rounding a decoded weight to binary16 again would err by up to 5e-4, so a kernel that did
+//! would fail every stage check of this file.
 //! Each kernel is checked stage by stage: the reference of a stage takes the device output of the
 //! stage before it (read back from the caller scratch), and each device value must lie within
 //! twice a first-order rounding bound of the f32 arithmetic of that stage, computed per value
@@ -17,9 +21,10 @@
 
 use super::{
     HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
-    hyper_read_bytes,
+    hyper_read_bytes, read_bytes,
 };
 use crate::EngError;
+use crate::kernels::cuda::native::resident::hyper::HYPER_Q80_BLOCK;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
@@ -129,7 +134,7 @@ impl Padded {
 
 fn narrow(dtype: HyperDtype, values: &[f32]) -> Vec<u16> {
     let one = |v: f32| match dtype {
-        HyperDtype::F16 => half::f16::from_f32(v).to_bits(),
+        HyperDtype::F16 | HyperDtype::Q80AndF16 => half::f16::from_f32(v).to_bits(),
         HyperDtype::Bf16 => half::bf16::from_f32(v).to_bits(),
     };
     values.iter().map(|&v| one(v)).collect()
@@ -137,7 +142,7 @@ fn narrow(dtype: HyperDtype, values: &[f32]) -> Vec<u16> {
 
 fn widen(dtype: HyperDtype, codes: &[u16]) -> Vec<f64> {
     let one = |c: u16| match dtype {
-        HyperDtype::F16 => half::f16::from_bits(c).to_f64(),
+        HyperDtype::F16 | HyperDtype::Q80AndF16 => half::f16::from_bits(c).to_f64(),
         HyperDtype::Bf16 => half::bf16::from_bits(c).to_f64(),
     };
     codes.iter().map(|&c| one(c)).collect()
@@ -145,6 +150,63 @@ fn widen(dtype: HyperDtype, codes: &[u16]) -> Vec<f64> {
 
 fn code_bytes(codes: &[u16]) -> Vec<u8> {
     codes.iter().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+const Q80_BLOCK: usize = 32;
+/// `half d; int8 qs[32]`: 34 bytes, 17 words.
+const Q80_WORDS: usize = 17;
+
+/// `values` as Q8_0 blocks: the fp16 scale `max|v| / 127` and the lanes `round(v / d)`, stored
+/// as the words of their bytes, the layout the kernels read.
+fn q80(values: &[f32]) -> Vec<u16> {
+    assert!(
+        values.len().is_multiple_of(Q80_BLOCK),
+        "{} values",
+        values.len()
+    );
+    let mut codes = Vec::with_capacity(values.len() / Q80_BLOCK * Q80_WORDS);
+    for block in values.chunks(Q80_BLOCK) {
+        let max = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = half::f16::from_f32(max / 127.0);
+        let df = d.to_f32();
+        let mut bytes = Vec::with_capacity(Q80_WORDS * 2);
+        bytes.extend_from_slice(&d.to_bits().to_le_bytes());
+        for &v in block {
+            let q = if df == 0.0 {
+                0.0
+            } else {
+                (v as f64 / f64::from(df)).round()
+            };
+            bytes.push(q.clamp(-128.0, 127.0) as i8 as u8);
+        }
+        codes.extend(bytes.chunks(2).map(|w| u16::from_le_bytes([w[0], w[1]])));
+    }
+    codes
+}
+
+/// The values of Q8_0 codes as the kernels decode them: the fp16 scale times the int8 lane, a
+/// product f32 holds exactly.
+fn q80_values(codes: &[u16]) -> Vec<f64> {
+    code_bytes(codes)
+        .chunks(Q80_WORDS * 2)
+        .flat_map(|b| {
+            let d = f64::from(half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32());
+            b[2..Q80_WORDS * 2]
+                .iter()
+                .map(move |q| d * f64::from(*q as i8))
+        })
+        .collect()
+}
+
+/// `n` weights of standard deviation `sd`: vector weights in the bits of `dtype`; matrix weights
+/// too, or Q8_0 blocks for `Q80AndF16`.
+fn weights(rng: &mut Rng, dtype: HyperDtype, n: usize, sd: f64, matrix: bool) -> Vec<u16> {
+    let values = draw(rng, n, sd);
+    match dtype {
+        HyperDtype::F16 | HyperDtype::Bf16 => narrow(dtype, &values),
+        HyperDtype::Q80AndF16 if matrix => q80(&values),
+        HyperDtype::Q80AndF16 => narrow(dtype, &values),
+    }
 }
 
 fn draw(rng: &mut Rng, n: usize, sd: f64) -> Vec<f32> {
@@ -192,7 +254,8 @@ const fn small(
     }
 }
 
-/// One read: `x` f32 and the weight codes (`dtype` bits).
+/// One read: `x` f32 and the weight codes (`dtype` bits; the matrices of `Q80AndF16` as Q8_0
+/// blocks, whole words).
 struct Case {
     shape: HyperShape,
     dtype: HyperDtype,
@@ -226,7 +289,8 @@ impl Case {
         // near 2: SiLU and both sigmoids see both signs, away from saturation.
         let down_sd = 1.5 * branches as f64 / (width as f64).sqrt();
         let up_sd = 2.0 / (rank as f64).sqrt();
-        let mut weights = |n: usize, sd: f64| narrow(dtype, &draw(rng, n, sd));
+        let vector = |rng: &mut Rng, n: usize, sd: f64| weights(rng, dtype, n, sd, false);
+        let matrix = |rng: &mut Rng, n: usize, sd: f64| weights(rng, dtype, n, sd, true);
         Self {
             shape: HyperShape {
                 m,
@@ -237,15 +301,23 @@ impl Case {
             dtype,
             eps: EPS,
             x,
-            norm: weights(width, 0.2),
-            down: weights(rank * width, down_sd),
-            up: weights(width * rank, up_sd),
-            inject: inject.then(|| weights(branches * width, down_sd)),
+            norm: vector(rng, width, 0.2),
+            down: matrix(rng, rank * width, down_sd),
+            up: matrix(rng, width * rank, up_sd),
+            inject: inject.then(|| vector(rng, branches * width, down_sd)),
         }
     }
 
     fn width(&self) -> usize {
         self.shape.branches * self.shape.hidden
+    }
+
+    /// A matrix (`down`, `up`) widened: the dtype's bits, or the values of its Q8_0 blocks.
+    fn matrix(&self, codes: &[u16]) -> Vec<f64> {
+        match self.dtype {
+            HyperDtype::Q80AndF16 => q80_values(codes),
+            HyperDtype::F16 | HyperDtype::Bf16 => widen(self.dtype, codes),
+        }
     }
 }
 
@@ -448,7 +520,7 @@ fn ref_low(c: &Case, normed: &[f32]) -> (Vec<Bounded>, Option<Vec<Bounded>>) {
     let width = c.width();
     let branches_f = branches as f64;
     let depth = lane_depth(width);
-    let down = widen(c.dtype, &c.down);
+    let down = c.matrix(&c.down);
     let inject = c.inject.as_deref().map(|codes| widen(c.dtype, codes));
     // Error of `dot / C` before the activation.
     let scaled = |row: &[f64], n: &[f32]| {
@@ -482,7 +554,7 @@ fn ref_low(c: &Case, normed: &[f32]) -> (Vec<Bounded>, Option<Vec<Bounded>>) {
 /// The `mix` rows from the device `low`.
 fn ref_mix(c: &Case, low: &[f32]) -> Vec<Bounded> {
     let rank = c.shape.rank;
-    let up = widen(c.dtype, &c.up);
+    let up = c.matrix(&c.up);
     let depth = lane_depth(rank);
     let mut out = Vec::with_capacity(c.shape.m * c.width());
     for l in low.chunks(rank) {
@@ -531,7 +603,7 @@ fn whole(c: &Case) -> (Vec<f64>, Option<Vec<f64>>) {
     } = c.shape;
     let width = c.width();
     let c_f = branches as f64;
-    let (down, up) = (widen(c.dtype, &c.down), widen(c.dtype, &c.up));
+    let (down, up) = (c.matrix(&c.down), c.matrix(&c.up));
     let inject = c.inject.as_deref().map(|codes| widen(c.dtype, codes));
     let normed: Vec<f64> = ref_normed(c).iter().map(|b| b.value).collect();
     let dot64 = |w: &[f64], v: &[f64]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f64>();
@@ -617,7 +689,7 @@ fn check_read(label: &str, c: &Case, got: &Read) {
     );
 }
 
-const READ_SPECS: [Spec; 11] = [
+const READ_SPECS: [Spec; 14] = [
     flash_next(1, HyperDtype::F16, true),
     flash_next(3, HyperDtype::Bf16, true),
     // The final mixer has no inject projection.
@@ -634,6 +706,11 @@ const READ_SPECS: [Spec; 11] = [
     small(1, (16, 16384, 4), HyperDtype::Bf16),
     small(1, (2, 2048, 4096), HyperDtype::F16),
     small(32768, (2, 3, 2), HyperDtype::Bf16),
+    // Q8_0 matrices with F16 vectors: the Flash-Next site with and without inject, and three
+    // branches (C is no power of two).
+    flash_next(1, HyperDtype::Q80AndF16, true),
+    flash_next(2, HyperDtype::Q80AndF16, false),
+    small(2, (3, 4096, 64), HyperDtype::Q80AndF16),
 ];
 
 #[test]
@@ -677,14 +754,20 @@ fn shifted_ranges_give_the_same_bits() {
     }
     let rig = Rig::new();
     let mut rng = Rng::new(0x4c03_0003);
-    let c = Case::new(&mut rng, small(3, (4, 640, 96), HyperDtype::Bf16));
-    let base = run_read(&rig, &c, (0, 0));
-    for extra in [(4, 2), (12, 6), (260, 254)] {
-        let got = run_read(&rig, &c, extra);
-        assert_eq!(bits(&got.mixed), bits(&base.mixed), "{extra:?}: mixed");
-        assert_eq!(bits(&got.mix), bits(&base.mix), "{extra:?}: mix");
-        let (gate, base_gate) = (got.gate.expect("gate"), base.gate.as_deref().expect("gate"));
-        assert_eq!(bits(&gate), bits(base_gate), "{extra:?}: gate");
+    // Bf16, and Q8_0 matrices, whose blocks a shift lands inside.
+    for spec in [
+        small(3, (4, 640, 96), HyperDtype::Bf16),
+        small(3, (4, 4096, 96), HyperDtype::Q80AndF16),
+    ] {
+        let c = Case::new(&mut rng, spec);
+        let base = run_read(&rig, &c, (0, 0));
+        for extra in [(4, 2), (12, 6), (260, 254)] {
+            let got = run_read(&rig, &c, extra);
+            assert_eq!(bits(&got.mixed), bits(&base.mixed), "{extra:?}: mixed");
+            assert_eq!(bits(&got.mix), bits(&base.mix), "{extra:?}: mix");
+            let (gate, base_gate) = (got.gate.expect("gate"), base.gate.as_deref().expect("gate"));
+            assert_eq!(bits(&gate), bits(base_gate), "{extra:?}: gate");
+        }
     }
 }
 
@@ -1335,7 +1418,7 @@ const TILED_MAX_M: usize = 513;
 /// last tiles.
 const TILED_MS: [usize; 15] = [1, 2, 3, 4, 5, 7, 8, 31, 32, 33, 127, 128, 129, 512, 513];
 
-const TILED_SPECS: [Spec; 12] = [
+const TILED_SPECS: [Spec; 15] = [
     // The Flash-Next site, both dtypes, with and without inject.
     site((4, 2560, 320), HyperDtype::F16, true),
     site((4, 2560, 320), HyperDtype::F16, false),
@@ -1352,6 +1435,12 @@ const TILED_SPECS: [Spec; 12] = [
     site((2, 64, 1100), HyperDtype::Bf16, true),
     site((2, 2048, 4096), HyperDtype::F16, false),
     site((5, 4099, 65), HyperDtype::Bf16, true),
+    // Q8_0 matrices: the Flash-Next site with and without inject; three branches, so the one
+    // inject block holds three rows and clamps the fourth; a rank past one staged chunk (512
+    // floats at tile 8, 1024 at tile 4).
+    site((4, 2560, 320), HyperDtype::Q80AndF16, true),
+    site((4, 2560, 320), HyperDtype::Q80AndF16, false),
+    site((3, 4096, 1088), HyperDtype::Q80AndF16, true),
 ];
 
 #[test]
@@ -1372,4 +1461,198 @@ fn tiled_read_is_bit_identical_to_the_one_token_kernels() {
         }
     }
     assert_eq!(reads, TILED_SPECS.len() * TILED_MS.len());
+}
+
+/// The byte rules of the Q8_0 dtype on the host: 34 bytes a block of 32 values for the matrices,
+/// F16 for the vectors and the same scratch as every dtype; a width or a rank inside a block is
+/// refused where the F16 site is taken.
+#[test]
+fn a_q80_read_takes_whole_blocks() {
+    let flash_next = HyperShape {
+        m: 1,
+        branches: 4,
+        hidden: 2560,
+        rank: 320,
+    };
+    let need = read_bytes(flash_next, HyperDtype::Q80AndF16).expect("the Flash-Next site");
+    let matrix = 320 * 4 * 2560 / HYPER_Q80_BLOCK * 34;
+    assert_eq!((need.down, need.up), (matrix, matrix));
+    assert_eq!((need.norm_w, need.inject), (20_480, 81_920));
+    let f16 = hyper_read_bytes(flash_next).expect("the F16 site");
+    assert_eq!(
+        (
+            need.x,
+            need.normed,
+            need.low,
+            need.mix,
+            need.mixed,
+            need.gate
+        ),
+        (f16.x, f16.normed, f16.low, f16.mix, f16.mixed, f16.gate),
+        "the scratch does not depend on the dtype"
+    );
+    assert!(f16.down > matrix, "the F16 matrices are the larger");
+    for shape in [
+        HyperShape {
+            hidden: 2561,
+            ..flash_next
+        },
+        HyperShape {
+            rank: 321,
+            ..flash_next
+        },
+        HyperShape {
+            branches: 3,
+            hidden: 10,
+            ..flash_next
+        },
+    ] {
+        assert!(hyper_read_bytes(shape).is_ok(), "{shape:?}: F16 takes it");
+        let Err(EngError::BadRequest(message)) = read_bytes(shape, HyperDtype::Q80AndF16) else {
+            panic!("{shape:?}: a Q8_0 read accepted")
+        };
+        assert!(
+            message.contains("multiples of 32"),
+            "{shape:?}: refused as {message:?}"
+        );
+    }
+}
+
+/// A Q8_0 read whose shape leaves a block out is refused before any launch.
+#[test]
+fn a_q80_read_of_a_partial_block_is_refused_and_writes_nothing() {
+    if !testkit::device_present("a_q80_read_of_a_partial_block_is_refused_and_writes_nothing") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x4c08_0008);
+    let c = Case::new(&mut rng, small(2, (4, 4096, 64), HyperDtype::Q80AndF16));
+    let inputs = Inputs::new(&rig.ctx, &c, (0, 0));
+    let outputs = Outputs::new(&rig.ctx, &c);
+    for shape in [
+        HyperShape {
+            rank: 65,
+            ..c.shape
+        },
+        HyperShape {
+            hidden: 4097,
+            ..c.shape
+        },
+    ] {
+        let mut call = read_call(&c, &inputs, &outputs);
+        call.shape = shape;
+        match submit_read(&rig, call) {
+            Err(EngError::BadRequest(message)) => assert!(
+                message.contains("multiples of 32"),
+                "{shape:?}: refused as {message:?}"
+            ),
+            other => panic!("{shape:?}: {other:?}"),
+        }
+    }
+    outputs.untouched(&rig.ctx);
+    inputs.unchanged(&rig.ctx, &c);
+}
+
+/// The up matrix as Q8_0 blocks of the extreme scales and lanes: the zero scale, the least
+/// subnormal multiple, the least normal scale, and odd mantissas, each with the lanes -128,
+/// -127, -100, ..., 127. The odd scales make most decoded values binary16 numbers only after a
+/// rounding, so a kernel that rounded them again would fail the stage bounds.
+#[test]
+fn q80_blocks_decode_exactly_in_the_up_projection() {
+    if !testkit::device_present("q80_blocks_decode_exactly_in_the_up_projection") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x4c09_0009);
+    let mut c = Case::new(&mut rng, flash_next(2, HyperDtype::Q80AndF16, true));
+    const LANES: [i8; 16] = [
+        -128, -127, -100, -64, -2, -1, 0, 1, 2, 63, 64, 99, 126, 127, -128, 0,
+    ];
+    // One scale a block: a row of the up matrix has rank / 32 = 10 blocks.
+    let scales: [f32; 10] = [
+        0.0,
+        255.0 * 2f32.powi(-24),
+        255.0 * 2f32.powi(-14),
+        255.0 * 2f32.powi(-10),
+        255.0 * 2f32.powi(-5),
+        255.0 * 2f32.powi(-1),
+        255.0,
+        255.0 * 4.0,
+        255.0 * 32.0,
+        255.0 * 256.0,
+    ];
+    assert_eq!(c.shape.rank / Q80_BLOCK, scales.len());
+    let mut up = Vec::with_capacity(c.width() * scales.len() * Q80_WORDS);
+    for _ in 0..c.width() {
+        for &scale in &scales {
+            let mut block = Vec::with_capacity(Q80_WORDS * 2);
+            block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+            for lane in (0..Q80_BLOCK).map(|i| LANES[i % LANES.len()]) {
+                block.push(lane as u8);
+            }
+            up.extend(block.chunks(2).map(|w| u16::from_le_bytes([w[0], w[1]])));
+        }
+    }
+    c.up = up;
+    let values = c.matrix(&c.up);
+    let not_f16 = values
+        .iter()
+        .filter(|v| half::f16::from_f32(**v as f32).to_f32() != **v as f32)
+        .count();
+    assert!(
+        not_f16 > values.len() / 3,
+        "{not_f16} of {} decoded values are not binary16",
+        values.len()
+    );
+    let got = run_read(&rig, &c, (0, 0));
+    check_read("Q8_0 extreme blocks", &c, &got);
+}
+
+/// Microseconds a read takes, the two weight dtypes of the Flash-Next site beside each other on
+/// one device and stream: host-timed over a drained stream, `rounds` reads submitted back to back.
+/// Not a check but a measurement, for an idle device (the lease). The site of one value is the
+/// floor, four launches and no work: a read that takes the floor is bound by its launches, not by
+/// its bytes.
+#[test]
+#[ignore = "a measurement, not a check: run alone on an idle device"]
+fn read_time_by_dtype() {
+    if !testkit::device_present("read_time_by_dtype") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x4c0a_000a);
+    let read_us = |c: &Case, rounds: usize| {
+        let inputs = Inputs::new(&rig.ctx, c, (0, 0));
+        let outputs = Outputs::new(&rig.ctx, c);
+        for _ in 0..5 {
+            submit_read(&rig, read_call(c, &inputs, &outputs)).expect("a valid read");
+        }
+        rig.stream.synchronize().expect("drain");
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            submit_read(&rig, read_call(c, &inputs, &outputs)).expect("a valid read");
+        }
+        rig.stream.synchronize().expect("drain");
+        started.elapsed().as_secs_f64() * 1e6 / rounds as f64
+    };
+    let floor = Case::new(&mut rng, small(1, (1, 1, 1), HyperDtype::F16));
+    // Five rounds of each, the median: one number a dtype and token count.
+    let median_us = |c: &Case, rounds: usize| {
+        let mut samples: Vec<f64> = (0..5).map(|_| read_us(c, rounds)).collect();
+        samples.sort_by(f64::total_cmp);
+        samples[2]
+    };
+    eprintln!(
+        "hyper read, a site of one value (the launch floor): {:.1} us a read",
+        median_us(&floor, 2000)
+    );
+    for (m, rounds) in [(1usize, 2000usize), (8, 600), (128, 200)] {
+        for dtype in [HyperDtype::F16, HyperDtype::Q80AndF16] {
+            let c = Case::new(&mut rng, flash_next(m, dtype, true));
+            eprintln!(
+                "hyper read, the Flash-Next site, m {m}, {dtype:?}: {:.1} us a read",
+                median_us(&c, rounds)
+            );
+        }
+    }
 }

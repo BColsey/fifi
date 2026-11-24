@@ -93,6 +93,10 @@ pub(in super::super::super) fn upload_group_mapped(
             .ok_or_else(overflow)?;
         let bytes = match entry.form {
             Form::Blocks => usize::try_from(entry.bytes).map_err(|_| overflow())?,
+            // The one rule the estimate takes from the map: which tensors stay as stored.
+            Form::Half if entry.q80_stays_stored() => {
+                usize::try_from(entry.bytes).map_err(|_| overflow())?
+            }
             Form::Half => elements.checked_mul(2).ok_or_else(overflow)?,
             Form::Float | Form::NormPlusOne | Form::Decay => {
                 elements.checked_mul(4).ok_or_else(overflow)?

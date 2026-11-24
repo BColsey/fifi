@@ -1249,6 +1249,11 @@ fn build_driver_resolving(
         let dtype = match key_dtype {
             HyperDtype::F16 => Dtype::F16,
             HyperDtype::Bf16 => Dtype::Bf16,
+            HyperDtype::Q80AndF16 => {
+                return Err(EngError::Checkpoint(
+                    "the PLE projection matrices must be F16 or BF16".into(),
+                ));
+            }
         };
         Some(DevicePle::new(ctx, dtype, [key, value], shape)?)
     } else {

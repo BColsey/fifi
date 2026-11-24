@@ -79,7 +79,8 @@ pub(in crate::family::qwen::flash_next) enum Place {
 pub(in crate::family::qwen::flash_next) enum Form {
     /// The GGUF blocks as stored; the matvec kernel of the tensor's type reads them.
     Blocks,
-    /// Widened to F16 at upload, for the kernels that read half-precision weights.
+    /// Widened to F16 at upload, for the kernels that read half-precision weights; a Q8_0 hyper
+    /// mixing matrix of this form stays as stored instead.
     Half,
     /// Widened to F32 at upload.
     Float,
@@ -158,10 +159,22 @@ impl Mapped {
         let elements: u64 = self.dims.iter().product();
         match self.form {
             Form::Blocks => self.bytes,
+            // A Q8_0 mixing matrix of a hyper site stays as stored, 34 bytes a block.
+            Form::Half if self.q80_stays_stored() => self.bytes,
             Form::Half => elements * 2,
             Form::Float | Form::NormPlusOne | Form::Decay => elements * 4,
             Form::None => 0,
         }
+    }
+
+    /// A hyper mixing matrix (`down`, `up`) of a layer or of the final site stored as Q8_0, which
+    /// [`crate::family::qwen::flash_next::load::gguf::GgufModel::upload_hyper`] keeps as stored.
+    pub(in crate::family::qwen::flash_next) fn q80_stays_stored(&self) -> bool {
+        let part = match self.role {
+            Slot::Layer(Wanted::Hyper(_, part)) | Slot::Global(Global::HeadSite(part)) => part,
+            _ => return false,
+        };
+        self.ty == GgufType::Q80 && part.q80_stays_stored()
     }
 
     /// Whether a matvec kernel of this tensor's type reads it (block formats only).

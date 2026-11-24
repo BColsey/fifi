@@ -32,8 +32,8 @@ pub(crate) use crate::kernels::cuda::native::resident::hyper::HyperDtype;
 use crate::kernels::cuda::native::resident::hyper::hyper_read_reference_launch;
 use crate::kernels::cuda::native::resident::hyper::{
     HYPER_MAX_BRANCHES, HYPER_MAX_HIDDEN, HYPER_MAX_M, HYPER_MAX_RANK, HYPER_MAX_WIDTH,
-    HyperApplyRaw, HyperDims, HyperReadBytes, HyperReadRaw, dims_width, hyper_apply_launch,
-    hyper_read_launch, read_need,
+    HYPER_Q80_BLOCK, HyperApplyRaw, HyperDims, HyperReadBytes, HyperReadRaw, dims_width,
+    hyper_apply_launch, hyper_read_launch, read_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -56,9 +56,9 @@ impl HyperShape {
     }
 }
 
-/// The dense weights of one hyper-connection site, all of `dtype`: `norm` `[width]`, `down`
-/// `[rank][width]`, `up` `[width][rank]` and `inject` `[branches][width]` (absent for the final
-/// mixer). Each 2-byte aligned.
+/// The dense weights of one hyper-connection site: `norm` `[width]`, `down` `[rank][width]`, `up`
+/// `[width][rank]` and `inject` `[branches][width]` (absent for the final mixer), of `dtype` and
+/// each 2-byte aligned; `read_need` gives the bytes of each.
 pub(crate) struct HyperWeights<'b> {
     pub(crate) dtype: HyperDtype,
     pub(crate) norm: DeviceRange<'b>,
@@ -95,8 +95,15 @@ pub(crate) struct HyperApplyCall<'b> {
     pub(crate) block: DeviceRange<'b>,
 }
 
-/// The bytes each range of a read of `shape` must hold.
+/// The bytes each range of a read of `shape` must hold, with F16 weights: the sizes of the
+/// scratch ranges, which are the same for every weight dtype. A read sizes its weight ranges by
+/// [`read_bytes`].
 pub(crate) fn hyper_read_bytes(shape: HyperShape) -> Result<HyperReadBytes, EngError> {
+    read_bytes(shape, HyperDtype::F16)
+}
+
+/// The bytes each range of a read of `shape` must hold with weights of `dtype`.
+fn read_bytes(shape: HyperShape, dtype: HyperDtype) -> Result<HyperReadBytes, EngError> {
     check_dims(shape)?;
     if !(1..=HYPER_MAX_RANK).contains(&shape.rank) {
         return Err(EngError::BadRequest(format!(
@@ -104,7 +111,16 @@ pub(crate) fn hyper_read_bytes(shape: HyperShape) -> Result<HyperReadBytes, EngE
             shape.rank
         )));
     }
-    read_need(shape.dims(), shape.rank).ok_or_else(|| {
+    let width = shape.branches * shape.hidden;
+    if dtype == HyperDtype::Q80AndF16
+        && (!width.is_multiple_of(HYPER_Q80_BLOCK) || !shape.rank.is_multiple_of(HYPER_Q80_BLOCK))
+    {
+        return Err(EngError::BadRequest(format!(
+            "a CUDA hyper-connection of Q8_0 matrices takes a width and a rank that are multiples \
+             of {HYPER_Q80_BLOCK}, got {shape:?}"
+        )));
+    }
+    read_need(shape.dims(), shape.rank, dtype).ok_or_else(|| {
         EngError::BadRequest(format!(
             "the CUDA hyper-connection shape {shape:?} overflows"
         ))
@@ -167,14 +183,14 @@ impl CudaContext {
     }
 
     fn plan_hyper_read<'b>(&self, call: &HyperReadCall<'b>) -> Result<HyperReadRaw<'b>, EngError> {
-        let need = hyper_read_bytes(call.shape)?;
+        let weights = &call.weights;
+        let need = read_bytes(call.shape, weights.dtype)?;
         if !(call.eps.is_finite() && call.eps >= 0.0) {
             return Err(EngError::BadRequest(format!(
                 "the CUDA hyper-connection eps must be finite and nonnegative, got {}",
                 call.eps
             )));
         }
-        let weights = &call.weights;
         if weights.inject.is_some() != call.gate.is_some() {
             return Err(EngError::BadRequest(
                 "the CUDA hyper-connection takes inject and gate together or neither".into(),

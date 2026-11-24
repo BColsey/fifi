@@ -364,6 +364,15 @@ pub(crate) enum SiteTensor {
     Inject,
 }
 
+impl SiteTensor {
+    /// Whether a Q8_0 tensor of this part stays as stored on the device: a mixing matrix, which
+    /// the hyper-connection kernels decode value by value, so nothing rounds it again. The GGUF
+    /// loader stages such a matrix as stored and charges its stored bytes; a vector is F16.
+    pub(crate) fn q80_stays_stored(self) -> bool {
+        matches!(self, Self::Down | Self::Up)
+    }
+}
+
 /// The tensors outside the layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Global {
