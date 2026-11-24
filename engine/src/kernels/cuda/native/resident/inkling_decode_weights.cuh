@@ -73,6 +73,8 @@ __global__ void decode_nv_down(inference_cuda_dense_gemv_args a, DeviceSelectedW
     if (!lane) static_cast<float *>(a.y)[size_t(blockIdx.y)*a.ld_y+row]=sum;
 }
 
+#include "resident/inkling_vocab_iq4.cuh"
+
 template<typename Index>
 bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cudaStream_t s) {
     const int type = a.weight_dtype == kDtypeGgufNvfp4 ? 40 : a.weight_dtype - fifi_gguf::kDtypeBase;
@@ -85,6 +87,10 @@ bool launch_decode_split(const inference_cuda_dense_gemv_args &a, Index idx, cud
     if (!std::is_same_v<Index, SharedWeights> || a.m != 1 ||
         !((a.cols == 2304 && (a.rows == 384 || a.rows == 1024 || a.rows == 3072 || a.rows == 200064)) ||
           (a.cols == 3072 && a.rows == 2304))) return false;
+    if (type == 23 && a.cols == 2304 && a.rows == 200064 && aligned(a.x, 16) && aligned(a.w, 4)) {
+        decode_vocab_iq4<<<a.rows / 8, 256, 0, s>>>(a);
+        return true;
+    }
     switch (type) {
 #define SPLIT(t,b,n) case t: decode_split_packed<t,b,n><<<dim3(a.rows,a.m),128,0,s>>>(a,idx); break;
         SPLIT(8,32,34) SPLIT(12,256,144) SPLIT(13,256,176) SPLIT(14,256,210)
