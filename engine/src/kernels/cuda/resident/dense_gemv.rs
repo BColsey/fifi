@@ -196,7 +196,9 @@ impl CudaContext {
         self.dense_gemv_group_impl(stream, calls, None, false, reuse, None)
     }
 
-    /// Selects Q8_0 row reuse for one attention projection; returns 0, 2, or 4.
+    /// Selects Q8_0 row reuse for one attention projection; returns 0, 2, or 4. With
+    /// `FIFI_INKLING_CUDA_PREFILL_Q8_VISIT=1` a measured Q8 shape takes the weight-visit
+    /// kernel, which reads the weights once for all rows, and the result is that row count.
     pub(crate) fn dense_gemv_with_q8_row_reuse(
         &self,
         stream: &DeviceStream,
@@ -518,7 +520,13 @@ mod group_tests {
             };
             let (pair, expected) = run(false);
             let (four, actual) = run(true);
-            assert_eq!((pair, four), (2, 4));
+            // The opt-in weight-visit kernel serves this shape with every row in one group
+            // and reports the row count instead of a reuse width; `four` then has no effect.
+            let visit = super::inkling_q8_visit_enabled();
+            assert_eq!(
+                (pair, four),
+                if visit { (m as i32, m as i32) } else { (2, 4) }
+            );
             assert!(
                 actual == expected,
                 "Q8 output differs at {m} activation rows"
