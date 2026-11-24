@@ -1297,7 +1297,9 @@ fn f16_round(v: f32) -> f32 {
 fn cpu_q8_1(row: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut back = vec![0.0; row.len()];
     let mut scales = Vec::with_capacity(row.len() / 32);
-    for (values, out) in row.chunks_exact(32).zip(back.chunks_exact_mut(32)) {
+    let (blocks, _) = row.as_chunks::<32>();
+    let (outs, _) = back.as_chunks_mut::<32>();
+    for (values, out) in blocks.iter().zip(outs) {
         let amax = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
         let kept = f16_round(d);
@@ -1424,7 +1426,9 @@ fn raw<'a>(loaded: &'a CudaWeights, name: &str) -> &'a DeviceBuffer {
 /// the values first, the codes after (the vendored `block_q8_1`).
 fn dequant_q8_1(bytes: &[u8], k: usize) -> Vec<f32> {
     bytes[..36 * (k / 32)]
-        .chunks_exact(36)
+        .as_chunks::<36>()
+        .0
+        .iter()
         .flat_map(|b| {
             let d = le_f16_vec(&b[..2])[0];
             b[4..36].iter().map(move |q| d * (*q as i8) as f32)
