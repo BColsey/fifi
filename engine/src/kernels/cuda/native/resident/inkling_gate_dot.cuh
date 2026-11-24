@@ -107,9 +107,7 @@ __global__ void inkling_gate_dot(const GateDigits *packed, const uint8_t *gate,
 template<int Type, int Bytes>
 void launch_decode_gate(const GateDigits *packed, const uint8_t *gate, float *out,
                         DeviceSelectedWeights index, cudaStream_t stream) {
-    const dim3 grid(2304 / 16, 8);
-    if constexpr (Type == 19) decode_gate_pair<Type, Bytes><<<grid,256,0,stream>>>(packed,gate,out,index);
-    else decode_gate_cached<Type, Bytes><<<dim3(48,8),256,0,stream>>>(packed,gate,out,index);
+    decode_gate_cached<Type, Bytes><<<dim3(36,8),256,0,stream>>>(packed,gate,out,index);
 }
 
 bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
