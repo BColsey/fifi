@@ -28,6 +28,8 @@ struct MhcRouteArgsRaw {
     pre_scale: f32,
     iterations: c_int,
     fixed_identity: c_int,
+    rows: c_int,
+    ld_ab: c_int,
 }
 
 #[repr(C)]
@@ -37,6 +39,8 @@ struct MhcMergeArgsRaw {
     branch: *const c_void,
     route: *const c_void,
     hidden: c_int,
+    rows: c_int,
+    ld_ab: c_int,
 }
 
 #[repr(C)]
@@ -45,6 +49,8 @@ struct MhcAverageArgsRaw {
     b: *const c_void,
     out: *mut c_void,
     hidden: c_int,
+    rows: c_int,
+    ld_ab: c_int,
 }
 
 unsafe extern "C" {
@@ -79,6 +85,8 @@ pub(in crate::kernels::cuda) struct MhcRouteRaw<'a> {
     pub(in crate::kernels::cuda) pre_scale: f32,
     pub(in crate::kernels::cuda) iterations: usize,
     pub(in crate::kernels::cuda) fixed_identity: bool,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ld_ab: usize,
 }
 
 pub(in crate::kernels::cuda) struct MhcMergeRaw<'a> {
@@ -87,6 +95,8 @@ pub(in crate::kernels::cuda) struct MhcMergeRaw<'a> {
     pub(in crate::kernels::cuda) branch: RawRange<'a>,
     pub(in crate::kernels::cuda) route: RawRange<'a>,
     pub(in crate::kernels::cuda) hidden: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ld_ab: usize,
 }
 
 pub(in crate::kernels::cuda) struct MhcAverageRaw<'a> {
@@ -94,17 +104,41 @@ pub(in crate::kernels::cuda) struct MhcAverageRaw<'a> {
     pub(in crate::kernels::cuda) b: RawRange<'a>,
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) hidden: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ld_ab: usize,
 }
 
 const F32: usize = size_of::<f32>();
 const ROUTE_FLOATS: usize = 6;
+/// Rows of one chunk: the mmq chunk cap.
+const MAX_ROWS: usize = 4096;
 
-fn hidden_int(hidden: usize) -> Result<c_int, DeviceFailure> {
-    c_int::try_from(hidden).map_err(|_| invalid_argument())
+fn dim_int(value: usize) -> Result<c_int, DeviceFailure> {
+    c_int::try_from(value).map_err(|_| invalid_argument())
 }
 
 fn row(hidden: usize) -> Result<usize, DeviceFailure> {
     hidden.checked_mul(F32).ok_or_else(invalid_argument)
+}
+
+/// The bytes from the first row's start through the last row's end: `rows` rows of `row_bytes`,
+/// consecutive ones `stride` apart (the last needs only its own bytes).
+fn rows_extent(rows: usize, stride: usize, row_bytes: usize) -> Result<usize, DeviceFailure> {
+    rows.checked_sub(1)
+        .and_then(|lead| lead.checked_mul(stride))
+        .and_then(|lead| lead.checked_add(row_bytes))
+        .ok_or_else(invalid_argument)
+}
+
+/// Checks the row count and the stream stride; returns the bytes one stream half covers. A
+/// chunk's halves interleave inside their `[a || b]` rows, and `ld_ab >= 2 * hidden` keeps every
+/// element of `a` off every element of `b`.
+fn streams(rows: usize, ld_ab: usize, hidden: usize) -> Result<usize, DeviceFailure> {
+    if rows == 0 || rows > MAX_ROWS || ld_ab < 2 * hidden {
+        return Err(invalid_argument());
+    }
+    let stride = ld_ab.checked_mul(F32).ok_or_else(invalid_argument)?;
+    rows_extent(rows, stride, row(hidden)?)
 }
 
 pub(in crate::kernels::cuda) fn mhc_route_launch(
@@ -112,23 +146,26 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
     io: MhcRouteRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let row_bytes = row(io.hidden)?;
-    let logits = 8 * F32;
-    let route_bytes = ROUTE_FLOATS * F32;
+    let stream_bytes = streams(io.rows, io.ld_ab, io.hidden)?;
+    let logit_row = 8 * F32;
+    let logits = logit_row * io.rows;
+    let route_bytes = ROUTE_FLOATS * F32 * io.rows;
+    let input_bytes = rows_extent(io.rows, row_bytes, row_bytes)?;
     let logits_ok = io.logits.bytes >= logits && io.logits.offset.is_multiple_of(4);
     let mut reads = vec![Span::of(&io.logits, logits)];
     if let Some(bias) = &io.bias {
-        if bias.bytes < logits || !bias.offset.is_multiple_of(4) {
+        if bias.bytes < logit_row || !bias.offset.is_multiple_of(4) {
             return Err(invalid_argument());
         }
-        reads.push(Span::of(bias, logits));
+        reads.push(Span::of(bias, logit_row));
     }
-    let a_ok = io.a.bytes >= row_bytes && io.a.offset.is_multiple_of(4);
-    let b_ok = io.b.bytes >= row_bytes && io.b.offset.is_multiple_of(4);
+    let a_ok = io.a.bytes >= stream_bytes && io.a.offset.is_multiple_of(4);
+    let b_ok = io.b.bytes >= stream_bytes && io.b.offset.is_multiple_of(4);
     let written = [
         (
-            io.input.bytes >= row_bytes,
+            io.input.bytes >= input_bytes,
             io.input.offset.is_multiple_of(4),
-            Span::of(&io.input, row_bytes),
+            Span::of(&io.input, input_bytes),
         ),
         (
             io.route.bytes >= route_bytes,
@@ -138,8 +175,8 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
     ];
     let apart = written.iter().all(|w| {
         reads.iter().all(|read| read.apart(&w.2))
-            && Span::of(&io.a, row_bytes).apart(&w.2)
-            && Span::of(&io.b, row_bytes).apart(&w.2)
+            && Span::of(&io.a, stream_bytes).apart(&w.2)
+            && Span::of(&io.b, stream_bytes).apart(&w.2)
     }) && written[0].2.apart(&written[1].2);
     let scalars = io.pre_scale.is_finite() && io.iterations <= 32;
     if !(logits_ok && a_ok && b_ok && apart && scalars) || !written.iter().all(|w| w.0 && w.1) {
@@ -155,10 +192,12 @@ pub(in crate::kernels::cuda) fn mhc_route_launch(
         b: io.b.address().cast_const(),
         input: io.input.address(),
         route: io.route.address(),
-        hidden: hidden_int(io.hidden)?,
+        hidden: dim_int(io.hidden)?,
         pre_scale: io.pre_scale,
         iterations: io.iterations as c_int,
         fixed_identity: io.fixed_identity as c_int,
+        rows: dim_int(io.rows)?,
+        ld_ab: dim_int(io.ld_ab)?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: the claims above proved every range inside its live allocation, large enough,
@@ -174,22 +213,26 @@ pub(in crate::kernels::cuda) fn mhc_merge_launch(
     io: MhcMergeRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let row_bytes = row(io.hidden)?;
-    let route_bytes = ROUTE_FLOATS * F32;
-    if io.a.bytes < row_bytes
-        || io.b.bytes < row_bytes
-        || io.branch.bytes < row_bytes
+    let stream_bytes = streams(io.rows, io.ld_ab, io.hidden)?;
+    let branch_bytes = rows_extent(io.rows, row_bytes, row_bytes)?;
+    let route_bytes = ROUTE_FLOATS * F32 * io.rows;
+    if io.a.bytes < stream_bytes
+        || io.b.bytes < stream_bytes
+        || io.branch.bytes < branch_bytes
         || io.route.bytes < route_bytes
         || !io.a.offset.is_multiple_of(4)
         || !io.b.offset.is_multiple_of(4)
         || !io.branch.offset.is_multiple_of(4)
         || !io.route.offset.is_multiple_of(4)
-        || !Span::of(&io.a, row_bytes).apart(&Span::of(&io.branch, row_bytes))
-        || !Span::of(&io.b, row_bytes).apart(&Span::of(&io.branch, row_bytes))
-        || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.a, row_bytes))
-        || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.b, row_bytes))
-        || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.branch, row_bytes))
-        // a and b are written in place after one read of both, so they must not overlap
-        || !Span::of(&io.a, row_bytes).apart(&Span::of(&io.b, row_bytes))
+        || !Span::of(&io.a, stream_bytes).apart(&Span::of(&io.branch, branch_bytes))
+        || !Span::of(&io.b, stream_bytes).apart(&Span::of(&io.branch, branch_bytes))
+        || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.a, stream_bytes))
+        || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.b, stream_bytes))
+        || !Span::of(&io.route, route_bytes).apart(&Span::of(&io.branch, branch_bytes))
+        // a and b are written in place after one read of both, so no element may be both:
+        // one row's halves are two apart ranges, and a chunk's halves only interleave inside
+        // their [a || b] rows, where ld_ab >= 2 * hidden keeps every element of a off b.
+        || (io.rows == 1 && !Span::of(&io.a, row_bytes).apart(&Span::of(&io.b, row_bytes)))
     {
         return Err(invalid_argument());
     }
@@ -198,7 +241,9 @@ pub(in crate::kernels::cuda) fn mhc_merge_launch(
         b: io.b.address(),
         branch: io.branch.address().cast_const(),
         route: io.route.address().cast_const(),
-        hidden: hidden_int(io.hidden)?,
+        hidden: dim_int(io.hidden)?,
+        rows: dim_int(io.rows)?,
+        ld_ab: dim_int(io.ld_ab)?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: as `mhc_route_launch` above; a and b are the same range in and out (in place).
@@ -211,14 +256,16 @@ pub(in crate::kernels::cuda) fn mhc_average_launch(
     io: MhcAverageRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let row_bytes = row(io.hidden)?;
-    if io.a.bytes < row_bytes
-        || io.b.bytes < row_bytes
-        || io.out.bytes < row_bytes
+    let stream_bytes = streams(io.rows, io.ld_ab, io.hidden)?;
+    let out_bytes = rows_extent(io.rows, row_bytes, row_bytes)?;
+    if io.a.bytes < stream_bytes
+        || io.b.bytes < stream_bytes
+        || io.out.bytes < out_bytes
         || !io.a.offset.is_multiple_of(4)
         || !io.b.offset.is_multiple_of(4)
         || !io.out.offset.is_multiple_of(4)
-        || !Span::of(&io.out, row_bytes).apart(&Span::of(&io.a, row_bytes))
-        || !Span::of(&io.out, row_bytes).apart(&Span::of(&io.b, row_bytes))
+        || !Span::of(&io.out, out_bytes).apart(&Span::of(&io.a, stream_bytes))
+        || !Span::of(&io.out, out_bytes).apart(&Span::of(&io.b, stream_bytes))
     {
         return Err(invalid_argument());
     }
@@ -226,7 +273,9 @@ pub(in crate::kernels::cuda) fn mhc_average_launch(
         a: io.a.address().cast_const(),
         b: io.b.address().cast_const(),
         out: io.out.address(),
-        hidden: hidden_int(io.hidden)?,
+        hidden: dim_int(io.hidden)?,
+        rows: dim_int(io.rows)?,
+        ld_ab: dim_int(io.ld_ab)?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: as `mhc_route_launch` above.

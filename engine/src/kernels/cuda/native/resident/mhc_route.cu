@@ -1,5 +1,5 @@
 /*
- * The mHC stream routing kernels of the SenseNova Loop decode step.
+ * The mHC stream routing kernels of the SenseNova Loop decode step and prefill chunk.
  *
  * Three launch-only kernels over the two mHC residual streams; the math is the CPU reference's
  * (family/qwen/sensenova/step.rs: mhc_route and merge), element for element, in the arithmetic
@@ -28,8 +28,14 @@ __device__ inline float softplus_(float x) { return fmaxf(x, 0.f) + log1pf(expf(
 __global__ void __launch_bounds__(kUnit) mhc_route_k(
     const float *__restrict__ logits, const float *__restrict__ bias, const float *__restrict__ a,
     const float *__restrict__ b, float *__restrict__ input, float *__restrict__ route, int hidden,
-    float pre_scale, int iterations, int fixed_identity) {
+    float pre_scale, int iterations, int fixed_identity, int ld_ab) {
     const int j = blockIdx.x * kUnit + threadIdx.x;
+    // Row r: a and b are the halves of one ld_ab-wide [a||b] stream row; the rest are dense rows.
+    logits += blockIdx.y * 8;
+    route += blockIdx.y * 6;
+    input += (size_t)blockIdx.y * hidden;
+    a += (size_t)blockIdx.y * ld_ab;
+    b += (size_t)blockIdx.y * ld_ab;
     float l[8];
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
@@ -69,8 +75,12 @@ __global__ void __launch_bounds__(kUnit) mhc_route_k(
 
 __global__ void __launch_bounds__(kUnit) mhc_merge_k(
     float *__restrict__ a, float *__restrict__ b, const float *__restrict__ branch,
-    const float *__restrict__ route, int hidden) {
+    const float *__restrict__ route, int hidden, int ld_ab) {
     const int j = blockIdx.x * kUnit + threadIdx.x;
+    route += blockIdx.y * 6;
+    branch += (size_t)blockIdx.y * hidden;
+    a += (size_t)blockIdx.y * ld_ab;
+    b += (size_t)blockIdx.y * ld_ab;
     if (j < hidden) {
         const float m00 = route[2], m01 = route[3], m10 = route[4], m11 = route[5];
         const float post0 = route[0], post1 = route[1];
@@ -82,14 +92,23 @@ __global__ void __launch_bounds__(kUnit) mhc_merge_k(
 
 __global__ void __launch_bounds__(kUnit) mhc_average_k(
     const float *__restrict__ a, const float *__restrict__ b, float *__restrict__ out,
-    int hidden) {
+    int hidden, int ld_ab) {
     const int j = blockIdx.x * kUnit + threadIdx.x;
+    out += (size_t)blockIdx.y * hidden;
+    a += (size_t)blockIdx.y * ld_ab;
+    b += (size_t)blockIdx.y * ld_ab;
     if (j < hidden) {
         out[j] = 0.5f * (a[j] + b[j]);
     }
 }
 
 bool hidden_ok(int h) { return h >= kUnit && h % kUnit == 0 && h <= kMaxH; }
+
+// One decode step is one row; a prefill chunk is at most kMaxRows. The halves of a row never
+// share an element because ld_ab >= 2 * hidden.
+constexpr int kMaxRows = 4096;
+
+bool rows_ok(int rows, int ld_ab, int h) { return rows >= 1 && rows <= kMaxRows && ld_ab >= 2 * h; }
 
 }  // namespace
 
@@ -99,13 +118,14 @@ extern "C" int inference_cuda_mhc_route_launch(const inference_cuda_mhc_route_ar
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (in == NULL || in->logits == NULL || in->a == NULL || in->b == NULL ||
             in->input == NULL || in->route == NULL || !hidden_ok(in->hidden) ||
-            !isfinite(in->pre_scale) || in->iterations < 0 || in->iterations > 32) {
-            return INFERENCE_CUDA_INVALID_ARGUMENT;
+            !rows_ok(in->rows, in->ld_ab, in->hidden) || !isfinite(in->pre_scale) ||
+            in->iterations < 0 || in->iterations > 32) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        const dim3 grid((in->hidden + kUnit - 1) / kUnit);
+        const dim3 grid((in->hidden + kUnit - 1) / kUnit, in->rows);
         mhc_route_k<<<grid, kUnit, 0, (cudaStream_t)stream>>>(
             in->logits, in->bias, in->a, in->b, in->input, in->route, in->hidden, in->pre_scale,
-            in->iterations, in->fixed_identity);
+            in->iterations, in->fixed_identity, in->ld_ab);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
@@ -120,12 +140,13 @@ extern "C" int inference_cuda_mhc_merge_launch(const inference_cuda_mhc_merge_ar
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (in == NULL || in->a == NULL || in->b == NULL || in->branch == NULL ||
-            in->route == NULL || !hidden_ok(in->hidden)) {
+            in->route == NULL || !hidden_ok(in->hidden) ||
+            !rows_ok(in->rows, in->ld_ab, in->hidden)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        const dim3 grid((in->hidden + kUnit - 1) / kUnit);
+        const dim3 grid((in->hidden + kUnit - 1) / kUnit, in->rows);
         mhc_merge_k<<<grid, kUnit, 0, (cudaStream_t)stream>>>(in->a, in->b, in->branch, in->route,
-                                                              in->hidden);
+                                                              in->hidden, in->ld_ab);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
@@ -140,12 +161,12 @@ extern "C" int inference_cuda_mhc_average_launch(const inference_cuda_mhc_averag
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (in == NULL || in->a == NULL || in->b == NULL || in->out == NULL ||
-            !hidden_ok(in->hidden)) {
+            !hidden_ok(in->hidden) || !rows_ok(in->rows, in->ld_ab, in->hidden)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        const dim3 grid((in->hidden + kUnit - 1) / kUnit);
-        mhc_average_k<<<grid, kUnit, 0, (cudaStream_t)stream>>>(in->a, in->b, in->out,
-                                                                in->hidden);
+        const dim3 grid((in->hidden + kUnit - 1) / kUnit, in->rows);
+        mhc_average_k<<<grid, kUnit, 0, (cudaStream_t)stream>>>(in->a, in->b, in->out, in->hidden,
+                                                                in->ld_ab);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

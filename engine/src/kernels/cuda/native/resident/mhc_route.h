@@ -30,18 +30,25 @@ extern "C" {
  * a and b are [hidden] f32, input is [hidden] f32, logits are 8 f32, route is 6 f32 written:
  * post at 0..2 and mix at 2..6. hidden is a positive multiple of 256 (grid math) and at most
  * 2^20. bias is NULL or 8 f32 added to the logits once, before any sigmoid or Sinkhorn step.
- * Returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch for a bad argument. */
+ * Returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch for a bad argument.
+ *
+ * rows is 1 (one decode step) or a prefill chunk's row count, at most 4096. Every buffer then
+ * holds that many rows back to back (logits 8 and route 6 floats per row) except a and b: they
+ * are the halves of one ld_ab-wide [a || b] row with ld_ab >= 2 * hidden, so consecutive rows
+ * step ld_ab and the two halves never share an element. */
 typedef struct inference_cuda_mhc_route_args {
     const float *logits;
     const float *bias; /* NULL, or 8 f32 added to the logits before every use */
     const float *a;
     const float *b;
     float *input;
-    float *route; /* [2] post then [4] mix */
+    float *route; /* [rows][6]: [2] post then [4] mix */
     int hidden;
     float pre_scale;
     int iterations;
     int fixed_identity;
+    int rows;
+    int ld_ab;
 } inference_cuda_mhc_route_args;
 int inference_cuda_mhc_route_launch(const inference_cuda_mhc_route_args *args, void *stream,
                                     int *out_stage);
@@ -51,9 +58,11 @@ int inference_cuda_mhc_route_launch(const inference_cuda_mhc_route_args *args, v
 typedef struct inference_cuda_mhc_merge_args {
     float *a;
     float *b;
-    const float *branch; /* [hidden] f32 */
-    const float *route;
+    const float *branch; /* [rows][hidden] f32 */
+    const float *route;  /* [rows][6] */
     int hidden;
+    int rows;
+    int ld_ab;
 } inference_cuda_mhc_merge_args;
 int inference_cuda_mhc_merge_launch(const inference_cuda_mhc_merge_args *args, void *stream,
                                     int *out_stage);
@@ -62,8 +71,10 @@ int inference_cuda_mhc_merge_launch(const inference_cuda_mhc_merge_args *args, v
 typedef struct inference_cuda_mhc_average_args {
     const float *a;
     const float *b;
-    float *out;
+    float *out; /* [rows][hidden] f32 */
     int hidden;
+    int rows;
+    int ld_ab;
 } inference_cuda_mhc_average_args;
 int inference_cuda_mhc_average_launch(const inference_cuda_mhc_average_args *args, void *stream,
                                       int *out_stage);

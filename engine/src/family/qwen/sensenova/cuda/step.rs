@@ -402,6 +402,8 @@ impl<'a> LoopStep<'a> {
                     &self.stream,
                     MhcAverageCall {
                         hidden: h,
+                        rows: 1,
+                        ld_ab: 2 * h,
                         a: floats(&self.streams, 0, h)?,
                         b: floats(&self.streams, h, h)?,
                         out: self.resid_range()?,
@@ -541,6 +543,8 @@ impl<'a> LoopStep<'a> {
             &self.stream,
             MhcRouteCall {
                 hidden: h,
+                rows: 1,
+                ld_ab: 2 * h,
                 pre_scale: self.plan.mhc_pre_scale,
                 iterations: self.plan.mhc_iterations,
                 fixed_identity: self.plan.mhc_fixed_identity,
@@ -569,6 +573,8 @@ impl<'a> LoopStep<'a> {
             &self.stream,
             MhcMergeCall {
                 hidden: h,
+                rows: 1,
+                ld_ab: 2 * h,
                 a: floats(&self.streams, 0, h)?,
                 b: floats(&self.streams, h, h)?,
                 branch,

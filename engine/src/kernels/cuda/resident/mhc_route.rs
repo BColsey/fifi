@@ -11,13 +11,18 @@
 //! mirror `valid()` of `mhc_route.cu`, so the native entry cannot return `INVALID_ARGUMENT`
 //! (which would latch the backend). In order: the backend is usable; `hidden` is a positive
 //! multiple of 256 at most 2^20 (the grid math); `pre_scale` is finite and `iterations` is at
-//! most 32 (route); every range holds its bytes at 4-byte alignment; the written ranges
+//! most 32 (route); `rows` is 1..=4096 and `ld_ab` at least two `hidden`; every range holds
+//! the bytes of all its rows at 4-byte alignment; the written ranges
 //! overlap no other range of the call. A refused call changes nothing.
 //!
 //! The caller of one visit sequences route -> (branch) -> merge -> ... -> average on ONE
-//! stream, so every kernel reads what the previous one wrote; `a` and `b` must be distinct
-//! buffers (merge writes both in place after one read of each, per thread), and the 6-float
-//! route cell written by route is the cell merge reads.
+//! stream, so every kernel reads what the previous one wrote; `a` and `b` must hold distinct
+//! elements (merge writes both in place after one read of each, per thread): two ranges for
+//! one row, or the halves of `ld_ab`-wide `[a || b]` rows for a chunk; and the 6-float route
+//! cell written by route is the cell merge reads.
+//!
+//! One call serves one decode step (`rows: 1`) or one prefill chunk (`rows` rows): every range
+//! then holds its rows back to back.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
@@ -30,6 +35,25 @@ const UNIT: usize = 256;
 const MAX_HIDDEN: usize = 1 << 20;
 const LOGIT_FLOATS: usize = 8;
 const ROUTE_FLOATS: usize = 6;
+/// Rows of one chunk: the mmq chunk cap.
+const MAX_ROWS: usize = 4096;
+
+/// Checks the row count and the stream stride, and returns the bytes one stream half covers:
+/// `rows` rows whose first is a full row and whose rest step `ld_ab`. A chunk's halves
+/// interleave inside their `[a || b]` rows; `ld_ab >= 2 * hidden` keeps every element apart.
+fn stream_bytes(rows: usize, ld_ab: usize, hidden: usize) -> Result<usize, EngError> {
+    if rows == 0 || rows > MAX_ROWS || ld_ab < 2 * hidden {
+        return Err(EngError::BadRequest(format!(
+            "mhc_route: rows is {rows} and ld_ab is {ld_ab}, not 1..=4096 rows of ld_ab >= 2 * hidden"
+        )));
+    }
+    let floats = rows
+        .checked_sub(1)
+        .and_then(|lead| lead.checked_mul(ld_ab))
+        .and_then(|lead| lead.checked_add(hidden))
+        .ok_or_else(|| EngError::BadRequest("mhc_route: the stream rows overflow".to_owned()))?;
+    bytes("stream", floats)
+}
 
 fn check_hidden(hidden: usize) -> Result<(), EngError> {
     if hidden % UNIT != 0 || hidden > MAX_HIDDEN {
@@ -62,6 +86,10 @@ fn fit(what: &str, range: &DeviceRange<'_>, need: usize) -> Result<(), EngError>
 /// written by the call and read by the matching merge.
 pub(crate) struct MhcRouteCall<'b> {
     pub(crate) hidden: usize,
+    /// Rows of the call: 1 for a decode step, a chunk's row count for prefill.
+    pub(crate) rows: usize,
+    /// The stride between the `[a || b]` rows of a chunk, at least two `hidden`.
+    pub(crate) ld_ab: usize,
     pub(crate) pre_scale: f32,
     pub(crate) iterations: usize,
     pub(crate) fixed_identity: bool,
@@ -77,6 +105,8 @@ pub(crate) struct MhcRouteCall<'b> {
 /// One merge call: `a` and `b` in place with the branch output, using the route cell.
 pub(crate) struct MhcMergeCall<'b> {
     pub(crate) hidden: usize,
+    pub(crate) rows: usize,
+    pub(crate) ld_ab: usize,
     pub(crate) a: DeviceRange<'b>,
     pub(crate) b: DeviceRange<'b>,
     pub(crate) branch: DeviceRange<'b>,
@@ -86,6 +116,8 @@ pub(crate) struct MhcMergeCall<'b> {
 /// One average call: `out[j] = 0.5 * (a[j] + b[j])`.
 pub(crate) struct MhcAverageCall<'b> {
     pub(crate) hidden: usize,
+    pub(crate) rows: usize,
+    pub(crate) ld_ab: usize,
     pub(crate) a: DeviceRange<'b>,
     pub(crate) b: DeviceRange<'b>,
     pub(crate) out: DeviceRange<'b>,
@@ -105,16 +137,18 @@ impl CudaContext {
                 "mhc_route: pre_scale is not finite or iterations is above 32".to_owned(),
             ));
         }
-        let row = bytes("stream", call.hidden)?;
-        let logit_bytes = bytes("logits", LOGIT_FLOATS)?;
-        let route_bytes = bytes("route cell", ROUTE_FLOATS)?;
+        let half = stream_bytes(call.rows, call.ld_ab, call.hidden)?;
+        let logit_row = bytes("logits", LOGIT_FLOATS)?;
+        let logit_bytes = bytes("logits", LOGIT_FLOATS * call.rows)?;
+        let route_bytes = bytes("route cells", ROUTE_FLOATS * call.rows)?;
+        let input = bytes("input", call.hidden * call.rows)?;
         fit("logits", &call.logits, logit_bytes)?;
         if let Some(bias) = &call.bias {
-            fit("bias", bias, logit_bytes)?;
+            fit("bias", bias, logit_row)?;
         }
-        fit("a", &call.a, row)?;
-        fit("b", &call.b, row)?;
-        fit("input", &call.input, row)?;
+        fit("a", &call.a, half)?;
+        fit("b", &call.b, half)?;
+        fit("input", &call.input, input)?;
         fit("route", &call.route, route_bytes)?;
         let logits = self.raw_range(&call.logits)?;
         let bias = call.bias.as_ref().map(|r| self.raw_range(r)).transpose()?;
@@ -136,6 +170,8 @@ impl CudaContext {
                     pre_scale: call.pre_scale,
                     iterations: call.iterations,
                     fixed_identity: call.fixed_identity,
+                    rows: call.rows,
+                    ld_ab: call.ld_ab,
                 },
             )
         })
@@ -149,11 +185,12 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         check_hidden(call.hidden)?;
-        let row = bytes("stream", call.hidden)?;
-        let route_bytes = bytes("route cell", ROUTE_FLOATS)?;
-        fit("a", &call.a, row)?;
-        fit("b", &call.b, row)?;
-        fit("branch", &call.branch, row)?;
+        let half = stream_bytes(call.rows, call.ld_ab, call.hidden)?;
+        let branch = bytes("branch", call.hidden * call.rows)?;
+        let route_bytes = bytes("route cells", ROUTE_FLOATS * call.rows)?;
+        fit("a", &call.a, half)?;
+        fit("b", &call.b, half)?;
+        fit("branch", &call.branch, branch)?;
         fit("route", &call.route, route_bytes)?;
         let a = self.raw_range(&call.a)?;
         let b = self.raw_range(&call.b)?;
@@ -168,6 +205,8 @@ impl CudaContext {
                     branch,
                     route,
                     hidden: call.hidden,
+                    rows: call.rows,
+                    ld_ab: call.ld_ab,
                 },
             )
         })
@@ -181,10 +220,11 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         check_hidden(call.hidden)?;
-        let row = bytes("stream", call.hidden)?;
-        fit("a", &call.a, row)?;
-        fit("b", &call.b, row)?;
-        fit("out", &call.out, row)?;
+        let half = stream_bytes(call.rows, call.ld_ab, call.hidden)?;
+        let out = bytes("out", call.hidden * call.rows)?;
+        fit("a", &call.a, half)?;
+        fit("b", &call.b, half)?;
+        fit("out", &call.out, out)?;
         let a = self.raw_range(&call.a)?;
         let b = self.raw_range(&call.b)?;
         let out = self.raw_range(&call.out)?;
@@ -196,6 +236,8 @@ impl CudaContext {
                     b,
                     out,
                     hidden: call.hidden,
+                    rows: call.rows,
+                    ld_ab: call.ld_ab,
                 },
             )
         })
