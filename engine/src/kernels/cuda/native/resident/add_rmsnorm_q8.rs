@@ -43,10 +43,11 @@ struct AddNormQ8ArgsRepr {
     eps: f32,
     rows: c_int,
     h_stride: c_int,
+    threads: c_int,
 }
 
 const _: () = assert!(
-    size_of::<AddNormQ8ArgsRepr>() == 56
+    size_of::<AddNormQ8ArgsRepr>() == 64
         && offset_of!(AddNormQ8ArgsRepr, h) == 0
         && offset_of!(AddNormQ8ArgsRepr, delta) == 8
         && offset_of!(AddNormQ8ArgsRepr, w) == 16
@@ -56,6 +57,7 @@ const _: () = assert!(
         && offset_of!(AddNormQ8ArgsRepr, eps) == 44
         && offset_of!(AddNormQ8ArgsRepr, rows) == 48
         && offset_of!(AddNormQ8ArgsRepr, h_stride) == 52
+        && offset_of!(AddNormQ8ArgsRepr, threads) == 56
 );
 
 /// What one launch reads and writes: the residual row `h` (updated in place when `delta` is
@@ -72,6 +74,8 @@ pub(in crate::kernels::cuda) struct AddNormQ8Raw<'a> {
     pub(in crate::kernels::cuda) rows: usize,
     /// f32 elements between rows of `h`; 0 is `n` (dense).
     pub(in crate::kernels::cuda) h_stride: usize,
+    /// Threads per row block: 0 or 256 is add_rmsnorm_pack_k's summation order; 1024 another.
+    pub(in crate::kernels::cuda) threads: usize,
 }
 
 /// Bytes of the `block_q8_1` output of one row of `n` values: padded to 512 values, one 36-byte
@@ -114,6 +118,7 @@ fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
         || !call.eps.is_finite()
         || call.eps <= 0.0
         || !(1..=262_144).contains(&rows)
+        || !matches!(call.threads, 0 | 256 | 1024)
     {
         return Err(invalid_argument());
     }
@@ -154,6 +159,7 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
         eps: call.eps,
         rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
         h_stride: c_int::try_from(call.h_stride).map_err(|_| invalid_argument())?,
+        threads: c_int::try_from(call.threads).map_err(|_| invalid_argument())?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_add_norm_q8` proved every range inside its live allocation, large enough,
@@ -219,6 +225,7 @@ mod tests {
             eps: args.eps,
             rows: args.rows,
             h_stride: 0,
+            threads: 0,
         };
         let mut stage = STAGE_NONE;
         // SAFETY: only called with arguments the entry refuses before it uses any pointer or
@@ -324,6 +331,7 @@ mod tests {
             eps,
             rows: 1,
             h_stride: 0,
+            threads: 0,
         })
     }
 

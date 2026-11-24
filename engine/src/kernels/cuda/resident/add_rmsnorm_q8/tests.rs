@@ -156,6 +156,69 @@ pub(in crate::kernels::cuda) fn as_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// The opt-in wide form: 1024 threads add the sum of squares in another float order, so the
+/// row matches the 256-thread form to rounding and every q8 count to one step.
+#[test]
+fn add_rmsnorm_q8_wide_matches_the_256_thread_form() {
+    if !testkit::device_present("add_rmsnorm_q8_wide_matches_the_256_thread_form") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (n, eps) = (4096, 1e-6);
+    let value = |i: usize, salt: u32| {
+        let mixed = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(salt) >> 8;
+        mixed as f32 / 16_777_216.0
+    };
+    let h: Vec<f32> = (0..n).map(|i| value(i, 7) * 8.0 - 4.0).collect();
+    let weight: Vec<f32> = (0..n).map(|i| 0.5 + value(i, 11)).collect();
+    let (_, norm_256, q8_256) = launch_mine(&ctx, &stream, n, &h, None, &weight, eps);
+
+    let need = add_rmsnorm_q8_needs(n, 1).expect("sizes");
+    let h_dev = testkit::upload_f32(&ctx, &h);
+    let weight_dev = testkit::upload_f32(&ctx, &weight);
+    let norm = testkit::upload_filled(&ctx, 0xAB, need.row);
+    let q8 = testkit::upload_filled(&ctx, 0xA5, need.q8);
+    ctx.add_rmsnorm_q8_wide(
+        &stream,
+        AddNormQ8Call {
+            n,
+            eps,
+            h: h_dev.range(0, need.row).expect("h range"),
+            delta: None,
+            weight: weight_dev.range(0, need.weight).expect("weight range"),
+            norm_out: norm.range(0, need.row).expect("norm_out range"),
+            q8: q8.range(0, need.q8).expect("q8 range"),
+            rows: 1,
+        },
+    )
+    .expect("queue add_rmsnorm_q8_wide");
+    stream.synchronize().expect("drain");
+    let norm_wide = as_f32(&testkit::read_bytes(&ctx, &norm, need.row));
+    let q8_wide = testkit::read_bytes(&ctx, &q8, need.q8);
+
+    let worst = as_f32(&norm_256)
+        .iter()
+        .zip(&norm_wide)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 1e-4, "norm_out differs by {worst:e}");
+    for block in 0..n / 32 {
+        let (d_a, _, q_a) = parse_block(&q8_256, block * 36);
+        let (d_b, _, q_b) = parse_block(&q8_wide, block * 36);
+        assert!(
+            (d_a - d_b).abs() <= 1e-5 * d_a.max(1.0),
+            "block {block}: scales {d_a:e} {d_b:e}"
+        );
+        assert!(
+            q_a.iter()
+                .zip(q_b)
+                .all(|(x, y)| (x - y).unsigned_abs() <= 1),
+            "block {block}: counts {q_a:?} vs {q_b:?}"
+        );
+    }
+}
+
 fn launch_mine(
     ctx: &CudaContext,
     stream: &DeviceStream,

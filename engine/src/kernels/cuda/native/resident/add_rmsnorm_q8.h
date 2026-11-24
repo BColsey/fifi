@@ -24,7 +24,10 @@ extern "C" {
  * vendored quantize.cu object), so d is the IEEE division and the output is bit-checkable
  * against a host reference. The row is padded to MATRIX_ROW_PADDING (512) values: the tail
  * blocks past n are written as zeros (d = 0, q = 0, s = 0), q8 holds pad(n, 512)/32 blocks of
- * 36 bytes. One kernel, one block of 256 threads. h, delta, w, norm_out: f32 [n]; q8:
+ * 36 bytes. One kernel, one block per row: 256 threads, or 1024 when `threads` says so (the
+ * same block code over a quarter of the strided rounds; the q8 blocks are independent, but the
+ * sum of squares adds in another float order, so its last bits differ).
+ * h, delta, w, norm_out: f32 [n]; q8:
  * block_q8_1 [pad(n, 512)/32]. n is a multiple of 32 (one q8_1 block) in 32..32768, eps finite and > 0.
  * h (4-byte aligned), norm_out (16-byte aligned, like add_norm_pack's) and q8 (4-byte) are
  * written and must overlap no other range; delta (4) and w (4) are read and may share bytes
@@ -40,13 +43,14 @@ typedef struct inference_cuda_add_rmsnorm_q8_args {
     float eps;          /* finite, > 0 */
     int rows;           /* row count, 1..262144; one block per row */
     int h_stride;       /* f32 elements between rows of h: 0 = n, else >= n; delta, norm_out and q8 stay dense */
+    int threads;        /* threads per block: 0 or 256 = add_rmsnorm_pack_k's summation order; 1024 = another order */
 } inference_cuda_add_rmsnorm_q8_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h_stride) == 52,
+static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 64 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h_stride) == 52 && offsetof(inference_cuda_add_rmsnorm_q8_args, threads) == 56,
               "inference_cuda_add_rmsnorm_q8_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h_stride) == 52,
+_Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 64 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h_stride) == 52 && offsetof(inference_cuda_add_rmsnorm_q8_args, threads) == 56,
                "inference_cuda_add_rmsnorm_q8_args layout");
 #endif
 

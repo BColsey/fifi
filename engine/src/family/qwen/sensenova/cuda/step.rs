@@ -510,7 +510,7 @@ impl<'a> LoopStep<'a> {
         let stem = format!("blk.{}", self.plan.block(p));
         let weight = side(self.weights, &format!("{stem}.{part}.weight"))?;
         let bias = side(self.weights, &format!("{stem}.{part}.bias"))?;
-        self.ctx.add_rmsnorm_q8(
+        self.ctx.add_rmsnorm_q8_wide(
             &self.stream,
             AddNormQ8Call {
                 n: 2 * h,
@@ -591,7 +591,7 @@ impl<'a> LoopStep<'a> {
         weight: &DeviceBuffer,
     ) -> Result<(), EngError> {
         let h = self.shape.hidden;
-        self.ctx.add_rmsnorm_q8(
+        self.ctx.add_rmsnorm_q8_wide(
             &self.stream,
             AddNormQ8Call {
                 n: h,

@@ -83,7 +83,7 @@ impl CudaContext {
         stream: &DeviceStream,
         call: AddNormQ8Call<'_>,
     ) -> Result<(), EngError> {
-        self.add_rmsnorm_q8_strided(stream, call, 0)
+        self.add_rmsnorm_q8_sized(stream, call, 0, 0)
     }
 
     /// [`Self::add_rmsnorm_q8`] over rows of `h` that sit `h_stride` f32 elements apart (0 is `n`,
@@ -95,8 +95,30 @@ impl CudaContext {
         call: AddNormQ8Call<'_>,
         h_stride: usize,
     ) -> Result<(), EngError> {
+        self.add_rmsnorm_q8_sized(stream, call, h_stride, 0)
+    }
+
+    /// [`Self::add_rmsnorm_q8`] with 1024 threads in each row's block: a quarter of the
+    /// strided rounds of the 256-thread form, several times faster per launch on a 4096-wide
+    /// row, at the price of another float summation order (the last bits of the sum of
+    /// squares, so of `norm_out`). For lanes gated by a tolerance, not by a byte-identical row.
+    pub(crate) fn add_rmsnorm_q8_wide(
+        &self,
+        stream: &DeviceStream,
+        call: AddNormQ8Call<'_>,
+    ) -> Result<(), EngError> {
+        self.add_rmsnorm_q8_sized(stream, call, 0, 1024)
+    }
+
+    fn add_rmsnorm_q8_sized(
+        &self,
+        stream: &DeviceStream,
+        call: AddNormQ8Call<'_>,
+        h_stride: usize,
+        threads: usize,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        let raw = self.plan_add_rmsnorm_q8(&call, h_stride)?;
+        let raw = self.plan_add_rmsnorm_q8(&call, h_stride, threads)?;
         self.launch_on(stream, |stream_raw| add_rmsnorm_q8_launch(stream_raw, &raw))
     }
 
@@ -104,6 +126,7 @@ impl CudaContext {
         &self,
         call: &AddNormQ8Call<'b>,
         h_stride: usize,
+        threads: usize,
     ) -> Result<AddNormQ8Raw<'b>, EngError> {
         let h = self.raw_range(&call.h)?;
         let delta = call.delta.as_ref().map(|r| self.raw_range(r)).transpose()?;
@@ -131,6 +154,11 @@ impl CudaContext {
             return Err(EngError::BadRequest(format!(
                 "the CUDA add_rmsnorm_q8 takes rows in 1 to 262144, got {}",
                 call.rows
+            )));
+        }
+        if !matches!(threads, 0 | 256 | 1024) {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA add_rmsnorm_q8 takes 0, 256 or 1024 threads per block, got {threads}"
             )));
         }
         let need = add_rmsnorm_q8_needs(call.n, call.rows).ok_or_else(|| {
@@ -184,6 +212,7 @@ impl CudaContext {
             eps: call.eps,
             rows: call.rows,
             h_stride,
+            threads,
         })
     }
 }

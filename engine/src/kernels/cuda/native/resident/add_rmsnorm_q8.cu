@@ -31,6 +31,8 @@
 namespace {
 
 constexpr int kThreads = 256;  // add_rmsnorm_pack_k's block size (ops.cu)
+// The opt-in block: a quarter of the strided rounds per row, another float order.
+constexpr int kWideThreads = 1024;
 constexpr int kMaxWidth = 32768;
 constexpr int kMaxRows = 262144;  // one block per row; far past any head or batch loop
 constexpr int64_t kMatrixRowPadding = 512;  // common.cuh, the MMVQ activation padding
@@ -60,7 +62,9 @@ __device__ __forceinline__ float block_sum(float v) {
  * values into q8, one warp per 32-value block over the padded width (the tail past n is zeros:
  * d = 0, q = 0, s = 0). One block of 256 threads per row: the grid's x dimension is the row
  * count, every block strides h (and delta), norm_out and q8 by one row, and the rows share the
- * weight — a whole per-head or per-batch norm loop collapses into one launch. */
+ * weight — a whole per-head or per-batch norm loop collapses into one launch. With 1024
+ * threads the same block code runs a quarter of the strided rounds per row: the q8 blocks are
+ * independent, but the sum of squares adds in another float order, so the last bits differ. */
 __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const float *w, int n,
                                  float eps, float *base_norm_out, block_q8_1 *base_y, int64_t h_stride) {
   const int64_t padded =
@@ -117,7 +121,8 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
             args->eps <= 0.0f || rows < 1 || rows > kMaxRows || !aligned(args->h, 4) ||
             (args->delta != NULL && !aligned(args->delta, 4)) || !aligned(args->w, 4) ||
             !aligned(args->norm_out, 16) || !aligned(args->q8, 4) || args->h_stride < 0 ||
-            (args->h_stride != 0 && args->h_stride < n)) {
+            (args->h_stride != 0 && args->h_stride < n) ||
+            (args->threads != 0 && args->threads != kThreads && args->threads != kWideThreads)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         // The kernel writes h, norm_out and q8 (row-strided over `rows` blocks) while it reads
@@ -144,7 +149,7 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
                 }
             }
         }
-        add_rmsnorm_q8_k<<<dim3((unsigned)rows), kThreads, 0, (cudaStream_t)stream>>>(
+        add_rmsnorm_q8_k<<<dim3((unsigned)rows), dim3((unsigned)(args->threads ? args->threads : kThreads)), 0, (cudaStream_t)stream>>>(
             (float *)args->h, (const float *)args->delta, (const float *)args->w, n, args->eps,
             (float *)args->norm_out, (block_q8_1 *)args->q8, h_stride);
         Failure failure;
