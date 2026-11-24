@@ -1,0 +1,256 @@
+#include <cuda_runtime.h>
+#include <cmath>
+#include <cstdint>
+
+#include "abi.h"
+#include "device.h"
+
+namespace {
+constexpr int kWidth = 128, kTaps = 4;
+
+struct Args {
+    float *q, *relative, *raw_k, *raw_v, *k, *v, *sinks, *gates;
+    float *aux;
+    uint32_t *status;
+    int queries, kv, dims, history;
+    float qk_limit, rel_limit, eps;
+};
+
+// One block per head and plane. Use the host's reduction and tap order; these
+// short reductions run once per head, after parallel channel preparation.
+__global__ void inkling_local_prep(Args a) {
+    __shared__ float squares[kWidth], scale;
+    const int d = threadIdx.x;
+    int head = blockIdx.x;
+    const int q_words = a.queries * kWidth;
+    const int rel_words = a.queries * a.dims;
+    const int kv_words = a.kv * kWidth;
+    const float *q_scale = a.aux + 1; // first word is the attention position
+    const float *rel_scale = q_scale + q_words;
+    const float *kernels = rel_scale + rel_words;
+    float *output;
+    float x = 0.f;
+    bool valid = true;
+    int width = kWidth;
+    float limit = a.qk_limit;
+    bool rms = false;
+    if (head < a.queries) {
+        const int at = head * kWidth + d;
+        output = a.q + at;
+        x = *output * q_scale[at];
+        valid = isfinite(a.gates[at]) && (d != 0 || isfinite(a.sinks[head]));
+    } else if ((head -= a.queries) < a.queries) {
+        width = a.dims;
+        limit = a.rel_limit;
+        const int at = head * width + d;
+        output = a.relative + head * width + min(d, width - 1);
+        if (d < width) x = *output * rel_scale[at];
+    } else {
+        head -= a.queries;
+        rms = head >= a.kv;
+        const int plane = rms ? 1 : 0;
+        const int at = (head - plane * a.kv) * kWidth + d;
+        output = (rms ? a.v : a.k) + at;
+        const float raw = (rms ? a.raw_v : a.raw_k)[at];
+        const float *w = kernels + (plane * kv_words + at) * kTaps;
+        float *past = a.aux + 1 + q_words + rel_words + (2 * kTaps + plane * (kTaps - 1)) * kv_words;
+        float conv = __fmul_rn(w[kTaps - 1], raw);
+        for (int lag = 1; lag <= a.history; ++lag) {
+            conv = __fadd_rn(conv, __fmul_rn(w[kTaps - 1 - lag], past[(lag - 1) * kv_words + at]));
+        }
+        // Each thread owns one channel of the mirror. Read every old tap
+        // before shifting the history for that channel.
+        for (int lag = min(a.history, kTaps - 2); lag > 0; --lag) {
+            past[lag * kv_words + at] = past[(lag - 1) * kv_words + at];
+        }
+        past[at] = raw;
+        x = __fmul_rn(__fadd_rn(conv, raw), 1.f / sqrtf(float(kTaps + 1)));
+    }
+    squares[d] = x * x;
+    __syncthreads();
+    if (d == 0) {
+        float sum = 0.f;
+        for (int i = 0; i < width; ++i) sum += squares[i];
+        scale = rms ? 1.f / sqrtf(sum / width + a.eps)
+                    : fminf(1.f, limit / (sqrtf(sum) + 1.e-6f));
+        valid &= isfinite(sum);
+    }
+    __syncthreads();
+    const float result = x * scale;
+    const int invalid = __syncthreads_or(!valid || !isfinite(x) || !isfinite(result));
+    if (d < width) *output = result;
+    // Only one block writes status; per-head prep flags are distinct words.
+    if (d == 0) {
+        if (blockIdx.x == 0) *a.status = 0;
+        a.status[1 + blockIdx.x] = invalid;
+    }
+}
+// Static output convolution. Raw projected rows are immutable and become the
+// next tile's history. Initial history is right-aligned, oldest first.
+__global__ void inkling_output_conv(const float *raw, const float *past, const float *weight,
+                                    float *result, uint32_t *status, int rows, int width,
+                                    int history, float scale) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    bool bad = false;
+    if (channel < width) {
+        const int at = row * width + channel;
+        const float *w = weight + channel * kTaps;
+        float sum = 0.f;
+        for (int lag = 0; lag <= min(kTaps - 1, row + history); ++lag) {
+            const int source = row - lag;
+            const float value = source >= 0 ? raw[source * width + channel]
+                                            : past[(kTaps - 1 + source) * width + channel];
+            sum = __fadd_rn(sum, __fmul_rn(w[kTaps - 1 - lag], value));
+        }
+        const float value = __fmul_rn(__fadd_rn(sum, raw[at]), scale);
+        result[at] = value;
+        bad = !isfinite(value);
+    }
+    const int invalid = __syncthreads_or(bad);
+    if (threadIdx.x == 0 && invalid) atomicOr(status + row, 1u);
+}
+__device__ float ordered_rms_scale(const float *x, int width, float eps) {
+    float squares = -0.f;
+    for (int i = 0; i < width; ++i)
+        squares = __fadd_rn(squares, __fmul_rn(x[i], x[i]));
+    const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(squares, float(width)), eps));
+    return isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
+}
+
+__global__ void inkling_weighted_norm(const float *input, const float *gamma,
+    float *output, float *status, int width, float eps) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *x = input + row * width;
+    __shared__ float scale;
+    if (lane == 0) scale = ordered_rms_scale(x, width, eps);
+    __syncthreads();
+    bool bad = !isfinite(scale);
+    for (int i = lane; i < width; i += blockDim.x) {
+        const float value = __fmul_rn(__fmul_rn(x[i], scale), gamma[i]);
+        output[row * width + i] = value;
+        bad |= !isfinite(value);
+    }
+    const int failed = __syncthreads_or(bad);
+    if (lane == 0) status[row] = failed ? 1.f : 0.f;
+}
+
+// One CTA per token, with ordered accumulation matching Rust's depth RMSNorm.
+// The raw result feeds the residual stream; the normalized plane feeds depth.
+__global__ void inkling_depth_current(const float *prior, const float *attention,
+    float *raw, float *normalized, int width, bool boundary) {
+    const int offset = blockIdx.x * width;
+    const int lane = threadIdx.x;
+    __shared__ float scale;
+    for (int i = lane; i < width; i += blockDim.x) {
+        const int at = offset + i;
+        const float out = attention[at];
+        raw[at] = boundary ? out : __fadd_rn(prior[at], __fmul_rn(out, 1.f));
+    }
+    __syncthreads();
+    // Poison the depth score on overflow instead of silently normalizing to zero.
+    if (lane == 0) scale = ordered_rms_scale(raw + offset, width, 1.e-6f);
+    __syncthreads();
+    for (int i = lane; i < width; i += blockDim.x)
+        normalized[offset + i] = __fmul_rn(raw[offset + i], scale);
+}
+
+// Planes are normalized and packed in the CPU traversal order: most recent
+// sealed block first and current last. Each dot accumulates in scalar order.
+__global__ void inkling_depth_scores(const float *planes, const float *query,
+                                      float *scores, int rows, int width, int depth, float scale) {
+    const int row = blockIdx.x;
+    const int d = threadIdx.x;
+    if (d >= depth) return;
+    const float *current = planes + (d * rows + row) * width;
+    float acc = -0.f;
+    for (int k = 0; k < width; ++k)
+        acc = __fadd_rn(acc, __fmul_rn(current[k], query[k]));
+    scores[row * depth + d] = __fmul_rn(acc, scale);
+}
+
+__global__ void inkling_depth_mix(const float *planes, const float *weights,
+                                   float *output, int rows, int width, int depth) {
+    const int row = blockIdx.y;
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= width) return;
+    float sum = 0.f;
+    float mass = 0.f;
+    for (int d = 0; d < depth; ++d) {
+        const float weight = weights[row * depth + d];
+        mass = __fadd_rn(mass, weight);
+        sum = __fadd_rn(sum, __fmul_rn(weight, planes[(d * rows + row) * width + k]));
+    }
+    output[row * width + k] = __fdiv_rn(sum, mass);
+}
+} // namespace
+
+extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, int width,
+    float eps, void *stream, int *out_stage) {
+    inkling_weighted_norm<<<rows, 128, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+extern "C" int inference_cuda_inkling_depth_current(void *const *p, int rows, int width,
+    int boundary, void *stream, int *out_stage) {
+    inkling_depth_current<<<rows, 128, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, boundary != 0);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+extern "C" int inference_cuda_inkling_depth_mix(void *const *p, int rows, int width,
+    int depth, float scale, int scores_only, void *stream, int *out_stage) {
+    if (scores_only) {
+        inkling_depth_scores<<<rows, 32, 0, (cudaStream_t)stream>>>(
+            static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+            static_cast<float *>(p[2]), rows, width, depth, scale);
+    } else {
+        constexpr int block = 128;
+        inkling_depth_mix<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
+            static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+            static_cast<float *>(p[2]), rows, width, depth);
+    }
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+extern "C" int inference_cuda_inkling_output_conv(void *const *p, int rows, int width,
+    int history, float scale, void *stream, int *out_stage) {
+    constexpr int block = 128;
+    inkling_output_conv<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<const float *>(p[2]), static_cast<float *>(p[3]),
+        static_cast<uint32_t *>(p[4]), rows, width, history, scale);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+extern "C" int inference_cuda_inkling_local_prep(void *const *p, int queries, int kv,
+    int dims, int history, float qk_limit, float rel_limit, float eps, void *stream,
+    int *out_stage) {
+    Args args{static_cast<float *>(p[0]), static_cast<float *>(p[1]),
+              static_cast<float *>(p[2]), static_cast<float *>(p[3]),
+              static_cast<float *>(p[4]), static_cast<float *>(p[5]),
+              static_cast<float *>(p[6]), static_cast<float *>(p[7]),
+              static_cast<float *>(p[8]), static_cast<uint32_t *>(p[9]),
+              queries, kv, dims, history, qk_limit, rel_limit, eps};
+    inkling_local_prep<<<2 * (queries + kv), kWidth, 0, (cudaStream_t)stream>>>(args);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}

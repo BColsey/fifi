@@ -17,10 +17,13 @@ bool apart(const void *a, size_t ab, const void *b, size_t bb) {
     return x <= y ? ab <= y - x : bb <= x - y;
 }
 
+template <bool in_place>
 __global__ void softcap_kernel(float *out, const float *x, float cap, long long total) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
-    out[i] = cap * tanhf(x[i] / cap);
+    const float value = x[i];
+    // Inkling validates the raw projection before sampling; do not hide infinities.
+    out[i] = in_place && !isfinite(value) ? value : cap * tanhf(value / cap);
 }
 
 }  // namespace
@@ -34,18 +37,26 @@ extern "C" int inference_cuda_softcap_launch(const inference_cuda_softcap_args *
         // NaN fails the first comparison and infinity fails the second.
         if (!(args->cap > 0.0f) || !isfinite(args->cap))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        if (args->n < 32 || args->n > 4194304 || args->n % 32 != 0)
+        const bool in_place = args->out == args->x;
+        if (args->n < 1 || args->n > 4194304 ||
+            (!in_place && (args->n < 32 || args->n % 32 != 0)))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (!aligned(args->out, 4) || !aligned(args->x, 4))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         const long long total = (long long)args->n;
         const size_t bytes = (size_t)total * sizeof(float);
-        if (!apart(args->out, bytes, args->x, bytes)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!in_place && !apart(args->out, bytes, args->x, bytes))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
         const int block = 256;
         const unsigned grid = (unsigned)((total + block - 1) / block);
         Failure failure;
-        softcap_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
-            (float *)args->out, (const float *)args->x, args->cap, total);
+        if (in_place) {
+            softcap_kernel<true><<<grid, block, 0, (cudaStream_t)stream>>>(
+                (float *)args->out, (const float *)args->x, args->cap, total);
+        } else {
+            softcap_kernel<false><<<grid, block, 0, (cudaStream_t)stream>>>(
+                (float *)args->out, (const float *)args->x, args->cap, total);
+        }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

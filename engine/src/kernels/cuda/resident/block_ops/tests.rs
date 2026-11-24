@@ -674,7 +674,9 @@ fn the_shared_sigmoid_select_ranks_by_score_plus_bias_and_weights_the_scores() {
     let Some(r) = rig("router sigmoid select with a bias") else {
         return;
     };
-    use crate::kernels::cuda::resident::router::{RouterShape, RouterSigmoidCall};
+    use crate::kernels::cuda::resident::router::{
+        RouterShape, RouterSigmoidBias, RouterSigmoidCall,
+    };
     let (e, k) = (16usize, 4usize);
     for n in [1usize, 7] {
         let logits = data(61 + n as u64, n * e, 2.0);
@@ -697,7 +699,7 @@ fn the_shared_sigmoid_select_ranks_by_score_plus_bias_and_weights_the_scores() {
                     ids: whole(&ids),
                     weights: whole(&weights),
                     status: whole(&status),
-                    bias: Some(whole(&bb)),
+                    bias: Some(RouterSigmoidBias::KernelRounded(whole(&bb))),
                 },
             )
             .expect("select");

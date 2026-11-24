@@ -1,0 +1,332 @@
+//! Cross-pass controllers and their attention projections share a staging transaction.
+
+use super::{
+    ControllerWeights, DenseGemvCall, DenseGemvShape, DenseStep, ResidentProjection, Slot, bad,
+    dense_gemv_bytes, split_projections,
+};
+use crate::{
+    EngError,
+    family::inkling2::cuda_projection::q8_row_reuse,
+    kernels::cuda::{CudaContext, DeviceRange, resident::inkling_controller::Arithmetic},
+};
+
+#[cfg(test)]
+mod tests;
+
+pub(in crate::family::inkling2) struct ControlledAttentionInput<'a> {
+    pub gate: &'a [f32],
+    pub input: &'a [f32],
+    pub message: &'a [f32],
+    pub gamma: &'a [f32],
+}
+
+pub(in crate::family::inkling2::cuda_projection) type ProjectionTile<'a, const N: usize> =
+    (Vec<[Vec<f32>; N]>, Option<DeviceRange<'a>>);
+
+impl DenseStep {
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch_capacity<
+        const N: usize,
+    >(
+        &self,
+        [rank, hidden]: [usize; 2],
+        weights: [Option<ResidentProjection<'_>>; N],
+    ) -> Result<Option<usize>, EngError> {
+        if !(1..=4096).contains(&hidden) || !(1..=4096).contains(&rank) {
+            return Ok(None);
+        }
+        let mut output = 0usize;
+        for p in weights.iter().flatten() {
+            if p.input >= 3 || p.weight.shape[1] != hidden || p.weight.shape[0] == 0 {
+                return Ok(None);
+            }
+            let Some(sum) = output.checked_add(p.weight.shape[0]) else {
+                return Ok(None);
+            };
+            output = sum;
+        }
+        if output == 0 {
+            return Ok(None);
+        }
+        let Some(per_row) = Self::controlled_attention_row_words([rank, hidden], output) else {
+            return Ok(None);
+        };
+        let capacity =
+            self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>() / per_row;
+        Ok(Some(
+            capacity.min(DenseGemvShape::MAX_ACTIVATION_ROWS).min(512),
+        ))
+    }
+
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_row_words(
+        [rank, hidden]: [usize; 2],
+        output: usize,
+    ) -> Option<usize> {
+        hidden
+            .checked_mul(24)?
+            .checked_add(rank.checked_mul(3)?)?
+            .checked_add(3)?
+            .checked_add(output)
+    }
+
+    // Fused transaction for grouped prefill; the caller selects controller arithmetic.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch<
+        const N: usize,
+    >(
+        &self,
+        context: &CudaContext,
+        inputs: &[[ControlledAttentionInput<'_>; 3]],
+        controllers: [ControllerWeights<'_>; 3],
+        weights: [Option<ResidentProjection<'_>>; N],
+        (eps, arithmetic, keep, scales): (f32, Arithmetic, &[usize], Option<&[[[f32; 2]; 3]]>),
+    ) -> Result<Option<ProjectionTile<'_, N>>, EngError> {
+        let Some(first) = inputs.first() else {
+            return Ok(None);
+        };
+        let hidden = first[0].input.len();
+        let rank = controllers[0][0].0.shape[0];
+        let m = inputs.len();
+        if !(1..=4096).contains(&hidden)
+            || rank == 0
+            || rank > 4096
+            || m > DenseGemvShape::MAX_ACTIVATION_ROWS
+            || m > 512
+        {
+            return Ok(None);
+        }
+        if scales.is_some_and(|s| s.len() != m)
+            || controllers.iter().any(|w| {
+                w.map(|(x, _)| x.shape) != [[rank, 2 * hidden], [hidden, rank], [hidden, rank]]
+            })
+            || inputs.iter().flatten().any(|r| {
+                r.gate.len() != 2 * hidden
+                    || [r.input.len(), r.message.len(), r.gamma.len()] != [hidden; 3]
+            })
+            || weights
+                .iter()
+                .flatten()
+                .any(|p| p.input >= 3 || p.weight.shape[1] != hidden)
+        {
+            return Err(bad("invalid batched CUDA controlled attention shape"));
+        }
+        let widths = weights.map(|p| p.map_or(0, |p| p.weight.shape[0]));
+        let output_width = widths
+            .iter()
+            .try_fold(0usize, |a, &b| a.checked_add(b))
+            .ok_or_else(|| bad("batched CUDA attention output size overflows"))?;
+        let per_row = Self::controlled_attention_row_words([rank, hidden], output_width)
+            .ok_or_else(|| bad("batched CUDA attention workspace overflows"))?;
+        let capacity =
+            self.arena.tensor(Slot::Output as usize)?.bytes() / size_of::<f32>() / per_row;
+        if m > capacity {
+            return Ok(None);
+        }
+        let gates = 6 * m * hidden;
+        let raw = 9 * m * hidden;
+        let norm = gates;
+        let reduced = 24 * m * hidden;
+        let health_at = reduced + 3 * m * rank;
+        let out_at = health_at + 3 * m;
+        let range = |offset, len| self.range(Slot::Output, offset, len);
+        // Use the start of the gain scratch for scales; the first kernel reads
+        // them before any controller GEMV writes coefficients into that region.
+        let scale_words = 6 * m;
+        let upload = if scales.is_some() {
+            range(gates, raw + scale_words)?
+        } else {
+            range(0, gates + raw)?
+        };
+        let workspace = range(norm, 18 * m * hidden)?;
+        let health = range(health_at, 3 * m)?;
+        let mut host_widths = widths;
+        let mut side_widths = [0; N];
+        for &i in keep {
+            side_widths[i] = std::mem::take(&mut host_widths[i]);
+        }
+        let ld_host: usize = host_widths.iter().sum();
+        let ld_side: usize = side_widths.iter().sum();
+        let side_at = out_at + m * ld_host;
+        let side = (ld_side != 0)
+            .then(|| range(side_at, m * ld_side))
+            .transpose()?;
+        let readback = range(health_at, 3 * m + m * ld_host)?;
+        let mut control = Vec::with_capacity(9);
+        for (role, w) in controllers.into_iter().enumerate() {
+            let gate = role * m * 2 * hidden;
+            let mid = reduced + role * m * rank;
+            let gain = gates + raw + role * m * 2 * hidden;
+            control.push(self.batch_call(
+                w[0],
+                DenseGemvShape::packed(m, rank, 2 * hidden),
+                [gate, mid],
+            )?);
+            let mut shape = DenseGemvShape::packed(m, hidden, rank);
+            shape.ld_y = 2 * hidden;
+            control.push(self.batch_call(w[1], shape, [mid, gain])?);
+            control.push(self.batch_call(w[2], shape, [mid, gain + hidden])?);
+        }
+        let mut projections = Vec::with_capacity(N);
+        for (i, p) in weights.into_iter().enumerate() {
+            let Some(p) = p else { continue };
+            let mut shape = DenseGemvShape::packed(m, p.weight.shape[0], hidden);
+            let (base, widths, stride) = if side_widths[i] > 0 {
+                (side_at, &side_widths, ld_side)
+            } else {
+                (out_at, &host_widths, ld_host)
+            };
+            shape.ld_y = stride;
+            let x = gates + 15 * m * hidden + p.input * m * hidden;
+            let y = base + widths[..i].iter().sum::<usize>();
+            projections.push(self.batch_call((p.weight, p.dtype), shape, [x, y])?);
+        }
+        let mut staged = Vec::with_capacity(12 * m);
+        if scales.is_none() {
+            for role in 0..3 {
+                for row in inputs {
+                    staged.push(row[role].gate);
+                }
+            }
+        }
+        for role in 0..3 {
+            for row in inputs {
+                staged.extend([row[role].input, row[role].message, row[role].gamma]);
+            }
+        }
+        if let Some(scales) = scales {
+            for role in 0..3 {
+                staged.extend(scales.iter().map(|row| row[role].as_slice()));
+            }
+        }
+        let rebuild = scales
+            .map(|_| range(0, gates + raw + scale_words))
+            .transpose()?;
+        let values = self.run_rows(context, &self.stream, &staged, [upload, readback], || {
+            if let Some(workspace) = rebuild {
+                context.inkling_rebuild_gates(&self.stream, workspace, [hidden, 3 * m])?;
+            }
+            context.dense_gemv_group(&self.stream, &control)?;
+            context.inkling_controller_norm_with_arithmetic(
+                &self.stream,
+                workspace,
+                health,
+                ([hidden, 3 * m], eps),
+                arithmetic,
+            )?;
+            q8_row_reuse::project_group(context, &self.stream, &projections, "controlled_qkv")
+        })?;
+        self.capture_first_controller_tile(m, hidden)?;
+        let mut values = values.into_iter().skip(3 * m);
+        let host = (0..m)
+            .map(|_| host_widths.map(|width| values.by_ref().take(width).collect()))
+            .collect();
+        // run_rows fenced the producer; the caller must consume the borrowed tile
+        // before running another dense step that reuses Slot::Output.
+        Ok(Some((host, side)))
+    }
+
+    fn capture_first_controller_tile(&self, rows: usize, hidden: usize) -> Result<(), EngError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let Some(dir) = std::env::var_os("FIFI_INKLING_DEBUG_CONTROLLER_CAPTURE") else {
+            return Ok(());
+        };
+        if DONE.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let dir = std::path::PathBuf::from(dir);
+        let slot = self.arena.tensor(Slot::Output as usize)?;
+        let mut bytes = vec![0u8; 24 * rows * hidden * size_of::<f32>()];
+        slot.buffer()
+            .read_at(&self.stream, slot.offset(), &mut bytes)?;
+        std::fs::write(dir.join("gpu.f32"), bytes)
+            .map_err(|e| bad(format!("capture GPU tile: {e}")))?;
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::json!({"rows":rows,"hidden":hidden}).to_string(),
+        )
+        .map_err(|e| bad(format!("capture GPU tile metadata: {e}")))?;
+        Ok(())
+    }
+
+    fn batch_call<'a>(
+        &'a self,
+        (weight, dtype): (&'a super::Resident, super::DenseDtype),
+        shape: DenseGemvShape,
+        [x, y]: [usize; 2],
+    ) -> Result<DenseGemvCall<'a>, EngError> {
+        let need = dense_gemv_bytes(shape, dtype)?;
+        Ok(DenseGemvCall {
+            shape,
+            dtype,
+            w: weight.codes.range(0, need.w)?,
+            x: self.range(Slot::Output, x, need.x / size_of::<f32>())?,
+            y: self.range(Slot::Output, y, need.y / size_of::<f32>())?,
+        })
+    }
+
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention<const N: usize>(
+        &self,
+        context: &CudaContext,
+        inputs: [ControlledAttentionInput<'_>; 3],
+        controllers: [ControllerWeights<'_>; 3],
+        weights: [Option<ResidentProjection<'_>>; N],
+        eps: f32,
+    ) -> Result<Option<[Vec<f32>; N]>, EngError> {
+        let hidden = inputs[0].input.len();
+        if !(1..=4096).contains(&hidden) {
+            return Ok(None);
+        }
+        // The idle logits slot packs 6 gate rows, 9 raw input/message/gamma
+        // rows, 6 controller outputs, 3 normalized inputs, then the readback.
+        let stage = 15 * hidden;
+        let health_at = 24 * hidden;
+        let out_at = health_at + 3;
+        let rows: usize = weights.iter().flatten().map(|p| p.weight.shape[0]).sum();
+        let Ok(readback) = self.range(Slot::Output, health_at, 3 + rows) else {
+            return Ok(None);
+        };
+        if inputs.iter().any(|row| {
+            row.gate.len() != 2 * hidden
+                || [row.input, row.message, row.gamma].map(<[f32]>::len) != [hidden; 3]
+        }) {
+            return Err(bad("invalid CUDA controlled attention input shape"));
+        }
+        let upload = self.range(Slot::Output, 0, stage)?;
+        let workspace = self.range(Slot::Output, 6 * hidden, 18 * hidden)?;
+        let health = self.range(Slot::Output, health_at, 3)?;
+        let control = self.controlled_attention_calls(hidden, controllers)?;
+        let (projections, _) =
+            self.group_calls([21, 22, 23].map(|i| i * hidden), out_at, weights)?;
+        let staged: Vec<_> = inputs
+            .iter()
+            .map(|row| row.gate)
+            .chain(
+                inputs
+                    .iter()
+                    .flat_map(|row| [row.input, row.message, row.gamma]),
+            )
+            .collect();
+        let values = self.run_rows(context, &self.stream, &staged, [upload, readback], || {
+            context.dense_gemv_group(&self.stream, &control)?;
+            context.inkling_controller_norm(&self.stream, workspace, health, (hidden, eps))?;
+            context.dense_gemv_group(&self.stream, &projections)
+        })?;
+        Ok(Some(split_projections(values.into_iter().skip(3), weights)))
+    }
+
+    pub(super) fn controlled_attention_calls<'a>(
+        &'a self,
+        hidden: usize,
+        controllers: [ControllerWeights<'a>; 3],
+    ) -> Result<Vec<DenseGemvCall<'a>>, EngError> {
+        let reduced = self.range(Slot::Reduced, 0, controllers[0][0].0.shape[0])?;
+        let mut calls = Vec::with_capacity(9);
+        for (role, weights) in controllers.into_iter().enumerate() {
+            let gate = self.range(Slot::Output, role * 2 * hidden, 2 * hidden)?;
+            let gain = self.range(Slot::Output, (15 + 2 * role) * hidden, hidden)?;
+            let forget = self.range(Slot::Output, (16 + 2 * role) * hidden, hidden)?;
+            calls.extend(self.controller_calls(weights, [gate, reduced, gain, forget])?);
+        }
+        Ok(calls)
+    }
+}

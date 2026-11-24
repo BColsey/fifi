@@ -4,6 +4,8 @@
 //! publishes the same tokens a one-row `decode` loop would, several per call. When there is no
 //! draft, or no room for one, it calls the one-row `decode`, so a stand-down is the plain path.
 
+use std::sync::Arc;
+
 use super::{
     accept::{Accepted, accept_run},
     repeat::RepeatIndex,
@@ -30,18 +32,82 @@ pub(crate) struct Proposal {
     pub(crate) scores: Vec<f32>,
 }
 
+/// The target operations shared by a model-conditioned draft.
+pub(crate) trait DraftOutput {
+    fn embedding(&self, token: u32) -> Result<Vec<f32>>;
+    fn project(&self, hidden: &[f32]) -> Result<Vec<f32>>;
+
+    /// An optional target implementation of DSpark's corrected greedy head.
+    fn project_corrected_greedy(
+        &self,
+        _rows: [&[f32]; 2],
+        _vocab: usize,
+        _cap: f32,
+    ) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn cuda_context(&self) -> Option<&crate::kernels::cuda::CudaContext> {
+        None
+    }
+}
+
+/// Features of all committed inputs, in position order. The pending token in the
+/// session has not been fed and does not appear in these rows.
+pub(crate) struct TargetConditioning<'a> {
+    pub(crate) features: &'a [Arc<[f32]>],
+    /// Changes whenever the committed stream can diverge at an existing position.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) lineage: &'a Arc<()>,
+    pub(crate) output: &'a dyn DraftOutput,
+}
+
 /// A source of drafts.
 pub(crate) trait Drafter {
     /// Guesses at most `room` tokens that follow the last token of `history`, which is the
     /// pending token. An empty proposal means no guess.
     fn propose(&mut self, history: &[u32], room: usize) -> Result<Proposal>;
 
+    /// Offers a proposal with the target's committed features where available.
+    fn propose_conditioned(
+        &mut self,
+        history: &[u32],
+        room: usize,
+        _target: Option<TargetConditioning<'_>>,
+    ) -> Result<Proposal> {
+        self.propose(history, room)
+    }
+
     /// Learns the verdict of the window that carried the proposal.
     fn observe(&mut self, window: &Window, accepted: &Accepted) -> Result<()>;
 }
 
+impl<T: Drafter + ?Sized> Drafter for Box<T> {
+    fn propose(&mut self, history: &[u32], room: usize) -> Result<Proposal> {
+        (**self).propose(history, room)
+    }
+
+    fn propose_conditioned(
+        &mut self,
+        history: &[u32],
+        room: usize,
+        target: Option<TargetConditioning<'_>>,
+    ) -> Result<Proposal> {
+        (**self).propose_conditioned(history, room, target)
+    }
+
+    fn observe(&mut self, window: &Window, accepted: &Accepted) -> Result<()> {
+        (**self).observe(window, accepted)
+    }
+}
+
 /// The model side of a window.
 pub(crate) trait WindowModel: TokenStepper {
+    fn draft_conditioning(&self) -> Option<TargetConditioning<'_>> {
+        None
+    }
+
     /// Feeds `inputs` as rows after the committed ones and keeps the result of every row. The
     /// rows are not committed: `fed` is unchanged until `commit_window`.
     fn run_window(&mut self, inputs: &[u32]) -> Result<()>;
@@ -101,6 +167,7 @@ pub(crate) struct Speculator<D> {
     /// The most drafts any window may carry (`draft_max_rows - 1`).
     pub(crate) max_drafts: usize,
     pub(crate) stats: SpecStats,
+    adaptive_drafts: bool,
 }
 
 impl<D: Drafter> Speculator<D> {
@@ -109,7 +176,13 @@ impl<D: Drafter> Speculator<D> {
             drafter,
             max_drafts,
             stats: SpecStats::default(),
+            adaptive_drafts: false,
         }
+    }
+
+    pub(crate) fn with_adaptive_drafts(mut self) -> Self {
+        self.adaptive_drafts = true;
+        self
     }
 
     /// One call of the job's decode loop. It finishes the job exactly where the one-row loop
@@ -124,8 +197,16 @@ impl<D: Drafter> Speculator<D> {
         if let DecodePreparation::Finished(batch) = session.prepare_decode(model, generation)? {
             return Ok(batch);
         }
+        let draft_cap = if self.adaptive_drafts {
+            if generation.draft_budget.suspended() {
+                return self.plain(StandDown::Adaptive, session, model, generation, limits);
+            }
+            generation.draft_budget.cap(self.max_drafts)
+        } else {
+            self.max_drafts
+        };
         let room = drafts_allowed(
-            self.max_drafts,
+            draft_cap,
             model.fed(),
             limits.context_limit,
             generation.remaining_tokens(),
@@ -133,7 +214,11 @@ impl<D: Drafter> Speculator<D> {
         if room == 0 {
             return self.plain(StandDown::NoRoom, session, model, generation, limits);
         }
-        let mut proposal = self.drafter.propose(session.history(), room)?;
+        let mut proposal = self.drafter.propose_conditioned(
+            session.history(),
+            room,
+            model.draft_conditioning(),
+        )?;
         proposal.tokens.truncate(room);
         proposal.scores.truncate(room);
         if proposal.tokens.is_empty() {
@@ -153,6 +238,13 @@ impl<D: Drafter> Speculator<D> {
         )?;
         model.commit_window(&window.commit(&accepted)?)?;
         self.drafter.observe(&window, &accepted)?;
+        if self.adaptive_drafts {
+            generation.draft_budget.observe(
+                self.max_drafts,
+                window.drafts().len(),
+                accepted.drafts_accepted(),
+            );
+        }
         self.stats.window(window.rows(), accepted.rows_kept());
         session.finish_decode_tokens(model, generation, limits, &accepted.tokens)
     }
@@ -177,6 +269,7 @@ mod tests {
         family::sampler::SamplingParams,
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
     };
+    use std::collections::VecDeque;
 
     /// The synthetic tokenizer: ids 0 to 7 are the letters a to h.
     const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]}}"#;
@@ -370,6 +463,87 @@ mod tests {
         assert_eq!(a.tokens, b.tokens);
         assert_eq!(a.finish, b.finish);
         assert_eq!(a.text, b.text);
+    }
+
+    struct ScriptedDraft {
+        accepted_prefixes: VecDeque<usize>,
+        budgets: Vec<usize>,
+    }
+
+    impl ScriptedDraft {
+        fn new(prefixes: impl IntoIterator<Item = usize>) -> Self {
+            Self {
+                accepted_prefixes: prefixes.into_iter().collect(),
+                budgets: Vec::new(),
+            }
+        }
+    }
+
+    impl Drafter for ScriptedDraft {
+        fn propose(&mut self, history: &[u32], room: usize) -> Result<Proposal> {
+            self.budgets.push(room);
+            let prefix = self.accepted_prefixes.pop_front().unwrap_or(room);
+            let last = *history.last().unwrap() as usize;
+            let tokens = (0..room)
+                .map(|index| ((last + 1 + index + usize::from(index >= prefix)) % VOCAB) as u32)
+                .collect();
+            Ok(Proposal {
+                tokens,
+                scores: Vec::new(),
+            })
+        }
+
+        fn observe(&mut self, _: &Window, _: &Accepted) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn drive_adaptive(
+        speculator: &mut Speculator<ScriptedDraft>,
+        shape: Shape,
+        sampler: Sampler,
+        max_tokens: u32,
+    ) -> Outcome {
+        drive(
+            (CONTEXT, shape),
+            &[],
+            (sampler, max_tokens),
+            |session, lm, generation, limits| speculator.decode(session, lm, generation, limits),
+        )
+    }
+
+    #[test]
+    fn adaptive_budget_probes_after_first_rejection_and_resets_for_a_new_generation() {
+        let mut speculator = Speculator::new(ScriptedDraft::new([0, 0]), 7).with_adaptive_drafts();
+        let first = drive_adaptive(&mut speculator, Shape::Sharp, Sampler::greedy(), 20);
+        same(&first, &solo(Shape::Sharp, &[], (Sampler::greedy(), 20)));
+        assert_eq!(speculator.drafter.budgets, [7, 1]);
+        let stats = std::mem::take(&mut speculator.stats);
+        assert!(stats.line().contains("stand_down_adaptive=18"));
+        assert_eq!(stats.acceptance(), Some(0.0));
+
+        let second = drive_adaptive(&mut speculator, Shape::Sharp, Sampler::greedy(), 16);
+        same(&second, &solo(Shape::Sharp, &[], (Sampler::greedy(), 16)));
+        assert_eq!(speculator.drafter.budgets, [7, 1, 7, 7]);
+        assert_eq!(speculator.stats.acceptance(), Some(1.0));
+        assert!(!speculator.stats.line().contains("stand_down_adaptive"));
+    }
+
+    #[test]
+    fn adaptive_budget_reduces_partial_windows_and_recovers_after_full_acceptance() {
+        let mut speculator = Speculator::new(ScriptedDraft::new([2]), 7).with_adaptive_drafts();
+        let run = drive_adaptive(&mut speculator, Shape::Sharp, Sampler::greedy(), 22);
+        same(&run, &solo(Shape::Sharp, &[], (Sampler::greedy(), 22)));
+        assert_eq!(speculator.drafter.budgets, [7, 3, 6, 7]);
+        assert!(!speculator.stats.line().contains("stand_down_adaptive"));
+    }
+
+    #[test]
+    fn adaptive_budget_stand_down_preserves_seeded_target_draws() {
+        let mut speculator = Speculator::new(ScriptedDraft::new([0; 64]), 7).with_adaptive_drafts();
+        let run = drive_adaptive(&mut speculator, Shape::Hashy, sampled(17), 60);
+        same(&run, &solo(Shape::Hashy, &[], (sampled(17), 60)));
+        assert!(speculator.stats.line().contains("stand_down_adaptive="));
     }
 
     #[test]

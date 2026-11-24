@@ -321,12 +321,16 @@ fn require_device(count: usize) -> Result<(), EngError> {
     Ok(())
 }
 
+fn terminal_refusal() -> EngError {
+    EngError::Backend {
+        operation: EXECUTE_OPERATION,
+        message: "CUDA backend is terminal after an earlier native failure".to_owned(),
+    }
+}
+
 fn ensure_usable(terminal: &AtomicBool) -> Result<(), EngError> {
     if terminal.load(Ordering::Acquire) {
-        return Err(EngError::Backend {
-            operation: EXECUTE_OPERATION,
-            message: "CUDA backend is terminal after an earlier native failure".to_owned(),
-        });
+        return Err(terminal_refusal());
     }
     Ok(())
 }

@@ -58,7 +58,9 @@ pub(in crate::kernels::cuda) mod attn_decode_loop;
 pub(in crate::kernels::cuda) mod attn_decode_q8;
 pub(in crate::kernels::cuda) mod attn_prep;
 pub(in crate::kernels::cuda) mod block_ops;
+pub(in crate::kernels::cuda) mod correct_draft_logits_bf16;
 pub(in crate::kernels::cuda) mod dense_gemv;
+pub(in crate::kernels::cuda) mod draft_attention_bf16;
 pub(in crate::kernels::cuda) mod embed;
 pub(in crate::kernels::cuda) mod embed_bf16;
 pub(in crate::kernels::cuda) mod exl3;
@@ -68,6 +70,8 @@ pub(in crate::kernels::cuda) mod gdn_delta;
 pub(in crate::kernels::cuda) mod gelu_ffn;
 pub(in crate::kernels::cuda) mod graph;
 pub(in crate::kernels::cuda) mod hyper;
+pub(in crate::kernels::cuda) mod inkling_controller;
+pub(in crate::kernels::cuda) mod inkling_local_prep;
 pub(in crate::kernels::cuda) mod kv8_append;
 pub(in crate::kernels::cuda) mod kv_f16_append;
 pub(in crate::kernels::cuda) mod kv_f16_rows;
@@ -99,6 +103,7 @@ pub(in crate::kernels::cuda) mod qsa_attn;
 pub(in crate::kernels::cuda) mod qsa_index;
 pub(in crate::kernels::cuda) mod qsa_select;
 pub(in crate::kernels::cuda) mod quantize_q8_1;
+pub(in crate::kernels::cuda) mod relative_attention;
 pub(in crate::kernels::cuda) mod rope_gemma;
 pub(in crate::kernels::cuda) mod router;
 pub(in crate::kernels::cuda) mod router_rows;
@@ -161,6 +166,10 @@ impl<'a> RawRange<'a> {
 }
 
 impl RawRange<'_> {
+    pub(super) fn uses(&self, device: &RawDevice) -> bool {
+        self.device.ptr == device.ptr
+    }
+
     /// The byte offset of the range inside its allocation. Read-only: `address` relies on
     /// `RawRange::new`'s bound proof, so the fields stay private.
     pub(in crate::kernels::cuda) fn offset(&self) -> usize {

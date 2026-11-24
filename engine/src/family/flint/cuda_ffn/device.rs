@@ -667,11 +667,11 @@ fn route_reusing(
         frame.stream,
         RouterSigmoidCall {
             shape,
+            bias: None,
             logits: frame.range(logits)?,
             ids: frame.range(ids)?,
             weights: frame.range(gates)?,
             status: frame.flag()?,
-            bias: None,
         },
     )?;
     if device_picks {

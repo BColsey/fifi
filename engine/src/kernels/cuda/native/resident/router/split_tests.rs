@@ -36,8 +36,11 @@ fn select() -> RouterSigmoidArgsRaw {
         m: 1,
         n_expert: 8,
         top_k: 6,
-        bias: std::ptr::null(),
+        bias: ptr::null(),
         bias_bytes: 0,
+        floor: 0.0,
+        scale: 1.0,
+        bias_profile: BIAS_KERNEL_ROUNDED,
     }
 }
 
@@ -64,13 +67,37 @@ fn split_router_logits_c_abi_rejects_geometry_sizes_alignment_wrap_and_alias() {
 
 #[test]
 fn split_router_select_c_abi_rejects_geometry_short_align_wrap_and_alias() {
-    for case in 0..13 {
+    for case in 0..22 {
         let mut a = select();
         match case {
             0 => a.m = 4097,
             12 => {
                 a.n_expert = 513;
                 a.logits_bytes = 513 * 4;
+            }
+            13 => a.bias_bytes = 32,
+            14..=21 => {
+                a.bias = 0x5000usize as *const f32;
+                a.bias_bytes = 32;
+                a.bias_profile = BIAS_HOST_ROUNDED;
+                a.floor = 1.0 / 16384.0;
+                match case {
+                    14 => a.bias_bytes = 31,
+                    15 => a.bias = a.weights.cast_const(),
+                    16 => a.floor = f32::NAN,
+                    17 => a.scale = f32::INFINITY,
+                    18 => a.bias_profile = BIAS_KERNEL_ROUNDED, // takes no floor or scale
+                    19 => a.bias_profile = 2,
+                    20 => {
+                        a.bias = ptr::null(); // host-rounded needs a bias
+                        a.bias_bytes = 0;
+                    }
+                    _ => {
+                        a.bias_profile = BIAS_KERNEL_ROUNDED;
+                        a.floor = 0.0;
+                        a.scale = 2.0;
+                    }
+                }
             }
             1 => a.top_k = 9,
             2 => a.logits_bytes = 31,

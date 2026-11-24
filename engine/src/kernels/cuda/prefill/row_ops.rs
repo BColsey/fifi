@@ -202,5 +202,8 @@ impl CudaContext {
     }
 }
 
+mod experts;
+pub(crate) use experts::{ClippedExpertCall, IndexedRankSumCall};
+
 #[cfg(test)]
 mod tests;

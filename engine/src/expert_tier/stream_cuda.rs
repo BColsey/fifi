@@ -13,9 +13,6 @@ use crate::kernels::cuda::{
     CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, PinnedBuf,
 };
 
-// Preserve CUDA allocation alignment for every packed/scales subrange.
-const ALIGN: usize = 256;
-
 pub(crate) struct CudaStreamBanks {
     slots: [CudaStreamBank; 2],
 }
@@ -65,18 +62,27 @@ fn capacity() -> EngError {
 }
 
 impl CudaStreamBanks {
+    // Preserve CUDA allocation alignment for every packed/scales subrange.
+    pub(crate) const PAYLOAD_ALIGNMENT: usize = 256;
+
     /// Use the plan's reservation for hot placement first; allocate after releasing that wrapper.
     /// Host scratch covers demand ids, part metadata and one temporary payload per slot.
     pub(crate) fn new(ctx: &CudaContext, plan: StreamBankPlan) -> Result<Self, EngError> {
-        let bytes = usize::try_from(plan.bank_bytes()).map_err(|_| capacity())?;
-        let scratch = plan.host_bytes() - 2 * plan.bank_bytes();
-        let limit = usize::try_from(scratch / 2).map_err(|_| capacity())?;
         Ok(Self {
             slots: [
-                CudaStreamBank::new(ctx, bytes, limit)?,
-                CudaStreamBank::new(ctx, bytes, limit)?,
+                CudaStreamBank::from_plan(ctx, plan)?,
+                CudaStreamBank::from_plan(ctx, plan)?,
             ],
         })
+    }
+
+    pub(crate) fn replace_first(
+        &mut self,
+        ctx: &CudaContext,
+        plan: StreamBankPlan,
+    ) -> Result<(), EngError> {
+        self.slots[0] = CudaStreamBank::from_plan(ctx, plan)?;
+        Ok(())
     }
 
     pub(crate) fn slots_mut(&mut self) -> (&mut CudaStreamBank, &mut CudaStreamBank) {
@@ -86,6 +92,13 @@ impl CudaStreamBanks {
 }
 
 impl CudaStreamBank {
+    fn from_plan(ctx: &CudaContext, plan: StreamBankPlan) -> Result<Self, EngError> {
+        let bytes = usize::try_from(plan.bank_bytes()).map_err(|_| capacity())?;
+        let scratch = plan.host_bytes() - 2 * plan.bank_bytes();
+        let limit = usize::try_from(scratch / 2).map_err(|_| capacity())?;
+        Self::new(ctx, bytes, limit)
+    }
+
     fn new(ctx: &CudaContext, bytes: usize, scratch_limit: usize) -> Result<Self, EngError> {
         Ok(Self {
             host: ctx.pinned_buf(bytes)?,
@@ -303,12 +316,16 @@ fn pack_part(
     if view.data.is_empty() || view.shape.contains(&0) {
         return Err(bad("expert parts need data and positive matrix dimensions"));
     }
-    let start = used.checked_next_multiple_of(ALIGN).ok_or_else(capacity)?;
+    let start = used
+        .checked_next_multiple_of(CudaStreamBanks::PAYLOAD_ALIGNMENT)
+        .ok_or_else(capacity)?;
     let end = start.checked_add(view.data.len()).ok_or_else(capacity)?;
     let (scales, used) = if view.scales.is_empty() {
         (None, end)
     } else {
-        let start = end.checked_next_multiple_of(ALIGN).ok_or_else(capacity)?;
+        let start = end
+            .checked_next_multiple_of(CudaStreamBanks::PAYLOAD_ALIGNMENT)
+            .ok_or_else(capacity)?;
         let end = start.checked_add(view.scales.len()).ok_or_else(capacity)?;
         (Some(start..end), end)
     };

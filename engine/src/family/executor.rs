@@ -3,6 +3,7 @@
 use crate::EngError;
 use crate::family::sampler::Sampler;
 use crate::family::session::{self, DecodeSession, Limits, SaveKind, StoreLimits, TokenStepper};
+use crate::family::speculate::budget::DraftBudget;
 use crate::sched::job::{PrefillBankReport, PrefixReport};
 use crate::tokenizer::{DecodeBatch, IncrementalDecoder};
 use std::sync::Arc;
@@ -46,6 +47,8 @@ pub(crate) struct GenerationState {
     pub(crate) cancel: Arc<AtomicBool>,
     /// The sampler of this job. The executor draws from it inside `decode`.
     pub(crate) sampler: Sampler,
+    /// Reset when the worker creates a generation, including on prefix hits.
+    pub(crate) draft_budget: DraftBudget,
     max_tokens: Option<u32>,
     generated: u32,
 }
@@ -60,6 +63,7 @@ impl GenerationState {
             decoder,
             cancel: Arc::new(AtomicBool::new(false)),
             sampler,
+            draft_budget: DraftBudget::default(),
             max_tokens: None,
             generated: 0,
         }

@@ -38,9 +38,8 @@ typedef struct inference_cuda_router_args {
 int inference_cuda_router_launch(const inference_cuda_router_args *args, void *stream,
                                  int *out_stage);
 
-/* Split path: tightly packed logits [m][n_expert], with no shared gate or bias.
- * The caller BF16-publishes input/weights before logits, and logits before select,
- * using the shared publication primitive. Both entries require an explicit stream.
+/* Split path: tightly packed logits [m][n_expert] without a shared gate.
+ * The caller owns any model-specific publication. Both entries require an explicit stream.
  * Every written active extent is disjoint from all other active extents.
  */
 typedef struct inference_cuda_router_logits_args {
@@ -67,11 +66,21 @@ typedef struct inference_cuda_router_sigmoid_args {
     int m;
     int n_expert;
     int top_k;
-    /* Optional selection bias, f32 [n_expert]: experts are ranked by score + bias while the
-     * weights stay the unbiased scores. NULL ranks by the scores. */
     const float *bias;
     size_t bias_bytes;
+    float floor;
+    float scale;
+    int bias_profile;
 } inference_cuda_router_sigmoid_args;
+
+/* bias_profile, the contract of a non-NULL bias. Both rank the experts by sigmoid(logit) + bias
+ * and weight the selected experts by their unbiased scores.
+ *  KERNEL_ROUNDED: the kernel's own F32 sigmoid, ties broken by expert index, weights p / sum, and
+ *                  an empty sum is a fault. floor 0 and scale 1.
+ *  HOST_ROUNDED:   the sigmoid rounded as the Rust host rounds it, ties broken like total_cmp,
+ *                  weights scale * p / max(sum, floor) with a finite floor > 0. */
+#define INFERENCE_CUDA_ROUTER_BIAS_KERNEL_ROUNDED 0
+#define INFERENCE_CUDA_ROUTER_BIAS_HOST_ROUNDED 1
 
 int inference_cuda_router_logits_launch(const inference_cuda_router_logits_args *args,
                                         void *stream, int *out_stage);
@@ -102,7 +111,9 @@ int inference_cuda_router_logits_strided_launch(const inference_cuda_router_logi
                                                 void *stream, int *out_stage);
 /* Raw-logit health precedes F32 sigmoid. Rank sigmoid scores (lower-ID ties), then
  * normalize only the selected F32 scores. Bad rows get IDs -1, weights 0, status OR1.
- * Never clears status. Selected gates remain F32 until the caller's BF16 combine.
+ * With bias, rank sigmoid(logit) + bias in descending total order under bias_profile. Without
+ * bias, pass NULL, floor 0, scale 1 and bias_profile INFERENCE_CUDA_ROUTER_BIAS_KERNEL_ROUNDED.
+ * Never clears status.
  */
 int inference_cuda_router_sigmoid_select_launch(const inference_cuda_router_sigmoid_args *args,
                                                 void *stream, int *out_stage);
@@ -117,11 +128,13 @@ static_assert(sizeof(inference_cuda_router_logits_strided_args) == 64 &&
               offsetof(inference_cuda_router_logits_strided_args, n_expert) == 56 &&
               offsetof(inference_cuda_router_logits_strided_args, logit_stride) == 60,
               "router logits strided layout");
-static_assert(sizeof(inference_cuda_router_sigmoid_args) == 96 &&
+static_assert(sizeof(inference_cuda_router_sigmoid_args) == 112 &&
               offsetof(inference_cuda_router_sigmoid_args, status) == 48 &&
               offsetof(inference_cuda_router_sigmoid_args, top_k) == 72 &&
               offsetof(inference_cuda_router_sigmoid_args, bias) == 80 &&
-              offsetof(inference_cuda_router_sigmoid_args, bias_bytes) == 88, "router sigmoid layout");
+              offsetof(inference_cuda_router_sigmoid_args, scale) == 100 &&
+              offsetof(inference_cuda_router_sigmoid_args, bias_profile) == 104,
+              "router sigmoid layout");
 #endif
 
 #endif

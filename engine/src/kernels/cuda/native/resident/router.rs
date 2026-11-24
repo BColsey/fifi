@@ -201,7 +201,14 @@ struct RouterSigmoidArgsRaw {
     top_k: c_int,
     bias: *const f32,
     bias_bytes: usize,
+    floor: f32,
+    scale: f32,
+    bias_profile: c_int,
 }
+
+// `bias_profile` of router.h: the two contracts of a selection bias.
+const BIAS_KERNEL_ROUNDED: c_int = 0;
+const BIAS_HOST_ROUNDED: c_int = 1;
 
 const _: () = assert!(
     std::mem::size_of::<RouterLogitsArgsRaw>() == 64
@@ -216,7 +223,7 @@ const _: () = assert!(
         && std::mem::offset_of!(RouterLogitsArgsRaw, n_expert) == 56
 );
 const _: () = assert!(
-    std::mem::size_of::<RouterSigmoidArgsRaw>() == 96
+    std::mem::size_of::<RouterSigmoidArgsRaw>() == 112
         && std::mem::offset_of!(RouterSigmoidArgsRaw, logits) == 0
         && std::mem::offset_of!(RouterSigmoidArgsRaw, logits_bytes) == 8
         && std::mem::offset_of!(RouterSigmoidArgsRaw, ids) == 16
@@ -230,6 +237,9 @@ const _: () = assert!(
         && std::mem::offset_of!(RouterSigmoidArgsRaw, top_k) == 72
         && std::mem::offset_of!(RouterSigmoidArgsRaw, bias) == 80
         && std::mem::offset_of!(RouterSigmoidArgsRaw, bias_bytes) == 88
+        && std::mem::offset_of!(RouterSigmoidArgsRaw, floor) == 96
+        && std::mem::offset_of!(RouterSigmoidArgsRaw, scale) == 100
+        && std::mem::offset_of!(RouterSigmoidArgsRaw, bias_profile) == 104
 );
 
 unsafe extern "C" {
@@ -254,13 +264,42 @@ pub(in crate::kernels::cuda) struct RouterLogitsRaw<'a> {
     pub(in crate::kernels::cuda) ints: RouterInts,
 }
 
+/// The profile of a selection bias; `resident::RouterSigmoidBias` states the two contracts.
+pub(in crate::kernels::cuda) enum RouterSigmoidBiasRaw<'a> {
+    KernelRounded(RawRange<'a>),
+    HostRounded {
+        values: RawRange<'a>,
+        floor: f32,
+        scale: f32,
+    },
+}
+
+impl RouterSigmoidBiasRaw<'_> {
+    /// The bias range with its profile and the parameters the profile leaves at their neutral
+    /// values. C repeats these checks.
+    fn parameters(&self) -> Result<(&RawRange<'_>, f32, f32, c_int), DeviceFailure> {
+        match self {
+            Self::KernelRounded(values) => Ok((values, 0.0, 1.0, BIAS_KERNEL_ROUNDED)),
+            Self::HostRounded {
+                values,
+                floor,
+                scale,
+            } => {
+                if !floor.is_finite() || *floor <= 0.0 || !scale.is_finite() {
+                    return Err(invalid_argument());
+                }
+                Ok((values, *floor, *scale, BIAS_HOST_ROUNDED))
+            }
+        }
+    }
+}
+
 pub(in crate::kernels::cuda) struct RouterSigmoidRaw<'a> {
+    pub(in crate::kernels::cuda) bias: Option<RouterSigmoidBiasRaw<'a>>,
     pub(in crate::kernels::cuda) logits: RawRange<'a>,
     pub(in crate::kernels::cuda) ids: RawRange<'a>,
     pub(in crate::kernels::cuda) weights: RawRange<'a>,
     pub(in crate::kernels::cuda) status: RawRange<'a>,
-    /// The optional selection bias, f32 `[n_expert]`.
-    pub(in crate::kernels::cuda) bias: Option<RawRange<'a>>,
     pub(in crate::kernels::cuda) ints: RouterInts,
 }
 
@@ -331,22 +370,30 @@ pub(in crate::kernels::cuda) fn router_sigmoid_launch(
     io: RouterSigmoidRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let need = split_needs(&io.ints).ok_or_else(invalid_argument)?;
-    let mut regions = vec![
-        (&io.logits, need.logits, 4, false),
+    let mut regions = [
         (&io.ids, need.picks, 4, true),
         (&io.weights, need.picks, 4, true),
         (&io.status, 4, 4, true),
+        (&io.logits, need.logits, 4, false),
+        (&io.logits, 0, 4, false),
     ];
-    let bias_bytes = io
-        .ints
-        .n_expert
-        .checked_mul(4)
-        .and_then(|v| usize::try_from(v).ok())
-        .ok_or_else(invalid_argument)?;
-    if let Some(bias) = &io.bias {
-        regions.push((bias, bias_bytes, 4, false));
-    }
-    check_split_ranges(&regions)?;
+    let (bias, bias_bytes, floor, scale, profile, count) = match &io.bias {
+        Some(bias) => {
+            let (values, floor, scale, profile) = bias.parameters()?;
+            let bytes = usize::try_from(io.ints.n_expert).map_err(|_| invalid_argument())? * 4;
+            regions[4] = (values, bytes, 4, false);
+            (
+                values.address().cast::<f32>().cast_const(),
+                values.bytes,
+                floor,
+                scale,
+                profile,
+                5,
+            )
+        }
+        None => (ptr::null(), 0, 0.0, 1.0, BIAS_KERNEL_ROUNDED, 4),
+    };
+    check_split_ranges(&regions[..count])?;
     let args = RouterSigmoidArgsRaw {
         logits: io.logits.address().cast::<f32>().cast_const(),
         logits_bytes: io.logits.bytes,
@@ -359,11 +406,11 @@ pub(in crate::kernels::cuda) fn router_sigmoid_launch(
         m: io.ints.m,
         n_expert: io.ints.n_expert,
         top_k: io.ints.top_k,
-        bias: io
-            .bias
-            .as_ref()
-            .map_or(std::ptr::null(), |b| b.address().cast::<f32>().cast_const()),
-        bias_bytes: io.bias.as_ref().map_or(0, RawRange::bytes),
+        bias,
+        bias_bytes,
+        floor,
+        scale,
+        bias_profile: profile,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: checked live ranges have disjoint writes; C repeats shape/span checks.

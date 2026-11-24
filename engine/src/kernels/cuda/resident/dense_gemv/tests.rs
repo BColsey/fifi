@@ -92,6 +92,7 @@ fn narrow(dtype: DenseDtype, values: &[f32]) -> Vec<u16> {
         .map(|&v| match dtype {
             DenseDtype::F16 => half::f16::from_f32(v).to_bits(),
             DenseDtype::Bf16 => half::bf16::from_f32(v).to_bits(),
+            _ => unreachable!("half-precision fixture"),
         })
         .collect()
 }
@@ -102,6 +103,7 @@ fn widen(dtype: DenseDtype, codes: &[u16]) -> Vec<f64> {
         .map(|&c| match dtype {
             DenseDtype::F16 => half::f16::from_bits(c).to_f64(),
             DenseDtype::Bf16 => half::bf16::from_bits(c).to_f64(),
+            _ => unreachable!("half-precision fixture"),
         })
         .collect()
 }
@@ -162,7 +164,7 @@ fn reference(c: &Case, t: usize, r: usize) -> (f64, f64) {
 fn run(rig: &Rig, c: &Case, (w_extra, x_extra, y_extra): (usize, usize, usize)) -> Vec<f32> {
     let w = Padded::new(&rig.ctx, &code_bytes(&c.codes), w_extra);
     let x = Padded::new(&rig.ctx, &f32_bytes(&c.x), x_extra);
-    let need = dense_gemv_bytes(c.shape).expect("bytes");
+    let need = dense_gemv_bytes(c.shape, c.dtype).expect("bytes");
     let y = Padded::new(&rig.ctx, &sentinel(need.y), y_extra);
     let call = DenseGemvCall {
         shape: c.shape,
@@ -330,6 +332,160 @@ fn refused(rig: &Rig, call: DenseGemvCall<'_>, y: &Padded, expect: &str) {
 }
 
 #[test]
+fn f32_weights_cover_both_load_paths_and_require_full_extent_and_alignment() {
+    if !testkit::device_present(
+        "f32_weights_cover_both_load_paths_and_require_full_extent_and_alignment",
+    ) {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0xD3_5E_6E_06);
+    let shape = DenseGemvShape::packed(1, 64, 4608);
+    let weights = draw(&mut rng, shape.rows * shape.cols, 0.02);
+    let x = draw(&mut rng, shape.cols, 1.0);
+    let w = f32_bytes(&weights);
+    let x_gpu = Padded::new(&rig.ctx, &f32_bytes(&x), 0);
+    let y_gpu = Padded::new(&rig.ctx, &sentinel(4 * shape.rows), 0);
+    let call = |w| DenseGemvCall {
+        shape,
+        dtype: DenseDtype::F32,
+        w,
+        x: x_gpu.all(),
+        y: y_gpu.all(),
+    };
+
+    let misaligned = Padded::new(&rig.ctx, &w, 2);
+    refused(&rig, call(misaligned.all()), &y_gpu, "not a multiple of 4");
+    let aligned = Padded::new(&rig.ctx, &w, 0);
+    refused(
+        &rig,
+        call(aligned.range(0, w.len() - 4)),
+        &y_gpu,
+        "the call needs",
+    );
+    let scalar = Padded::new(&rig.ctx, &w, 4);
+    for matrix in [&aligned, &scalar] {
+        rig.ctx.dense_gemv(&rig.stream, call(matrix.all())).unwrap();
+        rig.stream.synchronize().unwrap();
+        let result = testkit::floats(&y_gpu.read(&rig.ctx, "y"));
+        for (row, actual) in weights.chunks_exact(shape.cols).zip(result) {
+            let want: f64 = row
+                .iter()
+                .zip(&x)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            assert!(
+                (f64::from(actual) - want).abs() <= 0.00001,
+                "{actual} vs {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_projection_group_validates_before_writing_and_orders_dependencies() {
+    if !testkit::device_present(
+        "a_projection_group_validates_before_writing_and_orders_dependencies",
+    ) {
+        return;
+    }
+    let rig = Rig::new();
+    let w = Padded::new(&rig.ctx, &f32_bytes(&[2.0, 3.0, 4.0, 5.0]), 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&[1.0, 2.0]), 0);
+    let y = Padded::new(&rig.ctx, &sentinel(16), 0);
+    let call = |x, y| DenseGemvCall {
+        shape: DenseGemvShape::packed(1, 2, 2),
+        dtype: DenseDtype::F32,
+        w: w.all(),
+        x,
+        y,
+    };
+    let intermediate = y.range(0, 8);
+    let error = rig
+        .ctx
+        .dense_gemv_group(
+            &rig.stream,
+            &[
+                call(x.all(), intermediate),
+                call(intermediate, y.range(8, 4)),
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(error, EngError::BadRequest(_)));
+    rig.stream.synchronize().unwrap();
+    assert_eq!(y.read(&rig.ctx, "y"), sentinel(16));
+    rig.ctx
+        .dense_gemv_group(
+            &rig.stream,
+            &[
+                call(x.all(), intermediate),
+                call(intermediate, y.range(8, 8)),
+            ],
+        )
+        .unwrap();
+    rig.stream.synchronize().unwrap();
+    assert_eq!(
+        testkit::floats(&y.read(&rig.ctx, "y")),
+        [8.0, 14.0, 58.0, 102.0]
+    );
+}
+
+#[test]
+fn q6_attention_row_pairs_preserve_reference_bits_and_padding() {
+    if !testkit::device_present("Q6_K attention row pairs") {
+        return;
+    }
+    let rig = Rig::new();
+    let sm75 = rig.ctx.mmq_device_facts().unwrap().cc == 750;
+    let dtype = DenseDtype::PackedGguf(crate::weights::GgufType::Q6K);
+    let w = (0..3072 * 9)
+        .flat_map(|block| {
+            let mut raw = std::array::from_fn::<_, 210, _>(|i| ((block * 13 + i * 37) % 251) as u8);
+            raw[208..].copy_from_slice(&half::f16::from_f32(0.00025).to_bits().to_le_bytes());
+            raw
+        })
+        .collect::<Vec<_>>();
+    let weights = Padded::new(&rig.ctx, &w, 0);
+    for m in [1, 8, 63, 64] {
+        let shape = DenseGemvShape {
+            ld_x: 2311,
+            ld_y: 3077,
+            ..DenseGemvShape::packed(m, 3072, 2304)
+        };
+        let input = (0..m * shape.ld_x)
+            .map(|i| ((i * 109 % 1009) as f32 - 504.0) / 513.0)
+            .collect::<Vec<_>>();
+        let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+        let y = Padded::new(&rig.ctx, &sentinel(m * shape.ld_y * 4), 0);
+        let ordinary = Padded::new(&rig.ctx, &sentinel(m * shape.ld_y * 4), 0);
+        let call = |y| DenseGemvCall {
+            shape,
+            dtype,
+            w: weights.all(),
+            x: x.all(),
+            y,
+        };
+        rig.ctx
+            .dense_gemv(&rig.stream, call(ordinary.all()))
+            .unwrap();
+        let reuse = super::AttentionRowReuse {
+            q8: false,
+            q6: true,
+        };
+        let counts = rig
+            .ctx
+            .dense_gemv_group_with_attention_reuse(&rig.stream, &[call(y.all())], reuse)
+            .unwrap();
+        assert_eq!(counts.q6_row_pairs, usize::from(sm75 && m > 1));
+        rig.stream.synchronize().unwrap();
+        assert!(
+            y.read(&rig.ctx, "paired y") == ordinary.read(&rig.ctx, "ordinary y"),
+            "m={m}"
+        );
+    }
+}
+
+#[test]
 fn bad_arguments_are_refused_before_any_launch() {
     if !testkit::device_present("bad_arguments_are_refused_before_any_launch") {
         return;
@@ -340,7 +496,7 @@ fn bad_arguments_are_refused_before_any_launch() {
     let case = Case::new(&mut rng, shape, DenseDtype::F16);
     let w = Padded::new(&rig.ctx, &code_bytes(&case.codes), 0);
     let x = Padded::new(&rig.ctx, &f32_bytes(&case.x), 0);
-    let need = dense_gemv_bytes(shape).unwrap();
+    let need = dense_gemv_bytes(shape, DenseDtype::F16).unwrap();
     let y = Padded::new(&rig.ctx, &sentinel(need.y), 0);
     let ok = |shape: DenseGemvShape| DenseGemvCall {
         shape,
@@ -421,4 +577,368 @@ fn bad_arguments_are_refused_before_any_launch() {
         .dense_gemv(&rig.stream, ok(shape))
         .expect("valid call");
     rig.stream.synchronize().expect("drain");
+}
+
+#[test]
+fn gguf_nvfp4_projects_original_blocks_and_checks_their_extents() {
+    if !testkit::device_present("gguf_nvfp4_projects_original_blocks_and_checks_their_extents") {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = DenseGemvShape::packed(2, 256, 128);
+    let mut blocks = Vec::new();
+    for scale in 0..=255u8 {
+        for block in 0..2 {
+            blocks.extend([scale; 4]);
+            blocks.extend((0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(block)));
+        }
+    }
+    let mut weights = vec![0.0; shape.rows * shape.cols];
+    crate::weights::dequantize_into(crate::weights::GgufType::Nvfp4, &blocks, &mut weights)
+        .unwrap();
+    let inputs: Vec<_> = (0..shape.m * shape.cols)
+        .map(|i| ((i % 11) as i32 - 5) as f32)
+        .collect();
+    let w = Padded::new(&rig.ctx, &blocks, 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&inputs), 0);
+    let y = Padded::new(&rig.ctx, &sentinel(shape.rows * shape.m * 4), 0);
+    let call = || DenseGemvCall {
+        shape,
+        dtype: DenseDtype::GgufNvfp4,
+        w: w.all(),
+        x: x.all(),
+        y: y.all(),
+    };
+    refused(
+        &rig,
+        DenseGemvCall {
+            w: w.range(0, blocks.len() - 1),
+            ..call()
+        },
+        &y,
+        "the call needs",
+    );
+    refused(
+        &rig,
+        DenseGemvCall {
+            shape: DenseGemvShape::packed(2, 256, 127),
+            ..call()
+        },
+        &y,
+        "the CUDA dense matvec takes",
+    );
+    rig.ctx.dense_gemv(&rig.stream, call()).unwrap();
+    rig.stream.synchronize().unwrap();
+    let out = y.read(&rig.ctx, "GGUF output");
+    let got: Vec<_> = out
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_ne_bytes(*b))
+        .collect();
+    // Integer activations and one binary scale per row keep these small sums exact.
+    let expected: Vec<f32> = inputs
+        .chunks_exact(shape.cols)
+        .flat_map(|x| {
+            weights
+                .chunks_exact(shape.cols)
+                .map(move |w| x.iter().zip(w).map(|(x, w)| x * w).sum::<f32>())
+        })
+        .collect();
+    assert_eq!(got, expected);
+}
+
+fn test_packed_blocks(kind: crate::weights::GgufType, count: usize) -> Vec<u8> {
+    use crate::weights::GgufType::*;
+    let mut rng = Rng::new(0xAB_54_30_17);
+    let mut bytes = vec![0; count * kind.block_bytes() as usize];
+    for (i, block) in bytes
+        .chunks_exact_mut(kind.block_bytes() as usize)
+        .enumerate()
+    {
+        for byte in block.iter_mut() {
+            *byte = (256.0 * rng.unit()) as u8;
+        }
+        let d = half::f16::from_f32((i % 7 + 1) as f32 / 256.0).to_bits();
+        let offset = match kind {
+            Q2K => 80,
+            Q3K => 108,
+            Q6K => 208,
+            Mxfp4 => {
+                block[0] = 121 + (i % 7) as u8;
+                continue;
+            }
+            Iq1M => {
+                for (j, byte) in block[49..56].iter_mut().step_by(2).enumerate() {
+                    *byte = (*byte & 15) | (((d >> (4 * j)) & 15) as u8) << 4;
+                }
+                continue;
+            }
+            _ => 0,
+        };
+        block[offset..offset + 2].copy_from_slice(&d.to_le_bytes());
+        if matches!(kind, Q2K | Q4K | Q5K) {
+            block[offset + 2..offset + 4].copy_from_slice(&(d + 13).to_le_bytes());
+        }
+    }
+    bytes
+}
+
+#[test]
+fn original_packed_gguf_gemv_matches_cpu_for_every_supported_format() {
+    use crate::weights::{GgufType, dequantize_into};
+
+    if !testkit::device_present("original_packed_gguf_gemv_matches_cpu_for_every_supported_format")
+    {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = DenseGemvShape {
+        m: 3,
+        rows: 13,
+        cols: 512,
+        ld_x: 517,
+        ld_y: 16,
+    };
+    let mut rng = Rng::new(0xAB_54_30_19);
+    let input = draw(&mut rng, (shape.m - 1) * shape.ld_x + shape.cols, 1.0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+    let y_bytes = ((shape.m - 1) * shape.ld_y + shape.rows) * 4;
+
+    let mut covered = 0;
+    for id in 0..=42 {
+        let Ok(kind) = GgufType::from_id(id) else {
+            continue;
+        };
+        let Some(dtype @ DenseDtype::PackedGguf(_)) = DenseDtype::from_gguf(kind) else {
+            continue;
+        };
+        covered += 1;
+        let values = shape.rows * shape.cols;
+        let blocks = test_packed_blocks(kind, values / kind.block_elems() as usize);
+        let mut decoded = vec![0.0; values];
+        dequantize_into(kind, &blocks, &mut decoded).unwrap();
+        let w = Padded::new(&rig.ctx, &blocks, 2);
+        let y = Padded::new(&rig.ctx, &sentinel(y_bytes), 0);
+        rig.ctx
+            .dense_gemv(
+                &rig.stream,
+                DenseGemvCall {
+                    shape,
+                    dtype,
+                    w: w.all(),
+                    x: x.all(),
+                    y: y.all(),
+                },
+            )
+            .unwrap();
+        rig.stream.synchronize().unwrap();
+        assert_eq!(w.read(&rig.ctx, "packed weight"), blocks);
+        let bytes = y.read(&rig.ctx, "GGUF packed output");
+        let result = testkit::floats(&bytes);
+        for t in 0..shape.m {
+            let x = &input[t * shape.ld_x..][..shape.cols];
+            for (row, weights) in decoded.chunks_exact(shape.cols).enumerate() {
+                let (want, magnitude) =
+                    x.iter().zip(weights).fold((0.0, 0.0), |(s, a), (&x, &w)| {
+                        let term = f64::from(x) * f64::from(w);
+                        (s + term, a + term.abs())
+                    });
+                let got = f64::from(result[t * shape.ld_y + row]);
+                let depth = (shape.cols / 32 + 6) as f64;
+                let tolerance = SLACK * U * depth * magnitude;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{} token {t} row {row}: got {got}, expected {want} ± {tolerance}",
+                    kind.name()
+                );
+            }
+            if t + 1 < shape.m {
+                for padding in shape.rows..shape.ld_y {
+                    assert_eq!(result[t * shape.ld_y + padding].to_bits(), SENT_BITS);
+                }
+            }
+        }
+        println!("packed GGUF {} against CPU", kind.name());
+    }
+    assert_eq!(covered, 19);
+}
+
+#[test]
+fn indexed_gguf_experts_match_ordered_cpu_projection() {
+    use super::{GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufMoeWeights};
+    use crate::weights::{GgufType, dequantize_into};
+
+    if !testkit::device_present("indexed_gguf_experts_match_ordered_cpu_projection") {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = GgufMoeShape {
+        hidden: 64,
+        middle: 64,
+        experts: 4,
+    };
+    let [hidden, middle, experts] = [shape.hidden, shape.middle, shape.experts];
+    let kinds = [GgufType::Q20, GgufType::Nvfp4];
+    let dtypes = kinds.map(|kind| DenseDtype::from_gguf(kind).unwrap());
+    let gate = test_packed_blocks(kinds[0], experts * 2 * middle);
+    let down = (0..experts * hidden)
+        .flat_map(|row| {
+            let scale = 0x16 + (row % 4) as u8;
+            [scale; 4]
+                .into_iter()
+                .chain((0..32).map(move |j| (13 * row + 23 * j) as u8))
+        })
+        .collect::<Vec<_>>();
+    let picks = [
+        GgufMoePick {
+            expert: 3,
+            gate_scale: 0.75,
+            down_scale: 0.5,
+            weight: 0.25,
+        },
+        GgufMoePick {
+            expert: 0,
+            gate_scale: 1.0,
+            down_scale: 2.0,
+            weight: 0.5,
+        },
+        GgufMoePick {
+            expert: 2,
+            gate_scale: 0.25,
+            down_scale: 1.0,
+            weight: 0.125,
+        },
+    ];
+    let caps = [0.75, 1.25];
+    let input = (0..hidden)
+        .map(|i| (i % 7) as f32 / 8.0 - 0.375)
+        .collect::<Vec<_>>();
+
+    let w = [
+        Padded::new(&rig.ctx, &gate, 0),
+        Padded::new(&rig.ctx, &down, 0),
+    ];
+    let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+    let scratch = Padded::new(
+        &rig.ctx,
+        &sentinel(shape.scratch_bytes(picks.len()).unwrap()),
+        0,
+    );
+    let y = Padded::new(&rig.ctx, &sentinel(hidden * 4), 0);
+    let args = || GgufMoeCall {
+        shape,
+        caps,
+        picks: GgufMoePicks::Host(&picks),
+        dtypes,
+        weights: GgufMoeWeights::Stacks([w[0].all(), w[1].all()]),
+        x: x.all(),
+        scratch: scratch.all(),
+        y: y.all(),
+    };
+    let err = rig
+        .ctx
+        .gguf_moe(
+            &rig.stream,
+            GgufMoeCall {
+                scratch: scratch.range(0, scratch.len - 1),
+                ..args()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngError::BadRequest(_)));
+    let bad_id = [GgufMoePick {
+        expert: experts as u32,
+        ..picks[1]
+    }];
+    let err = rig
+        .ctx
+        .gguf_moe(
+            &rig.stream,
+            GgufMoeCall {
+                picks: GgufMoePicks::Host(&bad_id),
+                ..args()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngError::BadRequest(_)));
+    assert_eq!(y.read(&rig.ctx, "refused y"), sentinel(hidden * 4));
+    rig.ctx.gguf_moe(&rig.stream, args()).unwrap();
+    rig.stream.synchronize().unwrap();
+
+    let mut gu = vec![0.0; 2 * experts * middle * hidden];
+    let mut down_weights = vec![0.0; experts * hidden * middle];
+    dequantize_into(kinds[0], &gate, &mut gu).unwrap();
+    dequantize_into(kinds[1], &down, &mut down_weights).unwrap();
+    let got = testkit::floats(&y.read(&rig.ctx, "mixed GGUF expert result"));
+    let sizes = [gate.len() / experts, down.len() / experts];
+    let staged_pick = picks[1].expert as usize;
+    let staged = [
+        Padded::new(&rig.ctx, &gate[staged_pick * sizes[0]..][..sizes[0]], 0),
+        Padded::new(&rig.ctx, &down[staged_pick * sizes[1]..][..sizes[1]], 0),
+    ];
+    let mut matrices = picks.map(|pick| {
+        let expert = pick.expert as usize;
+        [
+            w[0].range(expert * sizes[0], sizes[0]),
+            w[1].range(expert * sizes[1], sizes[1]),
+        ]
+    });
+    matrices[1] = [staged[0].all(), staged[1].all()];
+    let mut short = matrices;
+    short[1][1] = staged[1].range(0, sizes[1] - 1);
+    let error = rig
+        .ctx
+        .gguf_moe(
+            &rig.stream,
+            GgufMoeCall {
+                weights: GgufMoeWeights::Separate(&short),
+                ..args()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, EngError::BadRequest(_)));
+    rig.ctx
+        .gguf_moe(
+            &rig.stream,
+            GgufMoeCall {
+                weights: GgufMoeWeights::Separate(&matrices),
+                ..args()
+            },
+        )
+        .unwrap();
+    rig.stream.synchronize().unwrap();
+    assert_eq!(
+        got,
+        testkit::floats(&y.read(&rig.ctx, "separate GGUF expert result"))
+    );
+    let mut expected = vec![0.0; hidden];
+    let dot = |x: &[f32], w: &[f32]| x.iter().zip(w).map(|(x, w)| x * w).sum::<f32>();
+    let clip = |x: f32, cap: f32| cap * (x / cap).tanh();
+    for pick in picks {
+        let start = pick.expert as usize * 2 * middle * hidden;
+        let matrix = &gu[start..][..2 * middle * hidden];
+        let (gate, up) = matrix.split_at(middle * hidden);
+        let mid = gate
+            .chunks_exact(hidden)
+            .zip(up.chunks_exact(hidden))
+            .map(|(g, u)| {
+                let gate = pick.gate_scale * dot(&input, g);
+                let up = pick.gate_scale * dot(&input, u);
+                clip(gate, caps[0]) * (1.0 + (-gate).exp()).recip() * clip(up, caps[1])
+            })
+            .collect::<Vec<_>>();
+        let start = pick.expert as usize * hidden * middle;
+        let d = &down_weights[start..][..hidden * middle];
+        for (out, row) in expected.iter_mut().zip(d.chunks_exact(middle)) {
+            *out += pick.weight * (pick.down_scale * dot(&mid, row));
+        }
+    }
+    for (i, (&got, want)) in got.iter().zip(expected).enumerate() {
+        let error = (got - want).abs();
+        assert!(
+            error <= (want.abs() + 1.0) * 1e-5,
+            "column {i}, value {got}, CPU {want}"
+        );
+    }
 }

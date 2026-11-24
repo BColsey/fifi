@@ -26,7 +26,7 @@ use super::{CudaContext, DeviceRange, LIVE_PINNED, device_error};
 use crate::EngError;
 use crate::kernels::cuda::guard::Lease;
 use crate::kernels::cuda::native::resident::{self, RawPinned, RawRange};
-use crate::kernels::cuda::{TERMINAL, ensure_usable};
+use crate::kernels::cuda::{TERMINAL, ensure_usable, terminal_refusal};
 
 /// Page-locked host memory of `bytes` bytes owned by a [`CudaContext`].
 pub(crate) struct PinnedBuf {
@@ -231,6 +231,17 @@ impl PinnedBuf {
         Ok(())
     }
 
+    /// Fence even a partial enqueue. A fence failure normally takes precedence, but
+    /// a terminal guard refusal adds no fence result and must not mask the enqueue
+    /// error. In that case pending copies remain pending and terminal owners are leaked.
+    pub(crate) fn synchronize_after_enqueue(
+        &mut self,
+        stream: &DeviceStream,
+        queued: Result<(), EngError>,
+    ) -> Result<(), EngError> {
+        after_enqueue(queued, self.synchronize(stream))
+    }
+
     /// Waits for `event` and marks every transfer of the buffer as finished.
     ///
     /// Returns `BadRequest` unless a copy is outstanding and `event` was last recorded on the
@@ -347,6 +358,16 @@ impl PinnedBuf {
     }
 }
 
+fn after_enqueue(
+    queued: Result<(), EngError>,
+    fence: Result<(), EngError>,
+) -> Result<(), EngError> {
+    match (queued, fence) {
+        (Err(queued), Err(fence)) if fence == terminal_refusal() => Err(queued),
+        (queued, fence) => fence.and(queued),
+    }
+}
+
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
         let bytes = self.bytes;
@@ -364,6 +385,34 @@ mod tests {
     use crate::kernels::cuda::resident::matvec_q::tests::assert_bad_request;
     use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
     use crate::kernels::cuda::testkit;
+
+    #[test]
+    fn fence_after_enqueue_preserves_the_cause_of_a_terminal_refusal() {
+        use crate::kernels::cuda::EXECUTE_OPERATION;
+        use std::sync::atomic::AtomicBool;
+
+        let enqueue_error = EngError::Backend {
+            operation: EXECUTE_OPERATION,
+            message: "invalid argument (status 1)".to_owned(),
+        };
+        let sync_error = EngError::Backend {
+            operation: EXECUTE_OPERATION,
+            message: "illegal memory access (status 700)".to_owned(),
+        };
+        let terminal = || ensure_usable(&AtomicBool::new(true));
+        let failed_enqueue = || Err(enqueue_error.clone());
+        assert_eq!(
+            after_enqueue(failed_enqueue(), terminal()),
+            failed_enqueue()
+        );
+        assert_eq!(after_enqueue(Ok(()), terminal()), terminal());
+        assert_eq!(after_enqueue(failed_enqueue(), Ok(())), failed_enqueue());
+        assert_eq!(
+            after_enqueue(failed_enqueue(), Err(sync_error.clone())),
+            Err(sync_error)
+        );
+        assert_eq!(after_enqueue(Ok(()), Ok(())), Ok(()));
+    }
 
     #[test]
     #[ignore = "requires native CUDA; run explicitly under the GPU lease"]

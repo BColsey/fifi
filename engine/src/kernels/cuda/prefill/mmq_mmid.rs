@@ -444,6 +444,7 @@ fn out_claims<'a>(out: &MmidIdsOut<'a>, shape: &MmidShape) -> Result<[Claim<'a>;
 /// `quant`, the first at the start of `base`, each `stride_bytes` after the one before (a
 /// `NativeWeight`'s buffer, or a bank of slots with `n_experts = slots`). `base` is 16-byte
 /// aligned.
+#[derive(Clone, Copy)]
 pub(crate) struct MmidWeight<'b> {
     pub(crate) base: DeviceRange<'b>,
     pub(crate) quant: QuantType,
@@ -891,8 +892,10 @@ impl CudaContext {
 }
 
 mod dq;
+mod dq_rows;
 mod routed;
-pub(crate) use dq::DqMmidCall;
+pub(crate) use dq::{DqMmidCall, SparseDqCall};
+pub(crate) use dq_rows::GroupedDqRows;
 pub(crate) use routed::{Q8Cursor, RoutedQuant, RoutedX, routed_gemm};
 
 #[cfg(all(test, feature = "native-cuda"))]

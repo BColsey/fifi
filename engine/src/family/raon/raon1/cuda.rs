@@ -44,7 +44,9 @@ use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
-use crate::kernels::cuda::resident::router::{RouterLogitsCall, RouterShape, RouterSigmoidCall};
+use crate::kernels::cuda::resident::router::{
+    RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
+};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 use crate::weights::dequantize;
 
@@ -1281,7 +1283,7 @@ impl Raon1Device {
                 ids: sc.ids.range(0, n * USED * 4)?,
                 weights: sc.weights.range(0, n * USED * 4)?,
                 status: Self::whole(&sc.route_status)?,
-                bias: Some(self.raw(&names.exp_bias)?),
+                bias: Some(RouterSigmoidBias::KernelRounded(self.raw(&names.exp_bias)?)),
             },
         )?;
         if self.trace.borrow().is_some() {

@@ -1,4 +1,5 @@
 mod acquire;
+pub(crate) mod dspark_gguf;
 #[cfg(all(
     feature = "native-fault-qualification",
     target_os = "macos",
@@ -68,6 +69,7 @@ pub use gguf::{
     ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SMALL_VECTOR_BYTES, SplitInfo,
     check_split_set, hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
 };
+pub(crate) use gguf_dequant::project_f32_rows;
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,

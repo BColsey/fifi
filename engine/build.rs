@@ -144,6 +144,11 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/block_ops.cu",
     "src/kernels/cuda/native/resident/ple_block.cu",
     "src/kernels/cuda/native/resident/matvec_dq.cu",
+    "src/kernels/cuda/native/resident/relative_attention.cu",
+    "src/kernels/cuda/native/resident/inkling_controller.cu",
+    "src/kernels/cuda/native/resident/inkling_local_prep.cu",
+    "src/kernels/cuda/native/resident/draft_attention_bf16.cu",
+    "src/kernels/cuda/native/resident/correct_draft_logits_bf16.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -209,6 +214,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/prefill/mmq_nvfp4.h",
     "src/kernels/cuda/native/prefill/mmq_quant.h",
     "src/kernels/cuda/native/prefill/row_ops.h",
+    "src/kernels/cuda/native/expert_math.cuh",
     "src/kernels/cuda/native/prefill/scatter_cols.h",
     "src/kernels/cuda/native/prefill/status.h",
     "src/kernels/cuda/native/prefill/swiglu_rows.h",
@@ -219,6 +225,8 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/attn_prep.h",
     "src/kernels/cuda/native/resident/attn_split_reduce.cuh",
     "src/kernels/cuda/native/resident/block_ops.h",
+    "src/kernels/cuda/native/resident/correct_draft_logits_bf16.h",
+    "src/kernels/cuda/native/resident/draft_attention_bf16.h",
     "src/kernels/cuda/native/resident/embed.h",
     "src/kernels/cuda/native/resident/embed_bf16.h",
     "src/kernels/cuda/native/resident/exl3.h",
@@ -296,10 +304,15 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/nvfp4_gemv.h",
     "src/kernels/cuda/native/prefill/flint_qk.h",
     "src/kernels/cuda/native/resident/dense_gemv.h",
+    "src/kernels/cuda/native/resident/gguf_gemv.cuh",
+    "src/kernels/cuda/native/resident/inkling_gate_dot.cuh",
+    "src/kernels/cuda/native/resident/inkling_q2_down.cuh",
     "src/kernels/cuda/native/resident/hyper.h",
     "src/kernels/cuda/native/resident/q8_1_store.cuh",
     "src/kernels/cuda/native/resident/qsa_attn.h",
     "src/kernels/cuda/native/resident/qsa_index.h",
+    "src/kernels/cuda/native/resident/relative_attention.h",
+    "src/kernels/cuda/native/resident/relative_attention_tile.h",
     "src/kernels/cuda/native/resident/qsa_select.h",
 ];
 

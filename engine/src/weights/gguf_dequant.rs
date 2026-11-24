@@ -472,6 +472,22 @@ fn iq1_m(b: &[u8], y: &mut [f32]) {
     }
 }
 
+fn mxfp4(b: &[u8], y: &mut [f32]) {
+    // The GGML E2M1 table uses doubled integer values, so halve the E8M0 scale.
+    const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let exponent = u32::from(b[0]);
+    let scale = f32::from_bits(if exponent < 2 {
+        0x0020_0000 << exponent
+    } else {
+        (exponent - 1) << 23
+    });
+    let (low, high) = y.split_at_mut(16);
+    for ((lo, hi), &packed) in low.iter_mut().zip(high).zip(&b[1..]) {
+        *lo = f32::from(VALUES[usize::from(packed & 15)]) * scale;
+        *hi = f32::from(VALUES[usize::from(packed >> 4)]) * scale;
+    }
+}
+
 fn nvfp4(b: &[u8], y: &mut [f32]) {
     // The GGUF integer-value convention makes code 8 positive zero.
     const VALUES: [f32; 16] = [
@@ -509,6 +525,7 @@ fn plan(ty: GgufType, src_len: usize) -> Result<(Decoder, usize, usize, usize), 
         GgufType::Q5K => q5_k,
         GgufType::Q6K => q6_k,
         GgufType::Q80 => q8_0,
+        GgufType::Mxfp4 => mxfp4,
         GgufType::Nvfp4 => nvfp4,
         GgufType::Iq2Xxs => iq2_xxs,
         GgufType::Iq2Xs => iq2_xs,
@@ -559,6 +576,30 @@ pub fn dequantize_into(ty: GgufType, src: &[u8], dst: &mut [f32]) -> Result<(), 
         decode(b, y);
     }
     Ok(())
+}
+
+/// Project the first `rows` of a little-endian F32 GGUF matrix. The ordered
+/// products are accumulated directly from the mapped row without a decoded copy.
+pub(crate) fn project_f32_rows(src: &[u8], x: &[f32], rows: usize) -> Result<Vec<f32>, EngError> {
+    let row_bytes = x
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| bad("F32 row size"))?;
+    if row_bytes == 0 || !src.len().is_multiple_of(row_bytes) || rows > src.len() / row_bytes {
+        return Err(bad("invalid F32 matrix extent"));
+    }
+    Ok(src
+        .chunks_exact(row_bytes)
+        .take(rows)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(x)
+                .map(|(w, &value)| f32::from_le_bytes(*w) * value)
+                .sum()
+        })
+        .collect())
 }
 
 /// Decodes one NVFP4 expert and applies its little-endian F32 tensor scale.
@@ -665,6 +706,53 @@ pub fn widen_to_f32_bytes(ty: GgufType, src: &[u8]) -> Result<Vec<u8>, EngError>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_f32_projection_matches_the_decoded_rows_bit_for_bit() {
+        use super::*;
+        let x: Vec<_> = (0..23).map(|i| (3.25 - i as f32) / 13.0).collect();
+        let bytes: Vec<_> = (0..5 * x.len())
+            .flat_map(|i| ((i % 19) as f32 / 7.0 - 1.125).to_le_bytes())
+            .collect();
+        let want: Vec<_> = bytes
+            .chunks_exact(x.len() * 4)
+            .take(3)
+            .map(|row| {
+                let decoded = dequantize(GgufType::F32, row).unwrap();
+                x.iter()
+                    .zip(decoded)
+                    .map(|(&a, b)| a * b)
+                    .sum::<f32>()
+                    .to_bits()
+            })
+            .collect();
+        let got = project_f32_rows(&bytes, &x, 3).unwrap();
+        assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want);
+        assert!(project_f32_rows(&bytes[..bytes.len() - 1], &x, 3).is_err());
+        assert!(project_f32_rows(&bytes, &x, 6).is_err());
+    }
+
+    #[test]
+    fn iq1_s_matches_the_reference_grid_scales_and_signs() {
+        let mut block = std::array::from_fn::<_, 50, _>(|i| (i * 37 + 11) as u8);
+        block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let mut weights = [0.0; 256];
+        super::dequantize_into(super::GgufType::Iq1S, &block, &mut weights).unwrap();
+        assert_eq!(
+            weights[..8],
+            [-2.625, 0.375, 3.375, 3.375, 3.375, 0.375, 3.375, 0.375]
+        );
+        assert_eq!(
+            weights[112..120],
+            [
+                -1.875, -1.875, -16.875, -16.875, -16.875, -16.875, -1.875, -1.875
+            ]
+        );
+        assert_eq!(
+            weights[248..],
+            [-4.375, 5.625, 0.625, 0.625, -4.375, -4.375, 0.625, -4.375]
+        );
+    }
+
     use super::*;
 
     #[test]

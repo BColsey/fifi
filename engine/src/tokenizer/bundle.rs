@@ -408,6 +408,14 @@ impl TokenizerBundle {
         {
             return super::gguf::bundle_from_gguf(&file);
         }
+        Self::load_with_template(dir, pin, ChatTemplate::from_str)
+    }
+
+    pub(crate) fn load_with_template(
+        dir: &Path,
+        pin: Option<&TokenizerPin>,
+        parse: impl FnOnce(&str) -> Result<ChatTemplate, EngError>,
+    ) -> Result<Self, EngError> {
         let mut notes = Vec::new();
         let tokenizer_bytes = require(
             "tokenizer.json",
@@ -467,7 +475,7 @@ impl TokenizerBundle {
                     .to_string(),
             );
         }
-        Self::from_parts(
+        Self::from_parts_with_template(
             TokenizerParts {
                 tokenizer_json: tokenizer_bytes,
                 tokenizer_config_json: config_bytes,
@@ -476,6 +484,7 @@ impl TokenizerBundle {
             },
             pin.map(|pin| pin.vocab_size),
             notes,
+            parse,
         )
     }
 
@@ -487,7 +496,16 @@ impl TokenizerBundle {
     pub fn from_parts(
         parts: TokenizerParts,
         pinned_vocab: Option<u32>,
+        notes: Vec<String>,
+    ) -> Result<Self, EngError> {
+        Self::from_parts_with_template(parts, pinned_vocab, notes, ChatTemplate::from_str)
+    }
+
+    fn from_parts_with_template(
+        parts: TokenizerParts,
+        pinned_vocab: Option<u32>,
         mut notes: Vec<String>,
+        parse: impl FnOnce(&str) -> Result<ChatTemplate, EngError>,
     ) -> Result<Self, EngError> {
         let config = parse_json(&parts.tokenizer_config_json, "tokenizer_config.json")?;
         let generation = match &parts.generation_config_json {
@@ -505,7 +523,9 @@ impl TokenizerBundle {
             ));
         }
         let eos_token_ids = eos_lookup(&config, &generation, &tokenizer)?;
-        let template = parse_template(&parts.chat_template)?;
+        let template_text = std::str::from_utf8(&parts.chat_template)
+            .map_err(|_| EngError::Checkpoint("chat_template.jinja is not UTF-8".to_string()))?;
+        let template = parse(template_text)?;
         for note in &notes {
             eprintln!("{note}");
         }
@@ -1446,12 +1466,6 @@ fn generation_eos_ids(
             Ok(id)
         })
         .collect()
-}
-
-fn parse_template(bytes: &[u8]) -> Result<ChatTemplate, EngError> {
-    let source = std::str::from_utf8(bytes)
-        .map_err(|_| EngError::Checkpoint("chat_template.jinja is not UTF-8".to_string()))?;
-    ChatTemplate::from_str(source)
 }
 
 #[cfg(test)]

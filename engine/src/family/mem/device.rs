@@ -50,6 +50,8 @@ pub(crate) struct DevicePolicy {
     pub(crate) expert_tier_headroom: u64,
     /// Device bytes the Raon-1 load keeps free beside the weights, the scratch and the cache.
     pub(crate) raon_headroom: u64,
+    /// Inkling controller admission keeps this for lazy staging and allocator rounding.
+    pub(crate) inkling_controller_margin: u64,
     /// Free bytes the filesystem of an on-disk cache keeps beyond an entry's bytes: a write that
     /// would leave less is skipped, so a cache never takes the last bytes of a shared disk.
     pub(crate) disk_free_reserve: u64,
@@ -73,6 +75,7 @@ pub(crate) const DEVICE: DevicePolicy = DevicePolicy {
     sparse_headroom: 2 * GIB,
     expert_tier_headroom: 3 * GIB,
     raon_headroom: 768 * MIB,
+    inkling_controller_margin: 32 * MIB,
     disk_free_reserve: 512 * MIB,
     unified_pressure_margin: GIB,
 };
@@ -98,6 +101,7 @@ mod tests {
         assert_eq!(DEVICE.sparse_headroom, 2_147_483_648);
         assert_eq!(DEVICE.expert_tier_headroom, 3_221_225_472);
         assert_eq!(DEVICE.raon_headroom, 805_306_368);
+        assert_eq!(DEVICE.inkling_controller_margin, 33_554_432);
         assert_eq!(DEVICE.disk_free_reserve, 536_870_912);
         assert_eq!(DEVICE.unified_pressure_margin, 1_073_741_824);
     }

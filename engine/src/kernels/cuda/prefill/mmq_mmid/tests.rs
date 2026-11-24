@@ -878,6 +878,56 @@ fn run_from_host(
 }
 
 #[test]
+fn sparse_grouped_dq_writes_only_selected_expert_major_rows() {
+    use super::{GroupedDqRows, SparseDqCall};
+    if !testkit::device_present("sparse_grouped_dq_writes_only_selected_expert_major_rows") {
+        return;
+    }
+    let plan = GroupedDqRows::new(3, 4, 2, [(0, 0..1), (1, 1..3), (2, 3..4)]).unwrap();
+    let meta = le(&[plan.ids(), plan.bounds()].concat());
+    let phase = || -> Result<_, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        let mut packed = vec![0; 3 * 4 * 18];
+        for block in packed[4 * 18..8 * 18].as_chunks_mut::<18>().0.iter_mut() {
+            // FP16 scale 2 with code 0 encodes -2 for every weight.
+            block[1] = 0x40;
+        }
+        let w = ctx.upload(&packed)?;
+        let x = ctx.upload(&le(&vec![1_f32.to_bits() as i32; 4 * 64]))?;
+        let y = ctx.upload(&le(&[SENT; 5 * 4]))?;
+        let ids = ctx.upload(&meta)?;
+        let launch = |metadata_bytes| -> Result<(), EngError> {
+            ctx.gemm_dq_sparse_rows(
+                &stream,
+                SparseDqCall {
+                    weight: MmidWeight {
+                        base: w.range(0, packed.len())?,
+                        quant: QuantType::Q20,
+                        k: 64,
+                        n: 4,
+                        stride_bytes: 4 * 18,
+                    },
+                    plan: &plan,
+                    metadata: ids.range(0, metadata_bytes)?,
+                    x: x.range(0, 4 * 64 * 4)?,
+                    y: y.range(0, 4 * 4 * 4)?,
+                },
+            )
+        };
+        let short = launch(meta.len() - 4);
+        launch(meta.len())?;
+        stream.synchronize()?;
+        Ok((short, ints(&read(&ctx, &y)?)))
+    };
+    let (short, actual) = phase().unwrap();
+    assert!(matches!(short, Err(EngError::BadRequest(_))));
+    let mut expected = [SENT; 5 * 4];
+    expected[4..12].fill((-128_f32).to_bits() as i32);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn mmid_ids_from_host_uploads_what_the_builder_wrote() {
     if !testkit::device_present("mmid_ids_from_host_uploads_what_the_builder_wrote") {
         return;

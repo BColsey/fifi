@@ -353,5 +353,11 @@ pub(in crate::kernels::cuda) fn row_rank_sum_launch(
     checked(status, stage)
 }
 
+mod experts;
+pub(in crate::kernels::cuda) use experts::{
+    ClippedExpertRaw, IndexedRankSumRaw, clipped_expert_bytes, launch_clipped_expert,
+    launch_indexed_rank_sum,
+};
+
 #[cfg(test)]
 mod tests;

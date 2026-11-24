@@ -14,8 +14,8 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
 use crate::kernels::cuda::resident::router::{
-    ROUTER_STATUS_BIT, RouterCall, RouterOut, RouterShape, RouterSigmoidCall, RouterWeights,
-    router_logits_bytes,
+    ROUTER_STATUS_BIT, RouterCall, RouterOut, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
+    RouterWeights, router_logits_bytes,
 };
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CapturePlan, DeviceBuffer};
@@ -660,6 +660,40 @@ fn sigmoid_route(logits: &[f32], top_k: usize) -> (Vec<i32>, Vec<f32>) {
     (ids, picks.iter().map(|&e| p[e] / sum).collect())
 }
 
+/// One split sigmoid select on uploaded f32 logits `[m][n_expert]`: the ids, the weights and the
+/// status word, read back after a synchronize.
+fn select_on_device(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    shape: RouterShape,
+    logits: &[f32],
+    bias: Option<RouterSigmoidBias<'_>>,
+) -> Result<(Vec<i32>, Vec<f32>, i32), EngError> {
+    let (m, top_k) = (shape.m, shape.top_k);
+    let input = testkit::upload_bytes(ctx, &bytes_of(logits));
+    let ids = testkit::upload_bytes(ctx, &vec![POISON; m * top_k * 4]);
+    let weights = testkit::upload_bytes(ctx, &vec![POISON; m * top_k * 4]);
+    let status = testkit::upload_bytes(ctx, &[0u8; 4]);
+    ctx.router_sigmoid_select_rows(
+        stream,
+        RouterSigmoidCall {
+            shape,
+            logits: whole_range(&input)?,
+            ids: whole_range(&ids)?,
+            weights: whole_range(&weights)?,
+            status: whole_range(&status)?,
+            bias,
+        },
+    )?;
+    stream.synchronize()?;
+    let picks = m * top_k * 4;
+    Ok((
+        ints(&testkit::read_bytes(ctx, &ids, picks)),
+        testkit::floats(&testkit::read_bytes(ctx, &weights, picks)),
+        ints(&testkit::read_bytes(ctx, &status, 4))[0],
+    ))
+}
+
 /// The split sigmoid select (`router_sigmoid_select_rows`) above 256 experts, where a lane holds
 /// 16: three rows of distinct logits 1/64 apart at 300 and 512 experts against the f32 rule
 /// (ids equal in rank order, weights within the R1 bound), and a NaN logit at expert 299 or 511
@@ -685,30 +719,7 @@ fn router_sigmoid_select_ranks_and_flags_above_256_experts() -> Result<(), EngEr
             n_expert,
             top_k,
         };
-        let run = |values: &[f32]| -> Result<(Vec<i32>, Vec<f32>, i32), EngError> {
-            let input = testkit::upload_bytes(&ctx, &bytes_of(values));
-            let ids = testkit::upload_bytes(&ctx, &vec![POISON; m * top_k * 4]);
-            let weights = testkit::upload_bytes(&ctx, &vec![POISON; m * top_k * 4]);
-            let status = testkit::upload_bytes(&ctx, &[0u8; 4]);
-            ctx.router_sigmoid_select_rows(
-                &stream,
-                RouterSigmoidCall {
-                    shape,
-                    logits: whole_range(&input)?,
-                    ids: whole_range(&ids)?,
-                    weights: whole_range(&weights)?,
-                    status: whole_range(&status)?,
-                    bias: None,
-                },
-            )?;
-            stream.synchronize()?;
-            Ok((
-                ints(&testkit::read_bytes(&ctx, &ids, m * top_k * 4)),
-                testkit::floats(&testkit::read_bytes(&ctx, &weights, m * top_k * 4)),
-                ints(&testkit::read_bytes(&ctx, &status, 4))[0],
-            ))
-        };
-        let (ids, weights, status) = run(&logits)?;
+        let (ids, weights, status) = select_on_device(&ctx, &stream, shape, &logits, None)?;
         assert_eq!(status, 0, "{n_expert}: status");
         for t in 0..m {
             let (want_ids, want_w) =
@@ -721,7 +732,7 @@ fn router_sigmoid_select_ranks_and_flags_above_256_experts() -> Result<(), EngEr
             }
         }
         logits[n_expert + n_expert - 1] = f32::NAN;
-        let (ids, weights, status) = run(&logits)?;
+        let (ids, weights, status) = select_on_device(&ctx, &stream, shape, &logits, None)?;
         assert_eq!(
             status & ROUTER_STATUS_BIT,
             ROUTER_STATUS_BIT,
@@ -744,6 +755,121 @@ fn router_sigmoid_select_ranks_and_flags_above_256_experts() -> Result<(), EngEr
                 .all(|&i| i >= 0),
             "{n_expert}: a healthy row was faulted"
         );
+    }
+    Ok(())
+}
+
+/// The two bias profiles of the split sigmoid select on one input. Both rank by `p + bias` (the
+/// bias here reverses the score order) and weight the winners by their unbiased scores.
+/// KernelRounded follows the f32 rule `p / sum` and faults a row whose selected scores are all
+/// zero. HostRounded normalizes by `max(sum, floor)` under its scale: a row below the floor gets
+/// `scale * p / floor`, and the all-zero row is no fault.
+#[test]
+fn router_sigmoid_select_ranks_by_bias_under_both_profiles() -> Result<(), EngError> {
+    if !testkit::device_present("router_sigmoid_select_ranks_by_bias_under_both_profiles") {
+        return Ok(());
+    }
+    fn close(label: &str, got: f32, want: f32) {
+        let err = (f64::from(got) - f64::from(want)).abs() / f64::from(want);
+        assert!(err <= R1_WEIGHT, "{label}: weight {got} vs {want}");
+    }
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    // Row 0: scores 1/8 apart. Row 1: every sigmoid underflows to zero. Row 2: below the floor.
+    let (m, n_expert, top_k) = (3, 8, 3);
+    let logits: Vec<f32> = (0..m * n_expert)
+        .map(|i| match i / n_expert {
+            0 => (i % n_expert) as f32 / 8.0 - 0.5,
+            1 => -200.0,
+            _ => -80.0,
+        })
+        .collect();
+    let shape = RouterShape {
+        m,
+        hidden: 4,
+        n_expert,
+        top_k,
+    };
+    // Decreasing with the index, by more than a score step: the ranking is 0, 1, 2, ..
+    let bias: Vec<f32> = (0..n_expert).map(|e| (7 - e) as f32 / 16.0).collect();
+    let bias = testkit::upload_bytes(&ctx, &bytes_of(&bias));
+    let bias = whole_range(&bias)?;
+    let p = |x: f32| 1.0f32 / (1.0f32 + (-x).exp());
+    let scores: Vec<f32> = (0..n_expert).map(|e| p(e as f32 / 8.0 - 0.5)).collect();
+    let sum = scores[0] + scores[1] + scores[2];
+
+    let (ids, weights, status) = select_on_device(
+        &ctx,
+        &stream,
+        shape,
+        &logits,
+        Some(RouterSigmoidBias::KernelRounded(bias)),
+    )?;
+    assert_eq!(
+        ids[..top_k],
+        [0, 1, 2],
+        "kernel-rounded: rank by score + bias"
+    );
+    for e in 0..top_k {
+        close("kernel-rounded", weights[e], scores[e] / sum);
+    }
+    assert_eq!(
+        status & ROUTER_STATUS_BIT,
+        ROUTER_STATUS_BIT,
+        "kernel-rounded: the zero row faults"
+    );
+    assert_eq!(
+        ids[top_k..2 * top_k],
+        vec![-1; top_k],
+        "kernel-rounded: zero row ids"
+    );
+    assert_eq!(
+        weights[top_k..2 * top_k],
+        vec![0.0; top_k],
+        "kernel-rounded: zero row weights"
+    );
+    assert_eq!(
+        ids[2 * top_k..],
+        [0, 1, 2],
+        "kernel-rounded: the small row ranks by bias"
+    );
+    for w in &weights[2 * top_k..] {
+        close("kernel-rounded", *w, 1.0 / 3.0);
+    }
+
+    let (floor, scale) = (1.0f32 / 16384.0, 2.0f32);
+    let (ids, weights, status) = select_on_device(
+        &ctx,
+        &stream,
+        shape,
+        &logits,
+        Some(RouterSigmoidBias::HostRounded {
+            values: bias,
+            floor,
+            scale,
+        }),
+    )?;
+    assert_eq!(status, 0, "host-rounded: no row faults");
+    assert_eq!(
+        ids[..top_k],
+        [0, 1, 2],
+        "host-rounded: rank by score + bias"
+    );
+    for e in 0..top_k {
+        close("host-rounded", weights[e], scale * scores[e] / sum);
+    }
+    assert_eq!(
+        ids[top_k..2 * top_k],
+        [0, 1, 2],
+        "host-rounded: the zero row ranks by bias"
+    );
+    assert_eq!(
+        weights[top_k..2 * top_k],
+        vec![0.0; top_k],
+        "host-rounded: zero row weights"
+    );
+    for w in &weights[2 * top_k..] {
+        close("host-rounded", *w, scale * p(-80.0) / floor);
     }
     Ok(())
 }
