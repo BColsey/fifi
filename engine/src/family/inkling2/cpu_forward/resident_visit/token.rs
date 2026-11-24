@@ -2,6 +2,7 @@
 //! planes. Sealed prelude, previous-pass bank, and each visit's convolution
 //! state never cross PCIe during the chain. One coalesced receipt contains
 //! logits, status words, and the raw rows needed to rebuild host state.
+mod admission;
 mod shadow;
 use super::*;
 use crate::kernels::cuda::{NativeWeight, resident::embed::EmbedNativeCall};
@@ -84,9 +85,19 @@ impl TokenWorkspace {
         cuda: &GgufCuda,
         states: &[VisitState],
     ) -> Result<Option<Self>, EngError> {
+        Self::open_limited(f, cuda, states, usize::MAX)
+    }
+
+    fn open_limited(
+        f: &CpuForward,
+        cuda: &GgufCuda,
+        states: &[VisitState],
+        limit: usize,
+    ) -> Result<Option<Self>, EngError> {
         let h = f.hidden();
         let vocab = f.spec.unpadded_vocab_size as usize;
-        if !cuda.resident_head_supported([vocab, h])
+        if !Self::valid_geometry(f, states)
+            || !cuda.resident_head_supported([vocab, h])
             || f.draft_window_enabled()
             || !f.taps.is_empty()
         {
@@ -103,6 +114,9 @@ impl TokenWorkspace {
             return Ok(None);
         };
         let ctx = cuda.context();
+        if !Self::fits(f, cuda, &geometry, limit.min(ctx.memory_info()?.free))? {
+            return Ok(None);
+        }
         let mut end = 0;
         let logits = reserve(&mut end, vocab);
         let health = reserve(&mut end, 4);
@@ -153,10 +167,18 @@ impl TokenWorkspace {
         let Some(embedding) = weights.resident_embedding(ctx)? else {
             return Ok(None);
         };
+        let stream = ctx.stream()?;
+        if ctx.memory_info()?.free
+            < cuda
+                .token_growth_reserve(&f.spec, f.context)
+                .unwrap_or(usize::MAX)
+        {
+            return Ok(None);
+        }
         Ok(Some(Self {
             lineage: vec![None; slots.len()],
             slots,
-            stream: ctx.stream()?,
+            stream,
             depth,
             prelude,
             prelude_bytes,
@@ -388,6 +410,10 @@ impl TokenWorkspace {
 }
 
 #[cfg(test)]
+mod refusal_tests;
+#[cfg(test)]
 mod shadow_tests;
+#[cfg(test)]
+mod tap_tests;
 #[cfg(test)]
 mod tests;

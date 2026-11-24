@@ -289,6 +289,7 @@ impl GgufCuda {
                 let resident = self
                     .dense
                     .get(&name)
+                    .or_else(|| self.token_controllers.get(&name))
                     .ok_or_else(|| bad("resident local decode lacks a resident controller"))?;
                 if resident.0.shape != shape {
                     return Err(bad("resident local decode controller shape differs"));
@@ -443,7 +444,7 @@ fn resident_controllers<'a>(
     for names in names {
         let missing = || bad("resident local decode lacks a resident controller");
         weights.push(
-            cuda.controller_weights(names, 2 * hidden, [rank, hidden])
+            cuda.resolve_controller_weights(names, 2 * hidden, [rank, hidden], true)
                 .ok_or_else(missing)??,
         );
     }

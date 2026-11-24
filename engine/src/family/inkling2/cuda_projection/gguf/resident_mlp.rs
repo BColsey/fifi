@@ -108,7 +108,7 @@ impl GgufCuda {
             && self.routed(layer).is_ok_and(|routed| {
                 routed.shape.hidden == hidden
                     && self
-                        .controller_weights(names, 2 * hidden, [rank, hidden])
+                        .resolve_controller_weights(names, 2 * hidden, [rank, hidden], true)
                         .is_some_and(|weights| {
                             weights.is_ok_and(|weights| {
                                 self.step.controlled_routed_fits(
@@ -149,10 +149,11 @@ impl GgufCuda {
         require_packed(dtypes)?;
         let routed = self.routed(layer)?;
         let weights = self
-            .controller_weights(
+            .resolve_controller_weights(
                 controller,
                 2 * routed.shape.hidden,
                 [rank, routed.shape.hidden],
+                true,
             )
             .ok_or_else(|| bad("no resident CUDA MLP controller"))??;
         let rows = RoutedRows {

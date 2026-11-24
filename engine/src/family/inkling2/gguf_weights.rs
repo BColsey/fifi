@@ -798,6 +798,21 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn resident_embedding_bytes(
+        &self,
+        h: usize,
+        rows: usize,
+    ) -> Result<Option<usize>, EngError> {
+        let (t, bytes) = self.tensor("model.llm.embed.weight")?;
+        Ok((t.planes == 1
+            && t.kind == GgufType::Iq4Xs
+            && t.columns == h
+            && t.rows == rows
+            && matches!(t.vector_order, VectorOrder::Stored))
+        .then_some(bytes.len()))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_embedding(
         &self,
         ctx: &crate::kernels::cuda::CudaContext,

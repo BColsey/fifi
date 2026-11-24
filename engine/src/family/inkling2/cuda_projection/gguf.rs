@@ -36,6 +36,7 @@ pub(in crate::family::inkling2) mod resident_mlp;
 mod resident_prefill;
 pub(in crate::family::inkling2) mod router;
 pub(in crate::family::inkling2) mod streaming;
+mod token_controllers;
 
 pub(in crate::family::inkling2) use resident_local::{
     ConvRows, LocalDecodeWidths, PrepWeights, ResidentLocalDecode,
@@ -50,6 +51,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     controlled_attention_step: Option<DenseStep>,
     draft_head: Option<DraftHead>,
     dense: Projections,
+    token_controllers: Projections,
     packed_gguf: bool,
     group_projections: bool,
     group_attention: bool,
@@ -767,8 +769,25 @@ impl GgufCuda {
         } else {
             None
         };
+        // Do not change prefill/host placement to qualify decode. The extra
+        // matrices, if admitted, belong exclusively to the token chain.
+        let token_controllers = if full_expert_fit
+            && group_projections
+            && resident_attention.is_some()
+            && std::env::var("FIFI_INKLING_CUDA_RESIDENT_TOKEN").as_deref() == Ok("1")
+        {
+            token_controllers::load(
+                &context,
+                &optional,
+                &dense,
+                controller_residency::expert_workspace(spec, context_limit, device_prefill),
+            )?
+        } else {
+            Projections::new()
+        };
         Ok(Self {
             step,
+            token_controllers,
             controlled_attention_step,
             draft_head: None,
             dense,
@@ -1172,19 +1191,34 @@ impl GgufCuda {
 
     fn controller_weights(
         &self,
-        [down, gain, forget]: [&str; 3],
+        names: [&str; 3],
+        input_width: usize,
+        shape: [usize; 2],
+    ) -> Option<Result<ControllerWeights<'_>, EngError>> {
+        self.resolve_controller_weights(names, input_width, shape, false)
+    }
+
+    fn resolve_controller_weights(
+        &self,
+        names: [&str; 3],
         input_width: usize,
         [rank, hidden]: [usize; 2],
+        token: bool,
     ) -> Option<Result<ControllerWeights<'_>, EngError>> {
         if !self.group_projections {
             return None;
         }
         let shapes = [[rank, input_width], [hidden, rank], [hidden, rank]];
-        let weights = [
-            self.dense.get(down)?,
-            self.dense.get(gain)?,
-            self.dense.get(forget)?,
-        ];
+        let [a, b, c] = names.map(|name| {
+            self.dense.get(name).or_else(|| {
+                if token {
+                    self.token_controllers.get(name)
+                } else {
+                    None
+                }
+            })
+        });
+        let weights = [a?, b?, c?];
         if weights
             .iter()
             .zip(shapes)
