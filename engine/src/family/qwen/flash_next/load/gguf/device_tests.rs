@@ -263,7 +263,7 @@ const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":nul
 #[ignore = "needs a GPU (about 2 GiB)"]
 fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forward() {
     use crate::{
-        family::{executor::GenerationState, qwen::flash_next::factory, sampler::Sampler},
+        family::{executor::GenerationState, sampler::Sampler},
         sched::{
             job::{Job, JobEvent},
             worker::EngineNote,
@@ -332,7 +332,7 @@ fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forw
 #[test]
 #[ignore = "needs a GPU (about 2 GiB)"]
 fn stopping_the_engine_gives_back_its_card_memory() {
-    use crate::{family::qwen::flash_next::factory, sched::worker::EngineNote};
+    use crate::sched::worker::EngineNote;
     const SLACK: usize = 256 << 20;
     let small = write_small(7);
     let dir = small.dir.path();
@@ -460,8 +460,9 @@ fn real_file_first_layers_follow_the_host_with_streamed_experts() {
     for (at, &token) in tokens.iter().enumerate() {
         driver.logits(token).expect("device logits");
         let streams = crate::family::qwen::flash_next::cuda::gguf_device::layer_trace::take();
-        for layer in 0..layers {
-            let got = &streams[layer];
+        // `split_at` panics on a short trace, as indexing each layer did.
+        let (traced, _) = streams.split_at(layers);
+        for (layer, got) in traced.iter().enumerate() {
             let host_stream = &want.layer_out[at][layer];
             let scale = host_stream.iter().fold(0f32, |m, v| m.max(v.abs()));
             let diff = got

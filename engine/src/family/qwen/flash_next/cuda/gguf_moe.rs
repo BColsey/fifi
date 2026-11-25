@@ -109,8 +109,9 @@ fn read_picks(
     ids.buffer()
         .read_at(launch.stream, ids.offset(), &mut raw)?;
     let mut in_order = Vec::with_capacity(raw.len() / 4);
-    for chunk in raw.chunks_exact(4) {
-        let id = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    // The read-back is a whole number of ids: a partial tail word, if any, is not a pick.
+    for chunk in raw.as_chunks::<4>().0 {
+        let id = i32::from_le_bytes(*chunk);
         let id = u32::try_from(id)
             .ok()
             .filter(|&id| (id as usize) < experts)

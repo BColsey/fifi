@@ -356,6 +356,27 @@ fn plan_pass(
     Ok((order, plan, next))
 }
 
+/// The shard's file, opened once through the local-storage guard.
+fn open_shard(
+    paths: &[std::path::PathBuf],
+    shard: usize,
+    files: &mut [Option<Arc<File>>],
+) -> Result<Arc<File>, EngError> {
+    if let Some(Some(open)) = files.get(shard) {
+        return Ok(Arc::clone(open));
+    }
+    let path = paths
+        .get(shard)
+        .ok_or_else(|| refuse(format!("shard {shard} is not open")))?;
+    crate::storage_guard::require_local(path, "expert stacks")?;
+    let file = Arc::new(
+        File::open(path)
+            .map_err(|error| refuse(format!("cannot open {}: {error}", path.display())))?,
+    );
+    files[shard] = Some(Arc::clone(&file));
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,25 +399,4 @@ mod tests {
         assert_eq!(lru.slot_of(2), None, "the live row waits for the copies");
         assert_eq!(lru.state(), before);
     }
-}
-
-/// The shard's file, opened once through the local-storage guard.
-fn open_shard(
-    paths: &[std::path::PathBuf],
-    shard: usize,
-    files: &mut [Option<Arc<File>>],
-) -> Result<Arc<File>, EngError> {
-    if let Some(Some(open)) = files.get(shard) {
-        return Ok(Arc::clone(open));
-    }
-    let path = paths
-        .get(shard)
-        .ok_or_else(|| refuse(format!("shard {shard} is not open")))?;
-    crate::storage_guard::require_local(path, "expert stacks")?;
-    let file = Arc::new(
-        File::open(path)
-            .map_err(|error| refuse(format!("cannot open {}: {error}", path.display())))?,
-    );
-    files[shard] = Some(Arc::clone(&file));
-    Ok(file)
 }
