@@ -143,6 +143,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/dense_gemv.cu",
     "src/kernels/cuda/native/resident/block_ops.cu",
     "src/kernels/cuda/native/resident/ple_block.cu",
+    "src/kernels/cuda/native/resident/matvec_dq.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -237,6 +238,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/mailbox.h",
     "src/kernels/cuda/native/resident/matmul_expert.h",
     "src/kernels/cuda/native/resident/matmul_q5_0.h",
+    "src/kernels/cuda/native/resident/matvec_dq.h",
     "src/kernels/cuda/native/resident/matvec_expert.h",
     "src/kernels/cuda/native/resident/matvec_gguf.h",
     "src/kernels/cuda/native/resident/matvec_q.h",

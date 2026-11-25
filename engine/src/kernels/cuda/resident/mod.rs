@@ -98,6 +98,7 @@ pub(crate) mod kv8_append;
 pub(crate) mod kv_f16_append;
 pub(crate) mod kv_f16_rows;
 pub(crate) mod matmul_expert;
+pub(crate) mod matvec_dq;
 pub(crate) mod matvec_expert;
 #[cfg(test)]
 mod matvec_gguf;

@@ -86,7 +86,7 @@ pub(in crate::kernels::cuda) mod reference {
         lo | hi
     }
 
-    pub(super) fn weight_value(ty: QuantType, block: &[u8], i: usize) -> f64 {
+    pub(in crate::kernels::cuda) fn weight_value(ty: QuantType, block: &[u8], i: usize) -> f64 {
         match ty {
             QuantType::Q80 => half_at(block, 0) as f64 * (block[2 + i] as i8) as f64,
             // Q4_0 reads the CPU oracle (weights/gguf_dequant.rs), written from the

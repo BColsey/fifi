@@ -74,6 +74,7 @@ pub(in crate::kernels::cuda) mod kv_f16_rows;
 pub(in crate::kernels::cuda) mod mailbox;
 pub(in crate::kernels::cuda) mod matmul_expert;
 pub(in crate::kernels::cuda) mod matmul_q5_0;
+pub(in crate::kernels::cuda) mod matvec_dq;
 pub(in crate::kernels::cuda) mod matvec_expert;
 pub(in crate::kernels::cuda) mod matvec_gguf;
 pub(in crate::kernels::cuda) mod matvec_q;
