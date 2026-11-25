@@ -19,8 +19,8 @@ The first two compare an engine with itself under two cache forms. Neither says 
 | Arm | What scores the positions |
 |---|---|
 | `engine-q8` | The engine's `kv_quality_leg` with the int8 (`Int8G32`) KV cache: the cache form of the shipped 3090 profiles, `qwen36-cuda-3090-kv8-prefix.json` among them. |
-| `engine-f16` | The same leg with the fp16 KV cache: the control cache. On the CUDA arm a start keeps the cache this way for `kv_dtype: f32`, the member's default (`start.rs`, `kv_mode_of`), so it is the form of the `qwen36-rtx3090-24gb-fp16kv.json` profile and of a start whose config names no `kv_dtype`. |
-| `llama-ub1` | A driver on `libllama`: f16 KV cache, flash attention, the prefix in 512-token batches, then one-token decodes for the scored positions. |
+| `engine-f16` | The same leg with the fp16 KV cache: the control cache. On the CUDA arm a start keeps the cache this way for `kv_dtype: f32`, the member's default (`settings.rs`, `kv_dtype_of`; `start.rs`, `kv_mode_of`), so it is the form of the `qwen36-rtx3090-24gb-fp16kv.json` profile and of a start whose config names no `kv_dtype`. |
+| `llama-ub1` | A driver on `libllama`: f16 KV cache under flash attention (llama.cpp's `auto` setting, which resolved to on), the prefix in 512-token batches, then one-token decodes for the scored positions. |
 | `llama-ub512` | The same driver with the scored positions inside 512-token batches: llama.cpp against itself under a second path. |
 | `llama-q8` | The same driver as `llama-ub1`, with llama.cpp's q8_0 KV cache: llama.cpp against itself under a second cache form. |
 
@@ -30,14 +30,17 @@ All arms read the same file (`Qwen3.6-35B-A3B-Q4_K_M.gguf`, SHA-256 in the recor
 - llama.cpp: `acecd5603`, the CUDA backend.
 - Card: one RTX 3090.
 
-Each row is narrowed to the sampler vocabulary (248,077 ids) and normalized in f64. For a pair of arms, `KL(a || b)` is summed over the 256 most probable ids of a and `KL(b || a)` over those of b. Both are lower bounds: 1.4% of the probability mass lies outside the 256 rows. Bounds are 95% intervals from a bootstrap over the twelve windows.
+Each row is narrowed to the sampler vocabulary (248,077 ids) and normalized in f64. For a pair of arms, `KL(a || b)` is summed over the 256 most probable ids of a and `KL(b || a)` over those of b. The terms outside those rows, where about 1.4% of the probability mass lies, are left out and are signed, so neither figure is a bound on the KL over the whole vocabulary. For llama.cpp's two cache forms, the pair where both arms keep every logit, the KL over all 248,077 ids is 0.0240 and 0.0236 against the top-row sums 0.0233 and 0.0232: 2% to 3% higher. Bounds are 95% intervals from a bootstrap over the twelve windows.
 
-Each arm was run at least twice on this day: `llama-ub512`, `llama-ub1`, `llama-q8` and `engine-f16`
-directly and then through `scripts/kld_vs_llamacpp/run.sh`, with every sidecar byte for byte the same;
-the int8 arm once against each reference, with every field but the two reference terms the same. The
-last `llama-ub1` and `llama-q8` runs used the driver built from the committed source, and the committed
-`score_all.sh` on that run directory produced the score files this record gathers. Against the first
-scoring of the same arms every number is the same.
+Each arm was run at least twice on this day: `llama-ub512`, `llama-ub1` and `engine-f16`
+directly and then through `scripts/kld_vs_llamacpp/run.sh`, and `llama-q8` twice through `run.sh`, with
+every sidecar byte for byte the same. A first run under the `llama-q8` arm name had kept the f16 cache,
+because the arm passed no cache type at the time: its twelve sidecars were byte for byte those of
+`llama-ub1`, and were discarded. The int8 arm ran once against each reference, with every field but the
+two reference terms the same. The last `llama-ub1` and `llama-q8` runs used the driver built from the
+committed source (a rebuild from it gives the same binary), and the committed `score_all.sh` on that run
+directory produced the score files this record gathers. Against the first scoring of the same arms every
+number is the same.
 
 ## Results
 
@@ -49,7 +52,7 @@ scoring of the same arms every number is the same.
 | engine int8 cache, engine fp16 cache | | 0.0377 | 96.69% | −0.0019 | 66.96% against 67.12% |
 | llama.cpp q8_0 cache, llama.cpp f16 cache | 0.0232 | 0.0233 | 96.70% | −0.0003 | 67.08% against 67.24% |
 
-KL in nats per position, means over the 9,216 positions. A blank cell is the direction the harness does not give for that pair: it needs the second arm's full logit rows, which only `llama-ub1`, `llama-q8` and the engine's leg against a reference provide.
+KL in nats per position, means over the 9,216 positions. A blank cell is a direction the harness does not give for that pair: `KL(x || y)` over the top rows of x needs the full logit rows of y, which are kept for `llama-ub1` and `llama-q8`, or the engine's leg with y as its reference.
 
 Means of the NLL over all positions: engine 1.5105 with the int8 cache and 1.5124 with the fp16 cache, llama.cpp 1.5016 with the f16 cache and 1.5012 with the q8_0 cache.
 
@@ -66,7 +69,7 @@ Means of the NLL over all positions: engine 1.5105 with the int8 cache and 1.512
 
 ## Reading
 
-1. **The engines are as far from each other as each engine is from itself under a numerical change.** Engine against llama.cpp: 0.036 nats and 96.7% agreement. llama.cpp against itself between two batching paths: 0.033 and 96.9%. A KL of this size does not say which of the two distributions is nearer to the model.
+1. **The engines are as far from each other as each engine is from itself under a numerical change.** Engine against llama.cpp: 0.036 nats and 96.65% agreement. llama.cpp against itself between two batching paths: 0.033 and 96.9%. A KL of this size does not say which of the two distributions is nearer to the model.
 2. **The true token's NLL is the one measure with a reference outside the two arms.** It is 0.009 nats higher for the engine with the int8 cache and 0.011 higher with the fp16 cache than for llama.cpp: 0.9% and 1.1% in perplexity. Without the 69 and 78 outlier positions the difference is 0.0015 and 0.0009. The bootstrap intervals are +0.0024 to +0.0162 and +0.0009 to +0.0240.
 3. **The int8 cache costs about what llama.cpp's q8_0 cache costs, in this harness.** Against its own fp16 cache the engine's int8 cache gives 0.038, llama.cpp's q8_0 cache 0.023 against its f16 cache. The medians (0.0008 and 0.0009) and the agreement rates (96.69% and 96.70%) are the same; the mean is 1.6 times larger because 0.50% of the positions lie above one nat against 0.41%. Neither cache form moves the NLL: −0.0019 for the engine, −0.0003 for llama.cpp, both intervals across zero.
 4. **Figures of this kind compare only inside one harness.** An independent measurement of llama.cpp's q8_0 cache on this model (top-40 log-probabilities, BF16 weights, about 250,000 tokens in six categories) gives 0.039, and 0.024 for the dense Qwen3.6 27B ([localbench, 2026-04-24](https://localbench.substack.com/p/kv-cache-quantization-benchmark)). The 0.023 here is of that size; a figure of one order lower would need a corpus without its outlier positions.
