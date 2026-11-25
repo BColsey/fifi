@@ -21,7 +21,7 @@ use super::super::load::gguf::{
 };
 use crate::{
     EngError,
-    family::expert_bank::{layer_stream::Home, policy::LayerLru},
+    family::expert_bank::{PassPlan, layer_stream::Home, policy::LayerLru},
     kernels::cuda::{
         CudaContext, DeviceEvent, DeviceStream, NativeWeight, PinnedBuf,
         resident::matvec_q::QuantType,
@@ -84,6 +84,8 @@ pub(in crate::family::qwen::flash_next) struct ExpertCache {
     experts: usize,
     slots: usize,
     totals: StreamTotals,
+    /// Why a pass failed after it queued a copy: the slots hold bytes the row does not describe.
+    poisoned: Option<String>,
 }
 
 impl ExpertCache {
@@ -121,6 +123,12 @@ impl ExpertCache {
                 })?;
                 let bytes = usize::try_from(stack.bytes)
                     .map_err(|_| refuse(format!("{} overflows usize", stack.name)))?;
+                if bytes % experts != 0 || stack.rows % experts != 0 {
+                    return Err(refuse(format!(
+                        "{} holds {bytes} bytes in {} rows, not whole records of {experts} experts",
+                        stack.name, stack.rows
+                    )));
+                }
                 let each = bytes / experts;
                 record[part] = each;
                 let source = match plan.homes[layer] {
@@ -182,6 +190,7 @@ impl ExpertCache {
             experts,
             slots,
             totals: StreamTotals::default(),
+            poisoned: None,
         })
     }
 
@@ -210,26 +219,16 @@ impl ExpertCache {
         picks: &[u32],
     ) -> Result<Vec<i32>, EngError> {
         let started = Instant::now();
-        let experts = self.experts;
+        if let Some(why) = &self.poisoned {
+            return Err(refuse(format!(
+                "layer {layer}: a pass failed earlier ({why}); the cache is poisoned"
+            )));
+        }
         let cache = self
             .layers
             .get_mut(layer)
             .ok_or_else(|| refuse(format!("layer {layer} does not exist")))?;
-        let mut demanded = vec![false; experts];
-        let mut order: Vec<u16> = Vec::with_capacity(picks.len());
-        for &pick in picks {
-            let expert = u16::try_from(pick)
-                .ok()
-                .filter(|&expert| usize::from(expert) < experts)
-                .ok_or_else(|| refuse(format!("expert {pick} of {experts}")))?;
-            if !std::mem::replace(&mut demanded[usize::from(expert)], true) {
-                order.push(expert);
-            }
-        }
-        let plan = cache
-            .lru
-            .apply(&order, &demanded)
-            .map_err(refuse)?;
+        let (order, plan, next) = plan_pass(&cache.lru, self.experts, picks)?;
         let record_bytes: usize = cache.record.iter().sum();
         // Every record of a file-backed layer is read into the bounce buffer before the first
         // copy queues: the buffer cannot be written while a copy of it is outstanding.
@@ -255,39 +254,49 @@ impl ExpertCache {
                 jobs.push((part, slot, incoming, staged));
             }
         }
-        for (part, slot, incoming, staged) in jobs {
-            let each = cache.record[part];
-            let dst = cache.stacks[part].buffer().range(slot * each, each)?;
-            match (&cache.sources[part], staged) {
-                (Source::Pinned { buf }, _) => {
-                    self.ctx.copy_from_pinned(
-                        &self.copy,
-                        &mut self.store[*buf],
-                        incoming * each,
-                        dst,
-                    )?;
-                }
-                (Source::File { .. }, Some(at)) => {
-                    self.ctx
-                        .copy_from_pinned(&self.copy, &mut self.bounce, at, dst)?;
-                }
-                (Source::File { .. }, None) => {
-                    return Err(refuse("a file record was not staged"));
+        // From the first copy on, a failure leaves copies in flight on `copy` and slots whose bytes
+        // the live row does not describe: the row is not committed and the cache is poisoned.
+        let copied = (|| -> Result<(), EngError> {
+            for (part, slot, incoming, staged) in jobs {
+                let each = cache.record[part];
+                let dst = cache.stacks[part].buffer().range(slot * each, each)?;
+                match (&cache.sources[part], staged) {
+                    (Source::Pinned { buf }, _) => {
+                        self.ctx.copy_from_pinned(
+                            &self.copy,
+                            &mut self.store[*buf],
+                            incoming * each,
+                            dst,
+                        )?;
+                    }
+                    (Source::File { .. }, Some(at)) => {
+                        self.ctx
+                            .copy_from_pinned(&self.copy, &mut self.bounce, at, dst)?;
+                    }
+                    (Source::File { .. }, None) => {
+                        return Err(refuse("a file record was not staged"));
+                    }
                 }
             }
+            if !plan.moves.is_empty() {
+                self.copy.record(&self.copied)?;
+                self.copied.synchronize()?;
+                if from_file {
+                    self.bounce.wait(&self.copied)?;
+                }
+                for buffer in &mut self.store {
+                    if buffer.pending_stream().is_some() {
+                        buffer.wait(&self.copied)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            self.poisoned = Some(format!("{error:?}"));
+            return Err(error);
         }
-        if !plan.moves.is_empty() {
-            self.copy.record(&self.copied)?;
-            self.copied.synchronize()?;
-            if from_file {
-                self.bounce.wait(&self.copied)?;
-            }
-            for buffer in &mut self.store {
-                if buffer.pending_stream().is_some() {
-                    buffer.wait(&self.copied)?;
-                }
-            }
-        }
+        cache.lru = next;
         self.totals.visits += 1;
         self.totals.hits += plan.hits as u64;
         self.totals.misses += plan.moves.len() as u64;
@@ -309,6 +318,59 @@ impl ExpertCache {
     /// What the cache has done so far.
     pub(in crate::family::qwen::flash_next) fn totals(&self) -> StreamTotals {
         self.totals
+    }
+}
+
+impl Drop for ExpertCache {
+    fn drop(&mut self) {
+        // A failed pass can leave copies in flight on `copy`: they end here, before the slot
+        // stacks and the pinned buffers free under them.
+        let _ = self.copy.synchronize();
+    }
+}
+
+/// The pass of `picks` over the row of a layer with `experts` experts, planned on a copy of the
+/// row: a refused pass leaves the live row as it was, and the caller commits `next` only once
+/// the copies of the misses have landed.
+fn plan_pass(
+    lru: &LayerLru,
+    experts: usize,
+    picks: &[u32],
+) -> Result<(Vec<u16>, PassPlan, LayerLru), EngError> {
+    let mut demanded = vec![false; experts];
+    let mut order: Vec<u16> = Vec::with_capacity(picks.len());
+    for &pick in picks {
+        let expert = u16::try_from(pick)
+            .ok()
+            .filter(|&expert| usize::from(expert) < experts)
+            .ok_or_else(|| refuse(format!("expert {pick} of {experts}")))?;
+        if !std::mem::replace(&mut demanded[usize::from(expert)], true) {
+            order.push(expert);
+        }
+    }
+    let mut next = lru.clone();
+    let plan = next.apply(&order, &demanded).map_err(refuse)?;
+    Ok((order, plan, next))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused pass leaves the live row as it was; a planned pass moves the picks on the copy
+    /// only, so a copy that fails before the commit cannot publish a hit the slots do not hold.
+    #[test]
+    fn a_pass_is_planned_on_a_copy_of_the_row() {
+        let lru = LayerLru::from_identity(4, 2);
+        let before = lru.state();
+        let refused = plan_pass(&lru, 4, &[0, 1, 2]);
+        assert!(refused.is_err(), "two slots cannot take three demanded picks");
+        assert_eq!(lru.state(), before);
+        let (_, plan, next) = plan_pass(&lru, 4, &[2, 0]).expect("two picks fit");
+        assert_eq!((plan.hits, plan.moves.len()), (1, 1));
+        assert!(next.slot_of(2).is_some());
+        assert_eq!(lru.slot_of(2), None, "the live row waits for the copies");
+        assert_eq!(lru.state(), before);
     }
 }
 
