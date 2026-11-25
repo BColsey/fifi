@@ -12,11 +12,11 @@ use super::{
 };
 use crate::{
     EngError,
-    family::recipe::{Global, Role as Wanted},
     family::qwen::flash_next::cuda::{
         pack_feeds::{EmbeddingRows, PackFeeds},
         ple_feed::{HostMatrix, HostProjection, PleFeed, PleVectors},
     },
+    family::recipe::{Global, Role as Wanted},
     weights::{GgufWeights, dequantize},
 };
 
@@ -115,8 +115,14 @@ pub(in crate::family::qwen::flash_next) fn gguf_feeds(
     );
     let vectors = PleVectors::from_parts(
         read_floats(&model.weights, get(Slot::Layer(Wanted::PleNormKey), layer)?)?,
-        read_floats(&model.weights, get(Slot::Layer(Wanted::PleNormQuery), layer)?)?,
-        read_floats(&model.weights, get(Slot::Layer(Wanted::PleNormConv), layer)?)?,
+        read_floats(
+            &model.weights,
+            get(Slot::Layer(Wanted::PleNormQuery), layer)?,
+        )?,
+        read_floats(
+            &model.weights,
+            get(Slot::Layer(Wanted::PleNormConv), layer)?,
+        )?,
         read_floats(&model.weights, get(Slot::Layer(Wanted::PleConv), layer)?)?,
     );
     let ple = PleFeed::new(shape, model.ngram()?, vectors, Box::new(projection));

@@ -19,14 +19,16 @@ use crate::{
     EngError,
     family::{
         engine_owner::{EngineOwner, Handle},
+        exl3_tensors::f32_le_bytes,
         expert_bank::layer_stream::Home,
         mem::fill::{self, FreeMarks, LayerTier, TierReceipt},
-        exl3_tensors::f32_le_bytes,
+        project::cuda::{CudaProjector, CudaWeights},
         qwen::flash_next::load::gguf::{
-            GgufModel, feeds::gguf_feeds, placement::{ExpertSetup, LayerStacks, layer_stacks},
+            GgufModel,
+            feeds::gguf_feeds,
+            placement::{ExpertSetup, LayerStacks, layer_stacks},
             trunk::gguf_trunk,
         },
-        project::cuda::{CudaProjector, CudaWeights},
     },
     kernels::cuda::{
         CudaContext, DeviceStream, prefill::gdn_scan_seq::GdnForm,

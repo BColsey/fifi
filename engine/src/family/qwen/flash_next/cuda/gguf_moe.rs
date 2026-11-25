@@ -21,12 +21,13 @@ use crate::{
             moe::Exl3MoeBufs,
         },
         exl3_pack::layer_name,
-        qwen::flash_next::load::gguf::trunk::expert_key,
         project::cuda::{CudaWeight, CudaWeights},
+        qwen::flash_next::load::gguf::trunk::expert_key,
         qwen::qwen36::cuda::{
             mixer_weights::DenseWeight,
             moe::{
-                ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, StackWeights, run_moe_block, run_moe_ops,
+                ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, StackWeights, run_moe_block,
+                run_moe_ops,
             },
         },
     },
@@ -99,9 +100,14 @@ struct Picks {
 }
 
 /// The picks the router wrote, read back from the device.
-fn read_picks(launch: &Launch<'_>, ids: &DeviceRange<'_>, experts: usize) -> Result<Picks, EngError> {
+fn read_picks(
+    launch: &Launch<'_>,
+    ids: &DeviceRange<'_>,
+    experts: usize,
+) -> Result<Picks, EngError> {
     let mut raw = vec![0u8; ids.bytes()];
-    ids.buffer().read_at(launch.stream, ids.offset(), &mut raw)?;
+    ids.buffer()
+        .read_at(launch.stream, ids.offset(), &mut raw)?;
     let mut in_order = Vec::with_capacity(raw.len() / 4);
     for chunk in raw.chunks_exact(4) {
         let id = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -206,7 +212,10 @@ impl MoeBlock for GgufMoe<'_> {
         // the missed experts are copied into their slots, the router's expert ids are replaced by
         // the slot ids, and the launches that read the experts run on the slot stacks.
         let router_only = {
-            let cache = self.cache.as_ref().ok_or_else(|| refuse("no expert cache".into()))?;
+            let cache = self
+                .cache
+                .as_ref()
+                .ok_or_else(|| refuse("no expert cache".into()))?;
             let stacks = [
                 cache.stack(layer, 0)?,
                 cache.stack(layer, 1)?,
@@ -235,7 +244,10 @@ impl MoeBlock for GgufMoe<'_> {
         }
         let ids = &bufs.route.ids;
         ids.buffer().write_at(launch.stream, ids.offset(), &raw)?;
-        let cache = self.cache.as_ref().ok_or_else(|| refuse("no expert cache".into()))?;
+        let cache = self
+            .cache
+            .as_ref()
+            .ok_or_else(|| refuse("no expert cache".into()))?;
         let stacks = [
             cache.stack(layer, 0)?,
             cache.stack(layer, 1)?,

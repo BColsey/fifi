@@ -10,10 +10,7 @@ use super::{
 };
 use crate::{
     EngError,
-    family::{
-        expert_bank::layer_stream::Home,
-        recipe::Role as Wanted,
-    },
+    family::{expert_bank::layer_stream::Home, recipe::Role as Wanted},
     weights::GgufType,
 };
 
@@ -117,7 +114,11 @@ pub(in crate::family::qwen::flash_next) struct CachePlan {
 impl CachePlan {
     /// Layers pinned in host memory and layers read from disk.
     pub(in crate::family::qwen::flash_next) fn counts(&self) -> (usize, usize) {
-        let pinned = self.homes.iter().filter(|&&home| home == Home::Pinned).count();
+        let pinned = self
+            .homes
+            .iter()
+            .filter(|&&home| home == Home::Pinned)
+            .count();
         (pinned, self.homes.len() - pinned)
     }
 }
@@ -141,7 +142,13 @@ pub(in crate::family::qwen::flash_next) fn cache_plan(
     slots: usize,
     host_bytes: u64,
 ) -> CachePlan {
-    let bytes = |layer: usize| stacks[layer].stacks.iter().map(|stack| stack.bytes).sum::<u64>();
+    let bytes = |layer: usize| {
+        stacks[layer]
+            .stacks
+            .iter()
+            .map(|stack| stack.bytes)
+            .sum::<u64>()
+    };
     let mut order: Vec<usize> = (0..stacks.len()).collect();
     order.sort_by_key(|&layer| (std::cmp::Reverse(bytes(layer)), layer));
     let mut homes = vec![Home::Disk; stacks.len()];
@@ -185,10 +192,7 @@ mod tests {
             let facts = &stacks[layer].stacks;
             [facts[0].ty, facts[1].ty, facts[2].ty]
         };
-        assert_eq!(
-            types(0),
-            [GgufType::Iq2S, GgufType::Iq2S, GgufType::Iq4Nl]
-        );
+        assert_eq!(types(0), [GgufType::Iq2S, GgufType::Iq2S, GgufType::Iq4Nl]);
         assert_eq!(types(8), [GgufType::Iq2S, GgufType::Iq2S, GgufType::Q20]);
         assert_eq!(
             types(47),

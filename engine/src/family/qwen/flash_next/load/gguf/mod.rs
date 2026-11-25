@@ -22,16 +22,16 @@
     )
 )]
 
-pub(super) mod config;
 pub(in crate::family::qwen::flash_next) mod admission;
-pub(in crate::family::qwen::flash_next) mod feeds;
+pub(super) mod config;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests;
+pub(in crate::family::qwen::flash_next) mod feeds;
 #[cfg(test)]
 mod host;
 pub(super) mod ngram;
-pub(super) mod plan;
 pub(in crate::family::qwen::flash_next) mod placement;
+pub(super) mod plan;
 #[cfg(test)]
 pub(in crate::family::qwen::flash_next) mod smallmodel;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -39,9 +39,9 @@ pub(in super::super) mod start;
 pub(in crate::family::qwen::flash_next) mod tensors;
 #[cfg(test)]
 mod testkit;
-mod weight_map;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::qwen::flash_next) mod trunk;
+mod weight_map;
 
 use std::path::Path;
 
@@ -142,7 +142,9 @@ impl GgufModel {
 
     /// The placement of every routed expert in the files: shard, offset, size and type per
     /// layer, built by the shared GGUF expert index.
-    pub(in crate::family::qwen::flash_next) fn expert_index(&self) -> Result<GgufExpertIndex, EngError> {
+    pub(in crate::family::qwen::flash_next) fn expert_index(
+        &self,
+    ) -> Result<GgufExpertIndex, EngError> {
         let dims = &self.config.dims;
         GgufExpertIndex::new(
             self.weights.header(),
@@ -158,7 +160,9 @@ impl GgufModel {
 
     /// The routed experts as an [`ExpertRecordStore`](crate::weights::expert_store): one
     /// positioned read per slice, records of each layer's own size.
-    pub(in crate::family::qwen::flash_next) fn record_store(&self) -> Result<GgufRecordStore, EngError> {
+    pub(in crate::family::qwen::flash_next) fn record_store(
+        &self,
+    ) -> Result<GgufRecordStore, EngError> {
         GgufRecordStore::new(std::sync::Arc::clone(&self.weights), self.expert_index()?)
     }
 

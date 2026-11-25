@@ -1008,7 +1008,10 @@ fn real_file_feed_equals_the_host_ple_step() {
         }
     }
     eprintln!("max abs difference between the feed and the host step: {worst}");
-    assert!(worst < 1e-4, "the worst abs difference {worst} is not below 1e-4");
+    assert!(
+        worst < 1e-4,
+        "the worst abs difference {worst} is not below 1e-4"
+    );
 }
 
 #[test]

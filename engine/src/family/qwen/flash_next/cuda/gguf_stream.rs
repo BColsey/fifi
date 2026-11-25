@@ -29,10 +29,7 @@ use crate::{
 };
 
 fn refuse(detail: impl AsRef<str>) -> EngError {
-    EngError::MemoryPlan(format!(
-        "Flash-Next GGUF expert cache: {}",
-        detail.as_ref()
-    ))
+    EngError::MemoryPlan(format!("Flash-Next GGUF expert cache: {}", detail.as_ref()))
 }
 
 /// Host bytes one pinned fill reads at a time.
@@ -119,7 +116,11 @@ impl ExpertCache {
             let mut bufs: Vec<NativeWeight> = Vec::with_capacity(3);
             for (part, (stack, slice)) in facts.stacks.iter().zip([gate, up, down]).enumerate() {
                 let quant = QuantType::from_gguf(stack.ty).ok_or_else(|| {
-                    refuse(format!("{} is {}, with no kernel", stack.name, stack.ty.name()))
+                    refuse(format!(
+                        "{} is {}, with no kernel",
+                        stack.name,
+                        stack.ty.name()
+                    ))
                 })?;
                 let bytes = usize::try_from(stack.bytes)
                     .map_err(|_| refuse(format!("{} overflows usize", stack.name)))?;
@@ -244,7 +245,9 @@ impl ExpertCache {
                     Source::File { file, offset } => {
                         let mut host = vec![0u8; each];
                         file.read_exact_at(&mut host, *offset + (incoming * each) as u64)
-                            .map_err(|error| refuse(format!("read of expert {incoming}: {error}")))?;
+                            .map_err(|error| {
+                                refuse(format!("read of expert {incoming}: {error}"))
+                            })?;
                         self.bounce.write(bounce_at, &host)?;
                         from_file = true;
                         bounce_at += each;
@@ -364,7 +367,10 @@ mod tests {
         let lru = LayerLru::from_identity(4, 2);
         let before = lru.state();
         let refused = plan_pass(&lru, 4, &[0, 1, 2]);
-        assert!(refused.is_err(), "two slots cannot take three demanded picks");
+        assert!(
+            refused.is_err(),
+            "two slots cannot take three demanded picks"
+        );
         assert_eq!(lru.state(), before);
         let (_, plan, next) = plan_pass(&lru, 4, &[2, 0]).expect("two picks fit");
         assert_eq!((plan.hits, plan.moves.len()), (1, 1));

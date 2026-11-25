@@ -13,12 +13,12 @@ use super::{
     smallmodel::{Small, write_small, write_small_with},
 };
 use crate::family::{
+    project::cuda::CudaProjector,
     qwen::flash_next::cuda::{
         driver::TokenDriver,
         gguf_device::{GgufDevice, gguf_driver},
         pack_feeds::PackFeeds,
     },
-    project::cuda::CudaProjector,
     session::TokenStepper,
 };
 
@@ -54,7 +54,15 @@ fn driver_of(small: &Small, positions: usize) -> TokenDriver<GgufDevice, PackFee
         .expect("open")
         .expect("a qwen4exp model");
     let projector = CudaProjector::new().expect("the card");
-    gguf_driver(model, projector, 8 << 20, positions, 2, ExpertSetup::Resident).expect("the driver")
+    gguf_driver(
+        model,
+        projector,
+        8 << 20,
+        positions,
+        2,
+        ExpertSetup::Resident,
+    )
+    .expect("the driver")
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -444,7 +452,7 @@ fn real_file_first_layers_follow_the_host_with_streamed_experts() {
         2,
         ExpertSetup::Cached(placement),
     )
-        .expect("the driver");
+    .expect("the driver");
     let layers = 2;
     let reference = host::HostModel::load(model, layers).expect("host layers");
     let want = host::run(model, &reference, &tokens, 2).expect("host forward");
