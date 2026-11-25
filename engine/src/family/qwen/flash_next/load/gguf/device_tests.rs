@@ -401,12 +401,10 @@ fn which_layer_first_differs_when_the_indexer_drops_positions() {
 #[test]
 #[ignore = "needs a GPU and the real file"]
 fn real_file_first_layers_follow_the_host_with_streamed_experts() {
-    let Ok(path) = std::env::var("FIFI_FLASH_GGUF") else {
-        eprintln!("skipped: FIFI_FLASH_GGUF is unset");
-        return;
-    };
+    // A deliberate `#[ignore]`d run: an unresolved location fails instead of passing vacuously.
+    let path = crate::test_paths::required("FIFI_FLASH_GGUF");
     let open = || {
-        GgufModel::open(std::path::Path::new(&path))
+        GgufModel::open(&path)
             .expect("open the real model")
             .expect("a qwen4exp model at FIFI_FLASH_GGUF")
     };

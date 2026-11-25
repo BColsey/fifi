@@ -466,12 +466,13 @@ fn the_tensor_map_type_is_send() {
 }
 
 /// Real-file checks: set FIFI_FLASH_GGUF to the model directory (or its first shard) and run
-/// with `--nocapture`. Skipped when unset. Set FIFI_FLASH_EXL3 to the EXL3 pack directory to
-/// also compare the configuration and the n-gram hash constants with the pack's.
+/// with `--nocapture`. Skipped with the inventory's SKIPPING notice when the location is
+/// unresolved, and refused under FIFI_TEST_REQUIRE_DATA=1. Set FIFI_FLASH_EXL3 to the EXL3 pack
+/// directory to also compare the configuration and the n-gram hash constants with the pack's.
 fn real_model() -> Option<GgufModel> {
-    let path = std::env::var("FIFI_FLASH_GGUF").ok()?;
+    let path = crate::test_paths::or_skip("FIFI_FLASH_GGUF")?;
     Some(
-        GgufModel::open(std::path::Path::new(&path))
+        GgufModel::open(&path)
             .expect("open the real model")
             .expect("a qwen4exp model at FIFI_FLASH_GGUF"),
     )
