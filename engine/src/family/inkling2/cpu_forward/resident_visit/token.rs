@@ -515,3 +515,5 @@ mod shadow_tests;
 mod tap_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;
