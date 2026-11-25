@@ -1005,6 +1005,17 @@ mod tests {
                 free_bytes: None,
             }
         }
+
+        /// A staged save finishes, or is discarded, over the part it was staged on.
+        fn assert_save_on_its_part(&self) {
+            if self.staged {
+                let staged_on = *self.saved.last().expect("a staged save records its part");
+                assert_eq!(
+                    self.running.cells, staged_on,
+                    "the staged save finished on a different part"
+                );
+            }
+        }
     }
 
     impl TokenStepper for Fake {
@@ -1130,6 +1141,7 @@ mod tests {
         }
 
         fn finish_save(&mut self) -> Result<()> {
+            self.assert_save_on_its_part();
             self.saves += 1;
             self.staged = false;
             if self.fail_save_on == Some(self.saves) {
@@ -1142,6 +1154,7 @@ mod tests {
         }
 
         fn discard_save(&mut self) {
+            self.assert_save_on_its_part();
             if self.staged {
                 self.discards += 1;
                 self.staged = false;
@@ -1284,6 +1297,32 @@ mod tests {
             (1, false),
             "the orphan's staged save was discarded, not left for a later finish"
         );
+    }
+
+    /// Resizing a peer while the session that staged a save is resident finishes that save on
+    /// the owner's part first: the step changes places only after it.
+    #[test]
+    fn resizing_a_peer_finishes_the_live_owners_staged_save() {
+        let (mut sessions, mut first) = engine(2);
+        sessions
+            .reset_for_request(&mut first, 100, None, false)
+            .expect("sized");
+        sessions.prefill(&mut first, &[1, 2, 3]).expect("prefill");
+        assert!(
+            sessions
+                .save_prefix(&first, &[1, 2, 3], crate::family::session::SaveKind::Tip)
+                .expect("staged")
+        );
+        assert!(sessions.step.staged);
+        let mut peer = sessions.new_session().expect("admit a peer");
+        let saves = sessions.step.saves;
+        sessions.resize(&mut peer, 4_000).expect("resize the peer");
+        assert!(
+            !sessions.step.staged,
+            "the owner's save finished before the step changed places"
+        );
+        assert_eq!(sessions.step.saves, saves + 1);
+        assert_eq!(sessions.step.discards, 0);
     }
 
     #[test]
