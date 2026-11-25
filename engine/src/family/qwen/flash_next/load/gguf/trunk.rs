@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use super::{
     GgufModel,
-    tensors::{Convention, Mapped, Slot},
+    tensors::{Convention, Form, Mapped, Slot},
 };
 use crate::{
     EngError,
@@ -313,10 +313,27 @@ fn required(model: &GgufModel, resident_experts: &dyn Fn(usize) -> bool) -> Vec<
     out
 }
 
+/// Whether `how` carries `entry` to the form its kernel reads: a role stored as the device
+/// reads it goes up as stored, and a `1 + w` gamma goes up less one for a kernel that reads
+/// `w` and as stored for the one that adds the 1 itself ([`Form::NormPlusOne`]).
+fn convention_applied(entry: &Mapped, how: Upload) -> bool {
+    match (entry.convention, how) {
+        (Convention::AsStored, Upload::Native | Upload::Raw) => true,
+        (Convention::AsStored, Upload::Half { minus_one } | Upload::Float { minus_one }) => {
+            !minus_one
+        }
+        (Convention::GammaOnePlusW, Upload::Native | Upload::Raw) => false,
+        (Convention::GammaOnePlusW, Upload::Half { minus_one } | Upload::Float { minus_one }) => {
+            minus_one == (entry.form != Form::NormPlusOne)
+        }
+    }
+}
+
 /// Refuses a plan the step could not run on, before any upload: every name the step reads
-/// outside the layers and in layers `0..layers` must be planned, and the first missing one is
-/// named. The map already refuses a file without a tensor; this catches a role the plan does
-/// not cover.
+/// outside the layers and in layers `0..layers` must be planned (the first missing one is
+/// named), and every planned tensor must reach the form its kernel reads. The map already
+/// refuses a file without a tensor; these catch a role the plan does not cover, or covers
+/// without the value convention of its file.
 fn check_plan(
     model: &GgufModel,
     planned: &[Planned],
@@ -330,6 +347,19 @@ fn check_plan(
         return Err(refuse(format!(
             "the step reads {missing}, and the plan has no tensor under that name"
         )));
+    }
+    for Planned { entry, name, how } in planned {
+        if !convention_applied(entry, *how) {
+            let reads = if entry.form == Form::NormPlusOne {
+                "`1 + w` and takes the gamma as stored"
+            } else {
+                "`w` and takes the gamma less one"
+            };
+            return Err(refuse(format!(
+                "{name} ({}) is stored as `1 + w`; its kernel reads {reads}",
+                entry.name
+            )));
+        }
     }
     Ok(())
 }
@@ -494,6 +524,49 @@ mod tests {
             .cloned()
             .collect();
         check_plan(&model, &lacking, &resident).expect("layer 1 streams its experts");
+    }
+
+    /// A role the file stores as `1 + w` whose kernel reads `w` goes up less one; a plan that
+    /// would carry it up as stored is refused before the upload, naming it, and so is a `1 + w`
+    /// gamma returned to `w` for the attention prep, which reads it as stored. The roles with
+    /// the convention today pass the same check.
+    #[test]
+    fn a_gamma_stored_as_one_plus_w_is_refused_when_its_upload_skips_the_convention() {
+        let model = small_model();
+        let resident = |_: usize| true;
+        let mut planned = plan(&model, &resident);
+        check_plan(&model, &planned, &resident).expect("every convention is applied");
+        // The beta of layer 0 as if its file stored `1 + w`: its kernel reads `w`.
+        let beta = planned
+            .iter()
+            .position(|tensor| {
+                tensor.entry.role == Slot::Layer(Wanted::DeltaBeta) && tensor.entry.layer == Some(0)
+            })
+            .expect("the beta of layer 0");
+        planned[beta].entry.convention = Convention::GammaOnePlusW;
+        let error = format!(
+            "{:?}",
+            check_plan(&model, &planned, &resident).expect_err("a convention not applied")
+        );
+        assert!(
+            error.contains("blk.0.ssm_beta.weight")
+                && error.contains("linear_attn.in_proj_b.weight"),
+            "{error}"
+        );
+        // The query norm of layer 3 returned to `w`: its prep reads `1 + w`.
+        planned[beta].entry.convention = Convention::AsStored;
+        let q_norm = planned
+            .iter()
+            .position(|tensor| {
+                tensor.entry.role == Slot::Layer(Wanted::QNorm) && tensor.entry.layer == Some(3)
+            })
+            .expect("the query norm of layer 3");
+        planned[q_norm].how = Upload::Float { minus_one: true };
+        let error = format!(
+            "{:?}",
+            check_plan(&model, &planned, &resident).expect_err("a convention not applied")
+        );
+        assert!(error.contains("self_attn.q_norm.weight"), "{error}");
     }
 
     #[test]
