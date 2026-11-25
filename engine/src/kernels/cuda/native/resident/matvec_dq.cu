@@ -11,8 +11,15 @@
  * once per four weight rows, with no shared memory.
  *
  * The block layouts are the CPU oracle's (weights/gguf_dequant.rs). Every code goes to f32
- * through its mantissa (code_f), which runs on the FMA pipe where __int2float_rn costs a
- * convert.
+ * through its mantissa (code_f, code_at), which runs on the FMA pipe where __int2float_rn
+ * costs a convert.
+ *
+ * The weight bytes are read as 16-byte lines (load_line) or as one 16-bit unit (load_half),
+ * through typed pointers: a load through a byte pointer comes out as byte loads, one warp
+ * instruction for a few useful bytes. A Q4_K block is 16-byte aligned, so its 32 code bytes are
+ * two lines. A Q6_K block is 210 bytes at an even address and a lane's 32-byte window is
+ * 16-byte aligned only where the block is, so load_window reads the three lines that cover the
+ * window and moves it onto word boundaries with one byte perm a word.
  *
  * Every exported function has C linkage, takes and returns C types only, and wraps its body
  * in try/catch, like matvec_q.cu.
@@ -22,8 +29,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-#include <string.h>
 
 #include "abi.h"
 #include "device.h"
@@ -36,16 +41,25 @@ const int kRowsPerWarp = 4;  /* weight rows one warp serves */
 const int kLanesPerRow = 8;  /* lanes per weight row: 32 values of a K block each */
 const int kWarps = 4;        /* warps per CTA: 128 threads, 16 rows */
 
-__device__ __forceinline__ float half_at(const unsigned char *p) {
-    __half raw;
-    memcpy(&raw, p, sizeof(raw));
-    return __half2float(raw);
+/* The 16 bytes at a 16-byte aligned address, and the two at an even one. */
+__device__ __forceinline__ uint4 load_line(const unsigned char *p) {
+    return *reinterpret_cast<const uint4 *>(p);
+}
+
+__device__ __forceinline__ unsigned short load_half(const unsigned char *p) {
+    return *reinterpret_cast<const unsigned short *>(p);
 }
 
 /* An integer code 0..2^23-1 as an f32 through its mantissa: 0x4B000000 | code is 2^23 + code
  * and the subtraction is exact. */
 __device__ __forceinline__ float code_f(unsigned code) {
     return __int_as_float(0x4B000000u | code) - 8388608.0f;
+}
+
+/* 2^23 + a code of at most 6 bits held in byte j of `packed`: one byte perm moves the byte
+ * under the exponent 0x4B. */
+__device__ __forceinline__ float code_at(unsigned packed, int j) {
+    return __uint_as_float(__byte_perm(packed, 0x4B000000u, 0x7540u + (unsigned)j));
 }
 
 /* The 32 f32 values a lane owns in one K block, at a 16-byte aligned address. */
@@ -75,15 +89,20 @@ __device__ __forceinline__ float run_sum(const Run &r) {
 }
 
 /* ggml's get_scale_min_k4: the 6-bit multiplier and offset of Q4_K sub-block s (0..7) from the
- * 12 packed factor bytes. */
-__device__ __forceinline__ void k4_factors(const unsigned char *scales, int s, float *mult,
-                                           float *offs) {
+ * block's first line `head`: f16 d, f16 dmin, then the 12 packed factor bytes as three words
+ * a, b, c of four. With t = s mod 4, byte t of a is factor t, of b factor t + 4, of c factor
+ * t + 8. */
+__device__ __forceinline__ void k4_factors(const uint4 &head, int s, float *mult, float *offs) {
+    const unsigned t = (unsigned)(s & 3);
+    const unsigned a = head.y >> (8 * t);
+    const unsigned b = head.z >> (8 * t);
+    const unsigned c = head.w >> (8 * t);
     if (s < 4) {
-        *mult = code_f(scales[s] & 63u);
-        *offs = code_f(scales[s + 4] & 63u);
+        *mult = code_f(a & 63u);
+        *offs = code_f(b & 63u);
     } else {
-        *mult = code_f((scales[s + 4] & 0x0Fu) | ((scales[s - 4] >> 6) << 4));
-        *offs = code_f((scales[s + 4] >> 4) | ((scales[s] >> 6) << 4));
+        *mult = code_f((c & 0x0Fu) | ((a >> 2) & 0x30u));
+        *offs = code_f(((c >> 4) | (b >> 2)) & 0x3Fu);
     }
 }
 
@@ -106,28 +125,30 @@ struct Q4kSide {
 
     /* One K block of the lane's row: `raw` is 16-byte aligned (144 = 16 * 9). */
     __device__ __forceinline__ void add(const unsigned char *raw, int l, const Run &x, float sx) {
-        const unsigned char *unit = raw + 16 + 32 * (l >> 1);
+        const uint4 *unit = reinterpret_cast<const uint4 *>(raw + 16 + 32 * (l >> 1));
+        const uint4 u0 = unit[0];
+        const uint4 u1 = unit[1];
+        const unsigned codes[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
         const unsigned nib = 4u * (l & 1);
         float sd = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            uint4 packed;
-            memcpy(&packed, unit + 16 * i, 16);
-            const unsigned codes[4] = {packed.x, packed.y, packed.z, packed.w};
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float4 xv = x.v[4 * i + j];
-                sd = fmaf(code_f((codes[j] >> nib) & 0xFu), xv.x, sd);
-                sd = fmaf(code_f((codes[j] >> (nib + 8)) & 0xFu), xv.y, sd);
-                sd = fmaf(code_f((codes[j] >> (nib + 16)) & 0xFu), xv.z, sd);
-                sd = fmaf(code_f((codes[j] >> (nib + 24)) & 0xFu), xv.w, sd);
-            }
+        for (int i = 0; i < 8; ++i) {
+            /* Four codes, one in the low 4 bits of each byte. */
+            const unsigned packed = (codes[i] >> nib) & 0x0F0F0F0Fu;
+            const float4 xv = x.v[i];
+            sd = fmaf(code_at(packed, 0) - 8388608.0f, xv.x, sd);
+            sd = fmaf(code_at(packed, 1) - 8388608.0f, xv.y, sd);
+            sd = fmaf(code_at(packed, 2) - 8388608.0f, xv.z, sd);
+            sd = fmaf(code_at(packed, 3) - 8388608.0f, xv.w, sd);
         }
+        const uint4 head = load_line(raw);
         float mult;
         float offs;
-        k4_factors(raw + 4, l, &mult, &offs);
-        sum_d = fmaf(half_at(raw) * mult, sd, sum_d);
-        sum_m = fmaf(half_at(raw + 2) * offs, sx, sum_m);
+        k4_factors(head, l, &mult, &offs);
+        const float d = __half2float(__ushort_as_half((unsigned short)head.x));
+        const float dmin = __half2float(__ushort_as_half((unsigned short)(head.x >> 16)));
+        sum_d = fmaf(d * mult, sd, sum_d);
+        sum_m = fmaf(dmin * offs, sx, sum_m);
     }
 
     __device__ __forceinline__ void reduce(int bit) {
@@ -143,21 +164,51 @@ __device__ __forceinline__ float signed_f(unsigned byte) {
     return code_f(byte ^ 0x80u) - 128.0f;
 }
 
-/* One Q6_K weight from the value's code bytes and its signed scale. */
-__device__ __forceinline__ float q6_weight(unsigned lo, unsigned hi, float scale, unsigned nib,
-                                           unsigned pair) {
-    const unsigned code = ((lo >> nib) & 0xFu) | (((hi >> pair) & 3u) << 4);
-    return scale * (code_f(code) - 32.0f);
+/* The 32 bytes at `p` as eight words on word boundaries. p is even, but in a 210-byte block it
+ * is 16-byte aligned only where the block is: so the three 16-byte lines that cover [p, p + 32)
+ * are read, and every word is cut from two neighbours by one byte perm, placed by the window's
+ * start offset in its first line: s words (0 to 3) and r bytes (0 or 2). The lines stay inside
+ * the block's 210 bytes: the last window ends at +192, the third line at +208 at most. */
+struct Window {
+    unsigned w[8];
+};
+
+template <int S>
+__device__ __forceinline__ Window cut_window(const unsigned (&v)[12], unsigned sel) {
+    Window out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out.w[i] = __byte_perm(v[S + i], v[S + i + 1], sel);
+    }
+    return out;
 }
 
-/* Q6_K block, 210 bytes, 2-byte aligned in the weight file (so every load is 16-bit): ql[128]
- * at +0, qh[64] at +128, 16 signed scales at +192 (one per 16 values), f16 d at +208. The 256
- * values are two halves of 128, each four quarters of 32. Lane l owns quarter q = l % 4 of half
- * h = l / 4 (values [32 l, 32 l + 32)). Value m of that quarter weighs d * scale * (code - 32)
- * with
+__device__ __forceinline__ Window load_window(const unsigned char *p) {
+    const uintptr_t a = (uintptr_t)p & 15u;
+    const uint4 *lines = reinterpret_cast<const uint4 *>(p - a);
+    const uint4 l0 = lines[0];
+    const uint4 l1 = lines[1];
+    const uint4 l2 = lines[2];
+    const unsigned v[12] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w,
+                            l2.x, l2.y, l2.z, l2.w};
+    const unsigned sel = 0x3210u + 0x2222u * (unsigned)((a >> 1) & 1u);
+    switch (a >> 2) {
+        case 0: return cut_window<0>(v, sel);
+        case 1: return cut_window<1>(v, sel);
+        case 2: return cut_window<2>(v, sel);
+        default: return cut_window<3>(v, sel);
+    }
+}
+
+/* Q6_K block, 210 bytes at an even address: ql[128] at +0, qh[64] at +128, 16 signed scales at
+ * +192 (one per 16 values), f16 d at +208. The 256 values are two halves of 128, each four
+ * quarters of 32. Lane l owns quarter q = l % 4 of half h = l / 4 (values [32 l, 32 l + 32)).
+ * Value m of that quarter weighs d * scale * (code - 32) with
  *   code = ((ql[64 h + m + 32 (q & 1)] >> 4 (q >> 1)) & 0xF) | ((qh[32 h + m] >> 2 q & 3) << 4)
  *   scale = scales[8 h + 2 q + m / 16]
- * (the CPU oracle, weights/gguf_dequant.rs q6_k). */
+ * (the CPU oracle, weights/gguf_dequant.rs q6_k). Word i of each window holds the bytes of
+ * values 4 i to 4 i + 3, so their four codes are built in one word and taken out by code_at;
+ * the scale joins once per 16 values, when its two words are done. */
 struct Q6kSide {
     static const bool kOffsetSum = false;
     static const int kBlockBytes = 210;
@@ -170,32 +221,28 @@ struct Q6kSide {
         const int h = l >> 2;
         const unsigned nib = 4u * (unsigned)(q >> 1);
         const unsigned pair = 2u * (unsigned)q;
-        const unsigned char *ql = raw + 64 * h + 32 * (q & 1);
-        const unsigned char *qh = raw + 128 + 32 * h;
-        const unsigned char *sc = raw + 192 + 8 * h + 2 * q;
-        const float scales[2] = {signed_f(sc[0]), signed_f(sc[1])};
-        float sd = 0.0f;
+        const Window lo = load_window(raw + 64 * h + 32 * (q & 1));
+        const Window hi = load_window(raw + 128 + 32 * h);
+        /* qh's bit pair 2 q of every byte moves to bits 4 and 5 of the byte: one of the two
+         * shifts is the one that does it, the other sends its bits past the mask. */
+        const unsigned left = (4u - pair) & 31u;
+        const unsigned right = (pair - 4u) & 31u;
+        const unsigned short sc = load_half(raw + 192 + 8 * h + 2 * q);
+        float sd[2] = {0.0f, 0.0f};
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            float w[4];
-            #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                /* Values m = 4 i + 2 j and m + 1: the low and the high byte of each pair. */
-                unsigned short lo;
-                unsigned short hi;
-                memcpy(&lo, ql + 4 * i + 2 * j, 2);
-                memcpy(&hi, qh + 4 * i + 2 * j, 2);
-                const float scale = scales[i >> 2];
-                w[2 * j] = q6_weight(lo, hi, scale, nib, pair);
-                w[2 * j + 1] = q6_weight(lo >> 8, hi >> 8, scale, nib, pair);
-            }
+            const unsigned low = (lo.w[i] >> nib) & 0x0F0F0F0Fu;
+            const unsigned high = ((hi.w[i] << left) | (hi.w[i] >> right)) & 0x30303030u;
+            const unsigned packed = low | high;
             const float4 xv = x.v[i];
-            sd = fmaf(w[0], xv.x, sd);
-            sd = fmaf(w[1], xv.y, sd);
-            sd = fmaf(w[2], xv.z, sd);
-            sd = fmaf(w[3], xv.w, sd);
+            sd[i >> 2] = fmaf(code_at(packed, 0) - 8388640.0f, xv.x, sd[i >> 2]);
+            sd[i >> 2] = fmaf(code_at(packed, 1) - 8388640.0f, xv.y, sd[i >> 2]);
+            sd[i >> 2] = fmaf(code_at(packed, 2) - 8388640.0f, xv.z, sd[i >> 2]);
+            sd[i >> 2] = fmaf(code_at(packed, 3) - 8388640.0f, xv.w, sd[i >> 2]);
         }
-        sum = fmaf(half_at(raw + 208), sd, sum);
+        const float d = __half2float(__ushort_as_half(load_half(raw + 208)));
+        sum = fmaf(d * signed_f(sc & 0xFFu), sd[0], sum);
+        sum = fmaf(d * signed_f(sc >> 8), sd[1], sum);
     }
 
     __device__ __forceinline__ void reduce(int bit) {

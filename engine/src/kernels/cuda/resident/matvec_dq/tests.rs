@@ -302,17 +302,25 @@ fn matvec_dq_refuses_bad_arguments_before_the_adapter() {
 /// in the same process, one sample of each interleaved with the first arm alternated, medians
 /// of 100 after one dropped sample. Queued: 16 launches and one drain, per launch, which is the
 /// kernel's own cost. Drained: one launch and one drain, which is what a drain point pays. A
-/// microbenchmark, not a gate: it asserts nothing beyond the launch results.
+/// microbenchmark, not a gate: it asserts nothing beyond the launch results. The Q4_K arm of
+/// the same shape follows the Q6_K arm.
 #[test]
 #[ignore = "bench: exclusive timing slot"]
 fn matvec_dq_first_shape_against_the_matvec_bench() {
     if !testkit::device_present("matvec_dq_first_shape_against_the_matvec_bench") {
         return;
     }
+    for (ti, ty) in [QuantType::Q6K, QuantType::Q4K].into_iter().enumerate() {
+        first_shape_against_the_matvec(ty, ti as u64);
+    }
+}
+
+/// The bench of one type on the first shape, in a context of its own.
+fn first_shape_against_the_matvec(ty: QuantType, ti: u64) {
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    let (ty, k, rows) = (QuantType::Q6K, 4096, 12288);
-    let rig = rig(&ctx, ty, k, rows, 0xD0_0200);
+    let (k, rows) = (4096, 12288);
+    let rig = rig(&ctx, ty, k, rows, 0xD0_0200 + ti);
     let w_bytes = ty.weight_bytes(rows, k).expect("size");
     let x_q8_bytes = q8_1_bytes(k, 1).expect("size");
     let x_q8 = testkit::upload_filled(&ctx, 0, x_q8_bytes);
