@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     GgufModel,
-    admission::check_slots,
+    admission::{check_cuda_decode, check_slots},
     placement::{ExpertSetup, cache_plan, layer_stacks},
     plan::Card,
 };
@@ -71,14 +71,8 @@ pub(in crate::family::qwen::flash_next) fn start(
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     let model = &owned;
-    let mut options = options.cloned().unwrap_or_default();
-    if options.cuda_decode == Some(false) {
-        return Err(EngError::BadRequest(
-            "engine config: the Flash-Next CUDA decoder is off; set flash_next.cuda_decode to true to serve on a card"
-                .to_string(),
-        ));
-    }
-    options.cuda_decode = Some(true);
+    let options = options.cloned().unwrap_or_default();
+    check_cuda_decode(options.cuda_decode)?;
     let cuda = cuda_settings(&options)?.ok_or_else(|| {
         EngError::BadRequest("engine config: the CUDA decoder is not enabled".to_string())
     })?;
