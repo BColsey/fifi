@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     GgufModel,
-    admission::{check_cuda_decode, check_slots},
+    admission::{check_cuda_decode, check_opt_in, check_slots},
     placement::{ExpertSetup, cache_plan, layer_stacks},
     plan::Card,
 };
@@ -63,10 +63,12 @@ fn observed_pin(dir: &Path, vocab: u32) -> TokenizerPin {
 
 /// Plans the model on this machine, prints the plan, and starts the engine when every
 /// matrix type has a decode kernel and the routed experts all fit on the card. The tokenizer
-/// files are read from `tokenizer_dir`.
+/// files are read from `tokenizer_dir`. `opt_in` is the `FIFI_FLASH_NEXT_GGUF` switch, read by
+/// the caller: without it the start refuses where it refused before it read GGUF weights.
 pub(in crate::family::qwen::flash_next) fn start(
     owned: GgufModel,
     options: Option<&FlashOptions>,
+    opt_in: bool,
     tokenizer_dir: &Path,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
@@ -128,6 +130,7 @@ pub(in crate::family::qwen::flash_next) fn start(
     if !gaps.is_empty() {
         return Err(model.kernel_refusal(&gaps));
     }
+    check_opt_in(opt_in, model.first_path())?;
     // The routed experts that do not all fit beside the trunk and the K/V are cached: the memory
     // plan's slot count per layer sits on the card, and each layer's experts are read from pinned
     // host memory or from the file on a miss.

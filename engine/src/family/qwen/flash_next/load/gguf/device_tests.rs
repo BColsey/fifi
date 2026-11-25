@@ -22,6 +22,32 @@ use crate::family::{
     session::TokenStepper,
 };
 
+/// The GGUF start through the factory, as an operator who set the switch and the entry's
+/// `cuda_decode` would: the small model of `dir`, with its tokenizer files beside it.
+fn start_small(
+    dir: &std::path::Path,
+    ready: crate::sched::worker::ReadyNote,
+) -> crate::family::qwen::flash_next::factory::StartedEngine {
+    let options = crate::family::qwen::flash_next::settings::FlashOptions {
+        cuda_decode: Some(true),
+        ..Default::default()
+    };
+    let env = crate::family::qwen::flash_next::settings::FlashEnv {
+        gguf_start: Some("1".into()),
+        ..Default::default()
+    };
+    crate::family::qwen::flash_next::factory::start_engine_resolved(
+        dir,
+        dir,
+        Some(&options),
+        &env,
+        false,
+        ready,
+    )
+    .expect("the engine starts")
+    .0
+}
+
 /// The driver over the small model, owning its model, card handle and weights.
 fn driver_of(small: &Small, positions: usize) -> TokenDriver<GgufDevice, PackFeeds> {
     let model = GgufModel::open(&small.first)
@@ -267,14 +293,10 @@ fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forw
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let started = factory::start_engine(
+    let started = start_small(
         dir,
-        dir,
-        None,
-        false,
         Some(Box::new(move |note| tx.send(note).expect("note"))),
-    )
-    .expect("the engine starts");
+    );
     if let EngineNote::Failed(why) = rx.recv().expect("a note") {
         panic!("the start failed: {why}");
     }
@@ -319,14 +341,10 @@ fn stopping_the_engine_gives_back_its_card_memory() {
     let before = probe.memory_info().expect("memory").free;
     let live_before = crate::kernels::cuda::live_device_bytes();
     let (tx, rx) = std::sync::mpsc::channel();
-    let started = factory::start_engine(
+    let started = start_small(
         dir,
-        dir,
-        None,
-        false,
         Some(Box::new(move |note| tx.send(note).expect("note"))),
-    )
-    .expect("the engine starts");
+    );
     if let EngineNote::Failed(why) = rx.recv().expect("a note") {
         panic!("the start failed: {why}");
     }

@@ -36,9 +36,61 @@ pub(in crate::family::qwen::flash_next) fn check_cuda_decode(
     Ok(())
 }
 
+/// The GGUF start is new behaviour whose device tests are not qualified: it runs only when the
+/// switch `FIFI_FLASH_NEXT_GGUF` equals exactly `1`. Without it the start refuses as it did
+/// before it read GGUF weights, and names the switch.
+pub(in crate::family::qwen::flash_next) fn check_opt_in(
+    opt_in: bool,
+    first_path: &std::path::Path,
+) -> Result<(), EngError> {
+    if !opt_in {
+        return Err(refuse(format!(
+            "{} is planned and every matrix type has a decode kernel, but the GGUF start is \
+             not qualified yet: it runs only when FIFI_FLASH_NEXT_GGUF equals 1",
+            first_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The admission of the GGUF start: `cuda_decode` set to true, then the switch. Both are read by
+/// the caller (the entry and the environment) and passed in, so tests never change the process.
+pub(in crate::family::qwen::flash_next) fn admit(
+    cuda_decode: Option<bool>,
+    opt_in: bool,
+    first_path: &std::path::Path,
+) -> Result<(), EngError> {
+    check_cuda_decode(cuda_decode)?;
+    check_opt_in(opt_in, first_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// The switch alone, the entry alone, neither and both: only both serve.
+    #[test]
+    fn the_gguf_start_needs_cuda_decode_and_the_switch() {
+        let path = Path::new("/models/flash-next.gguf");
+        let both = admit(Some(true), true, path);
+        assert!(both.is_ok(), "{both:?}");
+        // The switch off: the start's own refusal, naming the switch and the file.
+        let Err(error) = admit(Some(true), false, path) else {
+            panic!("without the switch the start must be refused");
+        };
+        let text = format!("{error:?}");
+        assert!(text.contains("not qualified yet"), "{text}");
+        assert!(text.contains("FIFI_FLASH_NEXT_GGUF"), "{text}");
+        assert!(text.contains("flash-next.gguf"), "{text}");
+        // The entry not set to true: the pack's refusal, whatever the switch says.
+        for (cuda_decode, opt_in) in [(None, true), (Some(false), true), (None, false)] {
+            let Err(EngError::BadRequest(text)) = admit(cuda_decode, opt_in, path) else {
+                panic!("{cuda_decode:?} must be refused");
+            };
+            assert!(text.contains("cuda_decode"), "{text}");
+        }
+    }
 
     #[test]
     fn an_unset_or_false_cuda_decode_is_refused_like_the_pack_start() {
@@ -58,7 +110,10 @@ mod tests {
     fn a_cache_with_fewer_slots_than_the_router_picks_is_refused() {
         let error = check_slots(8, 10).expect_err("eight slots cannot serve ten picks");
         assert!(format!("{error:?}").contains("8 expert slots"), "{error:?}");
-        assert!(format!("{error:?}").contains("the 10 the router picks"), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("the 10 the router picks"),
+            "{error:?}"
+        );
         assert!(check_slots(10, 10).is_ok());
     }
 }

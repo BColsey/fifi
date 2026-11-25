@@ -59,8 +59,13 @@ pub(crate) fn start_engine_resolved(
     // and tensor table and takes its own start, without settings of the pack's kind.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     if let Some(model) = super::load::gguf::GgufModel::open(model_dir)? {
-        let (engine, bundle, context_limit) =
-            super::load::gguf::start::start(model, options, tokenizer_dir, ready_note)?;
+        let (engine, bundle, context_limit) = super::load::gguf::start::start(
+            model,
+            options,
+            env.gguf_opt_in(),
+            tokenizer_dir,
+            ready_note,
+        )?;
         return Ok((
             StartedEngine {
                 engine,

@@ -194,6 +194,8 @@ pub(crate) struct FlashEnv {
     pub(crate) manifest: Option<String>,
     /// `FLASH_NEXT_CACHE_LIMIT`, a byte count.
     pub(crate) cache_limit: Option<String>,
+    /// `FIFI_FLASH_NEXT_GGUF`, the switch of the unqualified GGUF start.
+    pub(crate) gguf_start: Option<String>,
 }
 
 impl FlashEnv {
@@ -201,7 +203,13 @@ impl FlashEnv {
         Self {
             manifest: std::env::var("FLASH_NEXT_ARTIFACT_MANIFEST").ok(),
             cache_limit: std::env::var("FLASH_NEXT_CACHE_LIMIT").ok(),
+            gguf_start: std::env::var("FIFI_FLASH_NEXT_GGUF").ok(),
         }
+    }
+
+    /// Whether the GGUF start is switched on: `FIFI_FLASH_NEXT_GGUF` equals exactly `1`.
+    pub(crate) fn gguf_opt_in(&self) -> bool {
+        self.gguf_start.as_deref() == Some("1")
     }
 }
 
@@ -903,6 +911,7 @@ mod tests {
         let env = FlashEnv {
             manifest: Some("/env-art/download-manifest.json".into()),
             cache_limit: Some("2048".into()),
+            ..FlashEnv::default()
         };
         let got = settings(None, &env).unwrap();
         assert_eq!(
@@ -1099,6 +1108,7 @@ mod tests {
         let env = FlashEnv {
             manifest: Some("/env/m.json".into()),
             cache_limit: Some("1".into()),
+            ..FlashEnv::default()
         };
         let got = build(&env).unwrap();
         assert_eq!(got.manifest, PathBuf::from("/env/m.json"));
@@ -1144,6 +1154,7 @@ mod tests {
         let env = FlashEnv {
             manifest: Some("/env-manifest".into()),
             cache_limit: Some("5".into()),
+            ..FlashEnv::default()
         };
         let got = settings(Some(&full()), &env).unwrap();
         assert_eq!(got.manifest, PathBuf::from("/art/download-manifest.json"));
@@ -1178,6 +1189,7 @@ mod tests {
         let env = FlashEnv {
             manifest: Some(String::new()),
             cache_limit: Some(String::new()),
+            ..FlashEnv::default()
         };
         let no_manifest = FlashOptions {
             manifest: None,
@@ -1273,6 +1285,7 @@ mod tests {
         let env = FlashEnv {
             manifest: Some("/manifest.json".into()),
             cache_limit: Some("1024".into()),
+            ..FlashEnv::default()
         };
         assert!(!settings(None, &env).unwrap().expert_prefetch);
         for (json, expected) in [
