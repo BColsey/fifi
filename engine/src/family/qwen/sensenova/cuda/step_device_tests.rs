@@ -443,19 +443,15 @@ fn card_trunk_matches_the_cpu_reference() {
 /// fresh card prefills rows 0..=N for each of those five N and its row stands against the
 /// reference row at N. With `SENSENOVA_PROBE_CARD_ONLY` set no CPU step runs: the rows come
 /// from that directory, so the prefill runs on the default route in one process and on
-/// `FIFI_SENSENOVA_PREFILL_GEMM=dq` in the next. The decode step has no route: every
-/// projection in it, the head included, takes the q8_1 row and the matvec. Nothing is
-/// asserted beyond the shapes.
+/// `FIFI_SENSENOVA_PREFILL_GEMM=dq` in the next. The decode step follows
+/// `FIFI_SENSENOVA_DECODE_GEMM`: by default every projection in it, the head included, takes
+/// the q8_1 row and the matvec. Nothing is asserted beyond the shapes.
 #[test]
 fn card_position_probe() {
     let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova position probe") else {
         return;
     };
-    let probe = std::env::var("SENSENOVA_PROBE_POS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| (5..PROMPT.len()).contains(n))
-        .unwrap_or(16);
+    let probe = probe_pos();
     let rows_dir = std::env::var("SENSENOVA_PROBE_ROWS").unwrap_or_default();
     let prefilled = prefill_rows(&ctx, &loaded, &weights, &mut projector, probe);
     let reference: Vec<Vec<f32>> = if std::env::var_os("SENSENOVA_PROBE_CARD_ONLY").is_some() {
@@ -477,6 +473,53 @@ fn card_position_probe() {
             argmax(row)
         );
     }
+}
+
+/// The decode walk on the card alone through the step's route (`FIFI_SENSENOVA_DECODE_GEMM`):
+/// positions 0..=`SENSENOVA_PROBE_POS` of the prompt, the last five logits rows against the
+/// reference rows [`decode_walk`] saved under `SENSENOVA_PROBE_ROWS`. No CPU step runs, so both
+/// routes fit one lease. Reports each row's diff, the reference's top-2 margin and both argmax
+/// ids, and asserts the trunk test's gate 3 on those rows. Without the directory it returns at
+/// once.
+#[test]
+fn card_decode_walk_against_the_saved_rows() {
+    let rows_dir = std::env::var("SENSENOVA_PROBE_ROWS").unwrap_or_default();
+    if rows_dir.is_empty() {
+        eprintln!("no SENSENOVA_PROBE_ROWS: nothing to stand the walk against");
+        return;
+    }
+    let Some((ctx, loaded, weights, mut projector)) =
+        open_rig("sensenova decode walk against the saved rows")
+    else {
+        return;
+    };
+    let route = std::env::var("FIFI_SENSENOVA_DECODE_GEMM").unwrap_or("default".to_owned());
+    let mut card = open_card(&ctx, &loaded, &weights, CACHE_ROWS);
+    let (mut worst, mut worst_pos) = (0.0f32, 0);
+    for (pos, &token) in PROMPT.iter().take(probe_pos() + 1).enumerate() {
+        let embed = projector.rows(weights.token_embd(), &[token]).unwrap();
+        card.decode(&embed, pos).unwrap();
+        if pos + 5 > probe_pos() {
+            let drawn = drain_row(&ctx, &card);
+            let reference = load_row(&rows_dir, pos);
+            let diff = max_abs_diff(&reference, &drawn);
+            eprintln!(
+                "pos {pos:2} route {route:<7} diff {diff:9.4} margin {:-8.3} ids {} {}",
+                top2_margin(&reference),
+                argmax(&reference),
+                argmax(&drawn)
+            );
+            if diff > worst {
+                worst = diff;
+                worst_pos = pos;
+            }
+        }
+    }
+    eprintln!("decode walk route {route}: worst row diff {worst:.4} at position {worst_pos}");
+    assert!(
+        worst.is_finite() && worst < 16.0,
+        "the logits rows diverged: worst {worst:.4} at position {worst_pos}"
+    );
 }
 
 /// The prompt through `probe` on the card against the CPU reference, one position per
@@ -655,6 +698,15 @@ fn prefill_rows(
             (n, drain_row(ctx, &card))
         })
         .collect()
+}
+
+/// `SENSENOVA_PROBE_POS` (default 16), kept inside the prompt.
+fn probe_pos() -> usize {
+    std::env::var("SENSENOVA_PROBE_POS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| (5..PROMPT.len()).contains(n))
+        .unwrap_or(16)
 }
 
 /// A reference row [`decode_walk`] saved: little-endian f32 words.
@@ -1252,7 +1304,8 @@ fn card_decode_trace() {
 }
 
 /// Device microbenchmark, not a gate: the decode step's weight sweep at 1, 2, 4 and 8
-/// activation columns. A batched step reads the weights once for all of its tokens, so
+/// activation columns, and at one column the dequantizing GEMM against the matvec for each
+/// weight shape. A batched step reads the weights once for all of its tokens, so
 /// this is the weight term of one token of a batch on this card. The glue, the launch gaps
 /// and the per-sequence attention state of a real batched step are not in it. The GB/s it
 /// prints is weight bytes per second, not measured HBM traffic.
@@ -1265,15 +1318,26 @@ fn card_decode_sweep_columns() {
     let card = open_card(&ctx, &loaded, &weights, CACHE_ROWS);
     let gib = card.step_weight_bytes() as f64 / 1e9;
     eprintln!("sweep reads {gib:.2} GB per pass: median and minimum of 5 groups of 5 sweeps");
+    let spread = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        (v[v.len() / 2], v[0])
+    };
     for ncols in [1, 2, 4, 8] {
-        let mut sorted = card.sweep_micros(ncols, 5, 5).unwrap();
-        sorted.sort_by(f64::total_cmp);
-        let (mid, min) = (sorted[sorted.len() / 2], sorted[0]);
+        let (mid, min) = spread(&mut card.sweep_micros(ncols, 5, 5, false).unwrap());
         eprintln!(
             "sweep {ncols} column(s): median {mid:.0} us, min {min:.0} us = {:.0} GB/s; weight term {:.2} ms per token = {:.0} tok/s from this term alone",
             gib / (mid * 1e-6),
             mid * 1e-6 * 1e3 / ncols as f64,
             ncols as f64 / (mid * 1e-6),
+        );
+    }
+    eprintln!(
+        "one column, per weight shape: the matvec against the dequantizing GEMM, median and min of 5 groups of 5 sweeps"
+    );
+    for (shape, mut matvec, mut dq) in card.sweep_shape_micros(5, 5).unwrap() {
+        let ((mm, mn), (dm, dn)) = (spread(&mut matvec), spread(&mut dq));
+        eprintln!(
+            "shape {shape}: matvec median {mm:.0} us, min {mn:.0} us; dq median {dm:.0} us, min {dn:.0} us"
         );
     }
 }

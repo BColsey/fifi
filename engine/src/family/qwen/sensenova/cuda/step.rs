@@ -32,6 +32,7 @@ use std::rc::Rc;
 
 use crate::EngError;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
+use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
 use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
@@ -125,6 +126,8 @@ pub(crate) struct LoopStep<'a> {
     plan: LoopPlan,
     rope: RopePlan,
     cache_rows: usize,
+    /// The projections' route: the dequantizing GEMM over f32 rows, or the matvec over q8_1.
+    dq: bool,
     /// GDN state and conv rings, one slot per trunk visit (an attention visit's slot is
     /// unused; direct visit indexing keeps the mapping arithmetic-free).
     rec: DeviceBuffer,
@@ -196,6 +199,19 @@ pub(super) fn bytes_range(buffer: &DeviceBuffer, len: usize) -> Result<DeviceRan
 fn q8_row(k: usize) -> Result<usize, EngError> {
     q8_1_bytes(k, 1).ok_or_else(|| EngError::BadRequest("a q8 row size overflows".to_owned()))
 }
+
+/// `FIFI_SENSENOVA_DECODE_GEMM=dq` puts the step's projections through the dequantizing GEMM
+/// over the f32 rows, with no q8_1 step; the default keeps the matvec over the q8_1 rows. Read
+/// once: every projection launch would otherwise take an env lock.
+fn decode_dq() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FIFI_SENSENOVA_DECODE_GEMM").is_ok_and(|v| v == "dq"))
+}
+
+/// One weight shape's sweep at one column: its description, then the microseconds of each group
+/// on the matvec route and on the dq route.
+#[cfg(all(test, feature = "native-cuda"))]
+type ShapeSweep = (String, Vec<f64>, Vec<f64>);
 
 pub(super) fn le_f32(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -294,7 +310,10 @@ impl<'a> LoopStep<'a> {
             out_q8: ctx.upload(&vec![0u8; q8_row(h)?])?,
             proj: ctx.upload(&zeros(proj_floats))?,
             conv_out: ctx.upload(&zeros(shape.conv_dim()))?,
-            delta_out: ctx.upload(&zeros(shape.delta_value_heads * shape.delta_value_dim))?,
+            delta_out: ctx.upload(&zeros(
+                (shape.delta_value_heads * shape.delta_value_dim)
+                    .max(shape.heads_q * shape.head_dim),
+            ))?,
             gu: ctx.upload(&zeros(2 * shape.feed_forward))?,
             gu_q8: ctx.upload(&vec![0u8; q8_row(shape.feed_forward)?])?,
             ffn_out: ctx.upload(&zeros(h))?,
@@ -308,6 +327,7 @@ impl<'a> LoopStep<'a> {
             plan: plan.clone(),
             rope: rope.clone(),
             cache_rows,
+            dq: decode_dq(),
             ctx,
             weights,
             attn_slot,
@@ -479,12 +499,11 @@ impl<'a> LoopStep<'a> {
         // The output norm and the head.
         let h = self.shape.hidden;
         self.norm_and_q8(self.resid_range()?, None, self.output_norm)?;
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             self.head,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.logits, 0, self.shape.vocab)?,
-            1,
         )?;
         Ok(())
     }
@@ -528,15 +547,52 @@ impl<'a> LoopStep<'a> {
     /// figure leaves out the step's drain points and its norm and mHC glue kernels. It does
     /// include any device idle where the host launch stream falls behind inside a group,
     /// which is most likely for the small matrices. Above four columns `matvec_native` takes
-    /// the vendored MMVQ geometry that the decode, at one column, never takes.
+    /// the vendored MMVQ geometry that the decode, at one column, never takes. With `dq`, every
+    /// weight goes through the dequantizing GEMM over one f32 row instead, whatever `ncols`
+    /// says: the launch the step issues on its dq route.
     #[cfg(all(test, feature = "native-cuda"))]
     pub(super) fn sweep_micros(
         &self,
         ncols: usize,
         sweeps: usize,
         groups: usize,
+        dq: bool,
     ) -> Result<Vec<f64>, EngError> {
-        let mut weights: Vec<&NativeWeight> = Vec::new();
+        self.sweep_list_micros(&self.sweep_weights(), ncols, sweeps, groups, dq)
+    }
+
+    /// The same sweep for each distinct weight shape (k, rows, quant) at one column, both
+    /// routes: the shape, then the microseconds of each group on the matvec route and on the
+    /// dq route.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(super) fn sweep_shape_micros(
+        &self,
+        sweeps: usize,
+        groups: usize,
+    ) -> Result<Vec<ShapeSweep>, EngError> {
+        use crate::kernels::cuda::resident::matvec_q::QuantType;
+        let mut shapes: Vec<(usize, usize, QuantType, Vec<&'a NativeWeight>)> = Vec::new();
+        for w in self.sweep_weights() {
+            let key = (w.k(), w.n_rows(), w.quant());
+            match shapes.iter_mut().find(|s| (s.0, s.1, s.2) == key) {
+                Some(s) => s.3.push(w),
+                None => shapes.push((key.0, key.1, key.2, vec![w])),
+            }
+        }
+        let mut out = Vec::with_capacity(shapes.len());
+        for (k, rows, quant, weights) in shapes {
+            let shape = format!("k {k} rows {rows} {quant:?}, {} weights", weights.len());
+            let matvec = self.sweep_list_micros(&weights, 1, sweeps, groups, false)?;
+            let dq = self.sweep_list_micros(&weights, 1, sweeps, groups, true)?;
+            out.push((shape, matvec, dq));
+        }
+        Ok(out)
+    }
+
+    /// Every weight the decode walk's projections read, in walk order.
+    #[cfg(all(test, feature = "native-cuda"))]
+    fn sweep_weights(&self) -> Vec<&'a NativeWeight> {
+        let mut weights = Vec::new();
         for il in 0..TRUNK_LAYERS {
             let phys = &self.phys[self.plan.physical(il)];
             match &phys.mixer {
@@ -548,26 +604,39 @@ impl<'a> LoopStep<'a> {
                 } => weights.extend([*qkvz, *beta_alpha, *out]),
                 Mixer::Attn { q, k, v, o, .. } => weights.extend([*q, *k, *v, *o]),
             }
-            weights.extend([&phys.ffn_gate, &phys.ffn_up, &phys.ffn_down]);
+            weights.extend([phys.ffn_gate, phys.ffn_up, phys.ffn_down]);
         }
         weights.push(self.head);
+        weights
+    }
+
+    #[cfg(all(test, feature = "native-cuda"))]
+    fn sweep_list_micros(
+        &self,
+        weights: &[&NativeWeight],
+        ncols: usize,
+        sweeps: usize,
+        groups: usize,
+        dq: bool,
+    ) -> Result<Vec<f64>, EngError> {
         let (k_max, rows_max) = weights
             .iter()
             .fold((0, 0), |(k, n), w| (k.max(w.k()), n.max(w.n_rows())));
         let x = self.ctx.upload(&vec![0u8; ncols * q8_row(k_max)?])?;
+        let x_f32 = self.ctx.upload(&le_f32(&vec![0.0; k_max]))?;
         let y = self.ctx.upload(&le_f32(&vec![0.0; ncols * rows_max]))?;
         let mut out = Vec::with_capacity(groups);
         for _ in 0..=groups {
             let t0 = std::time::Instant::now();
             for _ in 0..sweeps {
-                for w in &weights {
-                    self.ctx.matvec_native(
-                        &self.stream,
-                        w,
-                        x.range(0, ncols * q8_row(w.k())?)?,
-                        y.range(0, ncols * w.n_rows() * F32)?,
-                        ncols,
-                    )?;
+                for w in weights {
+                    let y_w = y.range(0, ncols * w.n_rows() * F32)?;
+                    if dq {
+                        self.gemm_dq_row(w, x_f32.range(0, w.k() * F32)?, y_w)?;
+                    } else {
+                        let x_w = x.range(0, ncols * q8_row(w.k())?)?;
+                        self.ctx.matvec_native(&self.stream, w, x_w, y_w, ncols)?;
+                    }
                 }
             }
             self.stream.synchronize()?;
@@ -748,6 +817,46 @@ impl<'a> LoopStep<'a> {
         )
     }
 
+    /// One projection of one row: through the matvec over the row's q8_1 bytes, or on the dq
+    /// route through the dequantizing GEMM over the f32 row.
+    fn project(
+        &self,
+        weight: &NativeWeight,
+        x_q8: DeviceRange<'_>,
+        x_f32: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        if self.dq {
+            return self.gemm_dq_row(weight, x_f32, y);
+        }
+        self.ctx.matvec_native(&self.stream, weight, x_q8, y, 1)
+    }
+
+    /// One row through the dequantizing GEMM: f16 by f16 with f32 accumulation over an f32 row,
+    /// not an exact f32 product.
+    fn gemm_dq_row(
+        &self,
+        weight: &NativeWeight,
+        x: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        self.ctx.gemm_dq(
+            &self.stream,
+            weight.quant(),
+            GemmDqTypedCall {
+                w: weight.buffer().range(0, weight.buffer().bytes())?,
+                x,
+                y,
+                k: weight.k(),
+                rows: weight.n_rows(),
+                ncols: 1,
+                x_col_stride: 0,
+                y_col_stride: 0,
+                x_f32: true,
+            },
+        )
+    }
+
     /// The mixer of visit `il` into `branch`.
     fn branch(&mut self, il: usize) -> Result<(), EngError> {
         let p = self.plan.physical(il);
@@ -785,19 +894,17 @@ impl<'a> LoopStep<'a> {
         let h = s.hidden;
         // One strided row holds [qkvz | beta_alpha]: the delta kernel reads z, beta and
         // alpha at their offsets of the same row.
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             qkvz,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.proj, 0, qkvz_row_len)?,
-            1,
         )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             beta_alpha,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.proj, qkvz_row_len, ba_len)?,
-            1,
         )?;
         let ring_floats = conv_dim * (ck - 1);
         let ring_at = il * ring_floats;
@@ -843,21 +950,22 @@ impl<'a> LoopStep<'a> {
             },
         )?;
         let delta_floats = vh * vd;
-        self.ctx.quantize_q8_1(
-            &self.stream,
-            crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
-                x: floats(&self.delta_out, 0, delta_floats)?,
-                y: bytes_range(&self.out_q8, q8_row(delta_floats)?)?,
-                k: delta_floats,
-                ncols: 1,
-            },
-        )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        if !self.dq {
+            self.ctx.quantize_q8_1(
+                &self.stream,
+                crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
+                    x: floats(&self.delta_out, 0, delta_floats)?,
+                    y: bytes_range(&self.out_q8, q8_row(delta_floats)?)?,
+                    k: delta_floats,
+                    ncols: 1,
+                },
+            )?;
+        }
+        self.project(
             out,
             bytes_range(&self.out_q8, q8_row(delta_floats)?)?,
+            floats(&self.delta_out, 0, delta_floats)?,
             floats(&self.branch, 0, h)?,
-            1,
         )
     }
 
@@ -880,26 +988,23 @@ impl<'a> LoopStep<'a> {
         let q_rows = hq * 2 * hd;
         let kv_rows = hkv * hd;
         let row_len = attn_row(s);
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             q,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.proj, 0, q_rows)?,
-            1,
         )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             k,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.proj, q_rows, kv_rows)?,
-            1,
         )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             v,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.proj, q_rows + kv_rows, kv_rows)?,
-            1,
         )?;
         let slot = self
             .attn_slot
@@ -957,25 +1062,36 @@ impl<'a> LoopStep<'a> {
                 v_cache: bytes_range(v_cache, v_cache.bytes())?,
                 kv_len: self.params_word(OFFSET_KV_LEN)?,
                 part: bytes_range(&self.part, self.part.bytes())?,
-                out: floats(&self.branch, 0, hq * hd)?,
+                // gemm_dq refuses an output over its own input; delta_out is free on an
+                // attention visit.
+                out: floats(
+                    if self.dq {
+                        &self.delta_out
+                    } else {
+                        &self.branch
+                    },
+                    0,
+                    hq * hd,
+                )?,
             },
         )?;
         let branch_floats = hq * hd;
-        self.ctx.quantize_q8_1(
-            &self.stream,
-            crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
-                x: floats(&self.branch, 0, branch_floats)?,
-                y: bytes_range(&self.out_q8, q8_row(branch_floats)?)?,
-                k: branch_floats,
-                ncols: 1,
-            },
-        )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        if !self.dq {
+            self.ctx.quantize_q8_1(
+                &self.stream,
+                crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
+                    x: floats(&self.branch, 0, branch_floats)?,
+                    y: bytes_range(&self.out_q8, q8_row(branch_floats)?)?,
+                    k: branch_floats,
+                    ncols: 1,
+                },
+            )?;
+        }
+        self.project(
             o,
             bytes_range(&self.out_q8, q8_row(branch_floats)?)?,
+            floats(&self.delta_out, 0, branch_floats)?,
             floats(&self.branch, 0, h)?,
-            1,
         )
     }
 
@@ -985,19 +1101,17 @@ impl<'a> LoopStep<'a> {
     fn ffn(&mut self, p: usize) -> Result<(), EngError> {
         let phys = &self.phys[p];
         let (h, ff) = (self.shape.hidden, self.shape.feed_forward);
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             phys.ffn_gate,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.gu, 0, ff)?,
-            1,
         )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        self.project(
             phys.ffn_up,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
+            floats(&self.norm_out, 0, h)?,
             floats(&self.gu, ff, ff)?,
-            1,
         )?;
         self.ctx.swiglu_rows(
             &self.stream,
@@ -1013,21 +1127,22 @@ impl<'a> LoopStep<'a> {
                 act: floats(&self.rows.act, 0, ff)?,
             },
         )?;
-        self.ctx.quantize_q8_1(
-            &self.stream,
-            crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
-                x: floats(&self.rows.act, 0, ff)?,
-                y: bytes_range(&self.gu_q8, q8_row(ff)?)?,
-                k: ff,
-                ncols: 1,
-            },
-        )?;
-        self.ctx.matvec_native(
-            &self.stream,
+        if !self.dq {
+            self.ctx.quantize_q8_1(
+                &self.stream,
+                crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
+                    x: floats(&self.rows.act, 0, ff)?,
+                    y: bytes_range(&self.gu_q8, q8_row(ff)?)?,
+                    k: ff,
+                    ncols: 1,
+                },
+            )?;
+        }
+        self.project(
             phys.ffn_down,
             bytes_range(&self.gu_q8, q8_row(ff)?)?,
+            floats(&self.rows.act, 0, ff)?,
             floats(&self.ffn_out, 0, h)?,
-            1,
         )
     }
 
