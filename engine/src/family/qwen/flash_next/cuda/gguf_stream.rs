@@ -257,8 +257,9 @@ impl ExpertCache {
                 jobs.push((part, slot, incoming, staged));
             }
         }
-        // From the first copy on, a failure leaves copies in flight on `copy` and slots whose bytes
-        // the live row does not describe: the row is not committed and the cache is poisoned.
+        // A failure anywhere in this block, before or after the first copy, poisons the cache:
+        // from the first copy on it leaves copies in flight on `copy` and slots whose bytes the
+        // live row does not describe. The row is not committed.
         let copied = (|| -> Result<(), EngError> {
             for (part, slot, incoming, staged) in jobs {
                 let each = cache.record[part];

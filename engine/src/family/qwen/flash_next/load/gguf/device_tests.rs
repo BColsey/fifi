@@ -427,7 +427,7 @@ fn which_layer_first_differs_when_the_indexer_drops_positions() {
 #[test]
 #[ignore = "needs a GPU and the real file"]
 fn real_file_first_layers_follow_the_host_with_streamed_experts() {
-    // A deliberate `#[ignore]`d run: an unresolved location fails instead of passing vacuously.
+    // A run ignored on purpose: an unresolved location fails instead of passing vacuously.
     let path = crate::test_paths::required("FIFI_FLASH_GGUF");
     let open = || {
         GgufModel::open(&path)

@@ -93,7 +93,9 @@ pub(in crate::family::qwen::flash_next) fn weights_digest(
 }
 
 /// A cache with fewer slots per layer than the router picks fails every token: a pick without a
-/// slot finds no victim to evict. Refused at the start, before any device work, naming both.
+/// slot finds no victim to evict. Refused at the start, after the plan that gives the slot count
+/// (it needs the card's free memory) and before the tokenizer load and the engine thread, naming
+/// both numbers.
 pub(in crate::family::qwen::flash_next) fn check_slots(
     slots: usize,
     top_k: usize,
