@@ -7,7 +7,7 @@ use super::super::step_plan::{KernelScratch, Slot, StepPlan};
 use super::{
     BufferFacts, CardMoeOp, ExpertFacts, MoeDims, MoeOp, OpSlots, PackFacts, PackKind, ProjFacts,
     RangeFacts, RouteFacts, StackFacts, WeightFacts, check_block, moe_sequence, moe_sequence_card,
-    op_slots,
+    op_slots, router_shape,
 };
 use crate::EngError;
 use crate::family::decode_step::shard::ShardTable;
@@ -385,6 +385,17 @@ fn block_refuses_shape_mismatches_before_launch() {
     for (case, dims, weights, bufs, needle) in cases {
         assert_bad_request(check_block(&dims, &weights, &bufs), case, needle);
     }
+}
+
+/// A router matrix with padded rows passes `check_weights` (it refuses only a short one); the
+/// router op scores the dims' expert count, so the padded rows are never picked.
+#[test]
+fn a_router_with_padded_rows_scores_the_dims_experts() {
+    let dims = moe_dims(1);
+    let mut padded = weight_facts(&dims);
+    padded.router.bytes += dims.hidden * 4;
+    check_block(&dims, &padded, &buffer_facts(&dims)).expect("padded router rows are admitted");
+    assert_eq!(router_shape(&dims).n_expert, dims.n_expert);
 }
 
 /// The NATIVE sequence as a literal: the router first and the combine last (their places and

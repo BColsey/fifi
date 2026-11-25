@@ -1044,6 +1044,18 @@ fn row_at<'b>(
     slice(range, index * width, width)
 }
 
+/// The router shape of the layer. `n_expert` is the dims' count, the one the expert launches
+/// index by: `check_weights` admits a router matrix with padded rows, and scoring those rows
+/// would let the kernel pick an expert id the stacks do not hold.
+fn router_shape(dims: &MoeDims) -> RouterShape {
+    RouterShape {
+        m: dims.rows,
+        hidden: dims.hidden,
+        n_expert: dims.n_expert,
+        top_k: dims.top_k,
+    }
+}
+
 /// The router of `op` ([`MoeOp::Router`]): ids, pick weights and the shared gate on the device.
 fn op_router(
     launch: &Launch<'_>,
@@ -1051,18 +1063,10 @@ fn op_router(
     bufs: &MoeBuffers<'_>,
     dims: MoeDims,
 ) -> Result<(), EngError> {
-    // The router scores every expert of the layer: its own matrix says how many, whatever depth
-    // the expert stacks have.
-    let shape = RouterShape {
-        m: dims.rows,
-        hidden: dims.hidden,
-        n_expert: weights.router.bytes() / (dims.hidden * F32),
-        top_k: dims.top_k,
-    };
     launch.ctx.router(
         launch.stream,
         RouterCall {
-            shape,
+            shape: router_shape(&dims),
             x: bufs.route.norm_row,
             weights: RouterWeights {
                 w: whole(weights.router)?,
