@@ -10,7 +10,7 @@ mod prompt;
 pub(crate) mod resident;
 pub(crate) mod serve;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// The server-family key a config names to select this family. The starter
 /// serves the Nemotron Bolt E4B on the native-cuda build and refuses any

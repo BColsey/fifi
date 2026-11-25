@@ -2975,6 +2975,26 @@ mod tests {
                 identity.detail
             );
         }
+
+        // The pass arm: the canonical Bolt inventory in the one file the load opens, beside
+        // the tokenizer files the directory check wants.
+        crate::family::gemma::gemma4::tests::write_canonical_bolt(&dir.path().join("model.gguf"));
+        for name in crate::capability::inspect::TOKENIZER_FILES {
+            std::fs::write(dir.path().join(name), "{}").expect("write a tokenizer file");
+        }
+        let candidate = Candidate {
+            family: Some(crate::family::gemma::gemma4::FAMILY.to_owned()),
+            ..Candidate::default()
+        };
+        let bolt = super::preflight(dir.path(), dir.path(), &candidate, &cuda).expect("report");
+        assert_eq!(
+            check_named(&bolt, "Bolt checkpoint").status,
+            CheckStatus::Pass,
+            "{:?}",
+            bolt.checks
+        );
+        assert_eq!(bolt.verdict, Verdict::Experimental, "{:?}", bolt.checks);
+        assert_eq!(bolt.dimensions.qualification, Qualification::Unverified);
     }
 
     #[test]

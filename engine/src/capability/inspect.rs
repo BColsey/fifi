@@ -57,9 +57,8 @@ pub struct ModelInspection {
     /// split set) that was asked for.
     pub weights_path: PathBuf,
     pub files: Vec<FileFact>,
-    /// Every `.gguf` file, parsed header-first. `None` inside the vector
-    /// is impossible: an unparseable GGUF lands in `gguf_errors` instead,
-    /// with the parser's own message.
+    /// Parsed `.gguf` files and Inkling mainline `.gguf_file` artifacts. Files that fail to
+    /// parse appear in `gguf_errors` with the parser's message.
     pub gguf_files: Vec<GgufFact>,
     pub gguf_errors: Vec<String>,
     pub safetensors_files: usize,
@@ -404,6 +403,28 @@ mod tests {
         let dir = PathBuf::from("/nonexistent/fifi-model-dir");
         let error = crate::capability::describe_error(&inspect(&dir, &dir).unwrap_err());
         assert!(error.contains("not a directory"), "{error}");
+    }
+
+    // A GGUF beside the Inkling safetensors whose header does not parse cannot be told from
+    // a second text checkpoint, so selection refuses the directory instead of guessing.
+    #[test]
+    fn inkling_selection_refuses_an_unreadable_gguf_sidecar() {
+        let dir = scratch("inkling-invalid-sidecar");
+        std::fs::write(dir.join("weights.safetensors"), [0]).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"inkling2_loop"}"#).unwrap();
+        assert!(
+            inspect(&dir, &dir)
+                .unwrap()
+                .inkling_gguf()
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(dir.join("draft.gguf"), b"GGUF-not-a-header").unwrap();
+        let report = inspect(&dir, &dir).unwrap();
+        assert!(report.has_inkling_safetensors());
+        let error = report.inkling_gguf().unwrap_err().describe();
+        assert!(error.contains("draft.gguf"), "{error}");
     }
 
     #[test]

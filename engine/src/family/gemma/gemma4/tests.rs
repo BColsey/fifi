@@ -799,6 +799,12 @@ fn write_bolt_gguf(
     write_bolt_gguf_payload(kvs, tensors, &[], path);
 }
 
+/// The checkpoint other modules' tests serve: the Bolt conversion's metadata and tensor
+/// inventory in one file, which passes `serve::bolt_geometry`.
+pub(crate) fn write_canonical_bolt(path: &std::path::Path) {
+    write_bolt_gguf(&bolt_base_kvs(&[]), &bolt_tensors(), path);
+}
+
 /// The scalar metadata of the Bolt conversion, minus excluded keys.
 fn bolt_base_kvs(exclude: &[&str]) -> Vec<Kv> {
     let mut heads = Vec::new();
