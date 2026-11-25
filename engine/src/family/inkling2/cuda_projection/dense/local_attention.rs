@@ -364,8 +364,9 @@ impl DenseStep {
         Ok(())
     }
 
-    /// The six gate halves: `inkling_stream_norm` of the shared input and of each message
-    /// into `[input | message]` rows with eps `MIX_EPS`; health into `gate_health`.
+    /// The six gate halves: one `inkling_stream_norm_rows` launch that norms the shared input
+    /// and each message into `[input | message]` rows with eps `MIX_EPS`; health into
+    /// `gate_health`.
     fn norm_gates(
         &self,
         context: &CudaContext,
@@ -377,23 +378,23 @@ impl DenseStep {
         ),
         hidden: usize,
     ) -> Result<(), EngError> {
-        for role in 0..3 {
-            for (half, src) in [&inputs[role], &messages[role]].into_iter().enumerate() {
+        // One launch: the six norms are independent rows of one width.
+        let rows = (0..3)
+            .flat_map(|role| {
+                [&inputs[role], &messages[role]]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(half, src)| (role, half, src))
+            })
+            .map(|(role, half, src)| {
                 let at = (2 * role + half) * hidden;
-                let dst = self.range(Slot::Output, at, hidden)?;
-                let health =
-                    health.slice((2 * role + half) * size_of::<f32>(), size_of::<f32>())?;
-                context.inkling_stream_norm(
-                    stream,
-                    NormCall {
-                        src: *src,
-                        dst,
-                        health,
-                    },
-                    (hidden, MIX_EPS),
-                )?;
-            }
-        }
-        Ok(())
+                Ok(NormCall {
+                    src: *src,
+                    dst: self.range(Slot::Output, at, hidden)?,
+                    health: health.slice((2 * role + half) * size_of::<f32>(), size_of::<f32>())?,
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        context.inkling_stream_norm_rows(stream, &rows, (hidden, MIX_EPS))
     }
 }

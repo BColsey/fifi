@@ -186,13 +186,9 @@ impl TokenWorkspace {
             append(&mut c, &f.weights.vec(name, h)?);
         }
         let constants = ctx.upload(&c)?;
-        let zeros = slots
-            .iter()
-            .map(|s| s.status_bytes)
-            .max()
-            .unwrap_or(0)
-            .max(health.bytes);
-        let params = ctx.upload(&vec![0; 8 + zeros])?;
+        // The device word holds the position and the token id (8 zeroed bytes); its zeros
+        // beyond them clear the health words of every token.
+        let params = ctx.upload(&vec![0; 8 + health.bytes])?;
         let depth = [ctx.allocate(depth_bytes)?, ctx.allocate(depth_bytes)?];
         let prelude = ctx.allocate(prelude_bytes)?;
         let journal = ctx.allocate(end)?;
@@ -328,6 +324,17 @@ impl TokenWorkspace {
                 h,
                 f.math.rms_norm_eps,
             )?;
+            // One launch zeroes every slot's status words before the chains and one gathers them
+            // into the journal afterwards, instead of a device copy before and after each chain.
+            let statuses = self
+                .slots
+                .iter()
+                .map(|s| {
+                    s.w.arena
+                        .range(s.w.layout.attention_status.start, s.status_bytes)
+                })
+                .collect::<Result<Vec<_>, EngError>>()?;
+            ctx.inkling_zero_words(stream, &statuses)?;
             for s in &self.slots {
                 let w = &s.w;
                 let l = &w.layout;
@@ -346,8 +353,6 @@ impl TokenWorkspace {
                         d.range(0, self.prelude_bytes)?,
                     )?;
                 }
-                let status = w.arena.range(l.attention_status.start, s.status_bytes)?;
-                ctx.copy_device(stream, params.range(8, s.status_bytes)?, status)?;
                 let b = &self.depth[s.active ^ 1];
                 Execution {
                     plan: &w.plan,
@@ -363,8 +368,14 @@ impl TokenWorkspace {
                     }),
                 }
                 .enqueue(cuda, f.position)?;
-                ctx.copy_device(stream, status, s.receipt.device(&self.journal)?)?;
             }
+            let receipts = self
+                .slots
+                .iter()
+                .zip(&statuses)
+                .map(|(s, status)| Ok((status.clone(), s.receipt.device(&self.journal)?)))
+                .collect::<Result<Vec<_>, EngError>>()?;
+            ctx.inkling_copy_words(stream, &receipts)?;
             let last = self.slots.last().ok_or_else(|| bad("empty token chain"))?;
             let shape = last.w.plan.shape;
             let blocks = shape.blocks + usize::from(shape.seal);

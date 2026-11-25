@@ -24,7 +24,9 @@ use crate::{
             dense_gemv::DenseDtype,
             inkling_conv::ConvCall,
             inkling_local_prep::PrepMath,
-            inkling_stream::{AddCall, MAX_BLOCKS, MixCall, MixShape, SealCall, StreamShape},
+            inkling_stream::{
+                AddCall, MAX_BLOCKS, MixCall, MixJob, MixShape, SealCall, StreamShape,
+            },
         },
     },
 };
@@ -636,7 +638,10 @@ impl Execution<'_> {
     fn enqueue(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
         let l = self.layout;
         let shape = self.plan.shape;
-        let (depth, bank) = ((l.depth, 0), (l.bank, shape.bank_first));
+        let width = shape.widths.hidden;
+        // The bank queries and the attention query read different stream states (the bank and
+        // the depth), so one launch holds a block per mix and they run in parallel.
+        let mut jobs = Vec::with_capacity(5);
         for (query, out) in self
             .weights
             .bank_queries
@@ -644,18 +649,36 @@ impl Execution<'_> {
             .flatten()
             .zip(l.messages)
         {
-            self.mix(bank, shape.bank_blocks, query, out)?;
+            jobs.push(MixJob {
+                state: self.row(l.bank.row((shape.bank_blocks + 1) * width))?,
+                query: self.weights.row(query)?,
+                out: self.row(out)?,
+                health: self.row(l.glue_health)?,
+                first_block: shape.bank_first,
+                blocks: shape.bank_blocks,
+            });
         }
         let input = match self.weights.attention_query {
             Some(query) => {
-                self.mix(depth, shape.blocks, query, l.attention_input)?;
+                jobs.push(MixJob {
+                    state: self.row(l.depth.row((shape.blocks + 1) * width))?,
+                    query: self.weights.row(query)?,
+                    out: self.row(l.attention_input)?,
+                    health: self.row(l.glue_health)?,
+                    first_block: 0,
+                    blocks: shape.blocks,
+                });
                 l.attention_input
             }
-            None => l.depth.row(shape.widths.hidden),
+            None => l.depth.row(width),
         };
+        if !jobs.is_empty() {
+            self.context
+                .inkling_stream_mix_jobs(self.stream, &jobs, (width, MIX_EPS))?;
+        }
         self.attention(cuda, position, input)?;
         let blocks = self.advance_depth()?;
-        self.mix(depth, blocks, self.weights.mlp_query, l.mlp_input)?;
+        self.mix((l.depth, 0), blocks, self.weights.mlp_query, l.mlp_input)?;
         self.mlp(cuda)?;
         self.add(l.mlp_conv)
     }

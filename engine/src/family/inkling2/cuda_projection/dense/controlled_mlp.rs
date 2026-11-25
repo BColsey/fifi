@@ -265,21 +265,20 @@ impl DenseStep {
         enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
     ) -> Result<(), EngError> {
         let row = rows.input.bytes();
-        // The gate halves: the normalized input, then the normalized message.
-        for (src, dst) in [
-            (rows.input, work.gate.slice(0, row)?),
-            (rows.message, work.gate.slice(row, row)?),
-        ] {
-            context.inkling_stream_norm(
-                stream,
-                NormCall {
-                    src,
-                    dst,
-                    health: rows.gate_health,
-                },
-                (work.width, MIX_EPS),
-            )?;
-        }
+        // The gate halves: the normalized input, then the normalized message, in one launch.
+        let gates = [
+            NormCall {
+                src: rows.input,
+                dst: work.gate.slice(0, row)?,
+                health: rows.gate_health,
+            },
+            NormCall {
+                src: rows.message,
+                dst: work.gate.slice(row, row)?,
+                health: rows.gate_health,
+            },
+        ];
+        context.inkling_stream_norm_rows(stream, &gates, (work.width, MIX_EPS))?;
         for (src, at) in [(rows.input, 0), (rows.message, row), (rows.gamma, 2 * row)] {
             context.copy_device(stream, src, work.norm.slice(at, row)?)?;
         }

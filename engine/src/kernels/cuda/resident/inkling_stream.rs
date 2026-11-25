@@ -14,10 +14,13 @@ use crate::EngError;
 use crate::kernels::cuda::{
     CudaContext, DeviceRange, DeviceStream,
     context::{Claim, require_apart, require_fit},
+    native::resident::RawRange,
 };
 
 pub(crate) use super::super::native::resident::inkling_stream::MAX_BLOCKS;
-use super::super::native::resident::inkling_stream::{self as native};
+use super::super::native::resident::inkling_stream::{
+    self as native, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_WORD_ROWS,
+};
 
 const MAX_WIDTH: usize = 8192;
 
@@ -27,6 +30,17 @@ pub(crate) struct MixCall<'a> {
     pub(crate) query: DeviceRange<'a>,
     pub(crate) out: DeviceRange<'a>,
     pub(crate) health: DeviceRange<'a>,
+}
+
+/// One mix of a `inkling_stream_mix_jobs` launch: the ranges of [`MixCall`] with the first and
+/// last sealed rows of [`MixShape`]; the width and eps belong to the launch.
+pub(crate) struct MixJob<'a> {
+    pub(crate) state: DeviceRange<'a>,
+    pub(crate) query: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) health: DeviceRange<'a>,
+    pub(crate) first_block: usize,
+    pub(crate) blocks: usize,
 }
 
 /// The sealed rows `first_block..blocks` join the mix, newest first; the current row comes last.
@@ -115,6 +129,88 @@ fn writes_apart<'a>(
 }
 
 impl CudaContext {
+    /// Zero every range in one launch, one block per range. Each range holds whole words.
+    pub(crate) fn inkling_zero_words(
+        &self,
+        stream: &DeviceStream,
+        ranges: &[DeviceRange<'_>],
+    ) -> Result<(), EngError> {
+        if ranges.is_empty() || ranges.len() > MAX_WORD_ROWS {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling word rows take 1 to {MAX_WORD_ROWS} ranges, got {}",
+                ranges.len()
+            )));
+        }
+        for range in ranges {
+            require_fit("Inkling word row", range, 1, align_of::<f32>())?;
+            if !range.bytes().is_multiple_of(size_of::<f32>()) {
+                return Err(EngError::BadRequest(
+                    "the CUDA Inkling word row holds a whole number of words".into(),
+                ));
+            }
+        }
+        self.ensure_usable()?;
+        let raw = ranges
+            .iter()
+            .map(|range| self.raw_range(range))
+            .collect::<Result<Vec<_>, EngError>>()?;
+        self.launch_on(stream, |s| native::zero_words(s, &raw))
+    }
+
+    /// Copy every `(source, destination)` pair in one launch, one block per pair; each pair
+    /// holds the same whole number of words and shares no byte.
+    pub(crate) fn inkling_copy_words(
+        &self,
+        stream: &DeviceStream,
+        pairs: &[(DeviceRange<'_>, DeviceRange<'_>)],
+    ) -> Result<(), EngError> {
+        if pairs.is_empty() || pairs.len() > MAX_WORD_ROWS {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling word rows take 1 to {MAX_WORD_ROWS} pairs, got {}",
+                pairs.len()
+            )));
+        }
+        for (source, destination) in pairs {
+            require_fit("Inkling word row source", source, 1, align_of::<f32>())?;
+            require_fit(
+                "Inkling word row destination",
+                destination,
+                1,
+                align_of::<f32>(),
+            )?;
+            if source.bytes() != destination.bytes()
+                || !source.bytes().is_multiple_of(size_of::<f32>())
+            {
+                return Err(EngError::BadRequest(
+                    "the CUDA Inkling word row copies hold the same whole number of words".into(),
+                ));
+            }
+            require_apart(
+                &Claim::of("Inkling word row source", source, source.bytes()),
+                &Claim::of(
+                    "Inkling word row destination",
+                    destination,
+                    destination.bytes(),
+                ),
+            )?;
+        }
+        self.ensure_usable()?;
+        let raw = pairs
+            .iter()
+            .map(|(source, destination)| {
+                Ok((self.raw_range(source)?, self.raw_range(destination)?))
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        self.launch_on(stream, |s| native::copy_words(s, &raw))
+    }
+}
+
+/// True when both ranges start at the same byte of the same allocation.
+fn same_start(a: &DeviceRange<'_>, b: &DeviceRange<'_>) -> bool {
+    std::ptr::eq(a.buffer(), b.buffer()) && a.offset() == b.offset()
+}
+
+impl CudaContext {
     /// `Stream::mix(first_block, query)` of the host: the softmax-weighted mean of the sealed
     /// rows `first_block..blocks` (newest first) and the normalized current row, each scored by
     /// `dot(row, query) / sqrt(width)`. Agrees with the host within floating-point error.
@@ -158,14 +254,86 @@ impl CudaContext {
         self.launch_on(stream, |raw| {
             native::mix(
                 raw,
-                state,
-                query,
-                out,
-                health,
+                [state, query, out, health],
                 [shape.first_block, shape.blocks, shape.width],
                 shape.eps,
             )
         })
+    }
+
+    /// Independent [`Self::inkling_stream_mix`] launches in one: one block per job, every job
+    /// over the same `width` and `eps`. Each job passes the checks of the single mix; no job's
+    /// output or health word shares a byte with another job's row, output or health word, unless
+    /// jobs name the same health word (each would store the same quiet NaN).
+    pub(crate) fn inkling_stream_mix_jobs(
+        &self,
+        stream: &DeviceStream,
+        jobs: &[MixJob<'_>],
+        (width, eps): (usize, f32),
+    ) -> Result<(), EngError> {
+        if jobs.is_empty() || jobs.len() > MAX_MIX_JOBS {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling stream mixes 1 to {MAX_MIX_JOBS} jobs at once, got {}",
+                jobs.len()
+            )));
+        }
+        let row = width * size_of::<f32>();
+        let health = size_of::<f32>();
+        let mut claims = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            check_shape("mix", job.first_block, job.blocks, width, eps)?;
+            let state = (job.blocks + 1) * row;
+            check_row("Inkling stream state", &job.state, state)?;
+            check_row("Inkling stream query", &job.query, row)?;
+            check_row("Inkling stream mix output", &job.out, row)?;
+            check_row("Inkling stream health", &job.health, health)?;
+            let (state, query) = (
+                Claim::of("Inkling stream state", &job.state, state),
+                Claim::of("Inkling stream query", &job.query, row),
+            );
+            let (out, health) = (
+                Claim::of("Inkling stream mix output", &job.out, row),
+                Claim::of("Inkling stream health", &job.health, health),
+            );
+            writes_apart([out, health], [state, query])?;
+            claims.push([state, query, out, health]);
+        }
+        for (i, [state, query, out, health]) in claims.iter().enumerate() {
+            for (other, [other_state, other_query, other_out, other_health]) in
+                claims[i + 1..].iter().enumerate()
+            {
+                require_apart(out, other_out)?;
+                require_apart(out, other_state)?;
+                require_apart(out, other_query)?;
+                require_apart(other_out, state)?;
+                require_apart(other_out, query)?;
+                if !same_start(&jobs[i].health, &jobs[i + 1 + other].health) {
+                    require_apart(out, other_health)?;
+                    require_apart(other_out, health)?;
+                    require_apart(health, other_health)?;
+                }
+                require_apart(health, other_state)?;
+                require_apart(health, other_query)?;
+                require_apart(other_health, state)?;
+                require_apart(other_health, query)?;
+            }
+        }
+        self.ensure_usable()?;
+        let raw: Vec<([RawRange<'_>; 4], [usize; 2])> = jobs
+            .iter()
+            .map(|job| {
+                Ok((
+                    [
+                        self.raw_range(&job.state)?,
+                        self.raw_range(&job.query)?,
+                        self.raw_range(&job.out)?,
+                        self.raw_range(&job.health)?,
+                    ],
+                    [job.first_block, job.blocks],
+                ))
+            })
+            .collect::<Result<_, EngError>>()?;
+        self.launch_on(stream, |s| native::mix_jobs(s, &raw, (width, eps)))
     }
 
     /// `Stream::seal(next)` of the host: the current row is RMS-normalized into the new sealed
@@ -237,35 +405,67 @@ impl CudaContext {
         self.launch_on(stream, |raw| native::add(raw, state, row, health, width))
     }
 
-    /// One gate half of a cross-pass controller: `dst = src * rms_scale(src)` with `eps`, the
-    /// host's `rms_norm_with_scale`. Agrees with the host within rounding.
-    pub(crate) fn inkling_stream_norm(
+    /// `dst = src * rms_scale(src)` with `eps`, the host's `rms_norm_with_scale`, for every
+    /// row in one launch, one block per row, all over the same `width` and `eps` (the gate
+    /// halves of the cross-pass controllers). A row's output and health word share no byte
+    /// with its source; no row's output or health word shares a byte with another row's ranges,
+    /// unless rows name the same health word (each stores the same quiet NaN). Agrees with the
+    /// host within floating-point error.
+    pub(crate) fn inkling_stream_norm_rows(
         &self,
         stream: &DeviceStream,
-        call: NormCall<'_>,
+        rows: &[NormCall<'_>],
         (width, eps): (usize, f32),
     ) -> Result<(), EngError> {
-        check_shape("norm", 0, 0, width, eps)?;
+        if rows.is_empty() || rows.len() > MAX_NORM_ROWS {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling stream norms 1 to {MAX_NORM_ROWS} rows at once, got {}",
+                rows.len()
+            )));
+        }
         let row = width * size_of::<f32>();
         let health = size_of::<f32>();
-        check_row("Inkling stream norm source", &call.src, row)?;
-        check_row("Inkling stream norm output", &call.dst, row)?;
-        check_row("Inkling stream health", &call.health, health)?;
-        writes_apart(
-            [
+        let mut claims = Vec::with_capacity(rows.len());
+        for call in rows {
+            check_shape("norm", 0, 0, width, eps)?;
+            check_row("Inkling stream norm source", &call.src, row)?;
+            check_row("Inkling stream norm output", &call.dst, row)?;
+            check_row("Inkling stream health", &call.health, health)?;
+            let src = Claim::of("Inkling stream norm source", &call.src, row);
+            let (out, health) = (
                 Claim::of("Inkling stream norm output", &call.dst, row),
                 Claim::of("Inkling stream health", &call.health, health),
-            ],
-            [Claim::of("Inkling stream norm source", &call.src, row)],
-        )?;
+            );
+            writes_apart([out, health], [src])?;
+            claims.push([src, out, health]);
+        }
+        for (r, [src, out, health]) in claims.iter().enumerate() {
+            for (other, [other_src, other_out, other_health]) in claims[r + 1..].iter().enumerate()
+            {
+                require_apart(out, other_src)?;
+                require_apart(other_out, src)?;
+                require_apart(out, other_out)?;
+                if same_start(&rows[r].health, &rows[r + 1 + other].health) {
+                    continue;
+                }
+                require_apart(out, other_health)?;
+                require_apart(other_out, health)?;
+                require_apart(health, other_health)?;
+                require_apart(health, other_src)?;
+                require_apart(other_health, src)?;
+            }
+        }
         self.ensure_usable()?;
-        let (src, dst, health) = (
-            self.raw_range(&call.src)?,
-            self.raw_range(&call.dst)?,
-            self.raw_range(&call.health)?,
-        );
-        self.launch_on(stream, |raw| {
-            native::norm(raw, src, dst, health, width, eps)
-        })
+        let raw: Vec<[RawRange<'_>; 3]> = rows
+            .iter()
+            .map(|call| {
+                Ok([
+                    self.raw_range(&call.src)?,
+                    self.raw_range(&call.dst)?,
+                    self.raw_range(&call.health)?,
+                ])
+            })
+            .collect::<Result<_, EngError>>()?;
+        self.launch_on(stream, |s| native::norm_rows(s, &raw, (width, eps)))
     }
 }

@@ -2,7 +2,10 @@ use std::mem::size_of;
 
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
-use super::{AddCall, MAX_BLOCKS, MixCall, MixShape, NormCall, SealCall, StreamShape};
+use super::{
+    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_WORD_ROWS, MixCall, MixJob, MixShape, NormCall,
+    SealCall, StreamShape,
+};
 
 const EPS: f32 = 1e-5;
 
@@ -504,7 +507,7 @@ fn wrapper_rejects_bad_shapes_and_shared_bytes_before_launching() {
 }
 
 #[test]
-fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
+fn norm_rows_match_the_host_scale_and_refuse_shared_bytes() {
     if !device_present("Inkling stream norm") {
         return;
     }
@@ -514,36 +517,72 @@ fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
     let row = row_bytes(width);
     let word = size_of::<f32>();
     let buffers = Buffers::new(&ctx, width);
-    let src = normal_row(&mut Rng::new(0x5eed_5730), width);
-    upload(&buffers.row, &stream, &src);
+    let mut rng = Rng::new(0x5eed_5730);
+    let rows = [normal_row(&mut rng, width), normal_row(&mut rng, width)];
+    // Two sources: the test row and its negation (the same scale, a different row).
+    upload(&buffers.row, &stream, &rows[0]);
+    upload(&buffers.out, &stream, &rows[1]);
     buffers.clear_health(&stream);
-    ctx.inkling_stream_norm(
+    let call = |src, dst, health| NormCall { src, dst, health };
+    ctx.inkling_stream_norm_rows(
         &stream,
-        NormCall {
-            src: buffers.row.range(0, row).unwrap(),
-            dst: buffers.out.range(0, row).unwrap(),
-            health: buffers.health.range(0, word).unwrap(),
-        },
+        &[
+            call(
+                buffers.row.range(0, row).unwrap(),
+                buffers.state.range(0, row).unwrap(),
+                buffers.health.range(0, word).unwrap(),
+            ),
+            call(
+                buffers.out.range(0, row).unwrap(),
+                buffers.query.range(0, row).unwrap(),
+                buffers.health.range(0, word).unwrap(),
+            ),
+        ],
         (width, EPS),
     )
     .unwrap();
-    let expected = host::norm(&src, EPS);
-    for (a, b) in download(&buffers.out, &stream, 0, width)
-        .iter()
-        .zip(&expected)
-    {
-        assert!((a - b).abs() <= 1e-6 * (1.0 + b.abs()), "{a} vs {b}");
+    for (buffer, source) in [(&buffers.state, &rows[0]), (&buffers.query, &rows[1])] {
+        let expected = host::norm(source, EPS);
+        for (a, b) in download(buffer, &stream, 0, width).iter().zip(&expected) {
+            assert!((a - b).abs() <= 1e-6 * (1.0 + b.abs()), "{a} vs {b}");
+        }
     }
+    // Both rows named one health word: each block found every value finite and left it zero.
     assert_eq!(buffers.health(&stream).to_bits(), 0);
 
     let error = ctx
-        .inkling_stream_norm(
+        .inkling_stream_norm_rows(
             &stream,
-            NormCall {
-                src: buffers.out.range(0, row).unwrap(),
-                dst: buffers.out.range(0, row).unwrap(),
-                health: buffers.health.range(0, word).unwrap(),
-            },
+            &[
+                call(
+                    buffers.row.range(0, row).unwrap(),
+                    buffers.state.range(0, row).unwrap(),
+                    buffers.health.range(0, word).unwrap(),
+                ),
+                call(
+                    buffers.out.range(0, row).unwrap(),
+                    buffers.state.range(0, row).unwrap(),
+                    buffers.health.range(0, word).unwrap(),
+                ),
+            ],
+            (width, EPS),
+        )
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(
+        error.contains(
+            "the CUDA Inkling stream norm output and Inkling stream norm output ranges overlap"
+        ),
+        "{error}"
+    );
+    let error = ctx
+        .inkling_stream_norm_rows(
+            &stream,
+            &[call(
+                buffers.state.range(0, row).unwrap(),
+                buffers.state.range(0, row).unwrap(),
+                buffers.health.range(0, word).unwrap(),
+            )],
             (width, EPS),
         )
         .map_err(|error| format!("{error:?}"))
@@ -554,4 +593,194 @@ fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
         ),
         "{error}"
     );
+}
+
+/// The host algorithm's stream state for `blocks` sealed rows and a new current row.
+fn job_state(rng: &mut Rng, width: usize, blocks: usize) -> Vec<f32> {
+    let mut current = normal_row(rng, width);
+    let mut state = Vec::new();
+    for _ in 0..blocks {
+        let sealed = host::seal(&mut current, normal_row(rng, width), EPS);
+        state.push(sealed);
+    }
+    let mut rows = state.concat();
+    rows.extend_from_slice(&current);
+    rows
+}
+
+#[test]
+fn mix_jobs_equal_the_single_launches_bit_for_bit() {
+    if !device_present("Inkling stream mix jobs") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let width = 2304;
+    let row = row_bytes(width);
+    let word = size_of::<f32>();
+    let mut rng = Rng::new(0x5eed_5731);
+    // Bank mixes start inside the sealed rows; the attention mix reads all of them.
+    let shapes = [
+        [0usize, 0usize],
+        [3, 7],
+        [0, 12],
+        [12, 12],
+        [5, 9],
+        [1, 2],
+        [0, 1],
+        [7, 8],
+    ];
+    let count = shapes.len();
+    assert_eq!(count, MAX_MIX_JOBS);
+    let state = ctx
+        .allocate(row * shapes.iter().map(|[_, b]| b + 1).sum::<usize>())
+        .unwrap();
+    let queries = ctx.allocate(row * count).unwrap();
+    let single = ctx.allocate(row * count).unwrap();
+    let together = ctx.allocate(row * count).unwrap();
+    let health = ctx.allocate(word).unwrap();
+    let mut at = 0;
+    let mut jobs = Vec::new();
+    for (j, [first_block, blocks]) in shapes.into_iter().enumerate() {
+        let rows = blocks + 1;
+        state
+            .write_at(
+                &stream,
+                at * row,
+                &bytes(&job_state(&mut rng, width, blocks)),
+            )
+            .unwrap();
+        queries
+            .write_at(&stream, j * row, &bytes(&normal_row(&mut rng, width)))
+            .unwrap();
+        upload(&health, &stream, &[0.0]);
+        let job = MixJob {
+            state: state.range(at * row, rows * row).unwrap(),
+            query: queries.range(j * row, row).unwrap(),
+            out: single.range(j * row, row).unwrap(),
+            health: health.range(0, word).unwrap(),
+            first_block,
+            blocks,
+        };
+        ctx.inkling_stream_mix(
+            &stream,
+            MixCall {
+                state: job.state.clone(),
+                query: job.query.clone(),
+                out: job.out.clone(),
+                health: job.health.clone(),
+            },
+            MixShape {
+                first_block,
+                blocks,
+                width,
+                eps: EPS,
+            },
+        )
+        .unwrap();
+        assert_eq!(download(&health, &stream, 0, 1)[0].to_bits(), 0, "job {j}");
+        jobs.push(MixJob {
+            out: together.range(j * row, row).unwrap(),
+            ..job
+        });
+        at += rows;
+    }
+    ctx.inkling_stream_mix_jobs(&stream, &jobs, (width, EPS))
+        .unwrap();
+    assert_eq!(
+        download(&single, &stream, 0, count * width),
+        download(&together, &stream, 0, count * width),
+        "one launch with a block per job differs from the single launches"
+    );
+    assert_eq!(download(&health, &stream, 0, 1)[0].to_bits(), 0);
+    // Two jobs may not write the same output row; a job may not read another job's output.
+    let mut clash = Vec::new();
+    for job in &jobs {
+        clash.push(MixJob {
+            state: job.state.clone(),
+            query: job.query.clone(),
+            out: job.out.clone(),
+            health: job.health.clone(),
+            first_block: job.first_block,
+            blocks: job.blocks,
+        });
+    }
+    clash[1].out = clash[0].out.clone();
+    let error = ctx
+        .inkling_stream_mix_jobs(&stream, &clash, (width, EPS))
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(error.contains("overlap"), "{error}");
+    clash[1].out = together.range(row, row).unwrap();
+    clash[0].query = clash[1].out.clone();
+    let error = ctx
+        .inkling_stream_mix_jobs(&stream, &clash, (width, EPS))
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(error.contains("overlap"), "{error}");
+}
+
+#[test]
+fn word_rows_zero_and_copy_whole_words_in_one_launch() {
+    if !device_present("Inkling word rows") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let words = [1usize, 70, 3, 256];
+    let total: usize = words.iter().sum();
+    let source = ctx.allocate(total * 4).unwrap();
+    let target = ctx.allocate(total * 4).unwrap();
+    let mut at = 0;
+    let mut zeros = Vec::new();
+    let mut pairs = Vec::new();
+    for &n in &words {
+        let s = source.range(at * 4, n * 4).unwrap();
+        let t = target.range(at * 4, n * 4).unwrap();
+        zeros.push(t.clone());
+        pairs.push((s, t));
+        at += n;
+    }
+    upload(&source, &stream, &vec![7.0; total]);
+    upload(&target, &stream, &vec![9.0; total]);
+    ctx.inkling_zero_words(&stream, &zeros).unwrap();
+    assert!(
+        download(&target, &stream, 0, total)
+            .iter()
+            .all(|v| v.to_bits() == 0)
+    );
+    ctx.inkling_copy_words(&stream, &pairs).unwrap();
+    assert!(
+        download(&target, &stream, 0, total)
+            .iter()
+            .all(|v| *v == 7.0)
+    );
+    // A row that is not a whole number of words, a pair of different sizes, a pair that shares
+    // bytes, an empty list and too many rows are refused before any launch.
+    let error = ctx
+        .inkling_zero_words(&stream, &[target.range(0, 6).unwrap()])
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(error.contains("whole number of words"), "{error}");
+    let error = ctx
+        .inkling_copy_words(
+            &stream,
+            &[(source.range(0, 8).unwrap(), target.range(0, 12).unwrap())],
+        )
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(error.contains("same whole number of words"), "{error}");
+    let error = ctx
+        .inkling_copy_words(
+            &stream,
+            &[(source.range(0, 8).unwrap(), source.range(4, 8).unwrap())],
+        )
+        .map_err(|error| format!("{error:?}"))
+        .unwrap_err();
+    assert!(error.contains("overlap"), "{error}");
+    assert!(ctx.inkling_zero_words(&stream, &[]).is_err());
+    let many = (0..=MAX_WORD_ROWS)
+        .map(|_| zeros[0].clone())
+        .collect::<Vec<_>>();
+    assert!(ctx.inkling_zero_words(&stream, &many).is_err());
 }

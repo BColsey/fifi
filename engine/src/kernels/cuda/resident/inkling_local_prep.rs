@@ -225,7 +225,9 @@ impl CudaContext {
         Ok(())
     }
 
-    /// Launch-only, single-row RMSNorm/gamma. The transaction owns the status
+    /// Launch-only, single-row RMSNorm/gamma with the parallel reduction (within
+    /// floating-point error of the host row). Only the resident decode chain calls it; the
+    /// readback form above keeps the host's summation order. The transaction owns the status
     /// word until its final fence; validation still precedes the launch.
     pub(crate) fn enqueue_row_weighted_norm(
         &self,
@@ -247,7 +249,7 @@ impl CudaContext {
         let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
         let raw = [a?, b?, c?, d?];
         self.launch_on(stream, |s| {
-            resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps)
+            resident::inkling_local_prep::weighted_norm_reduced(s, raw, [1, width], eps)
         })
     }
 
@@ -507,6 +509,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The parallel reduction of the launch-only row norm: the host row within rounding (the
+    /// lane-strided sums, the warp trees and the warp-ordered partials reorder the additions).
+    #[test]
+    fn row_weighted_norm_matches_the_host_row_within_rounding() {
+        if !device_present("Inkling CUDA reduced row norm") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let mut seed = 43_u32;
+        let mut generate = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 8) as f32 * (1.0 / 8388608.0) - 1.0
+                })
+                .collect::<Vec<_>>()
+        };
+        for width in [129usize, 1024, 2304, 4096] {
+            let input = generate(width);
+            let gamma = generate(width);
+            let x = upload_bytes(&ctx, bytes(&input).as_flattened());
+            let g = upload_bytes(&ctx, bytes(&gamma).as_flattened());
+            let y = ctx.allocate(width * 4).unwrap();
+            let status = ctx.allocate(4).unwrap();
+            let eps = 1.0e-6f32;
+            ctx.enqueue_row_weighted_norm(
+                &stream,
+                [
+                    x.range(0, x.bytes()).unwrap(),
+                    g.range(0, g.bytes()).unwrap(),
+                    y.range(0, y.bytes()).unwrap(),
+                    status.range(0, status.bytes()).unwrap(),
+                ],
+                width,
+                eps,
+            )
+            .unwrap();
+            let actual = read_bytes(&ctx, &y, y.bytes());
+            let expected = ordered_norm(&input, &gamma, eps);
+            for (i, (a, b)) in actual
+                .chunks_exact(4)
+                .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+                .zip(expected.iter().map(|bits| f32::from_bits(*bits)))
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() <= 4e-6 * (1.0 + b.abs()),
+                    "width {width}, element {i}: {a} vs {b}"
+                );
+            }
+            let word = read_bytes(&ctx, &status, 4);
+            assert_eq!(
+                f32::from_ne_bytes(word[..4].try_into().unwrap()),
+                0.0,
+                "width {width}"
+            );
+        }
+        // A non-finite input is reported in the status word (the kernel writes it either way).
+        let width = 4;
+        let x = upload_bytes(&ctx, bytes(&[1.0, 2.0, f32::NAN, 4.0]).as_flattened());
+        let g = upload_bytes(&ctx, bytes(&[1.0; 4]).as_flattened());
+        let y = ctx.allocate(16).unwrap();
+        let status = ctx.allocate(4).unwrap();
+        ctx.enqueue_row_weighted_norm(
+            &stream,
+            [
+                x.range(0, 16).unwrap(),
+                g.range(0, 16).unwrap(),
+                y.range(0, 16).unwrap(),
+                status.range(0, 4).unwrap(),
+            ],
+            width,
+            1.0e-6,
+        )
+        .unwrap();
+        let word = read_bytes(&ctx, &status, 4);
+        assert_eq!(f32::from_ne_bytes(word[..4].try_into().unwrap()), 1.0);
     }
 
     #[test]
