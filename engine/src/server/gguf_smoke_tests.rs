@@ -124,6 +124,34 @@ async fn await_ready(address: std::net::SocketAddr, engine: &Engine) {
     }
 }
 
+/// The server of the smoke: one engine over the pinned GGUF (the two directories name the
+/// environment), bound to a loopback port and waited until ready. A start refusal (a missing
+/// manifest, the switch off, a kernel gap) fails here with its text.
+async fn serve_pinned() -> (
+    Engine,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<std::result::Result<(), super::config::StartupError>>,
+) {
+    let entry: EngineConfig = serde_json::from_value(json!({
+        "id": "flash-gguf",
+        "family": "qwen3_8_flash_next",
+        "model": MODEL,
+        "model_dir": required(MODEL_DIR),
+        "tokenizer_dir": required(TOKENIZER_DIR),
+        "context_limit": null,
+        "flash_next": {"cuda_decode": true, "context": context()}
+    }))
+    .expect("a valid engine entry");
+    let (engine, started) = run::start_one(&entry, Some(false))
+        .unwrap_or_else(|error| panic!("the Flash-Next GGUF start refused: {}", error.0));
+    let state = std::sync::Arc::new(AppState::new(testkit::API_KEY, vec![started]));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(run::serve(listener, state, std::future::pending()));
+    await_ready(address, &engine).await;
+    (engine, address, server)
+}
+
 /// The opt-in serving path end to end: `INFERENCE_FLASH_NEXT_GGUF_SERVE=1`, the real server on a
 /// loopback port, the pinned GGUF, and a greedy three-token continuation checked against the host
 /// oracle's ids (`5854, 11, 59710`, the text `_len, eos`).
@@ -156,28 +184,9 @@ async fn flash_next_gguf_http_smoke_greedy_matches_host() {
         matches!(FlashEnv::capture().gguf_serve(), Ok(true)),
         "{SWITCH} must be set to 1 in the environment this test runs in"
     );
-    let model_dir = required(MODEL_DIR);
-    let tokenizer_dir = required(TOKENIZER_DIR);
     let prompt = std::env::var(PROMPT).unwrap_or(".Q, input".to_string());
     let expected = expected();
-    let entry: EngineConfig = serde_json::from_value(json!({
-        "id": "flash-gguf",
-        "family": "qwen3_8_flash_next",
-        "model": MODEL,
-        "model_dir": model_dir,
-        "tokenizer_dir": tokenizer_dir,
-        "context_limit": null,
-        "flash_next": {"cuda_decode": true, "context": context()}
-    }))
-    .expect("a valid engine entry");
-    // A start refusal (a missing manifest, the switch off, a kernel gap) fails here with its text.
-    let (engine, started) = run::start_one(&entry, Some(false))
-        .unwrap_or_else(|error| panic!("the Flash-Next GGUF start refused: {}", error.0));
-    let state = std::sync::Arc::new(AppState::new(testkit::API_KEY, vec![started]));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = tokio::spawn(run::serve(listener, state, std::future::pending()));
-    await_ready(address, &engine).await;
+    let (engine, address, server) = serve_pinned().await;
 
     let prompt_ids = encode(address, &prompt).await;
     let reply = json_call(

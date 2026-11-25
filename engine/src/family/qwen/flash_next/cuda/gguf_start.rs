@@ -43,6 +43,16 @@ use crate::{
 type GgufExecutor =
     FlashCudaExecutor<TokenDriver<GgufCardDevice<'static>, GgufTokenFeeds<'static>>>;
 
+/// What the calling thread hands the engine thread: the model it planned from, the context the
+/// caches hold, the tokenizer's limits and the store identity. Each is read once, on that thread,
+/// so they travel as one value.
+pub(in super::super) struct PlannedStart {
+    pub(in super::super) model: GgufModel,
+    pub(in super::super) positions: usize,
+    pub(in super::super) rules: CudaRules,
+    pub(in super::super) identity: PrefixIdentity,
+}
+
 /// The sizes the driver checks and splits the layers by, for the GGUF step (the pack's rule:
 /// the sampler vocabulary is the tokenizer's, the stream and the PLE embedding the model's).
 fn driver_shape(
@@ -84,16 +94,18 @@ pub(in super::super) fn cuda_rules(
 }
 
 /// Builds the executor and its first session over the leaked GGUF owners. No CUDA value crosses
-/// a thread boundary: `model` is the one the calling thread planned from, moved in.
-#[allow(clippy::too_many_arguments)] // the values the start closure captured, passed once
+/// a thread boundary: the model is the one the calling thread planned from, moved in.
 fn make(
     stage: &dyn Fn(&'static str),
-    model: GgufModel,
-    positions: usize,
-    rules: CudaRules,
-    identity: PrefixIdentity,
+    planned: PlannedStart,
     mut guard: BuildGuard,
 ) -> Result<(GgufExecutor, DecodeSession), EngError> {
+    let PlannedStart {
+        model,
+        positions,
+        rules,
+        identity,
+    } = planned;
     let began = Instant::now();
     stage("the CUDA context");
     // The served admission and the Flash-Next kernel registry: how the pack's start opens its card.
@@ -137,26 +149,14 @@ fn make(
 
 /// Starts the engine thread, which builds the executor ([`make`]) and its first session there,
 /// so no executor type leaves this module: the pack's start spawns from its own module the same
-/// way. `model` is the one the calling thread planned from; it is moved in, and no CUDA value
-/// crosses the boundary.
-#[allow(clippy::too_many_arguments)] // the values the start captured, passed once
+/// way. The planned values move in, and no CUDA value crosses the boundary.
 pub(in super::super) fn spawn(
-    model: GgufModel,
-    positions: usize,
+    planned: PlannedStart,
     prefill_chunk: usize,
-    rules: CudaRules,
-    identity: PrefixIdentity,
     ready_note: ReadyNote,
     guard: BuildGuard,
 ) -> Result<Engine, EngError> {
     spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
-        make(
-            &|name| stages.begin(name),
-            model,
-            positions,
-            rules,
-            identity,
-            guard,
-        )
+        make(&|name| stages.begin(name), planned, guard)
     })
 }

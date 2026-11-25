@@ -65,19 +65,7 @@ pub(in crate::family::qwen::flash_next) fn start(
     if !serve || !model.kernel_gaps().is_empty() {
         return Err(execution_refusal(&model));
     }
-    let settings = GgufStartSettings::new(
-        input.model_dir,
-        input.tokenizer_dir,
-        input.options,
-        input.env,
-    )?;
-    serve_gguf(
-        model,
-        context,
-        &settings,
-        input.tokenizer_dir,
-        input.ready_note,
-    )
+    serve_gguf(model, context, input)
 }
 
 /// Opens the card for its free memory and chooses the context and the expert slots per layer.
@@ -151,28 +139,35 @@ fn plan(model: &GgufModel, options: Option<&FlashOptions>) -> Result<u32, EngErr
 fn serve_gguf(
     model: GgufModel,
     context: u32,
-    settings: &GgufStartSettings,
-    tokenizer_dir: &Path,
-    ready_note: ReadyNote,
+    input: StartInput<'_>,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
+    let settings = GgufStartSettings::new(
+        input.model_dir,
+        input.tokenizer_dir,
+        input.options,
+        input.env,
+    )?;
     let pin = load_pin(&settings.manifest, settings.tokenizer_vocab_size)?;
-    let bundle = TokenizerBundle::load(tokenizer_dir, &pin)?;
+    let bundle = TokenizerBundle::load(input.tokenizer_dir, &pin)?;
     let head_vocab = model.config().model_shape()?.vocab;
     let rules = gguf_start::cuda_rules(&bundle, head_vocab)?;
     let identity = gguf_identity(&model, &pin)?;
     let prefill_chunk = usize::try_from(settings.prefill_chunk)
         .map_err(|_| EngError::BadRequest("engine config: prefill_chunk exceeds usize".into()))?;
+    let positions = usize::try_from(context)
+        .map_err(|_| EngError::BadRequest("engine config: context exceeds usize".into()))?;
     let guard = BuildGuard::acquire()?;
     let began = Instant::now();
     // The engine thread builds the executor inside `cuda`, so no executor type leaves that module.
     let engine = gguf_start::spawn(
-        model,
-        usize::try_from(context)
-            .map_err(|_| EngError::BadRequest("engine config: context exceeds usize".into()))?,
+        gguf_start::PlannedStart {
+            model,
+            positions,
+            rules,
+            identity,
+        },
         prefill_chunk,
-        rules,
-        identity,
-        ready_note,
+        input.ready_note,
         guard,
     )?;
     eprintln!(

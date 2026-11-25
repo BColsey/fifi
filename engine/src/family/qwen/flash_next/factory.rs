@@ -62,8 +62,25 @@ pub(crate) fn start_engine_resolved(
     // and tensor table and takes its own start.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     if let Some(model) = super::load::gguf::GgufModel::open(model_dir)? {
-        return start_gguf(model, model_dir, tokenizer_dir, options, env, ready_note)
-            .map(|s| (s, None));
+        use super::load::gguf::start::StartInput;
+        let (engine, bundle, context_limit) = super::load::gguf::start::start(
+            model,
+            StartInput {
+                model_dir,
+                tokenizer_dir,
+                options,
+                env,
+                ready_note,
+            },
+        )?;
+        return Ok((
+            StartedEngine {
+                engine,
+                bundle,
+                context_limit,
+            },
+            None,
+        ));
     }
     let settings = FlashSettings::new(model_dir, tokenizer_dir, options, env)?;
     if settings.manifest_found_in_pack {
@@ -83,35 +100,6 @@ pub(crate) fn start_engine_resolved(
         },
         Some(settings),
     ))
-}
-
-/// The GGUF start of this family: `load/gguf/start.rs` plans on this thread and serves the file
-/// when `INFERENCE_FLASH_NEXT_GGUF_SERVE` is on (it refuses with the pack's own text otherwise).
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-fn start_gguf(
-    model: super::load::gguf::GgufModel,
-    model_dir: &Path,
-    tokenizer_dir: &Path,
-    options: Option<&FlashOptions>,
-    env: &FlashEnv,
-    ready_note: ReadyNote,
-) -> Result<StartedEngine, EngError> {
-    use super::load::gguf::start::StartInput;
-    let (engine, bundle, context_limit) = super::load::gguf::start::start(
-        model,
-        StartInput {
-            model_dir,
-            tokenizer_dir,
-            options,
-            env,
-            ready_note,
-        },
-    )?;
-    Ok(StartedEngine {
-        engine,
-        bundle,
-        context_limit,
-    })
 }
 
 pub(crate) fn check_mlx_settings(settings: &FlashSettings) -> Result<(), EngError> {
