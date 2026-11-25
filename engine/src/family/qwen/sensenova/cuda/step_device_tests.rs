@@ -1262,17 +1262,43 @@ fn attn_prep_chunk_applies_the_frequency_table() {
 
 /// The decode rate on its own: the prompt through `prefill`, then [`STEPS`] greedy steps as
 /// the serve loop runs them (every step drains for its token), then as many again queued
-/// ahead without a drain. The difference is the launch-side cost; the run is also what the
-/// host's `nsys` profiles (the decode census in the lane's NOW card).
+/// ahead without a drain. The drained figure comes as a mean, a median and a minimum over the
+/// steps; the queued figure is the mean over one block, which has no per-step times. The
+/// difference is the launch-side cost; the run is also what the host's `nsys` profiles (the
+/// decode census in the lane's NOW card). `SENSENOVA_DECODE_CONTEXT=N` replaces the smoke
+/// prompt by `N` pseudo-random tokens (the long-prompt test's ids): the same steps at a
+/// longer context.
 #[test]
 fn card_decode_trace() {
     const STEPS: usize = 64;
     let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova decode trace") else {
         return;
     };
-    let mut card = open_card(&ctx, &loaded, &weights, CACHE_ROWS);
-    let prompt = projector.rows(weights.token_embd(), &PROMPT).unwrap();
-    card.prefill(&prompt, 0).unwrap();
+    let context = std::env::var("SENSENOVA_DECODE_CONTEXT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let vocab = weights.shape().vocab;
+    let ids: Vec<u32> = if context == 0 {
+        PROMPT.to_vec()
+    } else {
+        (1..=context as u32)
+            .map(|i| i.wrapping_mul(2_654_435_761) >> 7)
+            .map(|id| id % vocab as u32)
+            .collect()
+    };
+    let mut card = open_card(
+        &ctx,
+        &loaded,
+        &weights,
+        CACHE_ROWS.max(ids.len() + 2 * STEPS + 1),
+    );
+    let h = weights.shape().hidden;
+    let prompt = projector.rows(weights.token_embd(), &ids).unwrap();
+    // Chunks of at most 1024 rows: the long-prompt test's full chunk.
+    for (c, rows) in prompt.chunks(1024 * h).enumerate() {
+        card.prefill(rows, c * 1024).unwrap();
+    }
     let mut token = argmax(&drain_row(&ctx, &card));
 
     // The ceiling: the block and head weights every step reads (the loop layers once per
@@ -1285,31 +1311,37 @@ fn card_decode_trace() {
         RATED_GB_S / gib
     );
 
-    let t0 = std::time::Instant::now();
-    for pos in PROMPT.len()..PROMPT.len() + STEPS {
+    let mut drained = Vec::with_capacity(STEPS);
+    for pos in ids.len()..ids.len() + STEPS {
+        let t0 = std::time::Instant::now();
         let embed = projector.rows(weights.token_embd(), &[token]).unwrap();
         card.decode(&embed, pos).unwrap();
         token = argmax(&drain_row(&ctx, &card));
+        drained.push(t0.elapsed().as_secs_f64() * 1e3);
     }
-    let serialized = t0.elapsed().as_secs_f64() * 1e3 / STEPS as f64;
+    let serialized = drained.iter().sum::<f64>() / STEPS as f64;
+    drained.sort_by(f64::total_cmp);
 
     let embed = projector.rows(weights.token_embd(), &[token]).unwrap();
     card.stream().synchronize().unwrap();
     let t0 = std::time::Instant::now();
-    for pos in PROMPT.len() + STEPS..PROMPT.len() + 2 * STEPS {
+    for pos in ids.len() + STEPS..ids.len() + 2 * STEPS {
         card.decode(&embed, pos).unwrap();
     }
     card.stream().synchronize().unwrap();
     let pipelined = t0.elapsed().as_secs_f64() * 1e3 / STEPS as f64;
     eprintln!(
-        "decode: {serialized:.1} ms/step with the per-step drain, {pipelined:.1} ms/step queued ahead"
+        "decode: {serialized:.1} ms/step with the per-step drain (median {:.1}, min {:.1}), {pipelined:.1} ms/step queued ahead; context {} tokens",
+        drained[STEPS / 2],
+        drained[0],
+        ids.len()
     );
     assert!(serialized.is_finite() && pipelined.is_finite());
 }
 
 /// Device microbenchmark, not a gate: the decode step's weight sweep at 1, 2, 4 and 8
-/// activation columns, and at one column the dequantizing GEMM against the matvec for each
-/// weight shape. A batched step reads the weights once for all of its tokens, so
+/// activation columns, and at one column the dq route's f32 matvec against the default matvec
+/// for each weight shape. A batched step reads the weights once for all of its tokens, so
 /// this is the weight term of one token of a batch on this card. The glue, the launch gaps
 /// and the per-sequence attention state of a real batched step are not in it. The GB/s it
 /// prints is weight bytes per second, not measured HBM traffic.
@@ -1336,7 +1368,7 @@ fn card_decode_sweep_columns() {
         );
     }
     eprintln!(
-        "one column, per weight shape: the matvec against the dequantizing GEMM, median and min of 5 groups of 5 sweeps"
+        "one column, per weight shape: the default matvec against the dq route's f32 matvec, median and min of 5 groups of 5 sweeps"
     );
     for (shape, mut matvec, mut dq) in card.sweep_shape_micros(5, 5).unwrap() {
         let ((mm, mn), (dm, dn)) = (spread(&mut matvec), spread(&mut dq));

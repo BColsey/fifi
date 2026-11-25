@@ -2,6 +2,7 @@
 //! weight value decoded on the host in f64, times the same f32 row, within `64 * 2^-24 * sum |w x|`
 //! (the tolerance style of the int8 matvec tests).
 
+use crate::kernels::cuda::NativeWeight;
 use crate::kernels::cuda::context::{CudaContext, DeviceStream};
 use crate::kernels::cuda::resident::matvec_dq::MatvecDqCall;
 use crate::kernels::cuda::resident::matvec_q::MatvecCall;
@@ -295,6 +296,38 @@ fn matvec_dq_refuses_bad_arguments_before_the_adapter() {
         "y inside x",
         "matvec_dq y and matvec_dq x ranges overlap",
     );
+}
+
+/// The dq route's entry over a resident weight keeps the matvec's refusal: a weight of a type
+/// the kernel does not serve is a `BadRequest` before any launch, and `y` keeps its zeros:
+/// nothing runs in its place.
+#[test]
+fn matvec_dq_native_refuses_a_weight_the_kernel_does_not_serve() {
+    if !testkit::device_present("matvec_dq_native_refuses_a_weight_the_kernel_does_not_serve") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows) = (256, 4);
+    let ty = QuantType::Q5K;
+    let mut rng = testkit::Rng::new(0xD3_0002);
+    let w = testkit::upload_bytes(&ctx, &reference::build_weight(ty, rows, k, &mut rng));
+    let x = testkit::upload_f32(&ctx, &vec![0.0; k]);
+    let y = testkit::upload_filled(&ctx, 0, rows * F32);
+    let weight = NativeWeight::from_buffer(w, ty, k, rows, None).expect("a resident weight");
+    assert_bad_request(
+        ctx.matvec_dq_native(
+            &stream,
+            &weight,
+            x.range(0, k * F32).expect("x range"),
+            y.range(0, rows * F32).expect("y range"),
+        ),
+        "a resident weight of a type the kernel does not serve",
+        "matvec_dq needs a Q4_K or Q6_K weight",
+    );
+    stream.synchronize().expect("drain");
+    let y = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * F32));
+    assert!(y.iter().all(|&v| v == 0.0), "a launch wrote y: {y:?}");
 }
 
 /// Stage 2's decider on the first shape that made the dq route slow: k 4096, 12288 rows, Q6_K
