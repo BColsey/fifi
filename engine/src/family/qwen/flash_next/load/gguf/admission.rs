@@ -1,10 +1,60 @@
-//! The refusals of the GGUF start that need no device: pure decisions between the entry's
-//! options, the environment and the model, so they are checked on the host.
+//! The parts of the GGUF start that need no device: pure decisions between the entry's
+//! options, the environment and the model, and the digests of the files it serves, so they are
+//! checked on the host.
+
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 use crate::EngError;
 
 fn refuse(detail: impl AsRef<str>) -> EngError {
     EngError::Checkpoint(format!("Flash-Next GGUF start: {}", detail.as_ref()))
+}
+
+/// The digest of a tokenizer file of `dir`: an absent file pins zeros and is reported by the
+/// load; one that cannot be read is an error, not a zero digest that would pass for the empty
+/// file and match any other unreadable one.
+fn file_digest(path: &Path) -> Result<[u8; 32], EngError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Sha256::digest(bytes).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok([0u8; 32]),
+        Err(error) => Err(refuse(format!(
+            "{} cannot be read: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// The pin of the tokenizer files found in `dir`: their own digests, so the load matches and
+/// logs nothing, and the vocabulary the model's head holds.
+pub(in crate::family::qwen::flash_next) fn observed_pin(
+    dir: &Path,
+    vocab: u32,
+) -> Result<crate::tokenizer::TokenizerPin, EngError> {
+    let digest = |name: &str| file_digest(&dir.join(name));
+    Ok(crate::tokenizer::TokenizerPin {
+        tokenizer_json: digest("tokenizer.json")?,
+        tokenizer_config_json: digest("tokenizer_config.json")?,
+        chat_template_jinja: digest("chat_template_jinja")?,
+        generation_config_json: digest("generation_config.json")?,
+        vocab_size: vocab,
+    })
+}
+
+/// The tokenizer term of the prefix identity: the digest of the served `tokenizer.json`, whose
+/// read error propagates instead of becoming the digest of the empty file.
+pub(in crate::family::qwen::flash_next) fn tokenizer_digest(
+    dir: &Path,
+) -> Result<[u8; 32], EngError> {
+    std::fs::read(dir.join("tokenizer.json"))
+        .map(|bytes| Sha256::digest(bytes).into())
+        .map_err(|error| {
+            refuse(format!(
+                "{} cannot be read: {error}",
+                dir.join("tokenizer.json").display()
+            ))
+        })
 }
 
 /// A cache with fewer slots per layer than the router picks fails every token: a pick without a
@@ -67,6 +117,33 @@ pub(in crate::family::qwen::flash_next) fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreadable tokenizer file is refused; an absent one still pins zeros for the load to
+    /// report.
+    #[test]
+    fn an_unreadable_tokenizer_file_is_an_error_not_a_zero_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = observed_pin(dir.path(), 8).expect("absent files pin zeros");
+        assert_eq!(
+            (
+                absent.tokenizer_json,
+                absent.tokenizer_config_json,
+                absent.chat_template_jinja,
+                absent.generation_config_json,
+                absent.vocab_size
+            ),
+            ([0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 8)
+        );
+        let file = dir.path().join("tokenizer.json");
+        std::fs::write(&file, b"{}").expect("write");
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0))
+            .expect("unreadable");
+        let Err(error) = observed_pin(dir.path(), 8) else {
+            panic!("an unreadable file is refused");
+        };
+        assert!(format!("{error:?}").contains("tokenizer.json"), "{error:?}");
+        assert!(tokenizer_digest(dir.path()).is_err());
+    }
     use std::path::Path;
 
     /// The switch alone, the entry alone, neither and both: only both serve.

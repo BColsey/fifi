@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     GgufModel,
-    admission::{check_cuda_decode, check_opt_in, check_slots},
+    admission::{check_cuda_decode, check_opt_in, check_slots, observed_pin, tokenizer_digest},
     placement::{ExpertSetup, cache_plan, layer_stacks},
     plan::Card,
 };
@@ -39,27 +39,11 @@ use crate::{
         session::PrefixIdentity,
     },
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
-    tokenizer::{TokenizerBundle, TokenizerPin},
+    tokenizer::TokenizerBundle,
 };
 
 /// Host bytes one native tensor read holds while a tensor is uploaded.
 const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
-
-/// The pin of the tokenizer files found in `dir`: their own digests, so the load matches and
-/// logs nothing, and the vocabulary the model's head holds. A file that is absent pins zeros
-/// and is reported by the load.
-fn observed_pin(dir: &Path, vocab: u32) -> TokenizerPin {
-    let digest = |name: &str| -> [u8; 32] {
-        std::fs::read(dir.join(name)).map_or([0u8; 32], |bytes| Sha256::digest(bytes).into())
-    };
-    TokenizerPin {
-        tokenizer_json: digest("tokenizer.json"),
-        tokenizer_config_json: digest("tokenizer_config.json"),
-        chat_template_jinja: digest("chat_template.jinja"),
-        generation_config_json: digest("generation_config.json"),
-        vocab_size: vocab,
-    }
-}
 
 /// Plans the model on this machine, prints the plan, and starts the engine when every
 /// matrix type has a decode kernel and the routed experts all fit on the card. The tokenizer
@@ -166,7 +150,7 @@ pub(in crate::family::qwen::flash_next) fn start(
         &observed_pin(
             tokenizer_dir,
             u32::try_from(vocab).map_err(|_| refuse("the vocabulary overflows u32"))?,
-        ),
+        )?,
     )?;
     let sampler_vocab = usize::try_from(bundle.vocab_size())
         .map_err(|_| refuse("the tokenizer vocabulary overflows usize"))?;
@@ -185,9 +169,7 @@ pub(in crate::family::qwen::flash_next) fn start(
         .chain_update(header.tensors().len().to_le_bytes())
         .finalize()
         .into();
-    let tokenizer_digest: [u8; 32] =
-        Sha256::digest(std::fs::read(tokenizer_dir.join("tokenizer.json")).unwrap_or_default())
-            .into();
+    let tokenizer_digest = tokenizer_digest(tokenizer_dir)?;
     let identity = PrefixIdentity {
         weights: crate::weights::sha256_hex(&weights_digest).into(),
         tokenizer: crate::weights::sha256_hex(&tokenizer_digest).into(),
