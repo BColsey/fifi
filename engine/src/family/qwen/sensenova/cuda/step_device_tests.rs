@@ -2053,7 +2053,7 @@ fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
     let loaded: &'static CudaWeights = Box::leak(Box::new(loaded));
     let mut walked = open_card(&ctx, loaded, &weights, CACHE_ROWS);
     let step = open_card(&ctx, loaded, &weights, CACHE_ROWS);
-    let mut card = CardStep::new(ctx.clone(), step, stepper_host);
+    let mut card = CardStep::new(step, stepper_host);
 
     // The oracle: the walk's row at every prompt position, then its greedy continuation.
     let h = weights.shape().hidden;

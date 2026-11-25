@@ -115,7 +115,8 @@ pub(crate) enum Carried {
 }
 
 /// The trunk executor: the resolved weights, the per-visit state and the scratch rows.
-/// Built once per session; `decode` runs one token.
+/// Built once per engine; [`Self::reset`] starts a new session on the same buffers, and `decode`
+/// runs one token.
 pub(crate) struct LoopStep<'a> {
     ctx: Rc<CudaContext>,
     stream: DeviceStream,
@@ -521,14 +522,15 @@ impl<'a> LoopStep<'a> {
     /// rings and the attention planes return to the zeros of [`LoopStep::open`] (the planes too,
     /// so a session that ended on a non-finite value leaves nothing a masked read could meet),
     /// and the residual cursor returns to its start. Only the carried state is cleared: a step
-    /// overwrites every scratch row before its first read.
+    /// overwrites every scratch row before its first read. The fills are enqueued on the step's
+    /// stream, behind a step that is still in flight.
     pub(crate) fn reset(&mut self) -> Result<(), EngError> {
         let carried = once(&self.rec)
             .chain(once(&self.ring))
             .chain(self.k_cache.iter())
             .chain(self.v_cache.iter());
         for buffer in carried {
-            self.ctx.upload_at(buffer, 0, &vec![0u8; buffer.bytes()])?;
+            buffer.zero_at(&self.stream, 0, buffer.bytes())?;
         }
         self.cur_ix = 0;
         Ok(())
@@ -705,7 +707,7 @@ impl<'a> LoopStep<'a> {
         Ok(out)
     }
 
-    /// The executor's stream, for the caller's drain.
+    /// The step's stream: a read enqueued on it lands behind the step's kernels.
     pub(crate) fn stream(&self) -> &DeviceStream {
         &self.stream
     }

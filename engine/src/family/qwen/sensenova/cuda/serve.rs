@@ -17,6 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use super::super::serve::LIMITS;
@@ -46,6 +47,7 @@ pub(crate) fn start(
     let mut guard = BuildGuard::acquire()?;
     let cache_rows = context_limit as usize;
     let engine = spawn_engine_noted(PREFILL_ROWS, ready_note, move |_| {
+        let began = Instant::now();
         let ctx = Rc::new(CudaContext::with_admission(&served_admission())?);
         let gguf = Arc::new(GgufWeights::open_any_type(&file, LIMITS, None)?);
         let host = LoopWeights::open(Arc::clone(&gguf))?;
@@ -70,7 +72,11 @@ pub(crate) fn start(
             host.rope(),
             cache_rows,
         )?;
-        let card = CardStep::new(ctx, step, host);
+        eprintln!(
+            "sensenova cuda: ready in {:.1} s; the card step serves",
+            began.elapsed().as_secs_f64()
+        );
+        let card = CardStep::new(step, host);
         let executor = SerialDecode::new(card, eos, sampler_vocab, cache_rows);
         Ok((executor, DecodeSession::default()))
     })?;
@@ -80,7 +86,6 @@ pub(crate) fn start(
 /// The model side of one session: the card step over the leaked load, the host view of the file
 /// (its embedding table feeds the rows), and the number of rows the card has consumed.
 pub(super) struct CardStep {
-    ctx: Rc<CudaContext>,
     step: LoopStep<'static>,
     host: LoopWeights,
     projector: GgufProjector,
@@ -88,10 +93,9 @@ pub(super) struct CardStep {
 }
 
 impl CardStep {
-    pub(super) fn new(ctx: Rc<CudaContext>, step: LoopStep<'static>, host: LoopWeights) -> Self {
+    pub(super) fn new(step: LoopStep<'static>, host: LoopWeights) -> Self {
         let projector = host.projector();
         Self {
-            ctx,
             step,
             host,
             projector,
@@ -108,11 +112,9 @@ impl TokenStepper for CardStep {
     }
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
-        for piece in tokens.chunks(PREFILL_ROWS) {
-            let rows = self.projector.rows(self.host.token_embd(), piece)?;
-            self.step.prefill(&rows, self.pos)?;
-            self.pos += piece.len();
-        }
+        let rows = self.projector.rows(self.host.token_embd(), tokens)?;
+        self.step.prefill(&rows, self.pos)?;
+        self.pos += tokens.len();
         Ok(())
     }
 
@@ -120,10 +122,10 @@ impl TokenStepper for CardStep {
         let row = self.projector.rows(self.host.token_embd(), &[token])?;
         self.step.decode(&row, self.pos)?;
         self.pos += 1;
-        // The copy runs on the step's stream, behind its kernels.
+        // The read is enqueued on the step's stream, behind its kernels.
         let logits = self.step.logits_row();
         let mut bytes = vec![0u8; logits.bytes()];
-        self.ctx.download(logits, &mut bytes)?;
+        logits.read_at(self.step.stream(), 0, &mut bytes)?;
         Ok(bytes
             .as_chunks::<4>()
             .0
