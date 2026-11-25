@@ -82,6 +82,12 @@ pub(in crate::family::qwen::flash_next) fn gguf_feeds(
     };
     let embed = get(Slot::Global(Global::Embedding), None)?;
     let hidden = embed.dims[0] as usize;
+    if hidden != config.dims.hidden as usize {
+        return Err(refuse(format!(
+            "the embedding table has rows of {hidden} values, the model's hidden width is {}",
+            config.dims.hidden
+        )));
+    }
     let branches = config.dims.branches as usize;
     let block = embed.ty.block_elems() as usize;
     if !hidden.is_multiple_of(block) {
