@@ -55,10 +55,13 @@ pub(crate) fn start_engine_resolved(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(StartedEngine, Option<FlashSettings>), EngError> {
-    // A GGUF checkpoint has no manifest and no `config.json`: it plans from its own metadata
-    // and tensor table and takes its own start, without settings of the pack's kind.
+    // A directory that starts from a pack keeps the pack's start, whatever GGUF lies beside it.
+    // A GGUF checkpoint alone has no manifest and no `config.json`: it plans from its own
+    // metadata and tensor table and takes its own start, without settings of the pack's kind.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    if let Some(model) = super::load::gguf::GgufModel::open(model_dir)? {
+    if !super::settings::pack_start(options, env, model_dir, tokenizer_dir)
+        && let Some(model) = super::load::gguf::GgufModel::open(model_dir)?
+    {
         let (engine, bundle, context_limit) = super::load::gguf::start::start(
             model,
             options,
@@ -198,6 +201,27 @@ mod tests {
         };
         let text = message(start(Some(&options), &FlashEnv::default()));
         assert!(text.contains("native-mlx"), "{text}");
+    }
+
+    /// A directory that starts from a pack keeps the pack's start: the small GGUF beside the
+    /// pack's manifest does not switch the directory to the GGUF start.
+    #[test]
+    fn a_pack_directory_keeps_the_pack_start_beside_a_gguf() {
+        use super::super::settings::pack_start;
+        let small = super::super::load::gguf::smallmodel::write_small(7);
+        let dir = small.dir.path();
+        let env = FlashEnv::default();
+        assert!(!pack_start(None, &env, dir, dir), "a GGUF alone");
+        std::fs::write(dir.join("download-manifest.json"), "{}").expect("the pack's manifest");
+        assert!(pack_start(None, &env, dir, dir), "a pack beside the GGUF");
+        // Through the factory the pack's start answers (on this build its backend refusal);
+        // the GGUF start's own refusal is not what an operator sees.
+        let Err(error) = start_engine_resolved(dir, dir, None, &env, false, None) else {
+            panic!("no backend serves the pack here");
+        };
+        let text = format!("{error:?}");
+        eprintln!("the pack's start answers: {text}");
+        assert!(!text.contains("GGUF"), "{text}");
     }
 
     /// A CUDA build with the switch off names the switch (and the MLX alternative).

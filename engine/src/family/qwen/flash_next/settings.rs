@@ -265,6 +265,18 @@ fn bounded(key: &str, value: u32, low: u32, high: u32) -> Result<u32, EngError> 
 /// The file name a pack ships its manifest under.
 const PACK_MANIFEST: &str = "download-manifest.json";
 
+/// Whether `model_dir` starts from a pack: [`FlashSettings::new`] finds a manifest there (the
+/// entry's key, the environment's, or the pack's own file in the model or tokenizer directory).
+pub(in crate::family::qwen::flash_next) fn pack_start(
+    options: Option<&FlashOptions>,
+    env: &FlashEnv,
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+) -> bool {
+    let unset = FlashOptions::default();
+    manifest_path(options.unwrap_or(&unset), env, model_dir, tokenizer_dir).is_ok()
+}
+
 /// The manifest path: the config key, then `FLASH_NEXT_ARTIFACT_MANIFEST`, then
 /// `download-manifest.json` in the model directory or the tokenizer directory. The flag says the
 /// pack's own file was used.

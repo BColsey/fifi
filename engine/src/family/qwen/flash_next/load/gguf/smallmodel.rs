@@ -209,12 +209,12 @@ fn encode(ty: GgufType, values: &[f32]) -> Vec<u8> {
 }
 
 /// The small model written to a fresh directory (one file), with its first path.
-pub(super) struct Small {
-    pub(super) dir: tempfile::TempDir,
-    pub(super) first: PathBuf,
+pub(in crate::family::qwen::flash_next) struct Small {
+    pub(in crate::family::qwen::flash_next) dir: tempfile::TempDir,
+    pub(in crate::family::qwen::flash_next) first: PathBuf,
 }
 
-pub(super) fn write_small(seed: u64) -> Small {
+pub(in crate::family::qwen::flash_next) fn write_small(seed: u64) -> Small {
     write_small_with(seed, LAYERS, 8)
 }
 

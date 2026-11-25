@@ -33,7 +33,7 @@ pub(super) mod ngram;
 pub(super) mod plan;
 pub(in crate::family::qwen::flash_next) mod placement;
 #[cfg(test)]
-mod smallmodel;
+pub(in crate::family::qwen::flash_next) mod smallmodel;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in super::super) mod start;
 pub(in crate::family::qwen::flash_next) mod tensors;
