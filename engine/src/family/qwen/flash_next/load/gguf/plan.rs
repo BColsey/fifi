@@ -15,7 +15,7 @@
 
 use super::{GgufModel, tensors::Place};
 use crate::family::{
-    qwen::flash_next::host_plan::{HostFrame, HostMemory},
+    qwen::flash_next::host_plan::{HostFrame, HostMemory, HostTerms},
     recipe::Global,
 };
 use crate::{
@@ -113,6 +113,28 @@ impl GgufModel {
         })
     }
 
+    /// The host terms of the plan: the default heap, the two host F32 PLE projections (the
+    /// bytes the pack start charges for its own) and the expert cache's pinned bounce buffer
+    /// (one pass of the largest layer's records), all read from the plan's own numbers.
+    pub(in super::super::super) fn host_terms(
+        &self,
+        sizes: &GgufSizes,
+    ) -> Result<HostTerms, EngError> {
+        let dims = &self.config.dims;
+        let ple_rows = (u64::from(dims.hidden) * u64::from(dims.branches) + u64::from(dims.hidden))
+            * self.config.model_shape()?.ple.embed() as u64;
+        let largest = sizes.layer_record_bytes.iter().copied().max().unwrap_or(0);
+        let engine_heap = HostTerms::DEFAULT
+            .engine_heap
+            .checked_add(ple_rows * 4)
+            .and_then(|bytes| bytes.checked_add(self.config.top_k() as u64 * largest as u64))
+            .ok_or_else(|| refuse("the host terms overflow"))?;
+        Ok(HostTerms {
+            engine_heap,
+            ..HostTerms::DEFAULT
+        })
+    }
+
     /// The load plan on `card`. The disk tier is offered (the staging ring is charged), so a
     /// host that cannot pin the cold experts plans the tier that reads them from the files.
     pub(in super::super::super) fn load_plan(&self, card: Card) -> Result<FlashLoadPlan, EngError> {
@@ -125,7 +147,7 @@ impl GgufModel {
                 bytes_per_position: 1,
             },
             card.free_vram.saturating_sub(card.ring_budget),
-            HostFrame::with_default_terms(card.host),
+            HostFrame::new(card.host, self.host_terms(&sizes)?),
             rung_ring_placeholder_bytes(
                 usize::try_from(sizes.record_bytes_max)
                     .map_err(|_| refuse("the largest expert record overflows usize"))?,
@@ -139,5 +161,39 @@ impl GgufModel {
             sizes.ngram_bytes,
             inputs,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::family::qwen::flash_next::load::gguf::testkit::{Spec, write_flash};
+
+    /// The terms grow by the PLE projections' F32 bytes and the bounce buffer, and by nothing
+    /// else.
+    #[test]
+    fn the_host_terms_charge_the_ple_projections_and_the_bounce_buffer() {
+        let written = write_flash(&Spec::default());
+        let model = GgufModel::open(&written.first)
+            .expect("open")
+            .expect("a model");
+        let sizes = model.sizes().expect("sizes");
+        let terms = model.host_terms(&sizes).expect("terms");
+        let dims = &model.config().dims;
+        let ple = (u64::from(dims.hidden) * u64::from(dims.branches) + u64::from(dims.hidden))
+            * model.config().model_shape().expect("shape").ple.embed() as u64
+            * 4;
+        let largest = sizes.layer_record_bytes.iter().copied().max().unwrap_or(0);
+        assert_eq!(
+            terms.engine_heap,
+            HostTerms::DEFAULT.engine_heap + ple + model.config().top_k() as u64 * largest as u64
+        );
+        assert_eq!(
+            terms,
+            HostTerms {
+                engine_heap: terms.engine_heap,
+                ..HostTerms::DEFAULT
+            }
+        );
     }
 }
