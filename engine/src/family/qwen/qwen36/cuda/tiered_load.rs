@@ -216,6 +216,12 @@ pub(super) fn tiered_chunk_arm() -> bool {
     )
 }
 
+/// Whether a plan funds cold staging: a `Fit` plan on the one-token arm never reads it, so it
+/// builds none; an explicit slot count keeps the staging policy it asks for.
+fn funds_cold_staging(request: &SlotRequest, chunk_arm: bool) -> bool {
+    chunk_arm || *request != SlotRequest::Fit
+}
+
 pub(super) fn build_tiered(
     ctx: &CudaContext,
     (header, gguf): (&GgufHeader, &Path),
@@ -341,7 +347,11 @@ pub(super) fn attach_tiered_parts(
         SlotRequest::Fit => geometry.top_k,
         SlotRequest::Exactly(count) => count,
     };
-    let cold_cap = cold_cap_for(free, geometry, (layers, distinct.len()), planned, reserve);
+    let cold_cap = if funds_cold_staging(&plan.slots, tiered_chunk_arm()) {
+        cold_cap_for(free, geometry, (layers, distinct.len()), planned, reserve)
+    } else {
+        0
+    };
     // Charge the staging the plan is about to allocate, so the reserve the banks leave
     // behind still covers the loader's headroom after the staging exists.
     let mut cold_bytes = 0u64;
@@ -521,6 +531,13 @@ mod tests {
         assert_eq!(geometry.hidden, dims.shape.hidden);
         assert_eq!(geometry.inter, dims.shape.moe.inter);
         assert_eq!(geometry.top_k, dims.shape.moe.top_k);
+    }
+
+    #[test]
+    fn a_fit_plan_funds_no_cold_staging_on_the_one_token_arm() {
+        assert!(funds_cold_staging(&SlotRequest::Fit, true));
+        assert!(!funds_cold_staging(&SlotRequest::Fit, false));
+        assert!(funds_cold_staging(&SlotRequest::Exactly(8), false));
     }
 
     #[test]

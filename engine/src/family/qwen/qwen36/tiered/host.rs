@@ -1124,11 +1124,14 @@ impl TieredHost {
             .ranges(layer, usize::from(swap.promote))
             .map_err(HostError::Locator)?;
         if let Err(error) = device.fill_slot(layer, slot, &ranges, &self.region) {
-            // The failed slot poisons, but the fills QUEUED BEFORE it may have landed:
-            // complete what a wait can still salvage, so only the failure is poisoned.
-            let _ = device.wait_fills();
-            for event in std::mem::take(&mut self.pending_fills) {
-                let _ = self.table.event_complete(event);
+            // The failed slot poisons. The fills QUEUED BEFORE it may have landed: a drain that
+            // succeeds proves they did and completes them; a drain that fails proves nothing,
+            // so their events stay incomplete and no unconfirmed transfer is published.
+            let pending = std::mem::take(&mut self.pending_fills);
+            if device.wait_fills().is_ok() {
+                for event in pending {
+                    let _ = self.table.event_complete(event);
+                }
             }
             self.abandon_fills()?;
             return Err(error);
@@ -1166,6 +1169,7 @@ impl TieredHost {
 
     /// Poisons and frees every fill still in flight (only the one that just failed).
     fn abandon_fills(&mut self) -> Result<(), HostError> {
+        self.pending_fills.clear();
         for (layer, slot) in self.table.expire(u64::MAX) {
             self.table
                 .reclaim_poisoned(layer, slot)
@@ -2011,6 +2015,28 @@ mod tests {
             .unwrap();
         assert_eq!(plan.device_weights, vec![0.5, 0.0]);
         assert!(f.host.finish_layer(0).unwrap().is_some());
+    }
+
+    // A failed fill followed by a failed drain: nothing proves the fills queued before it
+    // landed, so none of them is published.
+    #[test]
+    fn a_failed_fill_and_drain_never_publish_unconfirmed_transfers() {
+        let mut f = fixture();
+        let mut device = MockDevice {
+            fail_on: Some(1),
+            // The first drain (before the fills) succeeds; the one inside the failure path fails.
+            fail_wait_at: Some(1),
+            ..MockDevice::default()
+        };
+        let picks = vec![vec![0, 1], vec![2], vec![3]];
+        assert_eq!(
+            run_token(&mut f, &picks, &mut device),
+            Err(HostError::Device(String::from("mock fill failure")))
+        );
+        assert!(!f.host.is_resident(0, 0) && !f.host.is_resident(0, 1));
+        assert!(f.host.pending_fills.is_empty());
+        f.host.table.check_partition().unwrap();
+        assert_eq!(f.host.end_token(&mut device), Err(HostError::Poisoned));
     }
 
     #[test]
