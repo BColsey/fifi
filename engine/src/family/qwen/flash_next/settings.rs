@@ -993,25 +993,37 @@ mod tests {
     }
 
     /// The default the GGUF start gives `cuda_decode` is the pack start's: unset is the card on a
-    /// build with the CUDA decoder, an MLX allocator key keeps it unset, a set value stays.
+    /// build with the CUDA decoder, an MLX allocator key keeps it unset, a set value stays. Every
+    /// other option of the entry survives it: the pack start serves what it returns.
     #[test]
     fn an_unset_cuda_decode_is_the_card_unless_an_mlx_key_names_the_mlx_arm() {
-        let unset = FlashOptions::default();
-        assert_eq!(unset.card_default(true).cuda_decode, Some(true));
-        assert_eq!(unset.card_default(false).cuda_decode, None);
+        let entry = FlashOptions {
+            context: Some(4096),
+            slots: Some(16),
+            prefill_chunk: Some(4),
+            ..FlashOptions::default()
+        };
+        assert_eq!(
+            entry.card_default(true),
+            FlashOptions {
+                cuda_decode: Some(true),
+                ..entry.clone()
+            }
+        );
+        assert_eq!(entry.card_default(false), entry);
         for key in ["cache", "prefill"] {
             let mlx = FlashOptions {
                 cache_limit_bytes: (key == "cache").then_some(1 << 30),
                 prefill_budget_bytes: (key == "prefill").then_some(1 << 30),
-                ..FlashOptions::default()
+                ..entry.clone()
             };
-            assert_eq!(mlx.card_default(true).cuda_decode, None, "{key}");
+            assert_eq!(mlx.card_default(true), mlx, "{key}");
         }
         let off = FlashOptions {
             cuda_decode: Some(false),
-            ..FlashOptions::default()
+            ..entry
         };
-        assert_eq!(off.card_default(true).cuda_decode, Some(false));
+        assert_eq!(off.card_default(true), off);
     }
 
     /// A plan whose slots fall by one per 2,048 positions from `top`.
