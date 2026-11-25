@@ -44,13 +44,14 @@ type GgufExecutor =
     FlashCudaExecutor<TokenDriver<GgufCardDevice<'static>, GgufTokenFeeds<'static>>>;
 
 /// What the calling thread hands the engine thread: the model it planned from, the context the
-/// caches hold, the tokenizer's limits and the store identity. Each is read once, on that thread,
-/// so they travel as one value.
+/// caches hold, the tokenizer's limits, the store identity and the expert slots per layer the
+/// memory plan sized. Each is read once, on that thread, so they travel as one value.
 pub(in super::super) struct PlannedStart {
     pub(in super::super) model: GgufModel,
     pub(in super::super) positions: usize,
     pub(in super::super) rules: CudaRules,
     pub(in super::super) identity: PrefixIdentity,
+    pub(in super::super) planned_slots: usize,
 }
 
 /// The sizes the driver checks and splits the layers by, for the GGUF step (the pack's rule:
@@ -105,6 +106,7 @@ fn make(
         positions,
         rules,
         identity,
+        planned_slots,
     } = planned;
     let began = Instant::now();
     stage("the CUDA context");
@@ -128,7 +130,15 @@ fn make(
     )?));
     stage("the decode step");
     let step = GgufStep::new(ctx, stream, trunk, positions)?;
-    let owner = GgufMoeOwner::new(&step, shape.moe.top_k() + 1)?;
+    let slots = shape.moe.top_k() + 1;
+    let owner = GgufMoeOwner::new(&step, slots)?;
+    // The memory plan the calling thread printed sized `planned_slots` experts per layer; this
+    // executor builds fewer: an LRU bank of `slots`, refilled from the files on a miss.
+    eprintln!(
+        "flash-next gguf cuda: {slots} expert slots per layer built (top_k + 1, an LRU bank; a \
+         routed expert outside it is refilled from the files at the step); the memory plan sized \
+         {planned_slots}"
+    );
     stage("the host feeds");
     let ngram = Box::leak(Box::new(model.ngram()?));
     let feeds = GgufTokenFeeds::new(model, ngram, ple_threads())?;

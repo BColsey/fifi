@@ -59,17 +59,18 @@ pub(in crate::family::qwen::flash_next) fn start(
     input: StartInput<'_>,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     let serve = input.env.gguf_serve()?;
-    let context = plan(&model, input.options)?;
+    let (context, planned_slots) = plan(&model, input.options)?;
     // A type without a decode kernel refuses with or without the switch; the switch lifts only
     // the executor refusal.
     if !serve || !model.kernel_gaps().is_empty() {
         return Err(execution_refusal(&model));
     }
-    serve_gguf(model, context, input)
+    serve_gguf(model, context, planned_slots, input)
 }
 
-/// Opens the card for its free memory and chooses the context and the expert slots per layer.
-fn plan(model: &GgufModel, options: Option<&FlashOptions>) -> Result<u32, EngError> {
+/// Opens the card for its free memory and chooses the context; returns it with the expert slots
+/// per layer the plan sized there (the executor prints what it builds beside it).
+fn plan(model: &GgufModel, options: Option<&FlashOptions>) -> Result<(u32, usize), EngError> {
     let mut options = options.cloned().unwrap_or_default();
     if options.cuda_decode == Some(false) {
         return Err(EngError::BadRequest(
@@ -129,7 +130,7 @@ fn plan(model: &GgufModel, options: Option<&FlashOptions>) -> Result<u32, EngErr
         tier_line(&load),
         facts.host.provenance_note()
     );
-    Ok(context)
+    Ok((context, load.context.plan.slots_per_layer()))
 }
 
 /// The serving half, the pack's `start` (`cuda/start.rs`) over the GGUF modules: the tokenizer
@@ -139,6 +140,7 @@ fn plan(model: &GgufModel, options: Option<&FlashOptions>) -> Result<u32, EngErr
 fn serve_gguf(
     model: GgufModel,
     context: u32,
+    planned_slots: usize,
     input: StartInput<'_>,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     let settings = GgufStartSettings::new(
@@ -165,6 +167,7 @@ fn serve_gguf(
             positions,
             rules,
             identity,
+            planned_slots,
         },
         prefill_chunk,
         input.ready_note,
