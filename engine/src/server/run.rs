@@ -623,17 +623,19 @@ fn start_flash(
         prefix_reuse,
         ready_note,
     )?;
-    let effective = if settings.cuda.is_none() {
-        crate::capability::effective::flash_mlx_effective(
-            config
-                .flash_next
-                .as_ref()
-                .unwrap_or(&FlashOptions::default()),
-            &env,
-            &settings,
-        )
-    } else {
-        Vec::new()
+    // A GGUF start reports no settings (it serves on CUDA from its own metadata): no MLX rows.
+    let effective = match &settings {
+        Some(settings) if settings.cuda.is_none() => {
+            crate::capability::effective::flash_mlx_effective(
+                config
+                    .flash_next
+                    .as_ref()
+                    .unwrap_or(&FlashOptions::default()),
+                &env,
+                settings,
+            )
+        }
+        _ => Vec::new(),
     };
     Ok(StartedEngine {
         engine: started.engine,

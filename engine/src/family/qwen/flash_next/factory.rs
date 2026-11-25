@@ -47,6 +47,9 @@ pub(crate) fn start_engine(
     .map(|(engine, _)| engine)
 }
 
+/// Starts one entry. The second element is the entry's resolved settings for a pack; a GGUF
+/// checkpoint has none (no manifest, no `config.json`) and answers `None`: its start plans from
+/// its own metadata and takes its own path, so no settings are made up for it.
 pub(crate) fn start_engine_resolved(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -54,13 +57,13 @@ pub(crate) fn start_engine_resolved(
     env: &FlashEnv,
     prefix_reuse: bool,
     ready_note: ReadyNote,
-) -> Result<(StartedEngine, FlashSettings), EngError> {
+) -> Result<(StartedEngine, Option<FlashSettings>), EngError> {
     // A GGUF checkpoint has no manifest and no `config.json`: it plans from its own metadata
     // and tensor table and takes its own start.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     if let Some(model) = super::load::gguf::GgufModel::open(model_dir)? {
-        let never = super::load::gguf::start::start(&model, options)?;
-        match never {}
+        return start_gguf(model, model_dir, tokenizer_dir, options, env, ready_note)
+            .map(|s| (s, None));
     }
     let settings = FlashSettings::new(model_dir, tokenizer_dir, options, env)?;
     if settings.manifest_found_in_pack {
@@ -78,8 +81,37 @@ pub(crate) fn start_engine_resolved(
             bundle,
             context_limit,
         },
-        settings,
+        Some(settings),
     ))
+}
+
+/// The GGUF start of this family: `load/gguf/start.rs` plans on this thread and serves the file
+/// when `INFERENCE_FLASH_NEXT_GGUF_SERVE` is on (it refuses with the pack's own text otherwise).
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn start_gguf(
+    model: super::load::gguf::GgufModel,
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    options: Option<&FlashOptions>,
+    env: &FlashEnv,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    use super::load::gguf::start::StartInput;
+    let (engine, bundle, context_limit) = super::load::gguf::start::start(
+        model,
+        StartInput {
+            model_dir,
+            tokenizer_dir,
+            options,
+            env,
+            ready_note,
+        },
+    )?;
+    Ok(StartedEngine {
+        engine,
+        bundle,
+        context_limit,
+    })
 }
 
 pub(crate) fn check_mlx_settings(settings: &FlashSettings) -> Result<(), EngError> {

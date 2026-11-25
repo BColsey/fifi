@@ -1,33 +1,87 @@
-//! The CUDA start of a Flash-Next GGUF: opens the card, plans memory, prints the plan, and
-//! refuses to serve because the resident executor cannot yet load GGUF weights.
+//! The CUDA start of a Flash-Next GGUF: opens the card, plans memory and prints the plan, then
+//! refuses or serves. Serving is opt-in (`INFERENCE_FLASH_NEXT_GGUF_SERVE`, `settings.rs`): with
+//! the switch off the start refuses after the plan, as before; with it on it serves the file in
+//! place through the GGUF decode modules (`cuda/gguf_start.rs`). The path is not qualified.
 //!
 //! Order: the CUDA context (for the card's free memory), the host admission snapshot, the
-//! context the plan chooses when the entry sets none, the plan line, then the refusal. Missing
-//! decode kernels are reported first; their availability alone does not enable execution.
-//! The plan is preliminary and does not account for a future GGUF executor's scratch buffers.
+//! context the plan chooses when the entry sets none, the plan line, then the refusal or the
+//! start. Missing decode kernels are reported first, with or without the switch; their
+//! availability alone does not enable execution. The plan is preliminary and does not account
+//! for the executor's scratch buffers.
+//!
+//! A served start keeps the pack's tokenizer rule (`cuda/start.rs`): the tokenizer files are
+//! pinned through an artifact manifest, found by the pack's own lookup, and a GGUF directory
+//! that has none is refused by that lookup's own message.
 
-use std::convert::Infallible;
+use std::path::Path;
+use std::time::Instant;
 
-use super::{GgufModel, plan::Card};
+use sha2::{Digest, Sha256};
+
+use super::{GgufModel, LIMITS, plan::Card};
 use crate::{
     EngError,
     family::{
         mem::Facts,
         project::cuda::CudaProjector,
-        qwen::flash_next::host_plan::{HOST_LABELS, HostMemory},
-        qwen::flash_next::settings::{
-            DEFAULT_CUDA_CONTEXT, FlashOptions, MAX_CUDA_CONTEXT, cuda_settings, default_context,
-            ring_budget_bytes,
+        qwen::flash_next::{
+            artifact::tokenizer_pin,
+            cuda::{BuildGuard, gguf_start},
+            host_plan::{HOST_LABELS, HostMemory},
+            settings::{
+                DEFAULT_CUDA_CONTEXT, FlashEnv, FlashOptions, GgufStartSettings, MAX_CUDA_CONTEXT,
+                cuda_settings, default_context, ring_budget_bytes,
+            },
         },
+        session::PrefixIdentity,
     },
+    sched::worker::{Engine, ReadyNote},
+    tokenizer::{TokenizerBundle, TokenizerPin},
+    weights::{GgufHeader, gguf_identity_digest, sha256_hex},
 };
 
-/// Plans the model on this machine and prints the plan. Returns the refusal that stands
-/// between the file and a served start; there is no serving path yet, so `Ok` never occurs.
+/// What the factory hands a GGUF start besides the opened model.
+pub(in crate::family::qwen::flash_next) struct StartInput<'a> {
+    /// The entry's `model_dir`: where the manifest lookup looks before the tokenizer directory.
+    pub(in crate::family::qwen::flash_next) model_dir: &'a Path,
+    pub(in crate::family::qwen::flash_next) tokenizer_dir: &'a Path,
+    pub(in crate::family::qwen::flash_next) options: Option<&'a FlashOptions>,
+    /// The captured environment: the switch and the manifest fallback are read here.
+    pub(in crate::family::qwen::flash_next) env: &'a FlashEnv,
+    pub(in crate::family::qwen::flash_next) ready_note: ReadyNote,
+}
+
+/// Plans the model on this machine, prints the plan, then refuses (the switch off) or serves
+/// it (the switch on) and returns the engine, its tokenizer bundle and the context the caches
+/// hold. A mis-set switch is refused before the card is opened.
 pub(in crate::family::qwen::flash_next) fn start(
-    model: &GgufModel,
-    options: Option<&FlashOptions>,
-) -> Result<Infallible, EngError> {
+    model: GgufModel,
+    input: StartInput<'_>,
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
+    let serve = input.env.gguf_serve()?;
+    let context = plan(&model, input.options)?;
+    // A type without a decode kernel refuses with or without the switch; the switch lifts only
+    // the executor refusal.
+    if !serve || !model.kernel_gaps().is_empty() {
+        return Err(execution_refusal(&model));
+    }
+    let settings = GgufStartSettings::new(
+        input.model_dir,
+        input.tokenizer_dir,
+        input.options,
+        input.env,
+    )?;
+    serve_gguf(
+        model,
+        context,
+        &settings,
+        input.tokenizer_dir,
+        input.ready_note,
+    )
+}
+
+/// Opens the card for its free memory and chooses the context and the expert slots per layer.
+fn plan(model: &GgufModel, options: Option<&FlashOptions>) -> Result<u32, EngError> {
     let mut options = options.cloned().unwrap_or_default();
     if options.cuda_decode == Some(false) {
         return Err(EngError::BadRequest(
@@ -87,8 +141,86 @@ pub(in crate::family::qwen::flash_next) fn start(
         tier_line(&load),
         facts.host.provenance_note()
     );
+    Ok(context)
+}
 
-    Err(execution_refusal(model))
+/// The serving half, the pack's `start` (`cuda/start.rs`) over the GGUF modules: the tokenizer
+/// pin, the bundle, the rules and the identity on the calling thread, then the engine thread
+/// builds everything CUDA inside `gguf_start::make`. The plan chose the context before the
+/// spawn, so it is returned directly: there is nothing to announce.
+fn serve_gguf(
+    model: GgufModel,
+    context: u32,
+    settings: &GgufStartSettings,
+    tokenizer_dir: &Path,
+    ready_note: ReadyNote,
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
+    let pin = load_pin(&settings.manifest, settings.tokenizer_vocab_size)?;
+    let bundle = TokenizerBundle::load(tokenizer_dir, &pin)?;
+    let head_vocab = model.config().model_shape()?.vocab;
+    let rules = gguf_start::cuda_rules(&bundle, head_vocab)?;
+    let identity = gguf_identity(&model, &pin)?;
+    let prefill_chunk = usize::try_from(settings.prefill_chunk)
+        .map_err(|_| EngError::BadRequest("engine config: prefill_chunk exceeds usize".into()))?;
+    let guard = BuildGuard::acquire()?;
+    let began = Instant::now();
+    // The engine thread builds the executor inside `cuda`, so no executor type leaves that module.
+    let engine = gguf_start::spawn(
+        model,
+        usize::try_from(context)
+            .map_err(|_| EngError::BadRequest("engine config: context exceeds usize".into()))?,
+        prefill_chunk,
+        rules,
+        identity,
+        ready_note,
+        guard,
+    )?;
+    eprintln!(
+        "flash-next gguf cuda: engine thread started at {:.1} s",
+        began.elapsed().as_secs_f64()
+    );
+    Ok((engine, bundle, context))
+}
+
+/// The tokenizer pin of the artifact manifest, as the pack's start reads it.
+fn load_pin(manifest: &Path, vocab_size: u32) -> Result<TokenizerPin, EngError> {
+    let manifest = std::fs::read(manifest).map_err(|error| {
+        EngError::Checkpoint(format!(
+            "the manifest {} cannot be read: {error}",
+            manifest.display()
+        ))
+    })?;
+    tokenizer_pin(&manifest, vocab_size)
+}
+
+/// The load identity of a GGUF checkpoint for the prefix paths: the identity digest of every
+/// shard (`weights::gguf_identity_digest`: the header, a sample of every tensor's bytes, the
+/// file length and its modification time; this family pins no full-file digest), folded into
+/// one, plus the pinned tokenizer and chat-template digests of the artifact manifest. Constant
+/// for one loaded checkpoint, as the pack's identity is for one pack.
+fn gguf_identity(model: &GgufModel, pin: &TokenizerPin) -> Result<PrefixIdentity, EngError> {
+    let mut hasher = Sha256::new();
+    for path in model.weights.paths() {
+        hasher.update(shard_identity(path)?);
+    }
+    let weights: [u8; 32] = hasher.finalize().into();
+    Ok(PrefixIdentity {
+        weights: sha256_hex(&weights).into(),
+        tokenizer: sha256_hex(&pin.tokenizer_json).into(),
+        template: sha256_hex(&pin.chat_template_jinja).into(),
+    })
+}
+
+/// The identity digest of one shard: its own header, read again with the loader's bounds.
+fn shard_identity(path: &Path) -> Result<[u8; 32], EngError> {
+    let bad = |error: std::io::Error| {
+        EngError::Checkpoint(format!("prefix identity: {}: {error}", path.display()))
+    };
+    let mut file = std::fs::File::open(path).map_err(bad)?;
+    let len = file.metadata().map_err(bad)?.len();
+    let max_header = LIMITS.max_header_bytes;
+    let header = GgufHeader::parse(&mut file, len, max_header)?;
+    gguf_identity_digest(&header, path, None).map_err(bad)
 }
 
 /// Check the actual part-major stack bytes against the planner's conservative charge.
@@ -115,7 +247,8 @@ fn verify_expert_stack_budget(model: &GgufModel, slots: usize) -> Result<(), Eng
     Ok(())
 }
 
-/// Kernel availability does not imply that the CUDA executor can load GGUF weights.
+/// Kernel availability does not imply that the path may serve: without the switch, or with a
+/// matrix type no decode kernel reads, this refusal stands between the plan and a start.
 fn execution_refusal(model: &GgufModel) -> EngError {
     let gaps = model.kernel_gaps();
     if !gaps.is_empty() {
@@ -155,6 +288,35 @@ mod tests {
         assert!(
             error.contains("executor does not read GGUF weights yet"),
             "{error}"
+        );
+    }
+
+    /// The factory routes a GGUF checkpoint to this start, and a mis-set switch is refused there
+    /// before the card is opened (`plan` is the first call that needs one). Host-only: the
+    /// fixture is a synthetic file and no CUDA context is made.
+    #[test]
+    fn the_factory_refuses_a_mis_set_switch_before_any_card_is_opened() {
+        use std::path::Path;
+        let fixture = write_flash(&Spec::default());
+        let env = FlashEnv {
+            gguf_serve: Some("yes".into()),
+            ..FlashEnv::default()
+        };
+        let error = match crate::family::qwen::flash_next::factory::start_engine_resolved(
+            &fixture.first,
+            Path::new("/unused-tokenizer-dir"),
+            None,
+            &env,
+            false,
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a mis-set switch must refuse the start"),
+        };
+        let text = error.describe();
+        assert!(
+            text.contains("INFERENCE_FLASH_NEXT_GGUF_SERVE") && text.contains("\"yes\""),
+            "{text}"
         );
     }
 }

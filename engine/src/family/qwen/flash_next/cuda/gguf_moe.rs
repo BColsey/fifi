@@ -64,6 +64,13 @@ impl<'a> GgufStep<'a> {
         &self.step
     }
 
+    /// The inner step mutably: the serving device (`cuda/gguf_device.rs`) installs a saved state
+    /// through it, the one `StateIo` call that takes `&mut`. Weights and layer window stay the
+    /// trunk's; nothing here rebinds the step to another trunk.
+    pub(super) fn step_mut(&mut self) -> &mut FlashStep<'a> {
+        &mut self.step
+    }
+
     /// Selects the arithmetic of the native GGUF decode projections on this trunk's step
     /// ([`GgufDecodePrecision`]). An owner bound afterwards ([`GgufMoeOwner::new`]) gives its
     /// routed experts the same arithmetic, so one trunk never mixes the two.

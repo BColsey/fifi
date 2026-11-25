@@ -147,8 +147,17 @@ mod testkit {
 // only. Staged: the executor is the first caller.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod gguf_moe;
+// The token driver's card device over the GGUF step (the opt-in GGUF serving path).
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod gguf_device;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod gguf_shared;
+// The executor build of that path on the engine thread; `load::gguf::start` spawns it.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::qwen::flash_next) mod gguf_start;
+/// The pack start's one-engine flag, which the GGUF start's engine thread takes as well.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::qwen::flash_next) use start::BuildGuard;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod mixer;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

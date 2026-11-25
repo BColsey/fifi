@@ -98,7 +98,7 @@ use crate::{
 /// Threads of the host PLE projections (rows split over them). The two projection matvecs are
 /// DRAM-bandwidth-bound (131 MB per token), so more threads helps until the socket saturates;
 /// `INFERENCE_FLASH_NEXT_PLE_THREADS` overrides the default.
-fn ple_threads() -> usize {
+pub(in super::super) fn ple_threads() -> usize {
     std::env::var("INFERENCE_FLASH_NEXT_PLE_THREADS")
         .ok()
         .and_then(|text| text.parse::<usize>().ok())
@@ -122,8 +122,8 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
 /// Registers the kernels the Flash-Next decode runs on its context: the wide single-row kernel for
 /// every dense projection and the id-indexed options of the routed experts. Qwen3.6 and Flint
 /// register their own; a bad launch switch or an option the kernel cannot combine with is refused
-/// here, before any weight is uploaded.
-fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
+/// here, before any weight is uploaded. The GGUF start (`gguf_start.rs`) registers the same set.
+pub(in super::super) fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
     ctx.register_served_kernels(ServedKernels {
         single_row: SERVED_SINGLE_ROW,
         indexed: Some(SERVED_INDEXED),
@@ -147,20 +147,21 @@ fn already_built() -> EngError {
 }
 
 /// Takes the one-engine flag; released on drop unless committed (a failure before the first leak
-/// owns nothing on the card).
-pub(super) struct BuildGuard {
+/// Owns nothing on the card). The GGUF start (`load/gguf/start.rs`) takes the same flag: one
+/// Flash-Next CUDA engine, pack or GGUF, per process.
+pub(in super::super) struct BuildGuard {
     committed: bool,
 }
 
 impl BuildGuard {
-    fn acquire() -> Result<Self, EngError> {
+    pub(in super::super) fn acquire() -> Result<Self, EngError> {
         CUDA_ENGINE_BUILT
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| already_built())?;
         Ok(Self { committed: false })
     }
 
-    fn commit(&mut self) {
+    pub(in super::super) fn commit(&mut self) {
         self.committed = true;
     }
 }

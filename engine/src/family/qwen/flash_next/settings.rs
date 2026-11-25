@@ -194,14 +194,46 @@ pub(crate) struct FlashEnv {
     pub(crate) manifest: Option<String>,
     /// `FLASH_NEXT_CACHE_LIMIT`, a byte count.
     pub(crate) cache_limit: Option<String>,
+    /// `INFERENCE_FLASH_NEXT_GGUF_SERVE`, the raw text; [`FlashEnv::gguf_serve`] parses it. A value
+    /// that is not UTF-8 is kept as a placeholder so the parser refuses it, never reads it as unset.
+    pub(crate) gguf_serve: Option<String>,
 }
+
+/// The opt-in switch of the Flash-Next GGUF serving path (`load/gguf/start.rs`).
+pub(crate) const GGUF_SERVE: &str = "INFERENCE_FLASH_NEXT_GGUF_SERVE";
 
 impl FlashEnv {
     pub(crate) fn capture() -> Self {
         Self {
             manifest: std::env::var("FLASH_NEXT_ARTIFACT_MANIFEST").ok(),
             cache_limit: std::env::var("FLASH_NEXT_CACHE_LIMIT").ok(),
+            gguf_serve: match std::env::var(GGUF_SERVE) {
+                Ok(text) => Some(text),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => Some("a non-unicode value".into()),
+            },
         }
+    }
+
+    /// Whether [`GGUF_SERVE`] is on; any set value other than the enable words is refused.
+    pub(crate) fn gguf_serve(&self) -> Result<bool, EngError> {
+        gguf_serve_text(self.gguf_serve.as_deref())
+    }
+}
+
+/// The default-off polarity of [`GGUF_SERVE`]: unset is off; `1`, `true` or `on` (trimmed and
+/// case-folded, the engine's enable words through `env_switch::env_allows_value`) is on; every
+/// other set value, the disable words included, is refused, so a typo never reads as a choice.
+/// The text core is split out so the rule is testable without the process environment.
+pub(super) fn gguf_serve_text(raw: Option<&str>) -> Result<bool, EngError> {
+    const ACCEPTED: &str = "must be unset, \"1\", \"true\" or \"on\"";
+    match raw {
+        None => Ok(false),
+        // The shared helper is default-ON for an absent variable; `None` is answered above.
+        Some(text) if crate::env_switch::env_allows_value(Some(text)) => Ok(true),
+        Some(seen) => Err(EngError::BadRequest(format!(
+            "{GGUF_SERVE} {ACCEPTED}, not {seen:?}"
+        ))),
     }
 }
 
@@ -251,6 +283,49 @@ fn bounded(key: &str, value: u32, low: u32, high: u32) -> Result<u32, EngError> 
         Err(bad(format!(
             "{key} must be between {low} and {high}, found {value}"
         )))
+    }
+}
+
+/// The settings of a GGUF entry that its CUDA start (`load/gguf/start.rs`) cannot read off
+/// `FlashOptions`: the artifact manifest that pins the tokenizer files, looked up exactly as a
+/// pack's (the key, the environment, then `download-manifest.json` in the model or the tokenizer
+/// directory), and the tokenizer vocabulary size and the prefill chunk with the defaults a pack
+/// takes. A GGUF directory ships no manifest, so the start refuses, naming where it looked, until
+/// one is supplied through those fallbacks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GgufStartSettings {
+    pub(super) manifest: PathBuf,
+    pub(super) tokenizer_vocab_size: u32,
+    pub(super) prefill_chunk: u32,
+}
+
+impl GgufStartSettings {
+    pub(super) fn new(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        options: Option<&FlashOptions>,
+        env: &FlashEnv,
+    ) -> Result<Self, EngError> {
+        let default = FlashOptions::default();
+        let options = options.unwrap_or(&default);
+        let (manifest, _) = manifest_path(options, env, model_dir, tokenizer_dir)?;
+        Ok(Self {
+            manifest,
+            tokenizer_vocab_size: ranged(
+                "tokenizer_vocab_size",
+                options.tokenizer_vocab_size,
+                DEFAULT_VOCAB_SIZE,
+                1,
+                u32::MAX,
+            )?,
+            prefill_chunk: ranged(
+                "prefill_chunk",
+                options.prefill_chunk,
+                DEFAULT_PREFILL_CHUNK,
+                1,
+                MAX_PREFILL_CHUNK,
+            )?,
+        })
     }
 }
 
@@ -902,6 +977,7 @@ mod tests {
     fn the_environment_fills_the_manifest_and_the_limit_and_the_defaults_fill_the_rest() {
         let env = FlashEnv {
             manifest: Some("/env-art/download-manifest.json".into()),
+            gguf_serve: None,
             cache_limit: Some("2048".into()),
         };
         let got = settings(None, &env).unwrap();
@@ -1098,6 +1174,7 @@ mod tests {
         // The environment variable and the config key both win over the pack's file.
         let env = FlashEnv {
             manifest: Some("/env/m.json".into()),
+            gguf_serve: None,
             cache_limit: Some("1".into()),
         };
         let got = build(&env).unwrap();
@@ -1143,6 +1220,7 @@ mod tests {
     fn the_config_wins_over_the_environment() {
         let env = FlashEnv {
             manifest: Some("/env-manifest".into()),
+            gguf_serve: None,
             cache_limit: Some("5".into()),
         };
         let got = settings(Some(&full()), &env).unwrap();
@@ -1177,6 +1255,7 @@ mod tests {
     fn an_empty_environment_variable_counts_as_not_set() {
         let env = FlashEnv {
             manifest: Some(String::new()),
+            gguf_serve: None,
             cache_limit: Some(String::new()),
         };
         let no_manifest = FlashOptions {
@@ -1243,6 +1322,7 @@ mod tests {
     #[test]
     fn an_environment_limit_that_is_not_a_number_is_rejected() {
         let env = FlashEnv {
+            gguf_serve: None,
             cache_limit: Some("1GiB".into()),
             ..FlashEnv::default()
         };
@@ -1272,6 +1352,7 @@ mod tests {
     fn expert_prefetch_defaults_off_and_parses_both_booleans() {
         let env = FlashEnv {
             manifest: Some("/manifest.json".into()),
+            gguf_serve: None,
             cache_limit: Some("1024".into()),
         };
         assert!(!settings(None, &env).unwrap().expert_prefetch);
@@ -1803,6 +1884,25 @@ mod tests {
         assert_eq!(
             super::ple_batch_text(Some("yes")).unwrap_err().describe(),
             "INFERENCE_FLASH_NEXT_PLE_BATCH must be unset or \"1\""
+        );
+    }
+
+    /// The GGUF serving switch: unset is off; the engine's enable words are on, with the shared
+    /// helper's trimming and case folding; a typo is refused with the variable named.
+    #[test]
+    fn the_gguf_serve_switch_is_off_unless_an_enable_word_is_set() {
+        let parse = super::gguf_serve_text;
+        assert!(!parse(None).unwrap(), "unset is off");
+        for on in ["1", "true", "on", " true ", "TRUE", "On"] {
+            assert!(parse(Some(on)).unwrap(), "{on:?} is on");
+        }
+        let error = match parse(Some("yes")) {
+            Err(EngError::BadRequest(text)) => text,
+            other => panic!("`yes` must be refused, got {other:?}"),
+        };
+        assert!(
+            error.contains("INFERENCE_FLASH_NEXT_GGUF_SERVE") && error.contains("\"yes\""),
+            "{error}"
         );
     }
 }
