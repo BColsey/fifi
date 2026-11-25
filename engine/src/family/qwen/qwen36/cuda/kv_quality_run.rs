@@ -8,8 +8,8 @@
 //! next position. A row is narrowed to the sampler vocabulary and scored in f64: the true-token
 //! log-probability, the greedy argmax and the top rows of the distribution go to a per-window
 //! sidecar. When a reference run's sidecars are named, the leg also writes the divergence of the
-//! reference distribution from its own, over the reference's stored top rows (a lower bound; the
-//! reference's tail mass is stored beside it).
+//! reference distribution from its own over the reference's stored top rows (no bound on the
+//! whole-vocabulary KL, the terms outside being signed) and the reference's tail mass beside it.
 //!
 //! The pairing, the bootstrap and the verdict run on the host from the sidecars of two runs.
 
