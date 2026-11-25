@@ -15,6 +15,8 @@
 //! The DeltaNet value heads stay in the file's tiled order: the scan runs in its tiled form and
 //! no tensor is reordered.
 
+use std::collections::HashSet;
+
 use super::{
     GgufModel,
     tensors::{Convention, Mapped, Slot},
@@ -33,6 +35,65 @@ use crate::{
 
 /// The pack name of the hyper-connection mixer that feeds `lm_head`.
 const MIXER: &str = "model.language_model.hyper_connection_mixer";
+
+/// The tensors of a hyper-connection site, under its pack name.
+const HYPER_TAILS: [&str; 4] = [
+    "hc_norm.weight",
+    "input_mix_weight_down.weight",
+    "input_mix_weight_up.weight",
+    "block_inject_weight.weight",
+];
+
+/// The trunk tensors of the mixer that feeds `lm_head`, under its pack name (no inject).
+const MIXER_TAILS: [&str; 3] = [
+    "hc_norm.weight",
+    "input_mix_weight_down.weight",
+    "input_mix_weight_up.weight",
+];
+
+/// The pack names the step reads in every layer: the two hyper-connection sites and the MoE.
+const EVERY_LAYER: [&str; 13] = [
+    "mlp.gate.weight",
+    "mlp.shared_expert_gate.weight",
+    "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.up_proj",
+    "mlp.shared_expert.down_proj",
+    "attn_hyper_connection.hc_norm.weight",
+    "attn_hyper_connection.input_mix_weight_down.weight",
+    "attn_hyper_connection.input_mix_weight_up.weight",
+    "attn_hyper_connection.block_inject_weight.weight",
+    "mlp_hyper_connection.hc_norm.weight",
+    "mlp_hyper_connection.input_mix_weight_down.weight",
+    "mlp_hyper_connection.input_mix_weight_up.weight",
+    "mlp_hyper_connection.block_inject_weight.weight",
+];
+
+/// The pack names of the gated DeltaNet tensors the step reads in a DeltaNet layer.
+const DELTA: [&str; 9] = [
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z",
+    "linear_attn.out_proj",
+    "linear_attn.in_proj_b.weight",
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.conv1d.weight",
+    "linear_attn.A_log",
+    "linear_attn.dt_bias",
+    "linear_attn.norm.weight",
+];
+
+/// The pack names of the QSA attention tensors the step reads in an attention layer.
+const QSA: [&str; 10] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "self_attn.indexer.q_layernorm.weight",
+    "self_attn.indexer.k_layernorm.weight",
+    "self_attn.indexer.index_qk_proj.q",
+    "self_attn.indexer.index_qk_proj.k",
+];
 
 /// How one tensor goes to the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +251,89 @@ fn f32_to_f16(value: f32) -> u16 {
     sign | (((exponent as u32) << 10) + rounded) as u16
 }
 
+/// One tensor of the trunk plan: the mapped entry, the name the step reads it under and how
+/// it goes up.
+#[derive(Debug, Clone)]
+struct Planned {
+    entry: Mapped,
+    name: String,
+    how: Upload,
+}
+
+/// The part of the routed-expert stack `role` is a tensor of, when it is one.
+fn expert_part(role: Slot) -> Option<&'static str> {
+    match role {
+        Slot::Layer(Wanted::ExpertGate) => Some("gate"),
+        Slot::Layer(Wanted::ExpertUp) => Some("up"),
+        Slot::Layer(Wanted::ExpertDown) => Some("down"),
+        _ => None,
+    }
+}
+
+/// The resident trunk of `model`: every mapped tensor the step reads on the card, and the
+/// routed experts of the layers `resident_experts` names as native stacks under [`expert_key`].
+/// No device memory moves: [`check_plan`] refuses an incomplete plan before the upload starts.
+fn plan(model: &GgufModel, resident_experts: &dyn Fn(usize) -> bool) -> Vec<Planned> {
+    let mut out = Vec::new();
+    for entry in model.map().entries() {
+        let layer = entry.layer.unwrap_or(0);
+        let expert_part = expert_part(entry.role);
+        let planned = match expert_part {
+            Some(part) if resident_experts(layer) => {
+                Some((expert_key(layer, part), Upload::Native))
+            }
+            Some(_) => None,
+            None => plan_of(entry),
+        };
+        if let Some((name, how)) = planned {
+            out.push(Planned {
+                entry: entry.clone(),
+                name,
+                how,
+            });
+        }
+    }
+    out
+}
+
+/// The pack names the step reads outside the layers and in each of the model's layers of its
+/// kind, the routed expert stacks of the layers `resident_experts` names included.
+fn required(model: &GgufModel, resident_experts: &dyn Fn(usize) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = vec!["lm_head".to_string()];
+    out.extend(MIXER_TAILS.iter().map(|tail| format!("{MIXER}.{tail}")));
+    for (layer, &attention) in model.config().kinds().iter().enumerate() {
+        let at = |suffix: &str| layer_name(layer, suffix);
+        out.extend(EVERY_LAYER.iter().map(|tail| at(tail)));
+        let mixer: &[&str] = if attention { &QSA } else { &DELTA };
+        out.extend(mixer.iter().map(|suffix| at(suffix)));
+        if resident_experts(layer) {
+            out.extend(["gate", "up", "down"].map(|part| expert_key(layer, part)));
+        }
+    }
+    out
+}
+
+/// Refuses a plan the step could not run on, before any upload: every name the step reads
+/// outside the layers and in layers `0..layers` must be planned, and the first missing one is
+/// named. The map already refuses a file without a tensor; this catches a role the plan does
+/// not cover.
+fn check_plan(
+    model: &GgufModel,
+    planned: &[Planned],
+    resident_experts: &dyn Fn(usize) -> bool,
+) -> Result<(), EngError> {
+    let names: HashSet<&str> = planned.iter().map(|tensor| tensor.name.as_str()).collect();
+    if let Some(missing) = required(model, resident_experts)
+        .into_iter()
+        .find(|name| !names.contains(name.as_str()))
+    {
+        return Err(refuse(format!(
+            "the step reads {missing}, and the plan has no tensor under that name"
+        )));
+    }
+    Ok(())
+}
+
 /// Uploads the resident trunk of `model` on `ctx`, and the routed experts of the layers
 /// `resident_experts` names as native stacks under [`expert_key`]. `chunk_limit` is the host bytes one native read holds.
 pub(in crate::family::qwen::flash_next) fn gguf_trunk(
@@ -199,30 +343,21 @@ pub(in crate::family::qwen::flash_next) fn gguf_trunk(
     chunk_limit: usize,
 ) -> Result<CudaWeights, EngError> {
     let weights = &*model.weights;
-    let experts = model.config().dims.experts as usize;
+    let planned = plan(model, resident_experts);
+    check_plan(model, &planned, resident_experts)?;
     let mut out: Vec<CudaWeight> = Vec::new();
-    for entry in model.map().entries() {
-        let expert_part = match entry.role {
-            Slot::Layer(Wanted::ExpertGate) => Some("gate"),
-            Slot::Layer(Wanted::ExpertUp) => Some("up"),
-            Slot::Layer(Wanted::ExpertDown) => Some("down"),
-            _ => None,
-        };
-        let planned = match expert_part {
-            Some(part) if resident_experts(entry.layer.unwrap_or(0)) => {
-                Some((expert_key(entry.layer.unwrap_or(0), part), Upload::Native))
-            }
-            Some(_) => None,
-            None => plan_of(entry),
-        };
-        let Some((name, how)) = planned else {
-            continue;
-        };
+    for Planned { entry, name, how } in &planned {
+        let (name, how) = (name.clone(), *how);
+        let expert_part = expert_part(entry.role);
         let upload = match how {
             Upload::Native => {
-                let (k, rows) = match entry.dims.as_slice() {
-                    [k, rows] => (*k as usize, *rows as usize),
-                    [k, rows, stack] => (*k as usize, *rows as usize * *stack as usize),
+                let (k, rows, stack) = match entry.dims.as_slice() {
+                    [k, rows] => (*k as usize, *rows as usize, None),
+                    [k, rows, stack] => (
+                        *k as usize,
+                        *rows as usize * *stack as usize,
+                        Some(*stack as usize),
+                    ),
                     other => {
                         return Err(refuse(format!("{} has dimensions {other:?}", entry.name)));
                     }
@@ -238,10 +373,17 @@ pub(in crate::family::qwen::flash_next) fn gguf_trunk(
                 let mut read =
                     |offset: usize, buf: &mut [u8]| weights.read_range(&source, offset as u64, buf);
                 let native = ctx.upload_native(tensor, chunk_limit, &mut read)?;
-                let native = if expert_part.is_some() {
-                    native.with_experts(Some(experts))
-                } else {
-                    native
+                // The recorded depth is the tensor's own stack dimension, which the MoE block
+                // checks against its rows and the dims' expert count.
+                let native = match (expert_part, stack) {
+                    (Some(_), Some(depth)) => native.with_experts(Some(depth)),
+                    (Some(_), None) => {
+                        return Err(refuse(format!(
+                            "{} is an expert stack without a stack dimension",
+                            entry.name
+                        )));
+                    }
+                    (None, _) => native,
                 };
                 CudaWeight::Native {
                     name,
@@ -306,7 +448,53 @@ fn widened(
 
 #[cfg(test)]
 mod tests {
-    use super::f32_to_f16;
+    use super::*;
+    use crate::family::qwen::flash_next::load::gguf::smallmodel::write_small;
+
+    fn small_model() -> GgufModel {
+        let small = write_small(7);
+        GgufModel::open(&small.first)
+            .expect("open")
+            .expect("a qwen4exp model")
+    }
+
+    /// The plan of the small model covers every name the step reads, and a plan that lacks one
+    /// of them is refused by that name before any upload. (A file that lacks the tensor is
+    /// refused by the map at open; this is the plan's own check, which needs no card.)
+    #[test]
+    fn a_plan_without_a_trunk_tensor_the_step_reads_is_refused_by_its_name() {
+        let model = small_model();
+        // Layers from 0 read their experts from the card; the others stream them.
+        let resident = |layer: usize| layer.is_multiple_of(2);
+        let planned = plan(&model, &resident);
+        check_plan(&model, &planned, &resident).expect("the plan is complete");
+        assert!(planned.iter().any(|t| t.name == expert_key(0, "up")));
+        assert!(!planned.iter().any(|t| t.name == expert_key(1, "up")));
+        for name in [
+            layer_name(1, "mlp.shared_expert_gate.weight"),
+            layer_name(3, "self_attn.indexer.index_qk_proj.q"),
+            format!("{MIXER}.input_mix_weight_up.weight"),
+            expert_key(2, "down"),
+        ] {
+            let lacking: Vec<Planned> = planned
+                .iter()
+                .filter(|tensor| tensor.name != name)
+                .cloned()
+                .collect();
+            let error = format!(
+                "{:?}",
+                check_plan(&model, &lacking, &resident).expect_err("a lacking plan")
+            );
+            assert!(error.contains(&name), "{name}: {error}");
+        }
+        // The experts of a streamed layer are not trunk tensors.
+        let lacking: Vec<Planned> = planned
+            .iter()
+            .filter(|tensor| tensor.name != expert_key(1, "up"))
+            .cloned()
+            .collect();
+        check_plan(&model, &lacking, &resident).expect("layer 1 streams its experts");
+    }
 
     #[test]
     fn half_conversion_matches_known_values() {
