@@ -80,8 +80,12 @@ pub(in crate::family::qwen::flash_next) fn start(
     })?;
     eprintln!("{}", model.summary());
 
-    let projector = CudaProjector::new()?;
-    let facts = Facts::read_card(HOST_LABELS, projector.card_bytes())?;
+    // The measuring projector is one of the two card leases a process holds: it is dropped here,
+    // before the engine thread takes its own, so a third holder in the process cannot fail it.
+    let facts = {
+        let projector = CudaProjector::new()?;
+        Facts::read_card(HOST_LABELS, projector.card_bytes())?
+    };
     let ring_budget = ring_budget_bytes(
         std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
             .ok()
