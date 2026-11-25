@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     GgufModel,
+    admission::check_slots,
     placement::{ExpertSetup, cache_plan, layer_stacks},
     plan::Card,
 };
@@ -141,6 +142,7 @@ pub(in crate::family::qwen::flash_next) fn start(
     let setup = if tier.slots_per_layer() >= experts {
         ExpertSetup::Resident
     } else {
+        check_slots(tier.slots_per_layer(), model.config().top_k())?;
         let host_bytes = match tier.store_tier() {
             TierChoice::Disk | TierChoice::CardDisk { .. } => tier.host_spare_bytes(),
             _ => tier.cold_bytes() + tier.host_spare_bytes(),

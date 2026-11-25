@@ -23,6 +23,7 @@
 )]
 
 pub(super) mod config;
+pub(in crate::family::qwen::flash_next) mod admission;
 pub(in crate::family::qwen::flash_next) mod feeds;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests;
