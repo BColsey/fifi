@@ -1,15 +1,20 @@
 //! The decode dq matvec: one f32 activation row `x` through a native Q4_K or Q6_K weight,
 //! `y[r] = sum_k x[k] * w[r][k]`, with the weights decoded per value and each block's sum
-//! rounded in f32 (not an exact f32 product: the CPU dequant reference holds within
-//! `64 * 2^-24 * sum |w x|`, see `tests.rs`).
+//! rounded in f32 (not an exact f32 product: the CPU reference holds within
+//! `64 * 2^-24 * sum |w x|`, see `tests.rs`). That reference is `reference::weight_value` of
+//! `resident/matvec_q/tests.rs`, a transcription of ggml's Q4_K and Q6_K layouts, not the
+//! crate's `weights/gguf_dequant.rs`.
 //!
 //! [CudaContext::matvec_dq] queues ONE kernel on a [DeviceStream] and returns when it is
 //! queued. It allocates nothing, copies nothing and never synchronizes.
 //!
-//! Every refusal is a BadRequest and happens before any native call: the backend is usable,
-//! the type is Q4_K or Q6_K, k is a positive multiple of 256, rows is above zero, w holds the
-//! rows' blocks and x k floats at 16-byte alignment, y holds rows floats at 4-byte alignment,
-//! and y overlaps no byte of w or x.
+//! Every refusal of the conditions below is a BadRequest and happens before any native call:
+//! the backend is usable, the type is Q4_K or Q6_K, k is a positive multiple of 256, rows is
+//! above zero, w holds the rows' blocks and x k floats at 16-byte alignment, y holds rows
+//! floats at 4-byte alignment, and y overlaps no byte of w or x. One refusal comes later and
+//! as a Backend error: a k or a rows at or above 2^31 passes these checks and is refused by
+//! the native entry, as the native entries of matvec_q, matvec_q5k, matvec_gguf and
+//! matvec_q3k refuse it.
 #![cfg_attr(
     not(test),
     expect(dead_code, reason = "staged for the resident decode step")

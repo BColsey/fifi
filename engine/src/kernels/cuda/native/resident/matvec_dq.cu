@@ -167,8 +167,12 @@ __device__ __forceinline__ float signed_f(unsigned byte) {
 /* The 32 bytes at `p` as eight words on word boundaries. p is even, but in a 210-byte block it
  * is 16-byte aligned only where the block is: so the three 16-byte lines that cover [p, p + 32)
  * are read, and every word is cut from two neighbours by one byte perm, placed by the window's
- * start offset in its first line: s words (0 to 3) and r bytes (0 or 2). The lines stay inside
- * the block's 210 bytes: the last window ends at +192, the third line at +208 at most. */
+ * start offset in its first line: s words (0 to 3) and r bytes (0 or 2). The lines end inside
+ * the block's 210 bytes: the last window ends at +192, the third line at +208 at most. They
+ * can start up to 14 bytes before the window, in the previous block of the row or in the last
+ * block of the previous row, so still inside the allocation. That holds only because the first
+ * block of row 0 starts at the 16-byte aligned w, so no line starts before it: this is why
+ * the launcher refuses a w that is not 16-byte aligned. */
 struct Window {
     unsigned w[8];
 };
