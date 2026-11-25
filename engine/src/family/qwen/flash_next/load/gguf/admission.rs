@@ -57,6 +57,42 @@ pub(in crate::family::qwen::flash_next) fn tokenizer_digest(
         })
 }
 
+/// Bytes sampled at each end of every tensor for the weights digest.
+const SAMPLE: u64 = 64;
+
+/// The weights term of the prefix identity. The header digest and the tensor count say which
+/// layout a file has, not which weights: two files with the same layout and different weights
+/// shared an identity. The length of every shard and a sample of every tensor's first and last
+/// bytes change with the weights, at a cost that does not grow with the file.
+pub(in crate::family::qwen::flash_next) fn weights_digest(
+    model: &super::GgufModel,
+) -> Result<[u8; 32], EngError> {
+    let weights = &*model.weights;
+    let header = weights.header();
+    let mut hash = Sha256::new();
+    hash.update(header.header_sha256());
+    hash.update(header.tensors().len().to_le_bytes());
+    for path in weights.paths() {
+        let len = std::fs::metadata(path)
+            .map_err(|error| refuse(format!("{} cannot be read: {error}", path.display())))?
+            .len();
+        hash.update(len.to_le_bytes());
+    }
+    let mut sample = [0u8; SAMPLE as usize];
+    for tensor in header.tensors() {
+        let take = tensor.byte_len().min(SAMPLE) as usize;
+        let (first, last) = sample.split_at_mut(take);
+        weights.read_range(tensor.name(), 0, first)?;
+        hash.update(first);
+        let from = tensor.byte_len().saturating_sub(SAMPLE);
+        if from > 0 {
+            weights.read_range(tensor.name(), from, last)?;
+            hash.update(last);
+        }
+    }
+    Ok(hash.finalize().into())
+}
+
 /// A cache with fewer slots per layer than the router picks fails every token: a pick without a
 /// slot finds no victim to evict. Refused at the start, before any device work, naming both.
 pub(in crate::family::qwen::flash_next) fn check_slots(
@@ -117,6 +153,33 @@ pub(in crate::family::qwen::flash_next) fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::qwen::flash_next::load::gguf::{GgufModel, smallmodel::write_small};
+
+    /// Two files with the same layout and different weights get different identities; the same
+    /// file twice gets the same.
+    #[test]
+    fn the_weights_digest_follows_the_bytes_not_only_the_layout() {
+        let small = write_small(7);
+        let open = || {
+            GgufModel::open(small.dir.path())
+                .expect("open")
+                .expect("a model")
+        };
+        let model = open();
+        let first = weights_digest(&model).expect("digest");
+        assert_eq!(weights_digest(&model).expect("digest again"), first);
+        let (shard, at) = {
+            let tensor = &model.weights.header().tensors()[0];
+            (tensor.shard(), tensor.abs_offset())
+        };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&model.weights.paths()[shard])
+            .expect("the shard for writing");
+        std::os::unix::fs::FileExt::write_all_at(&file, &[0xAA], at).expect("patch a byte");
+        let other = open();
+        assert_ne!(weights_digest(&other).expect("digest"), first);
+    }
 
     /// An unreadable tokenizer file is refused; an absent one still pins zeros for the load to
     /// report.

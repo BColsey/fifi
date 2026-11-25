@@ -10,11 +10,12 @@
 
 use std::{path::Path, sync::Arc};
 
-use sha2::{Digest, Sha256};
-
 use super::{
     GgufModel,
-    admission::{check_cuda_decode, check_opt_in, check_slots, observed_pin, tokenizer_digest},
+    admission::{
+        check_cuda_decode, check_opt_in, check_slots, observed_pin, tokenizer_digest,
+        weights_digest,
+    },
     placement::{ExpertSetup, cache_plan, layer_stacks},
     plan::Card,
 };
@@ -163,12 +164,7 @@ pub(in crate::family::qwen::flash_next) fn start(
         eos: Arc::from(bundle.eos_token_ids()),
         sampler_vocab,
     };
-    let header = model.weights.header();
-    let weights_digest: [u8; 32] = Sha256::new()
-        .chain_update(header.header_sha256())
-        .chain_update(header.tensors().len().to_le_bytes())
-        .finalize()
-        .into();
+    let weights_digest = weights_digest(model)?;
     let tokenizer_digest = tokenizer_digest(tokenizer_dir)?;
     let identity = PrefixIdentity {
         weights: crate::weights::sha256_hex(&weights_digest).into(),
