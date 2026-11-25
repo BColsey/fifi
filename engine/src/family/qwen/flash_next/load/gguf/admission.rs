@@ -139,17 +139,6 @@ pub(in crate::family::qwen::flash_next) fn check_opt_in(
     Ok(())
 }
 
-/// The admission of the GGUF start: `cuda_decode` set to true, then the switch. Both are read by
-/// the caller (the entry and the environment) and passed in, so tests never change the process.
-pub(in crate::family::qwen::flash_next) fn admit(
-    cuda_decode: Option<bool>,
-    opt_in: bool,
-    first_path: &std::path::Path,
-) -> Result<(), EngError> {
-    check_cuda_decode(cuda_decode)?;
-    check_opt_in(opt_in, first_path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,10 +220,14 @@ mod tests {
     #[test]
     fn the_gguf_start_needs_cuda_decode_and_the_switch() {
         let path = Path::new("/models/flash-next.gguf");
-        let both = admit(Some(true), true, path);
+        // The start's order: `cuda_decode`, then the switch, where the plan check stood.
+        let admit = |cuda_decode, opt_in| {
+            check_cuda_decode(cuda_decode).and_then(|()| check_opt_in(opt_in, path))
+        };
+        let both = admit(Some(true), true);
         assert!(both.is_ok(), "{both:?}");
         // The switch off: the start's own refusal, naming the switch and the file.
-        let Err(error) = admit(Some(true), false, path) else {
+        let Err(error) = admit(Some(true), false) else {
             panic!("without the switch the start must be refused");
         };
         let text = format!("{error:?}");
@@ -243,7 +236,7 @@ mod tests {
         assert!(text.contains("flash-next.gguf"), "{text}");
         // The entry not set to true: the pack's refusal, whatever the switch says.
         for (cuda_decode, opt_in) in [(None, true), (Some(false), true), (None, false)] {
-            let Err(EngError::BadRequest(text)) = admit(cuda_decode, opt_in, path) else {
+            let Err(EngError::BadRequest(text)) = admit(cuda_decode, opt_in) else {
                 panic!("{cuda_decode:?} must be refused");
             };
             assert!(text.contains("cuda_decode"), "{text}");
