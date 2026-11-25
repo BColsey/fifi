@@ -172,6 +172,16 @@ fn assert_delta_ranges(pool: &DeltaPool, first_slot: usize) {
         ranges, expected,
         "the clear ranges are the pageable blocks, in order"
     );
+    // The blocks must not overlap each other either, whatever the layout's offsets say.
+    let mut sorted = ranges.clone();
+    sorted.sort_unstable();
+    for pair in sorted.windows(2) {
+        assert!(
+            pair[0].0 + pair[0].1 <= pair[1].0,
+            "the clear ranges overlap around byte {}: {pair:?}",
+            pair[1].0
+        );
+    }
     for &(offset, bytes) in &ranges {
         assert!(
             offset + bytes <= pool.total,
