@@ -201,8 +201,10 @@ fn q8_row(k: usize) -> Result<usize, EngError> {
 }
 
 /// `FIFI_SENSENOVA_DECODE_GEMM=dq` puts the step's projections through the dequantizing GEMM
-/// over the f32 rows, with no q8_1 step; the default keeps the matvec over the q8_1 rows. Read
-/// once: every projection launch would otherwise take an env lock.
+/// over the f32 rows, with no q8_1 step; the default keeps the matvec over the q8_1 rows. On an
+/// RTX 3090 the route is about 12 to 14 times slower per token than the default and is an
+/// accuracy reference, not a serving route. Read once: every projection launch would otherwise
+/// take an env lock.
 fn decode_dq() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FIFI_SENSENOVA_DECODE_GEMM").is_ok_and(|v| v == "dq"))
