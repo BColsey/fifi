@@ -6,14 +6,6 @@
 //! the tile width it picked is refused there with `cudaErrorInvalidValue` before any kernel
 //! is enqueued.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
-
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 

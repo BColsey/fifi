@@ -1,5 +1,12 @@
 //! NVFP4-only extension of the dense C argument layout: it embeds the
 //! dense args struct and adds the y_scale field after it.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "its only caller, prefill/mmq_nvfp4.rs, is itself staged dead pending dense caller qualification"
+    )
+)]
 
 use super::{
     DeviceFailure, MmqDenseArgsRaw, MmqDenseRaw, RawRange, RawStream, STAGE_NONE, Span, c_dense,

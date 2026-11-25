@@ -20,14 +20,6 @@
 //! returns without synchronizing (the caller drains via [`LoopStep::stream`]), so the same
 //! list is what a later capture slice replays.
 
-// The serve path (`serve.rs` in this module) constructs LoopStep. Its timing and trace rigs
-// (`decode_traced`, `sweep_*`, `step_weight_bytes`) are test-only, so the library build still
-// reports dead code here.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the timing and trace rigs are test-only")
-)]
-
 use std::{iter::once, rc::Rc};
 
 use crate::EngError;
@@ -372,6 +364,7 @@ impl<'a> LoopStep<'a> {
     }
 
     /// The parity rig's twin: also snapshots the residual row after every visit.
+    #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn decode_traced(
         &mut self,
         embed_row: &[f32],
