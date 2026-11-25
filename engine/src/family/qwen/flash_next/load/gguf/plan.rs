@@ -127,7 +127,7 @@ impl GgufModel {
         let engine_heap = HostTerms::DEFAULT
             .engine_heap
             .checked_add(ple_rows * 4)
-            .and_then(|bytes| bytes.checked_add(self.config.top_k() as u64 * largest as u64))
+            .and_then(|bytes| bytes.checked_add(self.config.top_k() as u64 * largest))
             .ok_or_else(|| refuse("the host terms overflow"))?;
         Ok(HostTerms {
             engine_heap,
@@ -186,7 +186,7 @@ mod tests {
         let largest = sizes.layer_record_bytes.iter().copied().max().unwrap_or(0);
         assert_eq!(
             terms.engine_heap,
-            HostTerms::DEFAULT.engine_heap + ple + model.config().top_k() as u64 * largest as u64
+            HostTerms::DEFAULT.engine_heap + ple + model.config().top_k() as u64 * largest
         );
         assert_eq!(
             terms,

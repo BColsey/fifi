@@ -199,7 +199,7 @@ mod tests {
         );
         let file = dir.path().join("tokenizer.json");
         std::fs::write(&file, b"{}").expect("write");
-        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0))
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .expect("unreadable");
         let Err(error) = observed_pin(dir.path(), 8) else {
             panic!("an unreadable file is refused");

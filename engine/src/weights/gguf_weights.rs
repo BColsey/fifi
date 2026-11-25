@@ -218,6 +218,10 @@ impl GgufWeights {
     }
 
     /// The length of each shard file when it was opened, in shard order.
+    #[allow(
+        dead_code,
+        reason = "read by the expert index, which only the CUDA build's start reaches"
+    )]
     pub(crate) fn shard_lens(&self) -> &[u64] {
         &self.file_lens
     }

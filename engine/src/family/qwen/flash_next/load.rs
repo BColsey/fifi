@@ -96,7 +96,7 @@ pub(super) fn resident_packed_payload(key: &str, kinds: &[bool], ple_layer: usiz
 }
 
 #[derive(Debug, PartialEq)]
-struct Dims {
+pub(in crate::family::qwen::flash_next) struct Dims {
     hidden: u32,
     eps: f32,
     branches: u32,
