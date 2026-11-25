@@ -80,14 +80,13 @@ pub(in crate::family::qwen::flash_next) fn weights_digest(
     }
     let mut sample = [0u8; SAMPLE as usize];
     for tensor in header.tensors() {
-        let take = tensor.byte_len().min(SAMPLE) as usize;
-        let (first, last) = sample.split_at_mut(take);
-        weights.read_range(tensor.name(), 0, first)?;
-        hash.update(first);
-        let from = tensor.byte_len().saturating_sub(SAMPLE);
-        if from > 0 {
-            weights.read_range(tensor.name(), from, last)?;
-            hash.update(last);
+        let len = tensor.byte_len();
+        let take = len.min(SAMPLE) as usize;
+        weights.read_range(tensor.name(), 0, &mut sample[..take])?;
+        hash.update(&sample[..take]);
+        if len > SAMPLE {
+            weights.read_range(tensor.name(), len - SAMPLE, &mut sample)?;
+            hash.update(sample);
         }
     }
     Ok(hash.finalize().into())
@@ -168,17 +167,35 @@ mod tests {
         let model = open();
         let first = weights_digest(&model).expect("digest");
         assert_eq!(weights_digest(&model).expect("digest again"), first);
-        let (shard, at) = {
-            let tensor = &model.weights.header().tensors()[0];
-            (tensor.shard(), tensor.abs_offset())
+        // Flips one byte of a tensor: the first, or the last.
+        let flip = |index: usize, last: bool| {
+            let tensor = &model.weights.header().tensors()[index];
+            let at = tensor.abs_offset() + if last { tensor.byte_len() - 1 } else { 0 };
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&model.weights.paths()[tensor.shard()])
+                .expect("the shard for writing");
+            let mut byte = [0u8];
+            std::os::unix::fs::FileExt::read_exact_at(&file, &mut byte, at).expect("the byte");
+            std::os::unix::fs::FileExt::write_all_at(&file, &[byte[0] ^ 0xFF], at)
+                .expect("flip the byte");
         };
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&model.weights.paths()[shard])
-            .expect("the shard for writing");
-        std::os::unix::fs::FileExt::write_all_at(&file, &[0xAA], at).expect("patch a byte");
+        let long = model
+            .weights
+            .header()
+            .tensors()
+            .iter()
+            .position(|tensor| tensor.byte_len() > SAMPLE)
+            .expect("a tensor longer than the sample");
+        flip(0, false);
         let other = open();
         assert_ne!(weights_digest(&other).expect("digest"), first);
+        // The last byte of a long tensor lies outside both samples of a head-only digest.
+        let before = weights_digest(&other).expect("digest before the flip");
+        flip(long, true);
+        let other = open();
+        assert_ne!(weights_digest(&other).expect("digest"), before);
     }
 
     /// An unreadable tokenizer file is refused; an absent one still pins zeros for the load to
