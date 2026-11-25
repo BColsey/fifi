@@ -2100,4 +2100,17 @@ fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
     // The next request on the same card: the reset returns it to the fresh card.
     let second = served_request(&mut card, &walk);
     assert_eq!(second, first, "a reset card is not the fresh card");
+
+    // The reset clears through stream-ordered fills on the step's stream, never through a host
+    // upload: one reset adds fills to the observer and no ranged upload.
+    let total = |counts: std::collections::BTreeMap<usize, usize>| counts.values().sum::<usize>();
+    let before = ctx.buffer_requests();
+    card.reset().expect("the card resets");
+    let after = ctx.buffer_requests();
+    let fills = total(after.memsets) - total(before.memsets);
+    let uploads = total(after.ranged_h2d) - total(before.ranged_h2d);
+    assert!(
+        fills > 0 && uploads == 0,
+        "a reset must fill on the stream and upload nothing: {fills} fills, {uploads} uploads"
+    );
 }
