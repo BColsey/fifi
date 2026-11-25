@@ -106,9 +106,10 @@ pub(in crate::family::qwen::flash_next) fn check_slots(
     Ok(())
 }
 
-/// The entry must set `cuda_decode` to true for the GGUF start, exactly as the pack start
-/// requires it: the start promoted an unset value to true and served a card the entry never asked
-/// for. The refusal is the pack start's text.
+/// The entry must leave `cuda_decode` on for the GGUF start, as the pack start requires it: the
+/// caller gives an unset value the pack's default first (`FlashOptions::card_default`), so what
+/// is refused here is `false`, and unset beside an MLX allocator key. The refusal is the pack
+/// start's text.
 pub(in crate::family::qwen::flash_next) fn check_cuda_decode(
     cuda_decode: Option<bool>,
 ) -> Result<(), EngError> {
@@ -250,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_or_false_cuda_decode_is_refused_like_the_pack_start() {
+    fn an_unset_or_false_cuda_decode_is_refused_with_the_pack_start_s_text() {
         for value in [None, Some(false)] {
             let Err(EngError::BadRequest(text)) = check_cuda_decode(value) else {
                 panic!("{value:?} must be refused");

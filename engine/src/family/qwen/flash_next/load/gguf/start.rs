@@ -58,7 +58,12 @@ pub(in crate::family::qwen::flash_next) fn start(
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     let model = &owned;
-    let options = options.cloned().unwrap_or_default();
+    // The start exists only on a build with the CUDA decoder, where an unset `cuda_decode` is the
+    // card, as it is for a pack start.
+    let options = options
+        .cloned()
+        .unwrap_or_default()
+        .card_default(cfg!(all(feature = "native-cuda", target_os = "linux")));
     check_cuda_decode(options.cuda_decode)?;
     let cuda = cuda_settings(&options)?.ok_or_else(|| {
         EngError::BadRequest("engine config: the CUDA decoder is not enabled".to_string())

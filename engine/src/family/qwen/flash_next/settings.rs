@@ -69,6 +69,23 @@ pub(crate) struct FlashOptions {
     pub(crate) expert_stats: Option<PathBuf>,
 }
 
+impl FlashOptions {
+    /// These options with the default of `cuda_decode` given: on a build with the CUDA decoder
+    /// (`cuda_default`) an unset value is the card, unless an MLX allocator key names the MLX arm.
+    pub(in crate::family::qwen::flash_next) fn card_default(&self, cuda_default: bool) -> Self {
+        // The MLX allocator keys name the MLX arm, so they keep an entry off the card.
+        let mlx_keys = self.cache_limit_bytes.is_some() || self.prefill_budget_bytes.is_some();
+        if cuda_default && self.cuda_decode.is_none() && !mlx_keys {
+            Self {
+                cuda_decode: Some(true),
+                ..self.clone()
+            }
+        } else {
+            self.clone()
+        }
+    }
+}
+
 /// The K/V storage formats a `kv_format` value names.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -479,20 +496,7 @@ impl FlashSettings {
         cuda_default: bool,
     ) -> Result<Self, EngError> {
         let default = FlashOptions::default();
-        let options = options.unwrap_or(&default);
-        let resolved;
-        // The MLX allocator keys name the MLX arm, so they keep an entry off the card.
-        let mlx_keys =
-            options.cache_limit_bytes.is_some() || options.prefill_budget_bytes.is_some();
-        let options = if cuda_default && options.cuda_decode.is_none() && !mlx_keys {
-            resolved = FlashOptions {
-                cuda_decode: Some(true),
-                ..options.clone()
-            };
-            &resolved
-        } else {
-            options
-        };
+        let options = &options.unwrap_or(&default).card_default(cuda_default);
         let cuda = cuda_settings(options)?;
         let (manifest, manifest_found_in_pack) =
             manifest_path(options, env, model_dir, tokenizer_dir)?;
@@ -986,6 +990,28 @@ mod tests {
             ..mlx_key
         };
         assert!(message(build(Some(&both), true)).contains("cannot be combined with cuda_decode"));
+    }
+
+    /// The default the GGUF start gives `cuda_decode` is the pack start's: unset is the card on a
+    /// build with the CUDA decoder, an MLX allocator key keeps it unset, a set value stays.
+    #[test]
+    fn an_unset_cuda_decode_is_the_card_unless_an_mlx_key_names_the_mlx_arm() {
+        let unset = FlashOptions::default();
+        assert_eq!(unset.card_default(true).cuda_decode, Some(true));
+        assert_eq!(unset.card_default(false).cuda_decode, None);
+        for key in ["cache", "prefill"] {
+            let mlx = FlashOptions {
+                cache_limit_bytes: (key == "cache").then_some(1 << 30),
+                prefill_budget_bytes: (key == "prefill").then_some(1 << 30),
+                ..FlashOptions::default()
+            };
+            assert_eq!(mlx.card_default(true).cuda_decode, None, "{key}");
+        }
+        let off = FlashOptions {
+            cuda_decode: Some(false),
+            ..FlashOptions::default()
+        };
+        assert_eq!(off.card_default(true).cuda_decode, Some(false));
     }
 
     /// A plan whose slots fall by one per 2,048 positions from `top`.
