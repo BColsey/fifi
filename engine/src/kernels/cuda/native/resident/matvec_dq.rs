@@ -14,10 +14,6 @@
 //! - The allocations stay valid until the queued launch finishes because `inference_cuda_free`
 //!   synchronizes the whole device before `cudaFree`.
 //! - No raw pointer and no unsafe function leaves this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::offset_of;

@@ -8,6 +8,9 @@
 //! [CudaContext::matvec_dq] queues ONE kernel on a [DeviceStream] and returns when it is
 //! queued. It allocates nothing, copies nothing and never synchronizes.
 //!
+//! [CudaContext::matvec_dq_native] is the same launch over a [NativeWeight]: the SenseNova
+//! decode step's dq route (`FIFI_SENSENOVA_DECODE_GEMM=dq`) takes it for every projection.
+//!
 //! Every refusal of the conditions below is a BadRequest and happens before any native call:
 //! the backend is usable, the type is Q4_K or Q6_K, k is a positive multiple of 256, rows is
 //! above zero, w holds the rows' blocks and x k floats at 16-byte alignment, y holds rows
@@ -15,12 +18,9 @@
 //! as a Backend error: a k or a rows at or above 2^31 passes these checks and is refused by
 //! the native entry, as the native entries of matvec_q, matvec_q5k, matvec_gguf and
 //! matvec_q3k refuse it.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use crate::EngError;
+use crate::kernels::cuda::NativeWeight;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
@@ -49,6 +49,30 @@ impl CudaContext {
         self.ensure_usable()?;
         let raw = self.plan_matvec_dq(&call)?;
         self.launch_on(stream, |stream_raw| matvec_dq_launch(stream_raw, &raw))
+    }
+
+    /// One f32 row (k floats) through the resident `weight` into `y` (rows floats): the call
+    /// above over the weight's own type, blocks, `k` and rows. A weight the kernel does not
+    /// serve (a type other than Q4_K or Q6_K, a `k` that is not a multiple of 256) is the
+    /// matvec's own `BadRequest`, before any launch: nothing else runs in its place.
+    pub(crate) fn matvec_dq_native(
+        &self,
+        stream: &DeviceStream,
+        weight: &NativeWeight,
+        x: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        self.matvec_dq(
+            stream,
+            MatvecDqCall {
+                ty: weight.quant(),
+                w: weight.buffer().range(0, weight.buffer().bytes())?,
+                x,
+                y,
+                k: weight.k(),
+                rows: weight.n_rows(),
+            },
+        )
     }
 
     fn plan_matvec_dq<'b>(&self, call: &MatvecDqCall<'b>) -> Result<MatvecDqRaw<'b>, EngError> {

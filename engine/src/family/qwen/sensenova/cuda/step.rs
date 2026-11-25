@@ -32,7 +32,6 @@ use std::rc::Rc;
 
 use crate::EngError;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
-use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
 use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
@@ -126,7 +125,7 @@ pub(crate) struct LoopStep<'a> {
     plan: LoopPlan,
     rope: RopePlan,
     cache_rows: usize,
-    /// The projections' route: the dequantizing GEMM over f32 rows, or the matvec over q8_1.
+    /// The projections' route: the f32 decode matvec over f32 rows, or the matvec over q8_1.
     dq: bool,
     /// GDN state and conv rings, one slot per trunk visit (an attention visit's slot is
     /// unused; direct visit indexing keeps the mapping arithmetic-free).
@@ -200,11 +199,12 @@ fn q8_row(k: usize) -> Result<usize, EngError> {
     q8_1_bytes(k, 1).ok_or_else(|| EngError::BadRequest("a q8 row size overflows".to_owned()))
 }
 
-/// `FIFI_SENSENOVA_DECODE_GEMM=dq` puts the step's projections through the dequantizing GEMM
-/// over the f32 rows, with no q8_1 step; the default keeps the matvec over the q8_1 rows. On an
-/// RTX 3090 the route is about 12 to 14 times slower per token than the default and is an
-/// accuracy reference, not a serving route. Read once: every projection launch would otherwise
-/// take an env lock.
+/// `FIFI_SENSENOVA_DECODE_GEMM=dq` puts the step's projections through the f32 decode matvec
+/// (`CudaContext::matvec_dq_native`) over the f32 rows: every weight decoded per value, no
+/// q8_1 step. The default keeps the matvec over the q8_1 rows. The route is opt-in and
+/// default-off; a weight that is not Q4_K or Q6_K, or a `k` that is not a multiple of 256,
+/// stops the step with the matvec's `BadRequest`, and nothing runs in its place. Read once:
+/// every projection launch would otherwise take an env lock.
 fn decode_dq() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FIFI_SENSENOVA_DECODE_GEMM").is_ok_and(|v| v == "dq"))
@@ -550,7 +550,7 @@ impl<'a> LoopStep<'a> {
     /// include any device idle where the host launch stream falls behind inside a group,
     /// which is most likely for the small matrices. Above four columns `matvec_native` takes
     /// the vendored MMVQ geometry that the decode, at one column, never takes. With `dq`, every
-    /// weight goes through the dequantizing GEMM over one f32 row instead, whatever `ncols`
+    /// weight goes through the f32 decode matvec over one f32 row instead, whatever `ncols`
     /// says: the launch the step issues on its dq route.
     #[cfg(all(test, feature = "native-cuda"))]
     pub(super) fn sweep_micros(
@@ -634,7 +634,12 @@ impl<'a> LoopStep<'a> {
                 for w in weights {
                     let y_w = y.range(0, ncols * w.n_rows() * F32)?;
                     if dq {
-                        self.gemm_dq_row(w, x_f32.range(0, w.k() * F32)?, y_w)?;
+                        self.ctx.matvec_dq_native(
+                            &self.stream,
+                            w,
+                            x_f32.range(0, w.k() * F32)?,
+                            y_w,
+                        )?;
                     } else {
                         let x_w = x.range(0, ncols * q8_row(w.k())?)?;
                         self.ctx.matvec_native(&self.stream, w, x_w, y_w, ncols)?;
@@ -820,7 +825,7 @@ impl<'a> LoopStep<'a> {
     }
 
     /// One projection of one row: through the matvec over the row's q8_1 bytes, or on the dq
-    /// route through the dequantizing GEMM over the f32 row.
+    /// route through the f32 decode matvec over the f32 row.
     fn project(
         &self,
         weight: &NativeWeight,
@@ -829,34 +834,9 @@ impl<'a> LoopStep<'a> {
         y: DeviceRange<'_>,
     ) -> Result<(), EngError> {
         if self.dq {
-            return self.gemm_dq_row(weight, x_f32, y);
+            return self.ctx.matvec_dq_native(&self.stream, weight, x_f32, y);
         }
         self.ctx.matvec_native(&self.stream, weight, x_q8, y, 1)
-    }
-
-    /// One row through the dequantizing GEMM: f16 by f16 with f32 accumulation over an f32 row,
-    /// not an exact f32 product.
-    fn gemm_dq_row(
-        &self,
-        weight: &NativeWeight,
-        x: DeviceRange<'_>,
-        y: DeviceRange<'_>,
-    ) -> Result<(), EngError> {
-        self.ctx.gemm_dq(
-            &self.stream,
-            weight.quant(),
-            GemmDqTypedCall {
-                w: weight.buffer().range(0, weight.buffer().bytes())?,
-                x,
-                y,
-                k: weight.k(),
-                rows: weight.n_rows(),
-                ncols: 1,
-                x_col_stride: 0,
-                y_col_stride: 0,
-                x_f32: true,
-            },
-        )
     }
 
     /// The mixer of visit `il` into `branch`.
@@ -1064,8 +1044,8 @@ impl<'a> LoopStep<'a> {
                 v_cache: bytes_range(v_cache, v_cache.bytes())?,
                 kv_len: self.params_word(OFFSET_KV_LEN)?,
                 part: bytes_range(&self.part, self.part.bytes())?,
-                // gemm_dq refuses an output over its own input; delta_out is free on an
-                // attention visit.
+                // The dq route's matvec refuses an output over its own input; delta_out is
+                // free on an attention visit.
                 out: floats(
                     if self.dq {
                         &self.delta_out

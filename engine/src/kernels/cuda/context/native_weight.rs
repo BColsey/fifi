@@ -73,8 +73,8 @@ impl UploadRing {
 
 /// A quantized weight in the GGUF file's own block layout, resident on the device: one
 /// allocation of `n_rows` rows of `k / block_size` blocks each, `experts` the stack depth of a
-/// rank-3 tensor (`None` for a plain matrix). The `matvec_q`/`matvec_expert` kernels and the
-/// native `embed` read it; the tiled readers refuse it with a typed error.
+/// rank-3 tensor (`None` for a plain matrix). The `matvec_q`/`matvec_expert` kernels, the f32
+/// decode matvec and the native `embed` read it; the tiled readers refuse it with a typed error.
 pub(crate) struct NativeWeight {
     buffer: DeviceBuffer,
     quant: QuantType,
