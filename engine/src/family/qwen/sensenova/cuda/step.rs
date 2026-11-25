@@ -20,15 +20,15 @@
 //! returns without synchronizing (the caller drains via [`LoopStep::stream`]), so the same
 //! list is what a later capture slice replays.
 
-// Staged: the serve-path slice constructs LoopStep; until then the dead-code lint
-// fires on every item here in the library build, and the expect flips to an error
-// the day it is wired. The tests construct it, so the mark stands down under cfg(test).
+// The serve path (`serve.rs` in this module) constructs LoopStep. Its timing and trace rigs
+// (`decode_traced`, `sweep_*`, `step_weight_bytes`) are test-only, so the library build still
+// reports dead code here.
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "constructed by the serve wiring slice")
+    expect(dead_code, reason = "the timing and trace rigs are test-only")
 )]
 
-use std::rc::Rc;
+use std::{iter::once, rc::Rc};
 
 use crate::EngError;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
@@ -58,6 +58,8 @@ use super::super::weights::LoopShape;
 use super::super::{LoopPlan, PHYSICAL_LAYERS, RopePlan, TRUNK_LAYERS};
 
 mod prefill;
+
+pub(super) use prefill::PREFILL_ROWS;
 
 const F32: usize = size_of::<f32>();
 const GROUP: usize = 4;
@@ -513,6 +515,23 @@ impl<'a> LoopStep<'a> {
     /// The logits row (device floats); valid after the stream drained.
     pub(crate) fn logits_row(&self) -> &DeviceBuffer {
         &self.logits
+    }
+
+    /// Clears the carried state for a new session on the same card: the GDN state, the conv
+    /// rings and the attention planes return to the zeros of [`LoopStep::open`] (the planes too,
+    /// so a session that ended on a non-finite value leaves nothing a masked read could meet),
+    /// and the residual cursor returns to its start. Only the carried state is cleared: a step
+    /// overwrites every scratch row before its first read.
+    pub(crate) fn reset(&mut self) -> Result<(), EngError> {
+        let carried = once(&self.rec)
+            .chain(once(&self.ring))
+            .chain(self.k_cache.iter())
+            .chain(self.v_cache.iter());
+        for buffer in carried {
+            self.ctx.upload_at(buffer, 0, &vec![0u8; buffer.bytes()])?;
+        }
+        self.cur_ix = 0;
+        Ok(())
     }
 
     /// The stored block and head weight bytes one decode step reads: every visit's dense

@@ -11,12 +11,6 @@
 //! the shared state where the same tokens decoded one by one would; the head runs on the
 //! last row.
 
-// Staged as the parent module: the serve wiring slice is the first caller of `prefill`.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the serve wiring slice calls prefill first")
-)]
-
 use super::*;
 use crate::kernels::cuda::prefill::attn_prefill::{
     AttnKvStorage, AttnPrefillCall, AttnPrefillShape, CPF_ATTN_PART_CAP, CPF_ATTN_Q_TILE,

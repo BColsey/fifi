@@ -19,11 +19,6 @@
 //! - The `extern` declaration, the `repr(C)` mirror and every raw pointer are private to this
 //!   file. Nothing is re-exported.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the chunked-prefill driver")
-)]
-
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 

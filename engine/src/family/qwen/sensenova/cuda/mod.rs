@@ -7,6 +7,8 @@
 pub(crate) mod geometry;
 pub(crate) mod load;
 #[cfg(feature = "native-cuda")]
+pub(crate) mod serve;
+#[cfg(feature = "native-cuda")]
 pub(crate) mod step;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod step_device_tests;

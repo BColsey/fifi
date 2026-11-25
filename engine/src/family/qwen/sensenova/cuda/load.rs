@@ -12,9 +12,13 @@
 //! token is gathered on the host, and the card spends its bytes on `output.weight`
 //! (≈0.5 GB Q4_K_M) which every step needs.
 
+// Only `load` calls the name helpers, and only a card build has `load`.
 #![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the serve wiring slice constructs load")
+    not(any(test, feature = "native-cuda")),
+    expect(
+        dead_code,
+        reason = "without the card no caller of the name helpers is compiled"
+    )
 )]
 
 use super::super::{LoopPlan, PHYSICAL_LAYERS};

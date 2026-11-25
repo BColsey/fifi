@@ -20,6 +20,7 @@ use std::sync::Arc;
 use super::super::step::LoopState;
 use super::super::step::{logits, trunk_traced};
 use super::super::weights::{Layer, LoopWeights, Mixer};
+use super::serve::CardStep;
 use super::step::{Carried, LoopStep, bytes_range, floats, le_f32};
 use crate::EngError;
 use crate::family::math::rms_plain;
@@ -28,6 +29,7 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, WeightLayout,
 };
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
+use crate::family::session::TokenStepper;
 use crate::kernels::cuda::prefill::attn_prep_chunk::{
     AttnPrepChunkCall, AttnPrepChunkShape, PrepChunkMode,
 };
@@ -2021,4 +2023,81 @@ fn emulated_walk_over_the_saved_prompt() {
             argmax(&rows[pos])
         );
     }
+}
+
+/// One served request on the stepper the worker drives (`serve::CardStep`), walked the way the
+/// session walks it: every prompt row but the last through `feed_rows`, then the pending token
+/// and each drawn token through `logits`. Returns the rows of those steps.
+fn served_request(card: &mut CardStep, drawn: &[u32]) -> Vec<Vec<f32>> {
+    let (last, head) = PROMPT.split_last().expect("a non-empty prompt");
+    card.reset().expect("the card resets");
+    card.feed_rows(head).expect("the prompt rows");
+    let mut rows = vec![card.logits(*last).expect("the pending token")];
+    for &token in drawn {
+        rows.push(card.logits(token).expect("a drawn token"));
+    }
+    rows
+}
+
+/// The served stepper against the direct walk: the prompt through the prefill and the pending
+/// token through a decode step draw the walk's greedy ids, with the rows inside the gate of
+/// [`card_prefill_matches_the_card_decode_walk`]; a card reset after a request is the fresh
+/// card again, bits included.
+#[test]
+fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova served stepper") else {
+        return;
+    };
+    let (_file, stepper_host) = open_host().expect("the rig opened the file");
+    // Serving leaks the load for the process; the stepper's step borrows it the same way.
+    let loaded: &'static CudaWeights = Box::leak(Box::new(loaded));
+    let mut walked = open_card(&ctx, loaded, &weights, CACHE_ROWS);
+    let step = open_card(&ctx, loaded, &weights, CACHE_ROWS);
+    let mut card = CardStep::new(ctx.clone(), step, stepper_host);
+
+    // The oracle: the walk's row at every prompt position, then its greedy continuation.
+    let h = weights.shape().hidden;
+    let embed = projector.rows(weights.token_embd(), &PROMPT).unwrap();
+    let mut oracle: Vec<Vec<f32>> = (0..PROMPT.len())
+        .map(|pos| {
+            walked.decode(&embed[pos * h..(pos + 1) * h], pos).unwrap();
+            drain_row(&ctx, &walked)
+        })
+        .collect();
+    for pos in PROMPT.len()..PROMPT.len() + CONTINUE {
+        let token = argmax(oracle.last().unwrap());
+        let embed = projector.rows(weights.token_embd(), &[token]).unwrap();
+        walked.decode(&embed, pos).unwrap();
+        oracle.push(drain_row(&ctx, &walked));
+    }
+    let first_row = PROMPT.len() - 1;
+    // The ids the walk draws from its last prompt row on: the stepper is fed these.
+    let walk: Vec<u32> = oracle[..oracle.len() - 1]
+        .iter()
+        .skip(first_row)
+        .map(|row| argmax(row))
+        .collect();
+
+    let first = served_request(&mut card, &walk);
+    assert_eq!(card.fed(), PROMPT.len() + walk.len(), "every row consumed");
+    assert_eq!(first.len(), walk.len() + 1);
+    let mut worst = 0.0f32;
+    for ((served, oracle_row), &drawn) in first.iter().zip(&oracle[first_row..]).zip(&walk) {
+        assert_eq!(
+            argmax(served),
+            argmax(oracle_row),
+            "the served row draws the walk's id"
+        );
+        assert_eq!(drawn, argmax(oracle_row), "the walk fed the stepper");
+        worst = worst.max(max_abs_diff(served, oracle_row));
+    }
+    eprintln!("served stepper: worst row diff against the walk {worst:.4}");
+    assert!(
+        worst.is_finite() && worst < 16.0,
+        "the served rows diverged from the walk: worst {worst:.4}"
+    );
+
+    // The next request on the same card: the reset returns it to the fresh card.
+    let second = served_request(&mut card, &walk);
+    assert_eq!(second, first, "a reset card is not the fresh card");
 }

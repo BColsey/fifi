@@ -26,9 +26,10 @@ use super::{
 
 // Every row is a synchronous host forward; allow cancellation between rows.
 const PREFILL_PIECE: usize = 1;
-// shortcut: cap the host f32 KV cache at 4K until larger contexts have a memory plan.
-const HOST_CONTEXT_LIMIT: u32 = 4096;
-const LIMITS: GgufLimits = GgufLimits {
+// shortcut: cap the context at 4K until larger contexts have a memory plan (the host's f32 KV
+// cache, the card's attention cache depth).
+pub(super) const CONTEXT_LIMIT: u32 = 4096;
+pub(super) const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 32 << 20,
     max_tensor_bytes: 8 << 30,
 };
@@ -74,19 +75,32 @@ pub(crate) fn select_gguf(model: &Path) -> Result<PathBuf, EngError> {
 fn context_limit(file: &Path) -> Result<u32, EngError> {
     let header = shared_header(file, LIMITS.max_header_bytes)?;
     match header.meta("sensenova_loop.context_length") {
-        Some(MetaValue::U32(n)) if *n > 1 => Ok((*n).min(HOST_CONTEXT_LIMIT)),
+        Some(MetaValue::U32(n)) if *n > 1 => Ok((*n).min(CONTEXT_LIMIT)),
         _ => Err(EngError::Checkpoint(
             "sensenova: invalid context_length".into(),
         )),
     }
 }
 
+/// `FIFI_SENSENOVA_CUDA=1` serves from the card step; without it the host step serves.
+fn card_wanted() -> bool {
+    std::env::var("FIFI_SENSENOVA_CUDA").is_ok_and(|value| value == "1")
+}
+
 pub(crate) fn start_engine(model: &Path, ready_note: ReadyNote) -> Result<StartedEngine, EngError> {
     let file = select_gguf(model)?;
-    let context_limit = context_limit(&file)?;
     let bundle = bundle_from_lone_gguf(&file)?;
     let sampler_vocab = bundle.vocab_size() as usize;
     let eos = bundle.eos_token_ids().to_vec();
+    if card_wanted() {
+        let (engine, context_limit) = start_on_card(file, ready_note, eos, sampler_vocab)?;
+        return Ok(StartedEngine {
+            engine,
+            bundle,
+            context_limit,
+        });
+    }
+    let context_limit = context_limit(&file)?;
     let engine = spawn_engine_noted(PREFILL_PIECE, ready_note, move |_| {
         let step = LoopStep::open(&file)?;
         let executor = SerialDecode::new(step, eos, sampler_vocab, context_limit as usize);
@@ -97,6 +111,34 @@ pub(crate) fn start_engine(model: &Path, ready_note: ReadyNote) -> Result<Starte
         bundle,
         context_limit,
     })
+}
+
+/// The card engine of one file and the context limit it serves under: on a build with
+/// `native-cuda`, a refusal without it.
+#[cfg(feature = "native-cuda")]
+fn start_on_card(
+    file: PathBuf,
+    ready_note: ReadyNote,
+    eos: Vec<u32>,
+    sampler_vocab: usize,
+) -> Result<(Engine, u32), EngError> {
+    let limit = context_limit(&file)?;
+    let engine = super::cuda::serve::start(file, ready_note, eos, sampler_vocab, limit)?;
+    Ok((engine, limit))
+}
+
+#[cfg(not(feature = "native-cuda"))]
+fn start_on_card(
+    file: PathBuf,
+    ready_note: ReadyNote,
+    eos: Vec<u32>,
+    sampler_vocab: usize,
+) -> Result<(Engine, u32), EngError> {
+    let _ = (file, ready_note, eos, sampler_vocab);
+    Err(EngError::BadRequest(
+        "engine config: FIFI_SENSENOVA_CUDA=1 needs a build with the native-cuda feature"
+            .to_string(),
+    ))
 }
 
 pub(super) struct LoopStep {
