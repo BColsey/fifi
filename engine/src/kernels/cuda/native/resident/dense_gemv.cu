@@ -829,6 +829,7 @@ namespace {
 #include "resident/inkling_prefetch_staged.cuh"
 #include "resident/inkling_split_visit_tile.cuh"
 #include "resident/inkling_iq2_visit_tile.cuh"
+#include "resident/inkling_tensor_gemm.cuh"
 #include "resident/inkling_controller_pair.cuh"
 #include "resident/inkling_f32_visit.cuh"
 #include "resident/inkling_panel_mma.cuh"
@@ -1121,7 +1122,7 @@ extern "C" int inference_cuda_inkling_iq2_visit_launch(const inference_cuda_dens
         if (!sm75) return inference_cuda_gguf_wmma_launch(args, stream, out_stage);
         const dim3 grid(72,(args->m+31)/32);
         const auto s = static_cast<cudaStream_t>(stream);
-        switch(codec){
+        if (!inkling_try_tensor_gemm(*args, codec, s)) switch(codec){
         #define OCTET_CASE(C,K,B,S) case C: \
             if (aligned(args->x,16) && args->ld_x%4==0) \
                 inkling_iq2_visit_tile<C,K,B,S,true,32,128,C==19><<<grid,512,0,s>>>(*args); \
