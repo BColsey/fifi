@@ -102,7 +102,7 @@ __device__ __forceinline__ void k4_factors(const uint4 &head, int s, float *mult
         *offs = code_f(b & 63u);
     } else {
         *mult = code_f((c & 0x0Fu) | ((a >> 2) & 0x30u));
-        *offs = code_f(((c >> 4) | (b >> 2)) & 0x3Fu);
+        *offs = code_f(((c >> 4) & 0x0Fu) | ((b >> 2) & 0x30u));
     }
 }
 
