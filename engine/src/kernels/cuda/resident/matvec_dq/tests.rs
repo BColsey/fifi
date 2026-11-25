@@ -4,8 +4,10 @@
 
 use crate::kernels::cuda::context::{CudaContext, DeviceStream};
 use crate::kernels::cuda::resident::matvec_dq::MatvecDqCall;
+use crate::kernels::cuda::resident::matvec_q::MatvecCall;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::matvec_q::tests::{assert_bad_request, reference};
+use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange, testkit};
 
 const TYPES: [QuantType; 2] = [QuantType::Q4K, QuantType::Q6K];
@@ -293,4 +295,130 @@ fn matvec_dq_refuses_bad_arguments_before_the_adapter() {
         "y inside x",
         "matvec_dq y and matvec_dq x ranges overlap",
     );
+}
+
+/// Stage 2's decider on the first shape that made the dq route slow: k 4096, 12288 rows, Q6_K
+/// (18 weights of the step have it). The one-column matvec and the new kernel on the same weight
+/// in the same process, one sample of each interleaved with the first arm alternated, medians
+/// of 100 after one dropped sample. Queued: 16 launches and one drain, per launch, which is the
+/// kernel's own cost. Drained: one launch and one drain, which is what a drain point pays. A
+/// microbenchmark, not a gate: it asserts nothing beyond the launch results.
+#[test]
+#[ignore = "bench: exclusive timing slot"]
+fn matvec_dq_first_shape_against_the_matvec_bench() {
+    if !testkit::device_present("matvec_dq_first_shape_against_the_matvec_bench") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (ty, k, rows) = (QuantType::Q6K, 4096, 12288);
+    let rig = rig(&ctx, ty, k, rows, 0xD0_0200);
+    let w_bytes = ty.weight_bytes(rows, k).expect("size");
+    let x_q8_bytes = q8_1_bytes(k, 1).expect("size");
+    let x_q8 = testkit::upload_filled(&ctx, 0, x_q8_bytes);
+    ctx.quantize_q8_1(
+        &stream,
+        QuantizeCall {
+            x: rig.x_dev.range(0, k * F32).expect("x"),
+            y: x_q8.range(0, x_q8_bytes).expect("y"),
+            k,
+            ncols: 1,
+        },
+    )
+    .expect("quantize");
+    let y_bytes = rows * F32;
+    let y_matvec = testkit::upload_filled(&ctx, 0, y_bytes);
+    let y_dq = testkit::upload_filled(&ctx, 0, y_bytes);
+    let matvec = || {
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty,
+                w: rig.w.range(0, w_bytes).expect("w range"),
+                x_q8: x_q8.range(0, x_q8_bytes).expect("x range"),
+                y: y_matvec.range(0, y_bytes).expect("y range"),
+                k,
+                rows,
+                ncols: 1,
+            },
+        )
+        .expect("matvec")
+    };
+    let dq = || {
+        ctx.matvec_dq(
+            &stream,
+            call(
+                &rig,
+                rig.w.range(0, w_bytes).expect("w range"),
+                rig.x_dev.range(0, k * F32).expect("x range"),
+                y_dq.range(0, y_bytes).expect("y range"),
+            ),
+        )
+        .expect("matvec_dq")
+    };
+    /// Microseconds a launch of `launch` takes: `queued` of them, the drain inside the sample.
+    fn sample(stream: &DeviceStream, launch: impl Fn(), queued: usize) -> f64 {
+        let t = std::time::Instant::now();
+        for _ in 0..queued {
+            launch();
+        }
+        stream.synchronize().expect("drain");
+        t.elapsed().as_secs_f64() * 1e6 / queued as f64
+    }
+
+    const SAMPLES: usize = 100;
+    const QUEUED: usize = 16;
+    let (mut queued, mut drained) = (Vec::new(), Vec::new());
+    matvec();
+    dq();
+    stream.synchronize().expect("drain");
+    for i in 0..=SAMPLES {
+        let (mut q, mut d) = ([0f64; 2], [0f64; 2]);
+        for arm in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
+            let launch = || {
+                if arm == 0 {
+                    matvec();
+                } else {
+                    dq();
+                }
+            };
+            q[arm] = sample(&stream, launch, QUEUED);
+            d[arm] = sample(&stream, launch, 1);
+        }
+        if i > 0 {
+            queued.push(q);
+            drained.push(d);
+        }
+    }
+
+    let sorted = |all: &[[f64; 2]], pick: fn(&[f64; 2]) -> f64| -> Vec<f64> {
+        let mut v: Vec<f64> = all.iter().map(pick).collect();
+        v.sort_by(|p, q| p.total_cmp(q));
+        v
+    };
+    println!(
+        "matvec dq first shape: {ty:?} k {k} rows {rows}, {w_bytes} weight bytes, {SAMPLES} interleaved samples"
+    );
+    for (mode, all) in [("queued", &queued), ("drained", &drained)] {
+        let m = sorted(all, |s| s[0]);
+        let d = sorted(all, |s| s[1]);
+        let r = sorted(all, |s| s[1] / s[0]);
+        let (mid, last) = (SAMPLES / 2, SAMPLES - 1);
+        println!(
+            "{mode}: matvec median {:.1} us (min {:.1}, max {:.1}), {:.0} GB/s; \
+             dq median {:.1} us (min {:.1}, max {:.1}), {:.0} GB/s; \
+             dq over matvec: median {:.3} (min {:.3}, max {:.3})",
+            m[mid],
+            m[0],
+            m[last],
+            w_bytes as f64 / m[mid] / 1e3,
+            d[mid],
+            d[0],
+            d[last],
+            w_bytes as f64 / d[mid] / 1e3,
+            r[mid],
+            r[0],
+            r[last]
+        );
+    }
 }
