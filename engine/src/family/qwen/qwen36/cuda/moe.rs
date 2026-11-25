@@ -592,8 +592,38 @@ pub(super) fn check_block(
     weights: &WeightFacts,
     bufs: &BufferFacts,
 ) -> Result<(), EngError> {
+    check_block_of(dims, weights, bufs, StackDepth::EveryExpert)
+}
+
+/// Every refusal of [`check_block`] for a bank: the expert stacks hold the slots of a cache of the
+/// layer's experts, fewer than the router scores, because the caller replaces the router's ids by
+/// slot ids between the router and the expert ops. The plain block refuses such weights.
+pub(super) fn check_banked_block(
+    dims: &MoeDims,
+    weights: &WeightFacts,
+    bufs: &BufferFacts,
+) -> Result<(), EngError> {
+    check_block_of(dims, weights, bufs, StackDepth::Bank)
+}
+
+/// What the expert stacks of a layer hold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StackDepth {
+    /// Every expert of the layer: the expert launches index the stacks by the router's ids.
+    EveryExpert,
+    /// The slots of a bank, at least the picks of one row: a caller swaps the router's ids for
+    /// slot ids before the expert launches.
+    Bank,
+}
+
+fn check_block_of(
+    dims: &MoeDims,
+    weights: &WeightFacts,
+    bufs: &BufferFacts,
+    depth: StackDepth,
+) -> Result<(), EngError> {
     check_dims(dims, bufs.expert.packs.kind)?;
-    check_weights(dims, weights)?;
+    check_weights(dims, weights, depth)?;
     let need = NeedBytes::of(dims, bufs.expert.packs.kind)?;
     check_sizes(&need, bufs)?;
     check_apart(bufs)
@@ -625,7 +655,7 @@ fn check_dims(dims: &MoeDims, kind: PackKind) -> Result<(), EngError> {
     Ok(())
 }
 
-fn check_weights(dims: &MoeDims, weights: &WeightFacts) -> Result<(), EngError> {
+fn check_weights(dims: &MoeDims, weights: &WeightFacts, depth: StackDepth) -> Result<(), EngError> {
     let router = product(&[dims.n_expert, dims.hidden, F32])?;
     if weights.router.bytes < router {
         return Err(refuse(format!(
@@ -640,21 +670,32 @@ fn check_weights(dims: &MoeDims, weights: &WeightFacts) -> Result<(), EngError> 
             weights.router_shared.bytes, dims.hidden
         )));
     }
-    // The stacks hold every expert of the layer, or the slots of a cache of them: one depth in
-    // all three, at most the router's expert count.
-    let depth = weights.gate.experts;
-    let gu_rows = product(&[depth, dims.inter])?;
-    let down_rows = product(&[depth, dims.hidden])?;
+    // The stacks hold one depth in all three: every expert of the layer, or the slots of a bank.
+    let experts = weights.gate.experts;
+    if depth == StackDepth::Bank && !(dims.top_k..=dims.n_expert).contains(&experts) {
+        return Err(refuse(format!(
+            "the gate stack depth {experts} is not between top_k {} and the {} experts",
+            dims.top_k, dims.n_expert
+        )));
+    }
+    let gu_rows = product(&[experts, dims.inter])?;
+    let down_rows = product(&[experts, dims.hidden])?;
     let stacks = [
         ("gate", weights.gate, gu_rows, dims.hidden),
         ("up", weights.up, gu_rows, dims.hidden),
         ("down", weights.down, down_rows, dims.inter),
     ];
     for (name, stack, rows, k) in stacks {
-        if stack.experts != depth || depth == 0 || depth > dims.n_expert {
+        if stack.experts != experts
+            || (depth == StackDepth::EveryExpert && experts != dims.n_expert)
+        {
             return Err(refuse(format!(
-                "the {name} stack depth {} is not the gate's {depth}, or is not within the {} experts",
-                stack.experts, dims.n_expert
+                "the {name} stack depth {} does not equal {}",
+                stack.experts,
+                match depth {
+                    StackDepth::EveryExpert => format!("the {} experts", dims.n_expert),
+                    StackDepth::Bank => format!("the gate's {experts}"),
+                }
             )));
         }
         if stack.rows != rows || stack.k != k {
@@ -1537,7 +1578,9 @@ pub(super) fn run_moe_block_marked(
 /// The ops of [`run_moe_block`] from position `from` up to (not including) `to` in the block's
 /// op list, for a caller that has to act between two of them (a family that stages the picked
 /// experts after the router has chosen them). The list starts with the router, so `0..1` is the
-/// router alone and `1..usize::MAX` is everything after it.
+/// router alone and `1..usize::MAX` is everything after it. The weights are a bank: the caller
+/// replaces the router's expert ids by slot ids before the expert ops, so [`check_banked_block`]
+/// stands in for the plain block's [`check_block`].
 pub(in crate::family) fn run_moe_ops(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,
@@ -1545,7 +1588,7 @@ pub(in crate::family) fn run_moe_ops(
     dims: &MoeDims,
     ops: std::ops::Range<usize>,
 ) -> Result<(), EngError> {
-    check_block(dims, &weights.facts(), &bufs.facts())?;
+    check_banked_block(dims, &weights.facts(), &bufs.facts())?;
     let list = moe_sequence(dims.top_k, bufs.expert.packs.kind().layout());
     let end = ops.end.min(list.len());
     for &op in list.get(ops.start..end).unwrap_or_default() {

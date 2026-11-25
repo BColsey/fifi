@@ -6,8 +6,8 @@ use super::super::dims::{KvMode, StepDims, StepOptions};
 use super::super::step_plan::{KernelScratch, Slot, StepPlan};
 use super::{
     BufferFacts, CardMoeOp, ExpertFacts, MoeDims, MoeOp, OpSlots, PackFacts, PackKind, ProjFacts,
-    RangeFacts, RouteFacts, StackFacts, WeightFacts, check_block, moe_sequence, moe_sequence_card,
-    op_slots, router_shape,
+    RangeFacts, RouteFacts, StackFacts, WeightFacts, check_banked_block, check_block, moe_sequence,
+    moe_sequence_card, op_slots, router_shape,
 };
 use crate::EngError;
 use crate::family::decode_step::shard::ShardTable;
@@ -396,6 +396,60 @@ fn a_router_with_padded_rows_scores_the_dims_experts() {
     padded.router.bytes += dims.hidden * 4;
     check_block(&dims, &padded, &buffer_facts(&dims)).expect("padded router rows are admitted");
     assert_eq!(router_shape(&dims).n_expert, dims.n_expert);
+}
+
+/// A bank of fewer slots than the layer has experts passes the block's staged entry alone: its
+/// caller swaps the router's ids for slot ids. The plain block refuses it, as it did before the
+/// staged entry existed.
+#[test]
+fn a_bank_of_slots_passes_the_staged_entry_alone() {
+    let dims = moe_dims(1);
+    let bank = |slots: usize| WeightFacts {
+        gate: StackFacts {
+            rows: slots * dims.inter,
+            k: dims.hidden,
+            experts: slots,
+        },
+        up: StackFacts {
+            rows: slots * dims.inter,
+            k: dims.hidden,
+            experts: slots,
+        },
+        down: StackFacts {
+            rows: slots * dims.hidden,
+            k: dims.inter,
+            experts: slots,
+        },
+        ..weight_facts(&dims)
+    };
+    check_banked_block(&dims, &bank(40), &buffer_facts(&dims))
+        .expect("a bank of 40 slots is admitted");
+    assert_bad_request(
+        check_block(&dims, &bank(40), &buffer_facts(&dims)),
+        "a bank in the plain block",
+        &format!("does not equal the {} experts", dims.n_expert),
+    );
+    for slots in [dims.top_k - 1, dims.n_expert + 1] {
+        assert_bad_request(
+            check_banked_block(&dims, &bank(slots), &buffer_facts(&dims)),
+            "a bank outside top_k and the expert count",
+            "is not between",
+        );
+    }
+    let mut mixed = bank(40);
+    mixed.up.experts = dims.n_expert;
+    assert_bad_request(
+        check_banked_block(&dims, &mixed, &buffer_facts(&dims)),
+        "an up stack of the layer's full depth",
+        "does not equal the gate's 40",
+    );
+    let mut short = bank(40);
+    short.down.rows -= dims.hidden;
+    assert_bad_request(
+        check_banked_block(&dims, &short, &buffer_facts(&dims)),
+        "a down stack with a slot of rows missing",
+        "rows of",
+    );
 }
 
 /// The NATIVE sequence as a literal: the router first and the combine last (their places and
