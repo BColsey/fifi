@@ -652,7 +652,13 @@ impl CpuForward {
             for width in widths {
                 let bytes = PAST * width * WORD;
                 block.tails[1].read_at(&block.stream, at, &mut tails[..bytes])?;
-                planes.push(vec![words(&tails[..bytes])]);
+                // The tail plane holds its rows oldest first, one history row per `width` words.
+                planes.push(
+                    tails[..bytes]
+                        .chunks_exact(width * WORD)
+                        .map(|row| words(row))
+                        .collect(),
+                );
                 at += bytes;
             }
             let [k, v, attn, mlp] = <[Vec<Vec<f32>>; 4]>::try_from(planes).unwrap();
