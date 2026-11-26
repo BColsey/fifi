@@ -83,7 +83,7 @@ impl PrepShape {
             ranges.push(aux.slice(at * WORD, words * WORD)?);
             at += words;
         }
-        Ok(std::array::from_fn(|i| ranges[i].clone()))
+        Ok(std::array::from_fn(|i| ranges[i]))
     }
 }
 
@@ -626,8 +626,11 @@ mod tests {
             let actual = read_bytes(&ctx, &y, y.bytes());
             let expected = ordered_norm(&input, &gamma, eps);
             for (i, (a, b)) in actual
-                .chunks_exact(4)
-                .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_ne_bytes)
                 .zip(expected.iter().map(|bits| f32::from_bits(*bits)))
                 .enumerate()
             {

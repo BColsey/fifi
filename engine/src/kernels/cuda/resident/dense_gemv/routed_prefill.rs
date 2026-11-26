@@ -97,8 +97,8 @@ mod tests {
         assert_eq!(routed_prefill_scratch_bytes(0), None);
         assert_eq!(routed_prefill_scratch_bytes(4097), None);
         for rows in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 513, 4096] {
-            let s = 8 * rows;
-            let tiles = (s + 15) / 16 + 127;
+            let s: usize = 8 * rows;
+            let tiles = s.div_ceil(16) + 127;
             assert_eq!(
                 routed_prefill_scratch_bytes(rows),
                 Some(4 * (129 + s + s + 1) + 12 * tiles + s * (2304 + 1152) * 4)

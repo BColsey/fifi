@@ -673,10 +673,10 @@ fn mix_jobs_equal_the_single_launches_bit_for_bit() {
         ctx.inkling_stream_mix(
             &stream,
             MixCall {
-                state: job.state.clone(),
-                query: job.query.clone(),
-                out: job.out.clone(),
-                health: job.health.clone(),
+                state: job.state,
+                query: job.query,
+                out: job.out,
+                health: job.health,
             },
             MixShape {
                 first_block,
@@ -705,24 +705,24 @@ fn mix_jobs_equal_the_single_launches_bit_for_bit() {
     let mut clash = Vec::new();
     for job in &jobs {
         clash.push(MixJob {
-            state: job.state.clone(),
-            query: job.query.clone(),
-            out: job.out.clone(),
-            health: job.health.clone(),
+            state: job.state,
+            query: job.query,
+            out: job.out,
+            health: job.health,
             addend: None,
             norm: None,
             first_block: job.first_block,
             blocks: job.blocks,
         });
     }
-    clash[1].out = clash[0].out.clone();
+    clash[1].out = clash[0].out;
     let error = ctx
         .inkling_stream_mix_jobs(&stream, &clash, (width, EPS))
         .map_err(|error| format!("{error:?}"))
         .unwrap_err();
     assert!(error.contains("overlap"), "{error}");
     clash[1].out = together.range(row, row).unwrap();
-    clash[0].query = clash[1].out.clone();
+    clash[0].query = clash[1].out;
     let error = ctx
         .inkling_stream_mix_jobs(&stream, &clash, (width, EPS))
         .map_err(|error| format!("{error:?}"))
@@ -747,7 +747,7 @@ fn word_rows_zero_and_copy_whole_words_in_one_launch() {
     for &n in &words {
         let s = source.range(at * 4, n * 4).unwrap();
         let t = target.range(at * 4, n * 4).unwrap();
-        zeros.push(t.clone());
+        zeros.push(t);
         pairs.push((s, t));
         at += n;
     }
@@ -789,9 +789,7 @@ fn word_rows_zero_and_copy_whole_words_in_one_launch() {
         .unwrap_err();
     assert!(error.contains("overlap"), "{error}");
     assert!(ctx.inkling_zero_words(&stream, &[]).is_err());
-    let many = (0..=MAX_WORD_ROWS)
-        .map(|_| zeros[0].clone())
-        .collect::<Vec<_>>();
+    let many = (0..=MAX_WORD_ROWS).map(|_| zeros[0]).collect::<Vec<_>>();
     assert!(ctx.inkling_zero_words(&stream, &many).is_err());
 }
 
@@ -848,11 +846,11 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
         state: buffers.state.range(0, row * (blocks + 1)).unwrap(),
         query: buffers.query.range(0, row).unwrap(),
         out: buffers.out.range(0, row).unwrap(),
-        health: health.clone(),
-        addend: Some(add.clone()),
+        health,
+        addend: Some(add),
         norm: Some(MixNorm {
-            gamma: gamma.clone(),
-            normed: normed.clone(),
+            gamma,
+            normed,
             eps: EPS,
         }),
         first_block: 2,
@@ -862,7 +860,7 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
         state: twin.state.range(0, row * (blocks + 1)).unwrap(),
         query: twin.query.range(0, row).unwrap(),
         out: twin.out.range(0, row).unwrap(),
-        health: health.clone(),
+        health,
         addend: None,
         norm: None,
         first_block: 0,
@@ -871,15 +869,15 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
     // A job whose normed row is its own output writes the row twice: refused.
     let mut clash = copy_job(&job);
     clash.norm = Some(MixNorm {
-        gamma: gamma.clone(),
-        normed: job.out.clone(),
+        gamma,
+        normed: job.out,
         eps: EPS,
     });
     let error = ctx.inkling_stream_mix_jobs(&stream, &[clash], (width, EPS));
     assert!(matches!(error, Err(EngError::BadRequest(_))), "{error:?}");
     // A twin whose addend is a row the first job writes: refused before any launch.
     let mut clash = copy_job(&twin_job);
-    clash.addend = Some(job.out.clone());
+    clash.addend = Some(job.out);
     let error = ctx.inkling_stream_mix_jobs(&stream, &[copy_job(&job), clash], (width, EPS));
     assert!(matches!(error, Err(EngError::BadRequest(_))), "{error:?}");
     let refused = download(&buffers.out, &stream, 0, width);
@@ -920,12 +918,12 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
 /// A copy of `job` over the same ranges.
 fn copy_job<'a>(job: &MixJob<'a>) -> MixJob<'a> {
     MixJob {
-        state: job.state.clone(),
-        query: job.query.clone(),
-        out: job.out.clone(),
-        health: job.health.clone(),
-        addend: job.addend.clone(),
-        norm: job.norm.clone(),
+        state: job.state,
+        query: job.query,
+        out: job.out,
+        health: job.health,
+        addend: job.addend,
+        norm: job.norm,
         first_block: job.first_block,
         blocks: job.blocks,
     }

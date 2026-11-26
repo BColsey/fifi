@@ -105,11 +105,11 @@ pub(in crate::kernels::cuda) fn launch(
         && history.apart(&health);
     if let Some(state) = &call.state {
         let state = Span::of(state, row);
-        if !(&input).apart(&state)
-            || !(&out).apart(&state)
-            || !(&kernel).apart(&state)
-            || !(&history).apart(&state)
-            || !(&health).apart(&state)
+        if !input.apart(&state)
+            || !out.apart(&state)
+            || !kernel.apart(&state)
+            || !history.apart(&state)
+            || !health.apart(&state)
         {
             return Err(invalid_argument());
         }
@@ -127,7 +127,7 @@ pub(in crate::kernels::cuda) fn launch(
             call.history.address(),
             call.out.address(),
             call.state
-                .map_or(std::ptr::null_mut(), |state| state.address()) as *mut c_void,
+                .map_or(std::ptr::null_mut(), |state| state.address()),
             call.health.address(),
             width as c_int,
             taps as c_int,

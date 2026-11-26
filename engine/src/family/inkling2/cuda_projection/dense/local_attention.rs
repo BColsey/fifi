@@ -279,8 +279,8 @@ impl DenseStep {
         }
         // The rows of every controller role: the caller's triples, the gain and forget rows
         // the GEMVs wrote (or the caller's zero rows), and the normed output rows.
-        let controller_rows: Vec<[DeviceRange<'_>; 6]>;
-        match &inputs {
+
+        let controller_rows: Vec<[DeviceRange<'_>; 6]> = match &inputs {
             ResidentLocalInputs::Plain {
                 input,
                 gamma,
@@ -291,14 +291,14 @@ impl DenseStep {
                 // One role with identity control: the caller's zero rows are the gain and
                 // forget rows, so nothing is copied into the workspace.
                 let out = self.range(Slot::Output, layout.normed_at * hidden, hidden)?;
-                controller_rows = vec![[
+                vec![[
                     *input,
                     *input,
                     *gamma,
                     zeros.slice(0, hidden * size_of::<f32>())?,
                     zeros.slice(hidden * size_of::<f32>(), hidden * size_of::<f32>())?,
                     out,
-                ]];
+                ]]
             }
             ResidentLocalInputs::Controlled {
                 input,
@@ -331,9 +331,9 @@ impl DenseStep {
                         self.range(Slot::Output, (layout.normed_at + role) * hidden, hidden)?,
                     ]);
                 }
-                controller_rows = rows;
+                rows
             }
-        }
+        };
         context.inkling_controller_norm_rows(stream, &controller_rows, *health, (hidden, eps))?;
         let calls = weights
             .into_iter()

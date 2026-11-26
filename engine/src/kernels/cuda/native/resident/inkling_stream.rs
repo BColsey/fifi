@@ -539,7 +539,7 @@ fn word_rows(ranges: &[RawRange<'_>]) -> Result<Vec<c_int>, DeviceFailure> {
         .iter()
         .map(|range| {
             (range.bytes.is_multiple_of(4) && range.bytes > 0)
-                .then(|| (range.bytes / 4) as c_int)
+                .then_some((range.bytes / 4) as c_int)
                 .ok_or_else(invalid_argument)
         })
         .collect()

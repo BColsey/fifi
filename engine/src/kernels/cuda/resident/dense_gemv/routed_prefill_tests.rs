@@ -89,7 +89,7 @@ fn device_routed_stage_matches_scalar_projection_and_stable_sort() {
         assert_eq!(word(129 + slots + s), pos as i32);
     }
     let result = testkit::floats(&out.read(ctx, "routed out"));
-    for (r, row) in result.chunks_exact(2304).enumerate() {
+    for (r, row) in result.as_chunks::<2304>().0.iter().enumerate() {
         let mut expected = 0.;
         for &e in &ids[r * 8..r * 8 + 8] {
             let e = e as usize;

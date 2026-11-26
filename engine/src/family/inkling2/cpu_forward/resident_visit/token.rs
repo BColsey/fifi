@@ -397,7 +397,7 @@ impl TokenWorkspace {
                     .slots
                     .iter()
                     .zip(&statuses)
-                    .map(|(s, status)| Ok((status.clone(), s.receipt.device(&self.journal)?)))
+                    .map(|(s, status)| Ok((*status, s.receipt.device(&self.journal)?)))
                     .collect::<Result<Vec<_>, EngError>>()?;
                 ctx.inkling_copy_words(stream, &receipts)?;
             }

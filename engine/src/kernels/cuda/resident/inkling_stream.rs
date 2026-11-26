@@ -328,32 +328,28 @@ impl CudaContext {
             }
             // Named ranges; `claim` names a range in the error of `require_apart`.
             let mut reads: Vec<(&'static str, DeviceRange<'_>)> = vec![
-                ("Inkling stream state", job.state.clone()),
-                ("Inkling stream query", job.query.clone()),
+                ("Inkling stream state", job.state),
+                ("Inkling stream query", job.query),
             ];
             if let Some(addend) = &job.addend {
-                reads.push(("Inkling stream mix addend", addend.clone()));
+                reads.push(("Inkling stream mix addend", *addend));
             }
             if let Some(norm) = &job.norm {
-                reads.push(("Inkling stream mix gamma", norm.gamma.clone()));
+                reads.push(("Inkling stream mix gamma", norm.gamma));
             }
             // Named ranges and whether a written range is the current row of the state.
             let mut writes: Vec<(&'static str, DeviceRange<'_>, bool)> = vec![
-                ("Inkling stream mix output", job.out.clone(), false),
-                ("Inkling stream health", job.health.clone(), false),
+                ("Inkling stream mix output", job.out, false),
+                ("Inkling stream health", job.health, false),
             ];
             if let Some(norm) = &job.norm {
-                writes.push(("Inkling stream mix normed row", norm.normed.clone(), false));
+                writes.push(("Inkling stream mix normed row", norm.normed, false));
             }
             // With an addend the job writes the current row, the first row of its state.
             if job.addend.is_some() {
-                writes.push((
-                    "Inkling stream current row",
-                    job.state.clone().slice(0, row)?,
-                    true,
-                ));
+                writes.push(("Inkling stream current row", job.state.slice(0, row)?, true));
             }
-            let state_range = job.state.clone();
+            let state_range = job.state;
             for (i, write) in writes.iter().enumerate() {
                 for (_, other, _) in &writes[i + 1..] {
                     require_apart(&claim(write.0, &write.1), &claim(write.0, other))?;
@@ -366,7 +362,7 @@ impl CudaContext {
                     require_apart(&claim(write.0, &write.1), &claim(name, read))?;
                 }
             }
-            checked_jobs.push((reads, writes, job.health.clone()));
+            checked_jobs.push((reads, writes, job.health));
         }
         for (i, (_, writes, health)) in checked_jobs.iter().enumerate() {
             for (reads, other_writes, other_health) in &checked_jobs[i + 1..] {
@@ -376,20 +372,16 @@ impl CudaContext {
                 };
                 let other_claims = reads
                     .iter()
-                    .map(|(name, range)| (*name, range.clone()))
-                    .chain(
-                        other_writes
-                            .iter()
-                            .map(|(name, range, _)| (*name, range.clone())),
-                    )
+                    .map(|(name, range)| (*name, *range))
+                    .chain(other_writes.iter().map(|(name, range, _)| (*name, *range)))
                     .collect::<Vec<_>>();
                 let my_claims = checked_jobs[i]
                     .0
                     .iter()
-                    .map(|(name, range)| (*name, range.clone()))
-                    .chain(writes.iter().map(|(name, range, _)| (*name, range.clone())))
+                    .map(|(name, range)| (*name, *range))
+                    .chain(writes.iter().map(|(name, range, _)| (*name, *range)))
                     .collect::<Vec<_>>();
-                for (name, write) in writes.iter().map(|(n, r, _)| (*n, r.clone())) {
+                for (name, write) in writes.iter().map(|(n, r, _)| (*n, *r)) {
                     for (other_name, other) in &other_claims {
                         if !both_health(&write, other) {
                             require_apart(&claim(name, &write), &claim(other_name, other))?;

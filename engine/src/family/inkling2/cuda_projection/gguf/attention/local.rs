@@ -650,7 +650,7 @@ impl ResidentAttention {
         dense(
             [qr, relative, sinks, gates],
             ResidentStatus {
-                effective: effective.clone(),
+                effective,
                 controller_health: health.controller,
                 gate_health: health.gates,
                 zeros: store

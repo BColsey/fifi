@@ -238,8 +238,11 @@ fn rows_controller_norm_equals_the_packed_launch_bit_for_bit() {
         health.read_at(&stream, 0, &mut status).unwrap();
         let floats = |bytes: &[u8]| {
             bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_ne_bytes)
                 .collect::<Vec<_>>()
         };
         let (output, status) = (floats(&output), floats(&status));
