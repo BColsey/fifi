@@ -108,22 +108,25 @@ fn resident_pass_parity() {
         }
         // A second model without CUDA replays the first two layers of every prompt row on the
         // host and keeps the stream after each, with the second layer's attention input.
-        let mut host = CpuForward::open(Path::new(&checkpoint), rows).unwrap();
+        let host = CpuForward::open(Path::new(&checkpoint), rows).unwrap();
         let mut host_state: Vec<VisitState> =
             (0..host.state.len()).map(|_| VisitState::default()).collect();
         let (mut after, mut inputs) = (Vec::new(), Vec::new());
+        // The second layer's raw K/V and prepared rows, from a fresh visit state.
+        let mut raw = Vec::new();
+        let mut second = VisitState::default();
         for &id in &tokens[..rows] {
             let mut stream = host.embed(id).unwrap();
             let mut taps = TapRow::new(&[], host.hidden());
             for (n, visit) in host.visits[..2].iter().enumerate() {
                 let layer = format!("model.llm.layers.{}", visit.weight_layer);
                 if n == 1 {
-                    inputs.extend(
-                        host.attention_inputs(*visit, &layer, &stream, None)
-                            .unwrap()[0]
-                            .iter()
-                            .map(|x| x.to_bits()),
-                    );
+                    let inputs1 = host.attention_inputs(*visit, &layer, &stream, None).unwrap();
+                    inputs.extend(inputs1[0].iter().map(|x| x.to_bits()));
+                    let projected = host.project_attention(&layer, visit.attention, &inputs1).unwrap();
+                    raw.extend(projected[1].iter().map(|x| x.to_bits()));
+                    raw.extend(projected[2].iter().map(|x| x.to_bits()));
+                    host.attention(&layer, *visit, &mut second, projected).unwrap();
                 }
                 host.run_visits(&host.visits[n..n + 1], &mut host_state, &mut stream, None, &mut taps, false)
                     .unwrap();
@@ -135,6 +138,7 @@ fn resident_pass_parity() {
             serde_json::to_vec(&serde_json::json!({
                 "input": input, "raw_k": raw_k, "raw_v": raw_v, "state": state.parity_rows(),
                 "h": host.hidden(), "input1": inputs,
+                "raw1": raw, "second": second.parity_rows(),
                 "after": after,
             }))
             .unwrap(),
