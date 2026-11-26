@@ -276,16 +276,17 @@ impl DenseStep {
             health: rows.gate_health,
         });
         context.inkling_stream_norm_rows(stream, &gates, (work.width, MIX_EPS))?;
-        for (src, at) in [(rows.input, 0), (rows.message, row), (rows.gamma, 2 * row)] {
-            context.copy_device(stream, src, work.norm.slice(at, row)?)?;
-        }
+        // The controller GEMVs write the gain and forget rows into the work block; the norm
+        // reads them next to the caller's input, message and gamma rows where they live.
+        let [gain, forget] = [3, 4].map(|i| work.norm.slice(i * row, row));
+        let [gain, forget] = [gain?, forget?];
         context.copy_device(stream, rows.bias, work.bias)?;
         context.dense_gemv_group(stream, &work.calls)?;
-        context.inkling_controller_norm_roles(
+        context.inkling_controller_norm_rows(
             stream,
-            work.norm,
+            &[[rows.input, rows.message, rows.gamma, gain, forget, work.x]],
             rows.health,
-            ([work.width, 1], eps),
+            (work.width, eps),
         )?;
         enqueue(stream, [work.x, work.bias, rows.status, rows.out])
     }
