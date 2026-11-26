@@ -379,16 +379,21 @@ impl CpuForward {
         // K/V of a ring-only visit stay in the ring until a host visit needs them.
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.materialize_token_rows()?;
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        if self.resident_pass(tokens)? {
-            return Ok(());
-        }
-        if tokens.len() < 2
+        if tokens.is_empty()
             || tokens.len() > self.context.saturating_sub(self.position)
             || tokens
                 .iter()
                 .any(|&id| u64::from(id) >= self.spec.unpadded_vocab_size)
         {
+            return Err(bad(
+                "prefill rows or tokens are outside the Inkling text limits",
+            ));
+        }
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if self.resident_pass(tokens)? {
+            return Ok(());
+        }
+        if tokens.len() < 2 {
             return Err(bad(
                 "prefill rows or tokens are outside the Inkling text limits",
             ));
