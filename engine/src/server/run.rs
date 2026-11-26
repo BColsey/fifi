@@ -439,13 +439,7 @@ pub(crate) fn start_one(
     // opt-in is checked first (it only reads the engine's own options),
     // then the family-aware decision covers the ready note, the starter
     // (whose Q36 session-cap rule reads the flag) and the entry.
-    let flint_opt_in = config.family == flint::FAMILY
-        && flint::prefix_reuse_entry_enabled(
-            config
-                .flint
-                .as_ref()
-                .map(|options| options.kv_profile.as_str()),
-        );
+    let flint_opt_in = config.family == flint::FAMILY && flint::prefix_reuse_entry_enabled();
     let prefix_reuse = entry_prefix_reuse(config, file_prefix_reuse, flint_opt_in);
     if file_prefix_reuse.is_none()
         && config.family == q36_factory::FAMILY
@@ -606,13 +600,9 @@ fn start_flint(
     _prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    let started = flint::factory::start_engine(
-        &config.model_dir,
-        &config.tokenizer_dir,
-        config.flint.as_ref(),
-        ready_note,
-    )?;
-    let effective = crate::capability::effective::flint_effective_for_build(config.flint.as_ref())?;
+    let started =
+        flint::factory::start_engine(&config.model_dir, &config.tokenizer_dir, ready_note)?;
+    let effective = crate::capability::effective::flint_effective_for_build()?;
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
@@ -1191,7 +1181,6 @@ mod tests {
             qwen36: None,
             nemotron: None,
             gemma4: None,
-            flint: None,
         }
     }
 
@@ -1265,7 +1254,6 @@ mod tests {
             qwen36,
             nemotron: None,
             gemma4: None,
-            flint: None,
         }
     }
 

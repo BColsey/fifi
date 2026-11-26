@@ -338,7 +338,7 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             && super::probe::CompiledBackends::of_this_build().mlx;
         if is_flint || is_flash_mlx {
             let rows = if is_flint {
-                super::effective::flint_effective_for_build(engine.flint.as_ref())
+                super::effective::flint_effective_for_build()
             } else {
                 super::effective::flash_mlx_config_effective(
                     &engine.model_dir,

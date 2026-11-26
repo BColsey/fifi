@@ -23,7 +23,6 @@ pub(crate) mod factory;
 // Assembled at the park hooks once they exist, like gguf_weights above.
 #[cfg_attr(not(test), allow(dead_code))]
 mod park_identity;
-pub(crate) mod settings;
 // Staged CUDA source views; the mixed-residency entry has no serving caller yet.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -174,13 +173,9 @@ pub(in crate::family::flint) fn retention_cap_for(
     }
 }
 
-/// The server's entry flag: the frozen opt-in
-/// resolved against the engine's kv profile when the config carries one.
-/// `None` is the MLX target (its config carries no CUDA options), where
-/// the env alone arms the store; a non-f16 CUDA profile resolves OFF so a
-/// q8 entry logs and arms "off" and its boundary requests serve cold.
-pub(crate) fn prefix_reuse_entry_enabled(profile: Option<&str>) -> bool {
-    prefix_reuse_opt_in() && profile.is_none_or(|profile| profile == "f16")
+/// The server's entry flag: the environment opt-in alone arms the store.
+pub(crate) fn prefix_reuse_entry_enabled() -> bool {
+    prefix_reuse_opt_in()
 }
 
 /// FIFI_FLINT_PREFIX_REUSE, read once per process. The mirror of the

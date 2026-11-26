@@ -2,7 +2,7 @@
 //!
 //! The file carries no key.
 
-use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
+use crate::family::flint::FAMILY as FLINT_FAMILY;
 use crate::family::gemma::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
 use crate::family::inkling2::FAMILY as INKLING2_FAMILY;
 use crate::family::inkling2_mini::FAMILY as INKLING_FAMILY;
@@ -148,8 +148,6 @@ pub(crate) struct EngineConfig {
     pub(crate) nemotron: Option<NemotronOptions>,
     /// Options of the `gemma4` family: the session count.
     pub(crate) gemma4: Option<Gemma4Options>,
-    /// Explicit CUDA pilot context and KV profile; absent on legacy MLX entries.
-    pub(crate) flint: Option<FlintOptions>,
     /// Per-entry opt-out of resent-thinking replay (default: the template's
     /// own resolution — on iff the pinned-template eligibility says so).
     /// The flag can only turn replay off: `false` disables replay and the
@@ -377,20 +375,10 @@ impl Config {
                     "engines[{index}] sets nemotron, which only the {NEMOTRON_FAMILY} family takes"
                 )));
             }
-            if engine.family != FLINT_FAMILY && engine.flint.is_some() {
-                return Err(StartupError(format!(
-                    "engines[{index}] sets flint, which only the {FLINT_FAMILY} family takes"
-                )));
-            }
             if engine.family == SENSENOVA_FAMILY {
                 check_sensenova_tokenizer_path(&engine.model_dir, &engine.tokenizer_dir).map_err(
                     |error| StartupError(format!("engines[{index}].tokenizer_dir: {error}")),
                 )?;
-            }
-            if let Some(options) = &engine.flint {
-                options
-                    .plan()
-                    .map_err(|error| StartupError(format!("engines[{index}].flint: {error:?}")))?;
             }
             if !FAMILIES.contains(&engine.family.as_str()) {
                 return Err(StartupError(format!(
@@ -489,39 +477,11 @@ mod tests {
     }
 
     #[test]
-    fn flint_cuda_profile_is_explicit_and_family_scoped() {
+    fn a_flint_object_is_an_unknown_key() {
         let mut value: serde_json::Value = serde_json::from_str(VALID).unwrap();
-        value["engines"][0]["flint"] = serde_json::json!({
-            "context_limit": 128, "kv_profile": "f16"
-        });
-        assert!(message(load(&value.to_string())).contains("sets flint"));
         value["engines"][0]["family"] = serde_json::json!("flint");
-        let config = load(&value.to_string()).expect("explicit Flint pilot config");
-        assert_eq!(config.engines[0].flint.as_ref().unwrap().context_limit, 128);
-        assert_eq!(
-            config.engines[0].flint.as_ref().unwrap().prefill_chunk_size,
-            8
-        );
-        value["engines"][0]["flint"]["prefill_chunk_size"] = serde_json::json!(1);
-        let rollback = load(&value.to_string()).expect("explicit serial rollback");
-        assert_eq!(
-            rollback.engines[0]
-                .flint
-                .as_ref()
-                .unwrap()
-                .prefill_chunk_size,
-            1
-        );
-        value["engines"][0]["flint"]["kv_profile"] = serde_json::json!("q8");
-        let q8 = load(&value.to_string()).expect("explicit native Q8 profile");
-        assert_eq!(q8.engines[0].flint.as_ref().unwrap().kv_profile, "q8");
-        value["engines"][0]["flint"]["kv_profile"] = serde_json::json!("q4");
-        assert!(message(load(&value.to_string())).contains("explicit kv_profile f16, q8 or q8k"));
-        value["engines"][0]["flint"]["kv_profile"] = serde_json::json!("q8k");
-        let q8k = load(&value.to_string()).expect("explicit native Q8K mixed profile");
-        assert_eq!(q8k.engines[0].flint.as_ref().unwrap().kv_profile, "q8k");
-        value["engines"][0].as_object_mut().unwrap().remove("flint");
-        assert!(load(&value.to_string()).unwrap().engines[0].flint.is_none());
+        value["engines"][0]["flint"] = serde_json::json!({"context_limit": 128});
+        assert!(message(load(&value.to_string())).contains("unknown field `flint`"));
     }
 
     #[test]
@@ -1071,7 +1031,7 @@ mod tests {
             r#""family": "fake", "kv_cache": {"dir": "/c"}"#,
         );
         assert!(message(load(&fake)).contains("does not keep an on-disk prefix cache"));
-        // The Flint pilot serves EXL3 packs, which have no disk tier: the key says so.
+        // Flint has no disk tier: the key says so.
         let flint = VALID.replace(
             r#""family": "fake""#,
             r#""family": "flint", "kv_cache": {"dir": "/c"}"#,

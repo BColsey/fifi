@@ -12,6 +12,13 @@ const MODEL_CONTEXT_LIMIT: usize = 262_144;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvStorage {
     F16,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the int8 K/V layout is built by the staged CUDA views and tests only"
+        )
+    )]
     Q8G32,
 }
 
@@ -164,6 +171,13 @@ impl KvPlan {
 
     /// Per-plane profile parameter; only an explicit mixed profile
     /// (settings "q8k") reaches a non-uniform plan.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the int8 K/V layout is built by the staged CUDA views and tests only"
+        )
+    )]
     pub(crate) fn with_kv_storage(mut self, k: KvStorage, v: KvStorage) -> Self {
         self.k_storage = k;
         self.v_storage = v;

@@ -568,13 +568,10 @@ pub(crate) fn flash_mlx_config_effective(
     ))
 }
 
-pub(crate) fn flint_effective_for_build(
-    options: Option<&crate::family::flint::settings::FlintOptions>,
-) -> Result<Vec<EffectiveSetting>, crate::EngError> {
+pub(crate) fn flint_effective_for_build() -> Result<Vec<EffectiveSetting>, crate::EngError> {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     {
         use crate::family::flint::factory;
-        factory::check_mlx_options(options)?;
         let context = std::env::var_os("FIFI_FLINT_MLX_CONTEXT_LIMIT");
         let rows = std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL");
         let cache = std::env::var_os("FIFI_FLINT_MLX_CACHE_LIMIT");
@@ -639,7 +636,6 @@ pub(crate) fn flint_effective_for_build(
     }
     #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = options;
         Err(crate::EngError::BadRequest(
             "engine config: Flint requires --features native-mlx on Apple Silicon".into(),
         ))

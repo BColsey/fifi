@@ -199,7 +199,6 @@ mod tests {
             qwen36: None,
             nemotron: None,
             gemma4: None,
-            flint: None,
         }
     }
 

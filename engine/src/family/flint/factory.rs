@@ -1,6 +1,5 @@
 //! Flint startup. Native values are constructed only on the engine thread.
 
-use super::settings::FlintOptions;
 use std::path::Path;
 
 use crate::{
@@ -188,33 +187,20 @@ pub(crate) fn check_backend() -> Result<(), EngError> {
 pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,
-    options: Option<&FlintOptions>,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     check_backend()?;
-    launch(model_dir, tokenizer_dir, options, ready_note)
-}
-
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn check_mlx_options(options: Option<&FlintOptions>) -> Result<(), EngError> {
-    if options.is_some() {
-        return Err(EngError::BadRequest(
-            "flint options select the CUDA pilot, not MLX".into(),
-        ));
-    }
-    Ok(())
+    launch(model_dir, tokenizer_dir, ready_note)
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn launch(
     model_dir: &Path,
     tokenizer_dir: &Path,
-    options: Option<&FlintOptions>,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     use crate::sched::worker::spawn_engine_noted;
 
-    check_mlx_options(options)?;
     let bundle = load_tokenizer(tokenizer_dir)?;
     let eos = bundle.eos_token_ids().to_vec();
     let vocab = bundle.vocab_size() as usize;
@@ -234,7 +220,6 @@ fn launch(
 fn launch(
     _model_dir: &Path,
     _tokenizer_dir: &Path,
-    _options: Option<&FlintOptions>,
     _ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     Err(EngError::BadRequest(

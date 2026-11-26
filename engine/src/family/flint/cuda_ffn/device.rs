@@ -193,7 +193,7 @@ impl<'c, 's> Frame<'c, 's> {
             stream,
             buffers: Vec::new(),
             flag,
-            rows_cap: crate::family::flint::settings::PREFILL_MAX_ROWS,
+            rows_cap: 8,
             #[cfg(test)]
             statuses: Vec::new(),
         }

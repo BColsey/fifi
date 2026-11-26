@@ -552,7 +552,6 @@ pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
             qwen36: None,
             nemotron: None,
             gemma4: None,
-            flint: None,
         }],
     }
 }
