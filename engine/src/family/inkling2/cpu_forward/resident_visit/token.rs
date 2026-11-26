@@ -9,6 +9,19 @@ mod shadow;
 use super::*;
 use crate::kernels::cuda::{NativeWeight, resident::embed::EmbedNativeCall};
 
+/// Declines the whole-token path; the first decline of each reason is logged once per process.
+fn declined<T>(reason: &'static str) -> Result<Option<T>, EngError> {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !seen.contains(&reason) {
+        seen.push(reason);
+        eprintln!("Inkling CUDA declined whole resident decode token: {reason}");
+    }
+    Ok(None)
+}
+
 struct Slot {
     w: Workspace,
     active: usize,
@@ -110,28 +123,35 @@ impl TokenWorkspace {
     ) -> Result<Option<Self>, EngError> {
         let h = f.hidden();
         let vocab = f.spec.unpadded_vocab_size as usize;
-        if !Self::valid_geometry(f, states)
-            || !cuda.resident_head_supported([vocab, h])
-            || f.draft_window_enabled()
-            || !f.taps.is_empty()
-        {
+        if f.draft_window_enabled() || !f.taps.is_empty() {
             return Ok(None);
         }
+        if !Self::valid_geometry(f, states) {
+            return declined("the loop geometry is not one this workspace runs");
+        }
+        if !cuda.resident_head_supported([vocab, h]) {
+            return declined("the output head has no resident GEMV");
+        }
         let geometry = Self::layout(f);
-        if f.visits.iter().zip(&geometry).any(|(&v, g)| {
-            states[v.state_slot].position() != f.position
-                || states[v.state_slot].is_resident()
-                || !Self::eligible(cuda, v, f.position, g.3.is_some())
+        if f.visits.iter().any(|&v| {
+            states[v.state_slot].position() != f.position || states[v.state_slot].is_resident()
         }) {
             // A resident state has no host rows to boot from; the host path materializes first.
             return Ok(None);
+        }
+        if f.visits
+            .iter()
+            .zip(&geometry)
+            .any(|(&v, g)| !Self::eligible(cuda, v, f.position, g.3.is_some()))
+        {
+            return declined("a visit's attention has no resident decode at this position");
         }
         let Weights::Gguf(weights) = &f.weights else {
             return Ok(None);
         };
         let ctx = cuda.context();
         if !Self::fits(f, cuda, &geometry, limit.min(ctx.memory_info()?.free))? {
-            return Ok(None);
+            return declined("a layer has no resident kernel or the workspace does not fit");
         }
         let mut end = 0;
         let logits = reserve(&mut end, vocab);
@@ -139,7 +159,7 @@ impl TokenWorkspace {
         let (mut slots, mut depth_bytes, mut prelude_bytes, mut cold_bytes) = (Vec::new(), 0, 0, 8);
         for (&visit, (save, restart, blocks, bank, active)) in f.visits.iter().zip(geometry) {
             let Some(w) = Workspace::open_geometry(f, cuda, visit, blocks, bank)? else {
-                return Ok(None);
+                return declined("a visit workspace declined");
             };
             depth_bytes = depth_bytes.max(w.layout.depth.bytes);
             if save {
@@ -179,7 +199,7 @@ impl TokenWorkspace {
         let pinned = ctx.pinned_buf(end.max(cold_bytes))?;
         let scratch = ctx.allocate(2 * h * WORD)?;
         let Some(embedding) = weights.resident_embedding(ctx)? else {
-            return Ok(None);
+            return declined("the embedding table has no device gather or no room");
         };
         let stream = ctx.stream()?;
         if ctx.memory_info()?.free
@@ -187,7 +207,7 @@ impl TokenWorkspace {
                 .token_growth_reserve(&f.spec, f.context)
                 .unwrap_or(usize::MAX)
         {
-            return Ok(None);
+            return declined("free device memory is under the expert growth reserve");
         }
         Ok(Some(Self {
             warm: vec![false; slots.len()],

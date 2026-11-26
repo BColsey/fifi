@@ -14,7 +14,7 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         prefill::{
-            mmq_mmid::{GroupedDqRows, MmidWeight, SparseDqCall},
+            mmq_mmid::{GroupedDqRows, MmidWeight, SparseDqCall, grouped_dq_serves},
             row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
         },
         resident::{
@@ -24,7 +24,6 @@ use crate::{
             matvec_q::QuantType,
         },
     },
-    weights::GgufType,
 };
 
 // The direct packed projection measurements favor GEMV for narrow expert groups.
@@ -503,11 +502,10 @@ fn grouped_weight(
     [n, k]: [usize; 2],
     base: DeviceRange<'_>,
 ) -> Option<MmidWeight<'_>> {
-    let quant = match dtype {
-        DenseDtype::PackedGguf(GgufType::Iq2Xxs) => QuantType::Iq2Xxs,
-        DenseDtype::PackedGguf(GgufType::Q20) => QuantType::Q20,
-        _ => return None,
+    let DenseDtype::PackedGguf(kind) = dtype else {
+        return None;
     };
+    let quant = QuantType::from_gguf(kind).filter(|&quant| grouped_dq_serves(quant))?;
     if !k.is_multiple_of(quant.block_size().max(64)) || !n.is_multiple_of(4) {
         return None;
     }

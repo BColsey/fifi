@@ -883,19 +883,28 @@ impl GgufTextWeights {
         Ok((tensor, bytes))
     }
 
+    /// The embedding table and its bytes when the device gather reads it as stored: one plane
+    /// of a quantized type with a native kernel.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn gathered_embedding(&self) -> Result<Option<(&Tensor, &[u8])>, EngError> {
+        use crate::kernels::cuda::resident::matvec_q::QuantType;
+        let (t, bytes) = self.tensor("model.llm.embed.weight")?;
+        Ok((t.planes == 1
+            && QuantType::from_gguf(t.kind).is_some()
+            && matches!(t.vector_order, VectorOrder::Stored))
+        .then_some((t, bytes)))
+    }
+
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_embedding_bytes(
         &self,
         h: usize,
         rows: usize,
     ) -> Result<Option<usize>, EngError> {
-        let (t, bytes) = self.tensor("model.llm.embed.weight")?;
-        Ok((t.planes == 1
-            && t.kind == GgufType::Iq4Xs
-            && t.columns == h
-            && t.rows == rows
-            && matches!(t.vector_order, VectorOrder::Stored))
-        .then_some(bytes.len()))
+        Ok(self
+            .gathered_embedding()?
+            .filter(|(t, _)| t.columns == h && t.rows == rows)
+            .map(|(_, bytes)| bytes.len()))
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -905,13 +914,9 @@ impl GgufTextWeights {
     ) -> Result<Option<crate::kernels::cuda::NativeWeight>, EngError> {
         use crate::kernels::cuda::{CHUNK_LIMIT, QuantTensor};
         let name = "model.llm.embed.weight";
-        let (t, bytes) = self.tensor(name)?;
-        if t.planes != 1
-            || t.kind != GgufType::Iq4Xs
-            || !matches!(t.vector_order, VectorOrder::Stored)
-        {
+        let Some((t, bytes)) = self.gathered_embedding()? else {
             return Ok(None);
-        }
+        };
         // Leave the normal device reserve intact even during lazy admission.
         if ctx.memory_info()?.free.saturating_sub(bytes.len()) < 256 * 1024 * 1024 {
             return Ok(None);

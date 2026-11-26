@@ -62,6 +62,12 @@ struct DqLaunch<'b> {
     col_tile: usize,
 }
 
+/// Whether the grouped dequantizing GEMM decodes `quant` (the family-side check before it
+/// plans a grouped expert stack).
+pub(crate) fn grouped_dq_serves(quant: QuantType) -> bool {
+    gemm_dq_mmid_type(quant)
+}
+
 impl CudaContext {
     /// Queues one grouped dequantizing GEMM of `call` on `stream` and returns when it is
     /// queued; `y` holds the products after the stream drained. The ids are read in stream
