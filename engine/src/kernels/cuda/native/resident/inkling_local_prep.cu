@@ -10,9 +10,12 @@ constexpr int kWidth = 128, kTaps = 4;
 // Largest row the Rust wrappers pass to inkling_weighted_norm.
 constexpr int kMaxNormWidth = 4096;
 
+// The weight rows and the K/V conv histories are the caller's ranges: nothing is staged. The
+// kernel shifts `past_k` / `past_v` in place.
 struct Args {
     float *q, *relative, *raw_k, *raw_v, *k, *v, *sinks, *gates;
-    float *aux;
+    const float *q_scale, *rel_scale, *kernel_k, *kernel_v;
+    float *past_k, *past_v;
     uint32_t *status;
     int queries, kv, dims, history;
     float qk_limit, rel_limit, eps;
@@ -24,12 +27,9 @@ __global__ void inkling_local_prep(Args a) {
     __shared__ float squares[kWidth], scale;
     const int d = threadIdx.x;
     int head = blockIdx.x;
-    const int q_words = a.queries * kWidth;
-    const int rel_words = a.queries * a.dims;
     const int kv_words = a.kv * kWidth;
-    const float *q_scale = a.aux + 1; // first word is the attention position
-    const float *rel_scale = q_scale + q_words;
-    const float *kernels = rel_scale + rel_words;
+    const float *q_scale = a.q_scale;
+    const float *rel_scale = a.rel_scale;
     float *output;
     float x = 0.f;
     bool valid = true;
@@ -54,8 +54,8 @@ __global__ void inkling_local_prep(Args a) {
         const int at = (head - plane * a.kv) * kWidth + d;
         output = (rms ? a.v : a.k) + at;
         const float raw = (rms ? a.raw_v : a.raw_k)[at];
-        const float *w = kernels + (plane * kv_words + at) * kTaps;
-        float *past = a.aux + 1 + q_words + rel_words + (2 * kTaps + plane * (kTaps - 1)) * kv_words;
+        const float *w = (plane ? a.kernel_v : a.kernel_k) + at * kTaps;
+        float *past = plane ? a.past_v : a.past_k;
         float conv = __fmul_rn(w[kTaps - 1], raw);
         for (int lag = 1; lag <= a.history; ++lag) {
             conv = __fadd_rn(conv, __fmul_rn(w[kTaps - 1 - lag], past[(lag - 1) * kv_words + at]));
@@ -413,7 +413,10 @@ extern "C" int inference_cuda_inkling_local_prep(void *const *p, int queries, in
               static_cast<float *>(p[2]), static_cast<float *>(p[3]),
               static_cast<float *>(p[4]), static_cast<float *>(p[5]),
               static_cast<float *>(p[6]), static_cast<float *>(p[7]),
-              static_cast<float *>(p[8]), static_cast<uint32_t *>(p[9]),
+              static_cast<const float *>(p[8]), static_cast<const float *>(p[9]),
+              static_cast<const float *>(p[10]), static_cast<const float *>(p[11]),
+              static_cast<float *>(p[12]), static_cast<float *>(p[13]),
+              static_cast<uint32_t *>(p[14]),
               queries, kv, dims, history, qk_limit, rel_limit, eps};
     inkling_local_prep<<<2 * (queries + kv), kWidth, 0, (cudaStream_t)stream>>>(args);
     Failure failure;
