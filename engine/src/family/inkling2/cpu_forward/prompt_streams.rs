@@ -320,9 +320,19 @@ mod tests {
         let stream = context.stream().unwrap();
         let mut rng = Lcg(7);
         let (rows, eps) = (256, 1e-5);
-        // Widths with a partial last chunk of products, and enough sealed rows that their
-        // ordered sums span two warps.
-        for (width, sealed) in [(2304, 0), (2304, 1), (2304, 6), (1000, 6), (1000, 40)] {
+        // Widths with a partial last chunk of products, a whole number of chunks (960) and less
+        // than one (100); enough sealed rows that their ordered sums span two warps; and the
+        // widest mix of the most rows (4096 values, 63 sealed rows and the current one).
+        for (width, sealed) in [
+            (2304, 0),
+            (2304, 1),
+            (2304, 6),
+            (1000, 6),
+            (1000, 40),
+            (960, 6),
+            (100, 3),
+            (4096, MAX_BLOCKS),
+        ] {
             let mut host: Vec<Stream> = (0..rows)
                 .map(|_| {
                     let mut s = Stream::new(rng.row(width));
@@ -333,8 +343,8 @@ mod tests {
                 })
                 .collect();
             let refs: Vec<&Stream> = host.iter().collect();
-            let mut device =
-                PromptStreams::upload(&context, &stream, &refs, sealed.max(6) + 2).unwrap();
+            let capacity = (sealed.max(6) + 2).min(MAX_BLOCKS);
+            let mut device = PromptStreams::upload(&context, &stream, &refs, capacity).unwrap();
             let query = rng.row(width);
             let gamma = rng.row(width);
             let (q, g) = (
@@ -409,7 +419,10 @@ mod tests {
                     "current row {r}"
                 );
             }
-            // Seal, then add, against the host.
+            // Seal, then add, against the host, while a block is free.
+            if sealed == capacity {
+                continue;
+            }
             let next: Vec<Vec<f32>> = (0..rows).map(|_| rng.row(width)).collect();
             let addend: Vec<Vec<f32>> = (0..rows).map(|_| rng.row(width)).collect();
             let next_buffer = upload_floats(&context, &stream, &next.concat());

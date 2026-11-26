@@ -301,8 +301,14 @@ constexpr int ordered_max_width = 4096;
 size_t ordered_mix_shared_bytes(int width, int rows) {
     return (static_cast<size_t>(width) + ordered_staged_floats(rows)) * sizeof(float);
 }
-static_assert((ordered_max_width + ordered_staged_floats(max_rows)) * sizeof(float) <= 48 * 1024,
+// The mix kernel's static shared floats: the scores and weights of every row and two scalars.
+constexpr int ordered_mix_static_floats = 2 * max_rows + 2;
+static_assert((ordered_max_width + ordered_staged_floats(max_rows) + ordered_mix_static_floats) *
+                      sizeof(float) <=
+                  48 * 1024,
               "the widest ordered mix of the most rows must fit the default shared memory");
+// `ordered_dots` gives sum k to lane k, so a block needs a lane per sum.
+static_assert(max_rows <= threads, "an ordered mix needs a lane for each of its sums");
 
 // out = norm(mix) * gamma when `gamma` is set, else the mix. Without a query the mix is the raw
 // current row (the first visit's input). Output rows are `out_stride` floats apart.

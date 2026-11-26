@@ -35,8 +35,8 @@ __host__ __device__ constexpr int ordered_staged_floats(int count) { return coun
 // `count` sums in element order from -0.0, each the bits of `ordered_dot`: lane k < count
 // receives sum k of `product(k, i)` over i < width. The block's lanes compute every sum's
 // products one chunk at a time into `staged` (`ordered_staged_floats(count)` floats), then each
-// adding lane adds its sum's chunk in element order. Every lane of the block calls it; it
-// synchronizes the block before it returns.
+// adding lane adds its sum's chunk in element order. `count` must not exceed the block's lanes.
+// Every lane of the block calls it; it synchronizes the block before it returns.
 template <typename Product>
 static __device__ __forceinline__ float ordered_dots(Product product, int count, int width,
                                                      float *staged) {
