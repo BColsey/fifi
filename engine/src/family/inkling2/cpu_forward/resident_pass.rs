@@ -211,13 +211,14 @@ impl CpuForward {
         if !self.pass_admitted(weights, cuda)? {
             return Ok(false);
         }
+        let mut offset = 0;
         for block in tokens.chunks(Self::block_rows()) {
             let rows = block.len();
             let mut state = std::mem::take(&mut self.state);
             let started = std::time::Instant::now();
             let outcome = self.pass_workspace(cuda, MAX_ROWS).and_then(|()| {
                 let plan_us = started.elapsed().as_micros() as u64;
-                self.run_block(weights, cuda, block, &mut state)
+                self.run_block(weights, cuda, block, offset, &mut state)
                     .map(|report| {
                         report.plan_us.set(plan_us);
                         report
@@ -227,6 +228,7 @@ impl CpuForward {
             match outcome {
                 Ok(report) => {
                     self.position += rows;
+                    offset += rows;
                     self.failed = false;
                     if reporting() {
                         eprintln!(
@@ -472,6 +474,7 @@ impl CpuForward {
         weights: &GgufTextWeights,
         cuda: &GgufCuda,
         tokens: &[u32],
+        offset: usize,
         state: &mut [VisitState],
     ) -> Result<Report, EngError> {
         let committed = tokens.len();
@@ -502,6 +505,7 @@ impl CpuForward {
             visits: &plan.visits,
             rows,
             committed,
+            offset,
             h,
             live: std::cell::Cell::new(0),
             report: &mut report,
@@ -1063,7 +1067,7 @@ impl CpuForward {
     #[allow(clippy::too_many_arguments)]
     /// Test aid (`FIFI_INKLING_PASS_ROUTES_IN=<flag-off log>`): the expert routes an earlier flag-off
     /// run printed (`FIFI_INKLING_DEBUG_PREFILL_ROUTES=1`) take the place of this run's own
-    /// selection, per layer and call over the same number of rows. Two runs whose router logits
+    /// selection, per layer, for the block's rows `offset..offset + rows` of the prompt. Two runs whose router logits
     /// differ by float noise disagree on near-tie rows only; replaying the routes removes that
     /// disagreement from the comparison.
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -1073,14 +1077,16 @@ impl CpuForward {
         logits: &[f32],
         bias: &[f32],
         rows: usize,
+        offset: usize,
     ) -> Result<Option<Vec<MoeRoute>>, EngError> {
-        static ROUTES: std::sync::OnceLock<Option<Vec<(usize, Vec<Vec<usize>>)>>> =
-            std::sync::OnceLock::new();
-        static CALLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>> =
-            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        static ROUTES: std::sync::OnceLock<
+            Option<std::collections::HashMap<usize, Vec<Vec<usize>>>>,
+        > = std::sync::OnceLock::new();
+        // Every route set a layer printed, in the printed order: the flag-off path prints its
+        // pieces in prompt order, so the rows of a block are `offset..offset + rows` of it.
         let routes = ROUTES.get_or_init(|| {
             let text = std::fs::read_to_string(std::env::var("FIFI_INKLING_PASS_ROUTES_IN").ok()?).ok()?;
-            let mut out = Vec::new();
+            let mut out = std::collections::HashMap::<usize, Vec<Vec<usize>>>::new();
             for line in text
                 .lines()
                 .filter(|line| line.contains("Inkling grouped route diagnostic "))
@@ -1091,24 +1097,16 @@ impl CpuForward {
                     .trim()
                     .parse()
                     .ok()?;
-                out.push((
-                    value["layer"].as_u64()? as usize,
-                    serde_json::from_value(value["routes"].clone()).ok()?,
-                ));
+                out.entry(value["layer"].as_u64()? as usize)
+                    .or_default()
+                    .extend(serde_json::from_value::<Vec<Vec<usize>>>(value["routes"].clone()).ok()?);
             }
             Some(out)
         });
-        let Some(routes) = routes else {
-            return Ok(None);
-        };
-        let mut calls = CALLS.lock().unwrap();
-        let call = *calls.entry((layer, rows)).or_insert(0);
-        *calls.get_mut(&(layer, rows)).unwrap() += 1;
         let Some(picked) = routes
-            .iter()
-            .filter(|(printed, routes)| *printed == layer && routes.len() == rows)
-            .map(|(_, routes)| routes)
-            .nth(call)
+            .as_ref()
+            .and_then(|all| all.get(&layer))
+            .and_then(|all| all.get(offset..offset + rows))
         else {
             return Ok(None);
         };
@@ -1257,7 +1255,7 @@ impl CpuForward {
             block.report.readbacks.set(block.report.readbacks.get() + 2);
             let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
             #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-            let routes = match self.replayed_routes(weight_layer, &logits, &bias, rows)? {
+            let routes = match self.replayed_routes(weight_layer, &logits, &bias, rows, block.offset)? {
                 Some(routes) => routes,
                 None => self.route_prefill_logits(weight_layer, &logits, &bias, rows)?,
             };
@@ -1350,6 +1348,12 @@ struct Block<'a> {
     rows: usize,
     /// Rows the block commits (tails, cursors, publication).
     committed: usize,
+    /// The block's first row, counted from the prompt's first (test aid: the replayed routes).
+    #[cfg_attr(
+        not(all(test, feature = "native-cuda", target_os = "linux")),
+        allow(dead_code)
+    )]
+    offset: usize,
     h: usize,
     /// The live depth stream's buffer index.
     live: std::cell::Cell<usize>,
