@@ -132,6 +132,9 @@ fn resident_pass_parity() {
                 .unwrap(),
             )
             .unwrap();
+        if let Some(out) = &output {
+            fs::write(out, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
             return;
         }
         // A second model without CUDA replays the first two layers of every prompt row on the
