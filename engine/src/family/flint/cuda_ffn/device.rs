@@ -178,15 +178,6 @@ pub(super) fn count_publish(level: PublishLevel) {
     PUBLISH_LEVELS[level as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Separate publishes issued so far by [frame sites, routed expert sites].
-#[cfg(test)]
-pub(super) fn test_publish_levels() -> [u64; 2] {
-    let [direct, input, routed] = PUBLISH_LEVELS
-        .each_ref()
-        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
-    [direct + input - routed, routed]
-}
-
 impl<'c, 's> Frame<'c, 's> {
     fn new(ctx: &'c CudaContext, stream: &'s DeviceStream) -> Result<Self, EngError> {
         Ok(Self::with_flag(
@@ -194,28 +185,6 @@ impl<'c, 's> Frame<'c, 's> {
             stream,
             FrameFlag::Owned(ctx.upload(&[0; 4])?),
         ))
-    }
-
-    fn deferred(
-        ctx: &'c CudaContext,
-        stream: &'s DeviceStream,
-        flag: DeviceRange<'c>,
-    ) -> Result<Self, EngError> {
-        if flag.bytes() != 4 {
-            return Err(bad("deferred health requires one status word"));
-        }
-        Ok(Self::with_flag(ctx, stream, FrameFlag::Deferred(flag)))
-    }
-
-    fn parked(
-        ctx: &'c CudaContext,
-        stream: &'s DeviceStream,
-        word: DeviceRange<'c>,
-    ) -> Result<Self, EngError> {
-        if word.bytes() != 4 {
-            return Err(bad("parked token health requires one status word"));
-        }
-        Ok(Self::with_flag(ctx, stream, FrameFlag::Parked(word)))
     }
 
     fn with_flag(ctx: &'c CudaContext, stream: &'s DeviceStream, flag: FrameFlag<'c>) -> Self {
@@ -228,12 +197,6 @@ impl<'c, 's> Frame<'c, 's> {
             #[cfg(test)]
             statuses: Vec::new(),
         }
-    }
-
-    /// The same frame for a pass of up to `cap` rows.
-    fn tall(mut self, cap: usize) -> Self {
-        self.rows_cap = cap;
-        self
     }
 
     fn keep(&mut self, buffer: DeviceBuffer, bytes: usize) -> usize {
@@ -253,11 +216,10 @@ impl<'c, 's> Frame<'c, 's> {
         self.buffers[index].0.range(0, self.buffers[index].1)
     }
 
-    /// Producer-fusion arm (FIFI_FLINT_CUDA_FUSED_PUBLISH, default on):
-    /// armed producers store the bf16 roundtrip the publish kernel would
-    /// write, so their Frame publish sites skip the separate kernel.
+    /// Producers store the bf16 roundtrip the publish kernel would write, so their Frame
+    /// publish sites skip the separate kernel.
     fn fused_publish(&self) -> bool {
-        crate::family::flint::settings::fused_publish_armed()
+        true
     }
 
     fn flag(&self) -> Result<DeviceRange<'_>, EngError> {
@@ -265,13 +227,6 @@ impl<'c, 's> Frame<'c, 's> {
             FrameFlag::Owned(buffer) => buffer.range(0, 4),
             FrameFlag::Deferred(flag) | FrameFlag::Parked(flag) => Ok(*flag),
         }
-    }
-
-    #[cfg(test)]
-    fn test_set_health(&self, status: u32) -> Result<(), EngError> {
-        let flag = self.flag()?;
-        flag.buffer()
-            .write_at(self.stream, flag.offset(), &status.to_ne_bytes())
     }
 
     fn input(&mut self, x: DeviceRange<'_>, shape: RowShape) -> Result<usize, EngError> {
@@ -812,10 +767,6 @@ mod streaming;
 
 #[cfg(test)]
 pub(crate) mod castprobe;
-pub(crate) mod exl3;
-#[cfg(test)]
-mod exl3_dispatch_tests;
-pub(crate) mod runtime;
 #[cfg(test)]
 pub(crate) mod stage_clock;
 #[cfg(test)]

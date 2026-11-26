@@ -139,6 +139,7 @@ impl CudaContext {
 
 /// RN-even BF16 publication in F32 working storage. A finite input
 /// can overflow BF16: consume only after completion and caller flag & 1 == 0.
+#[cfg_attr(not(test), allow(dead_code, reason = "launched by the staged Flint GGUF frame and tests only"))]
 pub(crate) struct Bf16PublishCall<'b> {
     pub(crate) x: DeviceRange<'b>,
     pub(crate) out: DeviceRange<'b>,
@@ -148,6 +149,7 @@ pub(crate) struct Bf16PublishCall<'b> {
 }
 
 impl CudaContext {
+    #[cfg_attr(not(test), allow(dead_code, reason = "launched by the staged Flint GGUF frame and tests only"))]
     pub(crate) fn publish_bf16_rows(
         &self,
         stream: &DeviceStream,

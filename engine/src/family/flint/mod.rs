@@ -1,18 +1,14 @@
 //! Flint metadata, pinned startup, and the initial MLX execution path.
 
-/// Pure budget and policy layer for the EXL3 serving profile: the bank
-/// plan, the admission mirror and the switch parsers, host-buildable so
-/// the diagnostic surfaces compose the same decisions without a device.
-pub(crate) mod budget;
 pub(crate) mod chunk_plan;
 mod config;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) mod cpu_moe;
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-mod cuda_executor;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+// Staged CUDA pieces of the GGUF path (the FFN frame, the K/V layout): tests run them; no
+// serving start calls them yet.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) mod cuda_ffn;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) mod cuda_kv;
 #[cfg(test)]
 mod cuda_kv_tests;
@@ -26,19 +22,7 @@ mod cuda_kv_tests;
 // Assembled at the park hooks once they exist, like gguf_weights above.
 #[cfg_attr(not(test), allow(dead_code))]
 mod park_identity;
-// The prefix module's consumers are the native-cuda executor and its
-// device gates; portable test builds do not compile it (
-// a consumer-less compile is dead-code under clippy -D warnings).
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) mod cuda_prefix;
-#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-mod cuda_prefix_tests;
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-mod cuda_sample;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) mod exl3_resident;
 pub(crate) mod factory;
-pub(crate) mod prefill_order;
 pub(crate) mod settings;
 // Staged CUDA source views; the mixed-residency entry has no serving caller yet.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
@@ -218,27 +202,6 @@ pub(crate) fn prefix_reuse_opt_in() -> bool {
     all(feature = "native-cuda", target_os = "linux")
 )))]
 pub(crate) fn prefix_reuse_opt_in() -> bool {
-    false
-}
-
-/// The CUDA per-engine resolution of the frozen opt-in against the kv
-/// profile: a non-f16 profile resolves the opt-in to OFF with
-/// one load-line note per process — the server keeps serving cold and says
-/// why, instead of failing every boundary request at restore time.
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) fn prefix_reuse_enabled_for(profile: &str) -> bool {
-    if !prefix_reuse_opt_in() {
-        return false;
-    }
-    if profile == "f16" {
-        return true;
-    }
-    static NOTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    NOTED.get_or_init(|| {
-        eprintln!(
-            "flint prefix reuse: off (kv_profile {profile}: cuda snapshots are f16-only; serving cold)"
-        );
-    });
     false
 }
 

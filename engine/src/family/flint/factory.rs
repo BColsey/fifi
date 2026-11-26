@@ -172,18 +172,15 @@ pub(crate) struct StartedEngine {
 
 /// Unsupported builds refuse before sampling defaults, tokenizer, or weight reads.
 pub(crate) fn check_backend() -> Result<(), EngError> {
-    if cfg!(any(
-        all(
-            feature = "native-mlx",
-            target_os = "macos",
-            target_arch = "aarch64"
-        ),
-        all(feature = "native-cuda", target_os = "linux")
+    if cfg!(all(
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
     )) {
         Ok(())
     } else {
         Err(EngError::BadRequest(
-            "engine config: Flint requires --features native-mlx on Apple Silicon or --features native-cuda on Linux".into(),
+            "engine config: Flint requires --features native-mlx on Apple Silicon".into(),
         ))
     }
 }
@@ -233,59 +230,7 @@ fn launch(
     })
 }
 
-/// The options a CUDA engine runs with. A present `flint` object stays fully explicit; an absent
-/// one gets the long-context default.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-fn effective_options(options: Option<&FlintOptions>) -> FlintOptions {
-    options.cloned().unwrap_or_else(FlintOptions::cuda_default)
-}
-
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-fn launch(
-    model_dir: &Path,
-    tokenizer_dir: &Path,
-    options: Option<&FlintOptions>,
-    ready_note: ReadyNote,
-) -> Result<StartedEngine, EngError> {
-    use super::budget::FlintEnv;
-    use crate::{capability::effective::flint_effective, sched::worker::spawn_engine_noted};
-
-    let options_absent = options.is_none();
-    let options = effective_options(options);
-    if options_absent {
-        eprintln!(
-            "Flint CUDA: no flint options configured; using context_limit {} and kv_profile {}",
-            options.context_limit, options.kv_profile
-        );
-    }
-    options.plan()?;
-    let context_limit = options.context_limit;
-    let bundle = load_tokenizer(tokenizer_dir)?;
-    let eos = bundle.eos_token_ids().to_vec();
-    let vocab = bundle.vocab_size() as usize;
-    let root = model_dir.to_owned();
-    let template_sha = pinned_template_sha();
-    let engine = spawn_engine_noted(1, ready_note, move |stages| {
-        let (executor, session) =
-            super::cuda_executor::FlintExecutor::open(&root, &options, eos, vocab, template_sha)?;
-        stages.publish_effective(flint_effective(
-            &options,
-            &FlintEnv::capture(),
-            Some(executor.served_order()),
-        ));
-        Ok((executor, session))
-    })?;
-    Ok(StartedEngine {
-        engine,
-        bundle,
-        context_limit,
-    })
-}
-
-#[cfg(not(any(
-    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
-    all(feature = "native-cuda", target_os = "linux")
-)))]
+#[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
 fn launch(
     _model_dir: &Path,
     _tokenizer_dir: &Path,
@@ -293,19 +238,31 @@ fn launch(
     _ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     Err(EngError::BadRequest(
-        "engine config: Flint requires --features native-mlx on Apple Silicon or --features native-cuda on Linux".into(),
+        "engine config: Flint requires --features native-mlx on Apple Silicon".into(),
     ))
 }
 
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 /// The pinned chat-template digest: also the park-identity `template`
 /// field, so engines and parks agree on one template identity.
 const CHAT_TEMPLATE_JINJA_DIGEST: &[u8; 64] =
     b"7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466";
 
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 pub(super) fn pinned_template_sha() -> [u8; 32] {
     digest(CHAT_TEMPLATE_JINJA_DIGEST)
 }
 
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 /// The tested tokenizer release for this family, SHA-256 pinned file by
 /// file: RecursiveSI/flint-int4 revision 3b93f905, publisher manifest
 /// flint-int4.json. Shared by the loader and the diagnostic surfaces so
@@ -326,13 +283,16 @@ pub(crate) fn tokenizer_pin() -> crate::tokenizer::TokenizerPin {
 
 #[cfg(any(
     test,
-    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
-    all(feature = "native-cuda", target_os = "linux")
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 pub(super) fn load_tokenizer(dir: &Path) -> Result<TokenizerBundle, EngError> {
     TokenizerBundle::load(dir, &tokenizer_pin())
 }
 
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 const fn digest(hex: &[u8; 64]) -> [u8; 32] {
     const fn nibble(c: u8) -> u8 {
         match c {
@@ -379,73 +339,6 @@ mod tests {
         assert_eq!(super::cache_limit_with(Some("64MiB")), 0);
         assert_eq!(super::cache_limit_with(Some("invalid")), 0);
         assert_eq!(super::cache_limit_with(Some("")), 0);
-    }
-
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    #[test]
-    fn cuda_build_accepts_flint_backend_before_checkpoint_io() {
-        assert!(
-            super::check_backend().is_ok(),
-            "native-cuda/Linux must admit the Flint factory"
-        );
-    }
-
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    #[test]
-    fn cuda_pilot_defaults_an_absent_object_and_refuses_a_bad_profile_before_checkpoint_io() {
-        use crate::EngError;
-        let (model, tokenizer) = (
-            std::path::Path::new("missing-flint-model"),
-            std::path::Path::new("missing-flint-tokenizer"),
-        );
-        // No flint object is no longer an options error: startup goes on, as far as the
-        // tokenizer, which is missing here.
-        let Err(error) = super::start_engine(model, tokenizer, None, None) else {
-            panic!("a missing tokenizer must refuse startup")
-        };
-        assert!(
-            !format!("{error:?}").contains("requires flint"),
-            "an absent flint object takes the default: {error:?}"
-        );
-        // A present object stays explicit: a bad profile is refused before any file is read.
-        let options = super::FlintOptions {
-            context_limit: 4096,
-            kv_profile: "q4".to_owned(),
-            prefill_chunk_size: 8,
-
-            cpu_moe_offload_layers: 0,
-            cpu_moe_split_experts: 0,
-            cpu_moe_threads: 0,
-        };
-        let result = super::start_engine(model, tokenizer, Some(&options), None);
-        assert!(matches!(result, Err(EngError::BadRequest(message))
-            if message.contains("explicit kv_profile f16, q8 or q8k")));
-    }
-
-    #[test]
-    fn an_absent_flint_object_takes_the_default_and_a_present_one_is_kept() {
-        let absent = super::effective_options(None);
-        assert_eq!(absent.context_limit, 131_072);
-        assert_eq!(absent.kv_profile, "f16");
-        assert_eq!(absent.prefill_chunk_size, 8);
-        let present = super::FlintOptions {
-            context_limit: 4096,
-            kv_profile: "q8".to_owned(),
-            prefill_chunk_size: 1,
-
-            cpu_moe_offload_layers: 0,
-            cpu_moe_split_experts: 0,
-            cpu_moe_threads: 0,
-        };
-        let kept = super::effective_options(Some(&present));
-        assert_eq!(
-            (
-                kept.context_limit,
-                kept.kv_profile.as_str(),
-                kept.prefill_chunk_size
-            ),
-            (4096, "q8", 1)
-        );
     }
 
     #[test]

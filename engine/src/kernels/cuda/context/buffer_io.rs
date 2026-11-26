@@ -234,6 +234,7 @@ impl CudaContext {
     /// placeholder for a plane that carries nothing ("q8k" has no V scale
     /// plane). Distinct from [`Self::allocate`], which refuses zero bytes.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "launched by the staged Flint GGUF frame and tests only"))]
     pub(crate) fn empty_buffer(&self) -> Result<DeviceBuffer, EngError> {
         self.ensure_usable()?;
         Ok(DeviceBuffer::empty(&self.lease))

@@ -838,40 +838,5 @@ pub(crate) mod inject {
         static ABORTS_FIRED: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// Count of inject aborts actually consumed by `compute`; tests assert
-    /// one per leg so a leg that never reaches its hook cannot pass
-    /// vacuously.
-    pub(crate) fn take_aborts_fired() -> usize {
-        ABORTS_FIRED.with(|slot| slot.replace(0))
-    }
 
-    pub(crate) fn set_after_ffn_abort(layer: Option<usize>) {
-        AFTER_FFN_ABORT_AT.with(|slot| slot.set(layer));
-    }
-    pub(crate) fn set_after_residual_abort(layer: Option<usize>) {
-        AFTER_RESIDUAL_ABORT_AT.with(|slot| slot.set(layer));
-    }
-    pub(crate) fn set_post_clear_words(words: Vec<(usize, u32)>) {
-        POST_CLEAR_WORDS.with(|slot| *slot.borrow_mut() = words);
-    }
-
-    pub(crate) fn after_ffn_abort(index: usize) -> bool {
-        AFTER_FFN_ABORT_AT.with(|slot| {
-            slot.get() == Some(index) && {
-                ABORTS_FIRED.with(|fired| fired.set(fired.get() + 1));
-                true
-            }
-        })
-    }
-    pub(crate) fn after_residual_abort(index: usize) -> bool {
-        AFTER_RESIDUAL_ABORT_AT.with(|slot| {
-            slot.get() == Some(index) && {
-                ABORTS_FIRED.with(|fired| fired.set(fired.get() + 1));
-                true
-            }
-        })
-    }
-    pub(crate) fn take_post_clear_words() -> Vec<(usize, u32)> {
-        POST_CLEAR_WORDS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
-    }
 }

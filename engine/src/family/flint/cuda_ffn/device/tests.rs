@@ -4,7 +4,6 @@
 
 mod first_light;
 pub(super) mod profile;
-mod real_exl3;
 mod real_gguf;
 mod s2_nvfp4_dense;
 mod s3_nvfp4_ffn;

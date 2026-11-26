@@ -1,6 +1,11 @@
 //! Private D128 Q/K FFI. Checked live ranges enter through launch_on;
 //! C repeats geometry, alignment and overlap checks before touching the stream.
 
+// No serving start launches these since the Flint CUDA executor was removed; the staged Flint
+// GGUF frame and the kernel tests do.
+#![cfg_attr(not(test), allow(dead_code))]
+
+
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};

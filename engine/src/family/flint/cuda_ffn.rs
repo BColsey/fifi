@@ -2,7 +2,7 @@
 
 mod plan;
 
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 pub(crate) mod device;
 
 #[cfg(test)]

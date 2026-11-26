@@ -1234,9 +1234,8 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
 
     /// The same weights of a tiered load, with the types of each layer's projections.
     pub(super) fn with_shared(mut self, types: &'a [TieredTypes]) -> Self {
-        if let Self::Native { shared, .. } = &mut self {
-            *shared = types;
-        }
+        let Self::Native { shared, .. } = &mut self;
+        *shared = types;
         self
     }
 

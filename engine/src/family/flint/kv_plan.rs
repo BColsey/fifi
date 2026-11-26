@@ -7,7 +7,7 @@ use crate::family::kv_format::{KvFormat, KvRowShape};
 
 pub(crate) const LAYERS: usize = 49;
 pub(super) const WINDOW: usize = 513;
-const MODEL_CONTEXT_LIMIT: usize = super::budget::MODEL_CONTEXT_LIMIT as usize;
+const MODEL_CONTEXT_LIMIT: usize = 262_144;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvStorage {
@@ -147,13 +147,7 @@ impl KvPlan {
         })
     }
 
-    /// Most rows one append may carry, which the ring capacities were computed with.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    pub(crate) fn chunk_rows(&self) -> usize {
-        self.chunk_rows
-    }
-
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn window(&self) -> usize {
         self.window
     }
@@ -184,12 +178,12 @@ impl KvPlan {
         self.k_storage
     }
 
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn k_storage(&self) -> KvStorage {
         self.k_storage
     }
 
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn v_storage(&self) -> KvStorage {
         self.v_storage
     }
@@ -198,14 +192,14 @@ impl KvPlan {
     /// own storage, computed by the shared format per plane. Returns the
     /// shared refusal if either plane's geometry is rejected; Flint's fixed
     /// geometry never trips it. Tests unwrap, production propagates.
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn per_plane_row_bytes(&self) -> Result<(usize, usize), EngError> {
         let k = self.k_storage.checked_plane_row_bytes()?;
         let v = self.v_storage.checked_plane_row_bytes()?;
         Ok((k.0 + k.1, v.0 + v.1))
     }
 
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn context_rows(&self) -> usize {
         self.context_rows
     }

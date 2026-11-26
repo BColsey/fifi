@@ -1,6 +1,11 @@
 //! Private FFI for shared F32 row operations. Checked live ranges and the explicit
 //! stream arrive through launch_on; C repeats shape, alignment and overlap checks.
 
+// No serving start launches these since the Flint CUDA executor was removed; the staged Flint
+// GGUF frame and the kernel tests do.
+#![cfg_attr(not(test), allow(dead_code))]
+
+
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 

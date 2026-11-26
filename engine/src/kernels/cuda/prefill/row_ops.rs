@@ -3,6 +3,11 @@
 //! Unfused, BF16 publication remains a separate shared row_scale operation; a
 //! multiply with `fused` set rounds each product to BF16 itself.
 
+// No serving start launches these since the Flint CUDA executor was removed; the staged Flint
+// GGUF frame and the kernel tests do.
+#![cfg_attr(not(test), allow(dead_code))]
+
+
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,

@@ -17,10 +17,6 @@ use half::{bf16, f16};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
-use crate::{
-    EngError,
-    kernels::cuda::{DeviceRange, DeviceStream},
-};
 
 /// Sum of squares of the values and of the errors of each treatment, over the non-overflowing elements.
 #[derive(Clone, Debug, Default)]
@@ -56,79 +52,6 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static LAYER: Cell<usize> = const { Cell::new(0) };
     static STATS: RefCell<BTreeMap<(usize, usize, usize), Stats>> = const { RefCell::new(BTreeMap::new()) };
-}
-
-pub(crate) fn arm() {
-    ARMED.with(|armed| armed.set(true));
-    STATS.with(|stats| stats.borrow_mut().clear());
-}
-
-pub(crate) fn armed() -> bool {
-    ARMED.with(Cell::get)
-}
-
-pub(crate) fn set_layer(layer: usize) {
-    LAYER.with(|current| current.set(layer));
-}
-
-/// The statistics by (layer, k, n), draining the probe.
-pub(crate) fn take() -> BTreeMap<(usize, usize, usize), Stats> {
-    ARMED.with(|armed| armed.set(false));
-    STATS.with(|stats| std::mem::take(&mut *stats.borrow_mut()))
-}
-
-fn read(stream: &DeviceStream, range: DeviceRange<'_>) -> Result<Vec<f32>, EngError> {
-    let mut bytes = vec![0u8; range.bytes()];
-    range.buffer().read_at(stream, range.offset(), &mut bytes)?;
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_ne_bytes(*word))
-        .collect())
-}
-
-/// `FLINT_PROBE_ROW_STRIDE` (default 32): the probe measures one row in this many, to keep the host side to about a minute.
-fn row_stride() -> usize {
-    static STRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *STRIDE.get_or_init(|| {
-        std::env::var("FLINT_PROBE_ROW_STRIDE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&s| s >= 1)
-            .unwrap_or(32)
-    })
-}
-
-/// Reads `rows` rows of `width` rotated activations and adds their cast statistics under (layer, width, n).
-pub(crate) fn observe(
-    stream: &DeviceStream,
-    xh: DeviceRange<'_>,
-    rows: usize,
-    width: usize,
-    n: usize,
-) -> Result<(), EngError> {
-    stream.synchronize()?;
-    let values = read(stream, xh)?;
-    assert!(
-        values.len() >= rows * width,
-        "the probe read fewer values than rows x width"
-    );
-    let layer = LAYER.with(Cell::get);
-    STATS.with(|all| {
-        let mut all = all.borrow_mut();
-        let stats = all.entry((layer, width, n)).or_default();
-        stats.calls += 1;
-        // Every `stride`-th row, the first one moving with the call so that all rows of a piece are sampled over the layers.
-        let stride = row_stride();
-        let first = (stats.calls as usize * 7 + layer) % stride;
-        for (index, row) in values[..rows * width].chunks(width).enumerate() {
-            if index % stride == first {
-                add_row(stats, row);
-            }
-        }
-    });
-    Ok(())
 }
 
 /// F16 round-to-nearest-even, the cast of `__floats2half2_rn` (`half` 2.7.1 `f16::from_f32` rounds to nearest, ties to even,
@@ -207,60 +130,6 @@ pub(crate) fn add_row(stats: &mut Stats, row: &[f32]) {
 }
 
 impl Stats {
-    pub(crate) fn merge(&mut self, other: &Stats) {
-        self.calls += other.calls;
-        self.elements += other.elements;
-        self.zeros += other.zeros;
-        self.overflow += other.overflow;
-        self.subnormal += other.subnormal;
-        self.flushed += other.flushed;
-        self.max_abs = self.max_abs.max(other.max_abs);
-        self.energy += other.energy;
-        for i in 0..3 {
-            self.class_energy[i] += other.class_energy[i];
-            self.class_error[i] += other.class_error[i];
-        }
-        self.predicted_normal += other.predicted_normal;
-        self.error_bf16 += other.error_bf16;
-        self.error_row_pow2 += other.error_row_pow2;
-        self.error_hilo += other.error_hilo;
-        self.error_hilo_scaled += other.error_hilo_scaled;
-        self.worst_row = self.worst_row.max(other.worst_row);
-        self.peak_over_rms = self.peak_over_rms.max(other.peak_over_rms);
-    }
-
-    fn rel(&self, error: f64) -> f64 {
-        (error / self.energy.max(f64::MIN_POSITIVE)).sqrt()
-    }
-
-    /// One line of figures; the relative L2 errors are over the non-overflowing elements.
-    pub(crate) fn line(&self) -> String {
-        let f16_error: f64 = self.class_error.iter().sum();
-        let share =
-            |class: usize| 100.0 * self.class_error[class] / f16_error.max(f64::MIN_POSITIVE);
-        format!(
-            "calls {} elems {} zeros {} overflow {} subnormal {} flushed {} max|x| {:.3e} peak/rms {:.1} | F16 relL2 {:.3e} (mantissa-only prediction {:.3e}; \
-             error energy: normal {:.1}% subnormal {:.1}% flushed {:.1}%) worst row {:.3e} | BF16 {:.3e} F16+row-pow2 {:.3e} hi/lo {:.3e} hi/lo*2^11 {:.3e}",
-            self.calls,
-            self.elements,
-            self.zeros,
-            self.overflow,
-            self.subnormal,
-            self.flushed,
-            self.max_abs,
-            self.peak_over_rms,
-            self.rel(f16_error),
-            self.rel(self.predicted_normal),
-            share(0),
-            share(1),
-            share(2),
-            self.worst_row,
-            self.rel(self.error_bf16),
-            self.rel(self.error_row_pow2),
-            self.rel(self.error_hilo),
-            self.rel(self.error_hilo_scaled),
-        )
-    }
 }
 
 #[cfg(test)]

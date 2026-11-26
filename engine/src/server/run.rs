@@ -612,12 +612,8 @@ fn start_flint(
         config.flint.as_ref(),
         ready_note,
     )?;
-    // CUDA stages the rows on its worker after the executor opens with its final order.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    let effective = Vec::new();
-    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
     let effective =
-        crate::capability::effective::flint_effective_for_build(config.flint.as_ref(), None)?;
+        crate::capability::effective::flint_effective_for_build(config.flint.as_ref())?;
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),

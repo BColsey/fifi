@@ -2,6 +2,11 @@
 //! full layers use None, sliding layers use Some(pos0). No V or F16 KV conversion.
 //! Launch-only: retain owners and consume outputs only after completion and flag==0.
 
+// No serving start launches these since the Flint CUDA executor was removed; the staged Flint
+// GGUF frame and the kernel tests do.
+#![cfg_attr(not(test), allow(dead_code))]
+
+
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,

@@ -444,10 +444,7 @@ fn effective_rows(
     use crate::family::qwen::qwen36::factory::{DENSE_FAMILY, FAMILY, backend_of_build};
     use crate::family::qwen::qwen36::settings::Q36Settings;
     let rows = if engine.family == crate::family::flint::FAMILY {
-        Some(super::effective::flint_effective_for_build(
-            engine.flint.as_ref(),
-            None,
-        ))
+        Some(super::effective::flint_effective_for_build(engine.flint.as_ref()))
     } else if engine.family == crate::family::qwen::flash_next::factory::FAMILY
         && super::probe::CompiledBackends::of_this_build().mlx
     {
