@@ -99,7 +99,8 @@ impl State {
         let state = Self {
             sealed: ctx.allocate(plane * MAX_BLOCKS).unwrap(),
             current: ctx.allocate(plane).unwrap(),
-            next: ctx.allocate(plane).unwrap(),
+            // Two planes: the second half of each `next` row is the addend of the add step.
+            next: ctx.allocate(2 * plane).unwrap(),
             out: ctx.allocate(2 * plane).unwrap(),
             query: ctx.allocate(WIDTH * size_of::<f32>()).unwrap(),
             health: ctx.allocate(rows * size_of::<f32>()).unwrap(),
@@ -365,6 +366,7 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                 .map(|_| normal_rows(&mut rng, 2 * kv_heads * TAPS))
                 .collect();
             let side = vec![0.0; rows * side_stride];
+            let word = size_of::<f32>();
             let raw_buffer = ctx.upload(&bytes(&raw.concat())).unwrap();
             let side_buffer = ctx.upload(&bytes(&side)).unwrap();
             let history: Vec<DeviceBuffer> = host
@@ -390,12 +392,14 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
             let status = ctx
                 .upload(&vec![0u8; rows * size_of::<u32>()])
                 .unwrap();
-            let word = size_of::<f32>();
             ctx.inkling_pass_prep(
                 &stream,
                 PassPrepCall {
                     raw: raw_buffer.range(0, raw_buffer.bytes()).unwrap(),
-                    side: side_buffer.range(0, side_buffer.bytes()).unwrap(),
+                    // The exact extent the entry reads: the last row stops after its V words.
+                    side: side_buffer
+                        .range(0, ((rows - 1) * side_stride + value_at + channels) * word)
+                        .unwrap(),
                     history: [
                         history[0].range(0, history[0].bytes()).unwrap(),
                         history[1].range(0, history[1].bytes()).unwrap(),
@@ -518,7 +522,7 @@ fn the_pass_kernels_refuse_bad_calls_before_launching() {
                 status: bad_status,
             },
             rows,
-            8,
+            1,
             [2 * HEAD, 6 * HEAD, 0, HEAD, 2 * TAPS],
             (4.0, 1e-5),
             false,

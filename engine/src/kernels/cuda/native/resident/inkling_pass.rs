@@ -355,7 +355,8 @@ pub(in crate::kernels::cuda) fn prep(
             || exact(
                 &ranges,
                 6,
-                ((rows - 1) * dynamic_stride + kv_heads * TAPS) * WORD,
+                // The last row carries the K taps and the V taps of its dynamic convolution.
+                ((rows - 1) * dynamic_stride + 2 * kv_heads * TAPS) * WORD,
                 false,
             ))
         && exact(&ranges, 7, rows * size_of::<u32>(), true);
