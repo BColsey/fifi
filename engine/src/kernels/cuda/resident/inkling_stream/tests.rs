@@ -2,7 +2,7 @@ use std::mem::size_of;
 
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
-use super::{AddCall, MAX_BLOCKS, MixCall, MixShape, NormCall, SealCall, StreamShape};
+use super::{AddCall, MAX_BLOCKS, MixCall, MixShape, NormCall, SealCall, States, StreamShape};
 
 const EPS: f32 = 1e-5;
 
@@ -554,4 +554,139 @@ fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
         ),
         "{error}"
     );
+}
+
+/// One launch over several states, `stride` rows apart with gaps between them, gives each state
+/// the bits of its own single-state launch: mix, then seal, then add.
+#[test]
+fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
+    if !device_present("Inkling stream states") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut rng = Rng::new(0x0057_47e5);
+    let (width, blocks, rows) = (2304usize, 4usize, 5usize);
+    let stride = blocks + 3;
+    let row = row_bytes(width);
+    let states: Vec<f32> = (0..rows * stride)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let query = normal_row(&mut rng, width);
+    let addends: Vec<f32> = (0..rows)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let next: Vec<f32> = (0..rows)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let alloc = |words: usize| ctx.allocate(words * size_of::<f32>()).unwrap();
+    let (state, single) = (alloc(states.len()), alloc(stride * width));
+    let (q, out, one_out) = (alloc(width), alloc(rows * width), alloc(width));
+    let (adds, nexts, health) = (alloc(addends.len()), alloc(next.len()), alloc(1));
+    upload(&state, &stream, &states);
+    upload(&q, &stream, &query);
+    upload(&adds, &stream, &addends);
+    upload(&nexts, &stream, &next);
+    upload(&health, &stream, &[0.0]);
+    let many = States { rows, stride };
+    let span = |used: usize| ((rows - 1) * stride + used) * row;
+    let mix = MixShape {
+        first_block: 1,
+        blocks,
+        width,
+        eps: EPS,
+    };
+    ctx.inkling_stream_mix_states(
+        &stream,
+        MixCall {
+            state: state.range(0, span(blocks + 1)).unwrap(),
+            query: q.range(0, row).unwrap(),
+            out: out.range(0, rows * row).unwrap(),
+            health: health.range(0, 4).unwrap(),
+        },
+        mix,
+        many,
+    )
+    .unwrap();
+    let seal = StreamShape {
+        blocks,
+        width,
+        eps: EPS,
+    };
+    ctx.inkling_stream_seal_states(
+        &stream,
+        SealCall {
+            state: state.range(0, span(blocks + 2)).unwrap(),
+            next: nexts.range(0, rows * row).unwrap(),
+            health: health.range(0, 4).unwrap(),
+        },
+        seal,
+        many,
+    )
+    .unwrap();
+    ctx.inkling_stream_add_states(
+        &stream,
+        AddCall {
+            state: state.range(0, span(1)).unwrap(),
+            row: adds.range(0, rows * row).unwrap(),
+            health: health.range(0, 4).unwrap(),
+        },
+        width,
+        many,
+    )
+    .unwrap();
+    let mixed = download(&out, &stream, 0, rows * width);
+    let after = download(&state, &stream, 0, rows * stride * width);
+    for r in 0..rows {
+        let own = &states[r * stride * width..(r + 1) * stride * width];
+        upload(&single, &stream, own);
+        ctx.inkling_stream_mix(
+            &stream,
+            MixCall {
+                state: single.range(0, (blocks + 1) * row).unwrap(),
+                query: q.range(0, row).unwrap(),
+                out: one_out.range(0, row).unwrap(),
+                health: health.range(0, 4).unwrap(),
+            },
+            mix,
+        )
+        .unwrap();
+        let expected = download(&one_out, &stream, 0, width);
+        assert!(
+            mixed[r * width..(r + 1) * width]
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(expected.iter().map(|v| v.to_bits())),
+            "mix of state {r}"
+        );
+        ctx.inkling_stream_seal(
+            &stream,
+            SealCall {
+                state: single.range(0, (blocks + 2) * row).unwrap(),
+                next: nexts.range(r * row, row).unwrap(),
+                health: health.range(0, 4).unwrap(),
+            },
+            seal,
+        )
+        .unwrap();
+        ctx.inkling_stream_add(
+            &stream,
+            AddCall {
+                state: single.range(0, row).unwrap(),
+                row: adds.range(r * row, row).unwrap(),
+                health: health.range(0, 4).unwrap(),
+            },
+            width,
+        )
+        .unwrap();
+        let expected = download(&single, &stream, 0, stride * width);
+        let got = &after[r * stride * width..(r + 1) * stride * width];
+        assert!(
+            got.iter()
+                .map(|v| v.to_bits())
+                .eq(expected.iter().map(|v| v.to_bits())),
+            "seal and add of state {r}"
+        );
+    }
+    assert_eq!(download(&health, &stream, 0, 1)[0], 0.0);
 }

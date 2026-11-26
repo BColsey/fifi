@@ -16,8 +16,8 @@ use crate::kernels::cuda::{
     context::{Claim, require_apart, require_fit},
 };
 
-pub(crate) use super::super::native::resident::inkling_stream::MAX_BLOCKS;
 use super::super::native::resident::inkling_stream::{self as native};
+pub(crate) use super::super::native::resident::inkling_stream::{MAX_BLOCKS, MAX_STATES, States};
 
 const MAX_WIDTH: usize = 8192;
 
@@ -89,6 +89,16 @@ fn check_shape(
     )))
 }
 
+fn state_bytes(states: States, used: usize, width: usize) -> Result<usize, EngError> {
+    states.bytes(used, width).ok_or_else(|| {
+        EngError::BadRequest(format!(
+            "the CUDA Inkling stream takes 1 to {MAX_STATES} states at least {used} rows apart, \
+             got {} states {} rows apart",
+            states.rows, states.stride
+        ))
+    })
+}
+
 fn check_row(name: &'static str, range: &DeviceRange<'_>, bytes: usize) -> Result<(), EngError> {
     require_fit(name, range, bytes, align_of::<f32>())?;
     if range.bytes() == bytes {
@@ -124,6 +134,17 @@ impl CudaContext {
         call: MixCall<'_>,
         shape: MixShape,
     ) -> Result<(), EngError> {
+        self.inkling_stream_mix_states(stream, call, shape, States::one(shape.blocks + 1))
+    }
+
+    /// [`Self::inkling_stream_mix`] of each of `states`, the outputs packed one row apart.
+    pub(crate) fn inkling_stream_mix_states(
+        &self,
+        stream: &DeviceStream,
+        call: MixCall<'_>,
+        shape: MixShape,
+        states: States,
+    ) -> Result<(), EngError> {
         check_shape(
             "mix",
             shape.first_block,
@@ -132,15 +153,16 @@ impl CudaContext {
             shape.eps,
         )?;
         let row = shape.width * size_of::<f32>();
-        let state = (shape.blocks + 1) * row;
+        let state = state_bytes(states, shape.blocks + 1, shape.width)?;
+        let out = states.rows * row;
         let health = size_of::<f32>();
         check_row("Inkling stream state", &call.state, state)?;
         check_row("Inkling stream query", &call.query, row)?;
-        check_row("Inkling stream mix output", &call.out, row)?;
+        check_row("Inkling stream mix output", &call.out, out)?;
         check_row("Inkling stream health", &call.health, health)?;
         writes_apart(
             [
-                Claim::of("Inkling stream mix output", &call.out, row),
+                Claim::of("Inkling stream mix output", &call.out, out),
                 Claim::of("Inkling stream health", &call.health, health),
             ],
             [
@@ -163,7 +185,7 @@ impl CudaContext {
                 out,
                 health,
                 [shape.first_block, shape.blocks, shape.width],
-                shape.eps,
+                (shape.eps, states),
             )
         })
     }
@@ -176,19 +198,31 @@ impl CudaContext {
         call: SealCall<'_>,
         shape: StreamShape,
     ) -> Result<(), EngError> {
+        self.inkling_stream_seal_states(stream, call, shape, States::one(shape.blocks + 2))
+    }
+
+    /// [`Self::inkling_stream_seal`] of each of `states`, the next rows packed one row apart.
+    pub(crate) fn inkling_stream_seal_states(
+        &self,
+        stream: &DeviceStream,
+        call: SealCall<'_>,
+        shape: StreamShape,
+        states: States,
+    ) -> Result<(), EngError> {
         check_shape("seal", 0, shape.blocks, shape.width, shape.eps)?;
         let row = shape.width * size_of::<f32>();
-        let state = (shape.blocks + 2) * row;
+        let state = state_bytes(states, shape.blocks + 2, shape.width)?;
+        let next = states.rows * row;
         let health = size_of::<f32>();
         check_row("Inkling stream state", &call.state, state)?;
-        check_row("Inkling stream next row", &call.next, row)?;
+        check_row("Inkling stream next row", &call.next, next)?;
         check_row("Inkling stream health", &call.health, health)?;
         writes_apart(
             [
                 Claim::of("Inkling stream state", &call.state, state),
                 Claim::of("Inkling stream health", &call.health, health),
             ],
-            [Claim::of("Inkling stream next row", &call.next, row)],
+            [Claim::of("Inkling stream next row", &call.next, next)],
         )?;
         self.ensure_usable()?;
         let (state, next, health) = (
@@ -204,6 +238,7 @@ impl CudaContext {
                 health,
                 [shape.blocks, shape.width],
                 shape.eps,
+                states,
             )
         })
     }
@@ -215,18 +250,32 @@ impl CudaContext {
         call: AddCall<'_>,
         width: usize,
     ) -> Result<(), EngError> {
+        self.inkling_stream_add_states(stream, call, width, States::one(1))
+    }
+
+    /// [`Self::inkling_stream_add`] into the current row of each of `states`, the addends packed
+    /// one row apart.
+    pub(crate) fn inkling_stream_add_states(
+        &self,
+        stream: &DeviceStream,
+        call: AddCall<'_>,
+        width: usize,
+        states: States,
+    ) -> Result<(), EngError> {
         check_shape("add", 0, 0, width, 1.0)?;
         let row = width * size_of::<f32>();
+        let state = state_bytes(states, 1, width)?;
+        let rows = states.rows * row;
         let health = size_of::<f32>();
-        check_row("Inkling stream state", &call.state, row)?;
-        check_row("Inkling stream addend row", &call.row, row)?;
+        check_row("Inkling stream state", &call.state, state)?;
+        check_row("Inkling stream addend row", &call.row, rows)?;
         check_row("Inkling stream health", &call.health, health)?;
         writes_apart(
             [
-                Claim::of("Inkling stream state", &call.state, row),
+                Claim::of("Inkling stream state", &call.state, state),
                 Claim::of("Inkling stream health", &call.health, health),
             ],
-            [Claim::of("Inkling stream addend row", &call.row, row)],
+            [Claim::of("Inkling stream addend row", &call.row, rows)],
         )?;
         self.ensure_usable()?;
         let (state, row, health) = (
@@ -234,7 +283,9 @@ impl CudaContext {
             self.raw_range(&call.row)?,
             self.raw_range(&call.health)?,
         );
-        self.launch_on(stream, |raw| native::add(raw, state, row, health, width))
+        self.launch_on(stream, |raw| {
+            native::add(raw, state, row, health, width, states)
+        })
     }
 
     /// One gate half of a cross-pass controller: `dst = src * rms_scale(src)` with `eps`, the

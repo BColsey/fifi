@@ -38,15 +38,20 @@
 extern "C" {
 #endif
 
+/* Each of mix, seal and add runs on `rows` states, `stride` rows of `width` floats apart, one
+ * block per state; their other row operands (mix output, seal next, add addend) are packed
+ * `width` apart. `health` is one float for the whole launch. */
 int inference_cuda_inkling_stream_mix(const float *state, const float *query, float *out,
                                       float *health, int first_block, int blocks, int width,
-                                      float eps, void *stream, int *out_stage);
+                                      float eps, int rows, int stride, void *stream,
+                                      int *out_stage);
 
 int inference_cuda_inkling_stream_seal(float *state, const float *next, float *health, int blocks,
-                                       int width, float eps, void *stream, int *out_stage);
+                                       int width, float eps, int rows, int stride, void *stream,
+                                       int *out_stage);
 
 int inference_cuda_inkling_stream_add(float *state, const float *row, float *health, int width,
-                                      void *stream, int *out_stage);
+                                      int rows, int stride, void *stream, int *out_stage);
 
 int inference_cuda_inkling_stream_norm(const float *src, float *dst, float *health, int width,
                                        float eps, void *stream, int *out_stage);

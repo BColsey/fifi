@@ -15,6 +15,8 @@ constexpr int warps = threads / 32;
 constexpr int max_blocks = 63;
 constexpr int max_width = 8192;
 constexpr int max_rows = max_blocks + 1;
+// The most states one launch takes: one block per state.
+constexpr int max_states = 65535;
 
 // Ordered sum of one warp, lane 0 holds the result.
 __device__ float warp_sum(float value) {
@@ -88,7 +90,9 @@ constexpr int kSquareLoads = 9;
 
 __global__ void inkling_stream_mix(const float *state, const float *query, float *out,
                                    float *health, int first_block, int blocks, int width,
-                                   float eps) {
+                                   float eps, int stride) {
+    state += static_cast<size_t>(blockIdx.x) * stride * width;
+    out += static_cast<size_t>(blockIdx.x) * width;
     __shared__ float scratch[threads];
     __shared__ float scores[max_rows];
     __shared__ float weights[max_rows];
@@ -217,7 +221,9 @@ __global__ void inkling_stream_mix(const float *state, const float *query, float
 }
 
 __global__ void inkling_stream_seal(float *state, const float *next, float *health, int blocks,
-                                    int width, float eps) {
+                                    int width, float eps, int stride) {
+    state += static_cast<size_t>(blockIdx.x) * stride * width;
+    next += static_cast<size_t>(blockIdx.x) * width;
     __shared__ float scratch[threads];
     const int lane = threadIdx.x;
     int invalid = 0;
@@ -233,7 +239,10 @@ __global__ void inkling_stream_seal(float *state, const float *next, float *heal
     report(health, invalid);
 }
 
-__global__ void inkling_stream_add(float *state, const float *row, float *health, int width) {
+__global__ void inkling_stream_add(float *state, const float *row, float *health, int width,
+                                   int stride) {
+    state += static_cast<size_t>(blockIdx.x) * stride * width;
+    row += static_cast<size_t>(blockIdx.x) * width;
     const int lane = threadIdx.x;
     int invalid = 0;
     for (int i = lane; i < width; i += threads) {
@@ -269,12 +278,18 @@ bool overlaps(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 bool valid_shape(int width, float eps) {
     return width >= 1 && width <= max_width && isfinite(eps) && eps > 0.0f;
 }
+
+// `rows` states of `used` rows each, `stride >= used` rows apart; 0 when the shape is invalid.
+size_t states_bytes(int rows, int stride, int used, int width) {
+    if (rows < 1 || rows > max_states || stride < used) return 0;
+    return ((static_cast<size_t>(rows) - 1) * stride + used) * width * sizeof(float);
+}
 }  // namespace
 
 extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float *query, float *out,
                                                  float *health, int first_block, int blocks,
-                                                 int width, float eps, void *stream,
-                                                 int *out_stage) {
+                                                 int width, float eps, int rows, int stride,
+                                                 void *stream, int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (!state || !query || !out || !health || !stream || !aligned(state) || !aligned(query) ||
         !aligned(out) || !aligned(health) || !valid_shape(width, eps) || first_block < 0 ||
@@ -282,15 +297,18 @@ extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const size_t row = static_cast<size_t>(width) * sizeof(float);
-    const size_t state_bytes = (static_cast<size_t>(blocks) + 1) * row;
-    if (overlaps(out, row, state, state_bytes) || overlaps(out, row, query, row) ||
+    const size_t state_bytes = states_bytes(rows, stride, blocks + 1, width);
+    const size_t out_bytes = static_cast<size_t>(rows) * row;
+    if (state_bytes == 0 || overlaps(out, out_bytes, state, state_bytes) ||
+        overlaps(out, out_bytes, query, row) ||
         overlaps(health, sizeof(float), state, state_bytes) ||
-        overlaps(health, sizeof(float), query, row) || overlaps(health, sizeof(float), out, row) ||
+        overlaps(health, sizeof(float), query, row) ||
+        overlaps(health, sizeof(float), out, out_bytes) ||
         overlaps(state, state_bytes, query, row)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_mix<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        state, query, out, health, first_block, blocks, width, eps);
+    inkling_stream_mix<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        state, query, out, health, first_block, blocks, width, eps, stride);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
@@ -298,21 +316,23 @@ extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float
 }
 
 extern "C" int inference_cuda_inkling_stream_seal(float *state, const float *next, float *health,
-                                                  int blocks, int width, float eps, void *stream,
-                                                  int *out_stage) {
+                                                  int blocks, int width, float eps, int rows,
+                                                  int stride, void *stream, int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (!state || !next || !health || !stream || !aligned(state) || !aligned(next) ||
         !aligned(health) || !valid_shape(width, eps) || blocks < 0 || blocks >= max_blocks) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const size_t row = static_cast<size_t>(width) * sizeof(float);
-    const size_t state_bytes = (static_cast<size_t>(blocks) + 2) * row;
-    if (overlaps(state, state_bytes, next, row) || overlaps(health, sizeof(float), state, state_bytes) ||
-        overlaps(health, sizeof(float), next, row)) {
+    const size_t state_bytes = states_bytes(rows, stride, blocks + 2, width);
+    const size_t next_bytes = static_cast<size_t>(rows) * row;
+    if (state_bytes == 0 || overlaps(state, state_bytes, next, next_bytes) ||
+        overlaps(health, sizeof(float), state, state_bytes) ||
+        overlaps(health, sizeof(float), next, next_bytes)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_seal<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        state, next, health, blocks, width, eps);
+    inkling_stream_seal<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        state, next, health, blocks, width, eps, stride);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
@@ -320,20 +340,22 @@ extern "C" int inference_cuda_inkling_stream_seal(float *state, const float *nex
 }
 
 extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row, float *health,
-                                                 int width, void *stream, int *out_stage) {
+                                                 int width, int rows, int stride, void *stream,
+                                                 int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (!state || !row || !health || !stream || !aligned(state) || !aligned(row) ||
         !aligned(health) || !valid_shape(width, 1.0f)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
-    if (overlaps(state, row_bytes, row, row_bytes) ||
-        overlaps(health, sizeof(float), state, row_bytes) ||
+    const size_t state_bytes = states_bytes(rows, stride, 1, width);
+    const size_t row_bytes = static_cast<size_t>(rows) * width * sizeof(float);
+    if (state_bytes == 0 || overlaps(state, state_bytes, row, row_bytes) ||
+        overlaps(health, sizeof(float), state, state_bytes) ||
         overlaps(health, sizeof(float), row, row_bytes)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_add<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        state, row, health, width);
+    inkling_stream_add<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        state, row, health, width, stride);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

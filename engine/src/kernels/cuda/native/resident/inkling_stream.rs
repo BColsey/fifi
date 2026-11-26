@@ -20,6 +20,8 @@ unsafe extern "C" {
         blocks: c_int,
         width: c_int,
         eps: f32,
+        rows: c_int,
+        stride: c_int,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -31,6 +33,8 @@ unsafe extern "C" {
         blocks: c_int,
         width: c_int,
         eps: f32,
+        rows: c_int,
+        stride: c_int,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -40,6 +44,8 @@ unsafe extern "C" {
         row: *const c_void,
         health: *mut c_void,
         width: c_int,
+        rows: c_int,
+        stride: c_int,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -53,6 +59,41 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+}
+
+/// The most states one launch takes (one CUDA block each).
+pub(crate) const MAX_STATES: usize = 65535;
+
+/// `rows` stream states, each starting `stride` rows of the width after the previous one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct States {
+    pub(crate) rows: usize,
+    pub(crate) stride: usize,
+}
+
+impl States {
+    /// One state of `used` rows.
+    pub(crate) fn one(used: usize) -> Self {
+        Self {
+            rows: 1,
+            stride: used,
+        }
+    }
+
+    /// The bytes from the first state's start to the end of the last state's `used` rows, when
+    /// the count and stride are valid.
+    pub(crate) fn bytes(self, used: usize, width: usize) -> Option<usize> {
+        if !(1..=MAX_STATES).contains(&self.rows)
+            || self.stride < used
+            || c_int::try_from(self.stride).is_err()
+        {
+            return None;
+        }
+        ((self.rows - 1) * self.stride)
+            .checked_add(used)?
+            .checked_mul(width)?
+            .checked_mul(size_of::<f32>())
+    }
 }
 
 fn shape(blocks: usize, width: usize, eps: f32) -> bool {
@@ -72,22 +113,25 @@ pub(in crate::kernels::cuda) fn mix(
     out: RawRange<'_>,
     health: RawRange<'_>,
     [first_block, blocks, width]: [usize; 3],
-    eps: f32,
+    (eps, states): (f32, States),
 ) -> Result<(), DeviceFailure> {
     let row = width * size_of::<f32>();
-    let state_bytes = (blocks + 1) * row;
+    let state_bytes = states
+        .bytes(blocks + 1, width)
+        .ok_or_else(invalid_argument)?;
+    let out_bytes = states.rows * row;
     let health_bytes = size_of::<f32>();
     let valid = first_block <= blocks
         && shape(blocks, width, eps)
         && sized(&state, state_bytes)
         && sized(&query, row)
-        && sized(&out, row)
+        && sized(&out, out_bytes)
         && sized(&health, health_bytes);
     if !valid {
         return Err(invalid_argument());
     }
     let (out_span, health_span, state_span, query_span) = (
-        Span::of(&out, row),
+        Span::of(&out, out_bytes),
         Span::of(&health, health_bytes),
         Span::of(&state, state_bytes),
         Span::of(&query, row),
@@ -113,6 +157,8 @@ pub(in crate::kernels::cuda) fn mix(
             blocks as c_int,
             width as c_int,
             eps,
+            states.rows as c_int,
+            states.stride as c_int,
             stream.0.as_ptr(),
             &mut stage,
         )
@@ -129,20 +175,24 @@ pub(in crate::kernels::cuda) fn seal(
     health: RawRange<'_>,
     [blocks, width]: [usize; 2],
     eps: f32,
+    states: States,
 ) -> Result<(), DeviceFailure> {
     let row = width * size_of::<f32>();
-    let state_bytes = (blocks + 2) * row;
+    let state_bytes = states
+        .bytes(blocks + 2, width)
+        .ok_or_else(invalid_argument)?;
+    let next_bytes = states.rows * row;
     let health_bytes = size_of::<f32>();
     if !shape(blocks, width, eps)
         || !sized(&state, state_bytes)
-        || !sized(&next, row)
+        || !sized(&next, next_bytes)
         || !sized(&health, health_bytes)
     {
         return Err(invalid_argument());
     }
     let (state_span, next_span, health_span) = (
         Span::of(&state, state_bytes),
-        Span::of(&next, row),
+        Span::of(&next, next_bytes),
         Span::of(&health, health_bytes),
     );
     if !state_span.apart(&next_span)
@@ -161,6 +211,8 @@ pub(in crate::kernels::cuda) fn seal(
             blocks as c_int,
             width as c_int,
             eps,
+            states.rows as c_int,
+            states.stride as c_int,
             stream.0.as_ptr(),
             &mut stage,
         )
@@ -175,18 +227,20 @@ pub(in crate::kernels::cuda) fn add(
     row: RawRange<'_>,
     health: RawRange<'_>,
     width: usize,
+    states: States,
 ) -> Result<(), DeviceFailure> {
-    let row_bytes = width * size_of::<f32>();
+    let state_bytes = states.bytes(1, width).ok_or_else(invalid_argument)?;
+    let row_bytes = states.rows * width * size_of::<f32>();
     let health_bytes = size_of::<f32>();
     if !shape(0, width, 1.0)
-        || !sized(&state, row_bytes)
+        || !sized(&state, state_bytes)
         || !sized(&row, row_bytes)
         || !sized(&health, health_bytes)
     {
         return Err(invalid_argument());
     }
     let (state_span, row_span, health_span) = (
-        Span::of(&state, row_bytes),
+        Span::of(&state, state_bytes),
         Span::of(&row, row_bytes),
         Span::of(&health, health_bytes),
     );
@@ -204,6 +258,8 @@ pub(in crate::kernels::cuda) fn add(
             row.address() as *const c_void,
             health.address(),
             width as c_int,
+            states.rows as c_int,
+            states.stride as c_int,
             stream.0.as_ptr(),
             &mut stage,
         )
