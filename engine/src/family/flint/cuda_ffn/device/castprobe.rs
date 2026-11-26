@@ -17,7 +17,6 @@ use half::{bf16, f16};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
-
 /// Sum of squares of the values and of the errors of each treatment, over the non-overflowing elements.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Stats {
@@ -129,8 +128,7 @@ pub(crate) fn add_row(stats: &mut Stats, row: &[f32]) {
     }
 }
 
-impl Stats {
-}
+impl Stats {}
 
 #[cfg(test)]
 mod tests {

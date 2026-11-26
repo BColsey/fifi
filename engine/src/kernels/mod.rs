@@ -56,13 +56,13 @@ pub(crate) mod single_row;
 /// multiple of this. Defined here, above the backend trees, because
 /// host-side planning (the Flint EXL3 pack placement audit) places tensors
 /// with the same rule without a device.
-#[cfg_attr(not(any(test, feature = "native-cuda")), allow(dead_code))]
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
 pub(crate) const ARENA_ALIGN: usize = 256;
 
 /// The largest buffer of repacked tiles held on the host at once. Defined
 /// here, above the backend trees, for the same reason as [`ARENA_ALIGN`]:
 /// host-side pack planning bounds its staging with the same limit.
-#[cfg_attr(not(any(test, feature = "native-cuda")), allow(dead_code))]
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
 pub(crate) const CHUNK_LIMIT: usize = 64 << 20;
 
 /// Host time blocked in the stream-synchronise of a completed pageable copy

@@ -32,10 +32,9 @@ mod scale_tests;
 pub(crate) use audit::Audit;
 #[cfg(test)]
 use audit::audit_published;
+#[cfg(test)]
 pub(crate) use audit::{Limits, audit};
 pub(crate) use factor::RoutedScale;
 #[cfg(test)]
 pub(crate) use fixture::PackBuilder;
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) use schema::Plain;
-pub(crate) use schema::{Geometry, Kind, Plan};
+pub(crate) use schema::Geometry;

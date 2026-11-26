@@ -7,9 +7,8 @@ use super::{
     dims::KvMode,
     prefill_driver::pieces_of,
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot as S, Extra, M_LADDER,
-        PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_tensors,
-        kv_bytes, state_bytes,
+        Admission, ChunkCost, ChunkSlot as S, Extra, M_LADDER, PART_CHARGE, Phase, Phase::*,
+        SPARE_MIN, chunk_cost, chunk_costs, chunk_tensors, kv_bytes, state_bytes,
     },
 };
 use crate::family::prefill::arena::PrefillStep;

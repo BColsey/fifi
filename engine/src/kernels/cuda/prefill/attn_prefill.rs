@@ -1307,7 +1307,10 @@ impl CudaContext {
     /// FIFI_FLINT_CUDA_Q8_TILED stays armed (default ON); the entry launches the tiled kernel or,
     /// when its predicate rejects the shape, the default old kernel and counts the
     /// fallback. Admission is identical to [`Self::attn_prefill`].
-    #[allow(dead_code, reason = "the tiled int8 route has no caller since the Flint CUDA executor was removed")]
+    #[allow(
+        dead_code,
+        reason = "the tiled int8 route has no caller since the Flint CUDA executor was removed"
+    )]
     pub(crate) fn attn_prefill_q8_tiled_opt_in(
         &self,
         stream: &DeviceStream,
@@ -1338,7 +1341,10 @@ impl CudaContext {
     /// Route-fallback count for tests (see the native counter; production fallbacks
     /// also log once per process to stderr).
     #[cfg(test)]
-    #[allow(dead_code, reason = "the tiled int8 route has no caller since the Flint CUDA executor was removed")]
+    #[allow(
+        dead_code,
+        reason = "the tiled int8 route has no caller since the Flint CUDA executor was removed"
+    )]
     pub(crate) fn q8_tiled_fallback_count() -> u64 {
         crate::kernels::cuda::native::prefill::attn_prefill::Q8_TILED_FALLBACKS
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1347,7 +1353,10 @@ impl CudaContext {
     /// Route-acceptance count for tests: how many launches ran the tile kernel
     /// through the route entry (counted only after a successful enqueue).
     #[cfg(test)]
-    #[allow(dead_code, reason = "the tiled int8 route has no caller since the Flint CUDA executor was removed")]
+    #[allow(
+        dead_code,
+        reason = "the tiled int8 route has no caller since the Flint CUDA executor was removed"
+    )]
     pub(crate) fn q8_tiled_route_count() -> u64 {
         crate::kernels::cuda::native::prefill::attn_prefill::Q8_TILED_ROUTES
             .load(std::sync::atomic::Ordering::Relaxed)

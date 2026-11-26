@@ -572,8 +572,7 @@ fn free_backing(
 }
 
 #[cfg(test)]
-impl super::CudaContext {
-}
+impl super::CudaContext {}
 
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 impl super::CudaContext {

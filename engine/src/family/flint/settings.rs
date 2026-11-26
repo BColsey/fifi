@@ -103,5 +103,4 @@ mod tests {
             assert!(serde_json::from_str::<FlintOptions>(text).is_err());
         }
     }
-
 }

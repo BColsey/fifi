@@ -12,6 +12,7 @@ pub(crate) mod cuda_ffn;
 pub(crate) mod cuda_kv;
 #[cfg(test)]
 mod cuda_kv_tests;
+pub(crate) mod factory;
 /// Park-identity construction (pack fingerprint, cache-config hash)
 /// for the host park store; pure CPU code, built wherever an executor is.
 #[cfg(any(
@@ -22,7 +23,6 @@ mod cuda_kv_tests;
 // Assembled at the park hooks once they exist, like gguf_weights above.
 #[cfg_attr(not(test), allow(dead_code))]
 mod park_identity;
-pub(crate) mod factory;
 pub(crate) mod settings;
 // Staged CUDA source views; the mixed-residency entry has no serving caller yet.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

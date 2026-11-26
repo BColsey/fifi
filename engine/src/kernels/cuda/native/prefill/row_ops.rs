@@ -5,7 +5,6 @@
 // GGUF frame and the kernel tests do.
 #![cfg_attr(not(test), allow(dead_code))]
 
-
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 

@@ -12,7 +12,7 @@
 //! `native/resident/exl3.cu`, which makes the launch and answers the native
 //! `inference_cuda_exl3_rows_kernel` that the device counters call; a host test pins the table and
 //! a device test compares it with the native answer for every row count.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(not(all(test, feature = "native-cuda")), allow(dead_code))]
 
 /// The most rows of one group of a rows launch (`grouped_max_rows` in `exl3.cu`).
 pub(crate) const GROUPED_MAX_ROWS: usize = 8;
@@ -59,8 +59,10 @@ pub(crate) enum RowKernel {
     StatusFold,
     PackRows,
     /// `conv_silu_k<true>`: the conv with strided snapshots.
+    #[allow(dead_code, reason = "no step launches the snapshot kernels now")]
     ConvSnap,
     /// `gated_delta_k<true>`: the delta with strided snapshots.
+    #[allow(dead_code, reason = "no step launches the snapshot kernels now")]
     DeltaSnap,
     /// `router_logits_k` with a logit stride other than `n_expert` (beta and alpha written into the
     /// `[K][ld]` row).

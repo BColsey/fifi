@@ -1804,12 +1804,6 @@ impl CudaContext {
         ffi::launch_observer::capture(run)
     }
 
-    /// Which grouped variant a captured leg actually ran: none, all shuffle,
-    /// all gather, or mixed.
-    pub(crate) fn test_routed_grouped_variant() -> Option<&'static str> {
-        ffi::launch_observer::grouped_variant()
-    }
-
     /// The projection kernel the last odd-rate wide launch of this thread enqueued: 3 and 4 the
     /// compile-time rate 10 and rate 6 body without and with DP4A, 2 the unchanged kernels.
     pub(crate) fn test_last_odd_variant() -> u32 {

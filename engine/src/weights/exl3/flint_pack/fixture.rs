@@ -66,13 +66,6 @@ impl PackBuilder {
         Self::tiny_with_bits(4)
     }
 
-    /// As [`Self::tiny`] but every routed layer carries all 256 experts,
-    /// the count the Flint host cache requires; layers and dimensions
-    /// stay tiny so a full pack costs megabytes, not gigabytes.
-    pub(crate) fn full() -> Self {
-        Self::build(4, 256)
-    }
-
     /// As [`Self::tiny`] with `bits` bits per weight in every body projection.
     pub(crate) fn tiny_with_bits(bits: u32) -> Self {
         Self::build(bits, 4)

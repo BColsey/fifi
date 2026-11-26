@@ -9,7 +9,13 @@ use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 pub(crate) const K: usize = raw::K;
 pub(crate) const RESULT_BYTES: usize = raw::RESULT_BYTES;
 pub(crate) const RESULT_OFFSET: usize = raw::RESULT_OFFSET;
-#[cfg_attr(not(test), allow(dead_code, reason = "sized for the multi-row shortlist, which no step launches now; tests do"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "sized for the multi-row shortlist, which no step launches now; tests do"
+    )
+)]
 pub(crate) const SCRATCH_BYTES: usize = raw::SCRATCH_BYTES;
 /// Where the [`MASS_PARTS`] f64 partials of [`CudaContext::shortlist_mass`] sit in the scratch.
 pub(crate) const MASS_OFFSET: usize = raw::MASS_OFFSET;

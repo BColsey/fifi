@@ -612,8 +612,7 @@ fn start_flint(
         config.flint.as_ref(),
         ready_note,
     )?;
-    let effective =
-        crate::capability::effective::flint_effective_for_build(config.flint.as_ref())?;
+    let effective = crate::capability::effective::flint_effective_for_build(config.flint.as_ref())?;
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),

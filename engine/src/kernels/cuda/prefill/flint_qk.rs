@@ -6,7 +6,6 @@
 // GGUF frame and the kernel tests do.
 #![cfg_attr(not(test), allow(dead_code))]
 
-
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,

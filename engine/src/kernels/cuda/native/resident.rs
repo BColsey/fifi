@@ -833,20 +833,6 @@ pub(in crate::kernels::cuda) fn pinned_read_f32_into(
     Ok(())
 }
 
-/// The whole pinned allocation as a read-only slice.
-///
-/// Precondition the caller must discharge: no device-to-host copy ever targets this allocation
-/// (the host only reads it while the device may read it too). The only caller,
-/// `PinnedBuf::host_view`, refuses a buffer a device copy has written.
-pub(in crate::kernels::cuda) fn pinned_view(pinned: &RawPinned) -> &[u8] {
-    // SAFETY: the allocation is `pinned.bytes` bytes long, live and unfreed while `pinned` is
-    // borrowed, and zero-initialized before use. The caller's precondition rules out a device
-    // write, and the host never writes through a shared borrow of the owner.
-    unsafe {
-        std::slice::from_raw_parts(pinned.ptr.as_ptr().cast::<u8>().cast_const(), pinned.bytes)
-    }
-}
-
 /// The whole pinned allocation as a writable host slice. The owner proves no transfer can
 /// access it while the slice lives: no copy is outstanding and no device copy ever wrote it.
 pub(in crate::kernels::cuda) fn pinned_view_mut(pinned: &mut RawPinned) -> &mut [u8] {

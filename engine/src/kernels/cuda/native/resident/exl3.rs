@@ -1610,17 +1610,6 @@ pub(in crate::kernels::cuda) mod launch_observer {
         ROUTED.with(Cell::get) && COUNT.with(|count| count.get().is_some())
     }
 
-    /// Which grouped variant a captured leg actually ran: none, all shuffle,
-    /// all gather, or mixed. Written by C at the successful projection enqueue.
-    pub(in crate::kernels::cuda) fn grouped_variant() -> Option<&'static str> {
-        match GATHERED.with(Cell::get) {
-            0 => None,
-            1 => Some("shuffle"),
-            2 => Some("gather"),
-            _ => Some("mixed"),
-        }
-    }
-
     pub(super) fn linear(
         args: &LinearArgs,
         split_k: u32,

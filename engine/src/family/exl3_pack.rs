@@ -12,17 +12,12 @@ use crate::{EngError, tensor::Dtype, weights::StreamedCheckpoint};
 
 const LAYER_ROOT: &str = "model.language_model.layers";
 pub(in crate::family) const EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
-pub(in crate::family) const NORM_NAME: &str = "model.language_model.norm.weight";
 pub(in crate::family) const HEAD_PREFIX: &str = "lm_head";
-
-/// Root of every tensor name of the MTP head's layers in a stock pack.
-const MTP_LAYER_ROOT: &str = "mtp.layers";
 
 /// Where the layers of a walk live in the pack: the model's own layers or the MTP head's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::family) enum Root {
     Layers,
-    Mtp,
 }
 
 impl Root {
@@ -30,13 +25,13 @@ impl Root {
     pub(in crate::family) fn name(self, layer: usize, suffix: &str) -> String {
         let root = match self {
             Self::Layers => LAYER_ROOT,
-            Self::Mtp => MTP_LAYER_ROOT,
         };
         format!("{root}.{layer}.{suffix}")
     }
 }
 
 /// The full pack name of `suffix` in `layer`.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) fn layer_name(layer: usize, suffix: &str) -> String {
     Root::Layers.name(layer, suffix)
 }
@@ -109,41 +104,6 @@ pub(in crate::family) struct PackReport {
     pub(in crate::family) codebook: Marker,
 }
 
-/// The family-neutral planning summary of one pack directory: exactly the
-/// loader's own header walk, with its totals copied out for callers outside `family`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PackPlan {
-    /// Device bytes the load will hold ([`PackReport::device_bytes`]).
-    pub(crate) device_bytes: u64,
-    /// Device bytes of the routed experts alone ([`PackReport::expert_bytes`]).
-    pub(crate) expert_bytes: u64,
-    /// Quantized matrices (a routed expert counts one per projection).
-    pub(crate) matrices: usize,
-    /// Matrices per rate, keyed by twice the bits per weight.
-    pub(crate) rates: BTreeMap<u8, usize>,
-    /// The codebook marker tensor every matrix of the pack carries, by name.
-    pub(crate) codebook: &'static str,
-}
-
-/// The name of the codebook marker a matrix carries, for rows that retell the walk.
-pub(in crate::family) fn codebook_name(marker: Marker) -> &'static str {
-    match marker {
-        Marker::Mul1 => "Mul1",
-        Marker::Mcg => "Mcg",
-    }
-}
-
-/// Copies a walk report into the family-neutral plan.
-pub(in crate::family) fn plan_from_report(report: PackReport) -> PackPlan {
-    PackPlan {
-        device_bytes: report.device_bytes,
-        expert_bytes: report.expert_bytes,
-        matrices: report.matrices,
-        rates: report.rates,
-        codebook: codebook_name(report.codebook),
-    }
-}
-
 /// What kind of tensor a walk visited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::family) enum VisitKind {
@@ -171,21 +131,7 @@ pub(in crate::family) struct Visit {
 }
 
 #[cfg(test)]
-impl Visit {
-    /// Every pack tensor this visit stands for: a plain or host visit is its own name; a matrix
-    /// visit under a prefix stands for that prefix's stored components, present or not, because
-    /// the reader selects the components it knows and refuses the legacy ones. The loader's
-    /// check indexes the visits instead; this expansion is the survey's.
-    pub(in crate::family) fn tensor_names(&self) -> Vec<String> {
-        match self.kind {
-            VisitKind::Matrix { .. } => crate::weights::exl3::COMPONENT_SUFFIXES
-                .iter()
-                .map(|suffix| format!("{}.{suffix}", self.name))
-                .collect(),
-            VisitKind::Plain { .. } | VisitKind::Host { .. } => vec![self.name.clone()],
-        }
-    }
-}
+impl Visit {}
 
 /// The codebook marker tensor a matrix carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,11 +186,6 @@ impl<'a> Inspector<'a> {
                 bytes,
             });
         }
-    }
-
-    /// Where the layers of this walk live.
-    pub(in crate::family) fn root(&self) -> Root {
-        self.root
     }
 
     /// What the walk found so far.

@@ -142,5 +142,4 @@ impl Grouping {
 }
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}

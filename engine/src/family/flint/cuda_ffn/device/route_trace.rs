@@ -837,6 +837,4 @@ pub(crate) mod inject {
         static POST_CLEAR_WORDS: RefCell<Vec<(usize, u32)>> = const { RefCell::new(Vec::new()) };
         static ABORTS_FIRED: Cell<usize> = const { Cell::new(0) };
     }
-
-
 }

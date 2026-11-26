@@ -378,7 +378,6 @@ impl CudaContext {
             kv8_chunk_launch(raw_stream, raw, pos0)
         })
     }
-
 }
 
 #[cfg(all(test, feature = "native-cuda"))]

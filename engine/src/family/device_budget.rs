@@ -91,7 +91,10 @@ pub(crate) fn largest_fitting_linear(
 /// ledger can widen it without touching the others.
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceReserve {
-    #[cfg_attr(not(test), allow(dead_code, reason = "no start reads the band yet; tests do"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "no start reads the band yet; tests do")
+    )]
     band_bytes: u64,
     charges: Vec<(&'static str, u64)>,
 }
@@ -112,7 +115,10 @@ impl DeviceReserve {
     }
 
     /// The band the reserve's slack is judged against.
-    #[cfg_attr(not(test), allow(dead_code, reason = "no start reads the band yet; tests do"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "no start reads the band yet; tests do")
+    )]
     pub(crate) fn band_bytes(&self) -> u64 {
         self.band_bytes
     }
@@ -123,7 +129,10 @@ impl DeviceReserve {
     }
 
     /// The folded charge total; `None` on u64 overflow.
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by the Apple Silicon budget only"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "read by the Apple Silicon budget only")
+    )]
     pub(crate) fn checked_total(&self) -> Option<u64> {
         self.charges
             .iter()
