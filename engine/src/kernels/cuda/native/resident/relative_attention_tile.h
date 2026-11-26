@@ -9,7 +9,7 @@
 
 namespace snapshot {
 
-constexpr int kLimit = 64;
+constexpr int kLimit = 512;
 constexpr int kMaxStride = (1 << 20) / 4;  // words; bounds row offset arithmetic
 constexpr int kLastPosition = (1 << 30) - 2;  // native relative attention position limit
 

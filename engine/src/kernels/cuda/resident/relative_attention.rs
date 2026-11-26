@@ -23,7 +23,7 @@ pub(crate) const HEAD_DIM: usize = 128;
 const MAX_HEADS: usize = 64;
 const MAX_WORD: usize = (1 << 30) - 1;
 const MAX_STRIDE: usize = 1 << 20;
-pub(crate) const QUERY_TILE_LIMIT: usize = 64;
+pub(crate) const QUERY_TILE_LIMIT: usize = 512;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RelativeAttentionShape {

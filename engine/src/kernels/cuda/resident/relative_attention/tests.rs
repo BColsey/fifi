@@ -271,7 +271,10 @@ fn query_tile_validates_strided_bounds_and_positions() {
     assert_eq!(extents[11], 4 + tile.input_stride);
     for invalid in [
         RelativeAttentionTile { count: 1, ..tile },
-        RelativeAttentionTile { count: 65, ..tile },
+        RelativeAttentionTile {
+            count: QUERY_TILE_LIMIT + 1,
+            ..tile
+        },
         RelativeAttentionTile {
             first: POS_MAX as usize,
             ..tile

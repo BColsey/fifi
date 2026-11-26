@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-const ARENA_BYTES: usize = 8 << 20;
+const ARENA_BYTES: usize = 32 << 20;
 
 pub(in crate::family::inkling2) fn enabled() -> bool {
     Switch::BatchRelativeAttention.on()
