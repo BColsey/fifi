@@ -23,7 +23,7 @@ On this pair fifi is faster at every size: prefill by 1.6x to 2.0x, decode by 7 
 
 ## Qwen3.6-35B-A3B, MLX 4-bit, on Apple Silicon (36 GB)
 
-fifi: the shipped 36 GB config (`engine/config/qwen36-mac-studio-36gb.json`) with paths swapped — see [Current status](status.md) for its figure table and switch list. The default arm refuses to start on this host (missing `cache_limit_bytes`), so the tuned arm is the only side that can pair.
+fifi: the shipped 36 GB config (`engine/config/qwen36-mac-studio-36gb.json`) with paths swapped; see [Current status](status.md) for its figure table and switch list. The default arm refuses to start on this host (missing `cache_limit_bytes`), so the tuned arm is the only side that can pair.
 
 MLX-LM 0.32.2 (Python 3.12 venv; the older 0.29.1 refuses this model type), the same model file, the same prompt strings, greedy sampling, 256 generated tokens, measured in-process (no HTTP layer), same window and host.
 

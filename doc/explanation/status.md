@@ -13,9 +13,9 @@ How to read the rows:
 - **Default arm** means the server was started with nothing set: a config that names only the engine and model files, no tuning switches. What a user gets who sets nothing.
 - **Tuned arm** means the shipped profile for that host (named in each section) with only paths and the listen address swapped. Nothing hand-built.
 - **Prefill / first token** is the server's own `prefill_ms` / `time_to_first_token_ms` from the request log. **Decode** is `decode_tokens_per_second`. A row that was measured without temperature recording says so.
-- **Refusal rows** quote the exact error the server returned. A refusal is a result, not a missing row.
+- **Refusal rows** quote the exact error the server returned. A refusal is recorded as a result.
 - **Units**: GB is 10^9 bytes; MiB and GiB are binary (2^20 and 2^30 bytes). Rows that quote nvidia-smi use MiB.
-- Receipts are kept in the project's measurement archive, not in this repository. Each source names the receipt kind and the date; the sweep's per-run server logs are the underlying files.
+- The receipts (the per-run server logs of the sweep) are not in this repository. Each row names the receipt kind and the date.
 - Compare rows only when their conditions match; for comparisons against other engines, see [Benchmarks](benchmarks.md).
 
 ## Qwen3.6-35B-A3B, GGUF Q4_K_M, on an RTX 3090 (24 GB, CUDA)
@@ -42,7 +42,7 @@ Tuned arm: the shipped profile `engine/config/qwen36-cuda-3090-kv8-prefix.json` 
 
 Prefix reuse, default arm, as measured: after a 4,010-token turn the save store holds 2 entries and 297,594,880 B; a stateless second request over the same text missed (`prefix_hit miss`, reused 0). First-turn ttft 709.3 ms; second-turn 835.6 ms (4,518 tokens).
 
-Memory caps (default arm, read-only-mounted container, `--memory` per start, one start each): 6, 8, 12 and 20 GiB all **serve**; the tier line is identical at every cap (weights stream to the device, 20.7 GiB resident there; free-after-load 3,474,784,256 B; context 32,768; KV fp16). The measured 500-token walls — 29.0 s at 6 GiB, 22.5 s at 8, 14.0 s at 12, 7.9 s at 20 — are first-request warm-up under the cap: once warm, prefill is 144 to 148 ms and decode about 174 tok/s at every cap.
+Memory caps (default arm, read-only-mounted container, `--memory` per start, one start each): 6, 8, 12 and 20 GiB all serve; the tier line is identical at every cap (weights stream to the device, 20.7 GiB resident there; free-after-load 3,474,784,256 B; context 32,768; KV fp16). The measured 500-token walls (29.0 s at 6 GiB, 22.5 s at 8, 14.0 s at 12, 7.9 s at 20) are first-request warm-up under the cap: once warm, prefill is 144 to 148 ms and decode about 174 tok/s at every cap.
 
 Small card: with a holder leaving 5,836 MiB of device memory free, the default start refuses with "engine q36 failed: engine load failed: cuda admission: need 22153406976 bytes (tensors 20408576512, KV cache 671088640, work 0, headroom 1073741824), device has 5805441024 free". Qwen3.6 does not spill weights to host memory on a small card; a card that cannot hold the tensors plus admission does not serve.
 
@@ -67,7 +67,7 @@ Memory caps (default arm): 6, 8 and 12 GiB refuse before the arm with the fixed-
 
 Model file: the 19G MLX 4-bit pack.
 
-Default arm: **refused at startup**. Exact text: "enginesrv: serve --model: this build cannot serve ...: settings: the engine would refuse these settings: engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set". A user who sets nothing gets no server on this host class.
+Default arm: refused at startup. Exact text: "enginesrv: serve --model: this build cannot serve ...: settings: the engine would refuse these settings: engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set". A user who sets nothing gets no server on this host class.
 
 Tuned arm: the shipped config `engine/config/qwen36-mac-studio-36gb.json` verbatim (cache limit 4 GiB, context 262,144, session cap 4 GiB, prefill budget 30 GiB, reserve 8,286,699,520, bf16+q8, compile on) with model dir and listen swapped. Clean-host rerun, timings from `/v1/recent-requests`, three runs per size:
 
@@ -77,7 +77,7 @@ Tuned arm: the shipped config `engine/config/qwen36-mac-studio-36gb.json` verbat
 | 4,022 | 3,230.3 (3,224.7 / 3,230.3 / 3,234.3) | 78.59 / 78.67 / 78.68 | 20 Nov 2026 | same |
 | 32,028 | 34,539.3 (34,493.2 / 34,539.3 / 34,625.8) | 66.58 / 66.79 / 66.83 | 20 Nov 2026 | same |
 
-Peak server RSS 16.8 GiB (unified memory; process RSS is the host+device proxy). A third admission of the 4,022-token text prefills in 3,243 ms (median) — no reuse win on that turn. Against MLX-LM on the same file, see [Benchmarks](benchmarks.md).
+Peak server RSS 16.8 GiB (unified memory; process RSS is the host+device proxy). A third admission of the 4,022-token text prefills in 3,243 ms (median): no reuse win on that turn. Against MLX-LM on the same file, see [Benchmarks](benchmarks.md).
 
 Dense Qwen3.8-27B was not measured on this host: no MLX-format pack of it was available.
 
@@ -119,5 +119,5 @@ A 31,650-token prompt over the tuned 16,384 cap refuses with the same `context_l
 
 - **Qwen3.6 from an EXL3 pack**: not served. Qwen3.6 on CUDA serves the GGUF checkpoint only, and `"weight_format": "exl3"` is refused before any weight is read.
 - **Flint on CUDA**: not served. Flint serves on Apple Silicon only.
-- **Bolt e4b on the 3090**: refused — "gemma4 serve: 4 .gguf files in the model directory; exactly one expected" (the store keeps four quantizations of this model in one directory and the loader accepts exactly one file).
-- **Nemotron 3.5 Super on the 3090**: refused — the loader for this family is safetensors-based and the store holds only a GGUF conversion: "config.json: No such file" then "open shard: No such file".
+- **Bolt e4b on the 3090**: refused with "gemma4 serve: 4 .gguf files in the model directory; exactly one expected" (the store keeps four quantizations of this model in one directory and the loader accepts exactly one file).
+- **Nemotron 3.5 Super on the 3090**: refused. The loader for this family is safetensors-based and the store holds only a GGUF conversion: "config.json: No such file" then "open shard: No such file".

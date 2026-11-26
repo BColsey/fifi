@@ -16,7 +16,7 @@
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured. "Experimental" and "opt-in" paths are not validated end to end.
 
-A model path that holds only the GGUF weights file starts from its `general.architecture` metadata: `qwen35moe` selects the Qwen3.6 family and `gemma4` selects Bolt E4B. The other architectures this build knows by name — `sensenova_loop` (pass `--family sensenova`), `qwen4exp`, `nemotron_h_moe`, `dflash` and `clip` — are refused with a note; a `raon1` weights file serves like the tables above describe.
+A model path that holds only the GGUF weights file starts from its `general.architecture` metadata: `qwen35moe` selects the Qwen3.6 family and `gemma4` selects Bolt E4B. The other architectures this build knows by name are refused with a note: `sensenova_loop` (pass `--family sensenova`), `qwen4exp`, `nemotron_h_moe`, `dflash` and `clip`. A `raon1` weights file serves as the table above describes.
 
 On CUDA, any `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves (the largest when there are several; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file); the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
 
