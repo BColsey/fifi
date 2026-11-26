@@ -1063,30 +1063,34 @@ impl CpuForward {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     /// Test aid (`FIFI_INKLING_PASS_ROUTES_IN=<flag-off log>`): the expert routes an earlier flag-off
     /// run printed (`FIFI_INKLING_DEBUG_PREFILL_ROUTES=1`) take the place of this run's own
-    /// selection, per layer, for the block's rows `offset..offset + rows` of the prompt. Two runs whose router logits
-    /// differ by float noise disagree on near-tie rows only; replaying the routes removes that
-    /// disagreement from the comparison.
+    /// selection, for visit `index` of the block over the block's rows of the prompt. The flag-off
+    /// path prints its pieces one after another and, inside a piece, the layer's visits in order:
+    /// the sets that open a piece tile the prompt, so the set is found from the block's first row.
+    /// Two runs whose router logits differ by float noise disagree on near-tie rows only;
+    /// replaying the routes removes that disagreement from the comparison.
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     fn replayed_routes(
         &self,
-        layer: usize,
         logits: &[f32],
         bias: &[f32],
-        rows: usize,
-        offset: usize,
+        block: &Block<'_>,
+        index: usize,
+        layer: usize,
     ) -> Result<Option<Vec<MoeRoute>>, EngError> {
+        // layer -> that layer's printed sets, in printed order
         static ROUTES: std::sync::OnceLock<
-            Option<std::collections::HashMap<usize, Vec<Vec<usize>>>>,
+            Option<std::collections::HashMap<usize, Vec<Vec<Vec<usize>>>>>,
         > = std::sync::OnceLock::new();
-        // Every route set a layer printed, in the printed order: the flag-off path prints its
-        // pieces in prompt order, so the rows of a block are `offset..offset + rows` of it.
+        let (rows, offset) = (block.rows, block.offset);
+        let of_layer = |i: usize| self.visits[i].weight_layer == layer;
+        // The layer's visits in a piece, and this one's position among them.
+        let per_piece = (0..self.visits.len()).filter(|&i| of_layer(i)).count();
+        let ordinal = (0..index).filter(|&i| of_layer(i)).count();
         let routes = ROUTES.get_or_init(|| {
             let text = std::fs::read_to_string(std::env::var("FIFI_INKLING_PASS_ROUTES_IN").ok()?).ok()?;
-            let mut out = std::collections::HashMap::<usize, Vec<Vec<usize>>>::new();
+            let mut out = std::collections::HashMap::<usize, Vec<Vec<Vec<usize>>>>::new();
             for line in text
                 .lines()
                 .filter(|line| line.contains("Inkling grouped route diagnostic "))
@@ -1099,15 +1103,29 @@ impl CpuForward {
                     .ok()?;
                 out.entry(value["layer"].as_u64()? as usize)
                     .or_default()
-                    .extend(serde_json::from_value::<Vec<Vec<usize>>>(value["routes"].clone()).ok()?);
+                    .push(serde_json::from_value::<Vec<Vec<usize>>>(value["routes"].clone()).ok()?);
             }
             Some(out)
         });
-        let Some(picked) = routes
-            .as_ref()
-            .and_then(|all| all.get(&layer))
-            .and_then(|all| all.get(offset..offset + rows))
-        else {
+        let Some(sets) = routes.as_ref().and_then(|all| all.get(&layer)) else {
+            return Ok(None);
+        };
+        let mut picked = None;
+        let (mut piece, mut start) = (0, 0);
+        while let Some(opening) = sets.get(piece * per_piece) {
+            if offset < start + opening.len() {
+                let Some(set) = sets.get(piece * per_piece + ordinal) else {
+                    break;
+                };
+                if set.len() == opening.len() {
+                    picked = set.get(offset - start..offset - start + rows);
+                }
+                break;
+            }
+            start += opening.len();
+            piece += 1;
+        }
+        let Some(picked) = picked else {
             return Ok(None);
         };
         let mut replayed = Vec::with_capacity(rows);
@@ -1255,7 +1273,7 @@ impl CpuForward {
             block.report.readbacks.set(block.report.readbacks.get() + 2);
             let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
             #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-            let routes = match self.replayed_routes(weight_layer, &logits, &bias, rows, block.offset)? {
+            let routes = match self.replayed_routes(&logits, &bias, block, index, weight_layer)? {
                 Some(routes) => routes,
                 None => self.route_prefill_logits(weight_layer, &logits, &bias, rows)?,
             };
