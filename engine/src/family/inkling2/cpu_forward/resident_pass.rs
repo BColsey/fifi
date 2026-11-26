@@ -39,12 +39,18 @@ use super::super::cuda_projection::gguf::ExpertPrefillRows;
 use super::super::cuda_projection::q8_row_reuse;
 use super::{
     attention_norm_name, bad, control_names, Attention, CpuForward, LayerVisit, Role, Weights,
-    ATTENTION_ROLES, MIX_EPS,
+    ATTENTION_ROLES, MIX_EPS, ROUTE_NORMALIZATION_FLOOR,
 };
 use crate::family::inkling2::cuda_projection::gguf::GgufCuda;
 use crate::family::inkling2::gguf_weights::GgufTextWeights;
+use crate::kernels::cuda::resident::dense_gemv::routed_prefill::{
+    routed_prefill_scratch_bytes, DeviceRoutedPrefill,
+};
 use crate::kernels::cuda::resident::dense_gemv::{
     dense_gemv_bytes, DenseDtype, DenseGemvCall, DenseGemvShape,
+};
+use crate::kernels::cuda::resident::router::{
+    RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
 };
 use crate::kernels::cuda::resident::inkling_local_prep::OutputConvShape;
 use crate::kernels::cuda::resident::inkling_pass::{
@@ -124,6 +130,7 @@ struct VisitConsts {
     mlp_mix: Range<usize>,
     mlp_norm: Range<usize>,
     mlp_sconv: Range<usize>,
+    router_bias: Range<usize>,
 }
 
 /// Word offsets into the arena. Plane row `r` of a strided plane starts at `base + r * stride`.
@@ -134,6 +141,10 @@ struct Arena {
     status: usize,
     flags: usize,
     logits: usize,
+    /// Device router picks per MLP visit: `[rows][top_k]` i32 ids and f32 weights.
+    ids: usize,
+    route_weights: usize,
+    routed_scratch: usize,
     inputs: usize,
     messages: usize,
     gate: usize,
@@ -903,6 +914,7 @@ impl CpuForward {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn pass_mlp(
         &self,
         block: &mut Block<'_>,
@@ -918,6 +930,7 @@ impl CpuForward {
         let rows = block.rows;
         let h = block.h;
         let consts = &block.visits[index].consts;
+        let scratch_words = routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))? / WORD;
         let eps = self.math.rms_norm_eps;
         let rank = self.spec.core.gate_rank as usize;
         let input = block.at(l.mlp_input, rows * h)?;
@@ -956,66 +969,106 @@ impl CpuForward {
             block.report.launches.set(block.report.launches.get() + 1);
         }
 
-        // Router on the device; the host selects the routes as the flag-off path does.
+        // Router on the device: logits, then sigmoid top-k with the host's normalization.
         let experts = self.spec.n_routed_experts as usize;
+        let top_k = self.spec.num_experts_per_tok as usize;
         let prefix = format!("{layer}.mlp");
-        let (router, dtype, shape) = cuda
+        let (router, _, [router_rows, router_cols]) = cuda
             .router_weight(&format!("{prefix}.gate.weight"))
             .filter(|(_, dtype, _)| *dtype == DenseDtype::F32)
             .ok_or_else(|| bad("the resident pass needs an F32 router"))?;
-        let shape = DenseGemvShape::packed(rows, shape[0], shape[1]);
-        debug_assert_eq!(shape.cols, h);
-        let need = dense_gemv_bytes(shape, dtype)?;
-        let logits_bytes = rows * experts * WORD;
-        block.context.dense_gemv(
+        debug_assert_eq!((router_rows, router_cols), (experts, h));
+        let shape = RouterShape {
+            m: rows,
+            hidden: h,
+            n_expert: experts,
+            top_k,
+        };
+        let logits = block.at(l.logits, rows * experts)?;
+        let ids = block.at(l.ids, rows * top_k)?;
+        let route_weights = block.at(l.route_weights, rows * top_k)?;
+        let routed_status = block.at(l.flags + l.visits + index, 1)?;
+        block.context.router_logits_rows(
             &block.stream,
-            DenseGemvCall {
+            RouterLogitsCall {
                 shape,
-                dtype,
-                w: router.codes.range(0, need.w)?,
                 x: input,
-                y: block.at(l.logits, rows * experts)?,
+                w: router.codes.range(0, router.codes.bytes())?,
+                logits,
             },
         )?;
-        if readback.len() < logits_bytes {
-            return Err(bad("the resident pass readback plane is too small for the router"));
-        }
-        block.context.copy_to_pinned(
+        block.context.router_sigmoid_select_rows(
             &block.stream,
-            block.at(l.logits, rows * experts)?,
-            readback,
-            0,
+            RouterSigmoidCall {
+                shape,
+                bias: Some(RouterSigmoidBias {
+                    values: block.constant(&consts.router_bias)?,
+                    floor: ROUTE_NORMALIZATION_FLOOR,
+                    scale: self.math.route_scale,
+                }),
+                logits,
+                ids,
+                weights: route_weights,
+                status: routed_status,
+            },
         )?;
-        readback.synchronize(&block.stream)?;
-        let mut logits = vec![0f32; rows * experts];
-        readback.read_f32(0, &mut logits)?;
-        block.report.readbacks.set(block.report.readbacks.get() + 2);
-        let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
-        let routes = self.route_prefill_logits(self.visits[index].weight_layer, &logits, &bias, rows)?;
 
-        // The routed experts: the GEMM lane's one call site, enqueued behind this block.
-        let names = [
-            format!("{prefix}.experts.w13_weight"),
-            format!("{prefix}.experts.w2_weight"),
-        ];
-        let ids: Vec<&[usize]> = routes.iter().map(|route| route.selected.as_slice()).collect();
-        let batch = ExpertPrefillRows::Resident {
-            ids: &ids,
-            hidden: h,
-            activations: input,
-        };
+        // The routed experts: the GEMM lane's device-routed stage when the layer has its
+        // resident route, else its host-planned stage through this lane's launch-only adapter.
+        let expert_out = block.at(l.expert_out, rows * h)?;
+        let caps = [self.math.mlp_gate_softcap, self.math.mlp_up_softcap];
         let weight_layer = self.visits[index].weight_layer;
-        weights
-            .prefill_device_experts_unfenced(
-                names.each_ref().map(String::as_str),
-                weight_layer as u32,
-                (batch, Some(block.at(l.expert_out, rows * h)?)),
-                [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
-                |row, id| routes[row].weight(id, self.math.route_scale),
-                (&block.stream, block.at(l.flags + index, 1)?),
-            )?
-            .ok_or_else(|| bad("the resident pass expert window was not admitted"))?;
-        block.report.launches.set(block.report.launches.get() + 1);
+        let routed = weights.prefill_device_routed_experts(
+            weight_layer as u32,
+            &block.stream,
+            DeviceRoutedPrefill {
+                rows,
+                x: input,
+                ids,
+                weights: route_weights,
+                out: expert_out,
+                scratch: block.at(l.routed_scratch, scratch_words)?,
+                status: routed_status,
+            },
+            caps,
+        )?;
+        if routed.is_none() {
+            // The host adapter: the logits come back and the host selects as the flag-off
+            // path does, then the host-planned window is enqueued launch-only.
+            let logits_bytes = rows * experts * WORD;
+            if readback.len() < logits_bytes {
+                return Err(bad("the resident pass readback plane is too small for the router"));
+            }
+            block.context.copy_to_pinned(&block.stream, logits, readback, 0)?;
+            readback.synchronize(&block.stream)?;
+            let mut logits = vec![0f32; rows * experts];
+            readback.read_f32(0, &mut logits)?;
+            block.report.readbacks.set(block.report.readbacks.get() + 2);
+            let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
+            let routes = self.route_prefill_logits(weight_layer, &logits, &bias, rows)?;
+            let names = [
+                format!("{prefix}.experts.w13_weight"),
+                format!("{prefix}.experts.w2_weight"),
+            ];
+            let ids: Vec<&[usize]> = routes.iter().map(|route| route.selected.as_slice()).collect();
+            let batch = ExpertPrefillRows::Resident {
+                ids: &ids,
+                hidden: h,
+                activations: input,
+            };
+            weights
+                .prefill_device_experts_unfenced(
+                    names.each_ref().map(String::as_str),
+                    weight_layer as u32,
+                    (batch, Some(expert_out)),
+                    caps,
+                    |row, id| routes[row].weight(id, self.math.route_scale),
+                    (&block.stream, block.at(l.flags + index, 1)?),
+                )?
+                .ok_or_else(|| bad("the resident pass expert window was not admitted"))?;
+            block.report.readbacks.set(block.report.readbacks.get() + 1);
+        }
+        block.report.launches.set(block.report.launches.get() + 3);
 
         let past = PAST.min(position);
         let status = block.at(l.status + index * rows, rows)?;
@@ -1217,6 +1270,7 @@ impl PassWorkspace {
         let h = host.hidden();
         let visits_n = host.visits.len();
         let experts = host.spec.n_routed_experts as usize;
+        let top_k = host.spec.num_experts_per_tok as usize;
         let rank = host.spec.core.gate_rank as usize;
         let (_, attention) = cuda.resident_attention().ok_or_else(|| bad("admitted"))?;
         let mut consts = Consts::default();
@@ -1283,6 +1337,7 @@ impl PassWorkspace {
                 mlp_mix: consts.add(&vec(&format!("model.llm.attn_res.mlp_queries.{physical}"), h)?),
                 mlp_norm: consts.add(&vec(&format!("{layer}.mlp_norm.weight"), h)?),
                 mlp_sconv: consts.add(&vec(&format!("{layer}.mlp_sconv.weight"), TAPS * h)?),
+                router_bias: consts.add(&vec(&format!("{layer}.mlp.gate.bias"), experts)?),
             };
             let tails = tails_words..tails_words + PAST * (2 * geometry.kv_channels + 2 * h);
             tails_words = tails.end;
@@ -1313,6 +1368,9 @@ impl PassWorkspace {
             status: alloc(visits_n * rows),
             flags: alloc(2 * visits_n),
             logits: alloc(rows * experts),
+            ids: alloc(rows * top_k),
+            route_weights: alloc(rows * top_k),
+            routed_scratch: alloc(routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))? / WORD),
             inputs: alloc(ROLES * rows * h),
             messages: alloc(4 * rows * h),
             gate: alloc(rows * 2 * h),
@@ -1360,7 +1418,9 @@ impl PassWorkspace {
             ],
             tails_from: 0,
             tails_valid: false,
-            readback: context.pinned_buf((rows + visits_n * rows + 2 * visits_n + 1).max(rows * h) * WORD)?,
+            readback: context.pinned_buf(
+                (rows + visits_n * rows + 2 * visits_n + 1).max(rows * experts) * WORD,
+            )?,
             stream,
         })
     }
