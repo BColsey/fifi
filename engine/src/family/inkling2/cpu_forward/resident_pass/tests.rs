@@ -28,7 +28,15 @@ fn fingerprint(model: &mut CpuForward, tokens: &[u32], prefix_rows: usize) -> se
             detail.insert(slot.to_string(), slot_detail);
         }
     }
-    let parts = serde_json::json!({"parts": parts, "detail": detail});
+    let mut parts = serde_json::json!({"parts": parts, "detail": detail});
+    if let Some(slots) = env::var("FIFI_INKLING_PASS_DUMP_SLOTS").ok() {
+        // Every row of the named visits (a per-row comparison; large).
+        let rows: Vec<serde_json::Value> = slots
+            .split(',')
+            .map(|slot| model.state[slot.trim().parse::<usize>().unwrap()].parity_rows())
+            .collect();
+        parts["rows"] = serde_json::json!(rows);
+    }
     // Every decode step is teacher-forced; the logits of the first steps and of the last step are
     // kept (the full vocabulary), so the reference stays small for any block size.
     let steps = tokens.len() - prefix_rows;

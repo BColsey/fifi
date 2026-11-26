@@ -856,7 +856,7 @@ impl CpuForward {
                 )?,
                 history: [block.tail(0, index, 0)?, block.tail(0, index, 1)?],
                 kernel: [block.constant(&consts.conv_k)?, block.constant(&consts.conv_v)?],
-                dynamic: block.at(l.dynamic[kind], (rows - 1) * dynamic_stride + kv * TAPS)?,
+                dynamic: block.at(l.dynamic[kind], (rows - 1) * dynamic_stride + 2 * kv * TAPS)?,
                 status,
             },
             rows,
