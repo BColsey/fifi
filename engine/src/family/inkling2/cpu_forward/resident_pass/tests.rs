@@ -330,9 +330,10 @@ fn pass_constant_names() {
 #[test]
 fn feature_switches_need_exactly_one() {
     // The serving A/B turns the pass off with `=0`; anything but `1` must leave it off.
-    assert!(super::on(Some("1".into())));
+    let on = |value| crate::family::switch_table::read("FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS", value, false);
+    assert!(on(Some("1".into())));
     for value in ["0", "", "true", "yes"] {
-        assert!(!super::on(Some(value.into())), "{value:?}");
+        assert!(!on(Some(value.into())), "{value:?}");
     }
-    assert!(!super::on(None));
+    assert!(!on(None));
 }

@@ -56,11 +56,7 @@ __global__ void inkling_tensor_gemm(inference_cuda_dense_gemv_args a) {
 bool inkling_try_tensor_gemm(const inference_cuda_dense_gemv_args &a, int codec, cudaStream_t stream) {
     // Narrow IQ groups reuse little across the second half of this tile.
     if (!((codec == 40 && a.m >= 32) || ((codec == 17 || codec == 22) && a.m > 32 && a.m <= 64))) return false;
-    static const bool enabled = [] {
-        const char *v = std::getenv("FIFI_INKLING_CUDA_PREFILL_TENSOR_GEMM");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
-    if (!enabled) return false;
+    if (!(a.flags & INFERENCE_CUDA_DENSE_GEMV_PREFILL_TENSOR_GEMM)) return false;
     const dim3 grid(72, (a.m + 63) / 64);
     if (codec == 40) inkling_tensor_gemm<40><<<grid,256,0,stream>>>(a);
     else if (codec == 17) inkling_tensor_gemm<17><<<grid,256,0,stream>>>(a);

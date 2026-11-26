@@ -39,29 +39,12 @@ pub(crate) fn start_engine(
     // Leave cancellation and prefix boundaries with the shared worker.
     let engine = spawn_engine_noted(1, ready_note, move |stages| {
         stages.begin("weights");
-        let dflash = super::dflash2::configured()?;
         let mut forward = CpuForward::open(&model_dir, settings.context as usize)?;
         let mut settings = settings;
         let draft_workspace = settings
             .draft
             .as_ref()
             .map_or(0, |draft| draft.workspace_bytes);
-        let draft_workspace = if dflash.is_some() {
-            if backend != TextBackend::Cpu
-                || settings.draft.is_some()
-                || vocab_size != 200058
-                || forward.hidden() != 2304
-            {
-                return Err(super::bad(
-                    "DFlash2 requires a compatible CPU target without DSpark",
-                ));
-            }
-            forward.prepare_draft(vec![5, 23, 41, 48], 7)?;
-            // Bound temporary widened matrices, attention rows, and the visible tap suffix.
-            1 << 30
-        } else {
-            draft_workspace
-        };
         if let Some(draft) = &mut settings.draft {
             if draft.width != forward.hidden() || draft.vocab != vocab_size as usize {
                 return Err(super::bad(
@@ -99,15 +82,11 @@ pub(crate) fn start_engine(
                 cuda_forward(forward, plan.host_reserve)?
             }
         };
-        let speculator = if let Some(d) = dflash {
-            Some(Speculator::new(Box::new(d) as BoxDraft, 7))
-        } else {
-            settings
-                .draft
-                .take()
-                .map(|draft| start_draft(draft, &mut forward))
-                .transpose()?
-        };
+        let speculator = settings
+            .draft
+            .take()
+            .map(|draft| start_draft(draft, &mut forward))
+            .transpose()?;
         if grouped_verify_requested {
             let enabled = plan.grouped_verify && enable_grouped_verify(&mut forward);
             eprintln!(
@@ -149,12 +128,10 @@ pub(crate) fn start_engine(
     Ok((engine, bundle))
 }
 
-type BoxDraft = Box<dyn crate::family::speculate::driver::Drafter>;
-
 fn start_draft(
     draft: InklingDraft,
     forward: &mut CpuForward,
-) -> Result<Speculator<BoxDraft>, EngError> {
+) -> Result<Speculator<DsparkDrafter>, EngError> {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     let cap = draft.model.config().final_logit_softcap;
     let drafter = DsparkDrafter::new(draft.model);
@@ -169,7 +146,7 @@ fn start_draft(
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
         return Err(super::bad("CUDA draft head requires native-cuda on Linux"));
     }
-    let speculator = Speculator::new(Box::new(drafter) as BoxDraft, draft.max_drafts);
+    let speculator = Speculator::new(drafter, draft.max_drafts);
     Ok(if draft.adaptive_drafts {
         eprintln!("Inkling DSpark adaptive draft budget enabled");
         speculator.with_adaptive_drafts()
@@ -476,7 +453,7 @@ struct TextExecutor {
     forward: CpuForward,
     eos: Vec<u32>,
     prefill_rows: usize,
-    speculator: Option<Speculator<BoxDraft>>,
+    speculator: Option<Speculator<DsparkDrafter>>,
 }
 
 impl TextExecutor {

@@ -86,7 +86,7 @@ pub(super) fn workspace_floor(expert_workspace: u64) -> Option<u64> {
 }
 
 fn charge() -> u64 {
-    if std::env::var("FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS").as_deref() == Ok("1") {
+    if crate::family::inkling2::switches::Switch::ResidentPrefillPass.on() {
         PASS_CHARGE
     } else {
         MAX_CHARGE
