@@ -178,6 +178,8 @@ struct ResidentLayout {
     normed_at: usize,
 }
 
+mod baseline;
+
 impl ResidentLayout {
     fn new(hidden: usize, bank: bool) -> Self {
         let (workspace_at, roles, normed_at) = if bank {
@@ -247,6 +249,9 @@ impl DenseStep {
         targets: ResidentLocalTargets<'a, N>,
         role_inputs: Option<[DeviceRange<'a>; 3]>,
     ) -> Result<(), EngError> {
+        if !context.dense_group_policy().decode_glue {
+            return self.enqueue_roles_baseline(context, stream, local, targets, role_inputs);
+        }
         let ResidentLocal {
             inputs,
             controllers,

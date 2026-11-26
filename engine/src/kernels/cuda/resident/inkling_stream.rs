@@ -228,6 +228,8 @@ fn claim<'a>(name: &'static str, range: &'a DeviceRange<'a>) -> Claim<'a> {
     Claim::of(name, range, range.bytes())
 }
 
+mod baseline;
+
 impl CudaContext {
     /// `Stream::mix(first_block, query)` of the host: the softmax-weighted mean of the sealed
     /// rows `first_block..blocks` (newest first) and the normalized current row, each scored by
@@ -270,7 +272,12 @@ impl CudaContext {
             self.raw_range(&call.health)?,
         );
         self.launch_on(stream, |raw| {
-            native::mix(
+            let mix = if self.dense_group_policy().decode_glue {
+                native::mix
+            } else {
+                super::super::native::resident::inkling_stream_baseline::mix
+            };
+            mix(
                 raw,
                 [state, query, out, health],
                 [shape.first_block, shape.blocks, shape.width],
@@ -454,7 +461,12 @@ impl CudaContext {
             self.raw_range(&call.health)?,
         );
         self.launch_on(stream, |raw| {
-            native::seal(
+            let seal = if self.dense_group_policy().decode_glue {
+                native::seal
+            } else {
+                super::super::native::resident::inkling_stream_baseline::seal
+            };
+            seal(
                 raw,
                 state,
                 next,
@@ -497,7 +509,11 @@ impl CudaContext {
             self.raw_range(&call.row)?,
             self.raw_range(&call.health)?,
         );
-        self.launch_on(stream, |raw| native::add(raw, state, row, health, width))
+        self.launch_on(stream, |raw| {
+            super::super::native::resident::inkling_stream_baseline::add(
+                raw, state, row, health, width,
+            )
+        })
     }
 
     /// `dst = src * rms_scale(src)` with `eps`, the host's `rms_norm_with_scale`, for every

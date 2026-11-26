@@ -93,12 +93,7 @@ fn charge() -> u64 {
     }
 }
 
-fn floor(
-    before: u64,
-    original_floor: u64,
-    expert_workspace: u64,
-    charge: u64,
-) -> Option<u64> {
+fn floor(before: u64, original_floor: u64, expert_workspace: u64, charge: u64) -> Option<u64> {
     Some(
         workspace_floor(expert_workspace)?
             .max(original_floor.saturating_sub(charge))

@@ -297,7 +297,11 @@ impl CudaContext {
         let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
         let raw = [a?, b?, c?, d?];
         self.launch_on(stream, |s| {
-            resident::inkling_local_prep::weighted_norm_reduced(s, raw, [1, width], eps)
+            if self.dense_group_policy().decode_glue {
+                resident::inkling_local_prep::weighted_norm_reduced(s, raw, [1, width], eps)
+            } else {
+                resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps)
+            }
         })
     }
 

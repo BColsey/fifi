@@ -264,6 +264,9 @@ impl DenseStep {
         (rows, work, eps): (&RoutedRows<'_>, &Workspace<'_>, f32),
         enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
     ) -> Result<(), EngError> {
+        if !context.dense_group_policy().decode_glue {
+            return self.launch_controlled_baseline(context, stream, (rows, work, eps), enqueue);
+        }
         let row = rows.input.bytes();
         // The gate halves: the normalized input, then the normalized message, in one launch.
         let gates = [
@@ -294,6 +297,8 @@ impl DenseStep {
         enqueue(stream, [work.x, work.bias, rows.status, rows.out])
     }
 }
+
+mod baseline;
 
 #[cfg(test)]
 mod tests {

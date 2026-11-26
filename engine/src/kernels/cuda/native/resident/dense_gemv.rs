@@ -113,7 +113,11 @@ const PREFILL_TENSOR_GEMM: c_int = 2;
 /// The native flag bits of a call.
 fn flags(call: &DenseGemvRaw<'_>) -> c_int {
     (if call.decode_split { DECODE_SPLIT } else { 0 })
-        | (if call.prefill_tensor_gemm { PREFILL_TENSOR_GEMM } else { 0 })
+        | (if call.prefill_tensor_gemm {
+            PREFILL_TENSOR_GEMM
+        } else {
+            0
+        })
 }
 
 const _: () = assert!(

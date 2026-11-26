@@ -31,6 +31,7 @@ use crate::{
     },
 };
 
+mod baseline;
 #[cfg(test)]
 mod pair;
 mod token;
@@ -163,7 +164,7 @@ impl Layout {
             attention_out: take(h),
             mlp_input: take(h),
             mlp_conv: take(h),
-            mlp_normed: take(h),
+            mlp_normed: take(if Switch::DecodeGlue.on() { h } else { 0 }),
             bytes: end,
         }
     }
@@ -639,6 +640,9 @@ impl Execution<'_> {
     }
 
     fn enqueue(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
+        if !self.context.dense_group_policy().decode_glue {
+            return self.enqueue_baseline(cuda, position);
+        }
         let l = self.layout;
         let shape = self.plan.shape;
         let width = shape.widths.hidden;

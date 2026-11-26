@@ -153,6 +153,7 @@ pub(crate) struct DenseGroupPolicy {
     /// One launch for the six or eight attention matvecs of a decode step, and one per
     /// controller pair.
     pub(crate) decode_split: bool,
+    pub(crate) decode_glue: bool,
     /// The weight-visit kernels: measured shapes read their weights once for all rows.
     pub(crate) weight_visit: bool,
     /// Wider SM75 tile for measured expert prefill shapes.

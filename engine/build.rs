@@ -148,6 +148,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/draft_attention_bf16.cu",
     "src/kernels/cuda/native/resident/correct_draft_logits_bf16.cu",
     "src/kernels/cuda/native/resident/inkling_stream.cu",
+    "src/kernels/cuda/native/resident/inkling_stream_baseline.cu",
     "src/kernels/cuda/native/resident/inkling_conv.cu",
     "src/kernels/cuda/native/resident/inkling_pass.cu",
 ];

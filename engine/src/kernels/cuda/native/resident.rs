@@ -74,6 +74,7 @@ pub(in crate::kernels::cuda) mod inkling_conv;
 pub(in crate::kernels::cuda) mod inkling_local_prep;
 pub(in crate::kernels::cuda) mod inkling_pass;
 pub(in crate::kernels::cuda) mod inkling_stream;
+pub(in crate::kernels::cuda) mod inkling_stream_baseline;
 pub(in crate::kernels::cuda) mod kv8_append;
 pub(in crate::kernels::cuda) mod kv_f16_append;
 pub(in crate::kernels::cuda) mod mailbox;

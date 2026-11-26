@@ -224,10 +224,7 @@ impl GgufTextWeights {
         (rows, destination): (ExpertPrefillRows<'_>, Option<DeviceRange<'a>>),
         caps: [f32; 2],
         route_weight: impl Fn(usize, usize) -> f32,
-        (stream, flag_out): (
-            &'a crate::kernels::cuda::DeviceStream,
-            DeviceRange<'a>,
-        ),
+        (stream, flag_out): (&'a crate::kernels::cuda::DeviceStream, DeviceRange<'a>),
     ) -> Result<Option<()>, EngError> {
         let Some(cuda) = self
             .cuda

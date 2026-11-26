@@ -105,6 +105,8 @@ pub(in crate::family::inkling2) struct LocalResult {
     pub rows: [Vec<f32>; 4],
 }
 
+mod baseline;
+
 fn decode_split_enabled() -> bool {
     Switch::DecodeSplit.on()
 }
@@ -621,6 +623,16 @@ impl ResidentAttention {
         (shape, hidden, status): (LocalShape, usize, LocalStatus),
         dense: impl FnOnce([DeviceRange<'_>; 4], ResidentStatus<'_>) -> Result<(), EngError>,
     ) -> Result<PrepRows<'a>, EngError> {
+        if !context.dense_group_policy().decode_glue {
+            return self.enqueue_prep_baseline(
+                context,
+                stream,
+                store,
+                request,
+                (shape, hidden, status),
+                dense,
+            );
+        }
         let aux = store.aux.range(0, store.aux.bytes())?;
         let scratch = ScratchLayout::new(shape, hidden);
         let at = scratch.at;

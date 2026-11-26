@@ -118,6 +118,7 @@ fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2]
 pub(super) fn dense_group_policy() -> crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
     crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
         decode_split: Switch::DecodeSplit.on(),
+        decode_glue: Switch::DecodeGlue.on(),
         weight_visit: Switch::PrefillQ8Visit.on(),
         prefill_tensor_gemm: Switch::PrefillTensorGemm.on(),
     }

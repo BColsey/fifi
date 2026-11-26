@@ -14,7 +14,10 @@ const STEPS: usize = 36;
 #[test]
 #[ignore = "requires a leased CUDA device, the Inkling GGUF and FIFI_INKLING_CUDA_RESIDENT_TOKEN=1"]
 fn chain_tokens_across_the_attention_window_match_the_host_path() {
-    assert!(crate::family::inkling2::switches::Switch::ResidentToken.on(), "window test requires the resident-token chain");
+    assert!(
+        crate::family::inkling2::switches::Switch::ResidentToken.on(),
+        "window test requires the resident-token chain"
+    );
     let path = std::path::PathBuf::from(std::env::var_os("FIFI_INKLING_MODEL_DIR").unwrap());
     let vocab = 200_058;
     let mut seed = 7_u32;

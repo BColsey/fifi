@@ -355,7 +355,15 @@ impl GgufCuda {
         caps: [f32; 2],
         weight: impl Fn(usize, usize) -> f32,
     ) -> Result<Option<Vec<Vec<f32>>>, EngError> {
-        self.prefill_device_experts_impl(source, layer, (batch, destination), dtypes, caps, weight, None)
+        self.prefill_device_experts_impl(
+            source,
+            layer,
+            (batch, destination),
+            dtypes,
+            caps,
+            weight,
+            None,
+        )
     }
 
     /// The one call site of the routed-expert stage for the device-resident prefill pass
@@ -381,8 +389,16 @@ impl GgufCuda {
             flag_out,
             destination,
         };
-        self.prefill_device_experts_impl(source, layer, (batch, None), dtypes, caps, weight, Some(unfenced))
-            .map(|option| option.map(|_| ()))
+        self.prefill_device_experts_impl(
+            source,
+            layer,
+            (batch, None),
+            dtypes,
+            caps,
+            weight,
+            Some(unfenced),
+        )
+        .map(|option| option.map(|_| ()))
     }
 
     #[allow(clippy::too_many_arguments)]
