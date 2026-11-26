@@ -144,6 +144,16 @@ fn group_kernel(
     Ok((kernel, need))
 }
 
+/// `FIFI_INKLING_CUDA_DECODE_SPLIT=1`, read once per process: every family's
+/// dense matvec group asks.
+fn decode_split_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var_os("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 fn invalid_shape(shape: DenseGemvShape) -> EngError {
     EngError::BadRequest(format!(
         "the CUDA dense matvec takes 1 to {GEMV_MAX_M} rows of activations, 1 to \
@@ -300,8 +310,7 @@ impl CudaContext {
             .collect::<Result<Vec<_>, _>>()?;
         self.launch_on(stream, |raw_stream| {
             let mut counts = DenseGemvGroupCounts::default();
-            let pair = std::env::var_os("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref()
-                == Some(std::ffi::OsStr::new("1"));
+            let pair = decode_split_enabled();
             if pair
                 && matches!(planned.len(), 6 | 8)
                 && planned
