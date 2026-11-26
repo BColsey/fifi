@@ -10,11 +10,14 @@
 //! expert projections of a chunk, and [`site`] the residual sites: the plain add and the routed
 //! two-stream site.
 //!
+//! [`replay`] records a one-row step once and replays it, so a decode step is one call.
+//!
 //! A model supplies its layers (the mixer and the feed-forward of each visit) and its weights by
 //! name.
 
 pub(crate) mod experts;
 pub(crate) mod ffn;
+pub(crate) mod replay;
 pub(crate) mod rows;
 pub(crate) mod site;
 pub(crate) mod walk;

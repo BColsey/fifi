@@ -25,6 +25,7 @@ use std::{iter::once, rc::Rc};
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
 use crate::family::step::ffn;
+use crate::family::step::replay::Replay;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
 use crate::kernels::cuda::resident::attn_decode_loop::{
     AttnDecodeLoopCall, AttnLoopShape, attn_loop_part_bytes,
@@ -115,6 +116,8 @@ pub(crate) enum Carried {
 /// Built once per engine; [`Self::reset`] starts a new session on the same buffers, and `decode`
 /// runs one token.
 pub(crate) struct LoopStep<'a> {
+    /// The recorded decode step; first, so it drops before the buffers and the stream it uses.
+    replay: Replay<usize>,
     ctx: Rc<CudaContext>,
     stream: DeviceStream,
     weights: &'a CudaWeights,
@@ -272,6 +275,7 @@ impl<'a> LoopStep<'a> {
             logits: ctx.upload(&zeros(shape.vocab))?,
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
+            replay: Replay::default(),
             rows: prefill::open_rows(&ctx, shape, ctx.sm_count() as usize)?,
             shape: *shape,
             plan: plan.clone(),
@@ -340,8 +344,26 @@ impl<'a> LoopStep<'a> {
             ));
         }
         ensure_rows(pos, 1, self.cache_rows)?;
-        self.walk(&le_f32(embed_row), 1, pos, trace)?;
-        self.head(0, self.dq)
+        if trace.is_some() {
+            self.walk(&le_f32(embed_row), 1, pos, trace)?;
+            return self.head(0, self.dq);
+        }
+        self.feed(&le_f32(embed_row), 1, pos)?;
+        let mut replay = std::mem::take(&mut self.replay);
+        let left = replay.run(&self.ctx, &self.stream, || {
+            self.visits(1, pos, None)?;
+            self.head(0, self.dq)?;
+            Ok(self.rows.cur_ix.get())
+        });
+        self.replay = replay;
+        self.rows.cur_ix.set(left?);
+        Ok(())
+    }
+
+    /// Whether the last decode step replayed the recorded step.
+    #[cfg(test)]
+    pub(crate) fn replayed(&self) -> bool {
+        self.replay.recorded()
     }
 
     /// The logits row (device floats); valid after the stream drained.
@@ -363,7 +385,7 @@ impl<'a> LoopStep<'a> {
         for buffer in carried {
             buffer.zero_at(&self.stream, 0, buffer.bytes())?;
         }
-        self.rows.cur_ix = 0;
+        self.rows.cur_ix.set(0);
         Ok(())
     }
 
@@ -531,7 +553,7 @@ impl<'a> LoopStep<'a> {
         }
         out.push((
             Carried::Hidden,
-            &self.rows.resid[self.rows.cur_ix],
+            &self.rows.resid[self.rows.cur_ix.get()],
             0,
             shape.hidden * 4,
         ));

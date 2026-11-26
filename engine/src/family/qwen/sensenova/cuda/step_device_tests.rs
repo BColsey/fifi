@@ -2141,7 +2141,7 @@ fn card_chunk_of_one_against_the_decode_walk() {
     chunked.prefill(&embed, 0).unwrap();
     let mut token = argmax(&drain_row(&ctx, &walked));
     assert_eq!(token, argmax(&drain_row(&ctx, &chunked)));
-    let (mut walk_s, mut chunk_s, mut worst) = (0.0f64, 0.0f64, 0.0f32);
+    let (mut walk_ms, mut chunk_ms, mut worst) = (Vec::new(), Vec::new(), 0.0f32);
     let mut differing = 0;
     let (mut walk_rows, mut chunk_rows) = (Vec::new(), Vec::new());
     for step in 0..STEPS {
@@ -2150,11 +2150,11 @@ fn card_chunk_of_one_against_the_decode_walk() {
         let t0 = std::time::Instant::now();
         walked.decode(&row, pos).unwrap();
         let a = drain_row(&ctx, &walked);
-        walk_s += t0.elapsed().as_secs_f64();
+        walk_ms.push(t0.elapsed().as_secs_f64() * 1e3);
         let t0 = std::time::Instant::now();
         chunked.prefill(&row, pos).unwrap();
         let b = drain_row(&ctx, &chunked);
-        chunk_s += t0.elapsed().as_secs_f64();
+        chunk_ms.push(t0.elapsed().as_secs_f64() * 1e3);
         worst = worst.max(max_abs_diff(&a, &b));
         walk_rows.extend(a.iter().flat_map(|v| v.to_le_bytes()));
         chunk_rows.extend(b.iter().flat_map(|v| v.to_le_bytes()));
@@ -2163,12 +2163,20 @@ fn card_chunk_of_one_against_the_decode_walk() {
         }
         token = argmax(&a);
     }
+    // The median leaves out the two steps that load the kernels and record the step.
+    let median = |ms: &mut Vec<f64>| {
+        ms.sort_by(f64::total_cmp);
+        ms[ms.len() / 2]
+    };
+    let (walk, chunk) = (median(&mut walk_ms), median(&mut chunk_ms));
     eprintln!(
-        "decode walk {:.2} ms/step ({:.1} tok/s) | chunk of one {:.2} ms/step ({:.1} tok/s) | worst |diff| {worst:.4} | differing ids {differing} of {STEPS}",
-        walk_s * 1e3 / STEPS as f64,
-        STEPS as f64 / walk_s,
-        chunk_s * 1e3 / STEPS as f64,
-        STEPS as f64 / chunk_s,
+        "decode step, replayed {walk:.2} ms ({:.1} tok/s) | launched as a chunk of one {chunk:.2} ms ({:.1} tok/s) | medians of {STEPS} | worst |diff| {worst:.4} | differing ids {differing} of {STEPS}",
+        1e3 / walk,
+        1e3 / chunk,
+    );
+    assert!(
+        walked.replayed(),
+        "the decode steps did not replay a record"
     );
     if let Ok(out) = std::env::var("SENSENOVA_ROWS_OUT") {
         std::fs::write(format!("{out}.walk"), &walk_rows).unwrap();

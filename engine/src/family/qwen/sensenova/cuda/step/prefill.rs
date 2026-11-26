@@ -10,6 +10,8 @@
 //! the shared state where the same tokens decoded one by one would; the head runs on the
 //! last row.
 
+use std::cell::Cell;
+
 use super::*;
 use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
 use crate::family::step::{ffn, site};
@@ -50,7 +52,7 @@ fn exact_gemm() -> bool {
 /// columns of the four projection widths, and the attention partials at the part cap.
 pub(super) struct Rows {
     pub(super) resid: [DeviceBuffer; 2],
-    pub(super) cur_ix: usize,
+    pub(super) cur_ix: Cell<usize>,
     /// The two mHC streams of every row, adjacent as `[a || b]`.
     pub(super) streams: DeviceBuffer,
     /// The routed input rows of the current mHC visit.
@@ -130,7 +132,7 @@ pub(super) fn open_rows(
     };
     Ok(Rows {
         resid: [floats(h)?, floats(h)?],
-        cur_ix: 0,
+        cur_ix: Cell::new(0),
         streams: floats(2 * h)?,
         routed: floats(h)?,
         router_normed: floats(2 * h)?,
@@ -169,6 +171,8 @@ impl LoopStep<'_> {
                 "the embed rows are empty or not whole hidden-wide rows".to_owned(),
             ));
         }
+        // A chunk may regrow the workspace the recorded step holds: the next steps record again.
+        self.replay = Replay::default();
         let mut m = 0;
         for (chunk, rows) in embed_rows.chunks(PREFILL_ROWS * h).enumerate() {
             m = rows.len() / h;
@@ -181,7 +185,7 @@ impl LoopStep<'_> {
     /// The output norm of residual row `row` and the head, into the logits row.
     pub(super) fn head(&self, row: usize, exact: bool) -> Result<(), EngError> {
         let h = self.shape.hidden;
-        let last = floats(&self.rows.resid[self.rows.cur_ix], row * h, h)?;
+        let last = floats(&self.rows.resid[self.rows.cur_ix.get()], row * h, h)?;
         self.norm_site(last, None, self.output_norm, 1)?;
         let x = StepRows::both(&self.rows.norm_q8, &self.rows.norm_out);
         self.io(exact).project(self.head, x, &self.logits, 1)
@@ -214,8 +218,13 @@ impl LoopStep<'_> {
         p0: usize,
         mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        self.rows.cur_ix = 0;
+        self.feed(embed, m, p0)?;
+        self.visits(m, p0, trace.take())
+    }
+
+    /// The uploads of one chunk: its embedding rows into the residual and, for one row, the
+    /// position into the step parameters.
+    pub(super) fn feed(&self, embed: &[u8], m: usize, p0: usize) -> Result<(), EngError> {
         // Behind the last chunk's kernels: a blocking copy would land at once, and the
         // chunk before would write its final residual over it.
         self.rows.resid[0].write_at_enqueue(&self.stream, 0, embed)?;
@@ -223,6 +232,21 @@ impl LoopStep<'_> {
             let params = StepParams::new(0, p0 as i32)?;
             self.params
                 .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// The visits of one fed chunk, in order. It queues launches only unless `trace` is set,
+    /// and for one row the launches do not depend on `p0`.
+    pub(super) fn visits(
+        &self,
+        m: usize,
+        p0: usize,
+        mut trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<(), EngError> {
+        let h = self.shape.hidden;
+        self.rows.cur_ix.set(0);
+        if m == 1 {
             self.ctx
                 .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
         }
@@ -231,7 +255,7 @@ impl LoopStep<'_> {
             let mhc = self.plan.mhc_active(il);
             if mhc && p == self.plan.mhc_start {
                 self.routed()
-                    .fork(&self.io(false), &self.rows.resid[self.rows.cur_ix], m)?;
+                    .fork(&self.io(false), &self.rows.resid[self.rows.cur_ix.get()], m)?;
             }
             if mhc {
                 self.route(p, "hc_attn_fn", m)?;
@@ -268,7 +292,7 @@ impl LoopStep<'_> {
                 self.norm_site(cur, branch, self.phys[p].post_norm, m)?;
                 self.ffn(p, m)?;
                 // The add writes a distinct out: rotate the residual pair.
-                let next = self.rows.cur_ix ^ 1;
+                let next = self.rows.cur_ix.get() ^ 1;
                 let out = floats(&self.rows.resid[next], 0, m * h)?;
                 site::add(
                     &self.io(false),
@@ -277,16 +301,20 @@ impl LoopStep<'_> {
                     floats(&self.rows.ffn_out, 0, m * h)?,
                     m * h,
                 )?;
-                self.rows.cur_ix = next;
+                self.rows.cur_ix.set(next);
             }
-            self.snap(&mut trace, &self.rows.resid[self.rows.cur_ix])?;
+            self.snap(&mut trace, &self.rows.resid[self.rows.cur_ix.get()])?;
         }
         Ok(())
     }
 
     /// The `m` rows of the current residual plane.
     fn resid_rows(&self, m: usize) -> Result<DeviceRange<'_>, EngError> {
-        floats(&self.rows.resid[self.rows.cur_ix], 0, m * self.shape.hidden)
+        floats(
+            &self.rows.resid[self.rows.cur_ix.get()],
+            0,
+            m * self.shape.hidden,
+        )
     }
 
     /// The routed site over the chunk's rows.
