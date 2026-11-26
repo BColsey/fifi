@@ -3,7 +3,7 @@
 inline bool inkling_prefetch_select(const inference_cuda_dense_gemv_args &a,int codec,cudaStream_t s,int *measure_bm=nullptr){
     if(!aligned(a.x,16) || a.ld_x%4 || !(a.m==7 || a.m==8 || a.m==12 || a.m==63 || a.m==64))return false;
     const int bin=a.m<=8?0:a.m==12?1:2;
-#define CHOOSE(C,M,R,K) {if(measure_bm){*measure_bm=M;return true;}inkling_prefetch<C,M,R,K,true><<<dim3(a.rows/(8*R),(a.m+M-1)/M),256,0,s>>>(a);return true;}
+#define CHOOSE(C,M,R,K) {if(measure_bm){*measure_bm=M;return true;}inkling_prefetch<C,M,R,K,true><<<dim3(a.rows/(8*R),(a.m + M - 1) / M),256,0,s>>>(a);return true;}
     switch(codec){
     case 8:
         if(a.rows==384 && a.cols==2304){

@@ -77,7 +77,7 @@ pub(crate) fn host_shape(
 
 /// The YaRN descriptor the rope generalization needs beyond `theta` + `rotary_dim`:
 /// the shared kernels bake plain NTK-style rotary; SenseNova scales by `factor` from
-/// `original_context` (see CUDA-PLAN §math, divergence 3).
+/// `original_context`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
     not(test),

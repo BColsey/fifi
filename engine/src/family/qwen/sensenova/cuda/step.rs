@@ -1,7 +1,6 @@
 //! The trunk decode executor of SenseNova-Loop on the device: one token through the 56
 //! visits, every launch an existing resident kernel plus the two Loop kernel sets
-//! (`attn_decode_loop`, `mhc_route`). The launch map and the buffer layout live in the
-//! lane's `CUDA-PLAN.md` §B3-launch-map; this file is its code.
+//! (`attn_decode_loop`, `mhc_route`).
 //!
 //! The trunk is the CPU reference's (`super::super::step::token`), visit for visit: mHC
 //! visits keep both streams, route twice (attn, ffn) through the router table, and end with

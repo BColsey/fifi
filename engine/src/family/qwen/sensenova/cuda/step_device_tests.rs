@@ -316,7 +316,8 @@ fn card_trunk_matches_the_cpu_reference() {
     let mut last = Vec::new();
     let mut prev_diff = f32::INFINITY;
     let mut traced_bad = false;
-    // pos-0 per-visit resid diffs (gate 1) and the pos-1/2 full-row diffs (gate 2).
+    // The per-visit residual differences at position 0, and the full-row differences at
+    // positions 1 and 2.
     let mut pos0_resid: Vec<f32> = Vec::new();
     let mut early = [0.0f32; 2];
     // The debug knob shortens the prompt (the CPU reference costs ~2 min per step).

@@ -1089,13 +1089,13 @@ extern "C" int ablate_weight_probe(const inference_cuda_dense_gemv_args *args,cu
     inkling_exact_visit_tile<8,32,34,4,true><<<g,256,0,s>>>(a);return int(cudaGetLastError());
 }
 extern "C" int weight_panel_probe(const inference_cuda_dense_gemv_args *args,void *tmp,cudaStream_t s,int mode){auto a=*args;auto p=static_cast<InklingWeightPanel *>(tmp);
-#define WPL(M,N) inkling_weight_panel<M,N><<<dim3(a.rows/N,(a.m+M-1)/M),256,0,s>>>(a,p)
+#define WPL(M,N) inkling_weight_panel<M,N><<<dim3(a.rows/N,(a.m + M - 1) / M),256,0,s>>>(a,p)
     switch(mode){case 0:inkling_weight_repack<<<(a.rows*a.cols+255)/256,256,0,s>>>(a,p);break;case 1:WPL(8,16);break;case 2:WPL(8,32);break;case 3:WPL(16,32);break;default:return int(cudaErrorInvalidValue);}
 #undef WPL
     return int(cudaGetLastError());}
 extern "C" int down_visit_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int arm){auto a=*args;
-#define DOWN(M,R) inkling_f32_visit<M,R><<<dim3(8/R,(a.m+M-1)/M),256,0,s>>>(a)
-#define DIRECT(M) inkling_f32_rank_direct<M><<<dim3(8,(a.m+M-1)/M),256,0,s>>>(a)
+#define DOWN(M,R) inkling_f32_visit<M,R><<<dim3(8/R,(a.m + M - 1) / M),256,0,s>>>(a)
+#define DIRECT(M) inkling_f32_rank_direct<M><<<dim3(8,(a.m + M - 1) / M),256,0,s>>>(a)
     switch(arm){case 1:DOWN(2,1);break;case 2:DOWN(4,1);break;case 3:DOWN(8,1);break;case 4:DOWN(8,2);break;case 5:DIRECT(2);break;case 6:DIRECT(4);break;case 7:DIRECT(8);break;default:return int(cudaErrorInvalidValue);}
 #undef DOWN
 #undef DIRECT
@@ -1116,7 +1116,7 @@ extern "C" int codebook_visit_probe(const inference_cuda_dense_gemv_args *args,c
     return int(cudaGetLastError());}
 extern "C" int octet_big_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int mode){
     auto a=*args;int bm=mode==1?64:32;dim3 g(72,(a.m+bm-1)/bm);
-#define BIG(C,K,B,S,BK) case C: if(mode==1) inkling_iq2_visit_tile<C==2?40:C-256,K,B,S,true,64,128><<<g,512,0,s>>>(a); else inkling_iq2_visit_tile<C==2?40:C-256,K,B,S,true,32,BK><<<g,512,0,s>>>(a); break
+#define BIG(C,K,B,S,BK) case C: if(mode==1) inkling_iq2_visit_tile<C==2?40:C - 256,K,B,S,true,64,128><<<g,512,0,s>>>(a); else inkling_iq2_visit_tile<C==2?40:C - 256,K,B,S,true,32,BK><<<g,512,0,s>>>(a); break
     switch(a.weight_dtype){BIG(273,2304,256,74,256);BIG(275,2304,256,50,256);BIG(278,2304,256,82,256);BIG(2,1152,64,36,128);default:return -1;}
 #undef BIG
     return int(cudaGetLastError());
@@ -1162,7 +1162,7 @@ extern "C" int panel_probe(const inference_cuda_dense_gemv_args *args,void *tmp,
         int rc=int(cudaGetLastError());if(rc)return rc;
     }
     if(cached>=2){
-#define PW(K,M,N) inkling_panel_wide<K,M,N><<<dim3(a.rows/N,(a.m+M-1)/M),128,0,s>>>(a,pack)
+#define PW(K,M,N) inkling_panel_wide<K,M,N><<<dim3(a.rows/N,(a.m + M - 1) / M),128,0,s>>>(a,pack)
 #define PWS(K) if(cached==2){PW(K,32,64);}else if(cached==3){PW(K,64,32);}else{PW(K,64,64);}
         if(a.cols==1152){PWS(1152);}else{PWS(2304);}
 #undef PWS
@@ -1186,7 +1186,7 @@ extern "C" int octet_vector_probe(const inference_cuda_dense_gemv_args *args,cud
 extern "C" int stream_visit_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int variant){
     auto a=*args;
     if(variant>=16 && variant<=19){
-#define OCC(C,B,S,WN,WM,R,M,K) inkling_occupancy_tile<C,B,S,WN,WM,R,M,K><<<dim3(a.rows/(WN*R),(a.m+WM*M-1)/(WM*M)),WN*WM*32,0,s>>>(a)
+#define OCC(C,B,S,WN,WM,R,M,K) inkling_occupancy_tile<C,B,S,WN,WM,R,M,K><<<dim3(a.rows/(WN*R),(a.m + WM * M - 1) / (WM * M)),WN*WM*32,0,s>>>(a)
 #define OCCS(C,B,S) if(variant==16){OCC(C,B,S,4,2,4,4,64);}else if(variant==17){OCC(C,B,S,8,2,2,4,128);}else if(variant==18){OCC(C,B,S,4,4,4,4,64);}else{OCC(C,B,S,8,2,2,8,64);}
         if(a.weight_dtype==kQ8){OCCS(8,32,34);}else{OCCS(14,256,210);}
 #undef OCCS
@@ -1292,7 +1292,7 @@ extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
         if (visit) {
             dim3 tiles(a.rows / 32, (a.m + 7) / 8);
             if(expert_visit && a.m>=4 && aligned(a.x,16) && a.ld_x%4==0 && (codec==42 || a.m<=16)){
-#define EXP(C,M,R) inkling_prefetch<C,M,R,128,true><<<dim3(a.rows/(8*R),(a.m+M-1)/M),256,0,s>>>(a)
+#define EXP(C,M,R) inkling_prefetch<C,M,R,128,true><<<dim3(a.rows/(8*R),(a.m + M - 1) / M),256,0,s>>>(a)
                 if(codec==16){if(a.m==4){EXP(16,4,2);}else if(a.m<=8){EXP(16,8,2);}else{EXP(16,16,2);}}
                 else{if(a.m==4){EXP(42,4,2);}else if(a.m<=8){EXP(42,8,2);}else{EXP(42,8,4);}}
 #undef EXP
