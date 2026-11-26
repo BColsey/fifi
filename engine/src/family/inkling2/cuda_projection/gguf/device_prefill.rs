@@ -13,7 +13,7 @@ use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayloadSource},
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
+        CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, PinnedBuf,
         prefill::{
             mmq_mmid::{GroupedDqRows, MmidWeight, SparseDqCall, grouped_dq_serves},
             row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
@@ -147,6 +147,9 @@ struct Scratch {
     buffer: DeviceBuffer,
     stream: DeviceStream,
     host: PinnedBuf,
+    /// Recorded on the caller's stream right behind the last unfenced upload of `host`; the next
+    /// window waits for it before writing `host` again (nothing else is synchronized).
+    uploaded: Option<DeviceEvent>,
     rows: usize,
     geometry: Geometry,
 }
@@ -745,6 +748,7 @@ impl Scratch {
                 buffer,
                 stream: cuda.stream()?,
                 host: cuda.pinned_buf(layout.output.end)?,
+                uploaded: None,
                 rows,
                 geometry,
             }))
@@ -781,6 +785,7 @@ impl Scratch {
             });
         // A launch can be refused after the upload has been queued.
         let waited = self.host.synchronize(&self.stream);
+        self.uploaded = None;
         let counts = result?;
         waited?;
         let mut flag = [0; 4];
@@ -820,8 +825,16 @@ impl Scratch {
             return Err(bad("the unfenced expert window does not fit its admission"));
         }
         let upload = self.buffer.range(0, l.flag.end)?;
+        // The pinned page of the previous window is released by the event recorded behind its
+        // upload: a tiny copy long finished by the time the next visit reaches its experts.
+        if let Some(event) = self.uploaded.take() {
+            self.host.wait(&event)?;
+        }
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(stream, &mut self.host, 0, upload)?;
+        let event = cuda.event()?;
+        stream.record(&event)?;
+        self.uploaded = Some(event);
         let counts = self.enqueue(cuda, stream, projections, plan, operands)?;
         cuda.copy_device(stream, self.buffer.range(l.flag.start, 4)?, flag_out)?;
         Ok(counts)
