@@ -4,6 +4,9 @@ use std::ffi::{c_int, c_void};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
+/// Largest role count of `launch_rows`: the rows travel by value as kernel arguments.
+pub(crate) const MAX_ROW_ROLES: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub(crate) enum Arithmetic {
@@ -173,7 +176,7 @@ pub(in crate::kernels::cuda) fn launch(
     checked(status, stage)
 }
 
-/// Up to 1536 controller roles over the caller's rows, `[input, message, gamma, gain, forget,
+/// Up to 16 controller roles over the caller's rows (the pointers travel as kernel arguments), `[input, message, gamma, gain, forget,
 /// out]` per role, `width` floats each: every output row shares no byte with any row of any
 /// role, and `health` (`roles` floats) with none of them.
 pub(in crate::kernels::cuda) fn launch_rows(

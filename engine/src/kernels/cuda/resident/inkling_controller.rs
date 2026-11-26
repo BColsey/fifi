@@ -11,7 +11,7 @@ use crate::kernels::cuda::{
     context::{Claim, require_apart, require_fit},
 };
 
-pub(crate) use super::super::native::resident::inkling_controller::Arithmetic;
+pub(crate) use super::super::native::resident::inkling_controller::{Arithmetic, MAX_ROW_ROLES};
 use super::super::native::resident::inkling_controller::{
     launch, launch_rows, prepare, rebuild_gates,
 };
@@ -58,7 +58,7 @@ impl CudaContext {
         self.inkling_controller_norm_roles(stream, workspace, health, ([width, 3], eps))
     }
 
-    /// Up to 1536 independent controller roles over the caller's rows: per role
+    /// Up to 16 independent controller roles over the caller's rows: per role
     /// `[input, message, gamma, gain, forget, out]`, `width` floats each, so nothing is packed
     /// into a workspace. Every output row shares no byte with any other row; `health` (one
     /// float per role) with none of them.
@@ -71,12 +71,12 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         let roles = rows.len();
         if !(1..=4096).contains(&width)
-            || !(1..=1536).contains(&roles)
+            || !(1..=MAX_ROW_ROLES).contains(&roles)
             || !eps.is_finite()
             || eps <= 0.0
         {
             return Err(EngError::BadRequest(format!(
-                "the CUDA Inkling controller norm takes 1 to 1536 roles of 1 to 4096 columns and a finite positive eps, got roles {roles}, width {width}, eps {eps}"
+                "the CUDA Inkling controller norm takes 1 to {MAX_ROW_ROLES} roles of 1 to 4096 columns and a finite positive eps, got roles {roles}, width {width}, eps {eps}"
             )));
         }
         let word = size_of::<f32>();
