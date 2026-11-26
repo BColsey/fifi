@@ -9,7 +9,7 @@ use super::*;
 use std::{env, fs, path::Path};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-use super::super::TapRow;
+use super::super::{MessageBank, TapRow};
 
 /// Decode steps whose logits the reference keeps, besides the last step.
 const LOGIT_STEPS: usize = 3;
@@ -133,6 +133,35 @@ fn resident_pass_parity() {
                 after.extend(stream.current().iter().map(|x| x.to_bits()));
             }
         }
+        // The first banked visit (the second pass over the core): its live stream, three
+        // attention inputs and raw K/V on the host, with the bank `forward` builds for that pass.
+        let core = &host.spec.core;
+        let width = core.core_end - core.core_start;
+        let banked = core.core_start + width;
+        let bank_visit = host.visits[banked];
+        let bank_layer = format!("model.llm.layers.{}", bank_visit.weight_layer);
+        let mut bank_state: Vec<VisitState> =
+            (0..host.state.len()).map(|_| VisitState::default()).collect();
+        let (mut before18, mut inputs18, mut raw18) = (Vec::new(), Vec::new(), Vec::new());
+        for &id in &tokens[..rows] {
+            let mut stream = host.embed(id).unwrap();
+            let mut taps = TapRow::new(&[], host.hidden());
+            host.run_visits(&host.visits[..core.core_start], &mut bank_state, &mut stream, None, &mut taps, false)
+                .unwrap();
+            let prelude = stream.clone();
+            host.run_visits(&host.visits[core.core_start..banked], &mut bank_state, &mut stream, None, &mut taps, false)
+                .unwrap();
+            let bank = MessageBank {
+                first_block: prelude.block_count() + 1,
+                stream: std::mem::replace(&mut stream, prelude.clone()),
+            };
+            before18.extend(stream.current().iter().map(|x| x.to_bits()));
+            let inputs = host.attention_inputs(bank_visit, &bank_layer, &stream, Some(&bank)).unwrap();
+            inputs18.extend(inputs.iter().flat_map(|r| r.iter().map(|x| x.to_bits())));
+            let projected = host.project_attention(&bank_layer, bank_visit.attention, &inputs).unwrap();
+            raw18.extend(projected[1].iter().map(|x| x.to_bits()));
+            raw18.extend(projected[2].iter().map(|x| x.to_bits()));
+        }
         fs::write(
             out,
             serde_json::to_vec(&serde_json::json!({
@@ -140,6 +169,7 @@ fn resident_pass_parity() {
                 "h": host.hidden(), "input1": inputs,
                 "raw1": raw, "second": second.parity_rows(),
                 "after": after,
+                "before18": before18, "inputs18": inputs18, "raw18": raw18,
             }))
             .unwrap(),
         )

@@ -455,17 +455,19 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                 1e-5,
             );
             for r in 0..rows {
-                assert_within(
-                    row(&device, r, side_stride),
-                    &{
-                        let mut full = vec![0.0; side_stride];
-                        full[key_at..key_at + channels].copy_from_slice(&expected_k[r]);
-                        full[value_at..value_at + channels].copy_from_slice(&expected_v[r]);
-                        full
-                    },
-                    &format!("dynamic {dynamic}, history {history_rows}, row {r}"),
-                );
+                let mut full = vec![0.0; side_stride];
+                full[key_at..key_at + channels].copy_from_slice(&expected_k[r]);
+                full[value_at..value_at + channels].copy_from_slice(&expected_v[r]);
+                let got = row(&device, r, side_stride);
+                if got.iter().zip(&full).any(|(a, b)| (a - b).abs() > TOLERANCE * (1.0 + b.abs())) {
+                    eprintln!("prep {dynamic}/{history_rows} row {r}: K host {:?} device {:?}", &expected_k[r][..4], &got[key_at..key_at + 4]);
+                    eprintln!("prep {dynamic}/{history_rows} row {r}: V host {:?} device {:?}", &expected_v[r][..4], &got[value_at..value_at + 4]);
+                    let plain = (0..channels).map(|c| (0..TAPS).map(|lag| if r >= lag { kernels[0][c * TAPS + TAPS - 1 - lag] * raw[r - lag][c] } else { 0.0 }).sum::<f32>() * ((TAPS + 1) as f32).sqrt().recip()).collect::<Vec<_>>();
+                    eprintln!("prep {dynamic}/{history_rows} row {r}: K convolved (host, no clip) {:?}; device/head rms {:?} host/head rms {:?}", &plain[..4], (0..kv_heads).map(|h| got[key_at + h * HEAD..key_at + (h + 1) * HEAD].iter().map(|v| v * v).sum::<f32>().sqrt()).collect::<Vec<_>>(), (0..kv_heads).map(|h| plain[h * HEAD..(h + 1) * HEAD].iter().map(|v| v * v).sum::<f32>().sqrt()).collect::<Vec<_>>());
+                    panic!("prep mismatch {dynamic}/{history_rows} row {r}");
+                }
             }
+            let _ = (expected_k, expected_v, &raw, &kernels);
             drop((raw_buffer, side_buffer, dynamic_buffer, status, history, kernel));
          }
     }
@@ -556,7 +558,8 @@ fn tails_take_the_last_rows_of_a_strided_source_and_the_older_plane() {
     for (rows, past) in [(8, 0), (5, 2), (2, 2)] {
         // Source row r is [r | r + 100]; the previous plane holds rows 90, 91, 92 oldest first.
         let source = ctx.upload(&bytes(&strided(rows))).unwrap();
-        let old = ctx.upload(&bytes(&strided_parked(width))).unwrap();
+        // The previous plane is packed: one row of `width` words per history row.
+        let old = ctx.upload(&bytes(&(90..93).flat_map(key).collect::<Vec<f32>>())).unwrap();
         let out = ctx.allocate((TAPS - 1) * width * word).unwrap();
         ctx.inkling_pass_tails(
             &stream,
@@ -583,10 +586,3 @@ fn plane(buffer: &DeviceBuffer, words: usize) -> DeviceRange<'_> {
     buffer.range(0, words * size_of::<f32>()).unwrap()
 }
 
-/// Rows 90, 91 and 92 of a strided plane, oldest first ([r | r + 100] per row).
-fn strided_parked(width: usize) -> Vec<f32> {
-    (90..93)
-        .flat_map(|r| [vec![r as f32; width], vec![(r + 100) as f32; width]])
-        .flatten()
-        .collect()
-}
