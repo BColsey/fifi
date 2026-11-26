@@ -763,6 +763,8 @@ impl CpuForward {
                 norm_only()?;
             }
         }
+        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        block.dump_control(index, bank)?;
 
         // Projections into the sidecar, raw and dynamic planes.
         let heads = [query, kv];
@@ -1277,6 +1279,59 @@ impl Block<'_> {
         std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
             .map_err(|e| bad(format!("resident pass dump: {e}")))?;
         eprintln!("Inkling resident pass dumped visit {index} after its K/V preparation");
+        Ok(())
+    }
+
+    /// Test aid (`FIFI_INKLING_PASS_DUMP_CONTROL=index:path[,index:path]`): after the attention
+    /// inputs, the three role inputs, the controller messages, the gate and the controller rows
+    /// of the last role, as bits.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    fn dump_control(&self, index: usize, bank: Option<(usize, usize, usize)>) -> Result<(), EngError> {
+        static DUMP: std::sync::OnceLock<Vec<(usize, std::path::PathBuf)>> =
+            std::sync::OnceLock::new();
+        let dumps = DUMP.get_or_init(|| {
+            std::env::var("FIFI_INKLING_PASS_DUMP_CONTROL")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|item| {
+                            let (index, path) = item.split_once(':')?;
+                            Some((index.parse().ok()?, std::path::PathBuf::from(path)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        let Some((_, path)) = dumps.iter().find(|(wanted, _)| *wanted == index) else {
+            return Ok(());
+        };
+        let read = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, words: usize| {
+            let mut bytes = vec![0u8; words * WORD];
+            buffer.read_at(&self.stream, start * WORD, &mut bytes)?;
+            Ok::<_, EngError>(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let l = self.l;
+        let rows = self.rows;
+        let h = self.h;
+        let value = serde_json::json!({
+            "inputs": read(self.arena, l.inputs, 3 * rows * h)?,
+            "messages": read(self.arena, l.messages, 3 * rows * h)?,
+            "gate": read(self.arena, l.gate, rows * 2 * h)?,
+            "gain": read(self.arena, l.gain, rows * h)?,
+            "forget": read(self.arena, l.forget, rows * h)?,
+            "bank": bank,
+        });
+        std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
+            .map_err(|e| bad(format!("resident pass dump: {e}")))?;
+        eprintln!("Inkling resident pass dumped the control of visit {index}");
         Ok(())
     }
 
