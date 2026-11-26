@@ -215,7 +215,7 @@ fn mix_seal_and_add_match_the_host_stream() {
             .unwrap();
             for r in 0..rows {
                 sealed[r].push(normalize(&current[r], 1e-6));
-                current[r].copy_from_slice(&next[r]);
+                current[r].copy_from_slice(&next[r][..WIDTH]);
             }
             let device = download(&state.current, &stream, state.plane(&state.current));
             let sealed_device = download(&state.sealed, &stream, state.sealed(blocks + 1));
@@ -285,7 +285,9 @@ impl PrepHost {
         eps: f32,
     ) -> Vec<Vec<f32>> {
         let taps = TAPS;
-        let norm = ((taps + 1) as f32).sqrt().recip();
+        // `CausalConv::apply`: dynamic taps count as a second kernel.
+        let kernels = if dynamic.is_some() { 2 } else { 1 };
+        let norm = ((kernels * taps + 1) as f32).sqrt().recip();
         let mut rows: Vec<(Vec<f32>, bool)> = Vec::new();
         for (r, input) in raw.iter().enumerate() {
             let mut output = vec![0.0; channels];
