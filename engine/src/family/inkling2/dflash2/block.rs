@@ -7,6 +7,9 @@ use crate::family::speculate::{
     driver::{Drafter, Proposal, TargetConditioning},
     window::Window,
 };
+/// Greedy anchor and the selector's scored shortlist at one draft position.
+type Selection = (usize, Vec<(usize, f32)>);
+
 impl Drafter for Dflash2 {
     fn propose(&mut self, _: &[u32], _: usize) -> Result<Proposal, EngError> {
         Ok(Proposal::default())
@@ -203,7 +206,7 @@ impl Block<'_> {
         x: &Rows,
         mut anchor: usize,
         project: impl Fn(&[f32]) -> Result<Vec<f32>, EngError>,
-    ) -> Result<Vec<(usize, Vec<(usize, f32)>)>, EngError> {
+    ) -> Result<Vec<Selection>, EngError> {
         let proj = self.linear(x, "selector_hidden.weight")?;
         let mut output = Vec::new();
         for i in 1..x.len() {

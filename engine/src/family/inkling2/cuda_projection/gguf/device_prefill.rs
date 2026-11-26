@@ -368,8 +368,7 @@ impl GgufCuda {
         source: &mut impl ExpertPayloadSource,
         layer: u32,
         (batch, destination): (ExpertPrefillRows<'_>, Option<DeviceRange<'_>>),
-        dtypes: [DenseDtype; 2],
-        caps: [f32; 2],
+        (dtypes, caps): ([DenseDtype; 2], [f32; 2]),
         weight: impl Fn(usize, usize) -> f32,
         (stream, flag_out): (&'a DeviceStream, DeviceRange<'a>),
     ) -> Result<Option<()>, EngError> {
