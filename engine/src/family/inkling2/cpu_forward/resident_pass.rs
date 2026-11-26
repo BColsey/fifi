@@ -1338,6 +1338,74 @@ fn tail_bytes(rows: &[Vec<f32>], width: usize) -> Vec<u8> {
     out
 }
 
+impl CpuForward {
+    /// The constants of one visit, looked up on the host by name: the depth-mix queries, the
+    /// controller queries of a banked visit, the norms, clip scales, convolution taps and the router
+    /// bias. Also used by the host-only test that checks every name against the checkpoint.
+    fn visit_consts(
+        host: &CpuForward,
+        visit: LayerVisit,
+        geometry: Geometry,
+        consts: &mut Consts,
+    ) -> Result<VisitConsts, EngError> {
+        let physical = visit.weight_layer;
+        let layer = format!("model.llm.layers.{physical}");
+        let prefix = format!("{layer}.attn");
+        let kind = usize::from(visit.attention == Attention::Global);
+        let dynamic = kind == 1;
+        let h = host.hidden();
+        let experts = host.spec.n_routed_experts as usize;
+        let row = |name: &str, at: usize, len: usize| -> Result<Vec<f32>, EngError> {
+            host.weights.row(name, at, len).map(|cow| cow.into_owned())
+        };
+        let vec = |name: &str, len: usize| -> Result<Vec<f32>, EngError> {
+            host.weights.vec(name, len).map(|cow| cow.into_owned())
+        };
+        let mut mix: [Range<usize>; ROLES] = std::array::from_fn(|_| 0..0);
+        if let Some(q) = physical.checked_sub(1) {
+            for (role, range) in mix.iter_mut().enumerate() {
+                *range = consts.add(&row(
+                    &format!("model.llm.attn_res.attn_queries.{q}"),
+                    if kind == 0 { 0 } else { role },
+                    h,
+                )?);
+            }
+        }
+        let mut control: [Range<usize>; 4] = std::array::from_fn(|_| 0..0);
+        if host.pass_visit_banked(visit.state_slot) {
+            for (range, role) in control
+                .iter_mut()
+                .zip([Role::Query, Role::Key, Role::Value, Role::Mlp])
+            {
+                *range = consts.add(&host.control_query(physical, role)?);
+            }
+        }
+        let mut norms: [Range<usize>; ROLES] = std::array::from_fn(|_| 0..0);
+        for (i, range) in norms.iter_mut().enumerate() {
+            *range = consts.add(&vec(&attention_norm_name(&layer, kind == 0, i), h)?);
+        }
+        let mut clip = vec(&format!("{prefix}.q_l2_clip.scale"), geometry.channels)?;
+        clip.extend_from_slice(&vec(&format!("{prefix}.rel_l2_clip.scale"), geometry.relative)?);
+        let conv = |plane: &str| -> Result<Vec<f32>, EngError> {
+            let name = if dynamic { "static_w" } else { "weight" };
+            vec(&format!("{prefix}.{plane}_sconv.{name}"), TAPS * geometry.kv_channels)
+        };
+        Ok(VisitConsts {
+            mix,
+            control,
+            norms,
+            clip: consts.add(&clip),
+            conv_k: consts.add(&conv("k")?),
+            conv_v: consts.add(&conv("v")?),
+            attn_sconv: consts.add(&vec(&format!("{layer}.attn_sconv.weight"), TAPS * h)?),
+            mlp_mix: consts.add(&vec(&format!("model.llm.attn_res.mlp_queries.{physical}"), h)?),
+            mlp_norm: consts.add(&vec(&format!("{layer}.mlp_norm.weight"), h)?),
+            mlp_sconv: consts.add(&vec(&format!("{layer}.mlp_sconv.weight"), TAPS * h)?),
+            router_bias: consts.add(&vec(&format!("{layer}.mlp.gate.bias"), experts)?),
+        })
+    }
+}
+
 impl PassWorkspace {
     fn plan(
         host: &CpuForward,
@@ -1355,12 +1423,8 @@ impl PassWorkspace {
         let mut tails_words = 0;
         let mut visits = Vec::with_capacity(visits_n);
         for visit in &host.visits {
-            let physical = visit.weight_layer;
-            let layer = format!("model.llm.layers.{physical}");
-            let prefix = format!("{layer}.attn");
             let heads = host.pass_heads(visit.attention);
             let kind = usize::from(visit.attention == Attention::Global);
-            let dynamic = kind == 1;
             let parts = attention.tile_parts(visit.state_slot).ok_or_else(|| bad("admitted"))?;
             let geometry = *geometries[kind].get_or_insert(Geometry {
                 query: heads[0],
@@ -1373,60 +1437,13 @@ impl PassWorkspace {
             if geometry.query != heads[0] || geometry.kv != heads[1] {
                 return Err(bad("two visits of one attention kind differ in head count"));
             }
-            let row = |name: &str, at: usize, len: usize| -> Result<Vec<f32>, EngError> {
-                host.weights.row(name, at, len).map(|cow| cow.into_owned())
-            };
-            let vec = |name: &str, len: usize| -> Result<Vec<f32>, EngError> {
-                host.weights.vec(name, len).map(|cow| cow.into_owned())
-            };
-            let mut mix: [Range<usize>; ROLES] = std::array::from_fn(|_| 0..0);
-            if let Some(q) = physical.checked_sub(1) {
-                for (role, range) in mix.iter_mut().enumerate() {
-                    *range = consts.add(&row(
-                        &format!("model.llm.attn_res.attn_queries.{q}"),
-                        if kind == 0 { 0 } else { role },
-                        h,
-                    )?);
-                }
-            }
-            let mut control: [Range<usize>; 4] = std::array::from_fn(|_| 0..0);
-            if host.pass_visit_banked(visit.state_slot) {
-                for (range, role) in control
-                    .iter_mut()
-                    .zip([Role::Query, Role::Key, Role::Value, Role::Mlp])
-                {
-                    *range = consts.add(&host.control_query(physical, role)?);
-                }
-            }
-            let mut norms: [Range<usize>; ROLES] = std::array::from_fn(|_| 0..0);
-            for (i, range) in norms.iter_mut().enumerate() {
-                *range = consts.add(&vec(&attention_norm_name(&layer, kind == 0, i), h)?);
-            }
-            let mut clip = vec(&format!("{prefix}.q_l2_clip.scale"), geometry.channels)?;
-            clip.extend_from_slice(&vec(&format!("{prefix}.rel_l2_clip.scale"), geometry.relative)?);
-            let conv = |plane: &str| -> Result<Vec<f32>, EngError> {
-                let name = if dynamic { "static_w" } else { "weight" };
-                vec(&format!("{prefix}.{plane}_sconv.{name}"), TAPS * geometry.kv_channels)
-            };
-            let consts_for_visit = VisitConsts {
-                mix,
-                control,
-                norms,
-                clip: consts.add(&clip),
-                conv_k: consts.add(&conv("k")?),
-                conv_v: consts.add(&conv("v")?),
-                attn_sconv: consts.add(&vec(&format!("{prefix}.attn_sconv.weight"), TAPS * h)?),
-                mlp_mix: consts.add(&vec(&format!("model.llm.attn_res.mlp_queries.{physical}"), h)?),
-                mlp_norm: consts.add(&vec(&format!("{layer}.mlp_norm.weight"), h)?),
-                mlp_sconv: consts.add(&vec(&format!("{layer}.mlp_sconv.weight"), TAPS * h)?),
-                router_bias: consts.add(&vec(&format!("{layer}.mlp.gate.bias"), experts)?),
-            };
+            let consts = CpuForward::visit_consts(host, *visit, geometry, &mut consts)?;
             let tails = tails_words..tails_words + PAST * (2 * geometry.kv_channels + 2 * h);
             tails_words = tails.end;
             visits.push(VisitPlan {
                 kind,
                 tails,
-                consts: consts_for_visit,
+                consts,
                 heads,
             });
         }

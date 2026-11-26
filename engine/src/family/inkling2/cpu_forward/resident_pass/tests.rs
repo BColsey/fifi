@@ -102,3 +102,28 @@ fn resident_pass_parity() {
     assert!(max_abs < 1e-2, "logits differ from the flag-off path by {max_abs}");
     assert_eq!(argmax, expected_argmax, "a greedy decode step picks another token");
 }
+
+/// Every constant the pass plans for every visit resolves in the checkpoint (host only: no CUDA).
+#[test]
+#[ignore = "requires the Inkling GGUF"]
+fn pass_constant_names() {
+    let checkpoint = env::var_os("FIFI_INKLING_MODEL_DIR").expect("set the Inkling GGUF path");
+    let model = CpuForward::open(Path::new(&checkpoint), 512 + 64).unwrap();
+    let mut consts = Consts::default();
+    let mut geometries: [Option<Geometry>; 2] = [None, None];
+    for visit in &model.visits {
+        let heads = model.pass_heads(visit.attention);
+        let kind = usize::from(visit.attention == Attention::Global);
+        let geometry = *geometries[kind].get_or_insert(Geometry {
+            query: heads[0],
+            kv: heads[1],
+            channels: heads[0] * HEAD_DIM,
+            kv_channels: heads[1] * HEAD_DIM,
+            relative: heads[0] * model.math.d_rel,
+        });
+        CpuForward::visit_consts(&model, *visit, geometry, &mut consts).unwrap_or_else(|error| {
+            panic!("visit {} (layer {}): {:?}", visit.state_slot, visit.weight_layer, error.describe())
+        });
+    }
+    eprintln!("Inkling resident pass constants resolve for {} visits: {} words", model.visits.len(), consts.bytes.len());
+}
