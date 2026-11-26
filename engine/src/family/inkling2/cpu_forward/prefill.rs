@@ -734,6 +734,9 @@ impl CpuForward {
         layer: &str,
         rows: &[PromptRow<'_>],
     ) -> Result<Vec<[Vec<f32>; 3]>, EngError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
         let local = visit.attention == Attention::Local;
         let roles = if local { 1 } else { 3 };
         let hidden = self.hidden();
@@ -756,9 +759,9 @@ impl CpuForward {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let eps = self.math.rms_norm_eps;
-        let mut streams: Vec<&Stream> = rows.iter().map(|row| &row.stream).collect();
-        Ok(crate::family::host_rows::map_rows(
-            &mut streams,
+        let streams: Vec<&Stream> = rows.iter().map(|row| &row.stream).collect();
+        Ok(crate::family::host_rows::map_shared(
+            &streams,
             PROMPT_ROW_SPLIT,
             |stream| {
                 let input = |role: usize| {

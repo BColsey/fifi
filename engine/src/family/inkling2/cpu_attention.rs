@@ -46,9 +46,14 @@ impl CausalConv {
         for (result, x) in output.iter_mut().zip(&input) {
             *result = (*result + x) * norm;
         }
-        self.0.push_front(input);
-        self.0.truncate(taps - 1);
+        self.remember(input, taps);
         output
+    }
+
+    /// Records a raw row as the newest of the at most `taps - 1` history rows.
+    fn remember(&mut self, raw: Vec<f32>, taps: usize) {
+        self.0.push_front(raw);
+        self.0.truncate(taps - 1);
     }
 }
 
@@ -1099,7 +1104,8 @@ impl PrefillBridge<'_> {
         let heads = self.heads;
         let channels = heads.kv_channels();
         let taps = forward.math.sconv_kernel_size;
-        let dynamic = self.visit.attention == super::Attention::Global;
+        // The host convolution's rule: per-row taps were projected exactly when they are dynamic.
+        let dynamic = !coefficients.is_empty();
         let name = if dynamic { "static_w" } else { "weight" };
         let [k, v] = ["k", "v"].map(|plane| {
             forward.weights.vec(
@@ -1241,12 +1247,10 @@ impl PrefillBridge<'_> {
             for (row, [k, v]) in prepared.iter_mut().zip(device.rows) {
                 (row.k, row.v) = (k, v);
             }
-            let past = forward.math.sconv_kernel_size - 1;
+            let taps = forward.math.sconv_kernel_size;
             for [k, v] in device.raw_tail {
-                for (history, raw) in [(&mut state.conv.k.0, k), (&mut state.conv.v.0, v)] {
-                    history.push_front(raw);
-                    history.truncate(past);
-                }
+                state.conv.k.remember(k, taps);
+                state.conv.v.remember(v, taps);
             }
         }
         // The device ring is only a cache: publish the prepared host K/V
@@ -1317,6 +1321,35 @@ fn causal_conv_uses_per_visit_history_and_native_tap_order() {
     full.apply(vec![4.0], &[3.0, 2.0], 2, dynamic(vec![1.0, 2.0]));
     let actual = full.apply(vec![5.0], &[3.0, 2.0], 2, dynamic(vec![1.0, 2.0]));
     assert!((actual[0] - 41.0 / 5.0_f32.sqrt()).abs() < 2e-6);
+}
+
+#[test]
+fn sub_tiles_carry_the_history_one_tile_would_leave() {
+    // The device returns each sub-tile's last raw rows, at most `taps - 1`, oldest first.
+    let taps = 4;
+    let rows: Vec<Vec<f32>> = (0..7).map(|i| vec![i as f32, -(i as f32)]).collect();
+    for prior in 0..taps {
+        let mut whole = CausalConv::default();
+        for row in &rows[..prior] {
+            whole.apply(row.clone(), &[0.5; 8], taps, None);
+        }
+        let start = whole.clone();
+        for row in &rows[prior..] {
+            whole.apply(row.clone(), &[0.5; 8], taps, None);
+        }
+        for split in [vec![7 - prior], vec![1, 6 - prior], vec![2, 1, 4 - prior]] {
+            let mut carried = start.clone();
+            let mut first = prior;
+            for count in split {
+                let tile = &rows[first..first + count];
+                for raw in &tile[count - count.min(taps - 1)..] {
+                    carried.remember(raw.clone(), taps);
+                }
+                first += count;
+            }
+            assert_eq!(carried, whole, "prior {prior}");
+        }
+    }
 }
 
 #[test]

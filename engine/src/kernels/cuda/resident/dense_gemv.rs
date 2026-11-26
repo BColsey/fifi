@@ -592,14 +592,17 @@ mod group_tests {
                     weight.extend((0..payload).map(|i| ((i * 31 + block * 13) % 255) as u8));
                 }
                 let w = upload_bytes(&ctx, &weight);
-                for m in [2, 3, 5, 31] {
-                    let shape = DenseGemvShape::packed(m, rows, cols);
-                    let xs: Vec<_> = (0..m * cols)
+                for (m, gap) in [(2, 0), (3, 0), (5, 3), (31, 0), (512, 0), (512, 3)] {
+                    // A gap leaves odd strides between the activation and output rows.
+                    let mut shape = DenseGemvShape::packed(m, rows, cols);
+                    shape.ld_x += gap;
+                    shape.ld_y += 2 * gap;
+                    let xs: Vec<_> = (0..m * shape.ld_x)
                         .map(|i| ((i as f32 * 0.071).sin() * (1.0 + (i % 19) as f32)).to_ne_bytes())
                         .collect();
                     let x = upload_bytes(&ctx, xs.as_flattened());
                     let run = |tile| {
-                        let y = ctx.allocate(m * rows * 4).unwrap();
+                        let y = upload_bytes(&ctx, &vec![0; m * shape.ld_y * 4]);
                         let call = DenseGemvCall {
                             shape,
                             dtype: DenseDtype::PackedGguf(ty),
@@ -615,8 +618,15 @@ mod group_tests {
                     };
                     let (plain, expected) = run(false);
                     let (tiles, actual) = run(true);
-                    assert_eq!((plain, tiles), (0, 1), "{ty:?} {rows}x{cols} rows {m}");
-                    assert!(actual == expected, "{ty:?} {rows}x{cols} rows {m}");
+                    assert_eq!(
+                        (plain, tiles),
+                        (0, 1),
+                        "{ty:?} {rows}x{cols} rows {m} gap {gap}"
+                    );
+                    assert!(
+                        actual == expected,
+                        "{ty:?} {rows}x{cols} rows {m} gap {gap}"
+                    );
                 }
             }
         }

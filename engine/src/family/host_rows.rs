@@ -11,11 +11,16 @@ impl RowSplit {
     /// Threads for `rows` rows on this host: at most `max_threads` and the host's parallelism,
     /// each with at least `min_rows` rows; one when fewer than two would remain.
     pub(crate) fn threads(self, rows: usize) -> usize {
-        let threads = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(self.max_threads)
-            .min(rows / self.min_rows.max(1));
+        static HOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let host =
+            *HOST.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+        let threads = host.min(self.max_threads).min(rows / self.min_rows.max(1));
         if threads < 2 { 1 } else { threads }
+    }
+
+    /// Rows per thread for `rows` rows, never zero.
+    fn chunk(self, rows: usize) -> usize {
+        rows.div_ceil(self.threads(rows)).max(1)
     }
 }
 
@@ -26,17 +31,34 @@ pub(crate) fn map_rows<T: Send, R: Send>(
     split: RowSplit,
     f: impl Fn(&mut T) -> R + Sync,
 ) -> Vec<R> {
-    let threads = split.threads(items.len());
-    if threads == 1 {
-        return items.iter_mut().map(f).collect();
+    let chunk = split.chunk(items.len());
+    in_parts(items.chunks_mut(chunk), |part| {
+        part.iter_mut().map(&f).collect()
+    })
+}
+
+/// [`map_rows`] over items the work only reads.
+pub(crate) fn map_shared<T: Sync, R: Send>(
+    items: &[T],
+    split: RowSplit,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let chunk = split.chunk(items.len());
+    in_parts(items.chunks(chunk), |part| part.iter().map(&f).collect())
+}
+
+/// Runs each part on its own scoped thread (the only part on the caller) and joins the results
+/// in part order.
+fn in_parts<P: Send, R: Send>(
+    parts: impl ExactSizeIterator<Item = P>,
+    run: impl Fn(P) -> Vec<R> + Sync,
+) -> Vec<R> {
+    if parts.len() <= 1 {
+        return parts.flat_map(run).collect();
     }
-    let chunk = items.len().div_ceil(threads);
-    let f = &f;
+    let run = &run;
     std::thread::scope(|scope| {
-        let parts: Vec<_> = items
-            .chunks_mut(chunk)
-            .map(|part| scope.spawn(move || part.iter_mut().map(f).collect::<Vec<_>>()))
-            .collect();
+        let parts: Vec<_> = parts.map(|part| scope.spawn(move || run(part))).collect();
         parts
             .into_iter()
             .flat_map(|part| {
@@ -65,6 +87,8 @@ mod tests {
             });
             assert_eq!(doubled, (0..len).map(|x| (x + 100) * 2).collect::<Vec<_>>());
             assert_eq!(items, (100..100 + len).collect::<Vec<_>>());
+            let tripled = map_shared(&items, split, |x| *x * 3);
+            assert_eq!(tripled, (100..100 + len).map(|x| x * 3).collect::<Vec<_>>());
         }
     }
 

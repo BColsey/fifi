@@ -229,11 +229,12 @@ constexpr int exact_expert_tile(int type, int m, int rows, int cols) {
         // Inkling attention projections at the measured narrow and wide tile shapes.
         return rows == 3072 && cols == 2304 && (m == 8 || m == 63 || m == 64) ? 2 : 0;
     }
-    const bool block32 = type == 42 || type == 20 || type == 8;  // Q2_0, IQ4_NL, Q8_0
+    // Q2_0, IQ4_NL and Q8_0 tile four rows when the activations are narrow enough.
+    const bool four_rows = type == 42 || type == 20 || type == 8;
     if (m < 2 || m > 512 || rows > kInklingGateWidth || cols > kInklingGateWidth ||
-        (type != 16 && !block32)) return 0;
+        (type != 16 && !four_rows)) return 0;
     // At most 18 KiB of activation staging per CTA.
-    return block32 && cols <= kInklingGateWidth / 2 && m >= 4 ? 4 : 2;
+    return four_rows && cols <= kInklingGateWidth / 2 && m >= 4 ? 4 : 2;
 }
 
 static_assert(exact_expert_tile(16, 512, 2304, 2304) == 2 &&

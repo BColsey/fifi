@@ -146,7 +146,8 @@ __global__ void inkling_kv_prep_rows(KvRowsArgs a) {
         conv = __fadd_rn(conv, __fmul_rn(w, x));
     }
     const float raw = a.raw[(size_t)row * a.raw_stride + raw_at + at];
-    const float norm = 1.f / sqrtf(float(a.dynamic ? 2 * kTaps + 1 : kTaps + 1));
+    // Explicitly rounded steps, so a fast-math build cannot change the host's order.
+    const float norm = __frcp_rn(__fsqrt_rn(float(a.dynamic ? 2 * kTaps + 1 : kTaps + 1)));
     const float x = __fmul_rn(__fadd_rn(conv, raw), norm);
     squares[d] = __fmul_rn(x, x);
     __syncthreads();
@@ -154,8 +155,8 @@ __global__ void inkling_kv_prep_rows(KvRowsArgs a) {
     if (d == 0) {
         float sum = 0.f;
         for (int i = 0; i < kWidth; ++i) sum = __fadd_rn(sum, squares[i]);
-        scale = plane ? 1.f / sqrtf(sum / kWidth + a.eps)
-                      : fminf(1.f, a.limit / (sqrtf(sum) + 1.e-6f));
+        scale = plane ? __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(sum, float(kWidth)), a.eps)))
+                      : fminf(1.f, __fdiv_rn(a.limit, __fadd_rn(__fsqrt_rn(sum), 1.e-6f)));
         valid = isfinite(sum);
     }
     __syncthreads();

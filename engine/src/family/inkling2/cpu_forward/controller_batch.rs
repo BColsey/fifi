@@ -9,7 +9,7 @@ use super::{
     control_input_from, control_names,
 };
 use crate::EngError;
-use crate::family::host_rows::map_rows;
+use crate::family::host_rows::map_shared;
 use crate::family::inkling2::{
     cpu_attention::{AttentionProjection, note_resident_queries},
     cuda_projection::gguf::{
@@ -468,6 +468,9 @@ impl CpuForward {
         visit: LayerVisit,
         rows: &[(&Stream, &MessageBank)],
     ) -> Result<Vec<[PreparedInput; 3]>, EngError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
         // Local roles share the residual before their separate cross-pass gates.
         let local = visit.attention == Attention::Local;
         let hidden = self.hidden();
@@ -503,9 +506,7 @@ impl CpuForward {
                 }
             })
         };
-        Ok(map_rows(&mut rows.to_vec(), PROMPT_ROW_SPLIT, |row| {
-            prepare(row)
-        }))
+        Ok(map_shared(rows, PROMPT_ROW_SPLIT, prepare))
     }
 }
 

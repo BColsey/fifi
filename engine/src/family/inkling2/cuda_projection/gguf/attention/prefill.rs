@@ -1090,4 +1090,45 @@ mod tests {
         assert!(query.capacity(false) > side.capacity(false));
         assert!(side.capacity(false) > host.capacity(false));
     }
+
+    #[test]
+    fn raw_kv_layouts_keep_kv_slots_and_fit_their_preparation() {
+        let shape = RelativeAttentionShape {
+            query_heads: 64,
+            kv_heads: 8,
+            relative_dims: 32,
+            relative_extent: 1024,
+            capacity: 4096,
+        };
+        let kv_bytes = 8 * 128 * size_of::<f32>();
+        let projected = Some(16384);
+        for query in [false, true] {
+            let plain = Layout::new(shape, projected, projection_side(query, false)).unwrap();
+            let kv = Layout::new(shape, projected, projection_side(query, true)).unwrap();
+            assert!(kv.raw_kv && !plain.raw_kv);
+            // The host rows keep slots for the prepared K and V; the side rows add the raw ones.
+            assert_eq!(kv.input, plain.input);
+            assert_eq!(kv.side_stride(), plain.side_stride() + 2 * kv_bytes);
+            assert_eq!(kv.side_slots()[1..3], [false, false]);
+            assert_eq!(plain.kv_prep_words(), [0, 0]);
+            assert_eq!(kv.kv_prep_words(), [2 * 7 * 1024, 2 * 4 * 8]);
+            assert_eq!(
+                kv.fixed_bytes(),
+                kv.scales + 4 * 2 * 7 * 1024 + 3 * kv.side_stride()
+            );
+            for tiled in [false, true] {
+                let capacity = kv.capacity(tiled);
+                let row_bytes = kv.row_bytes().unwrap();
+                assert!(capacity > 0);
+                assert!(kv.fixed_bytes() + capacity * row_bytes <= ARENA_BYTES);
+                assert!(
+                    capacity == plain.capacity(tiled)
+                        || kv.fixed_bytes() + (capacity + 1) * row_bytes > ARENA_BYTES
+                );
+            }
+        }
+        // K and V are raw together or not at all.
+        assert!(Layout::new(shape, projected, &[1, 4, 5]).is_none());
+        assert!(Layout::new(shape, projected, &[2, 4, 5]).is_none());
+    }
 }
