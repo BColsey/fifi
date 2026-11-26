@@ -169,7 +169,8 @@ impl CpuForward {
         let names = names.each_ref().map(String::as_str);
         let caps = [self.math.mlp_gate_softcap, self.math.mlp_up_softcap];
         if !width.is_multiple_of(4)
-            || weights.resident_prefill_router_shape(0, &router) != Some([experts, width])
+            || weights.resident_prefill_router_shape(0, &router, rows.len())
+                != Some([experts, width])
         {
             return Ok(false);
         }

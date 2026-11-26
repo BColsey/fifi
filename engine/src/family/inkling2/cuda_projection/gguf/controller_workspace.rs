@@ -5,6 +5,25 @@ use super::{CudaContext, DensePlan, DenseStep, EngError, controller_residency};
 pub(super) const TILE_ROWS: usize = 8;
 const MAX_BYTES: usize = 4 << 20;
 
+/// Keep the legacy workspace and shape unless both weight experiments are enabled.
+pub(super) fn target_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        if std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_VISIT").as_deref() == Ok("1")
+            && std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_WIDE").as_deref() == Ok("1")
+        {
+            // Larger arena is separately opt-in; unknown settings use 64.
+            match std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_WINDOW").as_deref() {
+                Ok("128") => 128,
+                Ok("256") => 256,
+                _ => 64,
+            }
+        } else {
+            TILE_ROWS
+        }
+    })
+}
+
 pub(super) fn enabled() -> bool {
     std::env::var("FIFI_INKLING_CUDA_PREFILL_CONTROLLER_WORKSPACE").as_deref() == Ok("1")
 }
@@ -14,25 +33,34 @@ pub(super) fn admit(
     [rank, hidden, max_output]: [usize; 3],
     expert_bytes: u64,
 ) -> Result<Option<DenseStep>, EngError> {
-    let Some(plan) = plan([rank, hidden, max_output])? else {
-        return Ok(None);
-    };
+    let shape = [rank, hidden, max_output];
     let Some(floor) = controller_residency::workspace_floor(expert_bytes) else {
         return Ok(None);
     };
-    if !fits(context.memory_info()?.free as u64, plan.device_bytes, floor) {
-        return Ok(None);
+    let free = context.memory_info()?.free as u64;
+    for rows in [256, 128, 64, TILE_ROWS] {
+        if rows > target_rows() {
+            continue;
+        }
+        let candidate = if rows == TILE_ROWS {
+            plan(shape)?
+        } else {
+            bounded_plan(shape, rows, rows * (512 << 10))?
+        };
+        let Some(plan) = candidate.filter(|p| fits(free, p.device_bytes, floor)) else {
+            continue;
+        };
+        let step = match DenseStep::new(context, &plan) {
+            Ok(step) => step,
+            Err(EngError::MemoryPlan(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        if context.memory_info()?.free as u64 >= floor {
+            return Ok(Some(step));
+        }
+        // Drop the oversized arena before considering the next smaller budget.
     }
-    let step = match DenseStep::new(context, &plan) {
-        Ok(step) => step,
-        Err(EngError::MemoryPlan(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    // Check the physical charge as allocations may be rounded by CUDA.
-    if (context.memory_info()?.free as u64) < floor {
-        return Ok(None);
-    }
-    Ok(Some(step))
+    Ok(None)
 }
 
 fn fits(free: u64, bytes: usize, floor: u64) -> bool {
@@ -40,18 +68,26 @@ fn fits(free: u64, bytes: usize, floor: u64) -> bool {
         .is_some_and(|after| after >= floor)
 }
 
-fn plan([rank, hidden, max_output]: [usize; 3]) -> Result<Option<DensePlan>, EngError> {
+fn plan(shape: [usize; 3]) -> Result<Option<DensePlan>, EngError> {
+    bounded_plan(shape, TILE_ROWS, MAX_BYTES)
+}
+
+fn bounded_plan(
+    [rank, hidden, max_output]: [usize; 3],
+    rows: usize,
+    budget: usize,
+) -> Result<Option<DensePlan>, EngError> {
     if !(1..=4096).contains(&hidden) || !(1..=4096).contains(&rank) || max_output == 0 {
         return Ok(None);
     }
     let Some(words) = DenseStep::controlled_attention_row_words([rank, hidden], max_output)
-        .and_then(|n| n.checked_mul(TILE_ROWS))
-        .filter(|&n| n <= MAX_BYTES / size_of::<f32>())
+        .and_then(|n| n.checked_mul(rows))
+        .filter(|&n| n <= budget / size_of::<f32>())
     else {
         return Ok(None);
     };
     let plan = DensePlan::new([words, 2 * hidden], hidden, rank)?;
-    Ok((plan.device_bytes <= MAX_BYTES).then_some(plan))
+    Ok((plan.device_bytes <= budget).then_some(plan))
 }
 
 #[cfg(test)]

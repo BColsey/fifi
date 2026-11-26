@@ -19,6 +19,10 @@ use crate::{
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod resident_first;
+mod resident_mlp;
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod weight_visit_tests;
 
 struct PromptRow<'a> {
     stream: Stream,
@@ -149,6 +153,11 @@ impl CpuForward {
             projection_values += 12 * hidden;
             projection_metadata += (8 * size_of::<Vec<f32>>()) as u128;
         }
+        if resident_mlp::enabled() && !self.draft_window_enabled() {
+            // Pinned input/message slab, shared gamma, and the mixed messages.
+            projection_values += 4 * hidden + 3;
+            projection_metadata += size_of::<Vec<f32>>() as u128;
+        }
         if crate::family::inkling2::cuda_projection::gguf::attention::prefill::enabled() {
             // Finished attention rows coexist until the residual update phase.
             projection_values += hidden;
@@ -185,6 +194,9 @@ impl CpuForward {
                 "a previous Inkling forward invalidated the sequence state",
             ));
         }
+        // Prefill reads host rows; a chain token left them on the device.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.materialize_resident()?;
         if tokens.len() < 2
             || tokens.len() > self.context.saturating_sub(self.position)
             || tokens
@@ -258,6 +270,8 @@ impl CpuForward {
         let core = &self.spec.core;
         let width = core.core_end - core.core_start;
         let end = core.core_start + width * core.num_passes;
+        let mut resident_mlp = (!verify && !self.draft_window_enabled() && resident_mlp::enabled())
+            .then(resident_mlp::Workspace::default);
         for &visit in &self.visits {
             let slot = visit.state_slot;
             if (core.core_start..end).contains(&slot)
@@ -272,7 +286,13 @@ impl CpuForward {
                     row.prelude = None;
                 }
             }
-            self.prompt_visit(visit, &mut state[slot], &mut rows, weights, verify)?;
+            self.prompt_visit(
+                visit,
+                &mut state[slot],
+                &mut rows,
+                weights,
+                (verify, resident_mlp.as_mut()),
+            )?;
         }
         Ok(rows)
     }
@@ -283,7 +303,7 @@ impl CpuForward {
         state: &mut VisitState,
         rows: &mut [PromptRow<'_>],
         weights: &GgufTextWeights,
-        verify: bool,
+        (verify, resident_mlp): (bool, Option<&mut resident_mlp::Workspace>),
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
@@ -291,6 +311,16 @@ impl CpuForward {
         let mut projected = None;
         let router = format!("{prefix}.gate.weight");
         let batch_router = weights.batch_prefill_router(physical as u32, &router);
+        let banked = rows.first().is_some_and(|row| row.bank.is_some());
+        // Choose a device-only consumer before attention can advance causal state.
+        let resident = if batch_router
+            && banked
+            && let Some(scratch) = resident_mlp
+        {
+            scratch.admit(self, weights, (physical, &layer, &prefix), rows.len())?
+        } else {
+            None
+        };
         let batched_attention = batch_router
             && !self.draft_window_enabled()
             && rows.len() > 1
@@ -317,20 +347,19 @@ impl CpuForward {
         };
         // Without the resident batched router, preserve the interleave between
         // per-row prefetch and route observation on cold expert layers.
-        let controller = if batch_router
-            && multirow_controllers_enabled()
-            && rows.first().is_some_and(|row| row.bank.is_some())
-        {
-            let names = control_names(&layer, Role::Mlp);
-            weights.batch_controller(
-                names.each_ref().map(String::as_str),
-                [self.spec.core.gate_rank as usize, self.hidden()],
-                rows.len(),
-                !self.draft_window_enabled(),
-            )?
-        } else {
-            None
-        };
+        let controller =
+            if batch_router && banked && resident.is_none() && multirow_controllers_enabled() {
+                let names = control_names(&layer, Role::Mlp);
+                weights.batch_controller(
+                    names.each_ref().map(String::as_str),
+                    [self.spec.core.gate_rank as usize, self.hidden()],
+                    rows.len(),
+                    !self.draft_window_enabled(),
+                )?
+            } else {
+                None
+            };
+        let control_batched = controller.is_some() || resident.is_some();
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if batched_attention
             && let Some((inputs, _)) = &attention_inputs
@@ -352,13 +381,7 @@ impl CpuForward {
                 }
                 ChainedAttention::Resident(outputs) => outputs,
             };
-            Some(self.prompt_attention_residuals(
-                visit,
-                &layer,
-                rows,
-                outputs,
-                controller.is_some(),
-            )?)
+            Some(self.prompt_attention_residuals(visit, &layer, rows, outputs, control_batched)?)
         } else if batched_attention {
             if let Some((inputs, batched_controllers)) = attention_inputs.take() {
                 let outputs =
@@ -383,7 +406,7 @@ impl CpuForward {
                             &layer,
                             rows,
                             outputs,
-                            controller.is_some(),
+                            control_batched,
                         )
                     })
                     .transpose()?
@@ -418,33 +441,36 @@ impl CpuForward {
                 row.bank.as_ref(),
                 AttentionInput::Grouped(projected.next()),
             )?;
-            if controller.is_some() {
+            if control_batched {
                 Ok(input)
             } else {
                 self.finish_mlp_input(input, row.bank.as_ref(), physical, &layer)
             }
         });
-        let (mlp, retained) = if batch_router {
+        let outputs = if batch_router {
             let mut inputs = match batched {
                 Some(inputs) => inputs,
                 None => inputs.collect::<Result<Vec<_>, _>>()?,
             };
-            if let Some(controller) = controller {
-                self.prompt_mlp_control(visit, &layer, rows, &mut inputs, controller)?;
+            if let Some(resident) = resident {
+                resident.execute(self, rows, &inputs)?
+            } else {
+                if let Some(controller) = controller {
+                    self.prompt_mlp_control(visit, &layer, rows, &mut inputs, controller)?;
+                }
+                let (mlp, retained) = self.prompt_routes(weights, physical, &prefix, inputs)?;
+                self.prompt_experts(weights, physical, &prefix, &mlp, retained)?
             }
-            self.prompt_routes(weights, physical, &prefix, inputs)?
         } else {
-            let rows = inputs
+            let mlp = inputs
                 .map(|input| {
                     let input = input?;
                     let route = self.moe_route(physical, &prefix, &input)?;
                     Ok(MlpRow { route, input })
                 })
-                .collect::<Result<_, EngError>>()?;
-            (rows, None)
+                .collect::<Result<Vec<_>, EngError>>()?;
+            self.prompt_experts(weights, physical, &prefix, &mlp, None)?
         };
-        // The cold expert weight stage holds these rows until resident experts finish.
-        let outputs = self.prompt_experts(weights, physical, &prefix, &mlp, retained)?;
         for (row, output) in rows.iter_mut().zip(outputs) {
             if let Some(journal) = &mut row.journal {
                 let attention = journal
@@ -784,10 +810,10 @@ fn grouped_draft_prefill_matches_serial_taps_and_restored_state() {
     assert!(!model.supports_grouped_prefill());
 
     model.feed_rows(&[1, 2, 3]).unwrap();
-    let prefix = model.snapshot();
+    let prefix = model.snapshot().unwrap();
     let suffix = [4, 5, 6, 7, 8, 9];
     model.feed_rows(&suffix).unwrap();
-    let serial = model.snapshot();
+    let serial = model.snapshot().unwrap();
     let logits = model.logits(10).unwrap();
     assert_eq!(serial.features.len(), serial.position);
     assert!(
@@ -872,7 +898,7 @@ fn grouped_prefill_matches_serial_logits_and_restored_state() {
         for &token in &tokens[..3] {
             model.token(token, false).unwrap();
         }
-        let prefix = model.snapshot();
+        let prefix = model.snapshot().unwrap();
         for _ in 0..2 {
             model.restore(&prefix);
             for chunk in tokens[3..].chunks(width + 1) {
@@ -923,7 +949,7 @@ fn device_grouped_prefill_last_logits() {
     assert!(model.supports_grouped_prefill());
     let (prefix, tail) = tokens.split_at(prefix_rows);
     model.prefill_grouped(prefix).unwrap();
-    let saved = model.snapshot();
+    let saved = model.snapshot().unwrap();
     let trace = env::var("FIFI_INKLING_TEST_VISIT_FINGERPRINT").as_deref() == Ok("1");
     if trace {
         eprintln!(

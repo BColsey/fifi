@@ -29,7 +29,9 @@ use super::{super::state_headroom, bad};
 
 mod local;
 pub(in crate::family::inkling2) mod prefill;
-pub(in crate::family::inkling2) use local::{LocalPrep, LocalReadWeights, LocalResult};
+pub(in crate::family::inkling2) use local::{
+    LocalPrep, LocalReadWeights, LocalResult, ResidentParts, ResidentStatus,
+};
 
 #[derive(Clone, Copy)]
 pub(in crate::family::inkling2) struct Config {
@@ -45,6 +47,26 @@ struct Visit {
     table_bytes: usize,
     cache_at: usize,
     cache_bytes: usize,
+}
+
+/// The local visit geometry as the resident decode chain uses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family::inkling2) struct LocalShape {
+    pub query_heads: usize,
+    pub kv_heads: usize,
+    pub relative_dims: usize,
+}
+
+impl LocalShape {
+    pub(in crate::family::inkling2) fn query_channels(self) -> usize {
+        self.query_heads * HEAD_DIM
+    }
+    pub(in crate::family::inkling2) fn kv_channels(self) -> usize {
+        self.kv_heads * HEAD_DIM
+    }
+    pub(in crate::family::inkling2) fn relative_words(self) -> usize {
+        self.query_heads * self.relative_dims
+    }
 }
 
 pub(in crate::family::inkling2) struct Plan {
@@ -82,6 +104,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     scratch_at: usize,
     local_workspace: Option<(usize, usize)>,
     projected_rows: Option<usize>,
+    align_projected_input: bool,
     projection_headroom: u64,
     reserve_credit: u64,
     stream: DeviceStream,
@@ -89,6 +112,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     state: RefCell<Runtime>,
     prefill: RefCell<Option<prefill::Workspace>>,
     local_aux: RefCell<Option<local::AuxStore>>,
+    resident: RefCell<Option<local::ResidentWorkspace>>,
 }
 
 struct Runtime {
@@ -198,8 +222,13 @@ impl Plan {
         let spare = |bytes: u64| {
             before.saturating_sub(state_headroom(if charge_reserve { bytes } else { 0 }))
         };
+        // Keep status and the returned projection contiguous. Only the internal
+        // attention row, consumed by the single-row weight kernel, needs padding.
+        let align_projected_input = self.projected_rows.is_some()
+            && std::env::var("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref() == Ok("1");
         let bytes = scratch_at
             .checked_add(self.scratch_bytes)
+            .and_then(|n| n.checked_add(if align_projected_input { 12 } else { 0 }))
             .ok_or_else(|| bad("CUDA relative attention arena overflows"))?;
         let proposed_credit = if charge_reserve { bytes as u64 } else { 0 };
         let spare = spare(bytes as u64);
@@ -247,12 +276,14 @@ impl Plan {
             scratch_at,
             local_workspace: self.local_workspace,
             projected_rows: self.projected_rows,
+            align_projected_input,
             projection_headroom,
             reserve_credit: credit,
             stream,
             query_tiles: self.projected_rows.is_some() && prefill::query_tiles_enabled(context),
             prefill: RefCell::default(),
             local_aux: RefCell::default(),
+            resident: RefCell::default(),
             state: RefCell::new(Runtime {
                 transfer,
                 encoded: Vec::with_capacity(self.scratch_bytes),
@@ -296,6 +327,21 @@ impl ResidentAttention {
         self.reserve_credit
     }
 
+    /// The geometry of a visit slot; `None` for an unknown slot.
+    pub(super) fn local_shape(&self, slot: usize) -> Option<LocalShape> {
+        let visit = self.visits.get(slot)?;
+        Some(LocalShape {
+            query_heads: visit.shape.query_heads,
+            kv_heads: visit.shape.kv_heads,
+            relative_dims: visit.shape.relative_dims,
+        })
+    }
+
+    /// The taps of every local short convolution, fixed by the prep kernel.
+    pub(super) fn local_taps(&self) -> usize {
+        crate::kernels::cuda::resident::inkling_local_prep::PrepShape::TAPS
+    }
+
     pub(super) fn projected_rows(&self) -> Option<usize> {
         self.projected_rows
     }
@@ -305,6 +351,55 @@ impl ResidentAttention {
         if let Some(aux) = self.local_aux.borrow_mut().as_mut() {
             aux.invalidate();
         }
+    }
+
+    /// The K and V rows of one visit's ring at `position`, oldest last, read behind the work
+    /// queued on `stream`, which must be the stream that appended the rows. Only explicit host
+    /// events call it; a chain token keeps these rows on the device.
+    pub(in crate::family::inkling2) fn download_ring(
+        &self,
+        stream: &DeviceStream,
+        slot: usize,
+        position: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), EngError> {
+        let visit = self
+            .visits
+            .get(slot)
+            .ok_or_else(|| bad("unknown visit slot"))?;
+        let capacity = visit.shape.capacity;
+        let row_bytes = visit.cache_bytes / capacity;
+        let first = position.saturating_sub(capacity);
+        let rows = position - first;
+        let row_words = row_bytes / size_of::<f32>();
+        let mut planes = Vec::with_capacity(2);
+        for plane in 0..2 {
+            let base = visit.cache_at + plane * visit.cache_bytes;
+            let mut bytes = vec![0u8; rows * row_bytes];
+            let mut read = 0;
+            for (at, count) in ring_splits(first % capacity, rows, capacity) {
+                if count > 0 {
+                    self.arena.read_at(
+                        stream,
+                        base + at * row_bytes,
+                        &mut bytes[read..read + count * row_bytes],
+                    )?;
+                    read += count * row_bytes;
+                }
+            }
+            planes.push(
+                bytes
+                    .chunks_exact(row_bytes)
+                    .map(|row| {
+                        row.chunks_exact(size_of::<f32>())
+                            .map(|word| f32::from_ne_bytes(word.try_into().unwrap()))
+                            .collect::<Vec<f32>>()
+                    })
+                    .collect::<Vec<Vec<f32>>>(),
+            );
+            debug_assert_eq!(planes[plane].len(), rows);
+        }
+        let [keys, values]: [Vec<Vec<f32>>; 2] = planes.try_into().unwrap();
+        Ok((keys, values))
     }
 
     pub(in crate::family::inkling2) fn step(
@@ -342,6 +437,11 @@ impl ResidentAttention {
         // Put the final result immediately after the status word for one readback.
         let chained = projection.is_some();
         let attention_at = out + if chained { output_bytes } else { 0 };
+        let attention_at = if chained && self.align_projected_input {
+            attention_at.next_multiple_of(16)
+        } else {
+            attention_at
+        };
         let attention_out = self.arena.range(attention_at, attention_bytes)?;
         let call = RelativeAttentionCall {
             shape: visit.shape,

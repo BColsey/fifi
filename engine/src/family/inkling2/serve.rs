@@ -569,7 +569,7 @@ impl ExecutorOps for TextExecutor {
             (),
             self.forward.position(),
             kind,
-            || Ok(self.forward.snapshot()),
+            || self.forward.snapshot(),
         )
     }
 

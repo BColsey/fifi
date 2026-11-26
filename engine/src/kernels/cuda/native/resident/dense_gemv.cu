@@ -6,6 +6,8 @@
 #include <mma.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <type_traits>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -300,6 +302,9 @@ bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelect
     return true;
 }
 
+#include "resident/inkling_decode_weights.cuh"
+#include "resident/inkling_decode_control_pair.cuh"
+#include "resident/inkling_decode_attention_group.cuh"
 #include "resident/inkling_gate_dot.cuh"
 #include "resident/inkling_q2_down.cuh"
 
@@ -466,7 +471,12 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
     const size_t shared = (size_t)a.cols * sizeof(float);
     const bool vector = a.cols % (sizeof(uint4) / sizeof(W)) == 0 && aligned(a.w, 16);
-    if (vector) {
+    if (a.m == 1 && ((a.cols == 4608 && a.rows == 64 && a.weight_dtype == kDtypeF32) ||
+                     (a.cols == 2304 && (a.rows == 24 || a.rows == 32) && a.weight_dtype == kDtypeBf16)) &&
+        decode_split_enabled() && vector && aligned(a.x,16)) {
+        if constexpr (std::is_same_v<W,float>) decode_controller_down_exact<<<a.rows,256,0,s>>>(a);
+        else decode_bf16_exact<<<a.rows,32,0,s>>>(a);
+    } else if (vector) {
         dense_gemv_k<W, true><<<grid, kWarps * 32, shared, s>>>(
             (const W *)a.w, (const float *)a.x, (float *)a.y, a.rows, a.cols, a.ld_x, a.ld_y);
     } else {
@@ -481,6 +491,10 @@ void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
                    Failure &failure, Index index) {
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
     const size_t shared = size_t(a.cols) * sizeof(float);
+    if (decode_split_enabled() && launch_decode_split(a, index, stream)) {
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        return;
+    }
     if (a.weight_dtype == kDtypeGgufNvfp4) {
         gguf_nvfp4_gemv<Index><<<grid, kWarps * 32, 0, stream>>>(a, index);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -600,8 +614,13 @@ bool launch_inkling_q2_down(const inference_cuda_gguf_moe_args &a, DeviceSelecte
                             const float *middle, float *down, cudaStream_t stream, Failure &failure) {
     if (!inkling_q2_down_shape(a.hidden, a.middle, a.count, a.down_dtype)) return false;
     const dim3 grid(kInklingDownRows / kQ2RowsPerCta, kInklingDownPicks);
-    inkling_q2_down<<<grid, kWarps * 32, 0, stream>>>(
-        static_cast<const uint8_t *>(a.down), middle, down, index);
+    if (decode_split_enabled() && aligned(middle, 16)) {
+        decode_q2_pair<<<grid, kWarps * 32, 0, stream>>>(
+            static_cast<const uint8_t *>(a.down), middle, down, index);
+    } else {
+        inkling_q2_down<<<grid, kWarps * 32, 0, stream>>>(
+            static_cast<const uint8_t *>(a.down), middle, down, index);
+    }
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     return true;
 }
@@ -675,7 +694,92 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
     }
 }
 
+extern "C" int inference_cuda_decode_attention_group(const inference_cuda_dense_gemv_args *calls,
+        int count, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!calls || (count != 6 && count != 8)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        DecodeAttentionGroup group{};
+        int blocks=0;
+        for (int i=0;i<count;++i) {
+            const auto &a=calls[i];
+            int n=decode_attention_blocks(a);
+            if (!n || !valid(a,stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            group.calls[i]=a;
+            group.limits[i]=blocks+=n;
+        }
+        for (int i=count;i<8;++i) group.limits[i]=blocks;
+        for (int i=0;i<count;++i) {
+            Span dst={calls[i].y,size_t(calls[i].rows)*4};
+            for (int j=0;j<count;++j) if (j!=i) {
+                const auto &b=calls[j];
+                if (!apart(dst,{b.y,size_t(b.rows)*4}) || !apart(dst,{b.x,2304*4}) ||
+                    !apart(dst,{b.w,size_t(b.rows)*weight_row_bytes(b.weight_dtype,2304)}))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
+        Failure f;
+        decode_attention_group<<<blocks,128,0,(cudaStream_t)stream>>>(group);
+        f.record(cudaGetLastError(),INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage,f.stage);
+        return (int)f.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_decode_control_pair(const inference_cuda_dense_gemv_args *a,
+        const inference_cuda_dense_gemv_args *b, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        const auto eligible = [stream](const inference_cuda_dense_gemv_args *p) {
+            return p && p->weight_dtype == kDtypeF32 && p->m == 1 && p->rows == 2304 &&
+                   p->cols == 64 && aligned(p->w, 16) && valid(*p, stream);
+        };
+        if (!eligible(a) || !eligible(b) || a->x != b->x ||
+            !apart({a->y,2304*4},{b->y,2304*4}) ||
+            !apart({a->y,2304*4},{b->w,2304*64*4}) ||
+            !apart({b->y,2304*4},{a->w,2304*64*4})) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure f;
+        decode_control_pair<<<dim3(144,2),256,0,(cudaStream_t)stream>>>(*a,*b);
+        f.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, f.stage);
+        return (int)f.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
 namespace {
+
+#include "resident/inkling_q8_visit.cuh"
+#include "resident/inkling_exact_visit_tile.cuh"
+#include "resident/inkling_qkv_visit.cuh"
+#include "resident/inkling_prefetch_select.cuh"
+#include "resident/inkling_prefetch_large.cuh"
+#include "resident/inkling_split_visit_tile.cuh"
+#include "resident/inkling_iq2_visit_tile.cuh"
+#include "resident/inkling_controller_pair.cuh"
+#include "resident/inkling_f32_visit.cuh"
+#include "resident/inkling_panel_mma.cuh"
+#include "resident/inkling_expert_group.cuh"
+#ifdef FIFI_VISIT_PROBE
+#include "resident/inkling_stream_visit.cuh"
+#include "resident/inkling_splitn_visit.cuh"
+#include "resident/inkling_grid_split.cuh"
+#include "resident/inkling_warp_visit.cuh"
+#include "resident/inkling_quartet.cuh"
+#include "resident/inkling_q8_residual_imma.cuh"
+#include "resident/inkling_q6_imma.cuh"
+#include "resident/inkling_expert_octet.cuh"
+#include "resident/inkling_interleave_visit.cuh"
+#include "resident/inkling_token_visit.cuh"
+#include "resident/inkling_simt_visit.cuh"
+#include "resident/inkling_panel_wide.cuh"
+#include "resident/inkling_weight_panel.cuh"
+#include "resident/inkling_group64.cuh"
+#include "resident/inkling_occupancy_tile.cuh"
+#endif
 
 // Two adjacent input rows share a decoded Q8_0 weight. Keep lane c on
 // column block*32+c and preserve the baseline FMA order within each row.
@@ -798,6 +902,357 @@ cudaError_t current_is_sm75(bool &sm75) {
 
 }  // namespace
 
+extern "C" int inference_cuda_inkling_ragged_pair_launch(const inference_cuda_dense_gemv_args *args,void *stream,int *stage,int *used){
+    if(!args || !used)return INFERENCE_CUDA_INVALID_ARGUMENT;*used=0;report_stage(stage,INFERENCE_CUDA_STAGE_NONE);
+    const auto a=args[0],b=args[1];if(!valid(a,stream)||!valid(b,stream))return INFERENCE_CUDA_INVALID_ARGUMENT;
+    const int c=a.weight_dtype-256;auto bin=[c](int m){return m==4?0:m>=5 && m<=8?1:m>=9 && m<=(c==16?16:32)?2:-1;};int slot=bin(a.m);
+    if(slot<0 || slot!=bin(b.m) || a.weight_dtype!=b.weight_dtype || a.rows!=2304 || b.rows!=2304 || a.cols!=b.cols ||
+        !((c==16 && a.cols==2304)||(c==42 && a.cols==1152)) || !aligned(a.x,16)||!aligned(b.x,16)||a.ld_x%4||b.ld_x%4)return 0;
+    auto y=[](const inference_cuda_dense_gemv_args &i){return Span{i.y,4*(size_t(i.m-1)*i.ld_y+i.rows)};};
+    auto x=[](const inference_cuda_dense_gemv_args &i){return Span{i.x,4*(size_t(i.m-1)*i.ld_x+i.cols)};};
+    size_t wb=2304*weight_row_bytes(a.weight_dtype,a.cols);
+    if(!apart(y(a),y(b))||!apart(y(a),x(b))||!apart(y(b),x(a))||!apart(y(a),{b.w,wb})||!apart(y(b),{a.w,wb}))return 0;
+    bool sm75;auto err=current_is_sm75(sm75);if(err==cudaSuccess){if(!sm75)return 0;int bm=slot==0?4:slot==1 || c==42?8:16;
+        InklingExpertGroup g{};g.calls[0]=a;g.calls[1]=b;g.ends[0]=(a.m+bm-1)/bm;g.ends[1]=g.ends[0]+(b.m+bm-1)/bm;auto s=static_cast<cudaStream_t>(stream);
+#define RAG2(C,M,R) inkling_ragged_exact<C,M,R><<<dim3(2304/(8*R),g.ends[1]),256,0,s>>>(g)
+        if(c==16){if(slot==0){RAG2(16,4,2);}else if(slot==1){RAG2(16,8,2);}else{RAG2(16,16,2);}}
+        else{if(slot==0){RAG2(42,4,2);}else if(slot==1){RAG2(42,8,2);}else{RAG2(42,8,4);}}
+#undef RAG2
+        err=cudaGetLastError();}
+    if(err==cudaSuccess)*used=1;else report_stage(stage,INFERENCE_CUDA_STAGE_LAUNCH);return int(err);}
+
+extern "C" int inference_cuda_inkling_down_launch(const inference_cuda_dense_gemv_args *args,void *stream,int *stage){
+    if(!args || !valid(*args,stream) || args->weight_dtype!=kDtypeF32 || args->rows!=64 || args->cols!=4608)return INFERENCE_CUDA_INVALID_ARGUMENT;
+    const auto a=*args;const auto s=static_cast<cudaStream_t>(stream);
+    if(!aligned(a.w,16) || !aligned(a.x,16) || a.ld_x%4)return inference_cuda_dense_gemv_launch(args,stream,stage);
+    bool sm75;auto e=current_is_sm75(sm75);if(e==cudaSuccess){if(!sm75)return inference_cuda_dense_gemv_launch(args,stream,stage);
+        switch(a.m){case 7:case 8:case 21:inkling_f32_rank_direct<2><<<dim3(8,(a.m+1)/2),256,0,s>>>(a);break;
+            case 63:case 64:inkling_f32_visit<8,1><<<dim3(8,(a.m+7)/8),256,0,s>>>(a);break;
+            case 127:case 128:case 255:case 256:inkling_f32_visit<8,2><<<dim3(4,(a.m+7)/8),256,0,s>>>(a);break;
+            default:return inference_cuda_dense_gemv_launch(args,stream,stage);}e=cudaGetLastError();}
+    report_stage(stage,e==cudaSuccess?INFERENCE_CUDA_STAGE_NONE:INFERENCE_CUDA_STAGE_LAUNCH);return int(e);}
+
+extern "C" int inference_cuda_inkling_panel_launch(const inference_cuda_dense_gemv_args *args,void *scratch,
+    size_t scratch_bytes, void *stream,int *stage,int *used){
+    if(!used || !args || !valid(*args,stream))return INFERENCE_CUDA_INVALID_ARGUMENT;
+    *used=0; report_stage(stage,INFERENCE_CUDA_STAGE_NONE);
+    const auto a=*args;const int kind=a.weight_dtype==kDtypeGgufNvfp4?40:a.weight_dtype-fifi_gguf::kDtypeBase;
+    if(a.rows!=2304 || a.m<=32 || a.m>512 || (kind==40?a.cols!=1152:((kind!=17 && kind!=19 && kind!=22) || a.cols!=2304)) ||
+        !aligned(a.x,16) || a.ld_x%4 || !scratch || !aligned(scratch,16))return 0;
+    const size_t size=size_t(a.rows)*a.cols*2;Span tmp{scratch,size};
+    if(scratch_bytes<size || !apart(tmp,{a.w,size_t(a.rows)*weight_row_bytes(a.weight_dtype,a.cols)}) ||
+        !apart(tmp,{a.x,4*(size_t(a.m-1)*a.ld_x+a.cols)}) || !apart(tmp,{a.y,4*(size_t(a.m-1)*a.ld_y+a.rows)}))return 0;
+    auto s=static_cast<cudaStream_t>(stream);auto pack=static_cast<__half *>(scratch);bool sm75;auto err=current_is_sm75(sm75);
+    if(err==cudaSuccess){if(!sm75)return 0; const int grid=a.rows*a.cols/2048;
+        switch(kind){case 17:inkling_decode_panels<17,2304,256,74><<<grid,256,0,s>>>(a,pack);break;
+            case 19:inkling_decode_panels<19,2304,256,50><<<grid,256,0,s>>>(a,pack);break;
+            case 22:inkling_decode_panels<22,2304,256,82><<<grid,256,0,s>>>(a,pack);break;
+            case 40:inkling_decode_panels<40,1152,64,36><<<grid,256,0,s>>>(a,pack);break;}
+        err=cudaGetLastError();if(err==cudaSuccess){dim3 g(72,(a.m+31)/32);
+            if(kind==40)inkling_panel_mma<1152><<<g,128,0,s>>>(a,pack);else inkling_panel_mma<2304><<<g,128,0,s>>>(a,pack);
+            err=cudaGetLastError();}}
+    if(err==cudaSuccess)*used=1;else report_stage(stage,INFERENCE_CUDA_STAGE_LAUNCH);
+    return int(err);
+}
+
+extern "C" int inference_cuda_inkling_qkv_visit_launch(const inference_cuda_dense_gemv_args *args,
+    int count,void *stream,int *stage,int *used){
+    if(!used || !args || count<2 || count>4)return INFERENCE_CUDA_INVALID_ARGUMENT;
+    *used=0;report_stage(stage,INFERENCE_CUDA_STAGE_NONE);
+    InklingQkvGroup group{}; unsigned tiles=0;
+    for(int i=0;i<count;i++){
+        const auto &a=args[i];if(!valid(a,stream))return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if(a.weight_dtype!=kQ8 || a.m!=args[0].m || a.m<7 || a.m>12 || a.cols!=2304 || (a.rows!=1024 && a.rows!=3072))return 0;
+        Span ya{a.y,4*(size_t(a.m-1)*a.ld_y+a.rows)};
+        for(int j=0;j<count;j++)if(j!=i){const auto &b=args[j];if(!valid(b,stream))return INFERENCE_CUDA_INVALID_ARGUMENT;
+            Span xb{b.x,4*(size_t(b.m-1)*b.ld_x+b.cols)},wb{b.w,size_t(b.rows)*fifi_gguf::row_bytes(b.weight_dtype,b.cols)};
+            if(!apart(ya,xb)||!apart(ya,wb))return 0;
+            Span yb{b.y,4*(size_t(b.m-1)*b.ld_y+b.rows)};
+            if(!apart(ya,yb)){
+                if(a.ld_y!=b.ld_y)return 0;
+                size_t stride=size_t(a.ld_y)*4;
+                size_t delta=(uintptr_t(b.y)%stride+stride-uintptr_t(a.y)%stride)%stride;
+                if(delta<size_t(a.rows)*4 || stride-delta<size_t(b.rows)*4)return 0;
+            }
+        }
+        group.a[i]=a;group.end[i]=(tiles+=a.rows/32);
+    }
+    bool sm75;auto err=current_is_sm75(sm75);if(err==cudaSuccess){if(!sm75)return 0;
+        const bool prefetch=count==2 && args[0].m==8 && args[0].rows==1024 && args[1].rows==1024 &&
+            aligned(args[0].x,16) && aligned(args[1].x,16) && args[0].ld_x%4==0 && args[1].ld_x%4==0;
+        if(prefetch){group.end[0]*=2;group.end[1]*=2;inkling_qkv_prefetch<<<dim3(tiles*2,1),256,0,static_cast<cudaStream_t>(stream)>>>(group);}
+        else inkling_qkv_visit<<<dim3(tiles,(args[0].m+7)/8),256,0,static_cast<cudaStream_t>(stream)>>>(group);
+        err=cudaGetLastError();}
+    if(err==cudaSuccess)*used=1;else report_stage(stage,INFERENCE_CUDA_STAGE_LAUNCH);return int(err);
+}
+
+// Shape admission is duplicated at the FFI boundary; no unchecked tail loads.
+extern "C" int inference_cuda_inkling_packed_visit_launch(const inference_cuda_dense_gemv_args *args,
+    void *stream, int *stage, int variant) {
+    if (!args || !valid(*args,stream) || args->m<2 || (args->m>64 && !(args->m==127 || args->m==128 || args->m==255 || args->m==256))) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    const auto a=*args;
+    const int codec=a.weight_dtype-fifi_gguf::kDtypeBase;
+    const bool attn=(a.cols==2304 && (a.rows==384 || a.rows==1024 || a.rows==3072)) || (a.cols==3072 && a.rows==2304);
+    const bool expert=a.rows==2304 && a.cols==2304 && a.m<=16;
+    if (!(attn && (codec==8 || codec==12 || codec==13 || codec==14 || codec==18)) &&
+        !(expert && (codec==17 || codec==19 || codec==22))) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    bool sm75; auto err=current_is_sm75(sm75);
+    if (err==cudaSuccess && !sm75) return inference_cuda_dense_gemv_launch(args,stream,stage);
+    if(err==cudaSuccess){
+        const auto s=static_cast<cudaStream_t>(stream);
+        if(variant==3 && (inkling_prefetch_select(a,codec,s) || inkling_large_select(a,codec,s))){
+            err=cudaGetLastError();report_stage(stage,err==cudaSuccess?INFERENCE_CUDA_STAGE_NONE:INFERENCE_CUDA_STAGE_LAUNCH);return int(err);
+        }
+        if(variant==3 && expert && (codec==17 || codec==19 || codec==22)){
+            dim3 g(a.rows/32,(a.m+7)/8);
+            if(codec==17)inkling_exact_visit_tile<17,256,74,4,false,true><<<g,256,0,s>>>(a);
+            else if(codec==19)inkling_exact_visit_tile<19,256,50,4,false,true><<<g,256,0,s>>>(a);
+            else inkling_exact_visit_tile<22,256,82,4,false,true><<<g,256,0,s>>>(a);
+            err=cudaGetLastError();report_stage(stage,err==cudaSuccess?INFERENCE_CUDA_STAGE_NONE:INFERENCE_CUDA_STAGE_LAUNCH);return int(err);
+        }
+        if(variant==3)variant=a.rows<=1024 && a.m<=8?1:2;
+        const dim3 small(a.rows/8,(a.m+7)/8), large(a.rows/32,(a.m+7)/8);
+#define VISIT_CASE(C,B,S) case C: if(variant==1) inkling_exact_visit_tile<C,B,S,1><<<small,256,0,s>>>(a); else inkling_exact_visit_tile<C,B,S><<<large,256,0,s>>>(a); break
+        switch(codec){ VISIT_CASE(8,32,34); VISIT_CASE(12,256,144); VISIT_CASE(13,256,176); VISIT_CASE(14,256,210);
+            VISIT_CASE(17,256,74); VISIT_CASE(18,256,98); VISIT_CASE(19,256,50); VISIT_CASE(22,256,82); }
+#undef VISIT_CASE
+        err=cudaGetLastError();
+    }
+    report_stage(stage,err==cudaSuccess?INFERENCE_CUDA_STAGE_NONE:INFERENCE_CUDA_STAGE_LAUNCH);return int(err);
+}
+
+extern "C" int inference_cuda_inkling_controller_pair_launch(const inference_cuda_dense_gemv_args *a,
+    const inference_cuda_dense_gemv_args *b, void *stream, int *stage, int *used) {
+    if (!used || !a || !b || !valid(*a,stream) || !valid(*b,stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    *used = 0;
+    report_stage(stage, INFERENCE_CUDA_STAGE_NONE);
+    if (a->weight_dtype!=kDtypeF32 || b->weight_dtype!=kDtypeF32 || a->m!=b->m || a->m<2 || (a->m>64 && !(a->m==127 || a->m==128 || a->m==255 || a->m==256)) ||
+        a->rows!=2304 || b->rows!=2304 || a->cols!=64 || b->cols!=64 || a->x!=b->x || a->ld_x!=b->ld_x ||
+        !aligned(a->w,16) || !aligned(b->w,16)) return 0;
+    Span ya{a->y,4*(size_t(a->m-1)*a->ld_y+2304)}, yb{b->y,4*(size_t(b->m-1)*b->ld_y+2304)};
+    const bool interleaved = a->ld_y == 4608 && b->ld_y == 4608 && uintptr_t(b->y)>uintptr_t(a->y) &&
+        uintptr_t(b->y)-uintptr_t(a->y)==2304*4;
+    if ((!interleaved && !apart(ya,yb)) || !apart(ya,{b->w,2304*64*4}) || !apart(yb,{a->w,2304*64*4})) return 0;
+    inkling_controller_pair<<<dim3(144,(a->m+7)/8,2),256,0,static_cast<cudaStream_t>(stream)>>>(*a,*b);
+    const auto err = cudaGetLastError();
+    if (err == cudaSuccess) *used = 1; else report_stage(stage, INFERENCE_CUDA_STAGE_LAUNCH);
+    return int(err);
+}
+
+extern "C" int inference_cuda_inkling_iq2_visit_launch(const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage) {
+    if (!args || !valid(*args, stream) || args->rows != 2304 || args->m > 512) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    const int codec = args->weight_dtype == kDtypeGgufNvfp4 ? 40 : args->weight_dtype - fifi_gguf::kDtypeBase;
+    if (!(codec==40 ? args->cols==1152 : (codec==17 || codec==19 || codec==22) && args->cols==2304))
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    bool sm75;
+    auto err = current_is_sm75(sm75);
+    if (err == cudaSuccess) {
+        if (!sm75) return inference_cuda_gguf_wmma_launch(args, stream, out_stage);
+        const dim3 grid(72,(args->m+31)/32);
+        const auto s = static_cast<cudaStream_t>(stream);
+        switch(codec){
+        #define OCTET_CASE(C,K,B,S) case C: \
+            if (aligned(args->x,16) && args->ld_x%4==0) \
+                inkling_iq2_visit_tile<C,K,B,S,true,32,128,C==19><<<grid,512,0,s>>>(*args); \
+            else inkling_iq2_visit_tile<C,K,B,S,false><<<grid,512,0,s>>>(*args); \
+            break
+        OCTET_CASE(17,2304,256,74); OCTET_CASE(19,2304,256,50);
+        OCTET_CASE(22,2304,256,82); OCTET_CASE(40,1152,64,36);
+#undef OCTET_CASE
+        }
+        err = cudaGetLastError();
+    }
+    report_stage(out_stage, err == cudaSuccess ? INFERENCE_CUDA_STAGE_NONE : INFERENCE_CUDA_STAGE_LAUNCH);
+    return int(err);
+}
+
+#ifdef FIFI_VISIT_PROBE
+extern "C" int ragged_exact_probe(const inference_cuda_dense_gemv_args *args,int count,int bin,cudaStream_t s){
+    InklingExpertGroup g{};int c=args[0].weight_dtype-256,bm=bin==0?4:bin==1 || c==42?8:16,tiles=0;
+    for(int i=0;i<count;i++){g.calls[i]=args[i];g.ends[i]=(tiles+=(args[i].m+bm-1)/bm);}
+#define RAG(C,M,R) inkling_ragged_exact<C,M,R><<<dim3(2304/(8*R),tiles),256,0,s>>>(g)
+    if(c==16){if(bin==0){RAG(16,4,2);}else if(bin==1){RAG(16,8,2);}else{RAG(16,16,2);}}
+    else if(c==42){if(bin==0){RAG(42,4,2);}else if(bin==1){RAG(42,8,2);}else{RAG(42,8,4);}}else return int(cudaErrorInvalidValue);
+#undef RAG
+    return int(cudaGetLastError());}
+extern "C" int expert_group_probe(const inference_cuda_dense_gemv_args *args,int count,cudaStream_t s){
+    InklingExpertGroup group{};int tiles=0;for(int i=0;i<count;i++){group.calls[i]=args[i];group.ends[i]=(tiles+=(args[i].m+31)/32);}
+    dim3 grid(72,tiles);
+    switch(args[0].weight_dtype){
+    case 273:inkling_expert_group<17,2304,256,74><<<grid,512,0,s>>>(group);break;
+    case 275:inkling_expert_group<19,2304,256,50><<<grid,512,0,s>>>(group);break;
+    case 278:inkling_expert_group<22,2304,256,82><<<grid,512,0,s>>>(group);break;
+    case 2:inkling_expert_group<40,1152,64,36><<<grid,512,0,s>>>(group);break;default:return -1;}
+    return int(cudaGetLastError());
+}
+extern "C" int ablate_weight_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s){auto a=*args;dim3 g(a.rows/32,(a.m+7)/8);
+    inkling_exact_visit_tile<8,32,34,4,true><<<g,256,0,s>>>(a);return int(cudaGetLastError());
+}
+extern "C" int weight_panel_probe(const inference_cuda_dense_gemv_args *args,void *tmp,cudaStream_t s,int mode){auto a=*args;auto p=static_cast<InklingWeightPanel *>(tmp);
+#define WPL(M,N) inkling_weight_panel<M,N><<<dim3(a.rows/N,(a.m+M-1)/M),256,0,s>>>(a,p)
+    switch(mode){case 0:inkling_weight_repack<<<(a.rows*a.cols+255)/256,256,0,s>>>(a,p);break;case 1:WPL(8,16);break;case 2:WPL(8,32);break;case 3:WPL(16,32);break;default:return int(cudaErrorInvalidValue);}
+#undef WPL
+    return int(cudaGetLastError());}
+extern "C" int down_visit_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int arm){auto a=*args;
+#define DOWN(M,R) inkling_f32_visit<M,R><<<dim3(8/R,(a.m+M-1)/M),256,0,s>>>(a)
+#define DIRECT(M) inkling_f32_rank_direct<M><<<dim3(8,(a.m+M-1)/M),256,0,s>>>(a)
+    switch(arm){case 1:DOWN(2,1);break;case 2:DOWN(4,1);break;case 3:DOWN(8,1);break;case 4:DOWN(8,2);break;case 5:DIRECT(2);break;case 6:DIRECT(4);break;case 7:DIRECT(8);break;default:return int(cudaErrorInvalidValue);}
+#undef DOWN
+#undef DIRECT
+    return int(cudaGetLastError());}
+extern "C" int larger_visit_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s){int stage=0;return inference_cuda_inkling_packed_visit_launch(args,s,&stage,3);}
+extern "C" int probe_prefetch_bm(const inference_cuda_dense_gemv_args *a){int m=8;inkling_prefetch_select(*a,a->weight_dtype-256,nullptr,&m);return m;}
+extern "C" int qkv_prefetch_probe(const inference_cuda_dense_gemv_args *args,int count,cudaStream_t s){InklingQkvGroup g{};int tiles=0;
+    for(int i=0;i<count;i++){g.a[i]=args[i];g.end[i]=(tiles+=args[i].rows/16);}inkling_qkv_prefetch<<<dim3(tiles,(args[0].m+7)/8),256,0,s>>>(g);return int(cudaGetLastError());}
+extern "C" int codebook_exact_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s){auto a=*args;dim3 g(a.rows/32,(a.m+7)/8);
+#define CL(C,S) case 256+C: inkling_exact_visit_tile<C,256,S,4,false,true><<<g,256,0,s>>>(a);break
+    switch(a.weight_dtype){CL(16,66);CL(17,74);CL(19,50);CL(22,82);default:return int(cudaErrorInvalidValue);}
+#undef CL
+    return int(cudaGetLastError());}
+extern "C" int codebook_visit_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s){auto a=*args;dim3 g(a.rows/32,(a.m+31)/32);
+#define CODES(C,S) case 256+C: inkling_iq2_visit_tile<C,2304,256,S,true,32,128,true><<<g,512,0,s>>>(a); break
+    switch(a.weight_dtype){CODES(17,74);CODES(19,50);CODES(22,82);default:return int(cudaErrorInvalidValue);}
+#undef CODES
+    return int(cudaGetLastError());}
+extern "C" int octet_big_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int mode){
+    auto a=*args;int bm=mode==1?64:32;dim3 g(72,(a.m+bm-1)/bm);
+#define BIG(C,K,B,S,BK) case C: if(mode==1) inkling_iq2_visit_tile<C==2?40:C-256,K,B,S,true,64,128><<<g,512,0,s>>>(a); else inkling_iq2_visit_tile<C==2?40:C-256,K,B,S,true,32,BK><<<g,512,0,s>>>(a); break
+    switch(a.weight_dtype){BIG(273,2304,256,74,256);BIG(275,2304,256,50,256);BIG(278,2304,256,82,256);BIG(2,1152,64,36,128);default:return -1;}
+#undef BIG
+    return int(cudaGetLastError());
+}
+extern "C" int interleave_probe(const inference_cuda_dense_gemv_args *args,void *tmp,cudaStream_t s,int arm){
+    auto a=*args;auto *q=static_cast<signed char *>(tmp);float *sc=reinterpret_cast<float *>(q+a.rows*a.cols);bool q8=a.weight_dtype==kQ8;
+    if(!arm){int grid=a.rows*a.cols/256;if(q8) inkling_interleave_encode<8><<<grid,256,0,s>>>(a,q,sc);else inkling_interleave_encode<14><<<grid,256,0,s>>>(a,q,sc);}
+    else {int bm=arm==1?8:16;dim3 g(a.rows/8,(a.m+bm-1)/bm);
+#define INTER(C) if(arm==1)inkling_interleave_visit<C,8><<<g,256,0,s>>>(a,q,sc);else inkling_interleave_visit<C,16><<<g,256,0,s>>>(a,q,sc)
+        if(q8){INTER(8);}else{INTER(14);}
+#undef INTER
+    }
+    return int(cudaGetLastError());
+}
+extern "C" int expert_octet_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int bm){
+    auto a=*args;dim3 grid(a.rows/16,(a.m+bm-1)/bm);
+#define EXP(C,S) case 256+C: if(bm==2)inkling_expert_octet<C,S,2><<<grid,64,0,s>>>(a); else inkling_expert_octet<C,S,4><<<grid,64,0,s>>>(a); break
+    switch(a.weight_dtype){EXP(16,66);EXP(17,74);EXP(19,50);EXP(22,82);default:return -1;}
+#undef EXP
+    return int(cudaGetLastError());
+}
+extern "C" int q6_imma_probe(const inference_cuda_dense_gemv_args *args,void *tmp,cudaStream_t s,int variant){auto a=*args;auto x=static_cast<ResidualBlock *>(tmp);
+    inkling_residual_pack<<<(a.m*a.cols/32+7)/8,256,0,s>>>(a,x);auto e=cudaGetLastError();if(e!=cudaSuccess)return int(e);
+#define Q6I(M,N,K) inkling_q6_imma<M,N,K><<<dim3(a.rows/(N*8),(a.m+M*8-1)/(M*8)),256,0,s>>>(a,x)
+    switch(variant){case 1:Q6I(1,1,8);break;case 2:Q6I(1,2,4);break;case 3:Q6I(2,2,2);break;case 4:Q6I(2,4,1);break;default:return int(cudaErrorInvalidValue);}
+#undef Q6I
+    return int(cudaGetLastError());}
+extern "C" int residual_probe(const inference_cuda_dense_gemv_args *args,void *tmp,cudaStream_t s){
+    auto a=*args;int blocks=a.m*a.cols/32;auto *q=static_cast<ResidualBlock *>(tmp);
+    static_assert(sizeof(ResidualBlock)==68);
+    inkling_residual_pack<<<(blocks+7)/8,256,0,s>>>(a,q);auto rc=cudaGetLastError();if(rc!=cudaSuccess)return int(rc);
+    inkling_residual_imma<<<dim3(a.rows/8,(a.m+7)/8),256,0,s>>>(a,q);return int(cudaGetLastError());
+}
+extern "C" int panel_probe(const inference_cuda_dense_gemv_args *args,void *tmp,cudaStream_t s,int cached){
+    auto a=*args;auto *pack=static_cast<__half *>(tmp);int grid=a.rows*a.cols/2048;
+    if(cached!=1){
+        switch(a.weight_dtype){
+        case 256+17:inkling_decode_panels<17,2304,256,74><<<grid,256,0,s>>>(a,pack);break;
+        case 256+19:inkling_decode_panels<19,2304,256,50><<<grid,256,0,s>>>(a,pack);break;
+        case 256+22:inkling_decode_panels<22,2304,256,82><<<grid,256,0,s>>>(a,pack);break;
+        case kDtypeGgufNvfp4:inkling_decode_panels<40,1152,64,36><<<grid,256,0,s>>>(a,pack);break;
+        default:return -1;}
+        int rc=int(cudaGetLastError());if(rc)return rc;
+    }
+    if(cached>=2){
+#define PW(K,M,N) inkling_panel_wide<K,M,N><<<dim3(a.rows/N,(a.m+M-1)/M),128,0,s>>>(a,pack)
+#define PWS(K) if(cached==2){PW(K,32,64);}else if(cached==3){PW(K,64,32);}else{PW(K,64,64);}
+        if(a.cols==1152){PWS(1152);}else{PWS(2304);}
+#undef PWS
+#undef PW
+        return int(cudaGetLastError());}
+    dim3 g(a.rows/32,(a.m+31)/32);if(a.cols==1152)inkling_panel_mma<1152><<<g,128,0,s>>>(a,pack);else inkling_panel_mma<2304><<<g,128,0,s>>>(a,pack);
+    return int(cudaGetLastError());
+}
+extern "C" int octet_vector_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s){
+    const auto a=*args;const dim3 grid(72,(a.m+31)/32);
+    if(!aligned(a.x,16) || a.ld_x%4)return -1;
+    switch(a.weight_dtype){
+    case 256+17: inkling_iq2_visit_tile<17,2304,256,74,true><<<grid,512,0,s>>>(a);break;
+    case 256+19: inkling_iq2_visit_tile<19,2304,256,50,true><<<grid,512,0,s>>>(a);break;
+    case 256+22: inkling_iq2_visit_tile<22,2304,256,82,true><<<grid,512,0,s>>>(a);break;
+    case kDtypeGgufNvfp4: inkling_iq2_visit_tile<40,1152,64,36,true><<<grid,512,0,s>>>(a);break;
+    default:return -1;
+    }
+    return int(cudaGetLastError());
+}
+extern "C" int stream_visit_probe(const inference_cuda_dense_gemv_args *args,cudaStream_t s,int variant){
+    auto a=*args;
+    if(variant>=16 && variant<=19){
+#define OCC(C,B,S,WN,WM,R,M,K) inkling_occupancy_tile<C,B,S,WN,WM,R,M,K><<<dim3(a.rows/(WN*R),(a.m+WM*M-1)/(WM*M)),WN*WM*32,0,s>>>(a)
+#define OCCS(C,B,S) if(variant==16){OCC(C,B,S,4,2,4,4,64);}else if(variant==17){OCC(C,B,S,8,2,2,4,128);}else if(variant==18){OCC(C,B,S,4,4,4,4,64);}else{OCC(C,B,S,8,2,2,8,64);}
+        if(a.weight_dtype==kQ8){OCCS(8,32,34);}else{OCCS(14,256,210);}
+#undef OCCS
+#undef OCC
+        return int(cudaGetLastError());
+    }
+    if(variant==14 || variant==15){
+#define GROUP64(C,B,S) if(variant==14)inkling_group64<C,B,S,32,128><<<dim3(a.rows/32,(a.m+31)/32),1024,0,s>>>(a);else inkling_group64<C,B,S,64,128><<<dim3(a.rows/32,(a.m+63)/64),1024,0,s>>>(a)
+        if(a.weight_dtype==kQ8){GROUP64(8,32,34);}else{GROUP64(14,256,210);}
+#undef GROUP64
+        return int(cudaGetLastError());
+    }
+    if(variant==12 || variant==13){
+#define SIMT(C,B,S) if(variant==12)inkling_simt_visit<C,B,S,16,32><<<dim3(a.rows/32,(a.m+15)/16),128,0,s>>>(a);else inkling_simt_visit<C,B,S,64,64><<<dim3(a.rows/64,(a.m+63)/64),128,0,s>>>(a)
+        if(a.weight_dtype==kQ8){SIMT(8,32,34);}else{SIMT(14,256,210);}
+#undef SIMT
+        return int(cudaGetLastError());
+    }
+    if(variant==10 || variant==11){
+#define TOK(C,B,S) if(variant==10)inkling_token_visit<C,B,S,8><<<dim3(a.rows/32,(a.m+7)/8),256,0,s>>>(a);else inkling_token_visit<C,B,S,32><<<dim3(a.rows/8,(a.m+31)/32),256,0,s>>>(a)
+        if(a.weight_dtype==kQ8){TOK(8,32,34);} else{TOK(14,256,210);}
+#undef TOK
+        return int(cudaGetLastError());
+    }
+    if(variant==7 || variant==8){
+#define QUART(C,B,S,K) if(variant==7) inkling_quartet<C,B,S,K,2><<<dim3(a.rows/8,(a.m+7)/8),64,0,s>>>(a);else inkling_quartet<C,B,S,K,8><<<dim3(a.rows/32,(a.m+7)/8),256,0,s>>>(a)
+        if(a.weight_dtype!=kQ8){QUART(14,256,210,2304);}else if(a.cols==2304){QUART(8,32,34,2304);}else{QUART(8,32,34,3072);}
+#undef QUART
+        return int(cudaGetLastError());
+    }
+    if(variant==5 || variant==6){
+#define WARP(C,B,S,K) if(variant==5) inkling_warp_visit<C,B,S,K,2,8><<<dim3(a.rows/8,(a.m+7)/8),128,0,s>>>(a);else inkling_warp_visit<C,B,S,K,4,8><<<dim3(a.rows/16,(a.m+7)/8),128,0,s>>>(a)
+        if(a.weight_dtype!=kQ8){WARP(14,256,210,2304);}else if(a.cols==2304){WARP(8,32,34,2304);}else{WARP(8,32,34,3072);}
+#undef WARP
+        return int(cudaGetLastError());
+    }
+    if(variant==4){
+#define GRID(C,B,S) if(a.m<=8) inkling_grid_split<C,B,S,8><<<dim3(a.rows/16,1),512,0,s>>>(a); else inkling_grid_split<C,B,S,16><<<dim3(a.rows/16,(a.m+15)/16),512,0,s>>>(a)
+        if(a.weight_dtype==kQ8){GRID(8,32,34);}else{GRID(14,256,210);}
+#undef GRID
+        return int(cudaGetLastError());
+    }
+    if(variant==3){
+#define TC(C,B,S) if(a.m<=16) inkling_splitn_visit<C,B,S,16><<<a.rows/16,256,0,s>>>(a); else inkling_splitn_visit<C,B,S,64><<<a.rows/16,256,0,s>>>(a)
+        if(a.weight_dtype==kQ8){TC(8,32,34);}else{TC(14,256,210);}
+#undef TC
+        return int(cudaGetLastError());
+    }
+#define STREAM(C,B,S) if(a.m>16){if(variant==1) inkling_stream_visit<C,B,S,1,64><<<a.rows/8,256,0,s>>>(a); else inkling_stream_visit<C,B,S,2,64><<<a.rows/16,256,0,s>>>(a);} else if(a.m>8) inkling_stream_visit<C,B,S,2,16><<<a.rows/16,256,0,s>>>(a); else if(variant==1) inkling_stream_visit<C,B,S,1,8><<<a.rows/8,256,0,s>>>(a); else inkling_stream_visit<C,B,S,2,8><<<a.rows/16,256,0,s>>>(a)
+    if(a.weight_dtype==kQ8){STREAM(8,32,34);} else {STREAM(14,256,210);}
+#undef STREAM
+    return int(cudaGetLastError());
+}
+extern "C" int split_visit_probe(const inference_cuda_dense_gemv_args *args, cudaStream_t s) {
+    auto a = *args;
+    dim3 grid(a.rows/32, (a.m+15)/16);
+    switch (a.weight_dtype - fifi_gguf::kDtypeBase) {
+    case 8: inkling_split_visit_tile<8,32,34><<<grid,512,0,s>>>(a); break;
+    case 14: inkling_split_visit_tile<14,256,210><<<grid,512,0,s>>>(a); break;
+    case 17: inkling_split_visit_tile<17,256,74><<<grid,512,0,s>>>(a); break;
+    default: return -1;
+    }
+    return int(cudaGetLastError());
+}
+#endif
+
 extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
     const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage, int *out_width,
     int prefer_four) {
@@ -806,7 +1261,16 @@ extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
         if (out_width) *out_width = 0;
         if (!args || !valid(*args, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         const auto &a = *args;
-        if (!q8_row_reuse_shape(a.weight_dtype, a.m, a.rows, a.cols)) {
+        const bool visit_shape = prefer_four == -1 && a.weight_dtype == kQ8 &&
+            (a.m == 7 || a.m == 8 || a.m == 63 || a.m == 64) &&
+            ((a.cols == 2304 && (a.rows == 1024 || a.rows == 3072)) ||
+             (a.cols == 3072 && a.rows == 2304));
+        const int codec = a.weight_dtype - fifi_gguf::kDtypeBase;
+        const bool expert_visit = prefer_four == -1 && a.rows == 2304 && a.m >= 2 && a.m <= 32 &&
+            ((codec == 16 && a.cols == 2304) || (codec == 42 && a.cols == 1152));
+        const bool q6_visit = prefer_four == -1 && a.weight_dtype == fifi_gguf::kDtypeBase + 14 &&
+            exact_expert_tile(14, a.m, a.rows, a.cols) == 2;
+        if (!visit_shape && !q6_visit && !expert_visit && !q8_row_reuse_shape(a.weight_dtype, a.m, a.rows, a.cols)) {
             return inference_cuda_dense_gemv_launch(args, stream, out_stage);
         }
         Failure failure;
@@ -821,10 +1285,26 @@ extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
         constexpr int output_rows = 2304;
         static_assert(output_rows % kWarps == 0);
         const bool four = prefer_four && a.rows == output_rows && a.cols == 3072;
-        const int width = four ? 4 : 2;
+        const bool visit = prefer_four == -1;
+        const int width = visit ? a.m : four ? 4 : 2;
         const dim3 grid((a.rows + kWarps - 1) / kWarps, (a.m + width - 1) / width);
         const auto s = static_cast<cudaStream_t>(stream);
-        if (four) {
+        if (visit) {
+            dim3 tiles(a.rows / 32, (a.m + 7) / 8);
+            if(expert_visit && a.m>=4 && aligned(a.x,16) && a.ld_x%4==0 && (codec==42 || a.m<=16)){
+#define EXP(C,M,R) inkling_prefetch<C,M,R,128,true><<<dim3(a.rows/(8*R),(a.m+M-1)/M),256,0,s>>>(a)
+                if(codec==16){if(a.m==4){EXP(16,4,2);}else if(a.m<=8){EXP(16,8,2);}else{EXP(16,16,2);}}
+                else{if(a.m==4){EXP(42,4,2);}else if(a.m<=8){EXP(42,8,2);}else{EXP(42,8,4);}}
+#undef EXP
+            } else if (expert_visit) {
+                dim3 expert_tiles(a.rows/8, (a.m+7)/8);
+                if (codec == 16) inkling_exact_visit_tile<16,256,66,1><<<expert_tiles,256,0,s>>>(a);
+                else inkling_exact_visit_tile<42,64,18,1><<<expert_tiles,256,0,s>>>(a);
+            } else if (!inkling_prefetch_select(a,q6_visit?14:8,s)) {
+                if(q6_visit) inkling_exact_visit_tile<14,256,210><<<tiles,256,0,s>>>(a);
+                else inkling_exact_visit_tile<8,32,34><<<tiles,256,0,s>>>(a);
+            }
+        } else if (four) {
             inkling_q8_reuse_four<<<grid, kWarps * 32, 0, s>>>(a);
         } else {
             inkling_q8_reuse_pair<<<grid, kWarps * 32, size_t(a.cols) * sizeof(float2), s>>>(a);

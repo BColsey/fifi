@@ -31,9 +31,16 @@ mod controller_workspace;
 mod device_prefill;
 mod grouped_controller_arithmetic;
 mod residency;
+mod resident_local;
+pub(in crate::family::inkling2) mod resident_mlp;
 mod resident_prefill;
 pub(in crate::family::inkling2) mod router;
 pub(in crate::family::inkling2) mod streaming;
+mod token_controllers;
+
+pub(in crate::family::inkling2) use resident_local::{
+    ConvRows, LocalDecodeWidths, PrepWeights, ResidentLocalDecode,
+};
 
 pub(in crate::family::inkling2) use device_prefill::ExpertPrefillRows;
 pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
@@ -44,12 +51,15 @@ pub(in crate::family::inkling2) struct GgufCuda {
     controlled_attention_step: Option<DenseStep>,
     draft_head: Option<DraftHead>,
     dense: Projections,
+    token_controllers: Projections,
     packed_gguf: bool,
     group_projections: bool,
     group_attention: bool,
     batch_router: bool,
     reuse_router_input: bool,
     resident_attention: Option<attention::ResidentAttention>,
+    hidden: usize,
+    gate_rank: usize,
     moe_scratch: Option<ResidentMoe>,
     route_scratch: Option<router::RouteScratch>,
     decode_exact_q2_down: bool,
@@ -79,7 +89,9 @@ type Projections = BTreeMap<String, (Resident, DenseDtype)>;
 
 type ControllerOutput = Option<[Vec<f32>; 2]>;
 
-pub(in crate::family::inkling2) use super::dense::{ControlledAttentionInput, PrefillProjection};
+pub(in crate::family::inkling2) use super::dense::{
+    ControlledAttentionInput, PrefillProjection, ResidentController,
+};
 use super::dense::{LocalInputs, LocalProjection};
 
 pub(in crate::family::inkling2) struct LocalDecode<'a> {
@@ -97,6 +109,7 @@ enum BatchWeights<'a> {
 
 pub(in crate::family::inkling2) struct BatchController<'a> {
     cuda: &'a GgufCuda,
+    step: &'a DenseStep,
     weights: BatchWeights<'a>,
     shape: [usize; 2],
     capacity: usize,
@@ -115,9 +128,14 @@ impl BatchController<'_> {
             }
         };
         let values = self
-            .cuda
             .step
-            .project_controller_batch(&self.cuda.context, inputs, weights, self.shape)?
+            .project_controller_batch_bounded(
+                &self.cuda.context,
+                inputs,
+                weights,
+                self.shape,
+                self.capacity,
+            )?
             .ok_or_else(|| bad("CUDA controller batch was not admitted"))?;
         if staged {
             static USED: std::sync::Once = std::sync::Once::new();
@@ -140,6 +158,22 @@ impl BatchController<'_> {
             eprintln!("Inkling CUDA multirow controller tile report {}", receipt());
         }
         Ok(values)
+    }
+}
+
+pub(in crate::family::inkling2) struct ResidentMlpController<'a> {
+    context: &'a CudaContext,
+    weights: ControllerWeights<'a>,
+}
+
+impl ResidentMlpController<'_> {
+    pub(in crate::family::inkling2) fn run<'a>(
+        &self,
+        scratch: &'a mut ResidentController,
+        rows: (&[Vec<f32>], &[Vec<f32>], &[f32]),
+        eps: (f32, f32),
+    ) -> Result<DeviceRange<'a>, EngError> {
+        scratch.run(self.context, self.weights, rows, eps)
     }
 }
 
@@ -242,7 +276,11 @@ impl AttentionControllers<'_> {
             let capacity = wide
                 .controlled_attention_batch_capacity(self.shape, *weights)?
                 .unwrap_or(0);
-            let target = controller_workspace::TILE_ROWS;
+            let desired = controller_workspace::target_rows();
+            let target = [256, 128, 64, controller_workspace::TILE_ROWS]
+                .into_iter()
+                .find(|&r| r <= capacity && r <= desired)
+                .unwrap_or(controller_workspace::TILE_ROWS);
             if capacity >= target && target > baseline {
                 return Ok((wide, target));
             }
@@ -296,6 +334,7 @@ impl AttentionControllers<'_> {
                 let controllers = self.weights.map(|weights| {
                     weights.map(|weights| BatchController {
                         cuda: self.cuda,
+                        step: &self.cuda.step,
                         weights: BatchWeights::Resident(weights),
                         shape: self.shape,
                         capacity,
@@ -731,8 +770,25 @@ impl GgufCuda {
         } else {
             None
         };
+        // Do not change prefill/host placement to qualify decode. The extra
+        // matrices, if admitted, belong exclusively to the token chain.
+        let token_controllers = if full_expert_fit
+            && group_projections
+            && resident_attention.is_some()
+            && std::env::var("FIFI_INKLING_CUDA_RESIDENT_TOKEN").as_deref() == Ok("1")
+        {
+            token_controllers::load(
+                &context,
+                &optional,
+                &dense,
+                controller_residency::expert_workspace(spec, context_limit, device_prefill),
+            )?
+        } else {
+            Projections::new()
+        };
         Ok(Self {
             step,
+            token_controllers,
             controlled_attention_step,
             draft_head: None,
             dense,
@@ -741,6 +797,8 @@ impl GgufCuda {
             group_attention,
             batch_router: std::env::var("FIFI_INKLING_CUDA_BATCH_ROUTER").as_deref() == Ok("1"),
             resident_attention,
+            hidden,
+            gate_rank: spec.core.gate_rank as usize,
             moe_scratch,
             decode_exact_q2_down: route_scratch.is_some()
                 && std::env::var("FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN").as_deref() == Ok("1")
@@ -852,6 +910,40 @@ impl GgufCuda {
         )
     }
 
+    pub(in crate::family::inkling2) fn resident_head_supported(&self, shape: [usize; 2]) -> bool {
+        self.dense
+            .get(crate::family::inkling2::OUTPUT_HEAD)
+            .is_some_and(|(w, d)| {
+                w.shape == shape && d.is_packed_gguf() && !self.step.uses_q8_activations(*d)
+            })
+    }
+
+    pub(in crate::family::inkling2) fn enqueue_resident_head(
+        &self,
+        stream: &crate::kernels::cuda::DeviceStream,
+        x: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+        cap: f32,
+    ) -> Result<(), EngError> {
+        use crate::kernels::cuda::resident::dense_gemv::{DenseGemvCall, DenseGemvShape};
+        let (w, d) = self
+            .dense
+            .get(crate::family::inkling2::OUTPUT_HEAD)
+            .ok_or_else(|| bad("missing resident head"))?;
+        let [rows, cols] = w.shape;
+        self.context.dense_gemv(
+            stream,
+            DenseGemvCall {
+                shape: DenseGemvShape::packed(1, rows, cols),
+                dtype: *d,
+                w: w.codes.range(0, w.codes.bytes())?,
+                x,
+                y,
+            },
+        )?;
+        self.context.softcap_in_place(stream, y, rows, cap)
+    }
+
     pub(in crate::family::inkling2) fn capped_head(
         &self,
         x: &[f32],
@@ -911,9 +1003,10 @@ impl GgufCuda {
         &self,
         layer: u32,
         name: &str,
+        rows: usize,
     ) -> Option<[usize; 2]> {
         let (weight, _) = self.dense.get(name)?;
-        self.batch_prefill_router(layer, name)
+        (self.batch_prefill_router(layer, name) && self.step.admits_resident_router(weight, rows))
             .then_some(weight.shape)
     }
 
@@ -1099,19 +1192,34 @@ impl GgufCuda {
 
     fn controller_weights(
         &self,
-        [down, gain, forget]: [&str; 3],
+        names: [&str; 3],
+        input_width: usize,
+        shape: [usize; 2],
+    ) -> Option<Result<ControllerWeights<'_>, EngError>> {
+        self.resolve_controller_weights(names, input_width, shape, false)
+    }
+
+    fn resolve_controller_weights(
+        &self,
+        names: [&str; 3],
         input_width: usize,
         [rank, hidden]: [usize; 2],
+        token: bool,
     ) -> Option<Result<ControllerWeights<'_>, EngError>> {
         if !self.group_projections {
             return None;
         }
         let shapes = [[rank, input_width], [hidden, rank], [hidden, rank]];
-        let weights = [
-            self.dense.get(down)?,
-            self.dense.get(gain)?,
-            self.dense.get(forget)?,
-        ];
+        let [a, b, c] = names.map(|name| {
+            self.dense.get(name).or_else(|| {
+                if token {
+                    self.token_controllers.get(name)
+                } else {
+                    None
+                }
+            })
+        });
+        let weights = [a?, b?, c?];
         if weights
             .iter()
             .zip(shapes)
@@ -1120,6 +1228,21 @@ impl GgufCuda {
             return Some(Err(bad("bad GGUF CUDA controller projection shape")));
         }
         Some(Ok(weights.map(|(w, dtype)| (w, *dtype))))
+    }
+
+    pub(in crate::family::inkling2) fn resident_mlp_controller(
+        &self,
+        names: [&str; 3],
+        shape @ [_, hidden, rank]: [usize; 3],
+    ) -> Result<Option<ResidentMlpController<'_>>, EngError> {
+        Ok(self
+            .controller_weights(names, 2 * hidden, [rank, hidden])
+            .transpose()?
+            .filter(|&weights| ResidentController::admits(shape, weights))
+            .map(|weights| ResidentMlpController {
+                context: &self.context,
+                weights,
+            }))
     }
 
     pub(in crate::family::inkling2) fn stages_prefill_controllers(&self) -> bool {
@@ -1152,11 +1275,28 @@ impl GgufCuda {
                 BatchWeights::Cold(staging, payload)
             }
         };
+        // The chained attention tile was synchronously consumed before the
+        // MLP controller. Borrow its workspace, not any resident weights.
+        static WIDE_MLP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let target = controller_workspace::target_rows();
+        let mut selected = (&self.step, capacity);
+        if target > capacity
+            && *WIDE_MLP.get_or_init(|| {
+                std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_MLP").as_deref() == Ok("1")
+            })
+            && let Some(wide) = &self.controlled_attention_step
+        {
+            let cap = wide.controller_batch_capacity(shape)?.min(target);
+            if cap > capacity {
+                selected = (wide, cap);
+            }
+        }
         Ok(Some(BatchController {
             cuda: self,
+            step: selected.0,
             weights,
             shape,
-            capacity,
+            capacity: selected.1,
         }))
     }
 

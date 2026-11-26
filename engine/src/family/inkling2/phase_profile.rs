@@ -23,10 +23,12 @@ pub(super) enum Work {
     MlpControlPrepare,
     MlpControlProject,
     MlpControlApply,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    ResidentVisit,
 }
 
 impl Work {
-    const ALL: [(Self, &str); 16] = [
+    const ALL: &'static [(Self, &str)] = &[
         (Self::CpuAttention, "cpu_attention"),
         (Self::DeviceAttention, "device_attention"),
         (Self::Convolution, "convolution"),
@@ -43,6 +45,8 @@ impl Work {
         (Self::MlpControlPrepare, "mlp_control_prepare"),
         (Self::MlpControlProject, "mlp_control_project"),
         (Self::MlpControlApply, "mlp_control_apply"),
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        (Self::ResidentVisit, "resident_visit"),
     ];
 }
 
@@ -80,8 +84,10 @@ struct Period {
 impl Period {
     fn receipt(&self) -> Value {
         let work: serde_json::Map<_, _> = Work::ALL
-            .into_iter()
-            .map(|(phase, name)| (name.into(), json!(self.work[phase as usize].get())))
+            .iter()
+            .map(|&(phase, name)| (name, self.work[phase as usize].get()))
+            .filter(|(name, sample)| *name != "resident_visit" || sample.calls > 0)
+            .map(|(name, sample)| (name.into(), json!(sample)))
             .collect();
         json!({
             "wall": self.wall.get(),

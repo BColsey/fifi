@@ -101,6 +101,15 @@ __global__ void inkling_gate_dot(const GateDigits *packed, const uint8_t *gate,
     if (lane == 0) out[size_t(blockIdx.y) * width + row] = sum;
 }
 
+#include "resident/inkling_decode_experts.cuh"
+#include "resident/inkling_gate_cached.cuh"
+
+template<int Type, int Bytes>
+void launch_decode_gate(const GateDigits *packed, const uint8_t *gate, float *out,
+                        DeviceSelectedWeights index, cudaStream_t stream) {
+    decode_gate_cached<Type, Bytes><<<dim3(36,8),256,0,stream>>>(packed,gate,out,index);
+}
+
 bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
                              float *temporary, cudaStream_t stream, Failure &failure) {
     constexpr int width = kInklingGateWidth;
@@ -115,8 +124,10 @@ bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelect
     if (!failure.ok()) return true;
     const dim3 grid(width / kWarps, a.count);
 #define GATE_DOT(id, bytes) \
-    case id: inkling_gate_dot<id, bytes><<<grid, kWarps * 32, 0, stream>>>( \
-        packed, static_cast<const uint8_t *>(a.gate), a.scratch, index); break;
+    case id: if (decode_split_enabled()) \
+        launch_decode_gate<id,bytes>(packed, static_cast<const uint8_t *>(a.gate), a.scratch, index, stream); \
+        else inkling_gate_dot<id, bytes><<<grid, kWarps * 32, 0, stream>>>( \
+            packed, static_cast<const uint8_t *>(a.gate), a.scratch, index); break;
     switch (type) {
         GATE_DOT(16,66)
         GATE_DOT(17,74)

@@ -3,7 +3,10 @@
 use super::{
     ControllerWeights, DenseGemvCall, DenseGemvShape, DenseStep, Slot, bad, dense_gemv_bytes,
 };
-use crate::{EngError, kernels::cuda::CudaContext};
+use crate::{
+    EngError,
+    kernels::cuda::{CudaContext, DeviceRange},
+};
 
 impl DenseStep {
     pub(in crate::family::inkling2::cuda_projection) fn controller_batch_capacity(
@@ -21,14 +24,25 @@ impl DenseStep {
             .min(DenseGemvShape::MAX_ACTIVATION_ROWS))
     }
 
+    #[cfg(test)]
     pub(in crate::family::inkling2::cuda_projection) fn project_controller_batch(
         &self,
         context: &CudaContext,
         inputs: &[&[f32]],
         weights: ControllerWeights<'_>,
-        shape @ [rank, hidden]: [usize; 2],
+        shape: [usize; 2],
     ) -> Result<Option<Vec<[Vec<f32>; 2]>>, EngError> {
-        let capacity = self.controller_batch_capacity(shape)?;
+        self.project_controller_batch_bounded(context, inputs, weights, shape, usize::MAX)
+    }
+    pub(in crate::family::inkling2::cuda_projection) fn project_controller_batch_bounded(
+        &self,
+        context: &CudaContext,
+        inputs: &[&[f32]],
+        weights: ControllerWeights<'_>,
+        shape @ [rank, hidden]: [usize; 2],
+        limit: usize,
+    ) -> Result<Option<Vec<[Vec<f32>; 2]>>, EngError> {
+        let capacity = self.controller_batch_capacity(shape)?.min(limit);
         if inputs.len() < 2 || capacity < 2 {
             return Ok(None);
         }
@@ -61,28 +75,58 @@ impl DenseStep {
         let gate_words = m * 2 * hidden;
         let output_offset = gate_words + m * rank;
         let input = self.range(Slot::Output, 0, gate_words)?;
+        let reduced = self.range(Slot::Output, gate_words, m * rank)?;
         let output = self.range(Slot::Output, output_offset, gate_words)?;
-        let call = |index: usize, x, y, ld_y| {
-            let (weight, dtype) = weights[index];
-            let [rows, cols] = weight.shape;
-            let mut shape = DenseGemvShape::packed(m, rows, cols);
-            shape.ld_y = ld_y;
-            let need = dense_gemv_bytes(shape, dtype)?;
-            Ok::<_, EngError>(DenseGemvCall {
-                shape,
-                dtype,
-                w: weight.codes.range(0, need.w)?,
-                x: self.range(Slot::Output, x, need.x / size_of::<f32>())?,
-                y: self.range(Slot::Output, y, need.y / size_of::<f32>())?,
-            })
-        };
-        let calls = [
-            call(0, 0, gate_words, rank)?,
-            call(1, gate_words, output_offset, 2 * hidden)?,
-            call(2, gate_words, output_offset + hidden, 2 * hidden)?,
-        ];
+        let calls = batch_controller_calls(weights, m, [input, reduced, output])?;
         self.run_rows(context, &self.stream, inputs, [input, output], || {
             context.dense_gemv_group(&self.stream, &calls)
         })
     }
+}
+
+/// Both controller paths use the same batched GEMVs and interleaved gain/forget layout.
+pub(super) fn batch_controller_calls<'a>(
+    weights: ControllerWeights<'a>,
+    rows: usize,
+    [gate, reduced, coefficients]: [DeviceRange<'a>; 3],
+) -> Result<[DenseGemvCall<'a>; 3], EngError> {
+    let hidden = weights[1].0.shape[0];
+    let shapes = controller_shapes(weights, rows);
+    let call = |index: usize, input: DeviceRange<'a>, (output, at): (DeviceRange<'a>, usize)| {
+        let (weight, dtype) = weights[index];
+        let shape = shapes[index];
+        let need = dense_gemv_bytes(shape, dtype)?;
+        Ok::<_, EngError>(DenseGemvCall {
+            shape,
+            dtype,
+            w: weight.codes.range(0, need.w)?,
+            x: input.slice(0, need.x)?,
+            y: output.slice(at, need.y)?,
+        })
+    };
+    Ok([
+        call(0, gate, (reduced, 0))?,
+        call(1, reduced, (coefficients, 0))?,
+        call(2, reduced, (coefficients, hidden * size_of::<f32>()))?,
+    ])
+}
+
+pub(super) fn admits_controller_weights(weights: ControllerWeights<'_>, rows: usize) -> bool {
+    controller_shapes(weights, rows)
+        .into_iter()
+        .zip(weights)
+        .all(|(shape, (weight, dtype))| {
+            dense_gemv_bytes(shape, dtype).is_ok_and(|need| weight.codes.bytes() >= need.w)
+        })
+}
+
+fn controller_shapes(weights: ControllerWeights<'_>, rows: usize) -> [DenseGemvShape; 3] {
+    let mut shapes = weights.map(|(weight, _)| {
+        let [n, k] = weight.shape;
+        DenseGemvShape::packed(rows, n, k)
+    });
+    let stride = 2 * weights[1].0.shape[0];
+    shapes[1].ld_y = stride;
+    shapes[2].ld_y = stride;
+    shapes
 }

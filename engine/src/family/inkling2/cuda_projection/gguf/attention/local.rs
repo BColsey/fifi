@@ -5,11 +5,16 @@ use super::{
     *,
 };
 use crate::{
-    family::inkling2::cuda_projection::DEVICE_HEADROOM,
-    kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape},
+    family::inkling2::cuda_projection::{DEVICE_HEADROOM, upload_tensor},
+    kernels::cuda::{
+        resident::inkling_conv::ConvCall,
+        resident::inkling_local_prep::{PrepMath, PrepShape},
+    },
 };
 
 use std::borrow::Cow;
+
+use super::super::resident_local::{LocalStatus, ResidentLocalDecode, local_status};
 
 pub(in crate::family::inkling2) type LocalReadWeights<'a> =
     dyn Fn([usize; 4]) -> Result<[Cow<'a, [f32]>; 4], EngError> + 'a;
@@ -35,6 +40,15 @@ impl AuxStore {
             .unwrap_or(0);
         let Some(scratch_at) = slot_bytes.checked_mul(visits.len()) else {
             return Ok(None);
+        };
+        // The local projection row uses aligned offsets relative to this base.
+        let scratch_at = if decode_split_enabled() {
+            let Some(at) = scratch_at.checked_next_multiple_of(16) else {
+                return Ok(None);
+            };
+            at
+        } else {
+            scratch_at
         };
         let Some(bytes) = scratch_at.checked_add(device) else {
             return Ok(None);
@@ -72,6 +86,8 @@ impl AuxStore {
 }
 
 #[cfg(test)]
+mod resident_tests;
+#[cfg(test)]
 mod tests;
 
 pub(in crate::family::inkling2) struct LocalPrep<'a> {
@@ -86,6 +102,10 @@ pub(in crate::family::inkling2) struct LocalResult {
     pub projected: bool,
     // Raw K/V followed by clipped K and RMS-normalized V.
     pub rows: [Vec<f32>; 4],
+}
+
+fn decode_split_enabled() -> bool {
+    std::env::var("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref() == Ok("1")
 }
 
 struct Layout {
@@ -118,6 +138,11 @@ impl Layout {
             end += words[i];
         }
         let attention_at = if output_rows.is_some() {
+            // A restored prefix takes the arena path on its first visit. Match
+            // that path's aligned projection input (and hence its arithmetic).
+            if decode_split_enabled() {
+                end = end.next_multiple_of(16);
+            }
             let at = end;
             end += words[0];
             at
@@ -242,7 +267,7 @@ impl ResidentAttention {
     ) -> bool {
         self.local_workspace.is_some()
             && position <= POS_MAX as usize
-            && self.state.borrow().next_position[slot] == Some(position)
+            && self.state.borrow().next_position.get(slot) == Some(&Some(position))
     }
 
     pub(in crate::family::inkling2::cuda_projection) fn step_local(
@@ -383,5 +408,414 @@ impl ResidentAttention {
             )?;
         }
         context.copy_to_pinned(stream, scratch.range(base, layout.readback)?, transfer, 0)
+    }
+}
+
+/// Scratch reused by successive local visits on one stream; the caller owns the
+/// persistent histories and weights.
+pub(super) struct ResidentWorkspace {
+    aux: DeviceBuffer,
+    scratch: DeviceBuffer,
+    zeros: Option<DeviceBuffer>,
+}
+
+/// The status sub-ranges the dense side writes into, with the zero gain and forget rows
+/// of a visit without a bank.
+pub(in crate::family::inkling2) struct ResidentStatus<'a> {
+    pub effective: [DeviceRange<'a>; 2],
+    pub controller_health: DeviceRange<'a>,
+    /// The six gate half health words; `None` without a bank.
+    pub gate_health: Option<DeviceRange<'a>>,
+    /// `2 * hidden` zero words for identity control, only needed without a bank.
+    pub zeros: Option<DeviceRange<'a>>,
+}
+
+/// Geometry the chain needs besides the request.
+pub(in crate::family::inkling2) struct ResidentParts<'a> {
+    pub shape: LocalShape,
+    pub projection: OutputProjection<'a>,
+    pub hidden: usize,
+}
+
+/// Word offsets and sizes inside one slot's aux, the layout `inkling_local_prep` reads:
+/// the position word (unused here), four weight rows, then the K and V histories, which
+/// the kernel shifts in place.
+#[derive(Clone, Copy)]
+struct AuxLayout {
+    at: [usize; 6],
+    sizes: [usize; 6],
+}
+
+/// Word offsets inside the shared scratch: query, relative, sinks, gates, the attention
+/// output before its projection, the projected row. Each row's width follows from the shape.
+#[derive(Clone, Copy)]
+struct ScratchLayout {
+    at: [usize; 6],
+    words: usize,
+}
+
+/// What the output half of the chain reads: the scratch rows the dense side wrote, the
+/// log's processed K and V, the attention status word and the two output scratch rows.
+struct PrepRows<'a> {
+    q: DeviceRange<'a>,
+    relative: DeviceRange<'a>,
+    sinks: DeviceRange<'a>,
+    gates: DeviceRange<'a>,
+    k: DeviceRange<'a>,
+    v: DeviceRange<'a>,
+    status: DeviceRange<'a>,
+    attention_out: DeviceRange<'a>,
+    projected: DeviceRange<'a>,
+}
+
+const WORD: usize = size_of::<f32>();
+
+fn words_range(
+    buffer: &DeviceBuffer,
+    at: usize,
+    words: usize,
+) -> Result<DeviceRange<'_>, EngError> {
+    buffer.range(at * WORD, words * WORD)
+}
+
+impl AuxLayout {
+    fn new(shape: LocalShape) -> Self {
+        let [q, rel, kv] = [
+            shape.query_channels(),
+            shape.relative_words(),
+            shape.kv_channels(),
+        ];
+        let taps = PrepShape::TAPS;
+        let sizes = [
+            q,
+            rel,
+            kv * taps,
+            kv * taps,
+            kv * (taps - 1),
+            kv * (taps - 1),
+        ];
+        let mut at = [1; 6];
+        for index in 1..6 {
+            at[index] = at[index - 1] + sizes[index - 1];
+        }
+        Self { at, sizes }
+    }
+
+    fn words(self) -> usize {
+        self.at[5] + self.sizes[5]
+    }
+
+    fn range(self, index: usize, aux: DeviceRange<'_>) -> Result<DeviceRange<'_>, EngError> {
+        aux.slice(self.at[index] * WORD, self.sizes[index] * WORD)
+    }
+}
+
+impl ScratchLayout {
+    fn new(shape: LocalShape, hidden: usize) -> Self {
+        let q = shape.query_channels();
+        let sizes = [q, shape.relative_words(), shape.query_heads, q, q, hidden];
+        let mut at = [0; 6];
+        for index in 1..6 {
+            at[index] = at[index - 1] + sizes[index - 1];
+        }
+        Self {
+            at,
+            words: at[5] + sizes[5],
+        }
+    }
+}
+
+impl ResidentWorkspace {
+    fn allocate(
+        context: &CudaContext,
+        (shape, hidden): (LocalShape, usize),
+    ) -> Result<Self, EngError> {
+        Ok(Self {
+            aux: context.allocate(AuxLayout::new(shape).words() * WORD)?,
+            scratch: context.allocate(ScratchLayout::new(shape, hidden).words * WORD)?,
+            zeros: None,
+        })
+    }
+}
+
+impl ResidentAttention {
+    pub(in crate::family::inkling2::cuda_projection::gguf) fn prepare_resident_workspace(
+        &self,
+        context: &CudaContext,
+        geometry: (LocalShape, usize),
+        banked: bool,
+    ) -> Result<(), EngError> {
+        let mut store = self.resident.borrow_mut();
+        if store.is_none() {
+            *store = Some(ResidentWorkspace::allocate(context, geometry)?);
+        }
+        let store = store.as_mut().expect("resident workspace allocated");
+        if !banked && store.zeros.is_none() {
+            store.zeros = Some(upload_tensor(context, &vec![0; 2 * geometry.1 * WORD])?);
+        }
+        Ok(())
+    }
+
+    /// Publish the ring cursor only after the caller fenced and checked every stage.
+    pub(in crate::family::inkling2) fn publish_resident_cursor(
+        &self,
+        slot: usize,
+        position: usize,
+    ) {
+        let mut state = self.state.borrow_mut();
+        debug_assert!(state.next_position[slot].is_none());
+        state.next_position[slot] = Some(position + 1);
+    }
+
+    /// Launch-only form of `step_local` for rows that stay on the device. `dense` queues
+    /// the controller and projection GEMVs into four scratch rows and the caller's log;
+    /// the prep then shifts the caller's K/V histories through the aux scratch, the
+    /// attention step appends to the ring, and the output projection and `attn_sconv`
+    /// convolution write `out`. The slot's cursor is unknown until completion is published.
+    pub(in crate::family::inkling2) fn enqueue_resident_local<'a>(
+        &'a self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        request: &'a ResidentLocalDecode<'a>,
+        parts: ResidentParts<'_>,
+        dense: impl FnOnce([DeviceRange<'_>; 4], ResidentStatus<'_>) -> Result<(), EngError>,
+    ) -> Result<(), EngError> {
+        let ResidentParts {
+            shape,
+            projection,
+            hidden,
+        } = parts;
+        let slot = request.visit.state_slot;
+        if !self.can_chain_local(slot, request.position) {
+            return Err(bad("resident local decode lost the device cursor"));
+        }
+        let store = self.resident.borrow();
+        let store = store
+            .as_ref()
+            .filter(|w| request.messages.is_some() || w.zeros.is_some())
+            .ok_or_else(|| bad("resident local decode workspace was not prepared"))?;
+        self.invalidate_local_aux(slot);
+        self.state.borrow_mut().next_position[slot] = None;
+        let status = local_status(shape, request.messages.is_some());
+        let rows = self.enqueue_resident_prep(
+            context,
+            stream,
+            store,
+            request,
+            (shape, hidden, status),
+            dense,
+        )?;
+        self.enqueue_resident_output(context, stream, request, (shape, projection), rows)
+    }
+
+    /// Aux staging, the dense closure, the prep launch and the shifted histories back.
+    fn enqueue_resident_prep<'a>(
+        &'a self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        store: &'a ResidentWorkspace,
+        request: &'a ResidentLocalDecode<'a>,
+        (shape, hidden, status): (LocalShape, usize, LocalStatus),
+        dense: impl FnOnce([DeviceRange<'_>; 4], ResidentStatus<'_>) -> Result<(), EngError>,
+    ) -> Result<PrepRows<'a>, EngError> {
+        let aux = store.aux.range(0, store.aux.bytes())?;
+        Self::stage_resident_aux(context, stream, request, (shape, aux))?;
+        let scratch = ScratchLayout::new(shape, hidden);
+        let at = scratch.at;
+        let row = |index: usize, words| words_range(&store.scratch, at[index], words);
+        let q = shape.query_channels();
+        let [qr, relative, sinks, gates] = [
+            row(0, q)?,
+            row(1, shape.relative_words())?,
+            row(2, shape.query_heads)?,
+            row(3, q)?,
+        ];
+        let health = Health::split(request.status, status)?;
+        dense(
+            [qr, relative, sinks, gates],
+            ResidentStatus {
+                effective: [
+                    AuxLayout::new(shape).range(2, aux)?,
+                    AuxLayout::new(shape).range(3, aux)?,
+                ],
+                controller_health: health.controller,
+                gate_health: health.gates,
+                zeros: store
+                    .zeros
+                    .as_ref()
+                    .map(|b| b.range(0, b.bytes()))
+                    .transpose()?,
+            },
+        )?;
+        let kv = shape.kv_channels();
+        let [raw_k, raw_v, k, v] =
+            [0, 1, 2, 3].map(|i| request.log.slice(i * kv * WORD, kv * WORD));
+        let [raw_k, raw_v, k, v] = [raw_k?, raw_v?, k?, v?];
+        let prep = PrepShape {
+            queries: shape.query_heads,
+            kv: shape.kv_heads,
+            dims: shape.relative_dims,
+        };
+        context.inkling_local_prep(
+            stream,
+            [
+                qr,
+                relative,
+                raw_k,
+                raw_v,
+                k,
+                v,
+                sinks,
+                gates,
+                aux,
+                health.prep,
+            ],
+            prep,
+            PrepShape::TAPS - 1,
+            request.math,
+        )?;
+        self.unstage_resident_aux(context, stream, request, (shape, aux))?;
+        Ok(PrepRows {
+            q: qr,
+            relative,
+            sinks,
+            gates,
+            k,
+            v,
+            status: health.attention,
+            attention_out: row(4, q)?,
+            projected: row(5, hidden)?,
+        })
+    }
+
+    fn stage_resident_aux(
+        context: &CudaContext,
+        stream: &DeviceStream,
+        request: &ResidentLocalDecode<'_>,
+        (shape, aux): (LocalShape, DeviceRange<'_>),
+    ) -> Result<(), EngError> {
+        let layout = AuxLayout::new(shape);
+        let sources = [
+            request.weights.query_scale,
+            request.weights.relative_scale,
+            request.weights.key_kernel,
+            request.weights.value_kernel,
+            request.raw_history[0],
+            request.raw_history[1],
+        ];
+        for (index, source) in sources.into_iter().enumerate() {
+            context.copy_device(stream, source, layout.range(index, aux)?)?;
+        }
+        Ok(())
+    }
+
+    /// The prep kernel shifted the aux histories in place; hand them back.
+    fn unstage_resident_aux(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        request: &ResidentLocalDecode<'_>,
+        (shape, aux): (LocalShape, DeviceRange<'_>),
+    ) -> Result<(), EngError> {
+        let layout = AuxLayout::new(shape);
+        for (plane, history) in request.raw_history.iter().enumerate() {
+            context.copy_device(stream, layout.range(4 + plane, aux)?, *history)?;
+        }
+        Ok(())
+    }
+
+    /// Attention over the resident ring, then the output projection and the `attn_sconv`
+    /// convolution into the caller's row.
+    fn enqueue_resident_output(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        request: &ResidentLocalDecode<'_>,
+        (shape, projection): (LocalShape, OutputProjection<'_>),
+        rows: PrepRows<'_>,
+    ) -> Result<(), EngError> {
+        let PrepRows {
+            q,
+            relative,
+            sinks,
+            gates,
+            k,
+            v,
+            status,
+            attention_out,
+            projected,
+        } = rows;
+        let visit = self.visits[request.visit.state_slot];
+        let ring = |at, bytes| self.arena.range(at, bytes);
+        context.relative_attention(
+            stream,
+            RelativeAttentionCall {
+                shape: visit.shape,
+                q,
+                k,
+                v,
+                relative,
+                sinks,
+                gates,
+                out: attention_out,
+                table: ring(visit.table_at, visit.table_bytes)?,
+                pos: request.pos,
+                status,
+                k_cache: ring(visit.cache_at, visit.cache_bytes)?,
+                v_cache: ring(visit.cache_at + visit.cache_bytes, visit.cache_bytes)?,
+            },
+        )?;
+        context.dense_gemv(
+            stream,
+            DenseGemvCall {
+                shape: DenseGemvShape::packed(1, projection.rows, shape.query_channels()),
+                dtype: projection.dtype,
+                w: projection.weight,
+                x: attention_out,
+                y: projected,
+            },
+        )?;
+        let status = local_status(shape, request.messages.is_some());
+        let health = Health::split(request.status, status)?;
+        context.inkling_conv(
+            stream,
+            ConvCall {
+                input: projected,
+                kernel: request.attn_conv.kernel,
+                history: request.attn_conv.history,
+                out: request.out,
+                health: health.conv,
+            },
+            (request.out.bytes() / WORD, PrepShape::TAPS),
+        )
+    }
+}
+
+/// The request's status range by consumer.
+struct Health<'a> {
+    /// The prep flags: one shared status word, then one flag per head.
+    prep: DeviceRange<'a>,
+    /// The shared status word of the prep and the attention step.
+    attention: DeviceRange<'a>,
+    controller: DeviceRange<'a>,
+    gates: Option<DeviceRange<'a>>,
+    conv: DeviceRange<'a>,
+}
+
+impl<'a> Health<'a> {
+    fn split(status: DeviceRange<'a>, layout: LocalStatus) -> Result<Self, EngError> {
+        let at = |index: usize| status.slice(index * WORD, WORD);
+        let controller = status.slice(layout.prep_words * WORD, layout.roles * WORD)?;
+        let gates_at = layout.prep_words + layout.roles;
+        let gates = (layout.gates > 0)
+            .then(|| status.slice(gates_at * WORD, layout.gates * WORD))
+            .transpose()?;
+        Ok(Self {
+            prep: status.slice(0, layout.prep_words * WORD)?,
+            attention: at(0)?,
+            controller,
+            gates,
+            conv: at(gates_at + layout.gates)?,
+        })
     }
 }

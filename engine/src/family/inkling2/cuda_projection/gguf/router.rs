@@ -103,18 +103,18 @@ fn scale_rows(tensors: [Option<&[u8]>; 2], experts: usize) -> Option<Vec<u8>> {
 }
 
 pub(super) struct RouteScratch {
-    shape: RouterShape,
+    pub(super) shape: RouterShape,
     scratch: DeviceBuffer,
     logits_bytes: usize,
     scales: BTreeMap<u32, usize>,
 }
 
-struct RouterInputs<'a> {
-    x: DeviceRange<'a>,
-    w: DeviceRange<'a>,
-    bias: DeviceRange<'a>,
-    status: DeviceRange<'a>,
-    scale: f32,
+pub(super) struct RouterInputs<'a> {
+    pub(super) x: DeviceRange<'a>,
+    pub(super) w: DeviceRange<'a>,
+    pub(super) bias: DeviceRange<'a>,
+    pub(super) status: DeviceRange<'a>,
+    pub(super) scale: f32,
 }
 
 impl RouteScratch {
@@ -139,7 +139,7 @@ impl RouteScratch {
         self.scales.contains_key(&layer)
     }
 
-    fn scale_ranges(&self, layer: u32) -> Result<[DeviceRange<'_>; 2], EngError> {
+    pub(super) fn scale_ranges(&self, layer: u32) -> Result<[DeviceRange<'_>; 2], EngError> {
         let offset = self
             .scales
             .get(&layer)
@@ -160,7 +160,7 @@ impl RouteScratch {
         ])
     }
 
-    fn enqueue(
+    pub(super) fn enqueue(
         &self,
         context: &CudaContext,
         stream: &DeviceStream,
@@ -319,7 +319,7 @@ impl GgufCuda {
     }
 }
 
-fn gate_schedule() -> GgufGate {
+pub(super) fn gate_schedule() -> GgufGate {
     static SCHEDULE: OnceLock<GgufGate> = OnceLock::new();
     *SCHEDULE.get_or_init(|| {
         if std::env::var("FIFI_INKLING_CUDA_GATE_DOT").as_deref() == Ok("1") {

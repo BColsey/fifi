@@ -7,6 +7,8 @@
 
 namespace {
 constexpr int kWidth = 128, kTaps = 4;
+// Largest row the Rust wrappers pass to inkling_weighted_norm.
+constexpr int kMaxNormWidth = 4096;
 
 struct Args {
     float *q, *relative, *raw_k, *raw_v, *k, *v, *sinks, *gates;
@@ -118,13 +120,20 @@ __device__ float ordered_rms_scale(const float *x, int width, float eps) {
     return isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
 }
 
+// The ordered scale sums every square in scalar order, so one lane adds and the chain of
+// dependent adds is the floor. The other lanes bring the row into shared memory first: one
+// lane loading from global memory serializes a memory latency behind every add. The values,
+// their order and every rounding are those of the sum from global memory.
 __global__ void inkling_weighted_norm(const float *input, const float *gamma,
     float *output, float *status, int width, float eps) {
+    __shared__ float staged[kMaxNormWidth];
     const int row = blockIdx.x;
     const int lane = threadIdx.x;
     const float *x = input + row * width;
+    for (int i = lane; i < width; i += blockDim.x) staged[i] = x[i];
+    __syncthreads();
     __shared__ float scale;
-    if (lane == 0) scale = ordered_rms_scale(x, width, eps);
+    if (lane == 0) scale = ordered_rms_scale(staged, width, eps);
     __syncthreads();
     bool bad = !isfinite(scale);
     for (int i = lane; i < width; i += blockDim.x) {

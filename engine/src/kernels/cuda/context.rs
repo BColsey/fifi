@@ -1927,7 +1927,7 @@ mod workspace;
 pub(crate) use device_arena::{ArenaHold, DeviceArena};
 pub(crate) use expert_bank::{ExpertBank, ExpertBankGeometry};
 pub(crate) use graph::{CapturePlan, GraphExec, is_capture_refusal};
-pub(in crate::kernels::cuda) use launch::{Claim, require_apart, require_fit};
+pub(crate) use launch::{Claim, require_apart, require_fit};
 pub(crate) use launch::{MatmulIo, PackCall, Projection};
 pub(crate) use mailbox::Mailbox;
 pub(crate) use native_weight::NativeWeight;

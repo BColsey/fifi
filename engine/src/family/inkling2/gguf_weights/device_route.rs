@@ -5,7 +5,36 @@ use crate::{
         cuda_projection::gguf::router::{MlpController, RouteInput},
         phase_profile::{PhaseProfile, Work},
     },
+    kernels::cuda::resident::dense_gemv::DenseDtype,
 };
+
+impl GgufTextWeights {
+    /// The packed GGUF kinds of the layer's expert gate (`w13`) and down (`w2`) stacks for
+    /// `ResidentMlpRequest::dtypes`; `None` when either tensor is not packed GGUF, the
+    /// condition `device_routed_experts` applies before it chains the layer.
+    pub(in crate::family::inkling2) fn resident_expert_dtypes(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<[DenseDtype; 2]>, EngError> {
+        let Some(cuda) = self.cuda.as_ref().filter(|_| self.ram.is_none()) else {
+            return Ok(None);
+        };
+        let dtype = |name| {
+            let (tensor, _) = self.tensor(name)?;
+            Ok::<_, EngError>(
+                cuda.expert_dtype(tensor.kind)
+                    .filter(|dtype| dtype.is_packed_gguf()),
+            )
+        };
+        let [Some(gate), Some(down)] = [
+            dtype(&format!("{prefix}.experts.w13_weight"))?,
+            dtype(&format!("{prefix}.experts.w2_weight"))?,
+        ] else {
+            return Ok(None);
+        };
+        Ok(Some([gate, down]))
+    }
+}
 
 impl GgufTextWeights {
     pub(in crate::family::inkling2) fn device_routed_experts(
@@ -21,26 +50,13 @@ impl GgufTextWeights {
         if !cuda.has_resident_route(route.layer) {
             return Ok(None);
         }
-        let gate = format!("{prefix}.experts.w13_weight");
-        let down = format!("{prefix}.experts.w2_weight");
-        let dtype = |name| {
-            let (tensor, _) = self.tensor(name)?;
-            Ok::<_, EngError>(
-                cuda.expert_dtype(tensor.kind)
-                    .filter(|dtype| dtype.is_packed_gguf()),
-            )
-        };
-        let [Some(gate_dtype), Some(down_dtype)] = [dtype(&gate)?, dtype(&down)?] else {
+        let Some(dtypes) = self.resident_expert_dtypes(prefix)? else {
             return Ok(None);
         };
         // This path measures the router and experts as one resident backend call.
         let _span = profile.and_then(|profile| profile.span(Work::Experts));
-        cuda.routed_expert_group(
-            prefix,
-            route,
-            [gate_dtype, down_dtype],
-            control,
-            |experts| self.vec(&format!("{prefix}.gate.bias"), experts),
-        )
+        cuda.routed_expert_group(prefix, route, dtypes, control, |experts| {
+            self.vec(&format!("{prefix}.gate.bias"), experts)
+        })
     }
 }

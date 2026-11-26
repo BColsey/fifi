@@ -15,7 +15,8 @@ fn flags() -> (bool, bool) {
     static FLAGS: OnceLock<(bool, bool)> = OnceLock::new();
     *FLAGS.get_or_init(|| {
         (
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE").as_deref() == Ok("1"),
+            std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE").as_deref() == Ok("1")
+                || std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_VISIT").as_deref() == Ok("1"),
             std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT").as_deref() == Ok("1"),
         )
     })
@@ -53,7 +54,7 @@ pub(super) fn project_group(
         }
     }
     if report {
-        report_counts(calls, stage, counts.q8_row_pairs);
+        report_counts(calls, stage, counts.q8_row_pairs, counts.q8_grouped_visits);
     }
     Ok(())
 }
@@ -83,29 +84,30 @@ pub(super) fn project_output(
             eprintln!("Inkling CUDA Q8 output exact4 rows {}", shape.m);
         }
     } else if report && q8 {
-        emit("attention_output", shape.m, 1, usize::from(width == 2));
+        emit("attention_output", shape.m, 1, usize::from(width == 2), 0);
     }
     Ok(())
 }
 
-fn report_counts(calls: &[DenseGemvCall<'_>], stage: &str, paired: usize) {
+fn report_counts(calls: &[DenseGemvCall<'_>], stage: &str, paired: usize, grouped: usize) {
     // No WMMA/expert opt-in here: every Q8_0 call took the pair or ordinary GEMV entry.
     let mut q8 = calls
         .iter()
         .filter(|call| call.dtype == DenseDtype::PackedGguf(GgufType::Q80));
     if let Some(first) = q8.next() {
-        emit(stage, first.shape.m, 1 + q8.count(), paired);
+        emit(stage, first.shape.m, 1 + q8.count(), paired, grouped);
     }
 }
 
-fn emit(stage: &str, rows: usize, total: usize, paired: usize) {
-    eprintln!(
-        "Inkling CUDA Q8 prefill {}",
-        serde_json::json!({
-            "stage": stage,
-            "rows": rows,
-            "q8_pair_calls": paired,
-            "q8_gemv_calls": total - paired,
-        })
-    );
+fn emit(stage: &str, rows: usize, total: usize, paired: usize, grouped: usize) {
+    let mut record = serde_json::json!({
+        "stage": stage,
+        "rows": rows,
+        "q8_pair_calls": paired,
+        "q8_gemv_calls": total - paired - grouped * 2,
+    });
+    if grouped != 0 {
+        record["q8_grouped_visit_launches"] = grouped.into();
+    }
+    eprintln!("Inkling CUDA Q8 prefill {record}");
 }

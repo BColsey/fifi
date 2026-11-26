@@ -44,11 +44,22 @@ typedef struct inference_cuda_dense_gemv_args {
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
 
+/* Internal independent single-row Inkling attention projections (6 or 8). */
+int inference_cuda_decode_attention_group(const inference_cuda_dense_gemv_args *calls,
+                                          int count, void *stream, int *out_stage);
+
+/* Internal opt-in paired controller projections. Independent F32 matrices and
+ * disjoint outputs, both M=1, K=64, N=2304, sharing the same input. */
+int inference_cuda_decode_control_pair(const inference_cuda_dense_gemv_args *a,
+                                       const inference_cuda_dense_gemv_args *b,
+                                       void *stream, int *out_stage);
+
 /* Opt-in: pair independent F32 activation rows sharing one dense Q8_0 matrix.
  * Same operand checks, strides and arithmetic as packed GEMV. Selects an active
  * SM75 device only, for (N,K)=(1024,2304) or (3072,2304) at M=7..12, or
  * (2304,3072) at M=63..64. Only the last shape honors prefer_four. Other valid
- * calls use ordinary GEMV. Optional out_width reports 2, 4, or 0. No retry. */
+ * calls use ordinary GEMV. prefer_four=-1 selects exact all-row visit instead.
+ * Optional out_width reports 2, 4, m for a visit, or 0. No retry. */
 int inference_cuda_gguf_q8_row_reuse_width_launch(const inference_cuda_dense_gemv_args *args,
                                                   void *stream, int *out_stage, int *out_width,
                                                   int prefer_four);
@@ -72,6 +83,31 @@ int inference_cuda_gguf_exact_expert_tile_launch(const inference_cuda_dense_gemv
  * can change the output from the F32 matvec. No global weight staging. */
 int inference_cuda_gguf_wmma_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
+
+/* Combine two independent exact expert calls; used=0 declines without enqueue. */
+int inference_cuda_inkling_ragged_pair_launch(const inference_cuda_dense_gemv_args *two,void *stream,int *stage,int *used);
+
+/* Exact F32 SM75 controller down at measured visit widths. */
+int inference_cuda_inkling_down_launch(const inference_cuda_dense_gemv_args *args,void *stream,int *stage);
+
+/* Decode an expert to borrowed aligned half panels then run WMMA. used=0
+ * declines without enqueue; a launch error never requests a fallback. */
+int inference_cuda_inkling_panel_launch(const inference_cuda_dense_gemv_args *args,void *scratch,
+    size_t scratch_bytes,void *stream,int *stage,int *used);
+
+/* Adjacent independent SM75 Q8 projections. used=0 declines without enqueue. */
+int inference_cuda_inkling_qkv_visit_launch(const inference_cuda_dense_gemv_args *args,int count,void *stream,int *stage,int *used);
+
+/* Exact multicodec packed tile: variant 1 uses eight weight rows per CTA. */
+int inference_cuda_inkling_packed_visit_launch(const inference_cuda_dense_gemv_args *args, void *stream, int *stage, int variant);
+
+/* F32 gain/forget heads. used=0 means an ineligible pair, no enqueue. */
+int inference_cuda_inkling_controller_pair_launch(const inference_cuda_dense_gemv_args *a,
+    const inference_cuda_dense_gemv_args *b, void *stream, int *stage, int *used);
+
+/* Opt-in IQ2_XS gate/up tile with the deployed WMMA accumulation order. */
+int inference_cuda_inkling_iq2_visit_launch(const inference_cuda_dense_gemv_args *args, void *stream,
+                                            int *out_stage);
 
 /* Contiguous GGUF expert stacks. Rank order is the order of picks. Scratch holds
  * count * (3 * middle + hidden) f32 values. The launch queues the two indexed

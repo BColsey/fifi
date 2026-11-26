@@ -18,6 +18,47 @@ __global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
     workspace[role * 2 * width + i] = __fmul_rn(raw[i], scales[i >= width]);
 }
 
+// One CTA per gate half. Keep the original pair for applying gain/forget;
+// broadcasting gamma here avoids uploading the same weight for every row.
+__global__ void inkling_prepare_controller(const float *pairs, const float *gamma,
+                                           float *triples, float *gates, float *health,
+                                           int width, float eps) {
+    const int half = blockIdx.x;
+    const int role = half / 2;
+    const int side = half % 2;
+    const float *src = pairs + half * width;
+    float *raw = triples + (3 * role + side) * width;
+    float *gate = gates + half * width;
+    float *raw_gamma = triples + (3 * role + 2) * width;
+    const int lane = threadIdx.x;
+    __shared__ float sums[threads];
+    float sum = 0.0f;
+    bool invalid = false;
+    for (int i = lane; i < width; i += threads) {
+        const float x = src[i];
+        raw[i] = x;
+        if (side == 0) raw_gamma[i] = gamma[i];
+        invalid |= !isfinite(x);
+        sum = __fadd_rn(sum, __fmul_rn(x, x));
+    }
+    sums[lane] = sum;
+    __syncthreads();
+    for (int stride = threads / 2; stride != 0; stride /= 2) {
+        if (lane < stride) sums[lane] = __fadd_rn(sums[lane], sums[lane + stride]);
+        __syncthreads();
+    }
+    const float variance = __fadd_rn(__fdiv_rn(sums[0], static_cast<float>(width)), eps);
+    const float scale = __frcp_rn(__fsqrt_rn(variance));
+    invalid |= !isfinite(variance) || !isfinite(scale);
+    for (int i = lane; i < width; i += threads) {
+        const float x = __fmul_rn(src[i], scale);
+        gate[i] = x;
+        invalid |= !isfinite(x);
+    }
+    const int failed = __syncthreads_or(invalid);
+    if (lane == 0) health[half] = failed ? __int_as_float(0x7fc00000) : 0.0f;
+}
+
 __global__ void inkling_controller_norm(float *workspace, float *health, int width, float eps) {
     const int role = blockIdx.x;
     const int roles = gridDim.x;
@@ -45,8 +86,9 @@ __global__ void inkling_controller_norm(float *workspace, float *health, int wid
         if (lane < stride) sums[lane] += sums[lane + stride];
         __syncthreads();
     }
-    const float scale = 1.0f / sqrtf(sums[0] / width + eps);
-    invalid |= !isfinite(sums[0]) || !isfinite(scale);
+    const float variance = sums[0] / width + eps;
+    const float scale = 1.0f / sqrtf(variance);
+    invalid |= !isfinite(variance) || !isfinite(scale);
     for (int i = lane; i < width; i += threads) {
         out[i] = __fmul_rn(__fmul_rn(out[i], scale), gamma[i]);
         invalid |= !isfinite(out[i]);
@@ -115,6 +157,22 @@ extern "C" int inference_cuda_inkling_rebuild_gates(float *workspace, int width,
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     const dim3 grid((2 * width + threads - 1) / threads, roles);
     inkling_rebuild_gates<<<grid, threads, 0, (cudaStream_t)stream>>>(workspace, width, roles);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return int(failure.err);
+}
+
+extern "C" int inference_cuda_inkling_prepare_controller(
+    const float *pairs, const float *gamma, float *triples, float *gates, float *health,
+    int width, int roles, float eps, void *stream, int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    if (!pairs || !gamma || !triples || !gates || !health || !stream ||
+        width < 1 || width > 4096 || roles < 1 || roles > 1536 ||
+        !isfinite(eps) || eps <= 0.0f)
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    inkling_prepare_controller<<<2 * roles, threads, 0, (cudaStream_t)stream>>>(
+        pairs, gamma, triples, gates, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

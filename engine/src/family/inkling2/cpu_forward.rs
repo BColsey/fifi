@@ -1,6 +1,6 @@
 //! Text execution for Inkling 2 Mini, including CUDA-backed projections.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{borrow::Cow, fs, path::Path, sync::Arc};
 
 use serde::Deserialize;
 
@@ -18,11 +18,13 @@ mod controller_batch;
 mod depth_mix;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prefill;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod resident_visit;
 mod window;
 
 use depth_mix::Stream;
 
-const MIX_EPS: f32 = 1e-6;
+pub(super) const MIX_EPS: f32 = 1e-6;
 pub(super) const ROUTE_NORMALIZATION_FLOOR: f32 = 1.0 / 16384.0;
 
 #[derive(Deserialize)]
@@ -79,6 +81,12 @@ pub(super) struct CpuForward {
     grouped_verify: bool,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     grouped_draft_prefill: bool,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    resident_visit: std::cell::RefCell<Option<resident_visit::Workspace>>,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    resident_token: Option<resident_visit::TokenWorkspace>,
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    resident_pair: [std::cell::RefCell<Option<resident_visit::Pair>>; 2],
 }
 
 pub(super) struct PrefixState {
@@ -206,6 +214,12 @@ impl CpuForward {
             grouped_verify: false,
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             grouped_draft_prefill: false,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            resident_visit: Default::default(),
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            resident_token: None,
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            resident_pair: Default::default(),
         })
     }
 
@@ -282,17 +296,24 @@ impl CpuForward {
             .ok_or_else(|| EngError::MemoryPlan("Inkling host state size overflows".into()))
     }
 
-    pub(super) fn snapshot(&self) -> PrefixState {
-        PrefixState {
+    pub(super) fn snapshot(&mut self) -> Result<PrefixState, EngError> {
+        // The method exists only in CUDA builds; without the feature no row is ever device-only.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.materialize_resident()?;
+        Ok(PrefixState {
             position: self.position,
             visits: self.state.clone(),
             features: self.features.clone(),
-        }
+        })
     }
 
     pub(super) fn restore(&mut self, saved: &PrefixState) {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.invalidate_device_attention();
+        // The saved host rows replace the sequence wholesale; device-only rows are dropped with
+        // their cursors, so no visit stays resident.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        debug_assert!(saved.visits.iter().all(|state| !state.is_resident()));
         self.window = None;
         self.features.clone_from(&saved.features);
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -341,6 +362,13 @@ impl CpuForward {
             return Err(bad("token or sequence is outside the Inkling text limits"));
         }
 
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if collect_logits && self.admit_resident_token()? {
+            return self.commit_resident_token(id).map(Some);
+        }
+        // The host-orchestrated path below reads host rows; a chain token left them on the device.
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.materialize_resident()?;
         self.window = None;
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);
@@ -521,6 +549,13 @@ impl CpuForward {
         bank: Option<&MessageBank>,
         decode: bool,
     ) -> Result<(), EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if decode
+            && let Some(bank) = bank
+            && self.try_resident_visit(visit, state, stream, bank)?
+        {
+            return Ok(());
+        }
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let residual = self.mlp_residual(
@@ -826,18 +861,7 @@ impl CpuForward {
         physical: usize,
         role: Role,
     ) -> Result<(ControlInput, [f32; 2]), EngError> {
-        let (kind, offset) = match role {
-            Role::Query => ("cross_pass_queries", 0),
-            Role::Key => ("cross_pass_kv_queries", 0),
-            Role::Value => ("cross_pass_kv_queries", 1),
-            Role::Mlp => ("cross_pass_queries", 1),
-        };
-        let row = 2 * (physical - self.spec.core.core_start) + offset;
-        let query = self.weights.row(
-            &format!("model.llm.middle_cycle_{kind}"),
-            row,
-            self.hidden(),
-        )?;
+        let query = self.control_query(physical, role)?;
         let message = bank.stream.mix(bank.first_block, &query);
         let mut gate = input.to_vec();
         gate.extend_from_slice(&message);
@@ -847,6 +871,21 @@ impl CpuForward {
             rms_norm_with_scale(right, MIX_EPS),
         ];
         Ok((ControlInput { gate, message }, scales))
+    }
+
+    fn control_query(&self, physical: usize, role: Role) -> Result<Cow<'_, [f32]>, EngError> {
+        let (kind, offset) = match role {
+            Role::Query => ("cross_pass_queries", 0),
+            Role::Key => ("cross_pass_kv_queries", 0),
+            Role::Value => ("cross_pass_kv_queries", 1),
+            Role::Mlp => ("cross_pass_queries", 1),
+        };
+        let row = 2 * (physical - self.spec.core.core_start) + offset;
+        self.weights.row(
+            &format!("model.llm.middle_cycle_{kind}"),
+            row,
+            self.hidden(),
+        )
     }
 
     fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {
