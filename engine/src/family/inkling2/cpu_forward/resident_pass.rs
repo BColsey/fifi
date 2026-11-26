@@ -842,10 +842,15 @@ impl CpuForward {
             &block.stream,
             PassPrepCall {
                 raw: block.at(l.raw[kind], rows * raw_stride)?,
-                side: block.at(l.side[kind], rows * l.side_stride[kind])?,
+                // The prep entry takes the exact extents it reads: the last row of `side` stops
+                // after V (the position word is written by `inkling_pass_positions`).
+                side: block.at(
+                    l.side[kind],
+                    (rows - 1) * l.side_stride[kind] + 2 * kv_channels,
+                )?,
                 history: [block.tail(0, index, 0)?, block.tail(0, index, 1)?],
                 kernel: [block.constant(&consts.conv_k)?, block.constant(&consts.conv_v)?],
-                dynamic: block.at(l.dynamic[kind], rows * dynamic_stride)?,
+                dynamic: block.at(l.dynamic[kind], (rows - 1) * dynamic_stride + kv * TAPS)?,
                 status,
             },
             rows,
