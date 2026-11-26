@@ -893,7 +893,14 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
         .map(<[f32]>::to_vec)
         .collect();
     let twin_expected = host::mix(&twin_sealed, &host_twin_current, 0, &twin_query, EPS);
-    assert!(max_error(&out, &expected) <= 1e-6, "mix output {out:?}");
+    let mut standalone_state = state.clone();
+    standalone_state[..width].copy_from_slice(&host_current);
+    let separate = Buffers::new(&ctx, width)
+        .mix(&ctx, &stream, &standalone_state, &query, 2, blocks, width)
+        .unwrap();
+    assert_eq!(out, separate, "fused output versus standalone mix");
+    let error = max_error(&out, &expected);
+    assert!(error <= 1e-6, "mix max absolute error {error}");
     assert!(
         max_error(&twin_out, &twin_expected) <= 1e-6,
         "twin mix output"
