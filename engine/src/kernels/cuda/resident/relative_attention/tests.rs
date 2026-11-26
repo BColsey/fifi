@@ -9,8 +9,10 @@ const SHAPE: RelativeAttentionShape = RelativeAttentionShape {
     query_heads: 24,
     kv_heads: 8,
     relative_dims: 16,
-    relative_extent: 13,
-    capacity: 19,
+    // A ring past the block's bias-table threshold (64 rows) and an extent short of it, so the
+    // positions cover both bias paths and distances with and without a bias.
+    relative_extent: 70,
+    capacity: 83,
 };
 const QUERY: usize = SHAPE.query_heads * HEAD_DIM;
 const KV: usize = SHAPE.kv_heads * HEAD_DIM;

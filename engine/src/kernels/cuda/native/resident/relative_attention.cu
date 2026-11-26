@@ -53,9 +53,11 @@ struct SerialKv {
 };
 
 // The score of the row at `distance`: the scaled QK dot of the lane's key columns, summed across
-// the warp, plus the learned bias.
+// the warp, plus the learned bias. `biases` is the block's table of the bias by distance, or null
+// when the warp sums each bias itself.
 __device__ __forceinline__ float row_score(const Args &a, const float (&query)[kColumns], float rel,
-                                           int distance, const float (&key)[kColumns]) {
+                                           int distance, const float (&key)[kColumns],
+                                           const float *biases) {
     const int lane = threadIdx.x % kWarp;
     float dot = 0.f;
 #pragma unroll
@@ -64,12 +66,49 @@ __device__ __forceinline__ float row_score(const Args &a, const float (&query)[k
     }
     float bias = 0.f;
     if (distance < a.relative_extent) {
-        const float term = lane < a.relative_dims
-                               ? rel * a.table[size_t(lane) * a.relative_extent + distance]
-                               : 0.f;
-        bias = warp_sum(term);
+        if (biases != nullptr) {
+            bias = biases[distance];
+        } else {
+            const float term = lane < a.relative_dims
+                                   ? rel * a.table[size_t(lane) * a.relative_extent + distance]
+                                   : 0.f;
+            bias = warp_sum(term);
+        }
     }
     return kScale * warp_sum(dot) + bias;
+}
+
+// The bias table covers extents up to kBiasRows. Below kBiasMinRows rows the warps sum each bias
+// themselves, which costs less than a fill and a barrier.
+constexpr int kBiasRows = 1024;
+constexpr int kBiasMinRows = 64;
+
+__device__ bool bias_table(const Args &a, int count) {
+    return a.relative_extent <= kBiasRows && count >= kBiasMinRows;
+}
+
+// The relative bias of each distance below min(extent, count), one thread per distance. The adds
+// follow warp_sum's butterfly (lanes at or past relative_dims add zero), so every score keeps the
+// bits of the warp-summed bias; the explicit roundings keep the products and sums from contracting
+// into FMAs the shuffled form cannot form. The caller synchronizes the block before reading it.
+__device__ void fill_biases(const Args &a, int head, int count, float *biases) {
+    const int rows = min(a.relative_extent, count);
+    for (int distance = threadIdx.x; distance < rows; distance += kThreads) {
+        float v[kWarp];
+#pragma unroll
+        for (int l = 0; l < kWarp; ++l) {
+            v[l] = l < a.relative_dims
+                       ? __fmul_rn(a.relative[head * a.relative_dims + l],
+                                   a.table[size_t(l) * a.relative_extent + distance])
+                       : 0.f;
+        }
+#pragma unroll
+        for (int offset = kWarp / 2; offset > 0; offset /= 2) {
+#pragma unroll
+            for (int l = 0; l < offset; ++l) v[l] = __fadd_rn(v[l], v[l + offset]);
+        }
+        biases[distance] = v[0];
+    }
 }
 
 // The lane's columns of one K or V row.
@@ -90,7 +129,8 @@ constexpr int kBatch = 4;
 // adds the distances w, w + kWarps, ... Only the source addresses vary by reader; the FP32
 // recurrence and order do not.
 template <class ReadKv>
-__device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_kv) {
+__device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_kv,
+                        const float *biases) {
     const int lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
     float query[kColumns];
     float acc[kColumns] = {};
@@ -116,7 +156,7 @@ __device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_k
         for (int j = 0; j < kBatch; ++j) {
             const int distance = first + j * kWarps;
             scores[j] =
-                distance < r.count ? row_score(a, query, rel, distance, keys[j]) : -INFINITY;
+                distance < r.count ? row_score(a, query, rel, distance, keys[j], biases) : -INFINITY;
         }
 #pragma unroll
         for (int j = 0; j < kBatch; ++j) {
@@ -170,6 +210,7 @@ __device__ void finish(const Args &a, const Rows &r, const Partials &p) {
 
 __global__ void relative_attention(Args a) {
     __shared__ Partials p;
+    __shared__ float biases[kBiasRows];
     const int pos = *a.pos, head = blockIdx.x, d = threadIdx.x;
     if (pos < 0 || pos >= kWordMax) {
         if (head == 0 && d == 0) atomicOr(a.status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
@@ -185,7 +226,12 @@ __global__ void relative_attention(Args a) {
         a.keys[dst] = a.k[src];
         a.values[dst] = a.v[src];
     }
-    partial(a, r, p, SerialKv{});
+    const bool table = bias_table(a, r.count);
+    if (table) {
+        fill_biases(a, head, r.count, biases);
+        __syncthreads();
+    }
+    partial(a, r, p, SerialKv{}, table ? biases : nullptr);
     __syncthreads();
     finish(a, r, p);
 }
@@ -207,6 +253,7 @@ struct SnapshotKv {
 __global__ void snapshot_queries(Args a, int first, int input_stride, int query_stride,
                                  int side_stride) {
     __shared__ Partials p;
+    __shared__ float biases[kBiasRows];
     const int query = blockIdx.y, head = blockIdx.x, pos = first + query;
     a.status += query;
     const int channels = a.query_heads * kHeadDim;
@@ -225,7 +272,13 @@ __global__ void snapshot_queries(Args a, int first, int input_stride, int query_
     a.relative += query * row_stride(query_stride, a.query_heads * a.relative_dims);
     a.sinks += query * row_stride(side_stride, a.query_heads);
     a.gates += query * row_stride(side_stride, channels);
-    partial(a, r, p, SnapshotKv{query, row_stride(input_stride, a.kv_heads * kHeadDim)});
+    const bool table = bias_table(a, r.count);
+    if (table) {
+        fill_biases(a, head, r.count, biases);
+        __syncthreads();
+    }
+    partial(a, r, p, SnapshotKv{query, row_stride(input_stride, a.kv_heads * kHeadDim)},
+            table ? biases : nullptr);
     __syncthreads();
     finish(a, r, p);
 }
