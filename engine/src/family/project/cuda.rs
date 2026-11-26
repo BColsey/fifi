@@ -254,6 +254,31 @@ impl CudaWeights {
         })
     }
 
+    /// Own a native GGUF load after its source adapter checked the stored metadata.
+    /// Raw auxiliaries may accompany native matrices, but a raw-only or mixed load is refused.
+    pub(crate) fn from_native(weights: Vec<CudaWeight>) -> Result<Self, EngError> {
+        let mut loaded = Self {
+            weights,
+            index: HashMap::new(),
+            times: LoadTimes::default(),
+        };
+        let names: Vec<_> = loaded.weights.iter().map(CudaWeight::name).collect();
+        loaded.index = load_index(&names)?;
+        // This GGUF owner does not support the separate tiled-head override.
+        let layout = load_layout(
+            loaded
+                .weights
+                .iter()
+                .map(|weight| (weight.name(), weight.kind())),
+        )?;
+        if layout != WeightLayout::Native {
+            return Err(EngError::Checkpoint(
+                "native load has no native matrices".into(),
+            ));
+        }
+        Ok(loaded)
+    }
+
     /// Own an explicit EXL3 load after its source adapter checked the stored metadata.
     pub(crate) fn from_exl3(weights: Vec<CudaWeight>) -> Result<Self, EngError> {
         let mut loaded = Self {

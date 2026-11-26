@@ -47,6 +47,9 @@ pub(crate) fn start_engine(
     .map(|(engine, _)| engine)
 }
 
+/// Starts one entry. The second element is the entry's resolved settings for a pack; a GGUF
+/// checkpoint has none (no manifest, no `config.json`) and answers `None`: its start plans from
+/// its own metadata and takes its own path, so no settings are made up for it.
 pub(crate) fn start_engine_resolved(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -62,13 +65,30 @@ pub(crate) fn start_engine_resolved(
     if !super::settings::pack_start(options, env, model_dir, tokenizer_dir)
         && let Some(model) = super::load::gguf::GgufModel::open(model_dir)?
     {
-        let (engine, bundle, context_limit) = super::load::gguf::start::start(
-            model,
-            options,
-            env.gguf_opt_in(),
-            tokenizer_dir,
-            ready_note,
-        )?;
+        use super::load::gguf::start::StartInput;
+        // `INFERENCE_FLASH_NEXT_GGUF_SERVE` selects the staged GGUF decode modules; without it
+        // the start takes the path behind `FIFI_FLASH_NEXT_GGUF` (`check_opt_in`). A mis-set
+        // switch is refused here, before the card is opened.
+        let (engine, bundle, context_limit) = if env.gguf_serve()? {
+            super::load::gguf::start::start_staged(
+                model,
+                StartInput {
+                    model_dir,
+                    tokenizer_dir,
+                    options,
+                    env,
+                    ready_note,
+                },
+            )?
+        } else {
+            super::load::gguf::start::start(
+                model,
+                options,
+                env.gguf_opt_in(),
+                tokenizer_dir,
+                ready_note,
+            )?
+        };
         return Ok((
             StartedEngine {
                 engine,

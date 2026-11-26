@@ -1407,3 +1407,85 @@ fn gemm_dq_q4k_q6k_match_the_cpu_dequant_matmul() {
     }
     println!("gemm dq q4k/q6k: max tolerance ratio {max_ratio:.3}");
 }
+
+#[test]
+#[ignore = "requires an admitted CUDA device"]
+fn window_q80_q6k_f32_padded_strides_match_fp16_reference() {
+    assert!(testkit::device_present(
+        "window_q80_q6k_f32_padded_strides_match_fp16_reference"
+    ));
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols, xs, ys) = (256usize, 17usize, 3usize, 272usize, 23usize);
+    for (ty, gt, block_bytes) in [
+        (QuantType::Q80, GgufType::Q80, 34usize),
+        (QuantType::Q6K, GgufType::Q6K, 210usize),
+    ] {
+        let mut rng = testkit::Rng::new(0x41c0 + gt.id() as u64);
+        let mut weights = vec![0u8; rows * (k / ty.block_size()) * block_bytes];
+        for block in weights.chunks_exact_mut(block_bytes) {
+            for byte in block.iter_mut() {
+                *byte = rng.next_u64() as u8;
+            }
+            let scale = if ty == QuantType::Q80 { 0 } else { 208 };
+            block[scale..scale + 2].copy_from_slice(&f16_bits(0.01).to_le_bytes());
+        }
+        let mut input = vec![123.0f32; (ncols - 1) * xs + k];
+        for col in 0..ncols {
+            for j in 0..k {
+                input[col * xs + j] = (rng.normal() * 0.2) as f32;
+            }
+        }
+        let input_bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let w = testkit::upload_bytes(&ctx, &weights);
+        let x = testkit::upload_bytes(&ctx, &input_bytes);
+        let ylen = (ncols - 1) * ys + rows;
+        let y = testkit::upload_filled(&ctx, 0xA5, ylen * 4);
+        ctx.gemm_dq_codebook(
+            &stream,
+            ty,
+            GemmDqTypedCall {
+                w: w.range(0, weights.len()).unwrap(),
+                x: x.range(0, input_bytes.len()).unwrap(),
+                y: y.range(0, ylen * 4).unwrap(),
+                k,
+                rows,
+                ncols,
+                x_col_stride: xs,
+                y_col_stride: ys,
+                x_f32: true,
+            },
+        )
+        .expect("padded f32 window gemm");
+        stream.synchronize().expect("drain");
+        let result = testkit::read_bytes(&ctx, &y, ylen * 4);
+        let decoded = dequantize(gt, &weights).expect("decode weights");
+        for col in 0..ncols {
+            for row in 0..rows {
+                let mut dot = 0.0f64;
+                let mut abs = 0.0f64;
+                for j in 0..k {
+                    let w = f64::from(f16_of(f16_bits(decoded[row * k + j])));
+                    let x = f64::from(f16_of(f16_bits(input[col * xs + j])));
+                    dot += w * x;
+                    abs += (w * x).abs();
+                }
+                let at = (col * ys + row) * 4;
+                let got = f32::from_le_bytes(result[at..at + 4].try_into().unwrap());
+                let tolerance = k as f64 * 2f64.powi(-24) * abs;
+                assert!(
+                    (f64::from(got) - dot).abs() <= tolerance,
+                    "{ty:?} col={col} row={row}"
+                );
+            }
+            if col + 1 < ncols {
+                assert!(
+                    result[(col * ys + rows) * 4..(col + 1) * ys * 4]
+                        .iter()
+                        .all(|&v| v == 0xA5)
+                );
+            }
+        }
+        eprintln!("{ty:?}: f32 activation and padded strides verified");
+    }
+}

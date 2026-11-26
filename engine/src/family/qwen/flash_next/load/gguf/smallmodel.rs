@@ -156,6 +156,36 @@ fn q8_0(values: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Quantizes `values` (a whole number of 256-value blocks) to Q6_K with one scale a block: the
+/// half is `amax / 31`, the sixteen sub-scales are 1, and a quant is the value over the half,
+/// rounded and held to -32..=31. The device and the host read the same bytes, so the block's
+/// precision is not what a device test compares.
+fn q6_k(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() / 256 * 210);
+    for block in values.as_chunks::<256>().0 {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let half = if amax == 0.0 { 1.0 } else { amax / 31.0 };
+        let (mut low, mut high) = ([0u8; 128], [0u8; 64]);
+        for (i, &value) in block.iter().enumerate() {
+            let quant = (value / half).round().clamp(-32.0, 31.0) as i32 + 32;
+            let (side, quarter, lane) = (i / 128, (i % 128) / 32, i % 32);
+            let nibble = (quant & 0xF) as u8;
+            let at = 64 * side + lane + 32 * (quarter & 1);
+            if quarter < 2 {
+                low[at] |= nibble;
+            } else {
+                low[at] |= nibble << 4;
+            }
+            high[32 * side + lane] |= (((quant >> 4) & 3) as u8) << (2 * quarter);
+        }
+        out.extend_from_slice(&low);
+        out.extend_from_slice(&high);
+        out.extend_from_slice(&[1u8; 16]);
+        out.extend_from_slice(&half_bits(half).to_le_bytes());
+    }
+    out
+}
+
 /// What the stored values of a role look like.
 fn values_for(role: Slot, count: usize, rng: &mut Lcg) -> Vec<f32> {
     let mut draw = |scale: f32, shift: f32| -> Vec<f32> {
@@ -204,6 +234,7 @@ fn encode(ty: GgufType, values: &[f32]) -> Vec<u8> {
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect(),
         GgufType::Q80 => q8_0(values),
+        GgufType::Q6K => q6_k(values),
         other => panic!("the small model has no encoder for {other:?}"),
     }
 }
@@ -220,6 +251,16 @@ pub(in crate::family::qwen::flash_next) fn write_small(seed: u64) -> Small {
 
 /// [`write_small`] with `layers` layers and an indexer that keeps `top_k` positions.
 pub(super) fn write_small_with(seed: u64, layers: usize, top_k: u32) -> Small {
+    write_small_as(seed, layers, top_k, GgufType::Q80)
+}
+
+/// [`write_small`] with the DeltaNet out-projection matrices stored as `out_proj`: the Q8_0 of
+/// every other matrix, or a K type, blocks of 256 values over heads of 128.
+pub(super) fn write_small_out_proj(seed: u64, out_proj: GgufType) -> Small {
+    write_small_as(seed, LAYERS, 8, out_proj)
+}
+
+fn write_small_as(seed: u64, layers: usize, top_k: u32, out_proj: GgufType) -> Small {
     let dir = tempfile::tempdir().expect("tempdir");
     let kvs = small_kvs_for(layers, top_k);
     let config = {
@@ -248,6 +289,7 @@ pub(super) fn write_small_with(seed: u64, layers: usize, top_k: u32) -> Small {
             dims[1] = VOCAB as u64;
         }
         let ty = match item.role {
+            Slot::Layer(Wanted::DeltaOut) => out_proj,
             Slot::Global(Global::NgramTable) => GgufType::F16,
             Slot::Layer(Wanted::IndexProj | Wanted::IndexKey) => GgufType::Bf16,
             Slot::Layer(Wanted::Hyper(_, SiteTensor::Inject)) => GgufType::F32,
@@ -266,4 +308,30 @@ pub(super) fn write_small_with(seed: u64, layers: usize, top_k: u32) -> Small {
     let path = dir.path().join("small.gguf");
     write_gguf(&path, &kvs, &tensors);
     Small { dir, first: path }
+}
+
+mod tests {
+    use super::*;
+
+    /// A block of the kit's Q6_K decodes, by the CPU oracle the host forward reads, to its
+    /// values within half a quant's step (and the half's own rounding).
+    #[test]
+    fn a_q6_k_block_decodes_to_its_values_within_half_a_step() {
+        let values: Vec<f32> = (0..512)
+            .map(|i| ((i * 37) % 101) as f32 / 250.0 - 0.2)
+            .collect();
+        let bytes = q6_k(&values);
+        assert_eq!(bytes.len(), 2 * 210);
+        let decoded = crate::weights::dequantize(GgufType::Q6K, &bytes).expect("decode Q6_K");
+        for (block, want) in decoded.chunks(256).zip(values.chunks(256)) {
+            let amax = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let step = amax / 31.0;
+            for (&got, &value) in block.iter().zip(want) {
+                assert!(
+                    (got - value).abs() <= 0.6 * step,
+                    "{value} decodes to {got}, step {step}"
+                );
+            }
+        }
+    }
 }

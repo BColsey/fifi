@@ -24,6 +24,19 @@ pub(crate) struct ModelShape {
     pub(crate) vocab: usize,
 }
 
+/// The arithmetic of a native GGUF decode projection on the device. `Exact`, the default, keeps
+/// the f32 activation and multiplies the exactly decoded weight of every value. `Q8` quantizes
+/// the activation to q8_1 and dots it in integer against the decoded codes: it needs the
+/// quantization pass, and on the pinned Flash-Next checkpoint (one prompt) its first logits were
+/// measurably farther from the host's, relative error 0.21 against 0.0003. A matrix the exact
+/// decoders cannot serve is refused, never silently quantized; select `Q8` for such a checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::family::qwen::flash_next) enum GgufDecodePrecision {
+    Q8,
+    #[default]
+    Exact,
+}
+
 pub(crate) enum AttnWeights<'a, W> {
     Delta(DeltaWeights<'a, W>),
     Qsa(QsaWeights<'a, W>),

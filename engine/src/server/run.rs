@@ -646,6 +646,7 @@ fn start_flash(
         prefix_reuse,
         ready_note,
     )?;
+    // A GGUF start reports no settings (it serves on CUDA from its own metadata): no MLX rows.
     let effective = match settings.as_ref().filter(|settings| settings.cuda.is_none()) {
         Some(settings) => crate::capability::effective::flash_mlx_effective(
             config

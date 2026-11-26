@@ -69,9 +69,12 @@ pub(in super::super) struct FlashCudaExecutor<S: ResumesState> {
     /// tests can shrink it below the fake device's position count. Production sets it from
     /// `RESUME_BLOCK_SPACING`.
     block_spacing: usize,
-    /// Whether `INFERENCE_FLASH_NEXT_PREFIX_RESUME` was armed when the executor was built;
-    /// the trait's store-shape answers read this snapshot, not the live environment, so a
-    /// test can pin the unarmed answers without touching the process-global switch.
+    /// Whether this executor's prefix resume is armed: `INFERENCE_FLASH_NEXT_PREFIX_RESUME` when
+    /// the executor was built, and only for a start whose save and restore are qualified (the
+    /// EXL3 pack). A GGUF start builds unarmed whatever the switch says
+    /// ([`Self::without_prefix_resume`]). The trait's store-shape answers and the save and
+    /// restore gates read this snapshot, not the live environment, so a test can pin the unarmed
+    /// answers without touching the process-global switch.
     armed: bool,
     /// The rung turn line the last finished turn printed, for the driver-level tests
     /// that cannot intercept stderr. `None` until a turn ends.
@@ -162,6 +165,22 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
     pub(super) fn with_expert_placement(mut self, placement: ExpertPlacement) -> Self {
         self.expert_placement = Some(placement);
         self
+    }
+
+    /// The executor and its first session with prefix resume kept off whatever
+    /// `INFERENCE_FLASH_NEXT_PREFIX_RESUME` says: for a start whose save and restore are not
+    /// qualified (the GGUF start). The store-shape answers are the unarmed ones, and
+    /// [`Self::save_prefix`] and [`Self::restore_prefix`] return before the driver's resume
+    /// methods, so no boundary state is ever read or installed. The pack's start keeps `new`,
+    /// where the snapshot is the switch itself.
+    pub(in super::super) fn without_prefix_resume(
+        driver: S,
+        rules: CudaRules,
+        identity: PrefixIdentity,
+    ) -> Result<(Self, DecodeSession)> {
+        let (mut executor, session) = Self::new(driver, rules, identity)?;
+        executor.armed = false;
+        Ok((executor, session))
     }
 
     /// The number of positions the caches accept.
@@ -322,7 +341,7 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
     /// sequence has overwritten the rows since — never matches it and falls back to a full
     /// prefill.
     fn save_prefix(&mut self, st: &DecodeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
-        if !resume::on() {
+        if !self.armed || !resume::on() {
             return Ok(false);
         }
         let generation = self.driver.resume_generation();
@@ -357,8 +376,10 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
     /// back to the device, the position rewinds and the session re-holds the boundary's pending
     /// token, so the prefill of the tail continues the sequence. The core session method runs
     /// the store's candidate walk; only an entry of the current arena generation is a candidate.
+    /// An executor built unarmed ([`Self::without_prefix_resume`]) restores nothing and never
+    /// reaches the driver, whatever the switch says later.
     fn restore_prefix(&mut self, st: &mut DecodeSession, prompt: &[u32]) -> Result<usize> {
-        if !resume::on() {
+        if !self.armed || !resume::on() {
             return Ok(0);
         }
         let generation = self.driver.resume_generation();

@@ -562,6 +562,6 @@ impl<D: TokenDevice + StateIo, F: TokenFeeds> ResumesState for TokenDriver<D, F>
 )]
 pub(in super::super) mod chunk;
 #[cfg(test)]
-pub(super) mod fakes;
+pub(in super::super) mod fakes;
 #[cfg(test)]
 mod tests;

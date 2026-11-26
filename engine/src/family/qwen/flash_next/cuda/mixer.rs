@@ -25,13 +25,14 @@ use super::{
 };
 use crate::{
     EngError,
-    family::{AttentionKind, exl3_pack::layer_name},
+    family::{AttentionKind, exl3_pack::layer_name, project::cuda::CudaWeight},
     kernels::cuda::{
         DeviceRange,
         prefill::gdn_scan_seq::{GDN_SCAN_EPS, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes},
         resident::{
-            attn_prep::{AttnPrepCall, AttnPrepShape, RopeParams, SlotMode},
+            attn_prep::{AttnPrepCall, AttnPrepRowsCall, AttnPrepShape, RopeParams, SlotMode},
             gdn_conv::{ConvCall, ConvShape, conv_bytes},
+            head_tile::{HeadTileCall, HeadTileShape},
             qsa_attn::{QsaAttnCall, QsaAttnShape},
             qsa_index::{QsaIndexCall, QsaIndexer, QsaPosition, QsaScoreCall, QsaSelectCall},
             router::RouterShape,
@@ -176,9 +177,42 @@ impl FlashStep<'_> {
             self.gdn_form,
         )?;
 
+        let out_name = at("linear_attn.out_proj");
+        let projection_input = match self.weights.get(&out_name) {
+            // A block wider than a value head goes through the tile slot, which only the staged
+            // plan has; a plan without it projects the scan's output as it lies, in the order
+            // the file stores the matrix in.
+            Some(CudaWeight::Native { weight, .. })
+                if !delta.value_dim.is_multiple_of(weight.quant().block_size())
+                    && self.step_plan.index(Slot::GgufDeltaTile).is_some() =>
+            {
+                // The GGUF uploader leaves such blocks in tiled order: reordering their
+                // heads as bytes would split a shared quantization scale.
+                if m != 1 {
+                    return Err(refuse(
+                        "GGUF DeltaNet head tiling supports decode only".into(),
+                    ));
+                }
+                let tiled = self.slot(Slot::GgufDeltaTile)?;
+                self.ctx.head_tile(
+                    &self.stream,
+                    HeadTileCall {
+                        src: head(&core, need.o_out)?,
+                        dst: head(&tiled, need.o_out)?,
+                        shape: HeadTileShape {
+                            key_heads: delta.key_heads,
+                            value_heads: delta.value_heads,
+                            head_dim: delta.value_dim,
+                        },
+                    },
+                )?;
+                tiled
+            }
+            _ => core,
+        };
         self.project(
-            &at("linear_attn.out_proj"),
-            core,
+            &out_name,
+            projection_input,
             self.slot(Slot::BlockOut(Site::Attn))?,
             m,
         )
@@ -236,36 +270,65 @@ impl FlashStep<'_> {
         let k_cache = self.state_slot(StateSlot::QsaK(layer))?;
         let v_cache = self.state_slot(StateSlot::QsaV(layer))?;
         let q = self.slot(Slot::AttnQ)?;
-        self.ctx.attn_prep(
-            &self.stream,
-            AttnPrepCall {
-                shape: AttnPrepShape {
-                    m,
-                    n_head: qsa.heads_q,
-                    n_kv_head: qsa.heads_kv,
-                    head_dim: qsa.head_dim,
-                    n_rot: dims.rotary_dim as usize,
-                    has_gate: true,
-                    slot: SlotMode::Position,
-                    rows: positions,
-                    ld,
+        let shape = AttnPrepShape {
+            m,
+            n_head: qsa.heads_q,
+            n_kv_head: qsa.heads_kv,
+            head_dim: qsa.head_dim,
+            n_rot: dims.rotary_dim as usize,
+            has_gate: true,
+            slot: SlotMode::Position,
+            rows: positions,
+            ld,
+        };
+        let rope = RopeParams {
+            eps: dims.eps,
+            rope_base: dims.theta,
+        };
+        let q_norm = self.float(&at("self_attn.q_norm.weight"))?;
+        let k_norm = self.float(&at("self_attn.k_norm.weight"))?;
+        if self.qsa_cache_f32 {
+            // The f32 rows entry writes its m rows from the start of the range it is given, so
+            // each range is the plane from this step's position, in bytes. The slots live in one
+            // arena: a buffer range counts from the arena, so each starts at its slot's offset.
+            let plane_row = qsa.heads_kv * qsa.head_dim * std::mem::size_of::<f32>();
+            let (start, len) = (pos * plane_row, m * plane_row);
+            self.ctx.attn_prep_rows(
+                &self.stream,
+                AttnPrepRowsCall {
+                    shape,
+                    rope,
+                    admit_pos: pos,
+                    proj: row,
+                    q_norm,
+                    k_norm,
+                    k_rows: k_cache.buffer().range(k_cache.offset() + start, len)?,
+                    v_rows: v_cache.buffer().range(v_cache.offset() + start, len)?,
+                    q,
+                    pos: self.pos_word()?,
+                    status: self.status_word()?,
+                    inv_freq: None,
                 },
-                rope: RopeParams {
-                    eps: dims.eps,
-                    rope_base: dims.theta,
+            )?;
+        } else {
+            self.ctx.attn_prep(
+                &self.stream,
+                AttnPrepCall {
+                    shape,
+                    rope,
+                    admit_pos: pos,
+                    proj: row,
+                    q_norm,
+                    k_norm,
+                    k_cache,
+                    v_cache,
+                    q,
+                    pos: self.pos_word()?,
+                    status: self.status_word()?,
+                    inv_freq: None,
                 },
-                admit_pos: pos,
-                proj: row,
-                q_norm: self.float(&at("self_attn.q_norm.weight"))?,
-                k_norm: self.float(&at("self_attn.k_norm.weight"))?,
-                k_cache,
-                v_cache,
-                q,
-                pos: self.pos_word()?,
-                status: self.status_word()?,
-                inv_freq: None,
-            },
-        )?;
+            )?;
+        }
 
         let indexer = QsaIndexer {
             heads: qsa.idx_heads,
@@ -328,31 +391,33 @@ impl FlashStep<'_> {
             },
         )?;
         let core = self.slot(Slot::AttnCore)?;
-        self.ctx.qsa_attn(
-            &self.stream,
-            QsaAttnCall {
-                shape: QsaAttnShape {
-                    m,
-                    n_head: qsa.heads_q,
-                    n_kv_head: qsa.heads_kv,
-                    rows: positions,
-                    ratio: qsa.ratio,
-                    budget_blocks,
-                    max_splits: self.options.qsa_splits,
-                },
-                ld,
-                scale: 1.0 / (qsa.head_dim as f32).sqrt(),
-                position: position()?,
-                q,
-                proj: row,
-                k_cache,
-                v_cache,
-                chosen,
-                part: self.slot(Slot::AttnPart)?,
-                out: core,
-                status: Some(self.status_word()?),
+        let attend = QsaAttnCall {
+            shape: QsaAttnShape {
+                m,
+                n_head: qsa.heads_q,
+                n_kv_head: qsa.heads_kv,
+                rows: positions,
+                ratio: qsa.ratio,
+                budget_blocks,
+                max_splits: self.options.qsa_splits,
             },
-        )?;
+            ld,
+            scale: 1.0 / (qsa.head_dim as f32).sqrt(),
+            position: position()?,
+            q,
+            proj: row,
+            k_cache,
+            v_cache,
+            chosen,
+            part: self.slot(Slot::AttnPart)?,
+            out: core,
+            status: Some(self.status_word()?),
+        };
+        if self.qsa_cache_f32 {
+            self.ctx.qsa_attn_exact(&self.stream, attend)
+        } else {
+            self.ctx.qsa_attn(&self.stream, attend)
+        }?;
         self.project(
             &at("self_attn.o_proj"),
             core,

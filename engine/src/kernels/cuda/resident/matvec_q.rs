@@ -376,7 +376,7 @@ impl CudaContext {
         })
     }
 
-    fn plan_matvec<'b>(
+    pub(super) fn plan_matvec<'b>(
         &self,
         call: &MatvecCall<'b>,
         invariant: bool,

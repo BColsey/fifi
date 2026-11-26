@@ -94,6 +94,7 @@ pub(crate) mod expert_activation;
 pub(crate) mod gdn_conv;
 pub(crate) mod gdn_delta;
 pub(crate) mod gelu_ffn;
+pub(crate) mod head_tile;
 pub(crate) mod hyper;
 pub(crate) mod inkling_controller;
 pub(crate) mod inkling_conv;
@@ -106,6 +107,7 @@ pub(crate) mod matvec_dq;
 pub(crate) mod matvec_expert;
 #[cfg(test)]
 mod matvec_gguf;
+pub(crate) mod matvec_gguf_f32;
 pub(crate) mod matvec_native;
 pub(crate) mod matvec_q;
 pub(crate) mod mhc_route;
@@ -121,6 +123,8 @@ pub(crate) mod paged_position;
     )
 )]
 pub(crate) mod ple_block;
+#[cfg(test)]
+pub(crate) mod q6_f32;
 pub(crate) mod qsa_attn;
 pub(crate) mod qsa_index;
 pub(crate) mod quantize_q8_1;

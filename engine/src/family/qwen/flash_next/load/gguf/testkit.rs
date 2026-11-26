@@ -285,7 +285,7 @@ pub(super) fn flash_kvs() -> Vec<Vec<u8>> {
     ]
 }
 
-fn split_kvs(shard: usize, shards: usize, total: usize) -> Vec<Vec<u8>> {
+pub(super) fn split_kvs(shard: usize, shards: usize, total: usize) -> Vec<Vec<u8>> {
     if shards <= 1 {
         return Vec::new();
     }

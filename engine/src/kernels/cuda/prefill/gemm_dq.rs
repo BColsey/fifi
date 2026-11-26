@@ -249,7 +249,10 @@ impl CudaContext {
             self.raw_range(&call.y)?,
         );
         let unit = ty.block_size().max(64);
-        if !ty.is_codebook() || call.k == 0 || !call.k.is_multiple_of(unit) {
+        if !(ty.is_codebook() || matches!(ty, QuantType::Q80 | QuantType::Q6K))
+            || call.k == 0
+            || !call.k.is_multiple_of(unit)
+        {
             return Err(EngError::BadRequest(format!(
                 "the {ty:?} dequantizing GEMM needs k as a positive multiple of {unit}, got {}",
                 call.k

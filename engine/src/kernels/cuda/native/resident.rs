@@ -68,6 +68,7 @@ pub(in crate::kernels::cuda) mod gdn_conv;
 pub(in crate::kernels::cuda) mod gdn_delta;
 pub(in crate::kernels::cuda) mod gelu_ffn;
 pub(in crate::kernels::cuda) mod graph;
+pub(in crate::kernels::cuda) mod head_tile;
 pub(in crate::kernels::cuda) mod hyper;
 pub(in crate::kernels::cuda) mod inkling_controller;
 pub(in crate::kernels::cuda) mod inkling_conv;
@@ -99,6 +100,8 @@ pub(in crate::kernels::cuda) mod paged_position;
     )
 )]
 pub(in crate::kernels::cuda) mod ple_block;
+#[cfg(test)]
+pub(in crate::kernels::cuda) mod q6_f32;
 pub(in crate::kernels::cuda) mod qsa_attn;
 pub(in crate::kernels::cuda) mod qsa_index;
 pub(in crate::kernels::cuda) mod qsa_select;

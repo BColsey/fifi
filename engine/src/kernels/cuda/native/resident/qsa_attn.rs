@@ -34,6 +34,9 @@ pub(in crate::kernels::cuda) const QSA_ATTN_PART_STRIDE: usize = QSA_ATTN_HEAD +
 
 const FLOAT: usize = 4;
 const WIDE: usize = 16;
+/// One stored key or value of the QSA caches, in bytes.
+const F16_ELEMENT: usize = 2;
+const F32_ELEMENT: usize = 4;
 
 #[repr(C)]
 struct QsaAttnArgsRaw {
@@ -56,15 +59,17 @@ struct QsaAttnArgsRaw {
     pos0: c_int,
     scale: f32,
     m: c_int,
+    kv_f32: c_int,
 }
 
 const _: () = assert!(
-    size_of::<QsaAttnArgsRaw>() == 112
+    size_of::<QsaAttnArgsRaw>() == 120
         && offset_of!(QsaAttnArgsRaw, status) == 64
         && offset_of!(QsaAttnArgsRaw, ld) == 72
         && offset_of!(QsaAttnArgsRaw, pos0) == 100
         && offset_of!(QsaAttnArgsRaw, scale) == 104
         && offset_of!(QsaAttnArgsRaw, m) == 108
+        && offset_of!(QsaAttnArgsRaw, kv_f32) == 112
 );
 
 unsafe extern "C" {
@@ -117,13 +122,14 @@ impl QsaAttnDims {
     }
 
     /// The touched bytes, or `None` outside the limits. Inside them nothing overflows: the
-    /// largest product is `2^30 * 64 * 256 * 2` bytes.
-    pub(in crate::kernels::cuda) fn bytes(self) -> Option<QsaAttnBytes> {
+    /// largest product is `2^30 * 64 * 256 * 4` bytes. `cache_element` is the size of one stored
+    /// key or value: `F16_ELEMENT` or `F32_ELEMENT`.
+    pub(in crate::kernels::cuda) fn bytes(self, cache_element: usize) -> Option<QsaAttnBytes> {
         let rows_of = |per_token: usize| self.m * per_token * FLOAT;
         self.inside().then(|| QsaAttnBytes {
             q: rows_of(self.n_head * QSA_ATTN_HEAD),
             gates: self.n_head * 2 * QSA_ATTN_HEAD * FLOAT,
-            cache: self.rows * self.n_kv_head * QSA_ATTN_HEAD * 2,
+            cache: self.rows * self.n_kv_head * QSA_ATTN_HEAD * cache_element,
             chosen: rows_of(self.budget_blocks),
             part: rows_of(self.n_head * self.max_splits * QSA_ATTN_PART_STRIDE),
             out: rows_of(self.n_head * QSA_ATTN_HEAD),
@@ -134,7 +140,7 @@ impl QsaAttnDims {
     /// `ld` past `c_int`, or for a row narrower than the query and gate columns. `ld` is bounded
     /// first, so nothing overflows: the largest product is `2^15 * 2^31 * 4` bytes.
     pub(in crate::kernels::cuda) fn proj_bytes(self, ld: usize) -> Option<usize> {
-        let gates = self.bytes()?.gates;
+        let gates = self.bytes(F16_ELEMENT)?.gates;
         c_int::try_from(ld).ok()?;
         (ld * FLOAT >= gates).then(|| (self.m - 1) * ld * FLOAT + gates)
     }
@@ -166,6 +172,8 @@ pub(in crate::kernels::cuda) struct QsaAttnRaw<'a> {
     pub(in crate::kernels::cuda) part: RawRange<'a>,
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) status: Option<RawRange<'a>>,
+    /// True when the caches hold f32 keys and values (`kv_f32` of `qsa_attn.h`).
+    pub(in crate::kernels::cuda) kv_f32: bool,
 }
 
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
@@ -173,7 +181,14 @@ fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
 }
 
 fn check_attn(call: &QsaAttnRaw<'_>) -> Result<QsaAttnBytes, DeviceFailure> {
-    let need = call.dims.bytes().ok_or_else(invalid_argument)?;
+    let need = call
+        .dims
+        .bytes(if call.kv_f32 {
+            F32_ELEMENT
+        } else {
+            F16_ELEMENT
+        })
+        .ok_or_else(invalid_argument)?;
     let proj = call.dims.proj_bytes(call.ld).ok_or_else(invalid_argument)?;
     let word_fits = |r: &Option<RawRange<'_>>| r.as_ref().is_none_or(|r| fits(r, FLOAT, FLOAT));
     let sized = fits(&call.q, need.q, WIDE)
@@ -232,6 +247,7 @@ pub(in crate::kernels::cuda) fn qsa_attn_launch(
         pos0: call.pos0,
         scale: call.scale,
         m,
+        kv_f32: c_int::from(call.kv_f32),
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_attn` proved every range inside its live allocation (`RawRange::new`), large

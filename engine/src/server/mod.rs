@@ -18,6 +18,8 @@ mod family_registry_tests;
 mod fetch_name;
 #[cfg(test)]
 mod flint_tests;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod gguf_smoke_tests;
 mod hf;
 #[cfg(test)]
 mod hf_tests;

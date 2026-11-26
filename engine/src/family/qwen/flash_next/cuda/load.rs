@@ -53,7 +53,9 @@ pub(in crate::family) enum Form {
     Matrix,
     /// A plain tensor as stored (F16 or BF16). Read by the hyper-connection kernels
     /// (`resident/hyper.cu`: the kernel widens exactly and applies `1 + w` to `hc_norm` itself) and,
-    /// for the two PLE projections, by the dense F16 matvec (`dense_gemv`).
+    /// for the two PLE projections, by the dense F16 matvec (`dense_gemv`). (A GGUF hyper matrix
+    /// kept as Q8_0 is no form of this pack: the GGUF loader stages it as a raw weight, which the
+    /// same kernels decode value by value.)
     Half,
     /// A plain tensor widened to F32 as stored. Read by `router.cu` (router, shared-expert gate), the
     /// strided F32 router path (`in_proj_a`, `in_proj_b`), the DeltaNet kernels (`dt_bias`, conv,

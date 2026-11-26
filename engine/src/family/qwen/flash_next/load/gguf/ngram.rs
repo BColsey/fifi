@@ -9,7 +9,10 @@
 //! stored as plain values, with none of the per-head bias and per-row scale the EXL3 table
 //! folds into its decode.
 
-use std::{fs::File, os::unix::fs::FileExt};
+use std::{
+    fs::File,
+    os::unix::fs::{FileExt, MetadataExt},
+};
 
 use super::{config::NgramHash, tensors::Mapped};
 use crate::{
@@ -70,8 +73,11 @@ impl GgufNgramRows {
             .get(tensor.shard())
             .ok_or_else(|| refuse("the table's shard is not open"))?;
         crate::storage_guard::require_local(path, "n-gram table")?;
-        let file = File::open(path)
-            .map_err(|error| refuse(format!("cannot open {}: {error}", path.display())))?;
+        // Preserve the shard identity already opened by GgufWeights, even if its path changes.
+        let file = weights
+            .file_of(tensor)
+            .try_clone()
+            .map_err(|error| refuse(format!("cannot clone {}: {error}", path.display())))?;
         let len = file
             .metadata()
             .map_err(|error| refuse(format!("cannot stat {}: {error}", path.display())))?
@@ -93,6 +99,26 @@ impl GgufNgramRows {
             ty,
             hash,
         })
+    }
+
+    /// Check that two readers address the same opened shard and table geometry.
+    pub(super) fn same_source(&self, other: &Self) -> Result<bool, EngError> {
+        let a = self
+            .file
+            .metadata()
+            .map_err(|e| refuse(format!("cannot stat reader: {e}")))?;
+        let b = other
+            .file
+            .metadata()
+            .map_err(|e| refuse(format!("cannot stat reader: {e}")))?;
+        Ok(a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && self.base == other.base
+            && self.rows == other.rows
+            && self.row_dim == other.row_dim
+            && self.row_bytes == other.row_bytes
+            && self.ty == other.ty
+            && self.hash == other.hash)
     }
 
     /// Rows in the table.

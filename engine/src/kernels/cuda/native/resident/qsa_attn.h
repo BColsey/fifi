@@ -13,7 +13,8 @@
  *
  * q is f32 [m][n_head][256] (attn_prep's normed and rotated q), proj f32 [m][ld], projection
  * rows whose head h gate is at column h * 512 + 256 + d (attn_prep's layout), the caches fp16
- * [rows][n_kv_head][256] with position j at row j, out f32 [m][n_head][256]. Each token's
+ * [rows][n_kv_head][256] with position j at row j (f32 of the same shape when kv_f32 is set), out
+ * f32 [m][n_head][256]. Each token's
  * positions are split over max_splits blocks per kv head; part is f32 scratch of
  * m * n_head * max_splits * 258 floats (per split a max, a sum and 256 partial values), no
  * initialization needed.
@@ -23,6 +24,10 @@
  * or p0 + m > rows, every output is NaN, and if a chosen block of token t is not below its
  * `blocks`, token t's output is NaN; either raises status bits 4 (OR-ed into *status when status
  * is given). No cache row outside [0, p] is read for token t.
+ *
+ * kv_f32 selects f32 caches: the same attention on keys and values stored in f32, so nothing is
+ * rounded at the store. It stages 16 rows at a time instead of 32, to keep the same shared memory.
+ * It is off (0) or on (1); any other value is refused.
  *
  * Limits: m in [1, 32768]; head size 256; n_kv_head in [1, 64] dividing n_head, group in
  * [1, 32]; rows in [1, 2^30 - 1]; ratio in [1, 64]; budget_blocks in [1, 2^24]; max_splits in
@@ -40,8 +45,8 @@ extern "C" {
 typedef struct inference_cuda_qsa_attn_args {
     const void *q;       /* f32 [m][n_head][256] */
     const void *proj;    /* f32 [m][ld], the gates */
-    const void *k_cache; /* fp16 [rows][n_kv_head][256] */
-    const void *v_cache; /* fp16 [rows][n_kv_head][256] */
+    const void *k_cache; /* fp16 [rows][n_kv_head][256], f32 when kv_f32 */
+    const void *v_cache; /* fp16 [rows][n_kv_head][256], f32 when kv_f32 */
     const void *chosen;  /* i32 [m][budget_blocks] */
     const void *pos;     /* device i32 position of token 0, or NULL for pos0 */
     void *part;          /* f32 [m][n_head][max_splits][258] */
@@ -57,6 +62,7 @@ typedef struct inference_cuda_qsa_attn_args {
     int pos0;
     float scale;
     int m;
+    int kv_f32; /* 1: the caches are f32 */
 } inference_cuda_qsa_attn_args;
 
 int inference_cuda_qsa_attn_launch(const inference_cuda_qsa_attn_args *args, void *stream,
@@ -68,12 +74,13 @@ int inference_cuda_qsa_attn_launch(const inference_cuda_qsa_attn_args *args, voi
 
 #ifdef __cplusplus
 #include <cstddef>
-static_assert(sizeof(inference_cuda_qsa_attn_args) == 112 &&
+static_assert(sizeof(inference_cuda_qsa_attn_args) == 120 &&
                   offsetof(inference_cuda_qsa_attn_args, status) == 64 &&
                   offsetof(inference_cuda_qsa_attn_args, ld) == 72 &&
                   offsetof(inference_cuda_qsa_attn_args, pos0) == 100 &&
                   offsetof(inference_cuda_qsa_attn_args, scale) == 104 &&
-                  offsetof(inference_cuda_qsa_attn_args, m) == 108,
+                  offsetof(inference_cuda_qsa_attn_args, m) == 108 &&
+                  offsetof(inference_cuda_qsa_attn_args, kv_f32) == 112,
               "inference_cuda_qsa_attn_args layout");
 #endif
 

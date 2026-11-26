@@ -31,6 +31,82 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 }
 
 #[test]
+fn gguf_decode_q8_scratch_is_explicit_and_disjoint() {
+    let (_, g) = real();
+    for rows in [1, 64] {
+        let base = if rows == 1 {
+            plan_at(&g, rows, 4096)
+        } else {
+            StepPlan::new_prefill(&g, rows, 4096, &StepOptions::for_sm_count(82)).unwrap()
+        };
+        assert!(base.index(Slot::GgufDecodeQ8).is_none());
+        assert!(base.clone().with_gguf_decode_q8(0).is_err());
+        assert!(base.clone().with_gguf_decode_q8(33).is_err());
+        assert!(base.clone().with_gguf_decode_q8(usize::MAX - 31).is_err());
+        let plan = base.clone().with_gguf_decode_q8(4128).unwrap();
+        assert!(plan.clone().with_gguf_decode_q8(4128).is_err());
+        let (offset, bytes) = plan.placement(Slot::GgufDecodeQ8).unwrap();
+        assert_eq!(bytes, 5184);
+        assert!(plan.arena_bytes() >= base.arena_bytes());
+        for entry in plan
+            .slots()
+            .iter()
+            .filter(|entry| entry.slot != Slot::GgufDecodeQ8)
+        {
+            let (other, size) = plan.placement(entry.slot).unwrap();
+            assert!(
+                offset + bytes <= other || other + size <= offset,
+                "overlap with {:?}",
+                entry.slot
+            );
+        }
+    }
+}
+
+#[test]
+fn gguf_decode_arena_sizes_the_exact_owner_plan() {
+    let (_, g) = real();
+    let options = StepOptions::for_sm_count(82);
+    for positions in [1, 4096, 32768] {
+        let base = StepPlan::new(&g, 1, positions, &options).unwrap();
+        assert_eq!(
+            StepPlan::gguf_decode(&g, positions, &options, 0).unwrap(),
+            base
+        );
+        let plan = StepPlan::gguf_decode(&g, positions, &options, 6144).unwrap();
+        assert_eq!(
+            plan,
+            base.with_gguf_decode_q8(6144)
+                .unwrap()
+                .with_gguf_delta_tile(g.delta.value_width())
+                .unwrap()
+        );
+        let allocated = crate::kernels::cuda::plan_arena(&plan.arena_tensors()).unwrap();
+        assert_eq!(plan.arena_bytes(), allocated.total);
+        assert_eq!(plan.placement(Slot::GgufDecodeQ8).unwrap().1, 6912);
+        let (tile, tile_bytes) = plan.placement(Slot::GgufDeltaTile).unwrap();
+        assert_eq!(tile_bytes, g.delta.value_width() * 4);
+        for other in [
+            Slot::DeltaCore,
+            Slot::BlockOut(Site::Attn),
+            Slot::GgufDecodeQ8,
+        ] {
+            let (offset, bytes) = plan.placement(other).unwrap();
+            assert!(
+                tile + tile_bytes <= offset || offset + bytes <= tile,
+                "tile aliases {other:?}"
+            );
+        }
+        assert!(
+            plan.clone()
+                .with_gguf_delta_tile(g.delta.value_width())
+                .is_err()
+        );
+        assert!(StepPlan::gguf_decode(&g, positions, &options, 33).is_err());
+    }
+}
+
+#[test]
 fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
     let (_, g) = real();
     assert_eq!(

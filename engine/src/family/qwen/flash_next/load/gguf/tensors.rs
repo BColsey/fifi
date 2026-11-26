@@ -79,7 +79,8 @@ pub(in crate::family::qwen::flash_next) enum Place {
 pub(in crate::family::qwen::flash_next) enum Form {
     /// The GGUF blocks as stored; the matvec kernel of the tensor's type reads them.
     Blocks,
-    /// Widened to F16 at upload, for the kernels that read half-precision weights.
+    /// Widened to F16 at upload, for the kernels that read half-precision weights. The staged
+    /// start keeps a Q8_0 hyper mixing matrix of this form as stored instead.
     Half,
     /// Widened to F32 at upload.
     Float,
@@ -116,7 +117,45 @@ pub(in crate::family::qwen::flash_next) struct Mapped {
 }
 
 impl Mapped {
-    /// Bytes this tensor takes on the card in its device form (zero off the card).
+    /// Tensor-relative stored bytes for contiguous output rows of a matrix or expert.
+    /// This plans file reads only; it does not upload or execute the resulting blocks.
+    pub(in super::super::super) fn row_span(
+        &self,
+        expert: Option<u64>,
+        rows: std::ops::Range<u64>,
+    ) -> Result<(u64, usize), EngError> {
+        let invalid = || EngError::BadRequest(format!("invalid row slice for {}", self.name));
+        let (k, outputs, expert) = match (self.dims.as_slice(), expert) {
+            ([k, outputs], None) => (*k, *outputs, 0),
+            ([k, outputs, experts], Some(expert)) if expert < *experts => (*k, *outputs, expert),
+            _ => return Err(invalid()),
+        };
+        let block = self.ty.block_elems();
+        if k == 0 || !k.is_multiple_of(block) || rows.start >= rows.end || rows.end > outputs {
+            return Err(invalid());
+        }
+        let stride = (k / block)
+            .checked_mul(self.ty.block_bytes())
+            .ok_or_else(invalid)?;
+        let begin = expert
+            .checked_mul(outputs)
+            .and_then(|n| n.checked_add(rows.start))
+            .and_then(|n| n.checked_mul(stride))
+            .ok_or_else(invalid)?;
+        let bytes = (rows.end - rows.start)
+            .checked_mul(stride)
+            .filter(|bytes| {
+                begin
+                    .checked_add(*bytes)
+                    .is_some_and(|end| end <= self.bytes)
+            })
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(invalid)?;
+        Ok((begin, bytes))
+    }
+
+    /// Bytes this tensor takes on the card in its device form (zero off the card): what the
+    /// trunk loader uploads, a `Half` matrix widened to F16.
     pub(in crate::family::qwen::flash_next) fn device_bytes(&self) -> u64 {
         let elements: u64 = self.dims.iter().product();
         match self.form {
@@ -125,6 +164,26 @@ impl Mapped {
             Form::Float | Form::NormPlusOne | Form::Decay => elements * 4,
             Form::None => 0,
         }
+    }
+
+    /// The same in the form the staged start uploads it in: a Q8_0 mixing matrix of a hyper
+    /// site stays as stored, 34 bytes a block.
+    pub(in crate::family::qwen::flash_next) fn staged_device_bytes(&self) -> u64 {
+        if self.form == Form::Half && self.q80_stays_stored() {
+            self.bytes
+        } else {
+            self.device_bytes()
+        }
+    }
+
+    /// A hyper mixing matrix (`down`, `up`) of a layer or of the final site stored as Q8_0, which
+    /// [`crate::family::qwen::flash_next::load::gguf::GgufModel::upload_hyper`] keeps as stored.
+    pub(in crate::family::qwen::flash_next) fn q80_stays_stored(&self) -> bool {
+        let part = match self.role {
+            Slot::Layer(Wanted::Hyper(_, part)) | Slot::Global(Global::HeadSite(part)) => part,
+            _ => return false,
+        };
+        self.ty == GgufType::Q80 && part.q80_stays_stored()
     }
 
     /// Whether a matvec kernel of this tensor's type reads it (block formats only).
@@ -725,6 +784,32 @@ impl TensorMap {
         self.entries.iter().map(Mapped::device_bytes).sum()
     }
 
+    /// The same in the forms the staged start holds the trunk in.
+    pub(in crate::family::qwen::flash_next) fn staged_device_bytes(&self) -> u64 {
+        self.entries.iter().map(Mapped::staged_device_bytes).sum()
+    }
+
+    /// Maximum input width of mapped quantized device matrices and routed expert stacks.
+    /// This bounds one serialized native activation row, not concurrent or prefill scratch.
+    /// Returns zero when no mapped quantized projection needs a native kernel.
+    pub(in super::super::super) fn max_quantized_input_width(&self) -> Result<usize, EngError> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.needs_kernel() && !is_float(entry.ty))
+            .try_fold(0usize, |max, entry| {
+                let k = entry
+                    .dims
+                    .first()
+                    .copied()
+                    .and_then(|k| usize::try_from(k).ok())
+                    .filter(|k| *k != 0 && k.is_multiple_of(32))
+                    .ok_or_else(|| {
+                        mismatch(format!("{} has an invalid native input width", entry.name))
+                    })?;
+                Ok(max.max(k))
+            })
+    }
+
     /// The tensor types that matrices of the model have and `supported` does not accept,
     /// each with its tensor count, bytes and first tensor, in order of first appearance.
     pub(in crate::family::qwen::flash_next) fn kernel_gaps(
@@ -758,6 +843,52 @@ impl TensorMap {
 /// of the shared native list has both (`GgufType::has_native_kernel`).
 pub(in crate::family::qwen::flash_next) fn has_decode_kernel(_place: Place, ty: GgufType) -> bool {
     ty.has_native_kernel()
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    fn entry(place: Place, form: Form, ty: GgufType, k: u64) -> Mapped {
+        Mapped {
+            role: Global::Embedding.into(),
+            layer: None,
+            name: "test".into(),
+            ty,
+            dims: vec![k, 4],
+            bytes: 0,
+            shard: 0,
+            place,
+            form,
+            convention: Convention::AsStored,
+        }
+    }
+
+    fn map(entries: Vec<Mapped>) -> TensorMap {
+        TensorMap {
+            entries,
+            unmapped: vec![],
+            total: 0,
+            mapped_names: 0,
+        }
+    }
+
+    #[test]
+    fn width_includes_experts_and_excludes_host_and_float_weights() {
+        let entries = vec![
+            entry(Place::Device, Form::Blocks, GgufType::Q80, 256),
+            entry(Place::Experts, Form::None, GgufType::Q80, 1024),
+            entry(Place::Host, Form::None, GgufType::Q80, 4096),
+            entry(Place::Device, Form::Blocks, GgufType::F32, 2048),
+        ];
+        assert_eq!(map(entries).max_quantized_input_width().unwrap(), 1024);
+        assert_eq!(map(vec![]).max_quantized_input_width().unwrap(), 0);
+        assert!(
+            map(vec![entry(Place::Device, Form::Blocks, GgufType::Q80, 33)])
+                .max_quantized_input_width()
+                .is_err()
+        );
+    }
 }
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]

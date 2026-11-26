@@ -39,6 +39,9 @@ use crate::kernels::cuda::native::resident::matvec_gguf::{
 use crate::kernels::cuda::resident::matvec_q::{QuantType, ROWS_MULTIPLE};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
+/// Per-launch limit of the vendored expert kernel, matching its native guard.
+const VENDORED_MAX_USED: usize = 8;
+
 pub(crate) struct ExpertMatvecCall<'b> {
     pub(crate) ty: QuantType,
     pub(crate) w_stack: DeviceRange<'b>,
@@ -121,6 +124,96 @@ impl CudaContext {
         }
         let raw = self.plan_matvec_expert(&call)?;
         self.launch_on(stream, |stream_raw| matvec_expert_launch(stream_raw, &raw))
+    }
+
+    /// Queue a routed projection in supported per-format chunks. The original
+    /// `matvec_expert` keeps its per-launch limits. Full-buffer claims are checked before
+    /// any chunk is queued, so an earlier output cannot overwrite a later chunk's input.
+    pub(crate) fn matvec_expert_chunks(
+        &self,
+        stream: &DeviceStream,
+        call: ExpertMatvecCall<'_>,
+    ) -> Result<(), EngError> {
+        enum Plan<'a> {
+            Window(ExpertGgufRaw<'a>),
+            Vendored(ExpertMatvecRaw<'a>),
+        }
+        self.ensure_usable()?;
+        if call.n_used == 0 || call.n_used > call.n_expert || call.y_slot_stride < call.rows {
+            return Err(EngError::BadRequest(
+                "invalid CUDA expert chunk geometry".into(),
+            ));
+        }
+        let needs = expert_needs(&call.shape())
+            .ok_or_else(|| EngError::BadRequest("the CUDA expert size overflows".into()))?;
+        for range in [&call.w_stack, &call.ids, &call.x_q8, &call.y] {
+            self.raw_range(range)?;
+        }
+        require_fit("w_stack", &call.w_stack, needs.w_stack, 4)?;
+        require_fit("ids", &call.ids, needs.ids, 4)?;
+        require_fit("x_q8", &call.x_q8, needs.x_q8, 4)?;
+        require_fit("y", &call.y, needs.y, 4)?;
+        let written = Claim::of("y", &call.y, needs.y);
+        require_apart(
+            &written,
+            &Claim::of("w_stack", &call.w_stack, needs.w_stack),
+        )?;
+        require_apart(&written, &Claim::of("ids", &call.ids, needs.ids))?;
+        require_apart(&written, &Claim::of("x_q8", &call.x_q8, needs.x_q8))?;
+        if let Some(gate) = &call.glu_gate {
+            self.raw_range(gate)?;
+            require_fit("glu_gate", gate, needs.w_stack, 4)?;
+            require_apart(&written, &Claim::of("glu_gate", gate, needs.w_stack))?;
+        }
+        let qrow = q8_1_bytes(call.k, 1)
+            .ok_or_else(|| EngError::BadRequest("the CUDA expert size overflows".into()))?;
+        let window = call.ty.expert_uses_window();
+        let max = if window { MAX_USED } else { VENDORED_MAX_USED };
+        let mut plans = Vec::new();
+        for first in (0..call.n_used).step_by(max) {
+            let used = (call.n_used - first).min(max);
+            let y_bytes = ((used - 1) * call.y_slot_stride + call.rows) * 4;
+            let (x_offset, x_bytes) = if call.x_per_slot {
+                (first * qrow, used * qrow)
+            } else {
+                (0, qrow)
+            };
+            let chunk = ExpertMatvecCall {
+                ty: call.ty,
+                w_stack: call.w_stack,
+                ids: call
+                    .ids
+                    .buffer()
+                    .range(call.ids.offset() + first * 4, used * 4)?,
+                x_q8: call
+                    .x_q8
+                    .buffer()
+                    .range(call.x_q8.offset() + x_offset, x_bytes)?,
+                x_per_slot: call.x_per_slot,
+                y: call
+                    .y
+                    .buffer()
+                    .range(call.y.offset() + first * call.y_slot_stride * 4, y_bytes)?,
+                y_slot_stride: call.y_slot_stride,
+                k: call.k,
+                rows: call.rows,
+                n_expert: call.n_expert,
+                n_used: used,
+                glu_gate: call.glu_gate,
+            };
+            plans.push(if window {
+                Plan::Window(self.plan_matvec_expert_codebook(&chunk)?)
+            } else {
+                Plan::Vendored(self.plan_matvec_expert(&chunk)?)
+            });
+        }
+        for plan in &plans {
+            self.launch_on(stream, |stream_raw| match plan {
+                Plan::Window(raw) => matvec_gguf_expert_launch(stream_raw, raw, qrow),
+                Plan::Vendored(raw) => matvec_expert_launch(stream_raw, raw),
+            })?;
+        }
+        Ok(())
     }
 
     fn plan_matvec_expert_codebook<'b>(
@@ -234,10 +327,10 @@ impl CudaContext {
                 call.rows
             )));
         }
-        if call.n_used < 1 || call.n_used > 8 || call.n_used > call.n_expert {
+        if call.n_used < 1 || call.n_used > VENDORED_MAX_USED || call.n_used > call.n_expert {
             return Err(EngError::BadRequest(format!(
                 "the CUDA expert launch takes 1 to {} used slots, got {}",
-                call.n_expert.min(8),
+                call.n_expert.min(VENDORED_MAX_USED),
                 call.n_used
             )));
         }

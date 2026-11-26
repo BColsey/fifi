@@ -14,8 +14,9 @@
 //!   `deltanet.rs` is `[channel][tap]`, the transpose; the byte count is the same, so the host
 //!   `DeltaState::byte_len` is the size oracle and an export must transpose the ring. The conv
 //!   ring row order is oldest first.
-//! - QSA layers (12 of 48): the fp16 K and V caches `[position][kv head][head_dim]` (the layout
-//!   `qsa_attn` reads), the pooled indexer keys f32 `[cap_blocks][idx_dim]` (one per completed
+//! - QSA layers (12 of 48): the K and V caches `[position][kv head][head_dim]` (fp16, or f32
+//!   with [`QsaCacheStorage::F32`]; the layout the QSA attention reads), the pooled indexer keys
+//!   f32 `[cap_blocks][idx_dim]` (one per completed
 //!   block of `ratio` positions) and the raw-key ring f32 `[ratio][idx_dim]` of the open block.
 //!   The raw ring is indexed by `position % ratio` (`qsa_index.h`), and the key cache holds
 //!   `ceil(positions / ratio)` blocks, so `cap_blocks * ratio >= positions` (the index kernel
@@ -36,6 +37,14 @@
 //! position bytes come from it and from [`KvGeometry`], so the state plan and the budget cannot
 //! disagree. [`StatePlan::new`] refuses a format without a QSA kernel ([`KvFormat::has_kernels`]):
 //! today only `F16`, which `qsa_attn` reads.
+//!
+//! # QSA cache storage
+//!
+//! How the QSA caches are stored is not the format: it is [`QsaCacheStorage`], a property of the
+//! step. [`StatePlan::new`] stores fp16. [`StatePlan::with_qsa_cache`] takes the storage: `F32`,
+//! which `qsa_attn_exact` reads (nothing is rounded at the store; twice the bytes), goes with the
+//! fp16 `KvFormat` only, and adds to [`StateBytes::kv_bytes`] and to
+//! [`StateBytes::bytes_per_position`] what the wider elements take.
 //!
 //! # Names shared with the context budget
 //!
@@ -383,7 +392,7 @@ pub(super) struct StateBytes {
     pub(super) delta_state_bytes: usize,
     /// Raw-key rings, the PLE ring and the words block: fixed, and not yet charged by the budget.
     pub(super) other_fixed_bytes: usize,
-    /// fp16 K and V planes of every QSA layer, `positions` rows.
+    /// K and V planes of every QSA layer, `positions` rows: fp16, or f32 with [`QsaCacheStorage::F32`].
     pub(super) kv_bytes: usize,
     /// Pooled indexer keys of every QSA layer.
     pub(super) index_key_bytes: usize,
@@ -408,26 +417,64 @@ impl StateBytes {
 }
 
 /// The planned state of a session of `positions` context positions.
+/// The storage of the QSA attention caches of a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) enum QsaCacheStorage {
+    /// fp16, which `attn_prep` writes and `qsa_attn` reads: every stored key and value is rounded.
+    F16,
+    /// f32, which `attn_prep` writes as rows and `qsa_attn_exact` reads: nothing is rounded at
+    /// the store, and the key and value planes take twice the bytes.
+    F32,
+}
+
+impl QsaCacheStorage {
+    /// Bytes of one stored key or value element.
+    pub(in super::super) fn element_bytes(self) -> usize {
+        match self {
+            Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StatePlan {
     geometry: FlashGeometry,
     positions: usize,
     format: KvFormat,
+    qsa_cache: QsaCacheStorage,
     slots: Vec<(StateSlot, usize)>,
     arena: ArenaPlan,
 }
 
 impl StatePlan {
-    /// `positions` is the context the K/V and indexer caches hold; the arena never grows.
+    /// `positions` is the context the K/V and indexer caches hold; the arena never grows. The
+    /// QSA caches are fp16.
     pub(super) fn new(
         geometry: &FlashGeometry,
         positions: usize,
         format: KvFormat,
     ) -> Result<Self, EngError> {
+        Self::with_qsa_cache(geometry, positions, format, QsaCacheStorage::F16)
+    }
+
+    /// [`Self::new`] with the QSA caches stored in `qsa_cache`. [`QsaCacheStorage::F32`] goes with the
+    /// fp16 `format` only: an int8 layout has no f32 attention.
+    pub(super) fn with_qsa_cache(
+        geometry: &FlashGeometry,
+        positions: usize,
+        format: KvFormat,
+        qsa_cache: QsaCacheStorage,
+    ) -> Result<Self, EngError> {
         let qsa = &geometry.qsa;
         if !format.has_kernels() {
             return Err(refuse(format!(
                 "{format:?} K/V has no attention kernel yet"
+            )));
+        }
+        if qsa_cache == QsaCacheStorage::F32 && format != KvFormat::F16 {
+            return Err(refuse(format!(
+                "{format:?} K/V has no f32 attention: f32 QSA caches are an fp16 layout"
             )));
         }
         if positions == 0 || positions > POS_MAX as usize {
@@ -438,7 +485,8 @@ impl StatePlan {
         let mut slots = Vec::new();
         let rec = geometry.delta.rec_bytes()?;
         let ring = geometry.delta.conv_ring_bytes()?;
-        let plane = qsa.plane_bytes(positions, format)?;
+        // The fp16 plane, with each two-byte element widened to the storage's element.
+        let plane = (qsa.plane_bytes(positions, KvFormat::F16)? / 2) * qsa_cache.element_bytes();
         let keys = qsa.index_key_bytes(positions)?;
         let raw = qsa.raw_ring_bytes()?;
         for (layer, kind) in geometry.layers.iter().enumerate() {
@@ -467,6 +515,7 @@ impl StatePlan {
             geometry: geometry.clone(),
             positions,
             format,
+            qsa_cache,
             slots,
             arena,
         })
@@ -545,8 +594,11 @@ impl StatePlan {
             };
             *part = part.checked_add(bytes).ok_or_else(overflow)?;
         }
+        let extra = self.qsa_cache_extra_per_position(qsa)?;
         let per_position = usize::try_from(qsa.kv_geometry()?.position_bytes(self.format)?)
-            .map_err(|_| overflow())?;
+            .map_err(|_| overflow())?
+            .checked_add(extra)
+            .ok_or_else(overflow)?;
         Ok(StateBytes {
             positions: self.positions,
             cap_blocks: qsa.cap_blocks(self.positions),
@@ -557,5 +609,16 @@ impl StatePlan {
             bytes_per_position: per_position,
             arena_bytes: self.arena.total,
         })
+    }
+
+    /// Bytes per position that the QSA caches take beyond their fp16 planes: none for
+    /// [`QsaCacheStorage::F16`]; for [`QsaCacheStorage::F32`], two more bytes in each stored key and value.
+    fn qsa_cache_extra_per_position(&self, qsa: &QsaGeometry) -> Result<usize, EngError> {
+        product(&[
+            qsa.cached_layers,
+            2,
+            qsa.kv_width(),
+            self.qsa_cache.element_bytes() - 2,
+        ])
     }
 }

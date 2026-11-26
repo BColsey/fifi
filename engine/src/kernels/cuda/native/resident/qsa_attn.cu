@@ -2,6 +2,8 @@
 // runs one block per (kv head, split, token) with one warp per query head of the group: the
 // split's attended positions go through shared memory 32 at a time, fp16 keys and values in
 // 16-byte loads, and each warp keeps an online softmax (max, sum, 8 partial values per lane).
+// The same kernel is instantiated for f32 caches (qsa_attn.h's kv_f32): 16 rows at a time, for
+// the same shared memory, and no widening.
 // The combine kernel merges the splits per (head, token) and applies the sigmoid output gate.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -20,6 +22,7 @@ constexpr int kMaxM = 32768;
 constexpr int kHead = 256;
 constexpr int kLaneDims = kHead / 32;
 constexpr int kTile = 32;
+constexpr int kTileF32 = kTile / 2;  // f32 elements: the same shared memory as kTile f16 rows
 constexpr int kMaxGroup = 32;
 constexpr int kMaxKvHeads = 64;
 constexpr int kMaxRatio = 64;
@@ -51,7 +54,7 @@ bool shape_ok(const inference_cuda_qsa_attn_args &a) {
            a.ratio <= kMaxRatio &&
            a.budget_blocks >= 1 && a.budget_blocks <= kMaxBudget && a.max_splits >= 1 &&
            a.max_splits <= kMaxSplits && (long long)a.ld >= (long long)a.n_head * 2 * kHead &&
-           std::isfinite(a.scale);
+           std::isfinite(a.scale) && (a.kv_f32 == 0 || a.kv_f32 == 1);
 }
 
 bool valid(const inference_cuda_qsa_attn_args &a, void *stream) {
@@ -68,7 +71,7 @@ bool valid(const inference_cuda_qsa_attn_args &a, void *stream) {
         if (p != NULL && !aligned(p, 4)) return false;
     }
     const size_t f = 4, m = (size_t)a.m, heads = (size_t)a.n_head;
-    const size_t cache = (size_t)a.rows * a.n_kv_head * kHead * 2;
+    const size_t cache = (size_t)a.rows * a.n_kv_head * kHead * (a.kv_f32 ? 4 : 2);
     const size_t proj = ((m - 1) * a.ld + heads * 2 * kHead) * f;
     const Span written[] = {{a.part, m * heads * a.max_splits * kPartStride * f},
                             {a.out, m * heads * kHead * f},
@@ -92,7 +95,7 @@ bool valid(const inference_cuda_qsa_attn_args &a, void *stream) {
 
 struct AttnArgs {
     const float *q, *proj;
-    const __half *k, *v;
+    const void *k, *v;  // the caches: __half, or float when kv_f32 is set
     const int *chosen, *pos;
     float *part, *out;
     int *status;
@@ -144,42 +147,60 @@ __device__ __forceinline__ void widen(const __half *src, float *dst) {
     }
 }
 
+/* The f32 caches need no widening: eight floats in two 16-byte loads. */
+__device__ __forceinline__ void widen(const float *src, float *dst) {
+    const float4 *f4 = reinterpret_cast<const float4 *>(src);
+    const float4 a = f4[0], b = f4[1];
+    dst[0] = a.x, dst[1] = a.y, dst[2] = a.z, dst[3] = a.w;
+    dst[4] = b.x, dst[5] = b.y, dst[6] = b.z, dst[7] = b.w;
+}
+
+/* The staged cache rows: keys and values of Rows rows in the element type T. */
+template <class T, int Rows>
 struct Tiles {
-    __half k[kTile][kHead];
-    __half v[kTile][kHead];
-    int rows[kTile];
+    T k[Rows][kHead];
+    T v[Rows][kHead];
+    int rows[Rows];
     int bad;
 };
 
 /* Stages the cache rows of entries t0 .. t0 + n - 1 for kv head g; a bad entry stages zeros
- * and marks the block. Every thread of the block calls it. */
-__device__ void stage(const AttnArgs &a, const Window &w, int g, int t0, int n, Tiles &s) {
-    if (threadIdx.x < kTile) {
+ * and marks the block. Every thread of the block calls it. One step moves eight elements: 16
+ * bytes of f16, 32 of f32. */
+template <class T, int Rows>
+__device__ void stage(const AttnArgs &a, const Window &w, int g, int t0, int n, Tiles<T, Rows> &s) {
+    if (threadIdx.x < Rows) {
         const int r = threadIdx.x < n ? row_of(a, w, t0 + threadIdx.x) : -1;
         if (threadIdx.x < n && r < 0) s.bad = 1;
         s.rows[threadIdx.x] = r;
     }
     __syncthreads();
     constexpr int kChunks = kHead / 8;
+    constexpr int kWords = 8 * sizeof(T) / 16;
     for (int i = threadIdx.x; i < 2 * n * kChunks; i += blockDim.x) {
         const bool is_v = i >= n * kChunks;
         const int rest = is_v ? i - n * kChunks : i;
         const int entry = rest / kChunks, c = rest % kChunks;
         const int r = s.rows[entry];
-        uint4 val = make_uint4(0u, 0u, 0u, 0u);
-        if (r >= 0) {
-            const __half *src = (is_v ? a.v : a.k) + ((size_t)r * a.n_kv + g) * kHead + c * 8;
-            val = *reinterpret_cast<const uint4 *>(src);
+        uint4 *dst = reinterpret_cast<uint4 *>((T *)(is_v ? s.v[entry] : s.k[entry]) + c * 8);
+        if (r < 0) {
+#pragma unroll
+            for (int w4 = 0; w4 < kWords; ++w4) dst[w4] = make_uint4(0u, 0u, 0u, 0u);
+            continue;
         }
-        __half *dst = (is_v ? s.v[entry] : s.k[entry]) + c * 8;
-        *reinterpret_cast<uint4 *>(dst) = val;
+        const uint4 *src = reinterpret_cast<const uint4 *>(
+            (const T *)(is_v ? a.v : a.k) + ((size_t)r * a.n_kv + g) * kHead + c * 8);
+#pragma unroll
+        for (int w4 = 0; w4 < kWords; ++w4) dst[w4] = src[w4];
     }
     __syncthreads();
 }
 
 // One block per (kv head, split, token), group * 32 threads, warp w = query head g * group + w.
+// T is the cache element: __half with kTile staged rows, float with kTileF32.
+template <class T, int Rows>
 __global__ void __launch_bounds__(kMaxGroup * 32) qsa_attn_split_k(AttnArgs a) {
-    __shared__ __align__(16) Tiles s;
+    __shared__ __align__(16) Tiles<T, Rows> s;
     const int g = blockIdx.x, split = blockIdx.y, t = blockIdx.z;
     const int group = a.n_head / a.n_kv;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -200,8 +221,8 @@ __global__ void __launch_bounds__(kMaxGroup * 32) qsa_attn_split_k(AttnArgs a) {
     float m = -INFINITY, l = 0.0f;
     if (threadIdx.x == 0) s.bad = 0;
     __syncthreads();
-    for (int t0 = lo; t0 < hi; t0 += kTile) {
-        const int n = hi - t0 < kTile ? hi - t0 : kTile;
+    for (int t0 = lo; t0 < hi; t0 += Rows) {
+        const int n = hi - t0 < Rows ? hi - t0 : Rows;
         stage(a, w, g, t0, n, s);
         for (int j = 0; j < n; ++j) {
             if (s.rows[j] < 0) continue;
@@ -272,8 +293,8 @@ extern "C" int inference_cuda_qsa_attn_launch(const inference_cuda_qsa_attn_args
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const inference_cuda_qsa_attn_args &x = *args;
-        const AttnArgs a{(const float *)x.q,      (const float *)x.proj,  (const __half *)x.k_cache,
-                         (const __half *)x.v_cache, (const int *)x.chosen, (const int *)x.pos,
+        const AttnArgs a{(const float *)x.q,      (const float *)x.proj,  x.k_cache,
+                         x.v_cache,                (const int *)x.chosen, (const int *)x.pos,
                          (float *)x.part,         (float *)x.out,         (int *)x.status,
                          x.ld,                    x.n_head,               x.n_kv_head,
                          x.rows,                  x.ratio,                x.budget_blocks,
@@ -282,7 +303,12 @@ extern "C" int inference_cuda_qsa_attn_launch(const inference_cuda_qsa_attn_args
         const cudaStream_t s = (cudaStream_t)stream;
         const int group = x.n_head / x.n_kv_head;
         Failure failure;
-        qsa_attn_split_k<<<dim3(x.n_kv_head, x.max_splits, x.m), group * 32, 0, s>>>(a);
+        const dim3 split_grid(x.n_kv_head, x.max_splits, x.m);
+        if (x.kv_f32) {
+            qsa_attn_split_k<float, kTileF32><<<split_grid, group * 32, 0, s>>>(a);
+        } else {
+            qsa_attn_split_k<__half, kTile><<<split_grid, group * 32, 0, s>>>(a);
+        }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.err == cudaSuccess) {
             qsa_attn_combine_k<<<dim3(x.n_head, x.m), kHead, 0, s>>>(a);

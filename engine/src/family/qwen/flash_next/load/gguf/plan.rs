@@ -4,16 +4,21 @@
 //! What differs from the pack is the expert size. A pack stores every routed expert in one
 //! format, so every expert has one size. A GGUF quantizes each layer's expert matrices on
 //! their own (a 3-bit mixed-quant file mixes IQ2_S, IQ3_XXS, IQ4_XS, IQ4_NL and Q2_0 across layers),
-//! so the size of an expert differs between layers. The planner's uniform slot is the mean
-//! expert size (the bank of a layer is sized by that layer's own records, so the bank's total
-//! bytes are exact), and the staging ring of the disk tier is charged for the largest record.
+//! so the size of an expert differs between layers. The planner's uniform slot is the rounded-up
+//! mean expert size. Part-major stacks can add up to six bytes of alignment padding per layer;
+//! the planner reserves that worst case separately from free VRAM. The staged `ExpertAllocation`
+//! computes exact stack sizes but is not yet wired into this planner. The disk-tier staging ring
+//! is charged for the largest record.
 //!
 //! The tiers: expert slots in video memory first (the same count in every layer), the rest in
 //! pinned host memory while the host's budget carries it, and otherwise read from the GGUF
 //! files on a miss through the staging ring. A host that cannot pin the cold experts of an
 //! 83.6 GB model therefore plans the disk tier and does not refuse.
 
-use super::{GgufModel, tensors::Place};
+use super::{
+    GgufModel,
+    tensors::{Mapped, Place},
+};
 use crate::family::{
     qwen::flash_next::host_plan::{HostFrame, HostMemory, HostTerms},
     recipe::Global,
@@ -33,11 +38,19 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
     EngError::MemoryPlan(format!("Flash-Next GGUF plan: {}", detail.as_ref()))
 }
 
+/// Two additional part starts per layer, each rounded up by at most three bytes.
+pub(in super::super::super) fn stack_alignment_reserve(layers: usize) -> Result<u64, EngError> {
+    u64::try_from(layers)
+        .ok()
+        .and_then(|n| n.checked_mul(6))
+        .ok_or_else(|| refuse("expert alignment reserve overflows"))
+}
+
 /// What the plan reads from the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::family::qwen::flash_next) struct GgufSizes {
     pub(in crate::family::qwen::flash_next) shape: TierShape,
-    /// Device bytes of the resident trunk in the forms the executor holds it in.
+    /// Device bytes of the resident trunk in the forms the start uploads it in.
     pub(in crate::family::qwen::flash_next) trunk_bytes: u64,
     /// The embedding table, whose rows the host gathers.
     pub(in crate::family::qwen::flash_next) embedding_bytes: u64,
@@ -63,9 +76,30 @@ pub(in crate::family::qwen::flash_next) struct Card {
     pub(in crate::family::qwen::flash_next) ring_budget: u64,
 }
 
+impl Card {
+    pub(in super::super::super) fn free_after_reserves(
+        self,
+        layers: usize,
+    ) -> Result<u64, EngError> {
+        Ok(self
+            .free_vram
+            .saturating_sub(self.ring_budget)
+            .saturating_sub(stack_alignment_reserve(layers)?))
+    }
+}
+
 impl GgufModel {
-    /// The sizes the memory plan needs.
+    /// The sizes the memory plan needs: the trunk as the trunk loader uploads it.
     pub(in crate::family::qwen::flash_next) fn sizes(&self) -> Result<GgufSizes, EngError> {
+        self.sizes_by(Mapped::device_bytes)
+    }
+
+    /// The same sizes for the staged start, which keeps a Q8_0 hyper mixing matrix as stored.
+    pub(in crate::family::qwen::flash_next) fn staged_sizes(&self) -> Result<GgufSizes, EngError> {
+        self.sizes_by(Mapped::staged_device_bytes)
+    }
+
+    fn sizes_by(&self, device_bytes: fn(&Mapped) -> u64) -> Result<GgufSizes, EngError> {
         let layers = self.config.layers();
         let experts = u64::from(self.config.dims.experts);
         let top_k = self.config.dims.top_k as usize;
@@ -84,7 +118,11 @@ impl GgufModel {
         let record_max = index
             .max_record_bytes()
             .map_err(|error| refuse(format!("{error:?}")))?;
-        let count = layers as u64 * experts;
+        let count = u64::try_from(layers)
+            .ok()
+            .and_then(|n| n.checked_mul(experts))
+            .filter(|&n| n != 0)
+            .ok_or_else(|| refuse("expert count is zero or overflows"))?;
         let shape = TierShape {
             layers,
             experts: experts as usize,
@@ -104,7 +142,7 @@ impl GgufModel {
         debug_assert_eq!(total, self.map.file_bytes(Place::Experts));
         Ok(GgufSizes {
             shape,
-            trunk_bytes: self.map.device_bytes(),
+            trunk_bytes: self.map.entries().iter().map(device_bytes).sum(),
             embedding_bytes: embedding,
             ngram_bytes: ngram,
             record_bytes_max: record_max,
@@ -135,10 +173,46 @@ impl GgufModel {
         })
     }
 
+    /// Stage a decode-only load plan after reserving the complete aligned GGUF step arena.
+    /// Rebuild per context; this is not a prefill plan or production executor admission.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(in super::super::super) fn load_plan_with_decode_arena(
+        &self,
+        card: Card,
+        positions: usize,
+        sm_count: u32,
+    ) -> Result<(FlashLoadPlan, u64), EngError> {
+        let shape = self.config.model_shape()?;
+        let max_k = self.map.max_quantized_input_width()?;
+        let bytes = super::super::super::cuda::gguf_decode_arena_bytes(
+            &shape,
+            self.config.kinds(),
+            positions,
+            sm_count,
+            max_k,
+        )?;
+        let free_vram = card
+            .free_vram
+            .checked_sub(bytes)
+            .ok_or_else(|| refuse("decode arena exceeds free VRAM"))?;
+        Ok((self.load_plan_staged(Card { free_vram, ..card })?, bytes))
+    }
+
     /// The load plan on `card`. The disk tier is offered (the staging ring is charged), so a
     /// host that cannot pin the cold experts plans the tier that reads them from the files.
     pub(in super::super::super) fn load_plan(&self, card: Card) -> Result<FlashLoadPlan, EngError> {
-        let sizes = self.sizes()?;
+        self.plan_on(card, self.sizes()?)
+    }
+
+    /// The same plan for the staged start, on [`Self::staged_sizes`].
+    pub(in super::super::super) fn load_plan_staged(
+        &self,
+        card: Card,
+    ) -> Result<FlashLoadPlan, EngError> {
+        self.plan_on(card, self.staged_sizes()?)
+    }
+
+    fn plan_on(&self, card: Card, sizes: GgufSizes) -> Result<FlashLoadPlan, EngError> {
         let inputs = TierInputs::measured(
             sizes.shape,
             (0, 0),
@@ -146,7 +220,7 @@ impl GgufModel {
                 positions: 1,
                 bytes_per_position: 1,
             },
-            card.free_vram.saturating_sub(card.ring_budget),
+            card.free_after_reserves(sizes.shape.layers)?,
             HostFrame::new(card.host, self.host_terms(&sizes)?),
             rung_ring_placeholder_bytes(
                 usize::try_from(sizes.record_bytes_max)

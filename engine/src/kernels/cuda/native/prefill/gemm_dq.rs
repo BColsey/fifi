@@ -506,7 +506,7 @@ pub(in crate::kernels::cuda) fn gemm_dq_codebook_launch(
     call: &GemmDqCodebookRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let id = gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
-    if !call.ty.is_codebook() {
+    if !call.ty.is_codebook() && !matches!(call.ty, QuantType::Q80 | QuantType::Q6K) {
         return Err(invalid_argument());
     }
     check_gemm_dq(

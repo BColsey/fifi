@@ -1,13 +1,15 @@
 //! Raw FFI to the entries of `native/resident/matvec_gguf.cu` (declared in
 //! `native/resident/matvec_gguf.h`): the dense and the expert decode matvec of the codebook and
-//! 2-bit GGUF types, and the device dequant the tests compare against the CPU oracle. Child of
+//! 2-bit GGUF types, their exact f32 twins (unquantized activation), and the device dequant the
+//! tests compare against the CPU oracle. Child of
 //! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this module relies on (mirrors the other native matvec adapters):
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
 //!   proves, again and on the sizes of the call, that `w` holds `rows` rows of whole native
-//!   blocks, that `x_q8` holds the padded blocks of the activation rows the call reads, that
-//!   `y` holds the floats the kernel writes, that every range is 4-byte aligned, and that `y`,
+//!   blocks, that the activation (`x_q8`: the padded q8_1 blocks, or the packed f32 rows of
+//!   the exact entries) holds the rows the call reads, that `y` holds the floats the kernel
+//!   writes, that every range is aligned as its kernel needs, and that `y`,
 //!   which the kernel writes, shares no byte with a range the kernel reads. The C entry repeats
 //!   the checks on the addresses.
 //! - The launch entries only queue work on the stream they are given; a fault in the kernel
@@ -39,7 +41,9 @@ pub(in crate::kernels::cuda) const MAX_USED: usize = 32;
 /// Bytes of one q8_1 block of 32 activation values.
 const Q8_1_BLOCK: usize = 36;
 
-/// Mirror of `inference_cuda_matvec_gguf_args` (`matvec_gguf.h`), field for field.
+/// Mirror of `inference_cuda_matvec_gguf_args` and of the layout-identical
+/// `inference_cuda_matvec_gguf_f32_args` (`matvec_gguf.h`), field for field; `x_q8` is the
+/// activation: the q8_1 rows, or the packed f32 rows for the exact entry.
 #[repr(C)]
 struct DenseArgsRepr {
     ty: c_int,
@@ -62,7 +66,8 @@ const _: () = assert!(
         && offset_of!(DenseArgsRepr, y) == 32
 );
 
-/// Mirror of `inference_cuda_matvec_gguf_expert_args` (`matvec_gguf.h`), field for field.
+/// Mirror of `inference_cuda_matvec_gguf_expert_args` and of the layout-identical
+/// `inference_cuda_matvec_gguf_f32_expert_args` (`matvec_gguf.h`), field for field.
 #[repr(C)]
 struct ExpertArgsRepr {
     ty: c_int,
@@ -140,6 +145,24 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
+    #[link_name = "inference_cuda_matvec_gguf_f32_launch"]
+    fn matvec_gguf_f32_launch_raw(
+        args: *const DenseArgsRepr,
+        table: *const c_void,
+        table_bytes: usize,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "inference_cuda_matvec_gguf_f32_expert_launch"]
+    fn matvec_gguf_f32_expert_raw(
+        args: *const ExpertArgsRepr,
+        table: *const c_void,
+        table_bytes: usize,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
     #[link_name = "inference_cuda_embed_gguf_launch"]
     fn embed_gguf_launch_raw(
         args: *const EmbedArgsRepr,
@@ -209,6 +232,85 @@ pub(in crate::kernels::cuda) fn table_of(ty: QuantType) -> &'static [u8] {
     }
 }
 
+/// The activation a matvec entry multiplies: the padded `quantize_q8_1` rows (`x_row_bytes`
+/// each, at least 36 bytes per 32 values) or the packed f32 rows of the exact entries (`4 * k`
+/// bytes each).
+#[derive(Clone, Copy)]
+enum Activation {
+    Q8 { x_row_bytes: usize },
+    F32,
+}
+
+impl Activation {
+    /// The bytes of `rows` activation rows; `None` for an invalid row size or an overflow.
+    fn bytes(self, k: usize, rows: usize) -> Option<usize> {
+        match self {
+            Self::Q8 { x_row_bytes } => {
+                if x_row_bytes == 0
+                    || !x_row_bytes.is_multiple_of(4)
+                    || x_row_bytes < (k / 32) * Q8_1_BLOCK
+                {
+                    return None;
+                }
+                x_row_bytes.checked_mul(rows)
+            }
+            Self::F32 => k.checked_mul(4)?.checked_mul(rows),
+        }
+    }
+
+    /// Where the kernel needs the activation rows to start.
+    fn alignment(self) -> usize {
+        match self {
+            Self::Q8 { .. } => 4,
+            Self::F32 => 16,
+        }
+    }
+}
+
+/// The ranges and geometry of a dense call, whichever entry takes it: what the guard checks.
+#[derive(Clone, Copy)]
+struct DenseView<'r, 'a> {
+    ty: QuantType,
+    w: &'r RawRange<'a>,
+    x: &'r RawRange<'a>,
+    y: &'r RawRange<'a>,
+    k: usize,
+    rows: usize,
+    ncols: usize,
+}
+
+/// The guard of both dense entries: the ranges hold the call's blocks, activation rows and
+/// output floats, start aligned, and the output shares no byte with what the kernel reads.
+fn check_dense(call: &DenseView<'_, '_>, act: Activation) -> Result<(), DeviceFailure> {
+    let (k, rows, ncols) = (call.k, call.rows, call.ncols);
+    gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
+    let need_w = call.ty.weight_bytes(rows, k).ok_or_else(invalid_argument)?;
+    let need_x = act.bytes(k, ncols).ok_or_else(invalid_argument)?;
+    let ints = [
+        c_int::try_from(k).ok(),
+        c_int::try_from(rows).ok(),
+        c_int::try_from(ncols).ok(),
+    ];
+    let y_bytes = rows.saturating_mul(ncols).saturating_mul(4);
+    let y = Span::of(call.y, y_bytes);
+    let apart = y.apart(&Span::of(call.w, need_w)) && y.apart(&Span::of(call.x, need_x));
+    if ints.iter().any(|int| int.is_none())
+        || !aligned4(call.w)
+        || !call.x.offset.is_multiple_of(act.alignment())
+        || !aligned4(call.y)
+        || !apart
+        || call.x.bytes < need_x
+        || call.y.bytes < y_bytes
+        || call.w.bytes < need_w
+        || k == 0
+        || rows == 0
+        || !(1..=8).contains(&ncols)
+    {
+        return Err(invalid_argument());
+    }
+    Ok(())
+}
+
 /// The in-house dense matvec call: `w` native blocks, `x_q8` the padded `quantize_q8_1` rows,
 /// `x_row_bytes` one activation row's stride (`q8_1_bytes(k, 1)`), `y` f32 out with column `j`
 /// at `y + j * rows`. `rows` may be any positive count: the kernel owns whole rows.
@@ -226,40 +328,25 @@ fn aligned4(range: &RawRange<'_>) -> bool {
     range.offset.is_multiple_of(4)
 }
 
+impl<'a> MatvecGgufRaw<'a> {
+    fn view(&self) -> DenseView<'_, 'a> {
+        DenseView {
+            ty: self.ty,
+            w: &self.w,
+            x: &self.x_q8,
+            y: &self.y,
+            k: self.k,
+            rows: self.rows,
+            ncols: self.ncols,
+        }
+    }
+}
+
 pub(in crate::kernels::cuda) fn check_matvec_gguf(
     call: &MatvecGgufRaw<'_>,
     x_row_bytes: usize,
 ) -> Result<(), DeviceFailure> {
-    let (k, rows, ncols) = (call.k, call.rows, call.ncols);
-    gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
-    let need_w = call.ty.weight_bytes(rows, k).ok_or_else(invalid_argument)?;
-    let ints = [
-        c_int::try_from(k).ok(),
-        c_int::try_from(rows).ok(),
-        c_int::try_from(ncols).ok(),
-    ];
-    let y_bytes = rows.saturating_mul(ncols).saturating_mul(4);
-    let y = Span::of(&call.y, y_bytes);
-    let apart = y.apart(&Span::of(&call.w, need_w))
-        && y.apart(&Span::of(&call.x_q8, x_row_bytes.saturating_mul(ncols)));
-    if ints.iter().any(|int| int.is_none())
-        || !aligned4(&call.w)
-        || !aligned4(&call.x_q8)
-        || !aligned4(&call.y)
-        || !apart
-        || x_row_bytes == 0
-        || !x_row_bytes.is_multiple_of(4)
-        || x_row_bytes < (k / 32) * Q8_1_BLOCK
-        || call.x_q8.bytes < x_row_bytes.saturating_mul(ncols)
-        || call.y.bytes < y_bytes
-        || call.w.bytes < need_w
-        || k == 0
-        || rows == 0
-        || !(1..=8).contains(&ncols)
-    {
-        return Err(invalid_argument());
-    }
-    Ok(())
+    check_dense(&call.view(), Activation::Q8 { x_row_bytes })
 }
 
 pub(in crate::kernels::cuda) fn matvec_gguf_launch(
@@ -317,14 +404,31 @@ pub(in crate::kernels::cuda) struct ExpertGgufRaw<'a> {
     pub(in crate::kernels::cuda) glu_gate: Option<RawRange<'a>>,
 }
 
+/// The ranges and geometry of an expert call, whichever entry takes it.
+#[derive(Clone, Copy)]
+struct ExpertView<'r, 'a> {
+    ty: QuantType,
+    w_stack: &'r RawRange<'a>,
+    ids: &'r RawRange<'a>,
+    x: &'r RawRange<'a>,
+    x_per_slot: bool,
+    y: &'r RawRange<'a>,
+    y_slot_stride: usize,
+    k: usize,
+    rows: usize,
+    n_expert: usize,
+    n_used: usize,
+    glu_gate: Option<&'r RawRange<'a>>,
+}
+
 struct ExpertSizes {
     w_stack: usize,
     ids: usize,
-    x_q8: usize,
+    x: usize,
     y: usize,
 }
 
-fn expert_sizes(call: &ExpertGgufRaw<'_>, x_row_bytes: usize) -> Option<ExpertSizes> {
+fn expert_sizes(call: &ExpertView<'_, '_>, act: Activation) -> Option<ExpertSizes> {
     let x_rows = if call.x_per_slot { call.n_used } else { 1 };
     let y_floats = call
         .y_slot_stride
@@ -335,17 +439,17 @@ fn expert_sizes(call: &ExpertGgufRaw<'_>, x_row_bytes: usize) -> Option<ExpertSi
             .ty
             .weight_bytes(call.rows.checked_mul(call.n_expert)?, call.k)?,
         ids: call.n_used.checked_mul(4)?,
-        x_q8: x_row_bytes.checked_mul(x_rows)?,
+        x: act.bytes(call.k, x_rows)?,
         y: y_floats.checked_mul(4)?,
     })
 }
 
-pub(in crate::kernels::cuda) fn check_matvec_gguf_expert(
-    call: &ExpertGgufRaw<'_>,
-    x_row_bytes: usize,
-) -> Result<(), DeviceFailure> {
+/// The guard of both expert entries: as the dense guard, for the stack, the ids and the slots
+/// of the output; a gate stack, when given, has the stack's size and stays apart from the
+/// output, and only the shared-activation view may take it.
+fn check_expert(call: &ExpertView<'_, '_>, act: Activation) -> Result<(), DeviceFailure> {
     gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
-    let need = expert_sizes(call, x_row_bytes).ok_or_else(invalid_argument)?;
+    let need = expert_sizes(call, act).ok_or_else(invalid_argument)?;
     let ints = [
         c_int::try_from(call.k).ok(),
         c_int::try_from(call.rows).ok(),
@@ -353,8 +457,8 @@ pub(in crate::kernels::cuda) fn check_matvec_gguf_expert(
         c_int::try_from(call.n_used).ok(),
         c_int::try_from(call.y_slot_stride).ok(),
     ];
-    let y = Span::of(&call.y, need.y);
-    let gate_ok = match &call.glu_gate {
+    let y = Span::of(call.y, need.y);
+    let gate_ok = match call.glu_gate {
         Some(gate) => {
             !call.x_per_slot
                 && gate.bytes >= need.w_stack
@@ -363,23 +467,20 @@ pub(in crate::kernels::cuda) fn check_matvec_gguf_expert(
         }
         None => true,
     };
-    let apart = y.apart(&Span::of(&call.w_stack, need.w_stack))
-        && y.apart(&Span::of(&call.x_q8, need.x_q8))
-        && y.apart(&Span::of(&call.ids, need.ids));
+    let apart = y.apart(&Span::of(call.w_stack, need.w_stack))
+        && y.apart(&Span::of(call.x, need.x))
+        && y.apart(&Span::of(call.ids, need.ids));
     if ints.iter().any(|int| int.is_none())
         || call.w_stack.bytes < need.w_stack
         || call.ids.bytes < need.ids
-        || call.x_q8.bytes < need.x_q8
+        || call.x.bytes < need.x
         || call.y.bytes < need.y
-        || !aligned4(&call.w_stack)
-        || !aligned4(&call.ids)
-        || !aligned4(&call.x_q8)
-        || !aligned4(&call.y)
+        || !aligned4(call.w_stack)
+        || !aligned4(call.ids)
+        || !call.x.offset.is_multiple_of(act.alignment())
+        || !aligned4(call.y)
         || !apart
         || !gate_ok
-        || x_row_bytes == 0
-        || !x_row_bytes.is_multiple_of(4)
-        || x_row_bytes < (call.k / 32) * Q8_1_BLOCK
         || call.k == 0
         || call.rows < 1
         || call.n_expert < 1
@@ -431,6 +532,172 @@ pub(in crate::kernels::cuda) fn matvec_gguf_expert_launch(
             table.as_ptr().cast::<c_void>(),
             table.len(),
             x_row_bytes,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+impl<'a> ExpertGgufRaw<'a> {
+    fn view(&self) -> ExpertView<'_, 'a> {
+        ExpertView {
+            ty: self.ty,
+            w_stack: &self.w_stack,
+            ids: &self.ids,
+            x: &self.x_q8,
+            x_per_slot: self.x_per_slot,
+            y: &self.y,
+            y_slot_stride: self.y_slot_stride,
+            k: self.k,
+            rows: self.rows,
+            n_expert: self.n_expert,
+            n_used: self.n_used,
+            glu_gate: self.glu_gate.as_ref(),
+        }
+    }
+}
+
+pub(in crate::kernels::cuda) fn check_matvec_gguf_expert(
+    call: &ExpertGgufRaw<'_>,
+    x_row_bytes: usize,
+) -> Result<(), DeviceFailure> {
+    check_expert(&call.view(), Activation::Q8 { x_row_bytes })
+}
+
+/// The exact f32 dense call: the fields of [`MatvecGgufRaw`] with `x` the packed f32 rows of
+/// the activation (`4 * k` bytes per column).
+pub(in crate::kernels::cuda) struct MatvecGgufF32Raw<'a> {
+    pub(in crate::kernels::cuda) ty: QuantType,
+    pub(in crate::kernels::cuda) w: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) y: RawRange<'a>,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ncols: usize,
+}
+
+impl<'a> MatvecGgufF32Raw<'a> {
+    fn view(&self) -> DenseView<'_, 'a> {
+        DenseView {
+            ty: self.ty,
+            w: &self.w,
+            x: &self.x,
+            y: &self.y,
+            k: self.k,
+            rows: self.rows,
+            ncols: self.ncols,
+        }
+    }
+}
+
+pub(in crate::kernels::cuda) fn matvec_gguf_f32_launch(
+    stream: &RawStream,
+    call: &MatvecGgufF32Raw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_dense(&call.view(), Activation::F32)?;
+    let ty = gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
+    let table = table_of(call.ty);
+    let args = DenseArgsRepr {
+        ty,
+        k: c_int::try_from(call.k).map_err(|_| invalid_argument())?,
+        rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
+        ncols: c_int::try_from(call.ncols).map_err(|_| invalid_argument())?,
+        w: call.w.address().cast_const(),
+        x_q8: call.x.address().cast_const(),
+        y: call.y.address().cast::<f32>(),
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: `check_dense` proved the `w`, `x` and `y` ranges inside their live allocations,
+    // large enough for the call, aligned as the exact kernel needs, and `y` disjoint from the
+    // ranges the kernel reads; the adapter repeats the checks on the addresses. `table` is a
+    // `'static` slice the adapter copies before returning. The allocations stay valid until the
+    // queued launch finishes because `inference_cuda_free` synchronizes the device first.
+    // `stream` is live for the call.
+    let status = unsafe {
+        matvec_gguf_f32_launch_raw(
+            &args,
+            table.as_ptr().cast::<c_void>(),
+            table.len(),
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The exact f32 expert call: the fields of [`ExpertGgufRaw`] with `x` the packed f32 rows
+/// (one row, or one per slot).
+pub(in crate::kernels::cuda) struct ExpertGgufF32Raw<'a> {
+    pub(in crate::kernels::cuda) ty: QuantType,
+    pub(in crate::kernels::cuda) w_stack: RawRange<'a>,
+    pub(in crate::kernels::cuda) ids: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) x_per_slot: bool,
+    pub(in crate::kernels::cuda) y: RawRange<'a>,
+    pub(in crate::kernels::cuda) y_slot_stride: usize,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) n_expert: usize,
+    pub(in crate::kernels::cuda) n_used: usize,
+    pub(in crate::kernels::cuda) glu_gate: Option<RawRange<'a>>,
+}
+
+impl<'a> ExpertGgufF32Raw<'a> {
+    fn view(&self) -> ExpertView<'_, 'a> {
+        ExpertView {
+            ty: self.ty,
+            w_stack: &self.w_stack,
+            ids: &self.ids,
+            x: &self.x,
+            x_per_slot: self.x_per_slot,
+            y: &self.y,
+            y_slot_stride: self.y_slot_stride,
+            k: self.k,
+            rows: self.rows,
+            n_expert: self.n_expert,
+            n_used: self.n_used,
+            glu_gate: self.glu_gate.as_ref(),
+        }
+    }
+}
+
+pub(in crate::kernels::cuda) fn matvec_gguf_f32_expert_launch(
+    stream: &RawStream,
+    call: &ExpertGgufF32Raw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_expert(&call.view(), Activation::F32)?;
+    let ty = gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
+    let table = table_of(call.ty);
+    let args = ExpertArgsRepr {
+        ty,
+        k: c_int::try_from(call.k).map_err(|_| invalid_argument())?,
+        rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
+        n_expert: c_int::try_from(call.n_expert).map_err(|_| invalid_argument())?,
+        n_used: c_int::try_from(call.n_used).map_err(|_| invalid_argument())?,
+        x_per_slot: c_int::from(call.x_per_slot),
+        y_slot_stride: c_int::try_from(call.y_slot_stride).map_err(|_| invalid_argument())?,
+        reserved: 0,
+        w_stack: call.w_stack.address().cast_const(),
+        ids: call.ids.address().cast_const(),
+        x_q8: call.x.address().cast_const(),
+        y: call.y.address().cast::<f32>(),
+        glu_gate: match &call.glu_gate {
+            Some(gate) => gate.address().cast_const(),
+            None => std::ptr::null(),
+        },
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: `check_expert` proved every range inside its live allocation, large enough for
+    // the call, aligned as the exact kernel needs, and `y` disjoint from the ranges the kernel
+    // reads (the adapter repeats the checks on the addresses); the ids are read on the device
+    // and an id outside the stack is answered with NaN rows and no weight read. `table` is a
+    // `'static` slice copied by the adapter before it returns.
+    let status = unsafe {
+        matvec_gguf_f32_expert_raw(
+            &args,
+            table.as_ptr().cast::<c_void>(),
+            table.len(),
             stream.0.as_ptr(),
             &mut stage,
         )

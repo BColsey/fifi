@@ -66,6 +66,46 @@ int inference_cuda_matvec_gguf_expert_launch(const inference_cuda_matvec_gguf_ex
                                              const void *table, size_t table_bytes,
                                              size_t x_row_bytes, void *stream, int *out_stage);
 
+/* The exact twins of the two matvec entries: the same weights and mapping, the activation as
+ * f32 (no quantization) and every product the decoded weight of gguf_decode.cuh's
+ * window_value times the activation in one fused multiply-add. */
+typedef struct inference_cuda_matvec_gguf_f32_args {
+    int type;        /* any GGUF tensor type id the window decoders serve (as for the embed entry) */
+    int k;           /* a positive multiple of the type's block size */
+    int rows;        /* any positive count (the kernel owns whole rows) */
+    int ncols;       /* 1..8 */
+    const void *w;   /* native blocks [rows][k / block_size], 4-byte aligned */
+    const float *x;  /* f32 activations [ncols][k], packed, 16-byte aligned */
+    float *y;        /* f32 out [ncols][rows], column j at y + j * rows */
+} inference_cuda_matvec_gguf_f32_args;
+
+/* One dense launch on stream (must not be NULL): y[j * rows + r] = sum_i x[j][i] * w[r][i].
+ * table and table_bytes as for the q8_1 entry. */
+int inference_cuda_matvec_gguf_f32_launch(const inference_cuda_matvec_gguf_f32_args *args,
+                                          const void *table, size_t table_bytes, void *stream,
+                                          int *out_stage);
+
+typedef struct inference_cuda_matvec_gguf_f32_expert_args {
+    int type;
+    int k;
+    int rows;
+    int n_expert;
+    int n_used;          /* 1..32 */
+    int x_per_slot;      /* 0: one shared activation row, 1: one per slot */
+    int y_slot_stride;   /* elements between slots, >= rows */
+    int reserved;        /* zero */
+    const void *w_stack; /* native blocks [n_expert][rows][k / block_size], 4-byte aligned */
+    const void *ids;     /* device i32 [n_used], read when the kernel runs */
+    const float *x;      /* f32: one row of k (x_per_slot 0) or n_used packed rows, 16-byte aligned */
+    float *y;            /* f32 out [n_used][y_slot_stride], rows used per slot */
+    const void *glu_gate; /* as for the q8_1 expert entry: y = up * silu(gate), x_per_slot 0 */
+} inference_cuda_matvec_gguf_f32_expert_args;
+
+/* The exact twin of the expert entry, with the same slot and id contract. */
+int inference_cuda_matvec_gguf_f32_expert_launch(
+    const inference_cuda_matvec_gguf_f32_expert_args *args, const void *table,
+    size_t table_bytes, void *stream, int *out_stage);
+
 /* Test support: decodes n_blocks blocks of type from w into f32 y (block_size values each)
  * through the same window decoders the matvec uses. */
 int inference_cuda_dequant_gguf_launch(int type, const void *w, float *y, size_t n_blocks,
@@ -129,6 +169,30 @@ static_assert(sizeof(inference_cuda_matvec_gguf_expert_args) == 72 &&
                   offsetof(inference_cuda_matvec_gguf_expert_args, y) == 56 &&
                   offsetof(inference_cuda_matvec_gguf_expert_args, glu_gate) == 64,
               "inference_cuda_matvec_gguf_expert_args layout");
+static_assert(sizeof(inference_cuda_matvec_gguf_f32_args) == 40 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, type) == 0 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, k) == 4 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, rows) == 8 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, ncols) == 12 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, w) == 16 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, x) == 24 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_args, y) == 32,
+              "inference_cuda_matvec_gguf_f32_args layout");
+static_assert(sizeof(inference_cuda_matvec_gguf_f32_expert_args) == 72 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, type) == 0 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, k) == 4 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, rows) == 8 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, n_expert) == 12 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, n_used) == 16 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, x_per_slot) == 20 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, y_slot_stride) == 24 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, reserved) == 28 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, w_stack) == 32 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, ids) == 40 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, x) == 48 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, y) == 56 &&
+                  offsetof(inference_cuda_matvec_gguf_f32_expert_args, glu_gate) == 64,
+              "inference_cuda_matvec_gguf_f32_expert_args layout");
 #endif
 
 #endif /* INFERENCE_CUDA_RESIDENT_MATVEC_GGUF_H */

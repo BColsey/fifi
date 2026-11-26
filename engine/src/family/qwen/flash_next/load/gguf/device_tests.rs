@@ -10,7 +10,7 @@
 use super::{
     GgufModel, host,
     placement::ExpertSetup,
-    smallmodel::{Small, write_small, write_small_with},
+    smallmodel::{Small, write_small, write_small_out_proj, write_small_with},
 };
 use crate::family::{
     project::cuda::CudaProjector,
@@ -194,6 +194,17 @@ fn sequence(len: usize) -> Vec<u32> {
 #[ignore = "needs a GPU (about 2 GiB)"]
 fn the_device_logits_follow_the_host_forward_on_the_small_model() {
     let small = write_small(7);
+    let got = agreement(&small, 4, &[5, 9, 200, 17, 33, 481]);
+    assert!(got.matched >= 2, "{} of 6 positions decided", got.matched);
+}
+
+/// The out-projection of a K type has blocks of 256 values over heads of 128. Only the staged
+/// plan has the head-tile slot for such a block; this step, which has none, projects the scan's
+/// output as it lies, and the logits follow the host forward as they do with a Q8_0 matrix.
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn the_device_logits_follow_the_host_forward_with_a_q6_k_out_projection() {
+    let small = write_small_out_proj(7, crate::weights::GgufType::Q6K);
     let got = agreement(&small, 4, &[5, 9, 200, 17, 33, 481]);
     assert!(got.matched >= 2, "{} of 6 positions decided", got.matched);
 }

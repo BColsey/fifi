@@ -263,7 +263,7 @@ impl GgufWeights {
     }
 
     /// The open file that holds `tensor`.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
     pub(crate) fn file_of(&self, tensor: &GgufTensor) -> &File {
         &self.files[tensor.shard()]
     }

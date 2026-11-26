@@ -43,6 +43,7 @@
 
 use crate::family::engine_owner::Handle;
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
+use crate::kernels::cuda::resident::attn_prep::MAX_DECODE_ROWS;
 use std::cell::Cell;
 
 use crate::{
@@ -62,16 +63,16 @@ use crate::{
         qwen::flash_next::{
             cuda::{
                 moe_block::{SplitMoe, SplitMoeTrunk},
-                state::{FlashGeometry, StatePlan, StateSlot, WORD_STEP_PARAMS},
+                state::{FlashGeometry, QsaCacheStorage, StatePlan, StateSlot, WORD_STEP_PARAMS},
                 step_plan::{PREFILL_TILE_ROWS, Site, Slot, StepOptions, StepPlan},
             },
             load::model_shape,
             moe::context_budget::KvFormat,
-            step::ModelShape,
+            step::{GgufDecodePrecision, ModelShape},
         },
     },
     kernels::cuda::{
-        CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
+        CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight,
         prefill::gdn_scan_seq::GdnForm,
         resident::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
@@ -79,6 +80,7 @@ use crate::{
             hyper::{
                 HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
             },
+            matvec_gguf_f32::DenseF32Call,
             matvec_q::MatvecCall,
             quantize_q8_1::{QuantizeCall, q8_1_bytes},
             step_params::{OFFSET_POS, OFFSET_STATUS},
@@ -91,6 +93,127 @@ pub(super) const F32: usize = size_of::<f32>();
 
 pub(super) fn refuse(detail: String) -> EngError {
     EngError::BadRequest(format!("Flash-Next step: {detail}"))
+}
+
+/// One staged native GGUF decode projection with caller-owned, stream-ordered scratch.
+pub(super) struct NativeProjection<'a> {
+    pub(super) weight: &'a NativeWeight,
+    pub(super) input: DeviceRange<'a>,
+    pub(super) output: DeviceRange<'a>,
+    pub(super) scratch: DeviceRange<'a>,
+}
+
+pub(super) fn project_native(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    call: NativeProjection<'_>,
+) -> Result<(), EngError> {
+    if call.weight.experts().is_some() {
+        return Err(refuse(
+            "native projection requires a matrix, not an expert stack".into(),
+        ));
+    }
+    ctx.validate_native_projection(call.weight, call.input, call.scratch, call.output)?;
+    ctx.quantize_q8_1(
+        stream,
+        QuantizeCall {
+            x: call.input,
+            y: call.scratch,
+            k: call.weight.k(),
+            ncols: 1,
+        },
+    )?;
+    ctx.matvec_native(stream, call.weight, call.scratch, call.output, 1)
+}
+
+/// One exact native GGUF decode projection ([`GgufDecodePrecision::Exact`]): the f32 activation
+/// against the exactly decoded weights of any type the window decoders serve. No scratch.
+pub(super) fn project_exact(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    weight: &NativeWeight,
+    input: DeviceRange<'_>,
+    output: DeviceRange<'_>,
+) -> Result<(), EngError> {
+    if weight.experts().is_some() {
+        return Err(refuse(
+            "exact projection requires a matrix, not an expert stack".into(),
+        ));
+    }
+    ctx.matvec_gguf_f32(
+        stream,
+        DenseF32Call {
+            ty: weight.quant(),
+            w: weight.buffer().range(0, weight.buffer().bytes())?,
+            x: input,
+            y: output,
+            k: weight.k(),
+            rows: weight.n_rows(),
+            ncols: 1,
+        },
+    )
+}
+
+/// Test-only experiment: retain the native Q6_K weights and use the existing dequantizing
+/// tensor-core GEMM, which rounds activations and decoded weights to FP16 rather than Q8_1.
+#[cfg(test)]
+pub(super) fn project_q6_f16(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    call: NativeProjection<'_>,
+) -> Result<(), EngError> {
+    use crate::kernels::cuda::{prefill::gemm_dq::GemmDqTypedCall, resident::matvec_q::QuantType};
+    if call.weight.quant() != QuantType::Q6K || call.weight.experts().is_some() {
+        return Err(refuse(
+            "FP16 DeltaNet experiment requires a Q6_K matrix".into(),
+        ));
+    }
+    ctx.gemm_dq_codebook(
+        stream,
+        QuantType::Q6K,
+        GemmDqTypedCall {
+            w: call
+                .weight
+                .buffer()
+                .range(0, call.weight.buffer().bytes())?,
+            x: call.input,
+            y: call.output,
+            k: call.weight.k(),
+            rows: call.weight.n_rows(),
+            ncols: 1,
+            x_col_stride: 0,
+            y_col_stride: 0,
+            x_f32: true,
+        },
+    )
+}
+
+/// Test-only native Q6_K projection using F32 activations and accumulation.
+#[cfg(test)]
+pub(super) fn project_q6_f32(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    call: NativeProjection<'_>,
+) -> Result<(), EngError> {
+    use crate::kernels::cuda::resident::{matvec_q::QuantType, q6_f32::Q6F32Call};
+    if call.weight.quant() != QuantType::Q6K || call.weight.experts().is_some() {
+        return Err(refuse(
+            "F32 native projection experiment requires a Q6_K matrix".into(),
+        ));
+    }
+    ctx.q6_f32(
+        stream,
+        Q6F32Call {
+            w: call
+                .weight
+                .buffer()
+                .range(0, call.weight.buffer().bytes())?,
+            x: call.input,
+            y: call.output,
+            rows: call.weight.n_rows(),
+            k: call.weight.k(),
+        },
+    )
 }
 
 /// The pack name of the hyper-connection mixer that feeds `lm_head`.
@@ -110,6 +233,15 @@ pub(super) struct FlashStep<'a> {
     pub(super) state_plan: StatePlan,
     pub(super) step_plan: StepPlan,
     pub(super) options: StepOptions,
+    /// The arithmetic of the native GGUF decode projections of a decode owner
+    /// ([`Self::new_gguf_decode`]): [`GgufDecodePrecision::default`] until
+    /// [`Self::set_gguf_decode_precision`]. Any other step never reads it.
+    gguf_decode: GgufDecodePrecision,
+    /// True when the QSA attention caches are f32 ([`QsaCacheStorage::F32`]): the mixer writes the key
+    /// and value rows in f32 and reads them with `qsa_attn_exact`, so nothing is rounded at the
+    /// store. The GGUF decode owner's choice ([`FlashStep::new_gguf_decode`], from
+    /// [`gguf_qsa_cache_storage`]); every other step has fp16 caches.
+    pub(super) qsa_cache_f32: bool,
     state: DeviceArena,
     scratch: DeviceArena,
     /// f32 `[hidden]` zeros: the residual the shared MoE block adds to, since the hyper apply adds
@@ -128,6 +260,68 @@ pub(super) struct FlashStep<'a> {
     pub(super) prefill_window: Cell<bool>,
     /// Set by any error of a launch call; cleared by [`Self::reset`].
     poisoned: Cell<bool>,
+}
+
+/// What the GGUF decode owner adds to the step: the exact scratch plan's `max_k` and the
+/// storage of the QSA attention caches.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GgufDecode {
+    pub(super) max_k: usize,
+    pub(super) qsa_cache: QsaCacheStorage,
+}
+
+/// The bytes of the Q8_1 pack of the widest activation a native projection reads: the hidden
+/// width, the attention and DeltaNet output widths and the expert widths; at least 64 KiB. The
+/// step uploads one at construction; a figure for the step's payload counts it.
+pub(super) fn activation_pack_bytes(geometry: &FlashGeometry) -> Result<usize, EngError> {
+    let widest = [
+        geometry.hidden,
+        geometry.qsa.q_width(),
+        geometry.delta.value_width(),
+        geometry.inter,
+        geometry.shared_inter,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    Ok(q8_1_bytes(widest, MATVEC_COLUMNS)
+        .ok_or_else(|| refuse("the activation pack size overflows".into()))?
+        .max(64 << 10))
+}
+
+/// The storage of the QSA attention caches of the GGUF decode owner
+/// ([`FlashStep::new_gguf_decode`]): fp16, unless `FIFI_FLASH_GGUF_QSA_CACHE` is `f32`, which
+/// rounds nothing at the store and takes twice the cache bytes. An opt-in setting until the f32
+/// caches are qualified, so that every step the owner builds follows it; any other value is
+/// refused.
+pub(super) fn gguf_qsa_cache_storage() -> Result<QsaCacheStorage, EngError> {
+    let value = match std::env::var("FIFI_FLASH_GGUF_QSA_CACHE") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_GGUF_QSA_CACHE is not valid UTF-8: {error}"
+            )));
+        }
+    };
+    parse_qsa_cache_storage(value.as_deref()).map_err(|rule| {
+        EngError::BadRequest(format!(
+            "FIFI_FLASH_GGUF_QSA_CACHE {rule}, got {:?}",
+            value.as_deref().unwrap_or("")
+        ))
+    })
+}
+
+/// The storage the setting names: unset or `f16` is fp16, `f32` is f32. Anything else breaks the
+/// rule the error names.
+pub(super) fn parse_qsa_cache_storage(
+    value: Option<&str>,
+) -> Result<QsaCacheStorage, &'static str> {
+    match value {
+        None | Some("f16") => Ok(QsaCacheStorage::F16),
+        Some("f32") => Ok(QsaCacheStorage::F32),
+        Some(_) => Err("must be f16 or f32"),
+    }
 }
 
 impl<'a> FlashStep<'a> {
@@ -151,6 +345,7 @@ impl<'a> FlashStep<'a> {
             rows,
             layers,
             false,
+            None,
         )
     }
 
@@ -171,7 +366,9 @@ impl<'a> FlashStep<'a> {
         rows: usize,
         layers: std::ops::Range<usize>,
     ) -> Result<Self, EngError> {
-        Self::build(ctx, stream, weights, shape, positions, rows, layers, false)
+        Self::build(
+            ctx, stream, weights, shape, positions, rows, layers, false, None,
+        )
     }
 
     /// The shared-prefill owner, with dense and routed scratch from the shared plan.
@@ -193,6 +390,62 @@ impl<'a> FlashStep<'a> {
             rows,
             layers,
             true,
+            None,
+        )
+    }
+
+    /// Construct a single-token GGUF decode owner with its exact scratch plan. The QSA caches
+    /// are stored as [`gguf_qsa_cache_storage`] says: fp16 unless the setting opts into f32.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn new_gguf_decode(
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        stream: impl Into<Handle<'a, DeviceStream>>,
+        weights: impl Into<Handle<'a, CudaWeights>>,
+        model: ModelShape,
+        kinds: &[bool],
+        positions: usize,
+        max_k: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::new_gguf_decode_in(
+            ctx,
+            stream,
+            weights,
+            model,
+            kinds,
+            positions,
+            max_k,
+            gguf_qsa_cache_storage()?,
+            layers,
+        )
+    }
+
+    /// [`Self::new_gguf_decode`] with the QSA caches stored in `qsa_cache`, whatever the setting
+    /// says: fp16, or [`QsaCacheStorage::F32`], which rounds nothing at the store and takes twice
+    /// the cache bytes. The f32 rows entry of the attention preparation takes at most
+    /// [`MAX_DECODE_ROWS`] rows a step.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn new_gguf_decode_in(
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        stream: impl Into<Handle<'a, DeviceStream>>,
+        weights: impl Into<Handle<'a, CudaWeights>>,
+        model: ModelShape,
+        kinds: &[bool],
+        positions: usize,
+        max_k: usize,
+        qsa_cache: QsaCacheStorage,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::build(
+            ctx,
+            stream,
+            weights,
+            (model, kinds.to_vec()),
+            positions,
+            1,
+            layers,
+            false,
+            Some(GgufDecode { max_k, qsa_cache }),
         )
     }
 
@@ -209,6 +462,7 @@ impl<'a> FlashStep<'a> {
         rows: usize,
         layers: std::ops::Range<usize>,
         shared_prefill: bool,
+        gguf: Option<GgufDecode>,
     ) -> Result<Self, EngError> {
         let (ctx, stream, weights) = (ctx.into(), stream.into(), weights.into());
         let geometry = FlashGeometry::new(&model, &kinds)?;
@@ -218,9 +472,17 @@ impl<'a> FlashStep<'a> {
                 geometry.layers.len()
             )));
         }
-        let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
+        let qsa_cache = gguf.map_or(QsaCacheStorage::F16, |decode| decode.qsa_cache);
+        if qsa_cache == QsaCacheStorage::F32 && rows > MAX_DECODE_ROWS {
+            return Err(refuse(format!(
+                "f32 QSA caches take at most {MAX_DECODE_ROWS} rows a step, got {rows}"
+            )));
+        }
+        let state_plan = StatePlan::with_qsa_cache(&geometry, positions, KvFormat::F16, qsa_cache)?;
         let options = StepOptions::for_sm_count(ctx.sm_count());
-        let step_plan = if shared_prefill {
+        let step_plan = if let Some(decode) = gguf {
+            StepPlan::gguf_decode(&geometry, positions, &options, decode.max_k)?
+        } else if shared_prefill {
             StepPlan::new_prefill(&geometry, rows, positions, &options)?
         } else {
             StepPlan::new(&geometry, rows, positions, &options)?
@@ -233,22 +495,7 @@ impl<'a> FlashStep<'a> {
             ctx.arena(&tensors)?
         };
         let zeros = ctx.upload(&vec![0u8; rows * geometry.hidden * F32])?;
-        // The widest activation a native projection reads: the hidden width, the attention and
-        // DeltaNet output widths and the expert widths; at least 64 KiB.
-        let widest = [
-            geometry.hidden,
-            geometry.qsa.q_width(),
-            geometry.delta.value_width(),
-            geometry.inter,
-            geometry.shared_inter,
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-        let q8_bytes = q8_1_bytes(widest, MATVEC_COLUMNS)
-            .ok_or_else(|| refuse("the activation pack size overflows".into()))?
-            .max(64 << 10);
-        let xq = ctx.upload(&vec![0u8; q8_bytes])?;
+        let xq = ctx.upload(&vec![0u8; activation_pack_bytes(&geometry)?])?;
         let step = Self {
             ctx,
             stream,
@@ -258,6 +505,8 @@ impl<'a> FlashStep<'a> {
             state_plan,
             step_plan,
             options,
+            gguf_decode: gguf.map_or(GgufDecodePrecision::Q8, |_| GgufDecodePrecision::default()),
+            qsa_cache_f32: qsa_cache == QsaCacheStorage::F32,
             state,
             scratch,
             zeros,
@@ -270,6 +519,30 @@ impl<'a> FlashStep<'a> {
         };
         step.reset()?;
         Ok(step)
+    }
+
+    #[cfg(test)]
+    pub(super) fn scratch_bytes_for_test(&self) -> usize {
+        self.scratch.bytes()
+    }
+
+    /// Selects the arithmetic of the native GGUF decode projections ([`GgufDecodePrecision`]).
+    /// The scratch of both is planned either way, so an owner may switch between tokens.
+    pub(super) fn set_gguf_decode_precision(&mut self, precision: GgufDecodePrecision) {
+        self.gguf_decode = precision;
+    }
+
+    /// The arithmetic in force for the native GGUF decode projections.
+    pub(super) fn gguf_decode_precision(&self) -> GgufDecodePrecision {
+        self.gguf_decode
+    }
+
+    /// True for a step built with the GGUF decode description ([`Self::new_gguf_decode`]): the
+    /// plan holds the decode scratch slot, and a native weight is projected on the owner's terms
+    /// (`project_native`, `project_exact`), one row. Any other step projects a native weight with
+    /// its own q8_1 pack ([`Self::project_native`]), as many rows as it holds.
+    pub(super) fn gguf_decode_step(&self) -> bool {
+        self.step_plan.index(Slot::GgufDecodeQ8).is_some()
     }
 
     /// Zeroes the persistent state (the recurrent states, the rings, the caches) and clears the
@@ -471,7 +744,8 @@ impl<'a> FlashStep<'a> {
         }
     }
 
-    /// A tensor kept as stored (F16 or BF16) with its dtype.
+    /// A tensor kept as stored: F16 or BF16 with its dtype, or the Q8_0 blocks of a hyper matrix
+    /// with `Q80AndF16`, which only the hyper-connection kernels read.
     pub(super) fn half(&self, name: &str) -> Result<(DeviceRange<'_>, HyperDtype), EngError> {
         half_of(&self.weights, name)
     }
@@ -525,10 +799,96 @@ impl<'a> FlashStep<'a> {
         self.check_rows(m)?;
         match self.weights.get(prefix) {
             Some(CudaWeight::Native { weight, .. }) => {
-                return self.project_native(weight, x, out, m);
+                if !self.gguf_decode_step() {
+                    return self.project_native(weight, x, out, m);
+                }
+                if m != 1 || self.shared_prefill() {
+                    return Err(refuse(format!(
+                        "{prefix}: native projection supports decode only"
+                    )));
+                }
+                let call = NativeProjection {
+                    weight,
+                    input: x,
+                    output: out,
+                    scratch: self.slot(Slot::GgufDecodeQ8)?,
+                };
+                #[cfg(test)]
+                if (prefix.ends_with("linear_attn.in_proj_qkv")
+                    || prefix.ends_with("linear_attn.in_proj_z"))
+                    && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_DELTA_IN").is_some()
+                {
+                    use crate::kernels::cuda::resident::matvec_q::QuantType;
+                    match weight.quant() {
+                        QuantType::Q6K => {
+                            eprintln!("GGUF test-only Delta input: {prefix} Q6_K F32");
+                            return project_q6_f32(&self.ctx, &self.stream, call);
+                        }
+                        QuantType::Q80 => {
+                            eprintln!(
+                                "GGUF test-only Delta input: {prefix} Q8_0 native Q8 fallback"
+                            );
+                        }
+                        _ => {
+                            return Err(refuse(format!(
+                                "{prefix}: unsupported Delta input probe type"
+                            )));
+                        }
+                    }
+                }
+                #[cfg(test)]
+                if prefix.ends_with("linear_attn.out_proj") {
+                    let f16 = std::env::var_os("FIFI_FLASH_GGUF_TEST_F16_DELTA_OUT").is_some();
+                    let f32 = std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_DELTA_OUT").is_some();
+                    if f16 && f32 {
+                        return Err(refuse(
+                            "select only one DeltaNet precision experiment".into(),
+                        ));
+                    }
+                    if f16 {
+                        return project_q6_f16(&self.ctx, &self.stream, call);
+                    }
+                    if f32 {
+                        return project_q6_f32(&self.ctx, &self.stream, call);
+                    }
+                }
+                #[cfg(test)]
+                if prefix.ends_with("self_attn.o_proj")
+                    && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_QSA_OUT").is_some()
+                {
+                    eprintln!("GGUF test-only QSA output: {prefix} Q6_K F32");
+                    return project_q6_f32(&self.ctx, &self.stream, call);
+                }
+                #[cfg(test)]
+                if prefix.ends_with("self_attn.q_proj")
+                    && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_QSA_IN").is_some()
+                {
+                    return project_q6_f32(&self.ctx, &self.stream, call);
+                }
+                #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+                if crate::family::qwen::flash_next::load::gguf::native_f16::enabled() {
+                    return crate::family::qwen::flash_next::load::gguf::native_f16::project(
+                        &self.ctx,
+                        &self.stream,
+                        weight,
+                        x,
+                        out,
+                    );
+                }
+                return match self.gguf_decode {
+                    GgufDecodePrecision::Q8 => project_native(&self.ctx, &self.stream, call),
+                    GgufDecodePrecision::Exact => {
+                        project_exact(&self.ctx, &self.stream, weight, x, out)
+                    }
+                };
             }
             None => return self.project_dense_pair(prefix, x, out, m),
             Some(_) => {}
+        }
+        if prefix.ends_with("self_attn.indexer.index_qk_proj")
+            && self.step_plan.index(Slot::GgufDecodeQ8).is_some()
+        {
+            return self.project_gguf_indexer(prefix, x, out, m);
         }
         let weight = self.exl3(prefix)?;
         if self.shared_prefill() {
@@ -664,6 +1024,55 @@ impl<'a> FlashStep<'a> {
         Ok(())
     }
 
+    /// GGUF stores the QSA indexer's query and key as one uploaded half matrix.
+    fn project_gguf_indexer(
+        &self,
+        prefix: &str,
+        x: DeviceRange<'_>,
+        out: DeviceRange<'_>,
+        m: usize,
+    ) -> Result<(), EngError> {
+        use crate::kernels::cuda::resident::dense_gemv::{
+            DenseDtype, DenseGemvCall, DenseGemvShape,
+        };
+        if m != 1 || self.shared_prefill() {
+            return Err(refuse(format!(
+                "{prefix}: GGUF indexer supports decode only"
+            )));
+        }
+        let Some(CudaWeight::Raw { ty, buffer, .. }) = self.weights.get(prefix) else {
+            return Err(refuse(format!("{prefix}: missing GGUF indexer matrix")));
+        };
+        let dtype = match ty {
+            GgufType::F16 => DenseDtype::F16,
+            GgufType::Bf16 => DenseDtype::Bf16,
+            other => {
+                return Err(refuse(format!(
+                    "{prefix}: unsupported indexer type {other:?}"
+                )));
+            }
+        };
+        let rows = self.geometry.qsa.idx_proj();
+        let cols = self.geometry.hidden;
+        let bytes = rows
+            .checked_mul(cols)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| refuse(format!("{prefix}: indexer shape overflows")))?;
+        if buffer.bytes() != bytes {
+            return Err(refuse(format!("{prefix}: indexer matrix has wrong size")));
+        }
+        self.ctx.dense_gemv(
+            &self.stream,
+            DenseGemvCall {
+                shape: DenseGemvShape::packed(1, rows, cols),
+                dtype,
+                w: buffer.range(0, bytes)?,
+                x,
+                y: out,
+            },
+        )
+    }
+
     /// The projection of `m` rows into `n` floats at column `col_off` of a `ld`-wide row
     /// (`DeltaProj`/`AttnProj`): one row writes its columns as today, many rows run the job
     /// table.
@@ -742,6 +1151,134 @@ impl<'a> FlashStep<'a> {
         row: &DeviceRange<'_>,
         m: usize,
     ) -> Result<(), EngError> {
+        let native_count = parts
+            .iter()
+            .filter(|(prefix, _, _)| {
+                matches!(self.weights.get(prefix), Some(CudaWeight::Native { .. }))
+            })
+            .count();
+        if self.gguf_decode_step() && native_count != 0 {
+            if native_count != parts.len() {
+                return Err(refuse("mixed native and EXL3 projection group".into()));
+            }
+            self.check_rows(m)?;
+            if m != 1 || self.shared_prefill() {
+                return Err(refuse(
+                    "native projection group supports decode only".into(),
+                ));
+            }
+            let scratch = self.slot(Slot::GgufDecodeQ8)?;
+            // Every member reads x again after the previous output is written.
+            if std::ptr::eq(row.buffer(), x.buffer())
+                && row.offset() < x.offset() + x.bytes()
+                && x.offset() < row.offset() + row.bytes()
+            {
+                return Err(refuse("native group row overlaps its input".into()));
+            }
+            let mut calls = Vec::with_capacity(parts.len());
+            for (index, (prefix, col, n)) in parts.iter().enumerate() {
+                let Some(CudaWeight::Native { weight, .. }) = self.weights.get(prefix) else {
+                    unreachable!();
+                };
+                if weight.experts().is_some() || weight.n_rows() != *n {
+                    return Err(refuse(format!(
+                        "{prefix}: invalid native group matrix width or experts"
+                    )));
+                }
+                let end = col
+                    .checked_add(*n)
+                    .and_then(|v| v.checked_mul(F32))
+                    .ok_or_else(|| refuse("native group output range overflows".into()))?;
+                if end > row.bytes() || std::ptr::eq(row.buffer(), weight.buffer()) {
+                    return Err(refuse(
+                        "native group output lies outside its row or aliases a weight".into(),
+                    ));
+                }
+                if parts[..index].iter().any(|(_, other_col, other_n)| {
+                    col.checked_add(*n).is_none_or(|end| {
+                        other_col
+                            .checked_add(*other_n)
+                            .is_none_or(|other_end| *col < other_end && *other_col < end)
+                    })
+                }) {
+                    return Err(refuse("native group outputs overlap".into()));
+                }
+                let output = Self::columns(row, *col, *n)?;
+                self.ctx
+                    .validate_native_projection(weight, x, scratch, output)?;
+                calls.push(NativeProjection {
+                    weight,
+                    input: x,
+                    output,
+                    scratch,
+                });
+            }
+            #[cfg(test)]
+            if parts.len() == 2
+                && parts[0].0.ends_with("self_attn.k_proj")
+                && parts[1].0.ends_with("self_attn.v_proj")
+                && std::env::var_os("FIFI_FLASH_GGUF_TEST_F32_QSA_IN").is_some()
+            {
+                use crate::kernels::cuda::resident::matvec_q::QuantType;
+                if calls
+                    .iter()
+                    .any(|call| call.weight.quant() != QuantType::Q6K)
+                {
+                    return Err(refuse("QSA input precision probe requires Q6_K K/V".into()));
+                }
+                for call in calls {
+                    project_q6_f32(&self.ctx, &self.stream, call)?;
+                }
+                return Ok(());
+            }
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            if crate::family::qwen::flash_next::load::gguf::native_f16::enabled() {
+                for call in calls {
+                    crate::family::qwen::flash_next::load::gguf::native_f16::project(
+                        &self.ctx,
+                        &self.stream,
+                        call.weight,
+                        call.input,
+                        call.output,
+                    )?;
+                }
+                return Ok(());
+            }
+            if self.gguf_decode == GgufDecodePrecision::Exact {
+                for call in &calls {
+                    project_exact(
+                        &self.ctx,
+                        &self.stream,
+                        call.weight,
+                        call.input,
+                        call.output,
+                    )?;
+                }
+                return Ok(());
+            }
+            let k = calls[0].weight.k();
+            if calls.iter().all(|call| call.weight.k() == k) {
+                // The whole group reads the same row; one quantization serves every matvec.
+                self.ctx.quantize_q8_1(
+                    &self.stream,
+                    QuantizeCall {
+                        x,
+                        y: scratch,
+                        k,
+                        ncols: 1,
+                    },
+                )?;
+                for call in calls {
+                    self.ctx
+                        .matvec_native(&self.stream, call.weight, scratch, call.output, 1)?;
+                }
+            } else {
+                for call in calls {
+                    project_native(&self.ctx, &self.stream, call)?;
+                }
+            }
+            return Ok(());
+        }
         if let Some((first, _, _)) = parts.first()
             && matches!(self.weights.get(first), Some(CudaWeight::Native { .. }))
         {
@@ -817,6 +1354,16 @@ impl<'a> FlashStep<'a> {
         row.buffer().range(row.offset() + col * F32, width * F32)
     }
 
+    /// Whether a hyper site's weights pair other than by one dtype: its vectors (`norm`, `inject`)
+    /// F16 and its two matrices Q8_0, which the kernels of dtype `Q80AndF16` read as stored.
+    fn stored_q80(vectors: HyperDtype, matrices: [HyperDtype; 2], inject: HyperDtype) -> bool {
+        let [down, up] = matrices;
+        inject == vectors
+            && down == up
+            && down == HyperDtype::Q80AndF16
+            && vectors == HyperDtype::F16
+    }
+
     fn hyper_shape(&self, m: usize) -> HyperShape {
         HyperShape {
             m,
@@ -839,12 +1386,15 @@ impl<'a> FlashStep<'a> {
         } else {
             (None, dtype)
         };
-        if [down_dtype, up_dtype, inject_dtype] != [dtype; 3] {
+        if [down_dtype, up_dtype, inject_dtype] != [dtype; 3]
+            && !Self::stored_q80(dtype, [down_dtype, up_dtype], inject_dtype)
+        {
             return Err(refuse(format!(
                 "the weights of {prefix} are not of one dtype: norm {dtype:?}, down {down_dtype:?}, \
                  up {up_dtype:?}, inject {inject_dtype:?}"
             )));
         }
+        let dtype = down_dtype;
         self.ctx.hyper_read(
             &self.stream,
             HyperReadCall {
@@ -1448,7 +1998,8 @@ impl MoeBlock for SplitMoeAt<'_> {
     }
 }
 
-/// A tensor of `weights` kept as stored (F16 or BF16) with its dtype.
+/// A tensor of `weights` kept as stored: F16 or BF16 with its dtype, or the Q8_0 blocks of a
+/// hyper matrix with `Q80AndF16`, which only the hyper-connection kernels read.
 fn half_of<'w>(
     weights: &'w CudaWeights,
     name: &str,
@@ -1458,6 +2009,7 @@ fn half_of<'w>(
             let dtype = match ty {
                 GgufType::F16 => HyperDtype::F16,
                 GgufType::Bf16 => HyperDtype::Bf16,
+                GgufType::Q80 => HyperDtype::Q80AndF16,
                 other => return Err(refuse(format!("{name} is stored as {other:?}"))),
             };
             Ok((buffer.range(0, buffer.bytes())?, dtype))
