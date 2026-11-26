@@ -47,6 +47,8 @@ impl Drafter for Dflash2 {
     }
 }
 type Rows = Vec<Vec<f32>>;
+/// One entry per drafted row: the draft it continues with and that row's ranked candidates.
+type Proposals = Vec<(usize, Vec<(usize, f32)>)>;
 fn dot(x: &[f32], y: &[f32]) -> f32 {
     debug_assert_eq!(x.len(), y.len());
     let mut sums = [0.; 8];
@@ -109,7 +111,8 @@ impl Block<'_> {
         rope(&mut k, start);
         let mut out = vec![vec![0.; 4096]; x.len()];
         for (i, row) in q.iter().enumerate() {
-            for (h, a) in row.chunks_exact(128).enumerate() {
+            // one 128-wide attention head per chunk
+            for (h, a) in row.as_chunks::<128>().0.iter().enumerate() {
                 let r = h / 4 * 128..(h / 4 + 1) * 128;
                 let mut scores: Vec<_> = k
                     .iter()
@@ -174,7 +177,8 @@ impl Block<'_> {
 }
 fn rope(rows: &mut Rows, start: usize) {
     for (t, row) in rows.iter_mut().enumerate() {
-        for h in row.chunks_exact_mut(128) {
+        for h in row.as_chunks_mut::<128>().0 {
+            // one 128-wide attention head per chunk
             for j in 0..64 {
                 let (s, c) = ((t + start) as f32 * 10000f32.powf(-(j as f32) / 64.)).sin_cos();
                 let (a, b) = (h[j], h[64 + j]);
@@ -203,7 +207,7 @@ impl Block<'_> {
         x: &Rows,
         mut anchor: usize,
         project: impl Fn(&[f32]) -> Result<Vec<f32>, EngError>,
-    ) -> Result<Vec<(usize, Vec<(usize, f32)>)>, EngError> {
+    ) -> Result<Proposals, EngError> {
         let proj = self.linear(x, "selector_hidden.weight")?;
         let mut output = Vec::new();
         for i in 1..x.len() {
@@ -237,8 +241,10 @@ fn block_oracle() {
         let b = std::fs::read(root.join(n)).unwrap();
         b.chunks_exact(width * 4)
             .map(|r| {
-                r.chunks_exact(4)
-                    .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                r.as_chunks::<4>() // one little-endian f32 per chunk
+                    .0
+                    .iter()
+                    .map(|v| f32::from_le_bytes(*v))
                     .collect()
             })
             .collect()
