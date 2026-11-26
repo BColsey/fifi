@@ -85,10 +85,12 @@ impl CudaContext {
         [rows, blocks, first, width, out_stride]: PassMixShape,
         eps: f32,
     ) -> Result<(), EngError> {
-        if rows == 0 || first > blocks || !(1..=MAX_BLOCKS).contains(&blocks) {
+        // Zero sealed blocks is the first request: the mix is the normalized current row alone.
+        if rows == 0 || first > blocks || blocks >= MAX_BLOCKS {
             return Err(EngError::BadRequest(format!(
-                "the Inkling pass mix takes 1 to {MAX_BLOCKS} sealed blocks and first_block at \
-                 most blocks, got blocks {blocks}, first_block {first}, rows {rows}"
+                "the Inkling pass mix takes 0 to {} sealed blocks and first_block at \
+                 most blocks, got blocks {blocks}, first_block {first}, rows {rows}",
+                MAX_BLOCKS - 1
             )));
         }
         if !eps.is_finite() || eps <= 0.0 {
@@ -144,9 +146,11 @@ impl CudaContext {
         [rows, blocks, width]: PassSealShape,
         eps: f32,
     ) -> Result<(), EngError> {
-        if rows == 0 || !(1..=MAX_BLOCKS).contains(&blocks) {
+        // Sealed row `blocks` receives the new row, so a stream may hold `MAX_BLOCKS - 1` already.
+        if rows == 0 || blocks >= MAX_BLOCKS {
             return Err(EngError::BadRequest(format!(
-                "the Inkling pass seal takes 1 to {MAX_BLOCKS} sealed blocks, got {blocks}"
+                "the Inkling pass seal takes 0 to {} sealed blocks, got {blocks}",
+                MAX_BLOCKS - 1
             )));
         }
         if !eps.is_finite() || eps <= 0.0 {

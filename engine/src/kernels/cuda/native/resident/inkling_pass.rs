@@ -186,8 +186,9 @@ pub(in crate::kernels::cuda) fn mix(
     let row = width * WORD;
     let valid = (1..=c_int::MAX as usize).contains(&rows)
         && first <= blocks
+        && blocks < MAX_BLOCKS
         && (width..=MAX_STRIDE).contains(&out_stride)
-        && shape(blocks, width, eps)
+        && shape(1, width, eps)
         && sized(&sealed, blocks * rows * width)
         && sized(&current, rows * width)
         && sized(&query, width)
@@ -239,7 +240,8 @@ pub(in crate::kernels::cuda) fn seal(
 ) -> Result<(), DeviceFailure> {
     let row = width * WORD;
     let valid = (1..=c_int::MAX as usize).contains(&rows)
-        && shape(blocks, width, eps)
+        && blocks < MAX_BLOCKS
+        && shape(1, width, eps)
         && sized(&sealed, (blocks + 1) * rows * width)
         && sized(&current, rows * width)
         && next.bytes == rows * row
