@@ -806,6 +806,12 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
     }
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
+    ctx.set_dense_group_policy(
+        crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
+            decode_glue: true,
+            ..Default::default()
+        },
+    );
     let mut rng = Rng::new(0xadd0_57a7);
     let width = 2304;
     let row = row_bytes(width);
@@ -899,10 +905,13 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
         .mix(&ctx, &stream, &standalone_state, &query, 2, blocks, width)
         .unwrap();
     assert_eq!(out, separate, "fused output versus standalone mix");
+    // Same sequential-host tolerance as mix_matches_the_host_algorithm_within_rounding:
+    // device dots use a warp tree instead of left-to-right summation. The separate
+    // launch above is the bit-exact oracle for changes introduced by fusion.
     let error = max_error(&out, &expected);
-    assert!(error <= 1e-6, "mix max absolute error {error}");
+    assert!(error <= 1e-4, "mix max absolute error {error}");
     assert!(
-        max_error(&twin_out, &twin_expected) <= 1e-6,
+        max_error(&twin_out, &twin_expected) <= 1e-4,
         "twin mix output"
     );
     let expected_norm: Vec<f32> = host::norm(&expected, EPS)
