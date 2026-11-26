@@ -21,6 +21,35 @@ pub(crate) fn q8(width: usize, rows: usize) -> usize {
     q8_1_bytes(width, rows).expect("a q8_1 row size fits usize")
 }
 
+/// The tensor `name` of a device load, resident in the blocks of its file type. `family` names
+/// the model in the refusal.
+pub(crate) fn native<'a>(
+    weights: &'a CudaWeights,
+    family: &str,
+    name: &str,
+) -> Result<&'a NativeWeight, EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Native { weight, .. }) => Ok(weight),
+        _ => Err(EngError::Checkpoint(format!(
+            "{family}: tensor {name} is not resident as native blocks"
+        ))),
+    }
+}
+
+/// The tensor `name` of a device load, resident as its raw bytes.
+pub(crate) fn raw<'a>(
+    weights: &'a CudaWeights,
+    family: &str,
+    name: &str,
+) -> Result<&'a DeviceBuffer, EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Raw { buffer, .. }) => Ok(buffer),
+        _ => Err(EngError::Checkpoint(format!(
+            "{family}: tensor {name} is not resident as a raw tensor"
+        ))),
+    }
+}
+
 /// The activation rows a projection reads: q8_1 rows for the quantized matvec and, when the
 /// producer wrote them, the f32 rows for the batched matrix product.
 #[derive(Clone, Copy)]
@@ -59,27 +88,15 @@ impl<'a> StepIo<'a> {
 
     /// The tensor `name`, resident in the blocks of its file type.
     pub(crate) fn native(&self, name: &str) -> Result<&'a NativeWeight, EngError> {
-        match self.weights.get(name) {
-            Some(CudaWeight::Native { weight, .. }) => Ok(weight),
-            _ => Err(EngError::Checkpoint(format!(
-                "{}: tensor {name} is not resident as native blocks",
-                self.family
-            ))),
-        }
+        native(self.weights, self.family, name)
     }
 
     /// The tensor `name`, resident as its raw bytes.
     pub(crate) fn raw(&self, name: &str) -> Result<DeviceRange<'a>, EngError> {
-        match self.weights.get(name) {
-            Some(CudaWeight::Raw { buffer, .. }) => buffer.range(0, buffer.bytes()),
-            _ => Err(EngError::Checkpoint(format!(
-                "{}: tensor {name} is not resident as a raw tensor",
-                self.family
-            ))),
-        }
+        Self::whole(raw(self.weights, self.family, name)?)
     }
 
-    pub(crate) fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    pub(crate) fn whole<'b>(buffer: &'b DeviceBuffer) -> Result<DeviceRange<'b>, EngError> {
         buffer.range(0, buffer.bytes())
     }
 

@@ -22,7 +22,7 @@
 use std::{iter::once, rc::Rc};
 
 use crate::EngError;
-use crate::family::project::cuda::{CudaWeight, CudaWeights};
+use crate::family::project::cuda::CudaWeights;
 use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
@@ -158,23 +158,12 @@ pub(crate) struct LoopStep<'a> {
 }
 
 fn native<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a NativeWeight, EngError> {
-    match weights.get(name) {
-        Some(CudaWeight::Native { weight, .. }) => Ok(weight),
-        _ => Err(EngError::Checkpoint(format!(
-            "the device load is missing {name} in the Native layout ({} tensors held)",
-            weights.len()
-        ))),
-    }
+    crate::family::step::rows::native(weights, "sensenova", name)
 }
 
 /// An F32 tensor the loader copied as read: the conv, `ssm_a`, the biases and every norm.
 fn side<'a>(weights: &'a CudaWeights, name: &str) -> Result<&'a DeviceBuffer, EngError> {
-    match weights.get(name) {
-        Some(CudaWeight::Raw { buffer, .. }) => Ok(buffer),
-        _ => Err(EngError::Checkpoint(format!(
-            "the device load is missing {name} as a raw F32 tensor"
-        ))),
-    }
+    crate::family::step::rows::raw(weights, "sensenova", name)
 }
 
 pub(super) fn floats(
