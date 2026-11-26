@@ -604,18 +604,20 @@ extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row,
 // chain and gathered into the journal after it, one block per slot instead of one copy each.
 constexpr int kMaxWordRows = 64;
 
-__global__ void inkling_zero_words(const float *const *rows, const int *words) {
-    const float *end = rows[blockIdx.x] + words[blockIdx.x];
-    for (float *at = const_cast<float *>(rows[blockIdx.x]) + threadIdx.x; at < end;
-         at += blockDim.x)
-        *at = 0.0f;
-}
+// The pointer lists and lengths live on the host. Capture them in CUDA's kernel
+// parameter space; only the row pointers themselves refer to device memory.
+struct WordRows {
+    const float *source[kMaxWordRows];
+    float *destination[kMaxWordRows];
+    int words[kMaxWordRows];
+};
 
-__global__ void inkling_copy_words(const float *const *source, float *const *destination,
-                                   const int *words) {
+template<bool Copy>
+__global__ void inkling_word_rows(WordRows rows) {
     const int r = blockIdx.x;
-    const int end = words[r];
-    for (int i = threadIdx.x; i < end; i += blockDim.x) destination[r][i] = source[r][i];
+    for (int i = threadIdx.x; i < rows.words[r]; i += blockDim.x) {
+        rows.destination[r][i] = Copy ? rows.source[r][i] : 0.0f;
+    }
 }
 
 extern "C" int inference_cuda_inkling_zero_words(const void *const *rows, const int *words,
@@ -624,11 +626,13 @@ extern "C" int inference_cuda_inkling_zero_words(const void *const *rows, const 
     if (!rows || !words || !stream || count < 1 || count > kMaxWordRows) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
+    WordRows packed{};
     for (int r = 0; r < count; ++r) {
         if (!rows[r] || !aligned(rows[r]) || words[r] < 1) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        packed.destination[r] = static_cast<float *>(const_cast<void *>(rows[r]));
+        packed.words[r] = words[r];
     }
-    inkling_zero_words<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        reinterpret_cast<const float *const *>(rows), words);
+    inkling_word_rows<false><<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(packed);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
@@ -642,16 +646,18 @@ extern "C" int inference_cuda_inkling_copy_words(const void *const *source, void
     if (!source || !destination || !words || !stream || count < 1 || count > kMaxWordRows) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
+    WordRows packed{};
     for (int r = 0; r < count; ++r) {
         if (!source[r] || !destination[r] || !aligned(source[r]) || !aligned(destination[r]) ||
             words[r] < 1 || overlaps(source[r], words[r] * sizeof(float), destination[r],
                                      words[r] * sizeof(float))) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
+        packed.source[r] = static_cast<const float *>(source[r]);
+        packed.destination[r] = static_cast<float *>(destination[r]);
+        packed.words[r] = words[r];
     }
-    inkling_copy_words<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        reinterpret_cast<const float *const *>(source),
-        reinterpret_cast<float *const *>(destination), words);
+    inkling_word_rows<true><<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(packed);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
