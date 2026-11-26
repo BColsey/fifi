@@ -8,12 +8,6 @@ mod block;
 
 pub(super) struct Dflash2(GgufWeights);
 
-pub(super) fn configured() -> Result<Option<Dflash2>, EngError> {
-    std::env::var_os("FIFI_INKLING_SPEC_DRAFT")
-        .map(|p| open(Path::new(&p)).map(Dflash2))
-        .transpose()
-}
-
 fn open(path: &Path) -> Result<GgufWeights, EngError> {
     let w = GgufWeights::open_any_type(
         path,

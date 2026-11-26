@@ -119,6 +119,7 @@ pub(super) fn dense_group_policy() -> crate::kernels::cuda::resident::dense_gemv
     crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
         decode_split: Switch::DecodeSplit.on(),
         weight_visit: Switch::PrefillQ8Visit.on(),
+        prefill_tensor_gemm: Switch::PrefillTensorGemm.on(),
     }
 }
 

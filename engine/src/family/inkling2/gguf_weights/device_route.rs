@@ -46,7 +46,7 @@ impl GgufTextWeights {
         rows: crate::kernels::cuda::resident::dense_gemv::routed_prefill::DeviceRoutedPrefill<'_>,
         caps: [f32; 2],
     ) -> Result<Option<()>, EngError> {
-        if std::env::var("FIFI_INKLING_CUDA_PREFILL_TENSOR_GEMM").as_deref() != Ok("1") {
+        if !crate::family::inkling2::switches::Switch::PrefillTensorGemm.on() {
             return Ok(None);
         }
         let Some(cuda) = self.cuda.as_ref().filter(|c| c.has_resident_route(layer)) else {

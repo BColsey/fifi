@@ -8,6 +8,9 @@ crate::family::switch_table::switch_table! {
         allow(dead_code, reason = "most paths exist only in CUDA builds")
     )]
     pub(crate) enum Switch {
+        ResidentPrefillPass = "FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS", false;
+        ResidentPassReport = "FIFI_INKLING_RESIDENT_PASS_REPORT", false;
+        PrefillTensorGemm = "FIFI_INKLING_CUDA_PREFILL_TENSOR_GEMM", false;
         BatchAttentionProjections = "FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS", true;
         BatchControllers = "FIFI_INKLING_CUDA_BATCH_CONTROLLERS", true;
         BatchExperts = "FIFI_INKLING_CUDA_BATCH_EXPERTS", true;
@@ -79,7 +82,7 @@ mod tests {
         for (index, &(switch, name, _)) in TABLE.iter().enumerate() {
             assert_eq!(switch as usize, index, "{switch:?} is out of order");
             assert_eq!(switch.name(), name);
-            assert!(name.starts_with("FIFI_INKLING_CUDA_"), "{name}");
+            assert!(name.starts_with("FIFI_INKLING_CUDA_") || name == "FIFI_INKLING_RESIDENT_PASS_REPORT", "{name}");
         }
         let mut names: Vec<_> = TABLE.iter().map(|row| row.1).collect();
         names.sort_unstable();

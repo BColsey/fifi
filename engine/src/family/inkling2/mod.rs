@@ -15,7 +15,7 @@ mod cpu_weights;
 mod cuda_projection;
 #[cfg(target_pointer_width = "64")]
 mod dspark;
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(test, target_pointer_width = "64"))]
 mod dflash2;
 #[cfg(target_pointer_width = "64")]
 mod gguf_weights;

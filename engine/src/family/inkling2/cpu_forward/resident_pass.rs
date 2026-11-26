@@ -69,16 +69,9 @@ use crate::kernels::cuda::{
 use crate::EngError;
 use crate::kernels::cuda::resident::inkling_pass::MAX_BLOCKS;
 
-/// A feature switch is on only when it reads exactly `1` (the tree's convention): `0`, an empty
-/// value or any other spelling leaves it off.
-fn on(value: Option<std::ffi::OsString>) -> bool {
-    value.as_deref() == Some(std::ffi::OsStr::new("1"))
-}
-
 /// Whether the pass is enabled; read once per process.
 pub(super) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on(std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS")))
+    crate::family::inkling2::switches::Switch::ResidentPrefillPass.on()
 }
 
 /// Rows one block takes at most: the output-convolution, clip and router kernels bound their
@@ -196,7 +189,7 @@ struct Geometry {
 
 /// Whether the block report line is wanted (`FIFI_INKLING_RESIDENT_PASS_REPORT`).
 fn reporting() -> bool {
-    on(std::env::var_os("FIFI_INKLING_RESIDENT_PASS_REPORT"))
+    crate::family::inkling2::switches::Switch::ResidentPassReport.on()
 }
 
 impl CpuForward {
