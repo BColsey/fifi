@@ -98,7 +98,8 @@ pub(super) struct PassWorkspace {
     /// The depth streams: the live stream, the bank of the current pass and the prelude.
     current: [DeviceBuffer; 3],
     sealed: [DeviceBuffer; 3],
-    /// Raw convolution tails per visit, oldest first: K, V, attention, MLP. The device flips
+    /// Raw convolution tails per visit, oldest first: K, V, attention, MLP (word ranges of the
+    /// tail buffers). The device flips
     /// them at the end of a block; the host uploads them when they are stale.
     tails: [DeviceBuffer; 2],
     tails_from: usize,
@@ -648,7 +649,7 @@ impl CpuForward {
                 block.h,
             ];
             let mut planes: Vec<Vec<Vec<f32>>> = Vec::with_capacity(4);
-            let mut at = consts.tails.start;
+            let mut at = consts.tails.start * WORD;
             for width in widths {
                 let bytes = PAST * width * WORD;
                 block.tails[1].read_at(&block.stream, at, &mut tails[..bytes])?;
@@ -846,8 +847,6 @@ impl CpuForward {
                 status,
             ],
         )?;
-        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-        block.dump_planes(index)?;
         let dynamic = kind == 1;
         block.context.inkling_pass_prep(
             &block.stream,
@@ -877,6 +876,8 @@ impl CpuForward {
             dynamic,
         )?;
         block.report.launches.set(block.report.launches.get() + 3);
+        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        block.dump_planes(index)?;
 
         // Attention in tiles of `QUERY_TILE_LIMIT` rows, each committing its ring rows.
         let side_stride = l.side_stride[kind];
@@ -1223,8 +1224,9 @@ struct Block<'a> {
 }
 
 impl Block<'_> {
-    /// Test aid (`FIFI_INKLING_PASS_DUMP_VISIT=index:path`): before its K/V preparation, the
-    /// visit's live stream, attention input and raw K/V rows, as bits, for a host comparison.
+    /// Test aid (`FIFI_INKLING_PASS_DUMP_VISIT=index:path`): after its K/V preparation, the
+    /// visit's live stream, attention input, raw K/V and prepared side rows, as bits, for a host
+    /// comparison.
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     fn dump_planes(&self, index: usize) -> Result<(), EngError> {
         static DUMP: std::sync::OnceLock<Option<(usize, std::path::PathBuf)>> =
@@ -1265,7 +1267,7 @@ impl Block<'_> {
         });
         std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
             .map_err(|e| bad(format!("resident pass dump: {e}")))?;
-        eprintln!("Inkling resident pass dumped visit {index} before its K/V preparation");
+        eprintln!("Inkling resident pass dumped visit {index} after its K/V preparation");
         Ok(())
     }
 
@@ -1302,11 +1304,12 @@ impl Block<'_> {
         self.sealed[buffer].range(0, blocks.max(1) * self.rows * self.h * WORD)
     }
 
-    /// The previous block's tail plane `which` of visit `index`, exactly `PAST * width` words.
+    /// The previous block's tail plane `which` of visit `index`, exactly `PAST * width` words
+    /// (`tails` ranges count words; the buffers take bytes).
     fn tail(&self, from: usize, index: usize, which: usize) -> Result<DeviceRange<'_>, EngError> {
         let consts = &self.visits[index];
         let widths = self.tail_widths(index);
-        let at = consts.tails.start + widths[..which].iter().sum::<usize>() * PAST * WORD;
+        let at = consts.tails.start * WORD + widths[..which].iter().sum::<usize>() * PAST * WORD;
         self.tails[from].range(at, PAST * widths[which] * WORD)
     }
 
