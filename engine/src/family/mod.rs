@@ -85,6 +85,8 @@ pub mod raon;
 )]
 pub(crate) mod recipe;
 pub(crate) mod slot_request;
+#[cfg(feature = "native-cuda")]
+pub(crate) mod step;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) mod step_dims;
 // The memory facts and the numbers every host plan shares. The host reader inside is compiled

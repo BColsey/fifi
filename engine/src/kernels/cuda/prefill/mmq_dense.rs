@@ -245,6 +245,11 @@ pub(crate) struct MmqDenseInputCall<'b> {
     pub(crate) y: DeviceRange<'b>,
 }
 
+/// Whether the dense product has a case for weights of type `ty`.
+pub(crate) fn takes(ty: QuantType) -> bool {
+    mmq_type_of(ty).is_ok()
+}
+
 /// The q8_1 scale layout (D4 or DS4) follows the weight type of the GEMM that reads the
 /// buffer; a mismatch gives wrong values, not a fault. This is the one place the dense path
 /// derives it, from the weight itself.

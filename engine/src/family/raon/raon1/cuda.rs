@@ -21,33 +21,31 @@ use super::{RAON_1_MINI_PREVIEW, Raon1Model, Raon1Spec, RaonKind, open_raon_1_mi
 use crate::EngError;
 use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
-    BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
+    BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
+use crate::family::step::rows::{Rows, StepIo, q8};
+use crate::family::step::walk::ChunkStep;
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
 };
-use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
 use crate::kernels::cuda::prefill::mmq_mmid::{
     IdsGuardCall, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
 };
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::prefill::mmq_size::{expert_bounds_ints, ids_dst_ints};
-use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::block_ops::{
     BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked, RowOutputs,
 };
-use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::hyper::{HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
-use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
-use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::router::{
     RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
 };
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 use crate::weights::dequantize;
 
 /// Token rows per chunk: the scratch is sized for this many.
@@ -106,30 +104,8 @@ fn f32_values(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn q8(width: usize, rows: usize) -> usize {
-    q8_1_bytes(width, rows).expect("a q8_1 row size fits usize")
-}
-
 fn plan_error(message: String) -> EngError {
     EngError::MemoryPlan(format!("raon1: {message}"))
-}
-
-/// The activation rows a projection reads: q8_1 rows for the quantized matvec and, when the
-/// producer wrote them, the f32 rows for the batched GEMM.
-#[derive(Clone, Copy)]
-struct Rows<'a> {
-    q8: &'a DeviceBuffer,
-    f32: Option<&'a DeviceBuffer>,
-}
-
-impl<'a> Rows<'a> {
-    fn q8(q8: &'a DeviceBuffer) -> Self {
-        Self { q8, f32: None }
-    }
-
-    fn both(q8: &'a DeviceBuffer, f32: &'a DeviceBuffer) -> Self {
-        Self { q8, f32: Some(f32) }
-    }
 }
 
 /// The tensor names of one layer, built once.
@@ -379,14 +355,7 @@ pub(crate) struct Raon1Device {
 /// One named stage of a traced feed.
 pub(crate) type Stage = (String, Vec<f32>);
 
-/// Which rows of a fed chunk run through the output head.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum HeadRows {
-    None,
-    Last,
-    #[cfg(test)]
-    All,
-}
+pub(crate) use crate::family::step::walk::HeadRows;
 
 impl Raon1Device {
     /// Opens the GGUF at `path` strictly and loads it onto the device. `context_limit` caps the
@@ -525,7 +494,8 @@ impl Raon1Device {
     pub(crate) fn reset(&mut self) -> Result<(), EngError> {
         for buffer in [&self.state, &self.hist] {
             let count = buffer.bytes() / 4;
-            self.run(BlockOp::fill(count, 0.0, buffer.range(0, buffer.bytes())?)?)?;
+            self.io()
+                .run(BlockOp::fill(count, 0.0, buffer.range(0, buffer.bytes())?)?)?;
         }
         self.stream.synchronize()
     }
@@ -550,207 +520,19 @@ impl Raon1Device {
         pos0: usize,
         head: HeadRows,
     ) -> Result<Vec<Vec<f32>>, EngError> {
-        if tokens.is_empty() {
-            return Err(EngError::BadRequest("raon1: a feed needs a token".into()));
-        }
-        if pos0
-            .checked_add(tokens.len())
-            .is_none_or(|end| end > self.cells)
-        {
-            return Err(EngError::ContextLimit(format!(
-                "raon1: {} tokens at position {pos0} exceed the {} cached positions",
-                tokens.len(),
-                self.cells
-            )));
-        }
-        if let Some(&token) = tokens.iter().find(|&&t| t as usize >= self.vocab) {
-            return Err(EngError::BadRequest(format!(
-                "raon1: token {token} is outside the vocabulary of {}",
-                self.vocab
-            )));
-        }
-        let mut logits = Vec::new();
-        let mut done = 0;
-        while done < tokens.len() {
-            let piece = &tokens[done..(done + CHUNK).min(tokens.len())];
-            let last_piece = done + piece.len() == tokens.len();
-            self.run_chunk(piece, pos0 + done)?;
-            match head {
-                HeadRows::None => {}
-                HeadRows::Last if !last_piece => {}
-                HeadRows::Last => logits.push(self.head_row(piece.len() - 1)?),
-                #[cfg(test)]
-                HeadRows::All => {
-                    for row in 0..piece.len() {
-                        logits.push(self.head_row(row)?);
-                    }
-                }
-            }
-            done += piece.len();
-        }
-        if head == HeadRows::None {
-            self.stream.synchronize()?;
-        }
-        Ok(logits)
+        crate::family::step::walk::feed(self, tokens, pos0, head)
     }
 
-    fn run(&self, op: BlockOp<'_>) -> Result<(), EngError> {
-        self.ctx.block_op(&self.stream, op)
-    }
-
-    fn native(&self, name: &str) -> Result<&NativeWeight, EngError> {
-        match self.weights.get(name) {
-            Some(CudaWeight::Native { weight, .. }) => Ok(weight),
-            _ => Err(EngError::Checkpoint(format!(
-                "raon1: tensor {name} is not resident as native blocks"
-            ))),
+    /// What the projections of this step share.
+    fn io(&self) -> StepIo<'_> {
+        StepIo {
+            family: "raon1",
+            ctx: &self.ctx,
+            stream: &self.stream,
+            weights: &self.weights,
+            mmq_q8: &self.sc.mmq_q8,
+            fixup: &self.sc.fixup,
         }
-    }
-
-    fn raw(&self, name: &str) -> Result<DeviceRange<'_>, EngError> {
-        match self.weights.get(name) {
-            Some(CudaWeight::Raw { buffer, .. }) => buffer.range(0, buffer.bytes()),
-            _ => Err(EngError::Checkpoint(format!(
-                "raon1: tensor {name} is not resident as a raw tensor"
-            ))),
-        }
-    }
-
-    fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
-        buffer.range(0, buffer.bytes())
-    }
-
-    /// RMS norm of `n` rows of `d` values scaled by `weight`: the f32 rows into `y` and the
-    /// q8_1 rows into `q8_out`, through the shared fused norm and quantize kernel.
-    #[allow(clippy::too_many_arguments)]
-    fn norm_rows(
-        &self,
-        n: usize,
-        d: usize,
-        eps: f32,
-        x: &DeviceBuffer,
-        weight: DeviceRange<'_>,
-        y: &DeviceBuffer,
-        q8_out: &DeviceBuffer,
-    ) -> Result<(), EngError> {
-        self.ctx.add_rmsnorm_q8(
-            &self.stream,
-            AddNormQ8Call {
-                n: d,
-                eps,
-                h: x.range(0, n * d * 4)?,
-                delta: None,
-                weight,
-                norm_out: y.range(0, n * d * 4)?,
-                q8: q8_out.range(0, q8(d, n))?,
-                rows: n,
-            },
-        )
-    }
-
-    /// `y[t] = W x[t]` for `n` rows. Up to 8 rows use the quantized matvec on the q8_1 rows;
-    /// a larger chunk with f32 rows and a row length on the 256 grid uses the batched GEMM.
-    fn mv(&self, name: &str, x: Rows<'_>, y: &DeviceBuffer, n: usize) -> Result<(), EngError> {
-        let weight = self.native(name)?;
-        let (k, rows) = (weight.k(), weight.n_rows());
-        if n > 8
-            && k.is_multiple_of(256)
-            && matches!(
-                weight.quant(),
-                QuantType::Q4K | QuantType::Q6K | QuantType::Q80
-            )
-            && let Some(f32_rows) = x.f32
-        {
-            let q8_range = self.sc.mmq_q8.range(0, mmq_q8_bytes(k, n)?)?;
-            self.ctx.mmq_dense_input(
-                &self.stream,
-                MmqDenseInputCall {
-                    packing: MmqPacking::CpuReference,
-                    weight,
-                    m: n,
-                    row_stride: k,
-                    x: f32_rows.range(0, n * k * 4)?,
-                    y: q8_range,
-                },
-            )?;
-            return self.ctx.mmq_dense(
-                &self.stream,
-                MmqDenseCall {
-                    weight,
-                    w_seg: None,
-                    m: n,
-                    q8_1: q8_range,
-                    dst: y.range(0, n * rows * 4)?,
-                    ld: rows,
-                    col_off: 0,
-                    fixup: Self::whole(&self.sc.fixup)?,
-                },
-            );
-        }
-        let w = Self::whole(weight.buffer())?;
-        let x_stride = q8(k, 1);
-        let mut first = 0;
-        while first < n {
-            let cols = (n - first).min(8);
-            self.ctx.matvec_q(
-                &self.stream,
-                MatvecCall {
-                    ty: weight.quant(),
-                    w,
-                    x_q8: x.q8.range(first * x_stride, q8(k, cols))?,
-                    y: y.range(first * rows * 4, cols * rows * 4)?,
-                    k,
-                    rows,
-                    ncols: cols,
-                },
-            )?;
-            first += cols;
-        }
-        Ok(())
-    }
-
-    /// The F16 projection `y[t] = W x[t]` of `n` f32 rows.
-    fn f16_mv(
-        &self,
-        name: &str,
-        x: &DeviceBuffer,
-        y: &DeviceBuffer,
-        n: usize,
-        rows: usize,
-        cols: usize,
-    ) -> Result<(), EngError> {
-        self.ctx.dense_gemv(
-            &self.stream,
-            DenseGemvCall {
-                shape: DenseGemvShape::packed(n, rows, cols),
-                dtype: DenseDtype::F16,
-                w: self.raw(name)?,
-                x: x.range(0, n * cols * 4)?,
-                y: y.range(0, n * rows * 4)?,
-            },
-        )
-    }
-
-    /// Quantizes `n` rows of `width` f32 values (x * sigmoid(gate) when a gate is given) into
-    /// q8_1 rows, and also writes the f32 product when `f32_out` is given.
-    fn quantize(
-        &self,
-        n: usize,
-        width: usize,
-        x: &DeviceBuffer,
-        gate: Option<&DeviceBuffer>,
-        out: Rows<'_>,
-    ) -> Result<(), EngError> {
-        self.run(BlockOp::gated_quant(
-            n,
-            width,
-            x.range(0, n * width * 4)?,
-            gate.map(|g| g.range(0, n * width * 4)).transpose()?,
-            RowOutputs {
-                q8: Some(out.q8.range(0, q8(width, n))?),
-                f32: out.f32.map(|b| b.range(0, n * width * 4)).transpose()?,
-            },
-        )?)
     }
 
     fn snap(&self, name: &str, buffer: &DeviceBuffer, values: usize) -> Result<(), EngError> {
@@ -782,7 +564,7 @@ impl Raon1Device {
         dequantize(ty, &bytes)
     }
 
-    fn run_chunk(&mut self, tokens: &[u32], pos0: usize) -> Result<(), EngError> {
+    fn chunk(&mut self, tokens: &[u32], pos0: usize) -> Result<(), EngError> {
         let n = tokens.len();
         let mut resid = vec![0f32; n * STREAMS * HIDDEN];
         for (t, &token) in tokens.iter().enumerate() {
@@ -811,25 +593,25 @@ impl Raon1Device {
         resid: &DeviceBuffer,
     ) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.run(BlockOp::hc_read(
+        self.io().run(BlockOp::hc_read(
             n,
             HIDDEN,
             self.hy.hc_eps,
             self.hy.hc_magnitude,
             resid.range(0, n * STREAMS * HIDDEN * 4)?,
-            self.raw(&site.mix)?,
-            self.raw(&site.base)?,
-            self.raw(&site.scale)?,
+            self.io().raw(&site.mix)?,
+            self.io().raw(&site.base)?,
+            self.io().raw(&site.scale)?,
             sc.branch.range(0, n * HIDDEN * 4)?,
             sc.post.range(0, n * STREAMS * 4)?,
             sc.comb.range(0, n * 16 * 4)?,
         )?)?;
-        self.norm_rows(
+        self.io().norm_rows(
             n,
             HIDDEN,
             self.hy.norm_eps,
             &sc.branch,
-            self.raw(norm)?,
+            self.io().raw(norm)?,
             &sc.cur,
             &sc.q8_cur,
         )
@@ -886,14 +668,18 @@ impl Raon1Device {
     fn rda_mixer(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
         let rda = names.ordinal;
-        self.mv(&names.attn_q, sc.cur_rows(), &sc.proj_q, n)?;
-        self.mv(&names.attn_k, sc.cur_rows(), &sc.proj_k, n)?;
-        self.mv(&names.attn_v, sc.cur_rows(), &sc.proj_v, n)?;
-        self.mv(&names.ssm_g, sc.cur_rows(), &sc.g2, n)?;
-        self.f16_mv(&names.ssm_f_a, &sc.cur, &sc.fa, n, TIME_RANK, HIDDEN)?;
-        self.f16_mv(&names.ssm_f_b, &sc.fa, &sc.g1, n, WIDTH, TIME_RANK)?;
-        self.f16_mv(&names.ssm_beta, &sc.cur, &sc.beta, n, HEADS, HIDDEN)?;
-        self.f16_mv(&names.ssm_rda, &sc.cur, &sc.delta, n, HEADS, HIDDEN)?;
+        self.io().mv(&names.attn_q, sc.cur_rows(), &sc.proj_q, n)?;
+        self.io().mv(&names.attn_k, sc.cur_rows(), &sc.proj_k, n)?;
+        self.io().mv(&names.attn_v, sc.cur_rows(), &sc.proj_v, n)?;
+        self.io().mv(&names.ssm_g, sc.cur_rows(), &sc.g2, n)?;
+        self.io()
+            .f16_mv(&names.ssm_f_a, &sc.cur, &sc.fa, n, TIME_RANK, HIDDEN)?;
+        self.io()
+            .f16_mv(&names.ssm_f_b, &sc.fa, &sc.g1, n, WIDTH, TIME_RANK)?;
+        self.io()
+            .f16_mv(&names.ssm_beta, &sc.cur, &sc.beta, n, HEADS, HIDDEN)?;
+        self.io()
+            .f16_mv(&names.ssm_rda, &sc.cur, &sc.delta, n, HEADS, HIDDEN)?;
         let row = n * WIDTH * 4;
         let hist_at = |which: usize| (rda * 3 + which) * CONV_TAPS * WIDTH * 4;
         for (which, (input, output)) in [
@@ -911,7 +697,7 @@ impl Raon1Device {
                     ld: WIDTH,
                 },
                 proj: input.range(0, row)?,
-                weights: self.raw(&names.conv[which])?,
+                weights: self.io().raw(&names.conv[which])?,
                 state: self.hist.range(hist_at(which), CONV_TAPS * WIDTH * 4)?,
                 out: output.range(0, row)?,
             };
@@ -923,7 +709,7 @@ impl Raon1Device {
             }
         }
         let state_bytes = HEADS * HEAD_DIM * HEAD_DIM * 4;
-        self.run(BlockOp::rda_pack(
+        self.io().run(BlockOp::rda_pack(
             n,
             HEADS,
             HEAD_DIM,
@@ -933,8 +719,8 @@ impl Raon1Device {
                 k: sc.conv_k.range(0, row)?,
                 v: sc.conv_v.range(0, row)?,
                 g1: sc.g1.range(0, row)?,
-                dt_bias: self.raw(&names.ssm_dt)?,
-                a: self.raw(&names.ssm_a)?,
+                dt_bias: self.io().raw(&names.ssm_dt)?,
+                a: self.io().raw(&names.ssm_a)?,
                 beta: sc.beta.range(0, n * HEADS * 4)?,
                 delta: sc.delta.range(0, n * HEADS * 4)?,
                 g2: sc.g2.range(0, row)?,
@@ -968,7 +754,7 @@ impl Raon1Device {
                 conv: sc.scan_qkv.range(0, 3 * row)?,
                 proj: sc.scan_proj.range(0, n * (WIDTH + HEADS) * 4)?,
                 decay: sc.scan_decay.range(0, row)?,
-                norm_w: self.raw(&names.ssm_norm)?,
+                norm_w: self.io().raw(&names.ssm_norm)?,
                 state: self.state.range(rda * state_bytes, state_bytes)?,
                 o_out: sc.scan_out.range(0, row)?,
                 status: None,
@@ -979,8 +765,9 @@ impl Raon1Device {
                 gate: GdnGate::Sigmoid,
             },
         )?;
-        self.quantize(n, WIDTH, &sc.scan_out, None, Rows::q8(&sc.q8_wide))?;
-        self.mv(
+        self.io()
+            .quantize(n, WIDTH, &sc.scan_out, None, Rows::q8(&sc.q8_wide))?;
+        self.io().mv(
             &names.attn_output,
             Rows::both(&sc.q8_wide, &sc.scan_out),
             &sc.proj,
@@ -991,21 +778,22 @@ impl Raon1Device {
     fn mla_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {
         let sc = &self.sc;
         let mla = names.ordinal;
-        self.mv(&names.attn_q_a, sc.cur_rows(), &sc.qa, n)?;
+        self.io().mv(&names.attn_q_a, sc.cur_rows(), &sc.qa, n)?;
         // The f32 rows go to `proj`, which the mixer has not written yet; only the q8_1 rows are read.
-        self.norm_rows(
+        self.io().norm_rows(
             n,
             Q_LORA,
             self.hy.latent_eps,
             &sc.qa,
-            self.raw(&names.attn_q_a_norm)?,
+            self.io().raw(&names.attn_q_a_norm)?,
             &sc.proj,
             &sc.q8_qa,
         )?;
-        self.mv(&names.attn_q_b, Rows::q8(&sc.q8_qa), &sc.qb, n)?;
-        self.mv(&names.attn_kv_a, sc.cur_rows(), &sc.kv, n)?;
+        self.io()
+            .mv(&names.attn_q_b, Rows::q8(&sc.q8_qa), &sc.qb, n)?;
+        self.io().mv(&names.attn_kv_a, sc.cur_rows(), &sc.kv, n)?;
         let layer_cache = self.cells * MLA_ROW * 2;
-        self.run(BlockOp::mla_kv_prep(
+        self.io().run(BlockOp::mla_kv_prep(
             n,
             RANK,
             ROPE,
@@ -1013,7 +801,7 @@ impl Raon1Device {
             self.cells,
             self.hy.latent_eps,
             sc.kv.range(0, n * MLA_ROW * 4)?,
-            self.raw(&names.attn_kv_a_norm)?,
+            self.io().raw(&names.attn_kv_a_norm)?,
             self.cache.range(mla * layer_cache, layer_cache)?,
         )?)?;
         let shape = MlaShape {
@@ -1024,10 +812,10 @@ impl Raon1Device {
             rank: RANK,
         };
         let factors = &self.mla[mla];
-        self.run(BlockOp::mla_q_absorb(
+        self.io().run(BlockOp::mla_q_absorb(
             shape,
             sc.qb.range(0, n * HEADS * Q_ROW * 4)?,
-            Self::whole(&factors.wk_b)?,
+            StepIo::whole(&factors.wk_b)?,
             sc.qeff.range(0, n * HEADS * MLA_ROW * 4)?,
         )?)?;
         let keys = pos0 + n;
@@ -1041,7 +829,7 @@ impl Raon1Device {
         };
         let per_split = keys.div_ceil(splits).div_ceil(32) * 32;
         let part_bytes = n * (HEADS / MLA_GROUP) * splits * MLA_GROUP * (RANK + 4) * 4;
-        self.run(BlockOp::mla_attn(
+        self.io().run(BlockOp::mla_attn(
             shape,
             pos0,
             splits,
@@ -1051,7 +839,7 @@ impl Raon1Device {
             self.cache.range(mla * layer_cache, layer_cache)?,
             sc.part.range(0, part_bytes)?,
         )?)?;
-        self.run(BlockOp::mla_reduce(
+        self.io().run(BlockOp::mla_reduce(
             n,
             HEADS,
             RANK,
@@ -1059,28 +847,28 @@ impl Raon1Device {
             sc.part.range(0, part_bytes)?,
             sc.mix.range(0, n * HEADS * RANK * 4)?,
         )?)?;
-        self.run(BlockOp::mla_project(
+        self.io().run(BlockOp::mla_project(
             n,
             HEADS,
             RANK,
             HEAD_DIM,
             sc.mix.range(0, n * HEADS * RANK * 4)?,
-            Self::whole(&factors.wv_b)?,
+            StepIo::whole(&factors.wv_b)?,
             sc.mla_out.range(0, n * WIDTH * 4)?,
         )?)?;
-        self.mv(&names.attn_gate, sc.cur_rows(), &sc.g2, n)?;
+        self.io().mv(&names.attn_gate, sc.cur_rows(), &sc.g2, n)?;
         if self.trace.borrow().is_some() {
             self.snap("mla_out", &sc.mla_out, n * WIDTH)?;
             self.snap("mla_gate", &sc.g2, n * WIDTH)?;
         }
-        self.quantize(
+        self.io().quantize(
             n,
             WIDTH,
             &sc.mla_out,
             Some(&sc.g2),
             Rows::both(&sc.q8_wide, &sc.mla_gated),
         )?;
-        self.mv(
+        self.io().mv(
             &names.attn_output,
             Rows::both(&sc.q8_wide, &sc.mla_gated),
             &sc.proj,
@@ -1117,7 +905,7 @@ impl Raon1Device {
         out: Rows<'_>,
     ) -> Result<(), EngError> {
         let span = ((rows - 1) * ld + width) * 4;
-        self.run(BlockOp::situ_quant(
+        self.io().run(BlockOp::situ_quant(
             rows,
             width,
             ld,
@@ -1134,8 +922,9 @@ impl Raon1Device {
 
     fn dense_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.mv(&names.ffn_gate, sc.cur_rows(), &sc.ffn_gate, n)?;
-        self.mv(&names.ffn_up, sc.cur_rows(), &sc.ffn_up, n)?;
+        self.io()
+            .mv(&names.ffn_gate, sc.cur_rows(), &sc.ffn_gate, n)?;
+        self.io().mv(&names.ffn_up, sc.cur_rows(), &sc.ffn_up, n)?;
         let up = sc.ffn_up.range(0, n * DENSE_INTER * 4)?;
         self.situ(
             n,
@@ -1145,7 +934,7 @@ impl Raon1Device {
             DENSE_INTER,
             Rows::both(&sc.q8_ffn, &sc.act_ffn),
         )?;
-        self.mv(
+        self.io().mv(
             &names.ffn_down,
             Rows::both(&sc.q8_ffn, &sc.act_ffn),
             &sc.proj,
@@ -1165,12 +954,12 @@ impl Raon1Device {
         rows: usize,
         k: usize,
     ) -> Result<(), EngError> {
-        let weight = self.native(name)?;
+        let weight = self.io().native(name)?;
         self.ctx.matvec_expert(
             &self.stream,
             ExpertMatvecCall {
                 ty: weight.quant(),
-                w_stack: Self::whole(weight.buffer())?,
+                w_stack: StepIo::whole(weight.buffer())?,
                 ids,
                 x_q8,
                 x_per_slot,
@@ -1217,7 +1006,7 @@ impl Raon1Device {
                     .range(0, expert_bounds_ints(EXPERTS)? * 4)?,
             },
         )?;
-        let gate = self.native(&names.gate_exps)?;
+        let gate = self.io().native(&names.gate_exps)?;
         let q8_rows = sc.mmq_q8_routed.range(0, mmq_q8_bytes(HIDDEN, n * USED)?)?;
         self.ctx.mmq_quantize_scatter_ids(
             &self.stream,
@@ -1231,7 +1020,10 @@ impl Raon1Device {
                 y: q8_rows,
             },
         )?;
-        for (weight, offset) in [(gate, 0), (self.native(&names.up_exps)?, MOE_INTER * 4)] {
+        for (weight, offset) in [
+            (gate, 0),
+            (self.io().native(&names.up_exps)?, MOE_INTER * 4),
+        ] {
             let quant = weight.quant();
             let stride_bytes = quant
                 .weight_bytes(MOE_INTER, HIDDEN)
@@ -1241,7 +1033,7 @@ impl Raon1Device {
                 MmidLaunchCall {
                     shape,
                     weight: MmidWeight {
-                        base: Self::whole(weight.buffer())?,
+                        base: StepIo::whole(weight.buffer())?,
                         quant,
                         k: HIDDEN,
                         n: MOE_INTER,
@@ -1251,7 +1043,7 @@ impl Raon1Device {
                     y: q8_rows,
                     dst: sc.gu.range(offset, n * gu_row - offset)?,
                     ld: stride,
-                    fixup: Self::whole(&sc.fixup)?,
+                    fixup: StepIo::whole(&sc.fixup)?,
                 },
             )?;
         }
@@ -1271,7 +1063,7 @@ impl Raon1Device {
             RouterLogitsCall {
                 shape,
                 x: sc.cur.range(0, n * HIDDEN * 4)?,
-                w: self.raw(&names.gate_inp)?,
+                w: self.io().raw(&names.gate_inp)?,
                 logits: sc.logits_route.range(0, n * EXPERTS * 4)?,
             },
         )?;
@@ -1282,8 +1074,10 @@ impl Raon1Device {
                 logits: sc.logits_route.range(0, n * EXPERTS * 4)?,
                 ids: sc.ids.range(0, n * USED * 4)?,
                 weights: sc.weights.range(0, n * USED * 4)?,
-                status: Self::whole(&sc.route_status)?,
-                bias: Some(RouterSigmoidBias::KernelRounded(self.raw(&names.exp_bias)?)),
+                status: StepIo::whole(&sc.route_status)?,
+                bias: Some(RouterSigmoidBias::KernelRounded(
+                    self.io().raw(&names.exp_bias)?,
+                )),
             },
         )?;
         if self.trace.borrow().is_some() {
@@ -1300,8 +1094,10 @@ impl Raon1Device {
             }
         }
         // The shared expert first: its output is the base the routed picks are summed onto.
-        self.mv(&names.gate_shexp, sc.cur_rows(), &sc.ffn_gate, n)?;
-        self.mv(&names.up_shexp, sc.cur_rows(), &sc.ffn_up, n)?;
+        self.io()
+            .mv(&names.gate_shexp, sc.cur_rows(), &sc.ffn_gate, n)?;
+        self.io()
+            .mv(&names.up_shexp, sc.cur_rows(), &sc.ffn_up, n)?;
         let up = sc.ffn_up.range(0, n * MOE_INTER * 4)?;
         self.situ(
             n,
@@ -1311,11 +1107,13 @@ impl Raon1Device {
             MOE_INTER,
             Rows::q8(&sc.q8_ffn),
         )?;
-        self.mv(&names.down_shexp, Rows::q8(&sc.q8_ffn), &sc.shared, n)?;
+        self.io()
+            .mv(&names.down_shexp, Rows::q8(&sc.q8_ffn), &sc.shared, n)?;
         let gu_row = USED * 2 * MOE_INTER * 4;
         let stride = 2 * MOE_INTER;
         let grouped = |name: &str| {
-            self.native(name)
+            self.io()
+                .native(name)
                 .is_ok_and(|w| matches!(w.quant(), QuantType::Q4K | QuantType::Q6K))
         };
         if n > 8 && grouped(&names.gate_exps) && grouped(&names.up_exps) {
@@ -1390,27 +1188,58 @@ impl Raon1Device {
     }
 
     /// The output head of row `row` of the last chunk: stream mean, norm, vocabulary matvec.
-    fn head_row(&self, row: usize) -> Result<Vec<f32>, EngError> {
+    fn logits_row(&self, row: usize) -> Result<Vec<f32>, EngError> {
         let sc = &self.sc;
-        self.run(BlockOp::hc_mean(
+        self.io().run(BlockOp::hc_mean(
             row,
             HIDDEN,
             sc.resid_a.range(0, (row + 1) * STREAMS * HIDDEN * 4)?,
             sc.head.range(0, HIDDEN * 4)?,
         )?)?;
-        self.norm_rows(
+        self.io().norm_rows(
             1,
             HIDDEN,
             self.hy.norm_eps,
             &sc.head,
-            self.raw("output_norm.weight")?,
+            self.io().raw("output_norm.weight")?,
             &sc.cur,
             &sc.q8_head,
         )?;
-        self.mv("output.weight", Rows::q8(&sc.q8_head), &sc.logits, 1)?;
+        self.io()
+            .mv("output.weight", Rows::q8(&sc.q8_head), &sc.logits, 1)?;
         let mut bytes = vec![0u8; self.vocab * 4];
         sc.logits.read_at(&self.stream, 0, &mut bytes)?;
         Ok(f32_values(&bytes))
+    }
+}
+
+impl ChunkStep for Raon1Device {
+    fn family(&self) -> &'static str {
+        "raon1"
+    }
+
+    fn chunk_rows(&self) -> usize {
+        CHUNK
+    }
+
+    fn cells(&self) -> usize {
+        self.cells
+    }
+
+    fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    fn run_chunk(&mut self, tokens: &[u32], pos0: usize) -> Result<(), EngError> {
+        self.chunk(tokens, pos0)
+    }
+
+    fn head_row(&self, row: usize) -> Result<Vec<f32>, EngError> {
+        self.logits_row(row)
+    }
+
+    fn drain(&self) -> Result<(), EngError> {
+        self.stream.synchronize()
     }
 }
 
