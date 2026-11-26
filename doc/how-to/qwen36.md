@@ -79,7 +79,7 @@ You need Linux with an NVIDIA driver, and:
    | `qwen36-cuda-3090-kv8-prefix-262k.json` | 262,144 | You need the longest context **and** other programs use under 744 MiB of GPU memory — a headless card; a desktop session alone is usually more, so use the 180,224 default there. |
    | `qwen36-rtx3090-24gb-fp16kv.json` | 98,304 | You want a 16-bit KV cache. |
 
-   The int8 cache of the kv8 profiles and the 16-bit cache of the fp16 profile were scored against each other and against llama.cpp on 2026-11-25: [the measured difference](../explanation/kld-vs-llamacpp.md).
+   The int8 cache of the kv8 profiles and the 16-bit cache of the fp16 profile were scored against each other and against llama.cpp, like against like, on 2026-11-25 and 2026-11-26: [the measured difference](../explanation/kld-vs-llamacpp.md).
 
    Check current GPU use with `nvidia-smi`. A desktop session alone often uses several hundred MiB.
 
