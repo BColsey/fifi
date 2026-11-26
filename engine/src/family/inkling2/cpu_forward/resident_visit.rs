@@ -679,8 +679,7 @@ impl Execution<'_> {
         self.attention(cuda, position, input)?;
         let blocks = self.advance_depth()?;
         self.mix(depth, blocks, self.weights.mlp_query, l.mlp_input)?;
-        self.mlp(cuda)?;
-        self.add(l.mlp_conv)
+        self.mlp(cuda)
     }
 
     fn mix(
@@ -850,6 +849,9 @@ impl Execution<'_> {
                 kernel: self.weights.row(conv)?,
                 history: self.row(l.histories[3])?,
                 out: self.row(l.mlp_conv)?,
+                // The convolved row is added into the depth stream's current row in the same
+                // launch, the add of the visit's MLP output.
+                state: Some(self.row(l.depth.row(shape.hidden))?),
                 health: self.row(l.glue_health)?,
             },
             (shape.hidden, shape.taps),

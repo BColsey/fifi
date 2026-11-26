@@ -760,6 +760,7 @@ impl ResidentAttention {
                 kernel: request.attn_conv.kernel,
                 history: request.attn_conv.history,
                 out: request.out,
+                state: None,
                 health: health.conv,
             },
             (request.out.bytes() / WORD, PrepShape::TAPS),
