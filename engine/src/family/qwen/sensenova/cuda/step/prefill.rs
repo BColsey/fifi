@@ -12,6 +12,8 @@
 //! last row.
 
 use super::*;
+use crate::family::step::ffn;
+use crate::family::step::rows::{Out as StepOut, Rows as StepRows, StepIo};
 use crate::kernels::cuda::prefill::attn_prefill::{
     AttnKvStorage, AttnPrefillCall, AttnPrefillShape, CPF_ATTN_PART_CAP, CPF_ATTN_Q_TILE,
     CpfAttnGeometry, CpfAttnSpan, CpfAttnSplit, cpf_attn_launch_plan,
@@ -26,7 +28,6 @@ use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
 use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
-use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::pack_rows::{PackRowsCall, PackSegment};
 
@@ -790,66 +791,44 @@ impl LoopStep<'_> {
     /// strided row, the SwiGLU, the down projection.
     fn ffn_chunk(&self, p: usize, m: usize) -> Result<(), EngError> {
         let phys = &self.phys[p];
-        let (h, ff) = (self.shape.hidden, self.shape.feed_forward);
-        let normed = Columns {
-            x: floats(&self.rows.norm_out, 0, m * h)?,
-            stride: h,
+        let ff = self.shape.feed_forward;
+        let gu = floats(&self.rows.gu, 0, m * 2 * ff)?;
+        ffn::gated(
+            &self.io(exact_gemm()),
+            phys.ffn(),
+            ffn::Join::Swiglu,
+            StepRows::both(&self.rows.norm_q8, &self.rows.norm_out),
             m,
-            q8: &self.rows.q8x,
-        };
-        let dst = floats(&self.rows.gu, 0, m * 2 * ff)?;
-        let typed = self.dense_typed(
-            phys.ffn_gate,
-            None,
-            normed.clone(),
-            Out {
-                m,
-                dst,
-                ld: 2 * ff,
-                col_off: 0,
-            },
-        )?;
-        self.dense_typed(
-            phys.ffn_up,
-            Some(typed),
-            normed,
-            Out {
-                m,
-                dst,
-                ld: 2 * ff,
-                col_off: ff,
-            },
-        )?;
-        self.ctx.swiglu_rows(
-            &self.stream,
-            SwigluRowsCall {
-                shape: SwigluRowsShape {
-                    rows: m,
-                    n_ff: ff,
-                    up_off: ff,
-                    ld_in: 2 * ff,
-                    ld_out: ff,
+            ffn::Scratch {
+                gate: StepOut {
+                    dst: gu,
+                    ld: 2 * ff,
+                    col_off: 0,
                 },
-                gu: floats(&self.rows.gu, 0, m * 2 * ff)?,
-                act: floats(&self.rows.act, 0, m * ff)?,
+                up: StepOut {
+                    dst: gu,
+                    ld: 2 * ff,
+                    col_off: ff,
+                },
+                // The matvec route reads these q8_1 rows and the batched route uses the same
+                // buffer as its own scratch; a block takes one route or the other.
+                act: StepRows::both(&self.rows.q8f, &self.rows.act),
             },
-        )?;
-        self.dense_typed(
-            phys.ffn_down,
-            None,
-            Columns {
-                x: floats(&self.rows.act, 0, m * ff)?,
-                stride: ff,
-                m,
-                q8: &self.rows.q8f,
-            },
-            Out {
-                m,
-                dst: floats(&self.rows.ffn_out, 0, m * h)?,
-                ld: h,
-                col_off: 0,
-            },
-        )?;
-        Ok(())
+            &self.rows.ffn_out,
+        )
+    }
+
+    /// What the shared projections of this step need. `exact` puts them on the decoding
+    /// routes.
+    pub(super) fn io(&self, exact: bool) -> StepIo<'_> {
+        StepIo {
+            family: "sensenova",
+            ctx: &self.ctx,
+            stream: &self.stream,
+            weights: self.weights,
+            mmq_q8: &self.rows.q8f,
+            fixup: &self.rows.fixup,
+            exact,
+        }
     }
 }

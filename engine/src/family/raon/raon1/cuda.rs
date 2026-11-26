@@ -23,7 +23,8 @@ use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
-use crate::family::step::rows::{Rows, StepIo, q8};
+use crate::family::step::ffn;
+use crate::family::step::rows::{Out, Rows, StepIo, q8};
 use crate::family::step::walk::ChunkStep;
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
@@ -35,7 +36,7 @@ use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::prefill::mmq_size::{expert_bounds_ints, ids_dst_ints};
 use crate::kernels::cuda::resident::block_ops::{
-    BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked, RowOutputs,
+    BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked,
 };
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::hyper::{HyperMixApplyCall, HyperShape};
@@ -286,6 +287,15 @@ struct Scratch {
 }
 
 impl Scratch {
+    fn ffn_scratch<'a>(
+        &'a self,
+        n: usize,
+        width: usize,
+        act: Rows<'a>,
+    ) -> Result<ffn::Scratch<'a>, EngError> {
+        ffn::Scratch::packed(&self.ffn_gate, &self.ffn_up, (n, width), act)
+    }
+
     fn cur_rows(&self) -> Rows<'_> {
         Rows::both(&self.q8_cur, &self.cur)
     }
@@ -532,6 +542,7 @@ impl Raon1Device {
             weights: &self.weights,
             mmq_q8: &self.sc.mmq_q8,
             fixup: &self.sc.fixup,
+            exact: false,
         }
     }
 
@@ -895,51 +906,25 @@ impl Raon1Device {
         Ok(())
     }
 
-    fn situ(
-        &self,
-        rows: usize,
-        width: usize,
-        gate: &DeviceBuffer,
-        up: &DeviceRange<'_>,
-        ld: usize,
-        out: Rows<'_>,
-    ) -> Result<(), EngError> {
-        let span = ((rows - 1) * ld + width) * 4;
-        self.io().run(BlockOp::situ_quant(
-            rows,
-            width,
-            ld,
-            ld,
-            (self.hy.situ_beta, self.hy.situ_linear_beta),
-            gate.range(0, span)?,
-            *up,
-            RowOutputs {
-                q8: Some(out.q8.range(0, q8(width, rows))?),
-                f32: out.f32.map(|b| b.range(0, rows * width * 4)).transpose()?,
-            },
-        )?)
-    }
-
     fn dense_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.io()
-            .mv(&names.ffn_gate, sc.cur_rows(), &sc.ffn_gate, n)?;
-        self.io().mv(&names.ffn_up, sc.cur_rows(), &sc.ffn_up, n)?;
-        let up = sc.ffn_up.range(0, n * DENSE_INTER * 4)?;
-        self.situ(
+        let io = self.io();
+        ffn::gated(
+            &io,
+            ffn::Weights::named(&io, &names.ffn_gate, &names.ffn_up, &names.ffn_down)?,
+            self.situ_join(),
+            sc.cur_rows(),
             n,
-            DENSE_INTER,
-            &sc.ffn_gate,
-            &up,
-            DENSE_INTER,
-            Rows::both(&sc.q8_ffn, &sc.act_ffn),
-        )?;
-        self.io().mv(
-            &names.ffn_down,
-            Rows::both(&sc.q8_ffn, &sc.act_ffn),
+            sc.ffn_scratch(n, DENSE_INTER, Rows::both(&sc.q8_ffn, &sc.act_ffn))?,
             &sc.proj,
-            n,
         )
+    }
+
+    fn situ_join(&self) -> ffn::Join {
+        ffn::Join::Situ {
+            beta: self.hy.situ_beta,
+            linear_beta: self.hy.situ_linear_beta,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1094,21 +1079,16 @@ impl Raon1Device {
             }
         }
         // The shared expert first: its output is the base the routed picks are summed onto.
-        self.io()
-            .mv(&names.gate_shexp, sc.cur_rows(), &sc.ffn_gate, n)?;
-        self.io()
-            .mv(&names.up_shexp, sc.cur_rows(), &sc.ffn_up, n)?;
-        let up = sc.ffn_up.range(0, n * MOE_INTER * 4)?;
-        self.situ(
+        let io = self.io();
+        ffn::gated(
+            &io,
+            ffn::Weights::named(&io, &names.gate_shexp, &names.up_shexp, &names.down_shexp)?,
+            self.situ_join(),
+            sc.cur_rows(),
             n,
-            MOE_INTER,
-            &sc.ffn_gate,
-            &up,
-            MOE_INTER,
-            Rows::q8(&sc.q8_ffn),
+            sc.ffn_scratch(n, MOE_INTER, Rows::q8(&sc.q8_ffn))?,
+            &sc.shared,
         )?;
-        self.io()
-            .mv(&names.down_shexp, Rows::q8(&sc.q8_ffn), &sc.shared, n)?;
         let gu_row = USED * 2 * MOE_INTER * 4;
         let stride = 2 * MOE_INTER;
         let grouped = |name: &str| {
@@ -1147,14 +1127,27 @@ impl Raon1Device {
                 )?;
             }
         }
-        let up = sc.gu.range(MOE_INTER * 4, n * gu_row - MOE_INTER * 4)?;
-        self.situ(
-            n * USED,
-            MOE_INTER,
-            &sc.gu,
-            &up,
-            stride,
-            Rows::q8(&sc.q8_experts),
+        let gu = sc.gu.range(0, n * gu_row)?;
+        let (ld, rows) = (stride, n * USED);
+        let scratch = ffn::Scratch {
+            gate: Out {
+                dst: gu,
+                ld,
+                col_off: 0,
+            },
+            up: Out {
+                dst: gu,
+                ld,
+                col_off: MOE_INTER,
+            },
+            act: Rows::q8(&sc.q8_experts),
+        };
+        ffn::joined(
+            &self.io(),
+            self.situ_join(),
+            (rows, MOE_INTER),
+            scratch,
+            true,
         )?;
         let e_stride = q8(MOE_INTER, 1);
         for t in 0..n {

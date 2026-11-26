@@ -23,7 +23,8 @@ use std::{iter::once, rc::Rc};
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
-use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
+use crate::family::step::ffn;
+use crate::family::step::rows::{Out as StepOut, Rows as StepRows};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
 use crate::kernels::cuda::resident::attn_decode_loop::{
@@ -67,6 +68,16 @@ struct Phys<'a> {
     ffn_up: &'a NativeWeight,
     ffn_down: &'a NativeWeight,
     mixer: Mixer<'a>,
+}
+
+impl<'a> Phys<'a> {
+    fn ffn(&self) -> ffn::Weights<'a> {
+        ffn::Weights {
+            gate: self.ffn_gate,
+            up: self.ffn_up,
+            down: self.ffn_down,
+        }
+    }
 }
 
 enum Mixer<'a> {
@@ -1083,50 +1094,28 @@ impl<'a> LoopStep<'a> {
     /// SwiGLU (the column-split rows kernel: `swiglu_q8` is one block for the whole row), its
     /// q8 quantize, the down matvec into `ffn_out`.
     fn ffn(&mut self, p: usize) -> Result<(), EngError> {
-        let phys = &self.phys[p];
-        let (h, ff) = (self.shape.hidden, self.shape.feed_forward);
-        self.project(
-            phys.ffn_gate,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.gu, 0, ff)?,
-        )?;
-        self.project(
-            phys.ffn_up,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.gu, ff, ff)?,
-        )?;
-        self.ctx.swiglu_rows(
-            &self.stream,
-            SwigluRowsCall {
-                shape: SwigluRowsShape {
-                    rows: 1,
-                    n_ff: ff,
-                    up_off: ff,
-                    ld_in: 2 * ff,
-                    ld_out: ff,
+        let ff = self.shape.feed_forward;
+        let gu = floats(&self.gu, 0, 2 * ff)?;
+        ffn::gated(
+            &self.io(self.dq),
+            self.phys[p].ffn(),
+            ffn::Join::Swiglu,
+            StepRows::both(&self.norm_q8, &self.norm_out),
+            1,
+            ffn::Scratch {
+                gate: StepOut {
+                    dst: gu,
+                    ld: 2 * ff,
+                    col_off: 0,
                 },
-                gu: floats(&self.gu, 0, 2 * ff)?,
-                act: floats(&self.rows.act, 0, ff)?,
+                up: StepOut {
+                    dst: gu,
+                    ld: 2 * ff,
+                    col_off: ff,
+                },
+                act: StepRows::both(&self.gu_q8, &self.rows.act),
             },
-        )?;
-        if !self.dq {
-            self.ctx.quantize_q8_1(
-                &self.stream,
-                crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
-                    x: floats(&self.rows.act, 0, ff)?,
-                    y: bytes_range(&self.gu_q8, q8_row(ff)?)?,
-                    k: ff,
-                    ncols: 1,
-                },
-            )?;
-        }
-        self.project(
-            phys.ffn_down,
-            bytes_range(&self.gu_q8, q8_row(ff)?)?,
-            floats(&self.rows.act, 0, ff)?,
-            floats(&self.ffn_out, 0, h)?,
+            &self.ffn_out,
         )
     }
 

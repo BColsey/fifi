@@ -7,12 +7,14 @@
 
 use crate::EngError;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
+use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
 use crate::kernels::cuda::prefill::mmq_dense::{self, MmqDenseCall, MmqDenseInputCall};
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, RowOutputs};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 
@@ -79,6 +81,33 @@ pub(crate) struct StepIo<'a> {
     pub(crate) mmq_q8: &'a DeviceBuffer,
     /// Scratch of the batched product: its fix-up words.
     pub(crate) fixup: &'a DeviceBuffer,
+    /// Projections of Q4_K and Q6_K weights read the f32 rows and decode every weight value,
+    /// with no q8_1 step: slower, and the accuracy reference of the quantized routes.
+    pub(crate) exact: bool,
+}
+
+/// Where a projection writes: row `t` lands at `col_off` of row `t` of `dst`, whose rows are
+/// `ld` floats apart.
+#[derive(Clone, Copy)]
+pub(crate) struct Out<'b> {
+    pub(crate) dst: DeviceRange<'b>,
+    pub(crate) ld: usize,
+    pub(crate) col_off: usize,
+}
+
+impl<'b> Out<'b> {
+    /// `n` rows of `width` floats back to back at the start of `buffer`.
+    pub(crate) fn packed(
+        buffer: &'b DeviceBuffer,
+        n: usize,
+        width: usize,
+    ) -> Result<Self, EngError> {
+        Ok(Self {
+            dst: buffer.range(0, n * width * 4)?,
+            ld: width,
+            col_off: 0,
+        })
+    }
 }
 
 impl<'a> StepIo<'a> {
@@ -140,8 +169,7 @@ impl<'a> StepIo<'a> {
         self.project(self.native(name)?, x, y, n)
     }
 
-    /// `y[t] = W x[t]` for `n` rows. Up to 8 rows use the quantized matvec on the q8_1 rows;
-    /// a larger chunk with f32 rows and a row length on the 256 grid uses the batched product.
+    /// `y[t] = W x[t]` for `n` rows, written back to back into `y`.
     pub(crate) fn project(
         &self,
         weight: &NativeWeight,
@@ -149,10 +177,68 @@ impl<'a> StepIo<'a> {
         y: &DeviceBuffer,
         n: usize,
     ) -> Result<(), EngError> {
-        let (k, rows) = (weight.k(), weight.n_rows());
-        if n > 8
-            && k.is_multiple_of(256)
+        self.project_into(weight, x, n, Out::packed(y, n, weight.n_rows())?)
+    }
+
+    /// Whether `n` rows through `weight` take the batched product: a chunk of more than 8 rows,
+    /// or any chunk of several rows whose output rows are not back to back, when the weight
+    /// type and the row length allow it and the rows exist as f32.
+    fn batched(&self, weight: &NativeWeight, x: Rows<'_>, n: usize, packed: bool) -> bool {
+        (n > 8 || (n > 1 && !packed))
+            && weight.k().is_multiple_of(256)
             && mmq_dense::takes(weight.quant())
+            && x.f32.is_some()
+    }
+
+    /// `y[t] = W x[t]` for `n` rows into `out`. One row, and up to 8 rows written back to back,
+    /// use the quantized matvec on the q8_1 rows; other chunks use the batched product on the
+    /// f32 rows. With [`Self::exact`] a Q4_K or Q6_K weight takes the decoding routes.
+    pub(crate) fn project_into(
+        &self,
+        weight: &NativeWeight,
+        x: Rows<'_>,
+        n: usize,
+        out: Out<'_>,
+    ) -> Result<(), EngError> {
+        let (k, rows) = (weight.k(), weight.n_rows());
+        let span = ((n - 1) * out.ld + rows) * 4;
+        let y = out
+            .dst
+            .buffer()
+            .range(out.dst.offset() + out.col_off * 4, span)?;
+        if self.exact
+            && matches!(weight.quant(), QuantType::Q4K | QuantType::Q6K)
+            && let Some(f32_rows) = x.f32
+        {
+            if n == 1 {
+                return self.ctx.matvec_dq_native(
+                    self.stream,
+                    weight,
+                    f32_rows.range(0, k * 4)?,
+                    y,
+                );
+            }
+            let row_bytes = weight.quant().weight_bytes(1, k).ok_or_else(|| {
+                EngError::MemoryPlan("the dense projection size overflows".to_owned())
+            })?;
+            return self.ctx.gemm_dq(
+                self.stream,
+                weight.quant(),
+                GemmDqTypedCall {
+                    w: weight.buffer().range(0, rows * row_bytes)?,
+                    x: f32_rows.range(0, n * k * 4)?,
+                    y,
+                    k,
+                    rows,
+                    ncols: n,
+                    x_col_stride: k,
+                    y_col_stride: out.ld,
+                    x_f32: true,
+                },
+            );
+        }
+        let packed = out.ld == rows && out.col_off == 0;
+        if self.batched(weight, x, n, packed)
             && let Some(f32_rows) = x.f32
         {
             let q8_range = self.mmq_q8.range(0, mmq_q8_bytes(k, n)?)?;
@@ -174,20 +260,30 @@ impl<'a> StepIo<'a> {
                     w_seg: None,
                     m: n,
                     q8_1: q8_range,
-                    dst: y.range(0, n * rows * 4)?,
-                    ld: rows,
-                    col_off: 0,
+                    dst: out.dst,
+                    ld: out.ld,
+                    col_off: out.col_off,
                     fixup: Self::whole(self.fixup)?,
                 },
             );
         }
-        self.ctx.matvec_native(
-            self.stream,
-            weight,
-            x.q8.range(0, q8(k, n))?,
-            y.range(0, n * rows * 4)?,
-            n,
-        )
+        if n > 1 && !packed {
+            return Err(EngError::BadRequest(format!(
+                "{}: {n} rows through the matvec need output rows back to back",
+                self.family
+            )));
+        }
+        self.ctx
+            .matvec_native(self.stream, weight, x.q8.range(0, q8(k, n))?, y, n)
+    }
+
+    /// Whether the projection of `n` rows through `weight`, written back to back, reads the
+    /// q8_1 rows of its input.
+    pub(crate) fn reads_q8(&self, weight: &NativeWeight, x: Rows<'_>, n: usize) -> bool {
+        let exact = self.exact
+            && matches!(weight.quant(), QuantType::Q4K | QuantType::Q6K)
+            && x.f32.is_some();
+        !exact && !self.batched(weight, x, n, true)
     }
 
     /// The F16 projection `y[t] = W x[t]` of `n` f32 rows.
