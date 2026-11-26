@@ -189,11 +189,18 @@ fn mix_seal_and_add_match_the_host_stream() {
                 let out = state.mix(&ctx, &stream, blocks, first, &query, 2 * WIDTH);
                 for r in 0..rows {
                     let expected = host_mix(&sealed[r], &current[r], first, &query, 1e-6);
-                    assert_within(
-                        row(&out, 2 * r, WIDTH),
-                        &expected,
-                        &format!("rows {rows}, blocks {blocks}, first {first}, row {r}"),
-                    );
+                    let got = row(&out, 2 * r, WIDTH);
+                    if got.iter().zip(&expected).any(|(a, b)| (a - b).abs() > TOLERANCE * (1.0 + b.abs())) {
+                        let device_sealed = download(&state.sealed, &stream, state.sealed(blocks));
+                        let device_current = download(&state.current, &stream, state.plane(&state.current));
+                        eprintln!("mix device sealed {:?} host sealed {:?}; device current {:?} host current {:?}; device out {:?} expected {:?}",
+                            (0..blocks).map(|b| row(&device_sealed, b * rows + r, WIDTH)[..3].to_vec()).collect::<Vec<_>>(),
+                            sealed[r].iter().map(|s| s[..3].to_vec()).collect::<Vec<_>>(),
+                            &device_current[r * WIDTH..r * WIDTH + 3], &current[r][..3], &got[..5], &expected[..5]);
+                        let from_device = host_mix(&(0..blocks).map(|b| row(&device_sealed, b * rows + r, WIDTH).to_vec()).collect::<Vec<_>>(), &device_current[r * WIDTH..(r + 1) * WIDTH], first, &query, 1e-6);
+                        eprintln!("mix host_mix over the device rows: {:?}", &from_device[..5]);
+                        panic!("mix mismatch rows {rows} blocks {blocks} first {first} row {r}");
+                    }
                 }
                 assert_healthy(&state, &stream, "mix");
             }
@@ -464,6 +471,19 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                     eprintln!("prep {dynamic}/{history_rows} row {r}: V host {:?} device {:?}", &expected_v[r][..4], &got[value_at..value_at + 4]);
                     let plain = (0..channels).map(|c| (0..TAPS).map(|lag| if r >= lag { kernels[0][c * TAPS + TAPS - 1 - lag] * raw[r - lag][c] } else { 0.0 }).sum::<f32>() * ((TAPS + 1) as f32).sqrt().recip()).collect::<Vec<_>>();
                     eprintln!("prep {dynamic}/{history_rows} row {r}: K convolved (host, no clip) {:?}; device/head rms {:?} host/head rms {:?}", &plain[..4], (0..kv_heads).map(|h| got[key_at + h * HEAD..key_at + (h + 1) * HEAD].iter().map(|v| v * v).sum::<f32>().sqrt()).collect::<Vec<_>>(), (0..kv_heads).map(|h| plain[h * HEAD..(h + 1) * HEAD].iter().map(|v| v * v).sum::<f32>().sqrt()).collect::<Vec<_>>());
+                    if r <= 2 {
+                        for rr in 0..=2 {
+                            eprintln!("prep raw row {rr}: K {:?} V {:?}", &raw[rr][..4], &raw[rr][channels..channels + 4]);
+                        }
+                        for c in 0..4 {
+                            eprintln!("prep K kernel c{c}: {:?}; V kernel c{c}: {:?}", &kernels[0][c * TAPS..c * TAPS + TAPS], &kernels[1][c * TAPS..c * TAPS + TAPS]);
+                        }
+                        for rr in 0..=r {
+                            let conv: Vec<f32> = (0..4).map(|c| (0..TAPS).filter(|&lag| rr >= lag).map(|lag| kernels[0][c * TAPS + TAPS - 1 - lag] * raw[rr - lag][c]).sum::<f32>()).collect();
+                            let conv_v: Vec<f32> = (0..4).map(|c| (0..TAPS).filter(|&lag| rr >= lag).map(|lag| kernels[1][c * TAPS + TAPS - 1 - lag] * raw[rr - lag][channels + c]).sum::<f32>()).collect();
+                            eprintln!("prep host row {rr}: K conv {:?} + raw {:?}; V conv {:?} + raw {:?}", conv, &raw[rr][..4], conv_v, &raw[rr][channels..channels + 4]);
+                        }
+                    }
                     panic!("prep mismatch {dynamic}/{history_rows} row {r}");
                 }
             }

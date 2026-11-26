@@ -9,7 +9,7 @@ use super::*;
 use std::{env, fs, path::Path};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-use super::super::{MessageBank, TapRow};
+use super::super::{MessageBank, TapRow, rms_norm_with_scale};
 
 /// Decode steps whose logits the reference keeps, besides the last step.
 const LOGIT_STEPS: usize = 3;
@@ -143,6 +143,9 @@ fn resident_pass_parity() {
         let mut bank_state: Vec<VisitState> =
             (0..host.state.len()).map(|_| VisitState::default()).collect();
         let (mut before18, mut inputs18, mut raw18) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut control18, mut messages18, mut gains18, mut forgets18) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let rank = host.spec.core.gate_rank as usize;
         for &id in &tokens[..rows] {
             let mut stream = host.embed(id).unwrap();
             let mut taps = TapRow::new(&[], host.hidden());
@@ -158,6 +161,32 @@ fn resident_pass_parity() {
             before18.extend(stream.current().iter().map(|x| x.to_bits()));
             let inputs = host.attention_inputs(bank_visit, &bank_layer, &stream, Some(&bank)).unwrap();
             inputs18.extend(inputs.iter().flat_map(|r| r.iter().map(|x| x.to_bits())));
+            // The pieces of the controlled input, per role: the residual mix before control, the
+            // bank message, the controller's gain and forget rows.
+            for (role, name) in [Role::Query, Role::Key, Role::Value].into_iter().enumerate() {
+                let mut mixed = host.attention_input(bank_visit, &stream, role).unwrap();
+                let message = bank.stream.mix(bank.first_block, &host.control_query(bank_visit.weight_layer, name).unwrap());
+                rms_norm_with_scale(&mut mixed, MIX_EPS);
+                let mut right = message.clone();
+                rms_norm_with_scale(&mut right, MIX_EPS);
+                let mut gate = mixed;
+                gate.extend_from_slice(&right);
+                let [gain, forget] = host
+                    .weights
+                    .controller(control_names(&bank_layer, name).each_ref().map(String::as_str), &gate, [rank, host.hidden()])
+                    .unwrap();
+                for (to, row) in [
+                    &mut control18,
+                    &mut messages18,
+                    &mut gains18,
+                    &mut forgets18,
+                ]
+                .into_iter()
+                .zip([&gate[..host.hidden()], &message, &gain, &forget])
+                {
+                    to.extend(row.iter().map(|x| x.to_bits()));
+                }
+            }
             let projected = host.project_attention(&bank_layer, bank_visit.attention, &inputs).unwrap();
             raw18.extend(projected[1].iter().map(|x| x.to_bits()));
             raw18.extend(projected[2].iter().map(|x| x.to_bits()));
@@ -170,6 +199,7 @@ fn resident_pass_parity() {
                 "raw1": raw, "second": second.parity_rows(),
                 "after": after,
                 "before18": before18, "inputs18": inputs18, "raw18": raw18,
+                "normed18": control18, "messages18": messages18, "gains18": gains18, "forgets18": forgets18,
             }))
             .unwrap(),
         )
