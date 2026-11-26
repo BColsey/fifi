@@ -843,6 +843,8 @@ impl CpuForward {
                 status,
             ],
         )?;
+        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        block.dump_planes(index)?;
         let dynamic = kind == 1;
         block.context.inkling_pass_prep(
             &block.stream,
@@ -1218,6 +1220,52 @@ struct Block<'a> {
 }
 
 impl Block<'_> {
+    /// Test aid (`FIFI_INKLING_PASS_DUMP_VISIT=index:path`): before its K/V preparation, the
+    /// visit's live stream, attention input and raw K/V rows, as bits, for a host comparison.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    fn dump_planes(&self, index: usize) -> Result<(), EngError> {
+        static DUMP: std::sync::OnceLock<Option<(usize, std::path::PathBuf)>> =
+            std::sync::OnceLock::new();
+        let Some((_, path)) = DUMP
+            .get_or_init(|| {
+                let value = std::env::var("FIFI_INKLING_PASS_DUMP_VISIT").ok()?;
+                let (index, path) = value.split_once(':')?;
+                Some((index.parse().ok()?, std::path::PathBuf::from(path)))
+            })
+            .as_ref()
+            .filter(|(wanted, _)| *wanted == index)
+        else {
+            return Ok(());
+        };
+        let read = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, words: usize| {
+            let mut bytes = vec![0u8; words * WORD];
+            buffer.read_at(&self.stream, start * WORD, &mut bytes)?;
+            Ok::<_, EngError>(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let l = self.l;
+        let rows = self.rows;
+        let kind = self.visits[index].kind;
+        let value = serde_json::json!({
+            "current": read(&self.current[self.live.get()], 0, rows * self.h)?,
+            "input": read(self.arena, l.inputs, rows * self.h)?,
+            "raw": read(self.arena, l.raw[kind], rows * l.raw_stride[kind])?,
+            "side": read(self.arena, l.side[kind], rows * l.side_stride[kind])?,
+            "raw_stride": l.raw_stride[kind],
+            "side_stride": l.side_stride[kind],
+        });
+        std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
+            .map_err(|e| bad(format!("resident pass dump: {e}")))?;
+        eprintln!("Inkling resident pass dumped visit {index} before its K/V preparation");
+        Ok(())
+    }
+
     /// `Stream::add_current(row)` of the live stream.
     fn pass_add_to_current(&self, row: DeviceRange<'_>) -> Result<(), EngError> {
         let health = self.at(self.l.health, self.rows)?;
