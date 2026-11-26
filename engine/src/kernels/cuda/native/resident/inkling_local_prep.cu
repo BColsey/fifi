@@ -4,6 +4,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "resident/ordered_sum.cuh"
 
 namespace {
 constexpr int kWidth = 128, kTaps = 4;
@@ -166,10 +167,10 @@ __global__ void inkling_kv_prep_rows(KvRowsArgs a) {
     if (d == 0 && invalid) atomicOr(a.status + row, 1u);
 }
 
-__device__ float ordered_rms_scale(const float *x, int width, float eps) {
-    float squares = -0.f;
-    for (int i = 0; i < width; ++i)
-        squares = __fadd_rn(squares, __fmul_rn(x[i], x[i]));
+// The squares in element order from -0.0. `ordered_dot` issues sixteen loads and products ahead
+// of their adds, so the adding lane does not wait on a shared-memory load per add.
+__device__ float ordered_row_scale(const float *x, int width, float eps) {
+    const float squares = ordered_dot(x, x, width);
     const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(squares, float(width)), eps));
     return isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
 }
@@ -187,7 +188,7 @@ __global__ void inkling_weighted_norm(const float *input, const float *gamma,
     for (int i = lane; i < width; i += blockDim.x) staged[i] = x[i];
     __syncthreads();
     __shared__ float scale;
-    if (lane == 0) scale = ordered_rms_scale(staged, width, eps);
+    if (lane == 0) scale = ordered_row_scale(staged, width, eps);
     __syncthreads();
     bool bad = !isfinite(scale);
     for (int i = lane; i < width; i += blockDim.x) {
