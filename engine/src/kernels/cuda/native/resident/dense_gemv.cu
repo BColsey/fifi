@@ -886,16 +886,17 @@ static_assert(!q8_row_reuse_shape(kQ8 + 1, 7, 1024, 2304) &&
               !q8_row_reuse_shape(kQ8, 62, 2304, 3072) &&
               !q8_row_reuse_shape(kQ8, 65, 2304, 3072));
 
-cudaError_t current_is_sm75(bool &sm75) {
+// The Inkling tile kernels use SM75 tensor-core instructions; every newer card runs them.
+cudaError_t current_is_sm75_or_newer(bool &sm75) {
     sm75 = false;
     int device = 0, major = 0, minor = 0;
     cudaError_t err = cudaGetDevice(&device);
     if (err == cudaSuccess) {
         err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
     }
-    if (err == cudaSuccess && major == 7) {
+    if (err == cudaSuccess) {
         err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-        sm75 = err == cudaSuccess && minor == 5;
+        sm75 = err == cudaSuccess && (major > 7 || (major == 7 && minor >= 5));
     }
     return err;
 }
@@ -912,7 +913,7 @@ extern "C" int inference_cuda_inkling_ragged_pair_launch(const inference_cuda_de
     auto x=[](const inference_cuda_dense_gemv_args &i){return Span{i.x,4*(size_t(i.m-1)*i.ld_x+i.cols)};};
     size_t wb=2304*weight_row_bytes(a.weight_dtype,a.cols);
     if(!apart(y(a),y(b))||!apart(y(a),x(b))||!apart(y(b),x(a))||!apart(y(a),{b.w,wb})||!apart(y(b),{a.w,wb}))return 0;
-    bool sm75;auto err=current_is_sm75(sm75);if(err==cudaSuccess){if(!sm75)return 0;int bm=slot==0?4:slot==1 || c==42?8:16;
+    bool sm75;auto err=current_is_sm75_or_newer(sm75);if(err==cudaSuccess){if(!sm75)return 0;int bm=slot==0?4:slot==1 || c==42?8:16;
         InklingExpertGroup g{};g.calls[0]=a;g.calls[1]=b;g.ends[0]=(a.m+bm-1)/bm;g.ends[1]=g.ends[0]+(b.m+bm-1)/bm;auto s=static_cast<cudaStream_t>(stream);
 #define RAG2(C,M,R) inkling_ragged_exact<C,M,R><<<dim3(2304/(8*R),g.ends[1]),256,0,s>>>(g)
         if(c==16){if(slot==0){RAG2(16,4,2);}else if(slot==1){RAG2(16,8,2);}else{RAG2(16,16,2);}}
@@ -925,7 +926,7 @@ extern "C" int inference_cuda_inkling_down_launch(const inference_cuda_dense_gem
     if(!args || !valid(*args,stream) || args->weight_dtype!=kDtypeF32 || args->rows!=64 || args->cols!=4608)return INFERENCE_CUDA_INVALID_ARGUMENT;
     const auto a=*args;const auto s=static_cast<cudaStream_t>(stream);
     if(!aligned(a.w,16) || !aligned(a.x,16) || a.ld_x%4)return inference_cuda_dense_gemv_launch(args,stream,stage);
-    bool sm75;auto e=current_is_sm75(sm75);if(e==cudaSuccess){if(!sm75)return inference_cuda_dense_gemv_launch(args,stream,stage);
+    bool sm75;auto e=current_is_sm75_or_newer(sm75);if(e==cudaSuccess){if(!sm75)return inference_cuda_dense_gemv_launch(args,stream,stage);
         switch(a.m){case 7:case 8:case 21:inkling_f32_rank_direct<2><<<dim3(8,(a.m+1)/2),256,0,s>>>(a);break;
             case 63:case 64:inkling_f32_visit<8,1><<<dim3(8,(a.m+7)/8),256,0,s>>>(a);break;
             case 127:case 128:case 255:case 256:inkling_f32_visit<8,2><<<dim3(4,(a.m+7)/8),256,0,s>>>(a);break;
@@ -942,7 +943,7 @@ extern "C" int inference_cuda_inkling_panel_launch(const inference_cuda_dense_ge
     const size_t size=size_t(a.rows)*a.cols*2;Span tmp{scratch,size};
     if(scratch_bytes<size || !apart(tmp,{a.w,size_t(a.rows)*weight_row_bytes(a.weight_dtype,a.cols)}) ||
         !apart(tmp,{a.x,4*(size_t(a.m-1)*a.ld_x+a.cols)}) || !apart(tmp,{a.y,4*(size_t(a.m-1)*a.ld_y+a.rows)}))return 0;
-    auto s=static_cast<cudaStream_t>(stream);auto pack=static_cast<__half *>(scratch);bool sm75;auto err=current_is_sm75(sm75);
+    auto s=static_cast<cudaStream_t>(stream);auto pack=static_cast<__half *>(scratch);bool sm75;auto err=current_is_sm75_or_newer(sm75);
     if(err==cudaSuccess){if(!sm75)return 0; const int grid=a.rows*a.cols/2048;
         switch(kind){case 17:inkling_decode_panels<17,2304,256,74><<<grid,256,0,s>>>(a,pack);break;
             case 19:inkling_decode_panels<19,2304,256,50><<<grid,256,0,s>>>(a,pack);break;
@@ -977,7 +978,7 @@ extern "C" int inference_cuda_inkling_qkv_visit_launch(const inference_cuda_dens
         }
         group.a[i]=a;group.end[i]=(tiles+=a.rows/32);
     }
-    bool sm75;auto err=current_is_sm75(sm75);if(err==cudaSuccess){if(!sm75)return 0;
+    bool sm75;auto err=current_is_sm75_or_newer(sm75);if(err==cudaSuccess){if(!sm75)return 0;
         const bool prefetch=count==2 && args[0].m==8 && args[0].rows==1024 && args[1].rows==1024 &&
             aligned(args[0].x,16) && aligned(args[1].x,16) && args[0].ld_x%4==0 && args[1].ld_x%4==0;
         if(prefetch){group.end[0]*=2;group.end[1]*=2;inkling_qkv_prefetch<<<dim3(tiles*2,1),256,0,static_cast<cudaStream_t>(stream)>>>(group);}
@@ -996,7 +997,7 @@ extern "C" int inference_cuda_inkling_packed_visit_launch(const inference_cuda_d
     const bool expert=a.rows==2304 && a.cols==2304 && a.m<=16;
     if (!(attn && (codec==8 || codec==12 || codec==13 || codec==14 || codec==18)) &&
         !(expert && (codec==17 || codec==19 || codec==22))) return INFERENCE_CUDA_INVALID_ARGUMENT;
-    bool sm75; auto err=current_is_sm75(sm75);
+    bool sm75; auto err=current_is_sm75_or_newer(sm75);
     if (err==cudaSuccess && !sm75) return inference_cuda_dense_gemv_launch(args,stream,stage);
     if(err==cudaSuccess){
         const auto s=static_cast<cudaStream_t>(stream);
@@ -1045,7 +1046,7 @@ extern "C" int inference_cuda_inkling_iq2_visit_launch(const inference_cuda_dens
     if (!(codec==40 ? args->cols==1152 : (codec==17 || codec==19 || codec==22) && args->cols==2304))
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     bool sm75;
-    auto err = current_is_sm75(sm75);
+    auto err = current_is_sm75_or_newer(sm75);
     if (err == cudaSuccess) {
         if (!sm75) return inference_cuda_gguf_wmma_launch(args, stream, out_stage);
         const dim3 grid(72,(args->m+31)/32);
@@ -1276,7 +1277,7 @@ extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
         Failure failure;
         bool sm75;
         // Rust selects the stream's adapter under the dispatch guard before entering here.
-        failure.record(current_is_sm75(sm75), INFERENCE_CUDA_STAGE_LAUNCH);
+        failure.record(current_is_sm75_or_newer(sm75), INFERENCE_CUDA_STAGE_LAUNCH);
         if (!failure.ok()) {
             report_stage(out_stage, failure.stage);
             return (int)failure.err;

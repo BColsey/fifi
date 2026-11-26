@@ -804,7 +804,7 @@ impl GgufCuda {
                 && std::env::var("FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN").as_deref() == Ok("1")
                 && context
                     .device_attributes()
-                    .is_ok_and(|attrs| attrs.compute_capability == (7, 5)),
+                    .is_ok_and(|attrs| attrs.compute_capability >= (7, 5)),
             route_scratch,
             batch_streamed,
             prefill_resident,
@@ -820,14 +820,15 @@ impl GgufCuda {
                     == Ok("1")
                 && context
                     .device_attributes()
-                    .is_ok_and(|attrs| attrs.compute_capability == (7, 5)),
+                    .is_ok_and(|attrs| attrs.compute_capability >= (7, 5)),
             device_prefill_exact_tile: device_prefill
                 && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_EXACT_TILE").as_deref()
                     == Ok("1")
-                // Only SM75 has component evidence. A refused diagnostic keeps the baseline.
+                // The kernels use SM75 tensor-core instructions. A refused diagnostic keeps
+                // the baseline.
                 && context
                     .device_attributes()
-                    .is_ok_and(|attrs| attrs.compute_capability == (7, 5)),
+                    .is_ok_and(|attrs| attrs.compute_capability >= (7, 5)),
             cold_controller,
             resident,
             cache: RefCell::default(),

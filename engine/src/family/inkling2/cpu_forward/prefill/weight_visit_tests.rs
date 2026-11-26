@@ -3,7 +3,7 @@ use super::CpuForward;
 use std::{env, fs, path::Path, time::Instant};
 
 #[test]
-#[ignore = "requires the Inkling checkpoint and a leased SM75 adapter"]
+#[ignore = "requires the Inkling checkpoint and a CUDA device from SM75"]
 fn weight_visit_request() {
     let checkpoint = env::var_os("FIFI_INKLING_MODEL_DIR").expect("model path");
     let ids: Vec<u32> = env::var("FIFI_INKLING_TOKEN_IDS")

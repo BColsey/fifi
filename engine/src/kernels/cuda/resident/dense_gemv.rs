@@ -196,7 +196,7 @@ impl CudaContext {
         .map(|_| ())
     }
 
-    /// Opts measured dense attention shapes into SM75 packed weight reuse.
+    /// Opts measured dense attention shapes into packed weight reuse on SM75 and newer.
     pub(crate) fn dense_gemv_group_with_attention_reuse(
         &self,
         stream: &DeviceStream,
@@ -295,7 +295,7 @@ impl CudaContext {
             Some(rows) if self.mmq_device_facts()?.cc >= 700 => Some(rows),
             _ => None,
         };
-        let q6 = reuse.q6 && self.mmq_device_facts()?.cc == 750;
+        let q6 = reuse.q6 && self.mmq_device_facts()?.cc >= 750;
         let planned = calls
             .iter()
             .map(|call| {
@@ -488,7 +488,7 @@ mod group_tests {
             return;
         }
         let ctx = CudaContext::new().unwrap();
-        if ctx.device_attributes().unwrap().compute_capability != (7, 5) {
+        if ctx.device_attributes().unwrap().compute_capability < (7, 5) {
             return;
         }
         let stream = ctx.stream().unwrap();

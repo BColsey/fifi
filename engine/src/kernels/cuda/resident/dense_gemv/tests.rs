@@ -441,7 +441,7 @@ fn q6_attention_row_pairs_preserve_reference_bits_and_padding() {
         return;
     }
     let rig = Rig::new();
-    let sm75 = rig.ctx.mmq_device_facts().unwrap().cc == 750;
+    let pairs = rig.ctx.mmq_device_facts().unwrap().cc >= 750;
     let dtype = DenseDtype::PackedGguf(crate::weights::GgufType::Q6K);
     let w = (0..3072 * 9)
         .flat_map(|block| {
@@ -481,7 +481,7 @@ fn q6_attention_row_pairs_preserve_reference_bits_and_padding() {
             .ctx
             .dense_gemv_group_with_attention_reuse(&rig.stream, &[call(y.all())], reuse)
             .unwrap();
-        assert_eq!(counts.q6_row_pairs, usize::from(sm75 && m > 1));
+        assert_eq!(counts.q6_row_pairs, usize::from(pairs && m > 1));
         rig.stream.synchronize().unwrap();
         assert!(
             y.read(&rig.ctx, "paired y") == ordinary.read(&rig.ctx, "ordinary y"),

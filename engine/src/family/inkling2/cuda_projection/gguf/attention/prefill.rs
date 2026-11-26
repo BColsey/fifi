@@ -21,10 +21,10 @@ pub(in crate::family::inkling2) fn enabled() -> bool {
 pub(super) fn query_tiles_enabled(context: &CudaContext) -> bool {
     enabled()
         && std::env::var("FIFI_INKLING_CUDA_PREFILL_QUERY_TILES").as_deref() == Ok("1")
-        // Only SM75 has device evidence for the component.
+        // The kernels use SM75 tensor-core instructions.
         && context
             .device_attributes()
-            .is_ok_and(|attrs| attrs.compute_capability == (7, 5))
+            .is_ok_and(|attrs| attrs.compute_capability >= (7, 5))
 }
 
 pub(in crate::family::inkling2) fn device_side_enabled() -> bool {
