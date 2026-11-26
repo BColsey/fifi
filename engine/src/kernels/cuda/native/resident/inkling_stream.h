@@ -12,6 +12,10 @@
  *   softmax of the scores (the peak is subtracted first) and `out` is their weighted mean. This is
  *   `Stream::mix(first_block, query)` of the host.
  *
+ * inference_cuda_inkling_stream_mix_jobs
+ *   Up to 8 independent mixes in one launch, a block per job, each with its own state, query,
+ *   output and sealed rows. Each output has the bits of the same mix launched on its own.
+ *
  * inference_cuda_inkling_stream_seal
  *   sealed[blocks] = current * rms_scale(current), then current = next. This is `Stream::seal(next)`.
  *
@@ -45,6 +49,13 @@ int inference_cuda_inkling_stream_mix(const float *state, const float *query, fl
                                       float *health, int first_block, int blocks, int width,
                                       float eps, int rows, int stride, void *stream,
                                       int *out_stage);
+
+/* `rows` holds `state, query, out` of each of the `count` jobs and `extents` their `first_block,
+ * blocks`. Every output and `health` share no byte with any row a job reads or with each other;
+ * the jobs share `health`. */
+int inference_cuda_inkling_stream_mix_jobs(const void *const *rows, const int *extents, int count,
+                                           float *health, int width, float eps, void *stream,
+                                           int *out_stage);
 
 int inference_cuda_inkling_stream_seal(float *state, const float *next, float *health, int blocks,
                                        int width, float eps, int rows, int stride, void *stream,

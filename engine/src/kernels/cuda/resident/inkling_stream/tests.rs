@@ -3,7 +3,8 @@ use std::mem::size_of;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
 use super::{
-    AddCall, MAX_BLOCKS, MAX_NORM_ROWS, MixCall, MixShape, NormCall, SealCall, States, StreamShape,
+    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MixCall, MixJob, MixShape, NormCall,
+    SealCall, States, StreamShape,
 };
 
 const EPS: f32 = 1e-5;
@@ -780,4 +781,137 @@ fn norm_rows_match_one_row_each_bit_for_bit() {
         dst: dst.range(0, row).unwrap(),
         health: src.range(0, word).unwrap(),
     }]));
+}
+
+/// The mixes of a visit in one launch: four queries on one state (the bank) and one on another
+/// (the depth), each output the bits of its own single launch; then the refusals.
+#[test]
+fn mix_jobs_match_one_launch_each_bit_for_bit() {
+    if !device_present("Inkling stream mix jobs") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut rng = Rng::new(0x0b10_c4ed);
+    let width = 2304usize;
+    let row = row_bytes(width);
+    let alloc = |words: usize| ctx.allocate(words * size_of::<f32>()).unwrap();
+    // (state blocks, first block) of each job: four on the bank state, one on the depth state.
+    let (bank_blocks, depth_blocks) = (5usize, 7usize);
+    let extents = [
+        (bank_blocks, 2),
+        (bank_blocks, 2),
+        (bank_blocks, 2),
+        (bank_blocks, 2),
+    ]
+    .into_iter()
+    .chain([(depth_blocks, 0)])
+    .collect::<Vec<_>>();
+    let bank: Vec<f32> = (0..=bank_blocks)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let depth: Vec<f32> = (0..=depth_blocks)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let queries: Vec<f32> = (0..extents.len())
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let (bank_state, depth_state) = (alloc(bank.len()), alloc(depth.len()));
+    let (query, out, one, health) = (
+        alloc(queries.len()),
+        alloc(extents.len() * width),
+        alloc(width),
+        alloc(1),
+    );
+    upload(&bank_state, &stream, &bank);
+    upload(&depth_state, &stream, &depth);
+    upload(&query, &stream, &queries);
+    upload(&health, &stream, &[0.0]);
+    let state_of = |j: usize| {
+        let (blocks, _) = extents[j];
+        let buffer = if j < 4 { &bank_state } else { &depth_state };
+        buffer.range(0, (blocks + 1) * row).unwrap()
+    };
+    let jobs: Vec<MixJob<'_>> = extents
+        .iter()
+        .enumerate()
+        .map(|(j, &(blocks, first_block))| MixJob {
+            state: state_of(j),
+            query: query.range(j * row, row).unwrap(),
+            out: out.range(j * row, row).unwrap(),
+            first_block,
+            blocks,
+        })
+        .collect();
+    let health_range = health.range(0, 4).unwrap();
+    ctx.inkling_stream_mix_jobs(&stream, &jobs, &health_range, (width, EPS))
+        .unwrap();
+    let together = download(&out, &stream, 0, extents.len() * width);
+    for (j, &(blocks, first_block)) in extents.iter().enumerate() {
+        ctx.inkling_stream_mix(
+            &stream,
+            MixCall {
+                state: state_of(j),
+                query: query.range(j * row, row).unwrap(),
+                out: one.range(0, row).unwrap(),
+                health: health.range(0, 4).unwrap(),
+            },
+            MixShape {
+                first_block,
+                blocks,
+                width,
+                eps: EPS,
+            },
+        )
+        .unwrap();
+        let alone = download(&one, &stream, 0, width);
+        let same = together[j * width..][..width]
+            .iter()
+            .zip(&alone)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "job {j} differs from its own launch");
+    }
+    assert_eq!(download(&health, &stream, 0, 1)[0].to_bits(), 0);
+    // Refusals: no jobs, too many jobs, one output twice, an output on a read state.
+    let refused = |jobs: &[MixJob<'_>]| {
+        ctx.inkling_stream_mix_jobs(&stream, jobs, &health_range, (width, EPS))
+            .is_err()
+    };
+    assert!(refused(&[]));
+    let many: Vec<MixJob<'_>> = (0..=MAX_MIX_JOBS)
+        .map(|_| MixJob {
+            state: state_of(0),
+            query: query.range(0, row).unwrap(),
+            out: one.range(0, row).unwrap(),
+            first_block: 0,
+            blocks: bank_blocks,
+        })
+        .collect();
+    assert!(refused(&many));
+    assert!(refused(&many[..2]));
+    let onto_state = [
+        MixJob {
+            state: state_of(4),
+            query: query.range(0, row).unwrap(),
+            out: bank_state.range(0, row).unwrap(),
+            first_block: 0,
+            blocks: depth_blocks,
+        },
+        MixJob {
+            state: state_of(0),
+            query: query.range(row, row).unwrap(),
+            out: one.range(0, row).unwrap(),
+            first_block: 0,
+            blocks: bank_blocks,
+        },
+    ];
+    assert!(refused(&onto_state));
+    let wide = [MixJob {
+        state: state_of(4),
+        query: query.range(0, row).unwrap(),
+        out: one.range(0, row).unwrap(),
+        first_block: 0,
+        blocks: MAX_BLOCKS + 1,
+    }];
+    assert!(refused(&wide));
 }

@@ -28,6 +28,17 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
+    fn inference_cuda_inkling_stream_mix_jobs(
+        rows: *const *const c_void,
+        extents: *const c_int,
+        count: c_int,
+        health: *mut c_void,
+        width: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
     fn inference_cuda_inkling_stream_seal(
         state: *mut c_void,
         next: *const c_void,
@@ -191,6 +202,88 @@ pub(in crate::kernels::cuda) fn mix(
             eps,
             states.rows as c_int,
             states.stride as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// Largest number of jobs of one [`mix_jobs`] launch.
+pub(crate) const MAX_MIX_JOBS: usize = 8;
+
+/// One job of [`mix_jobs`]: a state of `blocks + 1` rows, its query and its output row.
+pub(in crate::kernels::cuda) struct MixJobRaw<'a> {
+    pub(in crate::kernels::cuda) state: RawRange<'a>,
+    pub(in crate::kernels::cuda) query: RawRange<'a>,
+    pub(in crate::kernels::cuda) out: RawRange<'a>,
+    pub(in crate::kernels::cuda) first_block: usize,
+    pub(in crate::kernels::cuda) blocks: usize,
+}
+
+/// [`mix`] of each job in one launch, a block per job; the jobs share `health`. Every output and
+/// `health` share no byte with a row any job reads or with each other.
+pub(in crate::kernels::cuda) fn mix_jobs(
+    stream: &RawStream,
+    jobs: &[MixJobRaw<'_>],
+    health: RawRange<'_>,
+    (width, eps): (usize, f32),
+) -> Result<(), DeviceFailure> {
+    let row = width * size_of::<f32>();
+    let health_bytes = size_of::<f32>();
+    if !(1..=MAX_MIX_JOBS).contains(&jobs.len()) || !sized(&health, health_bytes) {
+        return Err(invalid_argument());
+    }
+    let mut reads = Vec::with_capacity(2 * jobs.len());
+    let mut writes = vec![Span::of(&health, health_bytes)];
+    for job in jobs {
+        if !(job.first_block <= job.blocks && shape(job.blocks, width, eps)) {
+            return Err(invalid_argument());
+        }
+        let state_bytes = (job.blocks + 1) * row;
+        if !(sized(&job.state, state_bytes) && sized(&job.query, row) && sized(&job.out, row)) {
+            return Err(invalid_argument());
+        }
+        let (state, query) = (Span::of(&job.state, state_bytes), Span::of(&job.query, row));
+        if !state.apart(&query) {
+            return Err(invalid_argument());
+        }
+        reads.extend([state, query]);
+        writes.push(Span::of(&job.out, row));
+    }
+    let apart = writes.iter().enumerate().all(|(at, write)| {
+        reads.iter().all(|read| write.apart(read))
+            && writes[at + 1..].iter().all(|other| write.apart(other))
+    });
+    if !apart {
+        return Err(invalid_argument());
+    }
+    let rows: Vec<*const c_void> = jobs
+        .iter()
+        .flat_map(|job| {
+            [
+                job.state.address() as *const c_void,
+                job.query.address() as *const c_void,
+                job.out.address() as *const c_void,
+            ]
+        })
+        .collect();
+    let extents: Vec<c_int> = jobs
+        .iter()
+        .flat_map(|job| [job.first_block as c_int, job.blocks as c_int])
+        .collect();
+    let mut stage = STAGE_NONE;
+    // SAFETY: each job's ranges are aligned and hold the extents above; the outputs and the
+    // health word share no byte with a read row or with each other. The C entry copies both
+    // lists into the kernel's parameters before it returns.
+    let status = unsafe {
+        inference_cuda_inkling_stream_mix_jobs(
+            rows.as_ptr(),
+            extents.as_ptr(),
+            jobs.len() as c_int,
+            health.address(),
+            width as c_int,
+            eps,
             stream.0.as_ptr(),
             &mut stage,
         )

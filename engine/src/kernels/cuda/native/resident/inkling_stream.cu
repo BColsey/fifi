@@ -112,11 +112,11 @@ constexpr int kScoreLoads = 16;
 constexpr int kChannelLoads = 9;
 constexpr int kSquareLoads = 9;
 
-__global__ void inkling_stream_mix(const float *state, const float *query, float *out,
-                                   float *health, int first_block, int blocks, int width,
-                                   float eps, int stride) {
-    state += static_cast<size_t>(blockIdx.x) * stride * width;
-    out += static_cast<size_t>(blockIdx.x) * width;
+// One block's mix: the body of `inkling_stream_mix` (a block per state) and of each job of
+// `inkling_stream_mix_jobs` (a block per job), so both give the same bits.
+__device__ __forceinline__ void mix_one(const float *state, const float *query, float *out,
+                                        float *health, int first_block, int blocks, int width,
+                                        float eps) {
     __shared__ float scratch[threads];
     __shared__ float scores[max_rows];
     __shared__ float weights[max_rows];
@@ -239,6 +239,32 @@ __global__ void inkling_stream_mix(const float *state, const float *query, float
         invalid |= !isfinite(value);
     }
     report(health, invalid);
+}
+
+__global__ void inkling_stream_mix(const float *state, const float *query, float *out,
+                                   float *health, int first_block, int blocks, int width,
+                                   float eps, int stride) {
+    mix_one(state + static_cast<size_t>(blockIdx.x) * stride * width, query,
+            out + static_cast<size_t>(blockIdx.x) * width, health, first_block, blocks, width, eps);
+}
+
+// Independent mixes in one launch, a block per job: the bank queries and the attention query of
+// a visit read different stream states, so they need not wait on each other. The lists travel
+// in the kernel's parameter space; only the row pointers address device memory.
+constexpr int max_mix_jobs = 8;
+
+struct MixJobs {
+    const float *state[max_mix_jobs];
+    const float *query[max_mix_jobs];
+    float *out[max_mix_jobs];
+    int first_block[max_mix_jobs];
+    int blocks[max_mix_jobs];
+};
+
+__global__ void inkling_stream_mix_jobs(MixJobs jobs, float *health, int width, float eps) {
+    const int j = blockIdx.x;
+    mix_one(jobs.state[j], jobs.query[j], jobs.out[j], health, jobs.first_block[j], jobs.blocks[j],
+            width, eps);
 }
 
 __global__ void inkling_stream_seal(float *state, const float *next, float *health, int blocks,
@@ -485,6 +511,57 @@ extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float
     }
     inkling_stream_mix<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         state, query, out, health, first_block, blocks, width, eps, stride);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return static_cast<int>(failure.err);
+}
+
+extern "C" int inference_cuda_inkling_stream_mix_jobs(const void *const *rows, const int *extents,
+                                                      int count, float *health, int width,
+                                                      float eps, void *stream, int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    // `rows` holds `state, query, out` per job and `extents` holds `first_block, blocks`.
+    if (!rows || !extents || !health || !stream || count < 1 || count > max_mix_jobs ||
+        !aligned(health) || !valid_shape(width, eps)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const size_t row = static_cast<size_t>(width) * sizeof(float);
+    MixJobs jobs{};
+    for (int j = 0; j < count; ++j) {
+        const float *state = static_cast<const float *>(rows[3 * j]);
+        const float *query = static_cast<const float *>(rows[3 * j + 1]);
+        float *out = static_cast<float *>(const_cast<void *>(rows[3 * j + 2]));
+        const int first_block = extents[2 * j], blocks = extents[2 * j + 1];
+        if (!state || !query || !out || !aligned(state) || !aligned(query) || !aligned(out) ||
+            first_block < 0 || blocks < first_block || blocks > max_blocks) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        jobs.state[j] = state;
+        jobs.query[j] = query;
+        jobs.out[j] = out;
+        jobs.first_block[j] = first_block;
+        jobs.blocks[j] = blocks;
+    }
+    // Every output and the health word are apart from every row a job reads and from each other.
+    for (int j = 0; j < count; ++j) {
+        const size_t state_bytes = static_cast<size_t>(jobs.blocks[j] + 1) * row;
+        if (overlaps(health, sizeof(float), jobs.state[j], state_bytes) ||
+            overlaps(health, sizeof(float), jobs.query[j], row) ||
+            overlaps(health, sizeof(float), jobs.out[j], row)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        for (int k = 0; k < count; ++k) {
+            const size_t read_bytes = static_cast<size_t>(jobs.blocks[k] + 1) * row;
+            if (overlaps(jobs.out[j], row, jobs.state[k], read_bytes) ||
+                overlaps(jobs.out[j], row, jobs.query[k], row) ||
+                (k != j && overlaps(jobs.out[j], row, jobs.out[k], row))) {
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
+    }
+    inkling_stream_mix_jobs<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        jobs, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

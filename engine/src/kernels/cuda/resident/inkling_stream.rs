@@ -18,7 +18,7 @@ use crate::kernels::cuda::{
 
 use super::super::native::resident::inkling_stream::{self as native};
 pub(crate) use super::super::native::resident::inkling_stream::{
-    MAX_BLOCKS, MAX_NORM_ROWS, MAX_ORDERED_WIDTH, MAX_STATES, States,
+    MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_ORDERED_WIDTH, MAX_STATES, States,
 };
 
 const MAX_WIDTH: usize = 8192;
@@ -29,6 +29,16 @@ pub(crate) struct MixCall<'a> {
     pub(crate) query: DeviceRange<'a>,
     pub(crate) out: DeviceRange<'a>,
     pub(crate) health: DeviceRange<'a>,
+}
+
+/// One mix of [`CudaContext::inkling_stream_mix_jobs`]: a state of `blocks + 1` rows whose
+/// sealed rows `first_block..blocks` join the mix, its query and its output row.
+pub(crate) struct MixJob<'a> {
+    pub(crate) state: DeviceRange<'a>,
+    pub(crate) query: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) first_block: usize,
+    pub(crate) blocks: usize,
 }
 
 /// The sealed rows `first_block..blocks` join the mix, newest first; the current row comes last.
@@ -158,6 +168,63 @@ impl CudaContext {
         shape: MixShape,
     ) -> Result<(), EngError> {
         self.inkling_stream_mix_states(stream, call, shape, States::one(shape.blocks + 1))
+    }
+
+    /// [`Self::inkling_stream_mix`] of independent jobs in one launch, a block per job: each
+    /// output has the bits of its own mix. The jobs share `health`; several may read one state.
+    pub(crate) fn inkling_stream_mix_jobs(
+        &self,
+        stream: &DeviceStream,
+        jobs: &[MixJob<'_>],
+        health: &DeviceRange<'_>,
+        (width, eps): (usize, f32),
+    ) -> Result<(), EngError> {
+        if !(1..=MAX_MIX_JOBS).contains(&jobs.len()) {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling stream mix takes 1 to {MAX_MIX_JOBS} jobs per launch, got {}",
+                jobs.len()
+            )));
+        }
+        let row = width * size_of::<f32>();
+        let health_bytes = size_of::<f32>();
+        check_row("Inkling stream health", health, health_bytes)?;
+        let mut reads = Vec::with_capacity(2 * jobs.len());
+        for job in jobs {
+            check_shape("mix", job.first_block, job.blocks, width, eps)?;
+            let state = (job.blocks + 1) * row;
+            check_row("Inkling stream state", &job.state, state)?;
+            check_row("Inkling stream query", &job.query, row)?;
+            check_row("Inkling stream mix output", &job.out, row)?;
+            let state = Claim::of("Inkling stream state", &job.state, state);
+            let query = Claim::of("Inkling stream query", &job.query, row);
+            require_apart(&state, &query)?;
+            reads.extend([state, query]);
+        }
+        let mut writes = vec![Claim::of("Inkling stream health", health, health_bytes)];
+        writes.extend(
+            jobs.iter()
+                .map(|job| Claim::of("Inkling stream mix output", &job.out, row)),
+        );
+        for (at, write) in writes.iter().enumerate() {
+            for other in reads.iter().chain(&writes[at + 1..]) {
+                require_apart(write, other)?;
+            }
+        }
+        self.ensure_usable()?;
+        let raw = jobs
+            .iter()
+            .map(|job| {
+                Ok(native::MixJobRaw {
+                    state: self.raw_range(&job.state)?,
+                    query: self.raw_range(&job.query)?,
+                    out: self.raw_range(&job.out)?,
+                    first_block: job.first_block,
+                    blocks: job.blocks,
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        let health = self.raw_range(health)?;
+        self.launch_on(stream, |s| native::mix_jobs(s, &raw, health, (width, eps)))
     }
 
     /// [`Self::inkling_stream_mix`] of each of `states`, the outputs packed one row apart.
