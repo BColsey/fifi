@@ -440,7 +440,7 @@ impl CudaContext {
             ));
         }
         let parts = [
-            Part { name: "Inkling pass tails source", range: source, bytes: ((rows - 1) * stride + 1) * row, writer: false },
+            Part { name: "Inkling pass tails source", range: source, bytes: ((rows - 1) * stride + width) * WORD, writer: false },
             Part { name: "Inkling pass tails old", range: old, bytes: (TAPS - 1) * row, writer: false },
             Part { name: "Inkling pass tails output", range: out, bytes: (TAPS - 1) * row, writer: true },
         ];
