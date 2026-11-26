@@ -52,6 +52,19 @@ pub(crate) fn raw<'a>(
     }
 }
 
+/// Width from which one row's norm takes the wide block.
+const WIDE_NORM: usize = 4096;
+
+/// One RMS norm: rows of `d` values at `x`, plus the rows at `delta` when given, scaled by
+/// `weight`. With `delta`, the sum also lands back in `x`.
+pub(crate) struct Norm<'a> {
+    pub(crate) d: usize,
+    pub(crate) eps: f32,
+    pub(crate) x: DeviceRange<'a>,
+    pub(crate) delta: Option<DeviceRange<'a>>,
+    pub(crate) weight: DeviceRange<'a>,
+}
+
 /// The activation rows a projection reads: q8_1 rows for the quantized matvec and, when the
 /// producer wrote them, the f32 rows for the batched matrix product.
 #[derive(Clone, Copy)]
@@ -129,8 +142,34 @@ impl<'a> StepIo<'a> {
         buffer.range(0, buffer.bytes())
     }
 
-    /// RMS norm of `n` rows of `d` values scaled by `weight`: the f32 rows into `y` and the
-    /// q8_1 rows into `q8_out`, through the shared fused norm and quantize kernel.
+    /// The norm of `n` rows: the f32 rows into `y` and their q8_1 rows into `q8_out`, through the
+    /// fused add, norm and quantize kernel. One wide row takes the kernel's 1024-thread block,
+    /// which sums the squares in another order than the 256-thread block of every other call.
+    pub(crate) fn norm(
+        &self,
+        n: usize,
+        norm: Norm<'_>,
+        y: DeviceRange<'_>,
+        q8_out: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let wide = n == 1 && norm.d >= WIDE_NORM;
+        let call = AddNormQ8Call {
+            n: norm.d,
+            eps: norm.eps,
+            h: norm.x,
+            delta: norm.delta,
+            weight: norm.weight,
+            norm_out: y,
+            q8: q8_out,
+            rows: n,
+        };
+        if wide {
+            return self.ctx.add_rmsnorm_q8_wide(self.stream, call);
+        }
+        self.ctx.add_rmsnorm_q8(self.stream, call)
+    }
+
+    /// [`Self::norm`] of whole buffers with no added rows.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn norm_rows(
         &self,
@@ -142,19 +181,15 @@ impl<'a> StepIo<'a> {
         y: &DeviceBuffer,
         q8_out: &DeviceBuffer,
     ) -> Result<(), EngError> {
-        self.ctx.add_rmsnorm_q8(
-            self.stream,
-            AddNormQ8Call {
-                n: d,
-                eps,
-                h: x.range(0, n * d * 4)?,
-                delta: None,
-                weight,
-                norm_out: y.range(0, n * d * 4)?,
-                q8: q8_out.range(0, q8(d, n))?,
-                rows: n,
-            },
-        )
+        let x = x.range(0, n * d * 4)?;
+        let norm = Norm {
+            d,
+            eps,
+            x,
+            delta: None,
+            weight,
+        };
+        self.norm(n, norm, y.range(0, n * d * 4)?, q8_out.range(0, q8(d, n))?)
     }
 
     /// `y[t] = W x[t]` for `n` rows of the tensor `name`: [`Self::project`] on the resident

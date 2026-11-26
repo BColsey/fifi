@@ -23,9 +23,8 @@ use std::{iter::once, rc::Rc};
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
-use crate::family::step::ffn;
 use crate::family::step::rows::{Out as StepOut, Rows as StepRows};
-use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
+use crate::family::step::{ffn, site};
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
 use crate::kernels::cuda::resident::attn_decode_loop::{
     AttnDecodeLoopCall, AttnLoopShape, attn_loop_part_bytes,
@@ -35,11 +34,7 @@ use crate::kernels::cuda::resident::attn_prep::{
 };
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::gdn_delta::{DeltaCall, DeltaShape, DeltaWeights, GDN_EPS};
-use crate::kernels::cuda::resident::mhc_route::{MhcAverageCall, MhcMergeCall, MhcRouteCall};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
-use crate::kernels::cuda::resident::router::{RouterLogitsCall, RouterShape};
-use crate::kernels::cuda::resident::row_add::RowAddCall;
-use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, STEP_PARAMS_BYTES, StepParams, ensure_rows,
 };
@@ -399,19 +394,17 @@ impl<'a> LoopStep<'a> {
             let p = self.plan.physical(il);
             let mhc = self.plan.mhc_active(il);
             if mhc && p == self.plan.mhc_start {
-                self.streams_from_cur()?;
+                self.routed(false)
+                    .fork(&self.io(self.dq), &self.resid[self.cur_ix], 1)?;
             }
             if mhc {
-                self.route(p, "hc_attn_fn")?;
+                self.route(p, "hc_attn_fn", 1, false)?;
                 // The branch consumes the routed input the router just wrote, normed
                 // with this layer's attn_norm (the CPU's rms_plain(r.input, attn_norm)).
-                self.norm_and_q8(
-                    floats(&self.router_normed, 0, h)?,
-                    None,
-                    self.phys[p].attn_norm,
-                )?;
+                let routed = floats(&self.router_normed, 0, h)?;
+                self.norm_site(routed, None, self.phys[p].attn_norm, 1, false)?;
             } else {
-                self.norm_and_q8(self.resid_range()?, None, self.phys[p].attn_norm)?;
+                self.norm_site(self.resid_range()?, None, self.phys[p].attn_norm, 1, false)?;
             }
             self.branch(il)?;
             if let Some(trace) = trace.as_deref_mut() {
@@ -430,49 +423,37 @@ impl<'a> LoopStep<'a> {
                 );
             }
             if mhc {
-                self.merge_streams(false)?;
-                self.route(p, "hc_ffn_fn")?;
+                self.routed(false)
+                    .merge(&self.io(self.dq), &self.branch, 1)?;
+                self.route(p, "hc_ffn_fn", 1, false)?;
                 // The ffn norm reads the routed input the second router wrote.
-                self.norm_and_q8(
-                    floats(&self.router_normed, 0, self.shape.hidden)?,
-                    None,
-                    self.phys[p].post_norm,
-                )?;
+                let routed = floats(&self.router_normed, 0, h)?;
+                self.norm_site(routed, None, self.phys[p].post_norm, 1, false)?;
                 self.ffn(p)?;
-                self.merge_streams(true)?;
-                let h = self.shape.hidden;
-                self.ctx.mhc_average(
-                    &self.stream,
-                    MhcAverageCall {
-                        hidden: h,
-                        rows: 1,
-                        ld_ab: 2 * h,
-                        a: floats(&self.streams, 0, h)?,
-                        b: floats(&self.streams, h, h)?,
-                        out: self.resid_range()?,
-                    },
-                )?;
+                self.routed(false)
+                    .merge(&self.io(self.dq), &self.ffn_out, 1)?;
+                self.routed(false)
+                    .mean(&self.io(self.dq), self.resid_range()?, 1)?;
             } else {
                 // Fused residual add and post norm: the branch lands in the residual.
-                self.norm_and_q8(
+                let branch = Some(floats(&self.branch, 0, h)?);
+                self.norm_site(
                     self.resid_range()?,
-                    Some(floats(&self.branch, 0, h)?),
+                    branch,
                     self.phys[p].post_norm,
+                    1,
+                    false,
                 )?;
                 self.ffn(p)?;
-                // row_add writes a distinct out: rotate the residual pair. The read
+                // The add writes a distinct out: rotate the residual pair. The read
                 // plane is the CURRENT residual, not the step's starting plane.
                 let next = self.cur_ix ^ 1;
-                self.ctx.row_add(
-                    &self.stream,
-                    RowAddCall {
-                        out: floats(&self.resid[next], 0, h)?,
-                        x: floats(&self.resid[self.cur_ix], 0, h)?,
-                        y: floats(&self.ffn_out, 0, h)?,
-                        n: h,
-                        flag: None,
-                        fused: false,
-                    },
+                site::add(
+                    &self.io(self.dq),
+                    floats(&self.resid[next], 0, h)?,
+                    self.resid_range()?,
+                    floats(&self.ffn_out, 0, h)?,
+                    h,
                 )?;
                 self.cur_ix = next;
             }
@@ -495,7 +476,7 @@ impl<'a> LoopStep<'a> {
 
         // The output norm and the head.
         let h = self.shape.hidden;
-        self.norm_and_q8(self.resid_range()?, None, self.output_norm)?;
+        self.norm_site(self.resid_range()?, None, self.output_norm, 1, false)?;
         self.project(
             self.head,
             bytes_range(&self.norm_q8, q8_row(h)?)?,
@@ -706,135 +687,6 @@ impl<'a> LoopStep<'a> {
 
     fn resid_range(&self) -> Result<DeviceRange<'_>, EngError> {
         floats(&self.resid[self.cur_ix], 0, self.shape.hidden)
-    }
-
-    fn streams_from_cur(&mut self) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        let cur = self.resid_range()?;
-        // Two copies of cur into the streams (row_scale with 1.0 is the copy).
-        self.ctx.row_scale(
-            &self.stream,
-            RowScaleCall {
-                out: floats(&self.streams, 0, h)?,
-                x: cur,
-                scale: 1.0,
-                m: 1,
-                n: h,
-            },
-        )?;
-        self.ctx.row_scale(
-            &self.stream,
-            RowScaleCall {
-                out: floats(&self.streams, h, h)?,
-                x: cur,
-                scale: 1.0,
-                m: 1,
-                n: h,
-            },
-        )
-    }
-
-    /// One router pass: the unit-RMS norm of `[a || b]` fused with its q8 quantize, the
-    /// router matvec, and the routing kernel (the bias folds into the logits there).
-    fn route(&mut self, p: usize, part: &str) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        let stem = format!("blk.{}", self.plan.block(p));
-        let weight = side(self.weights, &format!("{stem}.{part}.weight"))?;
-        let bias = side(self.weights, &format!("{stem}.{part}.bias"))?;
-        self.ctx.add_rmsnorm_q8_wide(
-            &self.stream,
-            AddNormQ8Call {
-                n: 2 * h,
-                eps: self.shape.eps,
-                h: floats(&self.streams, 0, 2 * h)?,
-                delta: None,
-                weight: floats(&self.ones_router, 0, 2 * h)?,
-                norm_out: floats(&self.router_normed, 0, 2 * h)?,
-                q8: bytes_range(&self.router_q8, q8_row(2 * h)?)?,
-                rows: 1,
-            },
-        )?;
-        // The router matrix is a raw F32 tensor: the split router dot reads it as stored,
-        // no quantize and no new kernel (the bias folds into the logits inside mhc_route).
-        self.ctx.router_logits_rows(
-            &self.stream,
-            RouterLogitsCall {
-                shape: RouterShape {
-                    m: 1,
-                    hidden: 2 * h,
-                    n_expert: 8,
-                    top_k: 1,
-                },
-                x: floats(&self.router_normed, 0, 2 * h)?,
-                w: floats(weight, 0, 8 * 2 * h)?,
-                logits: floats(&self.router_logits, 0, 8)?,
-            },
-        )?;
-        self.ctx.mhc_route(
-            &self.stream,
-            MhcRouteCall {
-                hidden: h,
-                rows: 1,
-                ld_ab: 2 * h,
-                pre_scale: self.plan.mhc_pre_scale,
-                iterations: self.plan.mhc_iterations,
-                fixed_identity: self.plan.mhc_fixed_identity,
-                logits: floats(&self.router_logits, 0, 8)?,
-                bias: Some(floats(bias, 0, 8)?),
-                a: floats(&self.streams, 0, h)?,
-                b: floats(&self.streams, h, h)?,
-                // The routed input takes the router-normed row's first half (scratch the
-                // second half was for); a dedicated buffer is not needed.
-                input: floats(&self.router_normed, 0, h)?,
-                route: floats(&self.route_cell, 0, 6)?,
-            },
-        )
-    }
-
-    /// One merge of both streams with a branch output: `ffn` picks the branch row
-    /// (the mixer's `branch` or `ffn_out`).
-    fn merge_streams(&mut self, ffn: bool) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        let branch = if ffn {
-            floats(&self.ffn_out, 0, h)?
-        } else {
-            floats(&self.branch, 0, h)?
-        };
-        self.ctx.mhc_merge(
-            &self.stream,
-            MhcMergeCall {
-                hidden: h,
-                rows: 1,
-                ld_ab: 2 * h,
-                a: floats(&self.streams, 0, h)?,
-                b: floats(&self.streams, h, h)?,
-                branch,
-                route: floats(&self.route_cell, 0, 6)?,
-            },
-        )
-    }
-
-    /// The fused add (optional), RMSNorm and q8 quantize of one row into `norm_q8`.
-    fn norm_and_q8(
-        &self,
-        row: DeviceRange<'_>,
-        delta: Option<DeviceRange<'_>>,
-        weight: &DeviceBuffer,
-    ) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        self.ctx.add_rmsnorm_q8_wide(
-            &self.stream,
-            AddNormQ8Call {
-                n: h,
-                eps: self.shape.eps,
-                h: row,
-                delta,
-                weight: floats(weight, 0, h)?,
-                norm_out: floats(&self.norm_out, 0, h)?,
-                q8: bytes_range(&self.norm_q8, q8_row(h)?)?,
-                rows: 1,
-            },
-        )
     }
 
     /// One projection of one row: through the matvec over the row's q8_1 bytes, or on the dq

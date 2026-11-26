@@ -6,11 +6,13 @@
 //! of a feed, the bounds and the head rows. [`rows`] holds the activation rows a projection reads
 //! and the projections themselves, chosen by the type of each weight tensor.
 //!
-//! [`ffn`] holds the gated feed-forward block over those projections.
+//! [`ffn`] holds the gated feed-forward block over those projections, and [`site`] the residual
+//! sites: the plain add and the routed two-stream site.
 //!
 //! A model supplies its layers (the mixer and the feed-forward of each visit) and its weights by
 //! name.
 
 pub(crate) mod ffn;
 pub(crate) mod rows;
+pub(crate) mod site;
 pub(crate) mod walk;

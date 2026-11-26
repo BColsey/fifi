@@ -12,8 +12,8 @@
 //! last row.
 
 use super::*;
-use crate::family::step::ffn;
-use crate::family::step::rows::{Out as StepOut, Rows as StepRows, StepIo};
+use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
+use crate::family::step::{ffn, site};
 use crate::kernels::cuda::prefill::attn_prefill::{
     AttnKvStorage, AttnPrefillCall, AttnPrefillShape, CPF_ATTN_PART_CAP, CPF_ATTN_Q_TILE,
     CpfAttnGeometry, CpfAttnSpan, CpfAttnSplit, cpf_attn_launch_plan,
@@ -29,7 +29,6 @@ use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
-use crate::kernels::cuda::resident::pack_rows::{PackRowsCall, PackSegment};
 
 /// Rows of one chunk. The mmq chunk cap is 4096; at 1024 the attention partials fit three
 /// splits under the 64 MiB part cap, and `row_add` takes a whole chunk's residual add in one
@@ -38,9 +37,6 @@ pub(crate) const PREFILL_ROWS: usize = 1024;
 
 /// `row_add`'s float limit per launch.
 const ROW_ADD_MAX: usize = 4_194_304;
-
-/// `pack_rows`' row limit per launch.
-const PACK_ROWS: usize = 16;
 
 /// `FIFI_SENSENOVA_PREFILL_GEMM=dq` puts every Q4_K/Q6_K projection on the dequantizing GEMM
 /// (f32 activations, no q8_1 step): 4.8x slower than MMQ at 1024 rows (305 against 1490
@@ -181,11 +177,8 @@ impl LoopStep<'_> {
             self.walk(&le_f32(rows), m, p0 + chunk * PREFILL_ROWS)?;
         }
         // The output norm and the head, on the last row.
-        self.norm_and_q8(
-            floats(&self.rows.resid[self.rows.cur_ix], (m - 1) * h, h)?,
-            None,
-            self.output_norm,
-        )?;
+        let last = floats(&self.rows.resid[self.rows.cur_ix], (m - 1) * h, h)?;
+        self.norm_site(last, None, self.output_norm, 1, false)?;
         self.ctx.matvec_native(
             &self.stream,
             self.head,
@@ -206,63 +199,49 @@ impl LoopStep<'_> {
             let p = self.plan.physical(il);
             let mhc = self.plan.mhc_active(il);
             if mhc && p == self.plan.mhc_start {
-                self.pack_streams(m)?;
+                self.routed(true)
+                    .fork(&self.io(false), &self.rows.resid[self.rows.cur_ix], m)?;
             }
             if mhc {
-                self.route_chunk(p, "hc_attn_fn", m)?;
+                self.route(p, "hc_attn_fn", m, true)?;
                 // The branch consumes the routed input, normed with this layer's attn_norm.
                 let routed = floats(&self.rows.routed, 0, m * h)?;
-                self.norm_chunk(routed, None, self.phys[p].attn_norm, m)?;
+                self.norm_site(routed, None, self.phys[p].attn_norm, m, true)?;
             } else {
                 let cur = self.resid_rows(m)?;
-                self.norm_chunk(cur, None, self.phys[p].attn_norm, m)?;
+                self.norm_site(cur, None, self.phys[p].attn_norm, m, true)?;
             }
             match &self.phys[p].mixer {
                 Mixer::Delta { .. } => self.gdn_chunk(il, p, m, p0)?,
                 Mixer::Attn { .. } => self.attn_chunk(il, p, m, p0)?,
             }
             if mhc {
-                self.merge_chunk(m, false)?;
-                self.route_chunk(p, "hc_ffn_fn", m)?;
+                self.routed(true)
+                    .merge(&self.io(false), &self.rows.mix_out, m)?;
+                self.route(p, "hc_ffn_fn", m, true)?;
                 // The ffn norm reads the routed input the second router wrote.
                 let routed = floats(&self.rows.routed, 0, m * h)?;
-                self.norm_chunk(routed, None, self.phys[p].post_norm, m)?;
+                self.norm_site(routed, None, self.phys[p].post_norm, m, true)?;
                 self.ffn_chunk(p, m)?;
-                self.merge_chunk(m, true)?;
-                let (a, b) = self.stream_halves(m)?;
-                self.ctx.mhc_average(
-                    &self.stream,
-                    MhcAverageCall {
-                        hidden: h,
-                        rows: m,
-                        ld_ab: 2 * h,
-                        a,
-                        b,
-                        out: self.resid_rows(m)?,
-                    },
-                )?;
+                self.routed(true)
+                    .merge(&self.io(false), &self.rows.ffn_out, m)?;
+                self.routed(true)
+                    .mean(&self.io(false), self.resid_rows(m)?, m)?;
             } else {
                 // Fused residual add and post norm: the branch lands in the residual.
                 let cur = self.resid_rows(m)?;
-                self.norm_chunk(
-                    cur,
-                    Some(floats(&self.rows.mix_out, 0, m * h)?),
-                    self.phys[p].post_norm,
-                    m,
-                )?;
+                let branch = Some(floats(&self.rows.mix_out, 0, m * h)?);
+                self.norm_site(cur, branch, self.phys[p].post_norm, m, true)?;
                 self.ffn_chunk(p, m)?;
-                // row_add writes a distinct out: rotate the residual pair.
+                // The add writes a distinct out: rotate the residual pair.
                 let next = self.rows.cur_ix ^ 1;
-                self.ctx.row_add(
-                    &self.stream,
-                    RowAddCall {
-                        out: floats(&self.rows.resid[next], 0, m * h)?,
-                        x: cur,
-                        y: floats(&self.rows.ffn_out, 0, m * h)?,
-                        n: m * h,
-                        flag: None,
-                        fused: false,
-                    },
+                let out = floats(&self.rows.resid[next], 0, m * h)?;
+                site::add(
+                    &self.io(false),
+                    out,
+                    cur,
+                    floats(&self.rows.ffn_out, 0, m * h)?,
+                    m * h,
                 )?;
                 self.rows.cur_ix = next;
             }
@@ -275,144 +254,87 @@ impl LoopStep<'_> {
         floats(&self.rows.resid[self.rows.cur_ix], 0, m * self.shape.hidden)
     }
 
-    /// The a and b halves of the chunk's `[a || b]` stream rows.
-    fn stream_halves(&self, m: usize) -> Result<(DeviceRange<'_>, DeviceRange<'_>), EngError> {
-        let h = self.shape.hidden;
-        let tail = (m - 1) * 2 * h + h;
-        Ok((
-            floats(&self.rows.streams, 0, tail)?,
-            floats(&self.rows.streams, h, tail)?,
-        ))
-    }
-
-    /// Both streams of the chunk start as the residual rows.
-    fn pack_streams(&self, m: usize) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        for at in (0..m).step_by(PACK_ROWS) {
-            let rows = (m - at).min(PACK_ROWS);
-            let src = floats(&self.rows.resid[self.rows.cur_ix], at * h, rows * h)?;
-            self.ctx.pack_rows(
-                &self.stream,
-                PackRowsCall {
-                    m: rows,
-                    ld: 2 * h,
-                    dst: floats(&self.rows.streams, at * 2 * h, rows * 2 * h)?,
-                    segments: vec![
-                        PackSegment {
-                            src,
-                            n: h,
-                            dst_off: 0,
-                        },
-                        PackSegment {
-                            src,
-                            n: h,
-                            dst_off: h,
-                        },
-                    ],
-                },
-            )?;
+    /// The routed site over the prefill rows (`chunk`) or over the decode row, whose branch
+    /// input takes the first half of the router's normed row.
+    pub(super) fn routed(&self, chunk: bool) -> site::Routed<'_> {
+        let rows = &self.rows;
+        let (streams, normed, normed_q8, logits, input, cell) = if chunk {
+            (
+                &rows.streams,
+                &rows.router_normed,
+                &rows.router_q8,
+                &rows.router_logits,
+                &rows.routed,
+                &rows.route_cell,
+            )
+        } else {
+            (
+                &self.streams,
+                &self.router_normed,
+                &self.router_q8,
+                &self.router_logits,
+                &self.router_normed,
+                &self.route_cell,
+            )
+        };
+        site::Routed {
+            hidden: self.shape.hidden,
+            eps: self.shape.eps,
+            pre_scale: self.plan.mhc_pre_scale,
+            iterations: self.plan.mhc_iterations,
+            fixed_identity: self.plan.mhc_fixed_identity,
+            ones: &self.ones_router,
+            streams,
+            normed,
+            normed_q8,
+            logits,
+            input,
+            cell,
         }
-        Ok(())
     }
 
-    /// One router pass over the chunk: the unit-RMS norm of every `[a || b]` row, the
-    /// router rows, and the routing kernel per row (the bias folds into the logits there).
-    fn route_chunk(&self, p: usize, part: &str, m: usize) -> Result<(), EngError> {
-        let h = self.shape.hidden;
+    /// One router pass of physical layer `p` over `m` rows; `part` names the router.
+    pub(super) fn route(
+        &self,
+        p: usize,
+        part: &str,
+        m: usize,
+        chunk: bool,
+    ) -> Result<(), EngError> {
         let stem = format!("blk.{}", self.plan.block(p));
         let weight = side(self.weights, &format!("{stem}.{part}.weight"))?;
         let bias = side(self.weights, &format!("{stem}.{part}.bias"))?;
-        self.ctx.add_rmsnorm_q8(
-            &self.stream,
-            AddNormQ8Call {
-                n: 2 * h,
-                eps: self.shape.eps,
-                h: floats(&self.rows.streams, 0, m * 2 * h)?,
-                delta: None,
-                weight: floats(&self.ones_router, 0, 2 * h)?,
-                norm_out: floats(&self.rows.router_normed, 0, m * 2 * h)?,
-                q8: bytes_range(&self.rows.router_q8, q8_rows(2 * h, m)?)?,
-                rows: m,
-            },
-        )?;
-        self.ctx.router_logits_rows(
-            &self.stream,
-            RouterLogitsCall {
-                shape: RouterShape {
-                    m,
-                    hidden: 2 * h,
-                    n_expert: 8,
-                    top_k: 1,
-                },
-                x: floats(&self.rows.router_normed, 0, m * 2 * h)?,
-                w: floats(weight, 0, 8 * 2 * h)?,
-                logits: floats(&self.rows.router_logits, 0, m * 8)?,
-            },
-        )?;
-        let (a, b) = self.stream_halves(m)?;
-        self.ctx.mhc_route(
-            &self.stream,
-            MhcRouteCall {
-                hidden: h,
-                rows: m,
-                ld_ab: 2 * h,
-                pre_scale: self.plan.mhc_pre_scale,
-                iterations: self.plan.mhc_iterations,
-                fixed_identity: self.plan.mhc_fixed_identity,
-                logits: floats(&self.rows.router_logits, 0, m * 8)?,
-                bias: Some(floats(bias, 0, 8)?),
-                a,
-                b,
-                input: floats(&self.rows.routed, 0, m * h)?,
-                route: floats(&self.rows.route_cell, 0, m * 6)?,
-            },
-        )
+        self.routed(chunk).route(&self.io(false), weight, bias, m)
     }
 
-    /// One merge of both streams with a mixer or FFN output row.
-    fn merge_chunk(&self, m: usize, ffn: bool) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        let branch = if ffn {
-            floats(&self.rows.ffn_out, 0, m * h)?
-        } else {
-            floats(&self.rows.mix_out, 0, m * h)?
-        };
-        let (a, b) = self.stream_halves(m)?;
-        self.ctx.mhc_merge(
-            &self.stream,
-            MhcMergeCall {
-                hidden: h,
-                rows: m,
-                ld_ab: 2 * h,
-                a,
-                b,
-                branch,
-                route: floats(&self.rows.route_cell, 0, m * 6)?,
-            },
-        )
-    }
-
-    /// The fused add (optional), RMSNorm and q8 quantize of the chunk rows into `norm_out`.
-    fn norm_chunk(
+    /// The fused add (optional), RMS norm and q8 quantize of `m` rows into the norm rows of
+    /// the prefill scratch (`chunk`) or of the decode row.
+    pub(super) fn norm_site(
         &self,
-        row: DeviceRange<'_>,
+        x: DeviceRange<'_>,
         delta: Option<DeviceRange<'_>>,
         weight: &DeviceBuffer,
         m: usize,
+        chunk: bool,
     ) -> Result<(), EngError> {
         let h = self.shape.hidden;
-        self.ctx.add_rmsnorm_q8(
-            &self.stream,
-            AddNormQ8Call {
-                n: h,
-                eps: self.shape.eps,
-                h: row,
-                delta,
-                weight: floats(weight, 0, h)?,
-                norm_out: floats(&self.rows.norm_out, 0, m * h)?,
-                q8: bytes_range(&self.rows.norm_q8, q8_rows(h, m)?)?,
-                rows: m,
-            },
+        let (out, q8) = if chunk {
+            (&self.rows.norm_out, &self.rows.norm_q8)
+        } else {
+            (&self.norm_out, &self.norm_q8)
+        };
+        let norm = Norm {
+            d: h,
+            eps: self.shape.eps,
+            x,
+            delta,
+            weight: floats(weight, 0, h)?,
+        };
+        self.io(false).norm(
+            m,
+            norm,
+            floats(out, 0, m * h)?,
+            bytes_range(q8, q8_rows(h, m)?)?,
         )
     }
 

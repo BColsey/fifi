@@ -23,9 +23,9 @@ use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
-use crate::family::step::ffn;
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
 use crate::family::step::walk::ChunkStep;
+use crate::family::step::{ffn, site};
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
 };
@@ -39,7 +39,6 @@ use crate::kernels::cuda::resident::block_ops::{
     BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked,
 };
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
-use crate::kernels::cuda::resident::hyper::{HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
@@ -595,6 +594,17 @@ impl Raon1Device {
         Ok(())
     }
 
+    fn site(&self) -> site::Mixed<'_> {
+        site::Mixed {
+            hidden: HIDDEN,
+            eps: self.hy.hc_eps,
+            magnitude: self.hy.hc_magnitude,
+            input: &self.sc.branch,
+            post: &self.sc.post,
+            comb: &self.sc.comb,
+        }
+    }
+
     /// The mixed-residual read of one site, then the layer norm into `cur` and `q8_cur`.
     fn site_read(
         &self,
@@ -604,19 +614,12 @@ impl Raon1Device {
         resid: &DeviceBuffer,
     ) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.io().run(BlockOp::hc_read(
-            n,
-            HIDDEN,
-            self.hy.hc_eps,
-            self.hy.hc_magnitude,
-            resid.range(0, n * STREAMS * HIDDEN * 4)?,
-            self.io().raw(&site.mix)?,
-            self.io().raw(&site.base)?,
-            self.io().raw(&site.scale)?,
-            sc.branch.range(0, n * HIDDEN * 4)?,
-            sc.post.range(0, n * STREAMS * 4)?,
-            sc.comb.range(0, n * 16 * 4)?,
-        )?)?;
+        let weights = site::MixWeights {
+            mix: self.io().raw(&site.mix)?,
+            base: self.io().raw(&site.base)?,
+            scale: self.io().raw(&site.scale)?,
+        };
+        self.site().read(&self.io(), weights, resid, n)?;
         self.io().norm_rows(
             n,
             HIDDEN,
@@ -635,23 +638,7 @@ impl Raon1Device {
         resid: &DeviceBuffer,
         out: &DeviceBuffer,
     ) -> Result<(), EngError> {
-        let sc = &self.sc;
-        self.ctx.hyper_mix_apply(
-            &self.stream,
-            HyperMixApplyCall {
-                shape: HyperShape {
-                    m: n,
-                    branches: STREAMS,
-                    hidden: HIDDEN,
-                    rank: 1,
-                },
-                x: resid.range(0, n * STREAMS * HIDDEN * 4)?,
-                out: out.range(0, n * STREAMS * HIDDEN * 4)?,
-                mix: sc.comb.range(0, n * STREAMS * STREAMS * 4)?,
-                gate: sc.post.range(0, n * STREAMS * 4)?,
-                block: sc.proj.range(0, n * HIDDEN * 4)?,
-            },
-        )
+        self.site().apply(&self.io(), resid, out, &self.sc.proj, n)
     }
 
     fn attn_half(&self, layer: usize, n: usize, pos0: usize) -> Result<(), EngError> {
