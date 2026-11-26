@@ -2118,7 +2118,9 @@ fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
 
 /// Decode as a chunk of one row against the one-row decode walk: after the same 512-token
 /// prompt on two cards, 64 greedy steps on each. Reports the time of a step on both routes and
-/// the worst logits difference; the ids must agree.
+/// the worst logits difference. With `SENSENOVA_ROWS_OUT` set, writes the logits rows of both
+/// routes to `<that path>.walk` and `<that path>.chunk` as little-endian f32, for a byte
+/// comparison between two builds.
 #[test]
 fn card_chunk_of_one_against_the_decode_walk() {
     const PROMPT_TOKENS: usize = 512;
@@ -2141,6 +2143,7 @@ fn card_chunk_of_one_against_the_decode_walk() {
     assert_eq!(token, argmax(&drain_row(&ctx, &chunked)));
     let (mut walk_s, mut chunk_s, mut worst) = (0.0f64, 0.0f64, 0.0f32);
     let mut differing = 0;
+    let (mut walk_rows, mut chunk_rows) = (Vec::new(), Vec::new());
     for step in 0..STEPS {
         let pos = PROMPT_TOKENS + step;
         let row = projector.rows(weights.token_embd(), &[token]).unwrap();
@@ -2153,6 +2156,8 @@ fn card_chunk_of_one_against_the_decode_walk() {
         let b = drain_row(&ctx, &chunked);
         chunk_s += t0.elapsed().as_secs_f64();
         worst = worst.max(max_abs_diff(&a, &b));
+        walk_rows.extend(a.iter().flat_map(|v| v.to_le_bytes()));
+        chunk_rows.extend(b.iter().flat_map(|v| v.to_le_bytes()));
         if argmax(&a) != argmax(&b) {
             differing += 1;
         }
@@ -2165,4 +2170,8 @@ fn card_chunk_of_one_against_the_decode_walk() {
         chunk_s * 1e3 / STEPS as f64,
         STEPS as f64 / chunk_s,
     );
+    if let Ok(out) = std::env::var("SENSENOVA_ROWS_OUT") {
+        std::fs::write(format!("{out}.walk"), walk_rows).unwrap();
+        std::fs::write(format!("{out}.chunk"), chunk_rows).unwrap();
+    }
 }

@@ -13,7 +13,6 @@ use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, RowOutputs};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
-use crate::kernels::cuda::resident::matvec_q::MatvecCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 
@@ -112,8 +111,8 @@ impl<'a> StepIo<'a> {
         )
     }
 
-    /// `y[t] = W x[t]` for `n` rows. Up to 8 rows use the quantized matvec on the q8_1 rows;
-    /// a larger chunk with f32 rows and a row length on the 256 grid uses the batched product.
+    /// `y[t] = W x[t]` for `n` rows of the tensor `name`: [`Self::project`] on the resident
+    /// weight.
     pub(crate) fn mv(
         &self,
         name: &str,
@@ -121,7 +120,18 @@ impl<'a> StepIo<'a> {
         y: &DeviceBuffer,
         n: usize,
     ) -> Result<(), EngError> {
-        let weight = self.native(name)?;
+        self.project(self.native(name)?, x, y, n)
+    }
+
+    /// `y[t] = W x[t]` for `n` rows. Up to 8 rows use the quantized matvec on the q8_1 rows;
+    /// a larger chunk with f32 rows and a row length on the 256 grid uses the batched product.
+    pub(crate) fn project(
+        &self,
+        weight: &NativeWeight,
+        x: Rows<'_>,
+        y: &DeviceBuffer,
+        n: usize,
+    ) -> Result<(), EngError> {
         let (k, rows) = (weight.k(), weight.n_rows());
         if n > 8
             && k.is_multiple_of(256)
@@ -154,26 +164,13 @@ impl<'a> StepIo<'a> {
                 },
             );
         }
-        let w = Self::whole(weight.buffer())?;
-        let x_stride = q8(k, 1);
-        let mut first = 0;
-        while first < n {
-            let cols = (n - first).min(8);
-            self.ctx.matvec_q(
-                self.stream,
-                MatvecCall {
-                    ty: weight.quant(),
-                    w,
-                    x_q8: x.q8.range(first * x_stride, q8(k, cols))?,
-                    y: y.range(first * rows * 4, cols * rows * 4)?,
-                    k,
-                    rows,
-                    ncols: cols,
-                },
-            )?;
-            first += cols;
-        }
-        Ok(())
+        self.ctx.matvec_native(
+            self.stream,
+            weight,
+            x.q8.range(0, q8(k, n))?,
+            y.range(0, n * rows * 4)?,
+            n,
+        )
     }
 
     /// The F16 projection `y[t] = W x[t]` of `n` f32 rows.
