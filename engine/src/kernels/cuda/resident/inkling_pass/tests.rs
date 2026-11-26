@@ -200,7 +200,12 @@ fn mix_seal_and_add_match_the_host_stream() {
             let next: Vec<Vec<f32>> = (0..rows)
                 .map(|_| normal_rows(&mut rng, 2 * WIDTH))
                 .collect();
-            upload(&state.next, &stream, 0, &next.concat());
+            // The seal takes the packed first half of each `next` row.
+            let first: Vec<f32> = next
+                .iter()
+                .flat_map(|row| row[..WIDTH].iter().copied())
+                .collect();
+            upload(&state.next, &stream, 0, &first);
             ctx.inkling_pass_seal(
                 &stream,
                 PassSealCall {
@@ -438,7 +443,10 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                 status_bytes.iter().all(|&b| b == 0),
                 "dynamic {dynamic}, history {history_rows}: status"
             );
-            let expected_k = host.convolve(0, &raw[..], &kernels[0], None, channels, 4.0, 1e-5);
+            // Each row of the dynamic plane holds the K coefficients, then the V coefficients.
+            let dynamic_k = dynamic
+                .then(|| coefficients.iter().map(|row| row[..kv_heads * TAPS].to_vec()).collect::<Vec<_>>());
+            let expected_k = host.convolve(0, &raw[..], &kernels[0], dynamic_k.as_deref(), channels, 4.0, 1e-5);
             let dynamic_arg = dynamic.then(|| {
                 coefficients
                     .iter()
