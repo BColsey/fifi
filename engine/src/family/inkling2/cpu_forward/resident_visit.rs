@@ -164,7 +164,16 @@ impl Layout {
             attention_out: take(h),
             mlp_input: take(h),
             mlp_conv: take(h),
-            mlp_normed: take(if Switch::DecodeGlue.on() { h } else { 0 }),
+            mlp_normed: if Switch::DecodeGlue.on() {
+                // Fused norm feeds the same vector-load GEMV as messages above.
+                let span = take(h + 3);
+                Region {
+                    start: span.start.next_multiple_of(16),
+                    bytes: h * WORD,
+                }
+            } else {
+                take(0)
+            },
             bytes: end,
         }
     }
