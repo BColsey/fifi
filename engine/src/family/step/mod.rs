@@ -13,7 +13,9 @@
 //! [`delta`] and [`attend`] are the mixers of a visit: the gated delta rule and the gated full
 //! attention, each over one row or a chunk.
 //!
-//! [`replay`] records a one-row step once and replays it, so a decode step is one call.
+//! [`scratch`] is where a step's scratch comes from: one declaration both plans and allocates
+//! it. [`head`] is the final norm and the projection onto the vocabulary. [`replay`] records a
+//! one-row step once and replays it, so a decode step is one call.
 //!
 //! A model supplies its layers (the mixer and the feed-forward of each visit) and its weights by
 //! name.
@@ -22,7 +24,9 @@ pub(crate) mod attend;
 pub(crate) mod delta;
 pub(crate) mod experts;
 pub(crate) mod ffn;
+pub(crate) mod head;
 pub(crate) mod replay;
 pub(crate) mod rows;
+pub(crate) mod scratch;
 pub(crate) mod site;
 pub(crate) mod walk;

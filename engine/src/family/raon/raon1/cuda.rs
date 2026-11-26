@@ -25,8 +25,9 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
+use crate::family::step::scratch::{Alloc, Count, OnDevice};
 use crate::family::step::walk::{self, ChunkStep, Half, Visits};
-use crate::family::step::{delta, experts, ffn, site};
+use crate::family::step::{delta, experts, ffn, head, site};
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP, MlaShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
@@ -210,59 +211,59 @@ struct MlaFactors {
 }
 
 /// The scratch of one chunk, allocated once at load.
-struct Scratch {
-    resid_a: DeviceBuffer,
-    resid_b: DeviceBuffer,
-    branch: DeviceBuffer,
-    post: DeviceBuffer,
-    comb: DeviceBuffer,
-    cur: DeviceBuffer,
-    q8_cur: DeviceBuffer,
-    proj: DeviceBuffer,
-    q8_wide: DeviceBuffer,
-    proj_qkv: DeviceBuffer,
-    scan_qkv: DeviceBuffer,
-    scan_decay: DeviceBuffer,
-    scan_proj: DeviceBuffer,
-    g1: DeviceBuffer,
-    g2: DeviceBuffer,
-    fa: DeviceBuffer,
-    beta: DeviceBuffer,
-    delta: DeviceBuffer,
-    scan_out: DeviceBuffer,
-    qa: DeviceBuffer,
-    q8_qa: DeviceBuffer,
-    qb: DeviceBuffer,
-    kv: DeviceBuffer,
-    qeff: DeviceBuffer,
-    part: DeviceBuffer,
-    mix: DeviceBuffer,
-    mla_out: DeviceBuffer,
-    ffn_gate: DeviceBuffer,
-    ffn_up: DeviceBuffer,
-    q8_ffn: DeviceBuffer,
-    ids: DeviceBuffer,
-    weights: DeviceBuffer,
-    gu: DeviceBuffer,
-    q8_experts: DeviceBuffer,
-    act_experts: DeviceBuffer,
-    down: DeviceBuffer,
-    shared: DeviceBuffer,
-    head: DeviceBuffer,
-    q8_head: DeviceBuffer,
-    logits: DeviceBuffer,
-    mla_gated: DeviceBuffer,
-    act_ffn: DeviceBuffer,
-    logits_route: DeviceBuffer,
-    route_status: DeviceBuffer,
-    mmq_q8: DeviceBuffer,
-    mmq_q8_routed: DeviceBuffer,
-    mmq_q8_act: DeviceBuffer,
-    fixup: DeviceBuffer,
-    ids_g: DeviceBuffer,
-    ids_src1: DeviceBuffer,
-    ids_dst: DeviceBuffer,
-    expert_bounds: DeviceBuffer,
+struct Scratch<B = DeviceBuffer> {
+    resid_a: B,
+    resid_b: B,
+    branch: B,
+    post: B,
+    comb: B,
+    cur: B,
+    q8_cur: B,
+    proj: B,
+    q8_wide: B,
+    proj_qkv: B,
+    scan_qkv: B,
+    scan_decay: B,
+    scan_proj: B,
+    g1: B,
+    g2: B,
+    fa: B,
+    beta: B,
+    delta: B,
+    scan_out: B,
+    qa: B,
+    q8_qa: B,
+    qb: B,
+    kv: B,
+    qeff: B,
+    part: B,
+    mix: B,
+    mla_out: B,
+    ffn_gate: B,
+    ffn_up: B,
+    q8_ffn: B,
+    ids: B,
+    weights: B,
+    gu: B,
+    q8_experts: B,
+    act_experts: B,
+    down: B,
+    shared: B,
+    head: B,
+    q8_head: B,
+    logits: B,
+    mla_gated: B,
+    act_ffn: B,
+    logits_route: B,
+    route_status: B,
+    mmq_q8: B,
+    mmq_q8_routed: B,
+    mmq_q8_act: B,
+    fixup: B,
+    ids_g: B,
+    ids_src1: B,
+    ids_dst: B,
+    expert_bounds: B,
 }
 
 impl Scratch {
@@ -277,48 +278,6 @@ impl Scratch {
 
     fn cur_rows(&self) -> Rows<'_> {
         Rows::both(&self.q8_cur, &self.cur)
-    }
-
-    /// The device bytes of the scratch of one chunk.
-    fn bytes(vocab: usize, fixup: u64) -> u64 {
-        let c = CHUNK;
-        let f = |count: usize| (count * 4) as u64;
-        let q = |width: usize, rows: usize| q8(width, rows) as u64;
-        let part = (c * (HEADS / MLA_GROUP)).max(320) * MLA_GROUP * (RANK + 4);
-        f(c * STREAMS * HIDDEN) * 2
-            + f(c * HIDDEN) * 4
-            + f(c * STREAMS * 17)
-            + q(HIDDEN, c)
-            + q(WIDTH, c)
-            + f(c * WIDTH) * 9
-            + f(c * TIME_RANK)
-            + f(c * HEADS) * 2
-            + f(c * Q_LORA) * 2
-            + q(Q_LORA, c)
-            + f(c * HEADS * Q_ROW)
-            + f(c * MLA_ROW)
-            + f(c * HEADS * MLA_ROW)
-            + f(part)
-            + f(c * HEADS * RANK)
-            + f(c * DENSE_INTER) * 2
-            + q(DENSE_INTER, c)
-            + f(c * USED) * 2
-            + f(c * USED * 2 * MOE_INTER)
-            + q(MOE_INTER, c * USED)
-            + f(c * USED * MOE_INTER)
-            + f(c * USED * HIDDEN)
-            + f(c * HIDDEN)
-            + f(HIDDEN)
-            + q(HIDDEN, 1)
-            + f(vocab)
-            + f(c * WIDTH)
-            + f(c * DENSE_INTER)
-            + mmq_q8_bytes(DENSE_INTER, c).expect("mmq q8 size") as u64
-            + fixup
-            + f(c * EXPERTS)
-            + mmq_q8_bytes(HIDDEN, c * USED).expect("mmq q8 size") as u64
-            + mmq_q8_bytes(MOE_INTER, c * USED).expect("mmq q8 size") as u64
-            + f(c * USED) * 4
     }
 }
 
@@ -387,12 +346,12 @@ impl Raon1Device {
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let tensors = crate::family::project::cuda::native_load_bytes(model.weights(), &name_refs)?;
         let mla_factor_bytes = (spec.mla_layers.len() * 2 * HEADS * RANK * HEAD_DIM * 4) as u64;
-        let fixup = ctx.mmq_fixup_bytes()? as u64;
-        let fixed = tensors
-            + mla_factor_bytes
-            + Scratch::bytes(vocab, fixup)
-            + state_bytes(spec)
-            + DEVICE.raon_headroom;
+        let fixup = ctx.mmq_fixup_bytes()?;
+        let plan = Count::default();
+        scratch(&plan, vocab, fixup)?;
+        let scratch_bytes = plan.total();
+        let fixed =
+            tensors + mla_factor_bytes + scratch_bytes + state_bytes(spec) + DEVICE.raon_headroom;
         let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
         let room = free.checked_sub(fixed).ok_or_else(|| {
             plan_error(format!(
@@ -425,7 +384,7 @@ impl Raon1Device {
         announce(cells);
         let reserve = Reserve {
             kv_cache: cells as u64 * KV_BYTES_PER_POSITION,
-            work: mla_factor_bytes + Scratch::bytes(vocab, fixup) + state_bytes(spec),
+            work: mla_factor_bytes + scratch_bytes + state_bytes(spec),
             headroom: DEVICE.raon_headroom,
         };
         let loader = BorrowedLoader::new(&ctx)?;
@@ -460,7 +419,7 @@ impl Raon1Device {
             }
             conv.push(ctx.upload(&f32_bytes(&taps))?);
         }
-        let sc = allocate_scratch(&ctx, vocab)?;
+        let sc = scratch(&OnDevice(&ctx), vocab, fixup)?;
         let rda_layers = spec.layers - spec.mla_layers.len();
         let state = ctx.upload(&vec![0u8; rda_layers * HEADS * HEAD_DIM * HEAD_DIM * 4])?;
         let hist = ctx.upload(&vec![0u8; rda_layers * 3 * CONV_TAPS * WIDTH * 4])?;
@@ -1037,17 +996,14 @@ impl Raon1Device {
             sc.resid_a.range(0, (row + 1) * STREAMS * HIDDEN * 4)?,
             sc.head.range(0, HIDDEN * 4)?,
         )?)?;
-        self.io().norm_rows(
-            1,
-            HIDDEN,
-            self.hy.norm_eps,
-            &sc.head,
-            self.io().raw("output_norm.weight")?,
-            &sc.cur,
-            &sc.q8_head,
-        )?;
-        self.io()
-            .mv("output.weight", Rows::q8(&sc.q8_head), &sc.logits, 1)?;
+        let head = head::Head {
+            norm: self.io().raw("output_norm.weight")?,
+            eps: self.hy.norm_eps,
+            weight: self.io().native("output.weight")?,
+            normed: Rows::both(&sc.q8_head, &sc.cur),
+            logits: &sc.logits,
+        };
+        head.logits(&self.io(), StepIo::whole(&sc.head)?)?;
         let mut bytes = vec![0u8; self.vocab * 4];
         sc.logits.read_at(&self.stream, 0, &mut bytes)?;
         Ok(f32_values(&bytes))
@@ -1139,10 +1095,12 @@ fn state_bytes(spec: Raon1Spec) -> u64 {
         + rda * 3 * ((CONV_TAPS + SPEC.conv_kernel as usize) * WIDTH * 4) as u64
 }
 
-fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError> {
+/// The scratch of one chunk, declared once: `fixup` is the bytes of the batched product's
+/// fix-up words on this device.
+fn scratch<A: Alloc>(a: &A, vocab: usize, fixup: usize) -> Result<Scratch<A::Buf>, EngError> {
     let c = CHUNK;
-    let f = |count: usize| ctx.allocate(count * 4);
-    let q = |width: usize, rows: usize| ctx.allocate(q8(width, rows));
+    let f = |count: usize| a.floats(count);
+    let q = |width: usize, rows: usize| a.q8(width, rows);
     let part = (c * (HEADS / MLA_GROUP)).max(320) * MLA_GROUP * (RANK + 4);
     Ok(Scratch {
         resid_a: f(c * STREAMS * HIDDEN)?,
@@ -1187,12 +1145,12 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         logits: f(vocab)?,
         mla_gated: f(c * WIDTH)?,
         act_ffn: f(c * DENSE_INTER)?,
-        mmq_q8: ctx.allocate(mmq_q8_bytes(DENSE_INTER, c)?)?,
+        mmq_q8: a.bytes(mmq_q8_bytes(DENSE_INTER, c)?)?,
         logits_route: f(c * EXPERTS)?,
-        route_status: ctx.upload(&[0u8; 4])?,
-        mmq_q8_routed: ctx.allocate(mmq_q8_bytes(HIDDEN, c * USED)?)?,
-        mmq_q8_act: ctx.allocate(mmq_q8_bytes(MOE_INTER, c * USED)?)?,
-        fixup: ctx.allocate(ctx.mmq_fixup_bytes()?)?,
+        route_status: a.zeroed(4)?,
+        mmq_q8_routed: a.bytes(mmq_q8_bytes(HIDDEN, c * USED)?)?,
+        mmq_q8_act: a.bytes(mmq_q8_bytes(MOE_INTER, c * USED)?)?,
+        fixup: a.bytes(fixup)?,
         ids_g: f(c * USED)?,
         ids_src1: f(c * USED)?,
         ids_dst: f(experts::Picks::dst_ints(USED, c)?)?,

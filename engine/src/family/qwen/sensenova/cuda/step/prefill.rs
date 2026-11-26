@@ -14,8 +14,9 @@ use std::cell::Cell;
 
 use super::*;
 use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
+use crate::family::step::scratch::{Alloc, OnDevice};
 use crate::family::step::walk::{self, Half, Visits};
-use crate::family::step::{attend, delta, ffn, site};
+use crate::family::step::{attend, delta, ffn, head, site};
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
 
@@ -94,22 +95,21 @@ pub(super) fn open_rows(
                 .to_owned(),
         ));
     }
-    let zeros = |floats: usize| le_f32(&vec![0.0; floats]);
-    let floats = |width: usize| ctx.upload(&zeros(PREFILL_ROWS * width));
-    let mmq = |k: usize| -> Result<DeviceBuffer, EngError> {
-        ctx.upload(&vec![0u8; mmq_q8_1_bytes(k, PREFILL_ROWS)?])
-    };
+    let a = OnDevice(ctx);
+    let floats = |width: usize| a.zeroed(PREFILL_ROWS * width * F32);
+    let mmq =
+        |k: usize| -> Result<DeviceBuffer, EngError> { a.zeroed(mmq_q8_1_bytes(k, PREFILL_ROWS)?) };
     Ok(Rows {
         resid: [floats(h)?, floats(h)?],
         cur_ix: Cell::new(0),
         streams: floats(2 * h)?,
         routed: floats(h)?,
         router_normed: floats(2 * h)?,
-        router_q8: ctx.upload(&vec![0u8; q8_rows(2 * h, PREFILL_ROWS)?])?,
+        router_q8: a.zeroed(q8_rows(2 * h, PREFILL_ROWS)?)?,
         router_logits: floats(8)?,
         route_cell: floats(6)?,
         norm_out: floats(h)?,
-        norm_q8: ctx.upload(&vec![0u8; q8_rows(h, PREFILL_ROWS)?])?,
+        norm_q8: a.zeroed(q8_rows(h, PREFILL_ROWS)?)?,
         mix_out: floats(h)?,
         attn_out: floats(q_width)?,
         proj: floats(proj_width)?,
@@ -123,7 +123,7 @@ pub(super) fn open_rows(
         q8a: mmq(q_width)?,
         q8f: mmq(ff)?,
         fixup: floats(fixup_floats_max(nsm)?)?,
-        part: ctx.upload(&vec![0u8; CPF_ATTN_PART_CAP])?,
+        part: a.zeroed(CPF_ATTN_PART_CAP)?,
         nsm,
     })
 }
@@ -153,10 +153,15 @@ impl LoopStep<'_> {
     /// The output norm of residual row `row` and the head, into the logits row.
     pub(super) fn head(&self, row: usize, exact: bool) -> Result<(), EngError> {
         let h = self.shape.hidden;
+        let head = head::Head {
+            norm: StepIo::whole(self.output_norm)?,
+            eps: self.shape.eps,
+            weight: self.head,
+            normed: StepRows::both(&self.rows.norm_q8, &self.rows.norm_out),
+            logits: &self.logits,
+        };
         let last = floats(&self.rows.resid[self.rows.cur_ix.get()], row * h, h)?;
-        self.norm_site(last, None, self.output_norm, 1)?;
-        let x = StepRows::both(&self.rows.norm_q8, &self.rows.norm_out);
-        self.io(exact).project(self.head, x, &self.logits, 1)
+        head.logits(&self.io(exact), last)
     }
 
     /// Row 0 of `buffer` joins the trace, once the stream drained.
