@@ -38,8 +38,8 @@ Every place the engine blocks on the device without a caller-visible
 
 ## 1. Lazy return runs on one stream (alloc_cache.rs)
 
-`AllocCache` may defer the device sync when a block goes idle if
-`FIFI_FLINT_CUDA_ALLOC_LAZY_RETURN` arms it and the lease has at most one
+`AllocCache` may defer the device sync when a block goes idle if lazy return
+is armed (`set_lazy_alloc_return`; no start arms it now) and the lease has at most one
 stream (`on_return`, `kernels/cuda/context/alloc_cache.rs`). Reissuing that
 block is safe only because every other enqueued user of its bytes is on the
 same stream, where ordering is program order.

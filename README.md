@@ -17,9 +17,9 @@ the server. To connect an application, see [Connect a client](doc/how-to/clients
 
 ## Models
 
-fifi runs supported checkpoints downloaded from Hugging Face. Depending on the
-model and backend, these include MLX, GGUF, EXL3, and NVFP4 formats. Download
-the files to local storage before loading them.
+fifi runs supported checkpoints downloaded from Hugging Face: GGUF files on
+CUDA, MLX packs on Apple Silicon, and NVFP4 safetensors for Nemotron and
+Inkling. Download the files to local storage before loading them.
 
 Support depends on the model architecture, checkpoint, tokenizer, and backend;
 not every model or quantization in these formats is supported. See the
@@ -28,7 +28,10 @@ limits, and the [current status](doc/explanation/status.md) for qualification
 and known limitations.
 
 The model guides cover [Qwen3.6](doc/how-to/qwen36.md),
-[Flint](doc/how-to/flint.md), and [Nemotron 3.5 Super](doc/how-to/nemotron.md).
+[Flint](doc/how-to/flint.md), [Nemotron 3.5 Super](doc/how-to/nemotron.md) and
+Inkling 2 Mini ([Mac](doc/how-to/inkling.md),
+[CPU or CUDA pilot](doc/how-to/inkling-loop.md)). The
+[model reference](doc/reference/models.md) covers the other families.
 
 ## Configuration
 

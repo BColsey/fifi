@@ -1,6 +1,6 @@
 # Current status
 
-**Goal: 128K to 256K tokens of context for every model, with EXL3 as the primary weight format.** The context rows show the measured admission limits and boot results.
+The goal is 128K to 256K tokens of context for every model, with GGUF as the weight format on CUDA. The context rows show the measured admission limits and boot results.
 
 This page records measurements by model and backend.
 It holds measured facts only. Every row gives the date, the conditions and the receipt it comes from, and anything that is an estimate says so.
@@ -67,7 +67,7 @@ Memory caps (default arm): 6, 8 and 12 GiB refuse before the arm with the fixed-
 
 Model file: the 19G MLX 4-bit pack.
 
-Default arm: **refused at startup**. Exact text: "enginesrv: serve --model: this build cannot serve ...: settings: the engine would refuse these settings: engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set". A user who sets nothing gets no server on this host class; this is the top item a fix should remove.
+Default arm: **refused at startup**. Exact text: "enginesrv: serve --model: this build cannot serve ...: settings: the engine would refuse these settings: engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set". A user who sets nothing gets no server on this host class.
 
 Tuned arm: the shipped config `engine/config/qwen36-mac-studio-36gb.json` verbatim (cache limit 4 GiB, context 262,144, session cap 4 GiB, prefill budget 30 GiB, reserve 8,286,699,520, bf16+q8, compile on) with model dir and listen swapped. Clean-host rerun, timings from `/v1/recent-requests`, three runs per size:
 
@@ -79,11 +79,11 @@ Tuned arm: the shipped config `engine/config/qwen36-mac-studio-36gb.json` verbat
 
 Peak server RSS 16.8 GiB (unified memory; process RSS is the host+device proxy). A third admission of the 4,022-token text prefills in 3,243 ms (median) — no reuse win on that turn. Against MLX-LM on the same file, see [Benchmarks](benchmarks.md).
 
-Dense Qwen3.8-27B on this host: not servable. Both local copies are EXL3 weights, and the server refuses at startup with "engine config: weight_format exl3 is CUDA-only". No MLX-format 27B pack exists on the host; the row needs one before it can hold a figure.
+Dense Qwen3.8-27B was not measured on this host: no MLX-format pack of it was available.
 
 ## Flint, MLX int4 21 GB fixture, on the same Apple Silicon host
 
-Default arm equals the tuned arm: nothing qualified to switch on for Flint on MLX, and the MLX path needs no Flint config object (the object itself selects the CUDA pilot). Config: id flint, family flint, model and tokenizer dirs only. Server-side timings, three runs per size:
+The default arm equals the tuned arm: no switch is qualified for Flint on MLX. Config: id flint, family flint, model and tokenizer dirs only. Server-side timings, three runs per size:
 
 | Prompt tokens | Prefill ms (median) | Decode tok/s | Date | Conditions |
 | ---: | ---: | --- | --- | --- |
@@ -117,8 +117,7 @@ A 31,650-token prompt over the tuned 16,384 cap refuses with the same `context_l
 
 ## Models without a current measurement here
 
-- **Qwen3.6 EXL3 4.00 bpw on the 3090**: not served. Qwen3.6 on CUDA serves the GGUF checkpoint only, and `"weight_format": "exl3"` is refused before any weight is read. The October sweep rows were removed with this rewrite.
-- **Qwen3.6 EXL3 2.08 bpw on an RTX 4050 laptop**: not served, for the same reason.
-- **Flint on the 3090**: not measured — no Flint pack on that host.
+- **Qwen3.6 from an EXL3 pack**: not served. Qwen3.6 on CUDA serves the GGUF checkpoint only, and `"weight_format": "exl3"` is refused before any weight is read.
+- **Flint on CUDA**: not served. Flint serves on Apple Silicon only.
 - **Bolt e4b on the 3090**: refused — "gemma4 serve: 4 .gguf files in the model directory; exactly one expected" (the store keeps four quantizations of this model in one directory and the loader accepts exactly one file).
 - **Nemotron 3.5 Super on the 3090**: refused — the loader for this family is safetensors-based and the store holds only a GGUF conversion: "config.json: No such file" then "open shard: No such file".

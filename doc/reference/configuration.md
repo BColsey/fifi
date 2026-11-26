@@ -26,7 +26,6 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | `tokenizer_dir` | yes | Directory with `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. For Qwen3.6, Flint and Nemotron, startup checks each file against the hashes of the tested release. |
 | `model` | no | The name clients send in the `model` field. Defaults to the family name. |
 | `qwen36` | no | [Qwen3.6 options](#qwen36). |
-| `flint` | CUDA only | [Flint options](#flint). |
 | `nemotron` | `nemotron35` only, required | [Nemotron options](#nemotron). |
 | `fake` | no | [Test engine options](#fake). |
 | `context_limit` | no | `fake` only: context limit in tokens. Default 4,096. |
@@ -74,8 +73,8 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `compile_program_limit` | MLX | 8 | Budget of distinct compiled program keys per adapter, from 1. Increasing it is opt-in and does not enable `compile`. CUDA refuses an explicit value. |
 | `max_seqs` | MLX | 4 on a host-derived MoE start with compiled decode and a funded prefill budget, else 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. A derived value that the memory plan refuses starts one session instead (the start says so); a value you set is never lowered. The clients' rows decode in one window; a lone client takes the single-row step at its usual rate. A client's greedy text in a window can differ from its text alone after some tokens: a window's numerics are not the single-row step's, and the output is held to the batch quality gate (mean KL, worst-row KL and top-1 agreement against the solo run), not to bit equality. |
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
-| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file when present, otherwise the directory's largest `.gguf` of the family, validated at open; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards; Flint and Flash-Next only). Qwen3.6 on CUDA serves `gguf` only: an `exl3` start is refused before any weight is read with `engine config: Qwen3.6 on CUDA serves a GGUF checkpoint, and <dir> is an EXL3 pack; use the model's GGUF file`. Any other value, including a different case, is refused. The MLX arm refuses `exl3`. |
-| `gguf_sha256` | CUDA GGUF | off | Expected SHA-256 of the selected GGUF file, exactly 64 hex digits. Startup always verifies this pin before opening the model. MLX and EXL3 refuse the key. See [content pinning](#gguf-content-pinning-cuda). |
+| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`. `gguf` serves the pinned Q4_K_M file when it is present, otherwise the directory's largest `.gguf` of the family, validated at open; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file. `exl3` is refused before any weight is read. Any other value, including a different case, is refused. |
+| `gguf_sha256` | CUDA GGUF | off | Expected SHA-256 of the selected GGUF file, exactly 64 hex digits. Startup always verifies this pin before opening the model. MLX refuses the key. See [content pinning](#gguf-content-pinning-cuda). |
 | `capture` | CUDA | `false` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
 | `kv_offload_host_bytes` | CUDA | off | Keep the KV cache in host memory, up to this many bytes. See [below](#host-memory-kv-cache-cuda). |
@@ -90,7 +89,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `ngram_match_min` | MLX | 2 | The shortest repeated tail that an n-gram draft needs, 1 to 64. |
 | `mtp_model_dir` | MLX | none | The pack directory that holds the `mtp.*` tensors. Required by `draft_mode` `mtp`, refused otherwise. |
 | `draft_rollback` | MLX | `host` | How a verify window is undone after a partial accept. `device` is refused on MLX because it is CUDA-only. Any other value is refused. |
-| `draft_verify` | MLX | `eager` | How a verify window runs its rows. `eager` feeds the rows through the one-row step, one after the other. `krow` (the K-row window) needs `draft_rollback` `device` and the EXL3 pack, so it is refused here. Any other value is refused. |
+| `draft_verify` | MLX | `eager` | How a verify window runs its rows. `eager` feeds the rows through the one-row step, one after the other. `krow` is refused. Any other value is refused. |
 
 CUDA refuses `prefill_budget_bytes` and `prefill_session_reserve_bytes`.
 It ignores `cache_limit_bytes`, `session_cap_bytes`, `prefill_chunk`, `compile` and `prefix_store_entries`, and logs one line for each.
@@ -158,21 +157,6 @@ Do not modify or replace the model file while the server is running.
 
 Tiered mode refuses `capture: true` and `kv_dtype: q8`.
 It processes prompts one token per step and, by default, keeps no saved prefixes in host memory.
-
-## `flint`
-
-Optional for Flint on CUDA; refused on Apple Silicon. Without it the engine uses `context_limit` 131,072 and `kv_profile` `"f16"`. When you set it, give both `context_limit` and `kv_profile`.
-
-| Key | Required | Values | Meaning |
-| --- | --- | --- | --- |
-| `context_limit` | with `flint` | 1 to 262,144 | Context limit in tokens. On a 24 GB card, up to about 60,000 tokens with `f16` and the token-major walk keep every expert on the GPU (the default job-table prefill reserves about 0.65 GB more, so the context that keeps every expert resident is shorter; not measured); a longer context keeps part of them in about 18 GiB of page-locked host memory (see `FIFI_FLINT_CUDA_EXPERT_CACHE` in environment.md). |
-| `kv_profile` | with `flint` | `"f16"`, `"q8"`, `"q8k"` | KV cache format. `q8` (int8 in groups of 32 with an FP16 scale) is experimental and materially lossier than f16; see `FIFI_FLINT_CUDA_Q8_TILED` in environment.md. `q8k` quantizes only the K plane and keeps V at f16; it is opt-in with no quality verdict, uses the default prefill enqueue (the q8 tiled route serves uniform `q8` only), and refuses prefix reuse like `q8`. |
-| `prefill_chunk_size` | no | 1 to 8, default 8 | Prompt rows per step. `1` processes one token at a time. Any value other than 8 keeps the token-major walk with that chunk instead of the default job-table prefill, which ignores the chunk size (`FIFI_EXL3_LAYER_MAJOR`). |
-| `cpu_moe_offload_layers` | no | whole number, default 0 (off); 999 or more means every routed layer | Runs every routed expert of the first N MoE layers on the CPU, from the page-locked host store, instead of on the GPU. Those layers keep no experts on the GPU, so the GPU memory they would have used goes to the other layers' experts or to a longer context. Needs the host store: it turns the expert cache on, and is refused with `FIFI_FLINT_CUDA_EXPERT_CACHE=0` and with an explicit `FIFI_EXL3_LAYER_MAJOR=1` or `jobs` (with the switch unset the engine keeps the token-major walk for CPU experts and says so at start). Exclusive with `cpu_moe_split_experts`. See the trade-off below. |
-| `cpu_moe_split_experts` | no | 0 to 255, default 0 (off) | Keeps `256` minus this many experts per layer on the GPU and computes the other experts a token picks on the CPU instead of copying them in. A slow hot-set rule moves an expert into a GPU slot only when it is used clearly more than the least used resident expert. Sets the experts per layer on the GPU, so it is refused together with `FIFI_FLINT_CUDA_EXPERT_SLOTS`; the same refusals as `cpu_moe_offload_layers` apply. Exclusive with `cpu_moe_offload_layers`. |
-| `cpu_moe_threads` | no | 0 to 256, default 0 (6) | Threads for the CPU experts, the engine thread included. The CPU expert kernel is limited by memory bandwidth; on a Ryzen 9 7900X 6 threads already read 45 GB/s, and more did not help. |
-
-CPU experts trade decode speed for GPU memory and for PCIe traffic. On an RTX 3090 with the EXL3 4.0 pack, a 4,096-token context, greedy decoding, one run each: with 128 experts per layer on the GPU (6.9 GiB less GPU memory than 224), serving the other picks from the host buffer by copying them in decoded 36.0 tokens/s after a 51.9 s first token and copied 339 GB in the 4,000-token prompt, while `cpu_moe_split_experts` 128 decoded 32.9 tokens/s after a 56.9 s first token and copied nothing. `cpu_moe_offload_layers` 8 freed 2.7 GiB and decoded 37.7 tokens/s against 39.8 with all layers on the GPU (224 experts per layer). The CPU path rounds its intermediate values to bf16 where the GPU kernels publish them, but it does not round each weight to FP16 as they do, so a greedy run can diverge from the GPU run at a close call between two tokens. Prefill with CPU experts is slower because each row-expert pair is computed on its own.
 
 ## `flash_next`
 
