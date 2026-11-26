@@ -13,8 +13,8 @@ use crate::family::exl3::layer_table::LayerTable;
 use super::super::admission_sketch::{CudaFitAsk, choose_cuda_fit};
 use super::super::card_short::{self, CardFigures, CardShort, CardVerdict};
 use super::super::settings::{
-    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, VerifyMode,
-    WeightFormat, check_cuda_serves, exl3_refusal, tokenizer_pin, weight_format_name,
+    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, check_cuda_serves,
+    tokenizer_pin,
 };
 use super::{
     card_load::card_loads,
@@ -951,13 +951,9 @@ fn session_plan(settings: &Q36Settings, device_first: bool) -> Option<usize> {
     if settings.max_seqs_set {
         return (settings.max_seqs > 1).then_some(settings.max_seqs);
     }
-    let plain = settings.weights == WeightFormat::Gguf
-        && !settings.speculation.enabled()
+    let plain = !settings.speculation.enabled()
         && settings.tiered.is_none()
-        && settings.expert_bank.is_none()
         && settings.kv_offload_host_bytes.is_none()
-        && settings.draft_rollback == RollbackMode::Host
-        && settings.draft_verify == VerifyMode::Eager
         && !device_first
         && !super::sparse_exec::armed();
     plain.then_some(DEFAULT_SESSION_CAP)
@@ -1886,15 +1882,12 @@ fn make(
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
     stages.begin("loading weights");
-    let gguf = match settings.weights {
-        WeightFormat::Gguf => open_gguf(
-            &settings.artifact,
-            verify,
-            allow_unpinned,
-            settings.gguf_sha256.as_deref(),
-        )?,
-        WeightFormat::Exl3 => return Err(exl3_refusal(&settings.artifact)),
-    };
+    let gguf = open_gguf(
+        &settings.artifact,
+        verify,
+        allow_unpinned,
+        settings.gguf_sha256.as_deref(),
+    )?;
     // The cache form and context the config left open come from the free card.
     let (settings, plan) = match card_fit(&projector, &settings, &plan, &gguf.0)? {
         Some((variant, variant_plan)) => (variant, variant_plan),
@@ -2133,9 +2126,8 @@ fn make(
         }
     }
     eprintln!(
-        "q36 cuda: {} weights resident ({} B), free after load {} B, context_limit {}, kv {}, \
+        "q36 cuda: gguf weights resident ({} B), free after load {} B, context_limit {}, kv {}, \
          capture {}{}",
-        weight_format_name(settings.weights),
         before.free.saturating_sub(after.free),
         after.free,
         ceiling_cells,

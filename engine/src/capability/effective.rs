@@ -80,9 +80,7 @@ pub(crate) fn q36_effective(
     backend: Backend,
     settings: &Q36Settings,
 ) -> Vec<EffectiveSetting> {
-    use crate::family::qwen::qwen36::settings::{
-        activation_name, kv_dtype_name, weight_format_name,
-    };
+    use crate::family::qwen::qwen36::settings::{activation_name, kv_dtype_name};
     let ignored = |key: &str| settings.ignored_mlx_keys.contains(&key);
     let on_arm = |key: &str, origin: Origin| {
         if ignored(key) {
@@ -128,7 +126,7 @@ pub(crate) fn q36_effective(
     let mut rows = vec![
         row(
             "weight_format",
-            weight_format_name(settings.weights).to_string(),
+            "gguf".to_string(),
             present(&options.weight_format),
         ),
         row(

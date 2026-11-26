@@ -73,7 +73,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `compile_program_limit` | MLX | 8 | Budget of distinct compiled program keys per adapter, from 1. Increasing it is opt-in and does not enable `compile`. CUDA refuses an explicit value. |
 | `max_seqs` | MLX | 4 on a host-derived MoE start with compiled decode and a funded prefill budget, else 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. A derived value that the memory plan refuses starts one session instead, and the start says so; a value you set is never lowered. Clients decode together in one window. A client's greedy text in a window can differ from its text alone: the window is held to the batch quality gate (mean KL, worst-row KL and top-1 agreement against the solo run), not to bit equality. |
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
-| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`. `gguf` serves the pinned Q4_K_M file when it is present, otherwise the directory's largest `.gguf` of the family, validated at open; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file. `exl3` is refused before any weight is read. Any other value, including a different case, is refused. |
+| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`. `gguf` serves the pinned Q4_K_M file when it is present, otherwise the directory's largest `.gguf` of the family, validated at open; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file. Any other value is refused, and `exl3` is refused by name. |
 | `gguf_sha256` | CUDA GGUF | off | Expected SHA-256 of the selected GGUF file, exactly 64 hex digits. Startup always verifies this pin before opening the model. MLX refuses the key. See [content pinning](#gguf-content-pinning-cuda). |
 | `capture` | CUDA | `false` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
@@ -88,8 +88,8 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `hybrid_draft_tokens` | MLX | 0 (off) | When the context repeats an earlier passage for at least this many tokens, draft that many tokens of the passage in one window. 0, or from `ngram_match_min` to 256. |
 | `ngram_match_min` | MLX | 2 | The shortest repeated tail that an n-gram draft needs, 1 to 64. |
 | `mtp_model_dir` | MLX | none | The pack directory that holds the `mtp.*` tensors. Required by `draft_mode` `mtp`, refused otherwise. |
-| `draft_rollback` | MLX | `host` | How a verify window is undone after a partial accept. `device` is refused on MLX because it is CUDA-only. Any other value is refused. |
-| `draft_verify` | MLX | `eager` | How a verify window runs its rows. `eager` feeds the rows through the one-row step, one after the other. `krow` is refused. Any other value is refused. |
+| `draft_rollback` | MLX | `host` | How a verify window is undone after a partial accept: the committed state is copied to the host, restored, and the kept rows are fed again. Any other value is refused. |
+| `draft_verify` | MLX | `eager` | How a verify window runs its rows. `eager` feeds the rows through the one-row step, one after the other. Any other value is refused. |
 
 CUDA refuses `prefill_budget_bytes` and `prefill_session_reserve_bytes`.
 It ignores `cache_limit_bytes`, `session_cap_bytes`, `prefill_chunk`, `compile` and `prefix_store_entries`, and logs one line for each.

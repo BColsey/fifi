@@ -8,7 +8,7 @@
 //! words the one start line. The figures in that line are the ones the device admission quotes
 //! when it refuses, so the two texts agree.
 
-use super::settings::{Q36Settings, TieredSettings, WeightFormat};
+use super::settings::{Q36Settings, TieredSettings};
 use crate::family::expert_bank::bank_tier::{CardBudget, TierBudget, TierChoice, choose_tier};
 
 /// Host bytes the tiered path keeps beside the mapped experts: the CPU pool's scratch and the
@@ -272,8 +272,7 @@ pub(crate) const TIERED_SESSION_TARGET: usize = super::settings::AUTO_MAX_SEQS;
 /// them is automatic. The context limit is never changed, so a context the config names is
 /// served as named.
 pub(crate) fn automatic(settings: &Q36Settings, device_first: bool) -> bool {
-    settings.weights == WeightFormat::Gguf
-        && settings.cuda_devices == [0]
+    settings.cuda_devices == [0]
         && settings.tiered.is_none()
         && settings.kv_offload_host_bytes.is_none()
         && !device_first
@@ -679,7 +678,6 @@ mod tests {
             &settings(r#"{"capture":false,"kv_dtype":"q8","kv_offload_host_bytes":4294967296}"#),
             false
         ));
-        assert!(!automatic(&settings(r#"{"weight_format":"exl3"}"#), false));
     }
 
     #[test]

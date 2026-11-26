@@ -1463,49 +1463,32 @@ fn q36_preflight(
         )),
     }
 
-    // Qualification of this exact combination: the GGUF engine is the qualified one; the
-    // EXL3 pack is refused above.
+    // Qualification of this exact combination: the GGUF engine is the qualified one.
     let qualification = Qualification::Qualified;
 
     // Format vs. directory shape: the resolved weight format must have
     // its files here. Exact checkpoint identity stays the loader's check.
-    use crate::family::qwen::qwen36::settings::WeightFormat;
     let mut selected_gguf_bytes = None;
-    match settings.weights {
-        WeightFormat::Gguf if backend == Backend::Cuda => {
-            let (check, bytes) = cuda_gguf_check(model_dir, inspection);
-            checks.push(check);
-            selected_gguf_bytes = bytes;
-        }
-        // The MLX arm reads an MLX safetensors pack; `gguf` is only the unset default of
-        // `weight_format`, which the MLX arm does not use.
-        WeightFormat::Gguf
-            if backend == Backend::Mlx
-                && inspection.gguf_files.is_empty()
-                && inspection.safetensors_files > 0 =>
-        {
-            checks.push(Check::new(
-                "weight format",
-                CheckStatus::Pass,
-                format!(
-                    "{} MLX safetensors shards are present; exact file identity is verified by the loader",
-                    inspection.safetensors_files
-                ),
-            ));
-        }
-        WeightFormat::Gguf if inspection.gguf_files.is_empty() => checks.push(Check::new(
-            "weight format",
-            CheckStatus::Fail,
-            "weight_format is gguf but no readable .gguf file is in the directory".to_string(),
-        )),
-        _ => checks.push(Check::new(
+    if backend == Backend::Cuda {
+        let (check, bytes) = cuda_gguf_check(model_dir, inspection);
+        checks.push(check);
+        selected_gguf_bytes = bytes;
+    } else if inspection.gguf_files.is_empty() && inspection.safetensors_files > 0 {
+        // The MLX arm reads an MLX safetensors pack.
+        checks.push(Check::new(
             "weight format",
             CheckStatus::Pass,
             format!(
-                "{} checkpoint files are present; exact file identity is verified by the loader",
-                crate::family::qwen::qwen36::settings::weight_format_name(settings.weights)
+                "{} MLX safetensors shards are present; exact file identity is verified by the loader",
+                inspection.safetensors_files
             ),
-        )),
+        ));
+    } else {
+        checks.push(Check::new(
+            "weight format",
+            CheckStatus::Fail,
+            "no MLX safetensors pack is in the directory".to_string(),
+        ));
     }
 
     if any_failed(&checks) {

@@ -353,16 +353,11 @@ fn the_rules_are_built_before_the_first_device_call() {
     assert!(make.contains("rules:QwenRules") && make.contains("QwenResidentStep::new("));
 }
 
-/// The weight format picks the load: a GGUF entry opens the pinned file, and an EXL3 entry is
-/// refused with the message naming GGUF before any weight is read.
+/// The start opens the GGUF file before any device work on the weights.
 #[test]
 fn the_weight_format_selects_the_load_in_make() {
     let make = pinned(fn_section("fn make("));
-    assert!(make.contains("WeightFormat::Gguf=>open_gguf("), "{make}");
-    assert!(
-        make.contains("WeightFormat::Exl3=>returnErr(exl3_refusal("),
-        "{make}"
-    );
+    assert!(make.contains("letgguf=open_gguf("), "{make}");
     let device = make
         .find("CudaProjector::new()")
         .expect("make opens the device");

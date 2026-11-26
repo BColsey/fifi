@@ -213,17 +213,8 @@ pub(crate) struct Q36Options {
     /// The tiered expert mode of the CUDA arm. Absent means off: the routed experts are all
     /// resident on the device, as before. The MLX arm refuses the member.
     pub(crate) tiered: Option<TieredOptions>,
-    /// The banked EXL3 expert mode of the CUDA arm: `slots` experts per layer stay on the device
-    /// and every expert's packed bytes stay in a pageable host store for miss copies. Absent means
-    /// off. An EXL3-only CUDA member. Measured on a 6 GB laptop GPU over PCIe Gen4 (2.08bpw):
-    /// 40.5-43.8 tok/s served decode. The ngram-drafted `draft_verify: krow` over the bank measured
-    /// net-negative in the same state (31.9/21.7 tok/s vs the 41.7/39.0 baseline, and 10.8/8.1 on
-    /// a Gen1 link) because every extra drafted expert read misses the bank and pays the PCIe
-    /// refill; revisit only with a real draft head, which reads resident experts it already
-    /// picked.
-    pub(crate) expert_bank: Option<ExpertBankOptions>,
-    /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
-    /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.
+    /// The checkpoint format `model_dir` holds: `gguf`, which is also the default. Any other value
+    /// is refused.
     pub(crate) weight_format: Option<String>,
     /// The CUDA devices this engine spans, as explicit ordinals in strictly ascending order.
     /// Absent means `[0]`: the first device only, as before. A CUDA member; the MLX arm
@@ -253,16 +244,12 @@ pub(crate) struct Q36Options {
     pub(crate) ngram_match_min: Option<u32>,
     /// The directory of the pack that holds the MTP head. Required by `draft_mode` `mtp`.
     pub(crate) mtp_model_dir: Option<PathBuf>,
-    /// How a verify window is rolled back after a partial accept: `host` (the default: the whole
-    /// committed state is copied to the host before the window and written back, then the kept rows
-    /// are fed again) or `device` (per-row copies of the DeltaNet state in device memory, no host
-    /// copy, no replay). `device` needs an enabled `draft_mode`; its slots take up to 440 MiB at 8
-    /// rows, and start is refused when they cannot be allocated.
+    /// How a verify window is rolled back after a partial accept: `host`, which is also the
+    /// default (the whole committed state is copied to the host before the window and written
+    /// back, then the kept rows are fed again). Any other value is refused.
     pub(crate) draft_rollback: Option<String>,
-    /// How a verify window runs its rows: `eager` (the default: the one-row step once per row) or
-    /// `krow` (one K-row window; a captured graph per window length on a resident engine, the
-    /// uncaptured body with host-mapped slot picks on a banked engine). `krow` needs
-    /// `draft_rollback` `device` and the EXL3 pack.
+    /// How a verify window runs its rows: `eager`, which is also the default (the one-row step
+    /// once per row). Any other value is refused.
     pub(crate) draft_verify: Option<String>,
     /// The on-disk prefix cache: saved prefixes that survive a restart and an
     /// eviction from pinned host memory. Absent means the default (see `kv_disk::KV_CACHE_DEFAULT_ON`).
@@ -285,113 +272,21 @@ fn kv_cache_settings(
     cache.checked().map(Some).map_err(bad)
 }
 
-/// How a verify window runs its rows (`draft_verify`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum VerifyMode {
-    /// The eager window: one one-row step per row. The reference of the K-row path.
-    #[default]
-    Eager,
-    /// One K-row window (`family/qwen/qwen36/krow.rs`).
-    Krow,
-}
-
-/// The config text of `draft_verify`.
-pub(crate) fn verify_mode_name(mode: VerifyMode) -> &'static str {
-    match mode {
-        VerifyMode::Eager => "eager",
-        VerifyMode::Krow => "krow",
+/// `draft_verify` takes `eager` only: a verify window feeds its rows through the one-row step.
+fn check_draft_verify(options: &Q36Options) -> Result<(), EngError> {
+    match options.draft_verify.as_deref() {
+        None | Some("eager") => Ok(()),
+        Some(other) => Err(bad(format!("draft_verify must be eager, got {other:?}"))),
     }
 }
 
-/// Parses `draft_verify` by exact match; absent is `eager`. `krow` needs the device rollback (its
-/// per-row states are written straight into the rollback slots) and the EXL3 pack (the only
-/// layout with a K-row plan). The window cap of 8 rows is `draft_max_rows`, already enforced for
-/// an enabled Qwen3.6 speculation.
-fn verify_of(
-    options: &Q36Options,
-    rollback: RollbackMode,
-    weights: WeightFormat,
-) -> Result<VerifyMode, EngError> {
-    let mode = match options.draft_verify.as_deref() {
-        None | Some("eager") => VerifyMode::Eager,
-        Some("krow") => VerifyMode::Krow,
-        Some(other) => {
-            return Err(bad(format!(
-                "draft_verify must be eager or krow, got {other:?}"
-            )));
-        }
-    };
-    if mode == VerifyMode::Krow {
-        if rollback != RollbackMode::Device {
-            return Err(bad(
-                "draft_verify krow needs draft_rollback device; set draft_rollback to device or \
-                 draft_verify to eager"
-                    .into(),
-            ));
-        }
-        if weights != WeightFormat::Exl3 {
-            return Err(bad("draft_verify krow needs weight_format exl3".into()));
-        }
+/// `draft_rollback` takes `host` only: the committed state is copied to the host, restored, and
+/// the kept rows are replayed.
+fn check_draft_rollback(options: &Q36Options) -> Result<(), EngError> {
+    match options.draft_rollback.as_deref() {
+        None | Some("host") => Ok(()),
+        Some(other) => Err(bad(format!("draft_rollback must be host, got {other:?}"))),
     }
-    Ok(mode)
-}
-
-/// How a verify window is rolled back (`draft_rollback`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RollbackMode {
-    /// Copy the committed state to the host, restore it, replay the kept rows.
-    #[default]
-    Host,
-    /// Device-resident per-row slots (`family/qwen/qwen36/rollback.rs`).
-    Device,
-}
-
-/// The config text of `draft_rollback`.
-pub(crate) fn rollback_mode_name(mode: RollbackMode) -> &'static str {
-    match mode {
-        RollbackMode::Host => "host",
-        RollbackMode::Device => "device",
-    }
-}
-
-/// Parses `draft_rollback` by exact match; absent is `host`. `device` needs an enabled speculative
-/// mode (the CUDA arm and an EXL3 pack are already required by that) and no host-paged KV, whose
-/// cache has no resident plane to truncate.
-fn rollback_of(
-    options: &Q36Options,
-    speculation: &SpecConfig,
-    kv_offload_host_bytes: Option<u64>,
-    backend: Backend,
-) -> Result<RollbackMode, EngError> {
-    let mode = match options.draft_rollback.as_deref() {
-        None | Some("host") => RollbackMode::Host,
-        Some("device") => RollbackMode::Device,
-        Some(other) => {
-            return Err(bad(format!(
-                "draft_rollback must be host or device, got {other:?}"
-            )));
-        }
-    };
-    if mode == RollbackMode::Device {
-        if backend != Backend::Cuda {
-            return Err(bad(
-                "draft_rollback device is CUDA-only: the MLX arm rolls back with a shared-handle \
-                 snapshot"
-                    .into(),
-            ));
-        }
-        if !speculation.enabled() {
-            return Err(bad("draft_rollback device needs draft_mode ngram".into()));
-        }
-        if kv_offload_host_bytes.is_some() {
-            return Err(bad(
-                "draft_rollback device is refused with kv_offload_host_bytes: the host-paged KV has no \
-                 resident plane to truncate"
-                    .into(),
-            ));
-        }
-    }
-    Ok(mode)
 }
 
 impl Q36Options {
@@ -410,88 +305,27 @@ impl Q36Options {
     }
 }
 
-/// The checkpoint format of one engine entry.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum WeightFormat {
-    /// The pinned GGUF file inside `model_dir`.
-    #[default]
-    Gguf,
-    /// A stock EXL3 pack: the safetensors shards and `config.json` inside `model_dir`.
-    Exl3,
-}
-
-pub(crate) fn weight_format_name(format: WeightFormat) -> &'static str {
-    match format {
-        WeightFormat::Gguf => "gguf",
-        WeightFormat::Exl3 => "exl3",
-    }
-}
-
-/// Parses the `weight_format` member by exact match; absent is the GGUF default. Anything else,
-/// a different case or padding included, is refused by name.
-pub(crate) fn weight_format_of(text: Option<&str>) -> Result<WeightFormat, EngError> {
+/// `weight_format` takes `gguf` only; absent is the same. An EXL3 pack is refused by name, and so is
+/// anything else, a different case or padding included.
+pub(crate) fn check_weight_format(text: Option<&str>) -> Result<(), EngError> {
     match text {
-        None | Some("gguf") => Ok(WeightFormat::Gguf),
-        Some("exl3") => Ok(WeightFormat::Exl3),
-        Some(other) => Err(bad(format!(
-            "weight_format must be gguf or exl3, got {other:?}"
-        ))),
+        None | Some("gguf") => Ok(()),
+        Some("exl3") => Err(bad(
+            "weight_format exl3 is not supported; use the model's GGUF file".into(),
+        )),
+        Some(other) => Err(bad(format!("weight_format must be gguf, got {other:?}"))),
     }
 }
 
-/// An EXL3 pack handed to a CUDA start.
-pub(crate) fn exl3_refusal(artifact: &Path) -> EngError {
-    EngError::BadRequest(format!(
-        "engine config: Qwen3.6 on CUDA serves a GGUF checkpoint, and {} is an EXL3 pack; use the \
-         model's GGUF file",
-        artifact.display()
-    ))
-}
-
-/// What a Qwen3.6 CUDA start or check refuses by name before any weight is read: an EXL3 pack, and the speculative
-/// verify window (the n-gram draft, the K-row verify and the device rollback), which ran on the
-/// EXL3 layout only and returns through the step's many-rows path.
+/// What a Qwen3.6 CUDA start or check refuses by name before any weight is read: the speculative
+/// verify window, which returns through the step's many-rows path.
 pub(crate) fn check_cuda_serves(settings: &Q36Settings) -> Result<(), EngError> {
-    if settings.weights == WeightFormat::Exl3 {
-        return Err(exl3_refusal(&settings.artifact));
-    }
-    if settings.speculation.enabled()
-        || settings.draft_verify == VerifyMode::Krow
-        || settings.draft_rollback == RollbackMode::Device
-    {
+    if settings.speculation.enabled() {
         return Err(EngError::BadRequest(
             "engine config: Qwen3.6 CUDA speculative verify is removed until the step's \
              many-rows path brings it back; unset the draft options"
                 .to_owned(),
         ));
-    }
-    Ok(())
-}
-
-/// Refuses the combinations of an EXL3 entry that have no implementation: the MLX arm has no
-/// EXL3 reader, and the tiered and host-paged KV modes read GGUF blocks. Graph capture is allowed:
-/// a captured EXL3 step reads the picked experts on the device.
-fn check_weight_format(
-    format: WeightFormat,
-    options: &Q36Options,
-    backend: Backend,
-) -> Result<(), EngError> {
-    if format != WeightFormat::Exl3 {
-        return Ok(());
-    }
-    if backend != Backend::Cuda {
-        return Err(bad("weight_format exl3 is CUDA-only".into()));
-    }
-    for (set, key) in [
-        (options.tiered.is_some(), "tiered"),
-        (
-            options.kv_offload_host_bytes.is_some(),
-            "kv_offload_host_bytes",
-        ),
-    ] {
-        if set {
-            return Err(bad(format!("weight_format exl3 does not support {key}")));
-        }
     }
     Ok(())
 }
@@ -507,11 +341,7 @@ pub(crate) const MAX_CUDA_DEVICES: usize = 4;
 /// the EXL3 pack (its shard slicing is unproven), tiered experts and
 /// host-paged KV (both read whole GGUF blocks on one device), and graph
 /// capture (the capture window owns one stream).
-fn cuda_devices_of(
-    options: &Q36Options,
-    backend: Backend,
-    weights: WeightFormat,
-) -> Result<Vec<usize>, EngError> {
+fn cuda_devices_of(options: &Q36Options, backend: Backend) -> Result<Vec<usize>, EngError> {
     let Some(list) = &options.cuda_devices else {
         return Ok(vec![0]);
     };
@@ -531,9 +361,7 @@ fn cuda_devices_of(
     }
     if list.len() > 1 {
         for (set, key) in [
-            (weights == WeightFormat::Exl3, "weight_format exl3"),
             (options.tiered.is_some(), "tiered"),
-            (options.expert_bank.is_some(), "expert_bank"),
             (
                 options.kv_offload_host_bytes.is_some(),
                 "kv_offload_host_bytes",
@@ -610,24 +438,13 @@ pub(crate) fn speculator_of(
     }
 }
 
-/// The speculation members. An enabled mode needs an arm that has a verify window: the CUDA arm
-/// with an EXL3 pack or the MLX resident arm with GGUF blocks.
-fn speculation_of(
-    options: &Q36Options,
-    backend: Backend,
-    weights: WeightFormat,
-) -> Result<SpecConfig, EngError> {
+/// The speculation members. An enabled mode needs an arm that has a verify window: the MLX
+/// resident arm.
+fn speculation_of(options: &Q36Options, backend: Backend) -> Result<SpecConfig, EngError> {
     let config = SpecConfig::new(&options.spec_options())?;
-    if config.enabled()
-        && !matches!(
-            (backend, weights),
-            (Backend::Cuda, WeightFormat::Exl3) | (Backend::Mlx, WeightFormat::Gguf)
-        )
-    {
+    if config.enabled() && backend != Backend::Mlx {
         return Err(bad(
-            "draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the \
-             MLX arm with gguf"
-                .into(),
+            "draft_mode other than disabled needs the MLX arm".into()
         ));
     }
     // The MTP head has no draft step yet: accepting the mode would promise a speed the engine
@@ -662,37 +479,7 @@ pub(crate) struct TieredOptions {
     pub(crate) swaps_milli: Option<u32>,
 }
 
-/// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
-/// resident when the rest live in a host store. `slots` may name the exact count (8 to 256,
-/// from the 8 picks of one token) or stay absent for "the most that fit"; `mode` is `auto`
-/// (bank only when the resident load does not fit) or `on` (always bank), `auto` by default.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ExpertBankOptions {
-    pub(crate) slots: Option<u32>,
-    pub(crate) mode: Option<String>,
-    /// How many of the layer's hottest experts stay pinned in their slots instead of
-    /// competing under LRU; 0 (the default) is plain LRU.
-    pub(crate) sticky: Option<u32>,
-}
-
 pub(crate) use crate::family::slot_request::SlotRequest;
-
-/// Whether the banked load runs only when the resident load does not fit (`Auto`) or always
-/// (`On`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BankMode {
-    Auto,
-    On,
-}
-
-/// The checked `expert_bank` entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExpertBankSettings {
-    pub(crate) slots: SlotRequest,
-    pub(crate) mode: BankMode,
-    pub(crate) sticky: usize,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TieredSettings {
@@ -1076,18 +863,10 @@ pub(crate) struct Q36Settings {
     pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
-    /// The banked EXL3 expert mode, or `None` for the resident engine.
-    pub(crate) expert_bank: Option<ExpertBankSettings>,
-    /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
-    pub(crate) weights: WeightFormat,
     /// Checked lowercase content pin for CUDA GGUF; absent preserves legacy verification.
     pub(crate) gguf_sha256: Option<String>,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
     pub(crate) speculation: SpecConfig,
-    /// How a verify window is rolled back. `Host` unless `draft_rollback` says `device`.
-    pub(crate) draft_rollback: RollbackMode,
-    /// How a verify window runs its rows. `Eager` unless `draft_verify` says `krow`.
-    pub(crate) draft_verify: VerifyMode,
     /// The CUDA device ordinals this engine spans, strictly ascending. `[0]` unless the
     /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
     pub(crate) cuda_devices: Vec<usize>,
@@ -1285,61 +1064,6 @@ pub(crate) fn cache_growth_per_position(
 /// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
 /// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
 /// `chunk_ready` keeps a tiered session off the chunk path).
-/// The checked `expert_bank` entry, or `None` when the member is absent. The refusals mirror the
-/// qualified state of the arm: the banked decode is eager-only and reads an EXL3 pack (so
-/// `tiered` and `kv_offload_host_bytes` cannot co-occur — both refuse `exl3` themselves). An
-/// enabled draft rides the same banked body (`ngram` today; `mtp` refuses globally, having no
-/// draft step).
-fn expert_bank_settings(
-    options: &Q36Options,
-    backend: Backend,
-    weights: WeightFormat,
-) -> Result<Option<ExpertBankSettings>, EngError> {
-    let Some(bank) = &options.expert_bank else {
-        return Ok(None);
-    };
-    if backend == Backend::Mlx {
-        return Err(bad(
-            "expert_bank is a CUDA member; the MLX arm refuses it".into()
-        ));
-    }
-    if weights != WeightFormat::Exl3 {
-        return Err(bad(
-            "expert_bank needs weight_format exl3: the host store reads an EXL3 pack".into(),
-        ));
-    }
-    if options.capture == Some(true) {
-        return Err(bad(
-            "expert_bank and capture exclude each other: the banked decode is eager only".into(),
-        ));
-    }
-    let slots = match bank.slots {
-        None => SlotRequest::Fit,
-        // From 8, the picks of one token: a smaller bank cannot hold one token's picks
-        // together, so the resolver would refuse every token after boot.
-        Some(count) => SlotRequest::Exactly(
-            usize::try_from(ranged("expert_bank.slots", Some(count), 8, 8, 256)?)
-                .map_err(|_| bad("expert_bank.slots exceeds usize".into()))?,
-        ),
-    };
-    let mode = match bank.mode.as_deref() {
-        None | Some("auto") => BankMode::Auto,
-        Some("on") => BankMode::On,
-        Some(other) => {
-            return Err(bad(format!(
-                "expert_bank.mode must be auto or on, got {other:?}"
-            )));
-        }
-    };
-    let sticky = usize::try_from(ranged("expert_bank.sticky", bank.sticky, 0, 0, 256)?)
-        .map_err(|_| bad("expert_bank.sticky exceeds usize".into()))?;
-    Ok(Some(ExpertBankSettings {
-        slots,
-        mode,
-        sticky,
-    }))
-}
-
 fn tiered_settings(
     options: &Q36Options,
     backend: Backend,
@@ -1487,13 +1211,12 @@ impl Q36Settings {
         geometric_checkpoint_window(env)?;
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
-        let weights = weight_format_of(options.weight_format.as_deref())?;
-        check_weight_format(weights, options, backend)?;
+        check_weight_format(options.weight_format.as_deref())?;
         let gguf_sha256 = options
             .gguf_sha256
             .as_deref()
             .map(|digest| {
-                if backend != Backend::Cuda || weights != WeightFormat::Gguf {
+                if backend != Backend::Cuda {
                     return Err(bad("gguf_sha256 requires CUDA GGUF weights".into()));
                 }
                 if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1502,11 +1225,11 @@ impl Q36Settings {
                 Ok(digest.to_ascii_lowercase())
             })
             .transpose()?;
-        let cuda_devices = cuda_devices_of(options, backend, weights)?;
-        let speculation = speculation_of(options, backend, weights)?;
+        let cuda_devices = cuda_devices_of(options, backend)?;
+        let speculation = speculation_of(options, backend)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
-        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes, backend)?;
-        let draft_verify = verify_of(options, draft_rollback, weights)?;
+        check_draft_rollback(options)?;
+        check_draft_verify(options)?;
         let mut budget_from_host = None;
         let mut cache_source = None;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
@@ -1684,12 +1407,10 @@ impl Q36Settings {
             Backend::Cuda => (0, 0),
         };
         let tiered = tiered_settings(options, backend)?;
-        let expert_bank = expert_bank_settings(options, backend, weights)?;
         let kv_cache = kv_cache_settings(options, &cuda_devices)?;
         // The card-driven choices apply to the single-device GGUF start that names neither
         // tiered experts nor host-paged KV; every member the config names is taken as given.
         let card_chosen = backend == Backend::Cuda
-            && weights == WeightFormat::Gguf
             && cuda_devices == [0]
             && tiered.is_none()
             && kv_offload_host_bytes.is_none();
@@ -1893,7 +1614,7 @@ impl Q36Settings {
             // A banked load stays eager: the slot resolver works on the host between the
             // readback and the launches, which a graph cannot do (an explicit `"capture": true`
             // was refused above).
-            capture: options.capture.unwrap_or(backend == Backend::Cuda) && expert_bank.is_none(),
+            capture: options.capture.unwrap_or(backend == Backend::Cuda),
             // The CUDA arm has no MLX compile seam: the key stays false there and
             // `ignored_mlx_keys_of` records it for the start line instead.
             compile,
@@ -1904,12 +1625,8 @@ impl Q36Settings {
             backend,
             prefix_reuse: false,
             tiered,
-            expert_bank,
-            weights,
             gguf_sha256,
             speculation,
-            draft_rollback,
-            draft_verify,
             cuda_devices,
             kv_cache,
             ignored_mlx_keys,
@@ -2074,17 +1791,14 @@ impl DiskExperts {
 #[cfg(test)]
 mod tests {
     use super::{
-        BF16_DEFAULT_PREFILL_CHUNK, Backend, BankMode, DEFAULT_CONTEXT_LIMIT,
-        DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE,
-        Q36Env, Q36Options, Q36Settings, SlotRequest, TieredSettings, activation_name,
-        activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
-        digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
+        DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE, Q36Env, Q36Options,
+        Q36Settings, SlotRequest, TieredSettings, activation_name, activation_of,
+        cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes, digest,
+        kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
         tokenizer_pin_for_spec,
     };
-    use super::{
-        QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
-        rollback_mode_name, rollback_of, verify_mode_name, verify_of,
-    };
+    use super::{QWEN36_MAX_WINDOW_ROWS, check_window_rows};
     use crate::EngError;
     use crate::family::session::StoreLimits;
     use crate::family::spec::{QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE};
@@ -2234,13 +1948,6 @@ mod tests {
             error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
             "{error}"
         );
-        let object =
-            serde_json::json!({"gguf_sha256": digest, "weight_format": "exl3"}).to_string();
-        let error = message(cuda_offload(&object));
-        assert!(
-            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -2254,96 +1961,12 @@ mod tests {
     }
 
     #[test]
-    fn expert_bank_refuses_wrong_arms_and_floors_slots_by_key() {
-        // Every refusal names the key an operator can fix; the multi-device arm refuses the
-        // member by name the same way it refuses tiered.
-        for (body, needle) in [
-            (r#"{"expert_bank":{}}"#, "weight_format exl3"),
-            (
-                r#"{"weight_format":"exl3","expert_bank":{},"capture":true}"#,
-                "capture",
-            ),
-            (
-                r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"mtp","mtp_model_dir":"/h"}"#,
-                "no draft step",
-            ),
-            (
-                r#"{"weight_format":"exl3","expert_bank":{"slots":4}}"#,
-                "expert_bank.slots",
-            ),
-            (
-                r#"{"weight_format":"exl3","expert_bank":{"slots":257}}"#,
-                "expert_bank.slots",
-            ),
-            (
-                r#"{"weight_format":"exl3","expert_bank":{"mode":"bogus"}}"#,
-                "expert_bank.mode",
-            ),
-            (
-                r#"{"weight_format":"exl3","expert_bank":{"sticky":257}}"#,
-                "expert_bank.sticky",
-            ),
-            (r#"{"cuda_devices":[0,1],"expert_bank":{}}"#, "expert_bank"),
-        ] {
-            let text = message(cuda_offload(body));
-            assert!(text.contains(needle), "{body}: {text}");
-        }
-        // The member is CUDA-only; on the MLX arm the refusal fires before the pack check
-        // (the cache limit the MLX settings also need comes from the env).
-        let options: Q36Options = serde_json::from_str(r#"{"expert_bank":{}}"#).unwrap();
-        let mlx = Q36Env {
-            cache_limit: Some("1024".to_string()),
-            ..Q36Env::default()
-        };
-        assert!(
-            message(settings_for(Some(&options), &mlx, Backend::Mlx))
-                .contains("the MLX arm refuses it")
-        );
-    }
-
-    #[test]
-    fn expert_bank_accepts_the_fit_request_and_explicit_slots_from_the_floor() {
-        // An ngram draft rides the banked window (the refusal above holds mtp out).
-        let draft =
-            cuda_offload(r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"ngram"}"#)
-                .unwrap();
-        assert!(matches!(
-            draft.speculation.mode,
-            crate::family::speculate::config::DraftMode::Ngram
-        ));
-        let fit = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{}}"#).unwrap();
-        assert_eq!(
-            fit.expert_bank
-                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
-            Some((SlotRequest::Fit, BankMode::Auto, 0))
-        );
-        let on = cuda_offload(
-            r#"{"weight_format":"exl3","expert_bank":{"slots":8,"mode":"on","sticky":64}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            on.expert_bank
-                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
-            Some((SlotRequest::Exactly(8), BankMode::On, 64))
-        );
-        let top = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":256}}"#).unwrap();
-        assert_eq!(
-            top.expert_bank.map(|bank| bank.slots),
-            Some(SlotRequest::Exactly(256))
-        );
-    }
-
-    #[test]
     fn cuda_devices_refuse_bad_shapes_and_combinations_by_name() {
         for (body, needle) in [
             (r#"{"cuda_devices":[]}"#, "cuda_devices"),
             (r#"{"cuda_devices":[0,0]}"#, "strictly ascending"),
             (r#"{"cuda_devices":[2,1]}"#, "strictly ascending"),
             (r#"{"cuda_devices":[0,1,2,3,4]}"#, "cuda_devices"),
-            (
-                r#"{"cuda_devices":[0,1],"weight_format":"exl3"}"#,
-                "weight_format exl3",
-            ),
             (r#"{"cuda_devices":[0,1]}"#, "capture"),
             (r#"{"cuda_devices":[0,1],"capture":true}"#, "capture"),
             (r#"{"cuda_devices":[0,1],"tiered":{"slots":8}}"#, "tiered"),
@@ -2632,9 +2255,10 @@ mod tests {
         }
     }
 
-    fn exl3_options(extra: impl FnOnce(&mut Q36Options)) -> Q36Options {
+    /// An Apple Silicon entry, the arm that runs a verify window, with `extra` applied.
+    fn window_options(extra: impl FnOnce(&mut Q36Options)) -> Q36Options {
         let mut options = Q36Options {
-            weight_format: Some("exl3".into()),
+            cache_limit_bytes: Some(8 << 30),
             ..Q36Options::default()
         };
         extra(&mut options);
@@ -2642,48 +2266,14 @@ mod tests {
     }
 
     #[test]
-    fn the_weight_format_defaults_to_gguf_and_accepts_exactly_two_spellings() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        assert_eq!(
-            settings_for(None, &Q36Env::default(), Backend::Cuda)
-                .unwrap()
-                .weights,
-            super::WeightFormat::Gguf
-        );
-        for (text, want) in [
-            ("gguf", super::WeightFormat::Gguf),
-            ("exl3", super::WeightFormat::Exl3),
-        ] {
-            let got = cuda(Q36Options {
-                weight_format: Some(text.into()),
-                ..Q36Options::default()
-            })
-            .unwrap();
-            assert_eq!(got.weights, want);
-            assert_eq!(super::weight_format_name(want), text);
-        }
-        for bad in ["", "EXL3", "Gguf", " exl3", "exl3 ", "exl2", "safetensors"] {
-            let text = message(cuda(Q36Options {
-                weight_format: Some(bad.into()),
-                ..Q36Options::default()
-            }));
-            assert_eq!(
-                text,
-                format!("engine config: weight_format must be gguf or exl3, got {bad:?}")
-            );
-        }
-    }
-
-    #[test]
     fn speculation_is_off_unless_the_mode_says_otherwise() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        let off = cuda(exl3_options(|_| ())).unwrap();
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
+        let off = mlx(window_options(|_| ())).unwrap();
         assert!(!off.speculation.enabled());
         assert_eq!(off.speculation, SpecConfig::default());
         // The members are checked even while a mode other than disabled is refused.
-        let members = cuda(exl3_options(|o| {
+        let members = mlx(window_options(|o| {
             o.num_draft_tokens = Some(3);
             o.ngram_match_min = Some(4);
         }))
@@ -2695,9 +2285,9 @@ mod tests {
 
     #[test]
     fn ngram_drafting_is_accepted_and_mtp_waits_for_its_draft_step() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        let on = cuda(exl3_options(|o| {
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
+        let on = mlx(window_options(|o| {
             o.draft_mode = Some("ngram".into());
             o.num_draft_tokens = Some(3);
             o.ngram_match_min = Some(4);
@@ -2706,7 +2296,7 @@ mod tests {
         assert!(on.speculation.enabled());
         assert_eq!(on.speculation.num_draft_tokens, 3);
         assert_eq!(on.speculation.ngram_match_min, 4);
-        let text = message(cuda(exl3_options(|o| {
+        let text = message(mlx(window_options(|o| {
             o.draft_mode = Some("mtp".into());
             o.mtp_model_dir = Some(PathBuf::from("/h"));
         })));
@@ -2714,44 +2304,11 @@ mod tests {
     }
 
     #[test]
-    fn the_mlx_arm_takes_ngram_but_not_the_device_rollback_or_mtp() {
+    fn a_speculative_window_of_more_than_eight_rows_is_refused_by_name() {
         let mlx =
             |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
-        let on = mlx(Q36Options {
-            draft_mode: Some("ngram".into()),
-            num_draft_tokens: Some(3),
-            cache_limit_bytes: Some(8 << 30),
-            ..Q36Options::default()
-        })
-        .unwrap();
-        assert!(on.speculation.enabled());
-        assert_eq!(on.speculation.num_draft_tokens, 3);
-        assert_eq!(on.draft_rollback, super::RollbackMode::Host);
-        assert_eq!(
-            message(mlx(Q36Options {
-                draft_mode: Some("ngram".into()),
-                draft_rollback: Some("device".into()),
-                ..Q36Options::default()
-            })),
-            "engine config: draft_rollback device is CUDA-only: the MLX arm rolls back with a \
-             shared-handle snapshot"
-        );
-        assert_eq!(
-            message(mlx(Q36Options {
-                draft_mode: Some("mtp".into()),
-                mtp_model_dir: Some(PathBuf::from("/h")),
-                ..Q36Options::default()
-            })),
-            "engine config: draft_mode mtp has no draft step yet"
-        );
-    }
-
-    #[test]
-    fn a_speculative_window_of_more_than_eight_rows_is_refused_by_name() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
         for rows in [9, 16, 64] {
-            let text = message(cuda(exl3_options(|o| {
+            let text = message(mlx(window_options(|o| {
                 o.draft_mode = Some("ngram".into());
                 o.draft_max_rows = Some(rows);
             })));
@@ -2767,10 +2324,10 @@ mod tests {
 
     #[test]
     fn eight_rows_are_accepted_as_a_cap_not_as_a_qualification() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
         for rows in 2..=8 {
-            let on = cuda(exl3_options(|o| {
+            let on = mlx(window_options(|o| {
                 o.draft_mode = Some("ngram".into());
                 o.draft_max_rows = Some(rows);
             }))
@@ -2780,7 +2337,7 @@ mod tests {
             assert!(on.speculation.window_drafts() < QWEN36_MAX_WINDOW_ROWS);
         }
         assert_eq!(QWEN36_MAX_WINDOW_ROWS, 8);
-        let default_on = cuda(exl3_options(|o| o.draft_mode = Some("ngram".into()))).unwrap();
+        let default_on = mlx(window_options(|o| o.draft_mode = Some("ngram".into()))).unwrap();
         assert_eq!(
             default_on.speculation.max_rows, QWEN36_MAX_WINDOW_ROWS,
             "the default row cap is the Qwen3.6 cap: speculation on by default needs no override"
@@ -2788,152 +2345,11 @@ mod tests {
     }
 
     #[test]
-    fn draft_rollback_is_host_unless_the_member_says_device() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        assert_eq!(
-            cuda(exl3_options(|_| {})).unwrap().draft_rollback,
-            RollbackMode::Host
-        );
-        assert_eq!(
-            cuda(exl3_options(|o| o.draft_rollback = Some("host".into())))
-                .unwrap()
-                .draft_rollback,
-            RollbackMode::Host
-        );
-        let device = cuda(exl3_options(|o| {
-            o.draft_mode = Some("ngram".into());
-            o.draft_rollback = Some("device".into());
-        }))
-        .unwrap();
-        assert_eq!(device.draft_rollback, RollbackMode::Device);
-        assert_eq!(rollback_mode_name(device.draft_rollback), "device");
-        assert_eq!(rollback_mode_name(RollbackMode::default()), "host");
-    }
-
-    #[test]
-    fn draft_rollback_device_is_refused_without_speculation_and_with_an_unknown_value() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        let text = message(cuda(exl3_options(|o| {
-            o.draft_rollback = Some("device".into())
-        })));
-        assert!(
-            text.contains("draft_rollback device needs draft_mode ngram"),
-            "{text}"
-        );
-        for bad_value in ["Device", "gpu", "", "1"] {
-            let text = message(cuda(exl3_options(|o| {
-                o.draft_mode = Some("ngram".into());
-                o.draft_rollback = Some(bad_value.into());
-            })));
-            assert!(
-                text.contains("draft_rollback must be host or device"),
-                "{bad_value:?}: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn draft_rollback_device_is_refused_with_the_host_paged_kv() {
-        let speculation = SpecConfig::new(&SpecOptions {
-            draft_mode: Some("ngram".into()),
-            ..SpecOptions::default()
-        })
-        .unwrap();
-        let options = Q36Options {
-            draft_rollback: Some("device".into()),
-            ..Q36Options::default()
-        };
-        let text = format!(
-            "{:?}",
-            rollback_of(&options, &speculation, Some(1 << 30), Backend::Cuda).unwrap_err()
-        );
-        assert!(text.contains("kv_offload_host_bytes"), "{text}");
-        assert_eq!(
-            rollback_of(&options, &speculation, None, Backend::Cuda).unwrap(),
-            RollbackMode::Device
-        );
-    }
-
-    #[test]
-    fn draft_verify_is_eager_unless_the_member_says_krow() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        assert_eq!(
-            cuda(exl3_options(|_| {})).unwrap().draft_verify,
-            VerifyMode::Eager
-        );
-        assert_eq!(
-            cuda(exl3_options(|o| o.draft_verify = Some("eager".into())))
-                .unwrap()
-                .draft_verify,
-            VerifyMode::Eager
-        );
-        let krow = cuda(exl3_options(|o| {
-            o.draft_mode = Some("ngram".into());
-            o.draft_rollback = Some("device".into());
-            o.draft_verify = Some("krow".into());
-        }))
-        .unwrap();
-        assert_eq!(krow.draft_verify, VerifyMode::Krow);
-        assert_eq!(krow.draft_rollback, RollbackMode::Device);
-        assert_eq!(verify_mode_name(krow.draft_verify), "krow");
-        assert_eq!(verify_mode_name(VerifyMode::default()), "eager");
-    }
-
-    #[test]
-    fn draft_verify_krow_is_refused_without_the_device_rollback_and_with_an_unknown_value() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        // The default rollback is host; an explicit host is refused the same way.
-        for rollback in [None, Some("host")] {
-            let text = message(cuda(exl3_options(|o| {
-                o.draft_mode = Some("ngram".into());
-                o.draft_rollback = rollback.map(Into::into);
-                o.draft_verify = Some("krow".into());
-            })));
-            assert!(
-                text.contains("draft_verify krow needs draft_rollback device"),
-                "{rollback:?}: {text}"
-            );
-        }
-        for bad_value in ["Krow", "k-row", "", "1", "device"] {
-            let text = message(cuda(exl3_options(|o| {
-                o.draft_mode = Some("ngram".into());
-                o.draft_rollback = Some("device".into());
-                o.draft_verify = Some(bad_value.into());
-            })));
-            assert!(
-                text.contains("draft_verify must be eager or krow"),
-                "{bad_value:?}: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn draft_verify_krow_is_refused_without_the_exl3_pack() {
-        let options = Q36Options {
-            draft_verify: Some("krow".into()),
-            ..Q36Options::default()
-        };
-        let text = format!(
-            "{:?}",
-            verify_of(&options, RollbackMode::Device, WeightFormat::Gguf).unwrap_err()
-        );
-        assert!(text.contains("weight_format exl3"), "{text}");
-        assert_eq!(
-            verify_of(&options, RollbackMode::Device, WeightFormat::Exl3).unwrap(),
-            VerifyMode::Krow
-        );
-    }
-
-    #[test]
     fn the_cap_is_confined_to_enabled_qwen36_speculation() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
         // A disabled entry feeds no window: the generic 2..=64 range still applies and loads.
-        let off = cuda(exl3_options(|o| o.draft_max_rows = Some(64))).unwrap();
+        let off = mlx(window_options(|o| o.draft_max_rows = Some(64))).unwrap();
         assert!(!off.speculation.enabled());
         assert_eq!(off.speculation.max_rows, 64);
         // The generic speculation range is not narrowed for other users of `SpecConfig`.
@@ -2955,104 +2371,82 @@ mod tests {
     }
 
     #[test]
-    fn ngram_drafting_never_meets_a_host_paged_kv_cache() {
-        // A window exports the whole session state, which the host-paged cache cannot do. EXL3
-        // weights, the only weights a window runs on, already refuse that cache by name.
-        let options = exl3_options(|o| {
-            o.draft_mode = Some("ngram".into());
-            o.kv_dtype = Some("q8".into());
-            o.kv_offload_host_bytes = Some(1 << 30);
-        });
-        let text = message(settings_for(
-            Some(&options),
-            &Q36Env::default(),
-            Backend::Cuda,
-        ));
-        assert_eq!(
-            text,
-            "engine config: weight_format exl3 does not support kv_offload_host_bytes"
-        );
-    }
-
-    #[test]
-    fn an_enabled_draft_mode_is_refused_where_no_window_runs() {
-        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the MLX arm with gguf";
-        let gguf = Q36Options {
-            draft_mode: Some("ngram".into()),
-            ..Q36Options::default()
-        };
-        let cuda_gguf = settings_for(Some(&gguf), &Q36Env::default(), Backend::Cuda);
-        assert_eq!(message(cuda_gguf), want);
-        let exl3 = exl3_options(|o| o.draft_mode = Some("ngram".into()));
-        let mlx = settings_for(Some(&exl3), &Q36Env::default(), Backend::Mlx);
-        assert_eq!(
-            message(mlx),
-            "engine config: weight_format exl3 is CUDA-only"
-        );
-    }
-
-    #[test]
     fn a_bad_speculation_member_is_named() {
-        let cuda =
-            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        let text = message(cuda(exl3_options(|o| o.draft_mode = Some("model".into()))));
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
+        let text = message(mlx(window_options(|o| o.draft_mode = Some("model".into()))));
         assert!(
             text.contains("draft_mode must be disabled, ngram or mtp"),
             "{text}"
         );
-        let text = message(cuda(exl3_options(|o| o.num_draft_tokens = Some(0))));
+        let text = message(mlx(window_options(|o| o.num_draft_tokens = Some(0))));
         assert!(text.contains("num_draft_tokens"), "{text}");
-        let text = message(cuda(exl3_options(|o| o.draft_mode = Some("mtp".into()))));
+        let text = message(mlx(window_options(|o| o.draft_mode = Some("mtp".into()))));
         assert!(text.contains("mtp_model_dir"), "{text}");
     }
 
     #[test]
-    fn an_exl3_entry_is_refused_where_nothing_reads_it() {
-        let mlx = settings_for(
-            Some(&exl3_options(|_| ())),
-            &Q36Env::default(),
-            Backend::Mlx,
+    fn a_draft_mode_is_refused_on_the_cuda_arm() {
+        let options = Q36Options {
+            draft_mode: Some("ngram".into()),
+            ..Q36Options::default()
+        };
+        let cuda = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            message(cuda),
+            "engine config: draft_mode other than disabled needs the MLX arm"
+        );
+    }
+
+    #[test]
+    fn the_weight_format_is_gguf_and_an_exl3_pack_is_refused_by_name() {
+        for backend in [Backend::Cuda, Backend::Mlx] {
+            let entry = |format: &str| {
+                let options = window_options(|o| o.weight_format = Some(format.into()));
+                settings_for(Some(&options), &Q36Env::default(), backend)
+            };
+            assert!(entry("gguf").is_ok());
+            assert_eq!(
+                message(entry("exl3")),
+                "engine config: weight_format exl3 is not supported; use the model's GGUF file"
+            );
+            for bad in ["", "EXL3", "Gguf", " gguf", "safetensors"] {
+                assert_eq!(
+                    message(entry(bad)),
+                    format!("engine config: weight_format must be gguf, got {bad:?}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draft_verify_and_draft_rollback_take_their_one_value() {
+        let entry = |extra: &dyn Fn(&mut Q36Options)| {
+            settings_for(
+                Some(&window_options(extra)),
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+        };
+        assert!(entry(&|o| o.draft_verify = Some("eager".into())).is_ok());
+        assert!(entry(&|o| o.draft_rollback = Some("host".into())).is_ok());
+        assert_eq!(
+            message(entry(&|o| o.draft_verify = Some("krow".into()))),
+            "engine config: draft_verify must be eager, got \"krow\""
         );
         assert_eq!(
-            message(mlx),
-            "engine config: weight_format exl3 is CUDA-only"
+            message(entry(&|o| o.draft_rollback = Some("device".into()))),
+            "engine config: draft_rollback must be host, got \"device\""
         );
-        let tiered = exl3_options(|o| {
-            o.tiered = Some(super::TieredOptions {
-                slots: Some(SlotRequest::Exactly(8)),
-                ..super::TieredOptions::default()
-            })
-        });
-        let paged = exl3_options(|o| {
-            o.kv_dtype = Some("q8".into());
-            o.kv_offload_host_bytes = Some(1 << 30);
-        });
-        for (options, key) in [(tiered, "tiered"), (paged, "kv_offload_host_bytes")] {
-            let text = message(settings_for(
-                Some(&options),
-                &Q36Env::default(),
-                Backend::Cuda,
-            ));
-            assert_eq!(
-                text,
-                format!("engine config: weight_format exl3 does not support {key}")
-            );
-        }
-        let plain = settings_for(
-            Some(&exl3_options(|_| ())),
-            &Q36Env::default(),
-            Backend::Cuda,
+    }
+
+    #[test]
+    fn an_expert_bank_object_is_an_unknown_key() {
+        let error = serde_json::from_str::<Q36Options>(r#"{"expert_bank":{}}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `expert_bank`"),
+            "{error}"
         );
-        assert_eq!(plain.unwrap().weights, super::WeightFormat::Exl3);
-        // Graph capture is accepted for an EXL3 entry: the step reads the picks on the device.
-        let captured = settings_for(
-            Some(&exl3_options(|o| o.capture = Some(true))),
-            &Q36Env::default(),
-            Backend::Cuda,
-        )
-        .unwrap();
-        assert_eq!(captured.weights, super::WeightFormat::Exl3);
-        assert!(captured.capture);
     }
 
     #[test]
@@ -3062,16 +2456,7 @@ mod tests {
                 .unwrap()
                 .capture
         };
-        // Unset: every CUDA entry captures (EXL3 and GGUF alike); an explicit false rolls back.
-        assert!(capture(&exl3_options(|_| ()), Backend::Cuda));
-        assert!(!capture(
-            &exl3_options(|o| o.capture = Some(false)),
-            Backend::Cuda
-        ));
-        assert!(capture(
-            &exl3_options(|o| o.capture = Some(true)),
-            Backend::Cuda
-        ));
+        // Unset: a CUDA entry captures; an explicit false rolls back.
         let gguf = Q36Options::default();
         assert!(capture(&gguf, Backend::Cuda));
         assert!(!capture(
@@ -3308,12 +2693,8 @@ mod tests {
                 backend: Backend::Mlx,
                 prefix_reuse: false,
                 tiered: None,
-                expert_bank: None,
-                weights: super::WeightFormat::Gguf,
                 gguf_sha256: None,
                 speculation: SpecConfig::default(),
-                draft_rollback: RollbackMode::Host,
-                draft_verify: VerifyMode::Eager,
                 ignored_mlx_keys: Vec::new(),
                 derived: Vec::new(),
                 host_note: None,
