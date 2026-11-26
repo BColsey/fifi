@@ -108,6 +108,8 @@ pub(in crate::family::inkling2) struct PrefillConv {
     raw: DeviceBuffer,
     convolved: DeviceBuffer,
     weights: DeviceBuffer,
+    // One word per row, for the whole-plane convolution of an expert plane.
+    status: DeviceBuffer,
     stride: usize,
     initial: usize,
     rows: usize,
@@ -195,6 +197,25 @@ impl ResidentOutput<'_> {
             "incorrect resident CUDA attention convolution destination",
         ))
     }
+}
+
+/// Rows of `stride` bytes of native-endian floats, refused when any value is not finite.
+fn finite_rows(bytes: &[u8], stride: usize, error: &str) -> Result<Vec<Vec<f32>>, EngError> {
+    bytes
+        .chunks_exact(stride)
+        .map(|row| {
+            let row: Vec<_> = row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_ne_bytes(*w))
+                .collect();
+            row.iter()
+                .all(|x| x.is_finite())
+                .then_some(row)
+                .ok_or_else(|| bad(error))
+        })
+        .collect()
 }
 
 pub(in crate::family::inkling2) fn projection_side(query: bool) -> &'static [usize] {
@@ -355,7 +376,7 @@ impl ResidentAttention {
         if weights.len() != taps || prior.iter().any(|row| row.len() != width) {
             return Err(bad("invalid CUDA prefill convolution weights or history"));
         }
-        let bytes = 4 * (2 * plane + past + taps);
+        let bytes = 4 * (2 * plane + past + taps + rows);
         if (context.memory_info()?.free as u64).saturating_sub(bytes as u64) < DEVICE_HEADROOM {
             return Ok(None);
         }
@@ -364,9 +385,10 @@ impl ResidentAttention {
                 context.allocate(4 * (plane + past))?,
                 context.allocate(4 * plane)?,
                 context.allocate(4 * taps)?,
+                context.allocate(4 * rows)?,
             ])
         })();
-        let [raw, convolved, kernel] = match buffers {
+        let [raw, convolved, kernel, status] = match buffers {
             Ok(buffers) => buffers,
             Err(EngError::MemoryPlan(_)) => return Ok(None),
             Err(error) => return Err(error),
@@ -386,6 +408,7 @@ impl ResidentAttention {
             raw,
             convolved,
             weights: kernel,
+            status,
             stride: 4 * width,
             initial,
             rows,
@@ -420,8 +443,8 @@ impl ResidentAttention {
         &self,
         context: &CudaContext,
         conv: &mut PrefillConv,
-        status: DeviceRange<'_>,
     ) -> Result<(), EngError> {
+        let status = conv.status.range(0, conv.status.bytes())?;
         let destination = conv.destination(conv.rows, false)?;
         let convolution = destination
             .convolution
@@ -453,6 +476,23 @@ impl ResidentAttention {
         Ok(())
     }
 
+    /// [`Self::finish_prefill_expert_conv`], then the convolved rows in order. Publish nothing
+    /// on failure.
+    pub(in crate::family::inkling2) fn finish_prefill_expert_conv_rows(
+        &self,
+        context: &CudaContext,
+        conv: &mut PrefillConv,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        self.finish_prefill_expert_conv(context, conv)?;
+        let mut bytes = vec![0; conv.rows * conv.stride];
+        conv.convolved.read_at(&self.stream, 0, &mut bytes)?;
+        finite_rows(
+            &bytes,
+            conv.stride,
+            "non-finite CUDA Inkling expert convolution",
+        )
+    }
+
     pub(in crate::family::inkling2) fn prefill_conv_tail(
         &self,
         conv: PrefillConv,
@@ -465,20 +505,12 @@ impl ResidentAttention {
         let first = PrefillConv::PAST + conv.written - count;
         conv.raw
             .read_at(&self.stream, first * conv.stride, &mut bytes)?;
-        let mut tail = VecDeque::with_capacity(count);
-        for row in bytes.chunks_exact(conv.stride).rev() {
-            let row: Vec<_> = row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|w| f32::from_ne_bytes(*w))
-                .collect();
-            if !row.iter().all(|x| x.is_finite()) {
-                return Err(bad("non-finite CUDA prefill convolution history"));
-            }
-            tail.push_back(row);
-        }
-        Ok(tail)
+        let rows = finite_rows(
+            &bytes,
+            conv.stride,
+            "non-finite CUDA prefill convolution history",
+        )?;
+        Ok(rows.into_iter().rev().collect())
     }
 
     pub(super) fn step_prefill_dispatch(

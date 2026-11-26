@@ -98,12 +98,6 @@ impl Scratch {
         Ok(expert_input)
     }
 
-    fn status(&self) -> Result<DeviceRange<'_>, EngError> {
-        let [p, q, _, o] = self.shape.words().unwrap();
-        self.device
-            .range((p + 2 * q + 3 * o) * 4, self.shape.rows * 4)
-    }
-
     fn materialize(
         &self,
         update: Option<(&CudaContext, DeviceRange<'_>)>,
@@ -199,7 +193,7 @@ impl CpuForward {
             return Ok(false);
         };
         let mlp_conv = if device_conv {
-            let Some(conv) = bridge.admit_mlp_conv(self, state, rows.len())? else {
+            let Some(conv) = self.admit_prompt_mlp_conv(state, layer, rows.len())? else {
                 return Ok(false);
             };
             Some(conv)
@@ -273,9 +267,9 @@ impl CpuForward {
         };
         bridge.publish_conv_tail(state, conv)?;
         let raw = if let Some(mut conv) = mlp_conv {
-            attention.finish_prefill_expert_conv(ctx, &mut conv, scratch.status()?)?;
+            attention.finish_prefill_expert_conv(ctx, &mut conv)?;
             let raw = scratch.materialize(Some((ctx, conv.convolved_plane()?)))?;
-            bridge.publish_mlp_conv_tail(state, conv)?;
+            self.publish_prompt_mlp_tail(state, conv)?;
             static USED_CONV: Once = Once::new();
             USED_CONV
                 .call_once(|| eprintln!("Inkling CUDA used resident expert output convolution"));

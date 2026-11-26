@@ -4,7 +4,7 @@
 use crate::family::inkling2::switches::Switch;
 use std::{borrow::Cow, sync::Once};
 
-use super::{CpuForward, GgufTextWeights, PromptRow, Role, bad, control_names};
+use super::{CpuForward, DeviceRange, GgufTextWeights, PromptRow, Role, bad, control_names};
 use crate::{
     EngError,
     family::inkling2::{
@@ -123,6 +123,7 @@ impl Visit<'_> {
         forward: &CpuForward,
         rows: &[PromptRow<'_>],
         inputs: &[Vec<f32>],
+        destination: Option<DeviceRange<'_>>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let control = forward.phase_span(Work::Controller);
         let messages = {
@@ -170,14 +171,14 @@ impl Visit<'_> {
                             hidden: forward.hidden(),
                             activations,
                         },
-                        None,
+                        destination,
                     ),
                     self.caps,
                     |row, id| routes[row].weight(id, forward.math.route_scale),
                 )?
                 .ok_or_else(|| bad("previously admitted Inkling resident MLP experts declined"))?
         };
-        if outputs.len() != rows.len() {
+        if outputs.len() != if destination.is_some() { 0 } else { rows.len() } {
             return Err(bad("incorrect Inkling resident MLP output rows"));
         }
         static USED: Once = Once::new();

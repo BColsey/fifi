@@ -415,6 +415,12 @@ impl CpuForward {
         if capacity < 2 {
             return Ok(None);
         }
+        // Without a caller's plane, the output convolution still runs on the device and the
+        // convolved rows come back in place of the raw ones.
+        let mut own = match resident {
+            Some(_) => None,
+            None => bridge.admit_conv(self, state, inputs.len())?,
+        };
         let mut outputs = Vec::with_capacity(inputs.len());
         for tile in inputs.chunks(capacity) {
             let refs: Vec<_> = tile
@@ -422,13 +428,15 @@ impl CpuForward {
                 .map(|row| row.each_ref().map(Vec::as_slice))
                 .collect();
             let (host, range) = projector.tile(&refs, keep)?;
-            outputs.extend(bridge.consume(
-                self,
-                state,
-                host,
-                range,
-                resident.as_deref_mut().map(|conv| (conv, false)),
-            )?);
+            let conv = match (resident.as_deref_mut(), own.as_mut()) {
+                (Some(conv), _) => Some((conv, false)),
+                (None, Some(conv)) => Some((conv, true)),
+                (None, None) => None,
+            };
+            outputs.extend(bridge.consume(self, state, host, range, conv)?);
+        }
+        if let Some(conv) = own {
+            bridge.publish_conv_tail(state, conv)?;
         }
         if resident_query {
             note_resident_queries(false);
@@ -948,6 +956,74 @@ pub(super) struct PrefillBridge<'a> {
     scales: Option<[std::borrow::Cow<'a, [f32]>; 2]>,
 }
 
+/// The MLP output convolution of a prompt visit on the device: the experts write their raw rows
+/// into the admitted plane, one launch convolves every row, and the raw tail becomes the visit's
+/// history.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl CpuForward {
+    pub(super) fn admit_prompt_mlp_conv(
+        &self,
+        state: &VisitState,
+        layer: &str,
+        rows: usize,
+    ) -> Result<Option<attention::prefill::PrefillConv>, EngError> {
+        if !Switch::PrefillResidentExpertConv.on() || self.math.sconv_kernel_size != 4 || rows < 2 {
+            return Ok(None);
+        }
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        let Some((context, device)) = weights.resident_attention() else {
+            return Ok(None);
+        };
+        let width = self.hidden();
+        let filter = self
+            .weights
+            .vec(&format!("{layer}.mlp_sconv.weight"), width * 4)?;
+        device.admit_prefill_conv(context, [rows, width], &state.conv.mlp.0, &filter)
+    }
+
+    /// Convolves the fully written expert plane, publishes its tail and returns the convolved
+    /// rows in order.
+    pub(super) fn finish_prompt_mlp_conv(
+        &self,
+        state: &mut VisitState,
+        mut conv: attention::prefill::PrefillConv,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let _span = self.phase_span(Work::Convolution);
+        let (context, device) = self.prompt_conv_device()?;
+        let rows = device.finish_prefill_expert_conv_rows(context, &mut conv)?;
+        state.conv.mlp.0 = device.prefill_conv_tail(conv)?;
+        Ok(rows)
+    }
+
+    /// Publishes the raw tail of a plane whose convolved rows the caller already consumed.
+    pub(super) fn publish_prompt_mlp_tail(
+        &self,
+        state: &mut VisitState,
+        conv: attention::prefill::PrefillConv,
+    ) -> Result<(), EngError> {
+        state.conv.mlp.0 = self.prompt_conv_device()?.1.prefill_conv_tail(conv)?;
+        Ok(())
+    }
+
+    fn prompt_conv_device(
+        &self,
+    ) -> Result<
+        (
+            &crate::kernels::cuda::CudaContext,
+            &attention::ResidentAttention,
+        ),
+        EngError,
+    > {
+        match &self.weights {
+            Weights::Gguf(weights) => weights.resident_attention(),
+            _ => None,
+        }
+        .ok_or_else(|| super::bad("Inkling prompt convolution lost its CUDA attention"))
+    }
+}
+
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 impl PrefillBridge<'_> {
     pub(super) fn admit_conv(
@@ -965,29 +1041,6 @@ impl PrefillBridge<'_> {
             .vec(&format!("{}.attn_sconv.weight", self.layer), width * 4)?;
         self.device
             .admit_prefill_conv(self.context, [rows, width], &state.conv.attn.0, &filter)
-    }
-
-    pub(super) fn admit_mlp_conv(
-        &self,
-        forward: &CpuForward,
-        state: &VisitState,
-        rows: usize,
-    ) -> Result<Option<attention::prefill::PrefillConv>, EngError> {
-        let width = forward.hidden();
-        let filter = forward
-            .weights
-            .vec(&format!("{}.mlp_sconv.weight", self.layer), width * 4)?;
-        self.device
-            .admit_prefill_conv(self.context, [rows, width], &state.conv.mlp.0, &filter)
-    }
-
-    pub(super) fn publish_mlp_conv_tail(
-        &self,
-        state: &mut VisitState,
-        conv: attention::prefill::PrefillConv,
-    ) -> Result<(), EngError> {
-        state.conv.mlp.0 = self.device.prefill_conv_tail(conv)?;
-        Ok(())
     }
 
     pub(super) fn publish_conv_tail(

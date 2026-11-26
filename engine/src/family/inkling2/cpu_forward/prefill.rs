@@ -426,6 +426,17 @@ impl CpuForward {
                 !verify,
             )?;
         }
+        // Verification journals keep the per-row MLP history.
+        let mlp_conv =
+            if rows.iter().all(|row| row.journal.is_none()) && !self.draft_window_enabled() {
+                self.admit_prompt_mlp_conv(state, &layer, rows.len())?
+            } else {
+                None
+            };
+        let destination = mlp_conv
+            .as_ref()
+            .map(|conv| conv.expert_destination())
+            .transpose()?;
         let mut projected = projected.into_iter().flatten();
         let inputs = rows.iter_mut().map(|row| {
             row.taps.capture(visit.state_slot, row.stream.current());
@@ -447,19 +458,22 @@ impl CpuForward {
                 self.finish_mlp_input(input, row.bank.as_ref(), physical, &layer)
             }
         });
-        let outputs = if batch_router {
+        let (outputs, written) = if batch_router {
             let mut inputs = match batched {
                 Some(inputs) => inputs,
                 None => inputs.collect::<Result<Vec<_>, _>>()?,
             };
             if let Some(resident) = resident {
-                resident.execute(self, rows, &inputs)?
+                (
+                    resident.execute(self, rows, &inputs, destination)?,
+                    destination.is_some(),
+                )
             } else {
                 if let Some(controller) = controller {
                     self.prompt_mlp_control(visit, &layer, rows, &mut inputs, controller)?;
                 }
                 let (mlp, retained) = self.prompt_routes(weights, physical, &prefix, inputs)?;
-                self.prompt_experts(weights, physical, &prefix, &mlp, retained)?
+                self.prompt_experts(weights, physical, &prefix, &mlp, (retained, destination))?
             }
         } else {
             let mlp = inputs
@@ -469,8 +483,19 @@ impl CpuForward {
                     Ok(MlpRow { route, input })
                 })
                 .collect::<Result<Vec<_>, EngError>>()?;
-            self.prompt_experts(weights, physical, &prefix, &mlp, None)?
+            self.prompt_experts(weights, physical, &prefix, &mlp, (None, destination))?
         };
+        if let Some(conv) = mlp_conv.filter(|_| written) {
+            for (row, output) in rows
+                .iter_mut()
+                .zip(self.finish_prompt_mlp_conv(state, conv)?)
+            {
+                row.stream.add_current(&output);
+            }
+            static USED: std::sync::Once = std::sync::Once::new();
+            USED.call_once(|| eprintln!("Inkling CUDA used prompt expert output convolution"));
+            return Ok(());
+        }
         for (row, output) in rows.iter_mut().zip(outputs) {
             if let Some(journal) = &mut row.journal {
                 let attention = journal
@@ -720,8 +745,8 @@ impl CpuForward {
         layer: usize,
         prefix: &str,
         mlp: &[MlpRow],
-        retained: Option<DeviceRange<'_>>,
-    ) -> Result<Vec<Vec<f32>>, EngError> {
+        (retained, destination): (Option<DeviceRange<'_>>, Option<DeviceRange<'_>>),
+    ) -> Result<(Vec<Vec<f32>>, bool), EngError> {
         let span = self.phase_span(super::Work::Experts);
         let routes: Vec<_> = mlp
             .iter()
@@ -749,11 +774,11 @@ impl CpuForward {
         if let Some(output) = weights.prefill_device_experts(
             names,
             layer as u32,
-            (batch, None),
+            (batch, destination),
             [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
             |row, id| mlp[row].route.weight(id, self.math.route_scale),
         )? {
-            return Ok(output);
+            return Ok((output, destination.is_some()));
         }
         // Draft conditioning and verification preserve the scalar expert group's
         // device activation and rank reduction, including on fallback.
@@ -766,26 +791,30 @@ impl CpuForward {
         };
         let Some(batch) = batch else {
             drop(span);
-            return mlp
-                .iter()
-                .map(|row| self.moe_with_route(layer, prefix, &row.input, &row.route))
-                .collect();
+            return Ok((
+                mlp.iter()
+                    .map(|row| self.moe_with_route(layer, prefix, &row.input, &row.route))
+                    .collect::<Result<_, _>>()?,
+                false,
+            ));
         };
-        Ok(mlp
-            .iter()
-            .zip(batch)
-            .map(|(input, results)| {
-                let mut output = vec![0.; self.hidden()];
-                for (&id, contribution) in input.route.selected.iter().zip(results) {
-                    add(
-                        &mut output,
-                        &contribution,
-                        input.route.weight(id, self.math.route_scale),
-                    );
-                }
-                output
-            })
-            .collect())
+        Ok((
+            mlp.iter()
+                .zip(batch)
+                .map(|(input, results)| {
+                    let mut output = vec![0.; self.hidden()];
+                    for (&id, contribution) in input.route.selected.iter().zip(results) {
+                        add(
+                            &mut output,
+                            &contribution,
+                            input.route.weight(id, self.math.route_scale),
+                        );
+                    }
+                    output
+                })
+                .collect(),
+            false,
+        ))
     }
 }
 
