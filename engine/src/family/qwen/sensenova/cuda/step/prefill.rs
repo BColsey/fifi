@@ -301,13 +301,12 @@ impl LoopStep<'_> {
                 norm,
             } => {
                 let layer = delta::Delta {
-                    qkvz,
-                    beta_alpha,
+                    rule: delta::Rule::Heads { qkvz, beta_alpha },
                     out,
-                    conv,
-                    a,
-                    dt_bias,
-                    norm,
+                    conv: StepIo::whole(conv)?,
+                    a: StepIo::whole(a)?,
+                    dt_bias: StepIo::whole(dt_bias)?,
+                    norm: StepIo::whole(norm)?,
                     key_heads: s.delta_key_heads,
                     key_dim: s.delta_key_dim,
                     value_heads: s.delta_value_heads,

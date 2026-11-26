@@ -26,15 +26,9 @@ use crate::family::project::cuda::{
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
 use crate::family::step::walk::{self, ChunkStep, Half, Visits};
-use crate::family::step::{experts, ffn, site};
-use crate::kernels::cuda::prefill::gdn_scan_seq::{
-    GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
-};
+use crate::family::step::{delta, experts, ffn, site};
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
-use crate::kernels::cuda::resident::block_ops::{
-    BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked,
-};
-use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
+use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP, MlaShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::resident::router::{
@@ -77,8 +71,8 @@ const _: () = assert!(
         && HEADS.is_multiple_of(8)
 );
 
-/// Rows per thread of the multi-row convolution kernel; shorter chunks use the one-row kernel.
-const CONV_ROWS_PER_THREAD: usize = 16;
+/// The three convolutions of a delta-rule layer in the order of their columns.
+const CONVS: [&str; 3] = ["ssm_conv1d_q", "ssm_conv1d_k", "ssm_conv1d_v"];
 /// Bytes of KV cache per position: seven attention layers of 576 f16 values.
 const KV_BYTES_PER_POSITION: u64 = SPEC.mla_layers.len() as u64 * MLA_ROW as u64 * 2;
 /// Smallest context a start accepts.
@@ -121,7 +115,6 @@ struct LayerNames {
     ssm_f_b: String,
     ssm_beta: String,
     ssm_rda: String,
-    conv: [String; 3],
     ssm_dt: String,
     ssm_a: String,
     ssm_norm: String,
@@ -184,11 +177,6 @@ impl LayerNames {
             ssm_f_b: n("ssm_f_b.weight"),
             ssm_beta: n("ssm_beta.weight"),
             ssm_rda: n("ssm_rda.weight"),
-            conv: [
-                n("ssm_conv1d_q.weight"),
-                n("ssm_conv1d_k.weight"),
-                n("ssm_conv1d_v.weight"),
-            ],
             ssm_dt: n("ssm_dt.bias"),
             ssm_a: n("ssm_a"),
             ssm_norm: n("ssm_norm.weight"),
@@ -232,12 +220,7 @@ struct Scratch {
     q8_cur: DeviceBuffer,
     proj: DeviceBuffer,
     q8_wide: DeviceBuffer,
-    proj_q: DeviceBuffer,
-    proj_k: DeviceBuffer,
-    proj_v: DeviceBuffer,
-    conv_q: DeviceBuffer,
-    conv_k: DeviceBuffer,
-    conv_v: DeviceBuffer,
+    proj_qkv: DeviceBuffer,
     scan_qkv: DeviceBuffer,
     scan_decay: DeviceBuffer,
     scan_proj: DeviceBuffer,
@@ -307,7 +290,7 @@ impl Scratch {
             + f(c * STREAMS * 17)
             + q(HIDDEN, c)
             + q(WIDTH, c)
-            + f(c * WIDTH) * 12
+            + f(c * WIDTH) * 9
             + f(c * TIME_RANK)
             + f(c * HEADS) * 2
             + f(c * Q_LORA) * 2
@@ -348,10 +331,12 @@ pub(crate) struct Raon1Device {
     hy: Hyper,
     names: Vec<LayerNames>,
     mla: Vec<MlaFactors>,
+    /// The taps of the `[q | k | v]` convolution of every delta-rule layer.
+    conv: Vec<DeviceBuffer>,
     sc: Scratch,
     /// `[rda layers][heads][head_dim][head_dim]` f32 delta-rule state.
     state: DeviceBuffer,
-    /// `[rda layers][3][3][width]` f32 convolution history.
+    /// `[rda layers][taps][3 * width]` f32 convolution history.
     hist: DeviceBuffer,
     /// `[mla layers][cells][576]` f16 latent cache.
     cache: DeviceBuffer,
@@ -394,6 +379,9 @@ impl Raon1Device {
                 name != "token_embd.weight"
                     && !name.ends_with("attn_k_b.weight")
                     && !name.ends_with("attn_v_b.weight")
+                    && !CONVS
+                        .iter()
+                        .any(|conv| name.ends_with(&format!("{conv}.weight")))
             })
             .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -464,6 +452,14 @@ impl Raon1Device {
                 wv_b: upload("attn_v_b.weight")?,
             });
         }
+        let mut conv = Vec::new();
+        for layer in (0..spec.layers).filter(|layer| !spec.mla_layers.contains(layer)) {
+            let mut taps = Vec::with_capacity(3 * WIDTH * SPEC.conv_kernel as usize);
+            for name in CONVS {
+                taps.extend(model.read_f32(&format!("blk.{layer}.{name}.weight"))?);
+            }
+            conv.push(ctx.upload(&f32_bytes(&taps))?);
+        }
         let sc = allocate_scratch(&ctx, vocab)?;
         let rda_layers = spec.layers - spec.mla_layers.len();
         let state = ctx.upload(&vec![0u8; rda_layers * HEADS * HEAD_DIM * HEAD_DIM * 4])?;
@@ -478,6 +474,7 @@ impl Raon1Device {
             hy,
             names: layer_names,
             mla,
+            conv,
             sc,
             state,
             hist,
@@ -636,113 +633,59 @@ impl Raon1Device {
         self.site().apply(&self.io(), resid, out, &self.sc.proj, n)
     }
 
-    fn rda_mixer(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
-        let sc = &self.sc;
-        let rda = names.ordinal;
-        self.io().mv(&names.attn_q, sc.cur_rows(), &sc.proj_q, n)?;
-        self.io().mv(&names.attn_k, sc.cur_rows(), &sc.proj_k, n)?;
-        self.io().mv(&names.attn_v, sc.cur_rows(), &sc.proj_v, n)?;
-        self.io().mv(&names.ssm_g, sc.cur_rows(), &sc.g2, n)?;
-        self.io()
-            .f16_mv(&names.ssm_f_a, &sc.cur, &sc.fa, n, TIME_RANK, HIDDEN)?;
-        self.io()
-            .f16_mv(&names.ssm_f_b, &sc.fa, &sc.g1, n, WIDTH, TIME_RANK)?;
-        self.io()
-            .f16_mv(&names.ssm_beta, &sc.cur, &sc.beta, n, HEADS, HIDDEN)?;
-        self.io()
-            .f16_mv(&names.ssm_rda, &sc.cur, &sc.delta, n, HEADS, HIDDEN)?;
-        let row = n * WIDTH * 4;
-        let hist_at = |which: usize| (rda * 3 + which) * CONV_TAPS * WIDTH * 4;
-        for (which, (input, output)) in [
-            (&sc.proj_q, &sc.conv_q),
-            (&sc.proj_k, &sc.conv_k),
-            (&sc.proj_v, &sc.conv_v),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let call = ConvCall {
-                shape: ConvShape {
-                    m: n,
-                    channels: WIDTH,
-                    ld: WIDTH,
-                },
-                proj: input.range(0, row)?,
-                weights: self.io().raw(&names.conv[which])?,
-                state: self.hist.range(hist_at(which), CONV_TAPS * WIDTH * 4)?,
-                out: output.range(0, row)?,
-            };
-            if n >= CONV_ROWS_PER_THREAD {
-                self.ctx
-                    .gdn_conv_rows(&self.stream, call, CONV_ROWS_PER_THREAD)?;
-            } else {
-                self.ctx.gdn_conv(&self.stream, call)?;
-            }
-        }
-        let state_bytes = HEADS * HEAD_DIM * HEAD_DIM * 4;
-        self.io().run(BlockOp::rda_pack(
-            n,
-            HEADS,
-            HEAD_DIM,
-            self.hy.gate_lower_bound,
-            RdaInputs {
-                q: sc.conv_q.range(0, row)?,
-                k: sc.conv_k.range(0, row)?,
-                v: sc.conv_v.range(0, row)?,
-                g1: sc.g1.range(0, row)?,
-                dt_bias: self.io().raw(&names.ssm_dt)?,
-                a: self.io().raw(&names.ssm_a)?,
-                beta: sc.beta.range(0, n * HEADS * 4)?,
-                delta: sc.delta.range(0, n * HEADS * 4)?,
-                g2: sc.g2.range(0, row)?,
-            },
-            RdaPacked {
-                qkv: sc.scan_qkv.range(0, 3 * row)?,
-                decay: sc.scan_decay.range(0, row)?,
-                proj: sc.scan_proj.range(0, n * (WIDTH + HEADS) * 4)?,
-            },
-        )?)?;
-        // The shared sequential scan: q/k L2 norms in the ggml form, a decay per key channel, a
-        // sigmoid output gate over the per-head RMS norm.
-        self.ctx.gdn_scan_seq_channel_decay(
-            &self.stream,
-            GdnChannelScanCall {
-                shape: ScanShape {
-                    m: n,
-                    p0: 0,
-                    ctx_tokens: n,
-                    n_k_heads: HEADS,
-                    n_v_heads: HEADS,
-                    head_dim: HEAD_DIM,
-                    conv_ld: 3 * WIDTH,
-                    ld: WIDTH + HEADS,
-                    z_off: 0,
-                    beta_off: WIDTH,
-                    alpha_off: WIDTH,
-                },
-                eps: GDN_SCAN_EPS,
+    fn rda_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {
+        let (sc, io, rda) = (&self.sc, self.io(), names.ordinal);
+        let layer = delta::Delta {
+            rule: delta::Rule::Channels(delta::Channels {
+                q: io.native(&names.attn_q)?,
+                k: io.native(&names.attn_k)?,
+                v: io.native(&names.attn_v)?,
+                gate: io.native(&names.ssm_g)?,
+                decay_a: io.raw(&names.ssm_f_a)?,
+                decay_b: io.raw(&names.ssm_f_b)?,
+                rank: TIME_RANK,
+                beta: io.raw(&names.ssm_beta)?,
+                delta: io.raw(&names.ssm_rda)?,
+                lower_bound: self.hy.gate_lower_bound,
                 norm_eps: self.hy.norm_eps,
-                conv: sc.scan_qkv.range(0, 3 * row)?,
-                proj: sc.scan_proj.range(0, n * (WIDTH + HEADS) * 4)?,
-                decay: sc.scan_decay.range(0, row)?,
-                norm_w: self.io().raw(&names.ssm_norm)?,
-                state: self.state.range(rda * state_bytes, state_bytes)?,
-                o_out: sc.scan_out.range(0, row)?,
-                status: None,
+                low: &sc.fa,
+                decay_in: &sc.g1,
+                decay: &sc.scan_decay,
+                gate_in: &sc.g2,
+                beta_rows: &sc.beta,
+                delta_rows: &sc.delta,
+                strengths: &sc.scan_proj,
+            }),
+            out: io.native(&names.attn_output)?,
+            conv: StepIo::whole(&self.conv[rda])?,
+            a: io.raw(&names.ssm_a)?,
+            dt_bias: io.raw(&names.ssm_dt)?,
+            norm: io.raw(&names.ssm_norm)?,
+            key_heads: HEADS,
+            key_dim: HEAD_DIM,
+            value_heads: HEADS,
+            value_dim: HEAD_DIM,
+            conv_kernel: SPEC.conv_kernel as usize,
+            conv_dim: 3 * WIDTH,
+        };
+        let (ring, record) = (layer.ring_floats() * 4, layer.record_floats() * 4);
+        delta::mix(
+            &io,
+            &layer,
+            &delta::DeltaRows {
+                input: sc.cur_rows(),
+                proj: &sc.proj_qkv,
+                conv_out: &sc.scan_qkv,
+                read: Rows::both(&sc.q8_wide, &sc.scan_out),
+                out: &sc.proj,
             },
-            GdnForm {
-                key_heads: GdnKeyHeads::Tiled,
-                l2: GdnL2::Ggml,
-                gate: GdnGate::Sigmoid,
+            delta::DeltaState {
+                ring: self.hist.range(rda * ring, ring)?,
+                record: self.state.range(rda * record, record)?,
+                context: self.cells,
             },
-        )?;
-        self.io()
-            .quantize(n, WIDTH, &sc.scan_out, None, Rows::q8(&sc.q8_wide))?;
-        self.io().mv(
-            &names.attn_output,
-            Rows::both(&sc.q8_wide, &sc.scan_out),
-            &sc.proj,
             n,
+            pos0,
         )
     }
 
@@ -1138,7 +1081,7 @@ impl Visits for Raon1Device {
     fn branch(&self, layer: usize, half: Half, n: usize, pos0: usize) -> Result<(), EngError> {
         let names = &self.names[layer];
         match (half, names.kind) {
-            (Half::Mixer, RaonKind::Rda) => self.rda_mixer(names, n),
+            (Half::Mixer, RaonKind::Rda) => self.rda_mixer(names, n, pos0),
             (Half::Mixer, RaonKind::Mla) => self.mla_mixer(names, n, pos0),
             (Half::Forward, _) if names.moe => self.moe_block(names, n),
             (Half::Forward, _) => self.dense_block(names, n),
@@ -1191,7 +1134,9 @@ impl ChunkStep for Raon1Device {
 
 fn state_bytes(spec: Raon1Spec) -> u64 {
     let rda = (spec.layers - spec.mla_layers.len()) as u64;
-    rda * (HEADS * HEAD_DIM * HEAD_DIM * 4) as u64 + rda * 3 * (CONV_TAPS * WIDTH * 4) as u64
+    // The record, the convolution history and the convolution taps of every delta-rule layer.
+    rda * (HEADS * HEAD_DIM * HEAD_DIM * 4) as u64
+        + rda * 3 * ((CONV_TAPS + SPEC.conv_kernel as usize) * WIDTH * 4) as u64
 }
 
 fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError> {
@@ -1209,12 +1154,7 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         q8_cur: q(HIDDEN, c)?,
         proj: f(c * HIDDEN)?,
         q8_wide: q(WIDTH, c)?,
-        proj_q: f(c * WIDTH)?,
-        proj_k: f(c * WIDTH)?,
-        proj_v: f(c * WIDTH)?,
-        conv_q: f(c * WIDTH)?,
-        conv_k: f(c * WIDTH)?,
-        conv_v: f(c * WIDTH)?,
+        proj_qkv: f(c * 3 * WIDTH)?,
         scan_qkv: f(c * 3 * WIDTH)?,
         scan_decay: f(c * WIDTH)?,
         scan_proj: f(c * (WIDTH + HEADS))?,

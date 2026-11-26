@@ -303,10 +303,14 @@ impl<'a> StepIo<'a> {
             );
         }
         if n > 1 && !packed {
-            return Err(EngError::BadRequest(format!(
-                "{}: {n} rows through the matvec need output rows back to back",
-                self.family
-            )));
+            // The matvec writes its rows back to back, so rows that are apart go one at a time.
+            let row = q8(k, 1);
+            for t in 0..n {
+                let y = y.slice(t * out.ld * 4, rows * 4)?;
+                self.ctx
+                    .matvec_native(self.stream, weight, x.q8.range(t * row, row)?, y, 1)?;
+            }
+            return Ok(());
         }
         self.ctx
             .matvec_native(self.stream, weight, x.q8.range(0, q8(k, n))?, y, n)
@@ -321,10 +325,11 @@ impl<'a> StepIo<'a> {
         !exact && !self.batched(weight, x, n, true)
     }
 
-    /// The F16 projection `y[t] = W x[t]` of `n` f32 rows.
-    pub(crate) fn f16_mv(
+    /// The projection `y[t] = W x[t]` of `n` f32 rows through the F16 matrix `w`, `rows` by
+    /// `cols`.
+    pub(crate) fn f16_project(
         &self,
-        name: &str,
+        w: DeviceRange<'_>,
         x: &DeviceBuffer,
         y: &DeviceBuffer,
         n: usize,
@@ -336,7 +341,7 @@ impl<'a> StepIo<'a> {
             DenseGemvCall {
                 shape: DenseGemvShape::packed(n, rows, cols),
                 dtype: DenseDtype::F16,
-                w: self.raw(name)?,
+                w,
                 x: x.range(0, n * cols * 4)?,
                 y: y.range(0, n * rows * 4)?,
             },

@@ -398,7 +398,12 @@ fn the_packed_delta_scan_matches_the_host_and_carries_its_state_between_calls() 
         .iter()
         .map(|d| r.up(d))
         .collect();
-    let packed_qkv = r.zeros(n * 3 * width);
+    // The conv rows as the scan reads them, `[q | k | v]` per token; the op scales `v` in place.
+    let rows_qkv: Vec<f32> = (0..n)
+        .flat_map(|t| [&q, &k, &v].map(|part| part[t * width..(t + 1) * width].to_vec()))
+        .flatten()
+        .collect();
+    let packed_qkv = r.up(&rows_qkv);
     let packed_decay = r.zeros(n * width);
     let packed_proj = r.zeros(n * (width + heads));
     let host_scan = |from: usize, to: usize, state: &mut Vec<f32>| -> Vec<f32> {
@@ -457,9 +462,6 @@ fn the_packed_delta_scan_matches_the_host_and_carries_its_state_between_calls() 
                 hd,
                 -5.0,
                 RdaInputs {
-                    q: slice(&bufs[0], width),
-                    k: slice(&bufs[1], width),
-                    v: slice(&bufs[2], width),
                     g1: slice(&bufs[3], width),
                     dt_bias: whole(&bufs[4]),
                     a: whole(&bufs[5]),

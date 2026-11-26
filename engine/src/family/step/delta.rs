@@ -1,20 +1,28 @@
-//! The gated delta-rule mixer of a visit.
+//! The delta-rule mixer of a visit.
 //!
-//! One fused projection writes the query, key, value and gate inputs of every row, a second the
-//! decay and write strengths, both into one strided row. A short causal convolution over the
-//! first columns carries its last inputs in a ring, the delta rule updates the layer's record
-//! and reads it, and an output projection returns to the hidden width. One row runs the
-//! one-step rule; a chunk runs the scan that walks its rows in order.
+//! Projections write the query, key, value and gate inputs of every row into one strided row. A
+//! short causal convolution over its first columns carries its last inputs in a ring, the delta
+//! rule updates the layer's record and reads it, and an output projection returns to the hidden
+//! width. A layer follows one of two rules. With one decay and one write strength per head, a
+//! fused projection writes the inputs and a second one the strengths, one row runs the one-step
+//! rule and a chunk the scan that walks its rows in order. With one decay per key channel, the
+//! query, key and value have a projection each, low-rank projections write the decay and the
+//! strengths, and every chunk runs the scan.
 
 use super::rows::{Out, Rows, StepIo, q8};
 use crate::EngError;
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
-    GDN_SCAN_EPS, GdnScanSeqCall, ScanShape, ScanWeights,
+    GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, GdnScanSeqCall,
+    ScanShape, ScanWeights,
 };
+use crate::kernels::cuda::resident::block_ops::{BlockOp, RdaInputs, RdaPacked};
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::gdn_delta::{DeltaCall, DeltaShape, DeltaWeights, GDN_EPS};
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange, NativeWeight};
+
+/// From this many rows a thread of the convolution walks this many rows of its channel.
+const CONV_ROWS_PER_THREAD: usize = 16;
 
 const F32: usize = size_of::<f32>();
 
@@ -22,23 +30,81 @@ fn floats(buffer: &DeviceBuffer, len: usize) -> Result<DeviceRange<'_>, EngError
     buffer.range(0, len * F32)
 }
 
+fn f32_rows<'a>(
+    io: &StepIo<'_>,
+    rows: Option<&'a DeviceBuffer>,
+    what: &str,
+) -> Result<&'a DeviceBuffer, EngError> {
+    rows.ok_or_else(|| {
+        EngError::BadRequest(format!(
+            "{}: the delta rule needs f32 rows for {what}",
+            io.family
+        ))
+    })
+}
+
 /// The weights and the widths of one delta-rule layer.
 #[derive(Clone, Copy)]
 pub(crate) struct Delta<'a> {
-    pub(crate) qkvz: &'a NativeWeight,
-    pub(crate) beta_alpha: &'a NativeWeight,
+    pub(crate) rule: Rule<'a>,
     pub(crate) out: &'a NativeWeight,
-    pub(crate) conv: &'a DeviceBuffer,
-    pub(crate) a: &'a DeviceBuffer,
-    pub(crate) dt_bias: &'a DeviceBuffer,
-    pub(crate) norm: &'a DeviceBuffer,
+    /// The taps of every convolved column.
+    pub(crate) conv: DeviceRange<'a>,
+    /// The decay scale of every value head.
+    pub(crate) a: DeviceRange<'a>,
+    /// The decay bias: one per value head, or one per key channel under [`Rule::Channels`].
+    pub(crate) dt_bias: DeviceRange<'a>,
+    pub(crate) norm: DeviceRange<'a>,
     pub(crate) key_heads: usize,
     pub(crate) key_dim: usize,
     pub(crate) value_heads: usize,
     pub(crate) value_dim: usize,
     pub(crate) conv_kernel: usize,
-    /// Columns of the fused projection the convolution covers.
+    /// Columns of the strided row the convolution covers.
     pub(crate) conv_dim: usize,
+}
+
+/// How a layer forms its decay and its write strength.
+#[derive(Clone, Copy)]
+pub(crate) enum Rule<'a> {
+    /// One decay and one write strength per value head: `qkvz` writes the query, key, value and
+    /// gate inputs, `beta_alpha` the two logits of every head beside them.
+    Heads {
+        qkvz: &'a NativeWeight,
+        beta_alpha: &'a NativeWeight,
+    },
+    /// One decay per key channel.
+    Channels(Channels<'a>),
+}
+
+/// The weights and the rows of the per-channel rule. The F16 matrices read the f32 input rows.
+#[derive(Clone, Copy)]
+pub(crate) struct Channels<'a> {
+    pub(crate) q: &'a NativeWeight,
+    pub(crate) k: &'a NativeWeight,
+    pub(crate) v: &'a NativeWeight,
+    pub(crate) gate: &'a NativeWeight,
+    /// The two factors of the decay projection, `rank` wide between them.
+    pub(crate) decay_a: DeviceRange<'a>,
+    pub(crate) decay_b: DeviceRange<'a>,
+    pub(crate) rank: usize,
+    /// The write strength logit of every head, and what the value adds to it.
+    pub(crate) beta: DeviceRange<'a>,
+    pub(crate) delta: DeviceRange<'a>,
+    /// The log of the smallest decay.
+    pub(crate) lower_bound: f32,
+    pub(crate) norm_eps: f32,
+    /// Rows of `rank` floats.
+    pub(crate) low: &'a DeviceBuffer,
+    /// Rows of one float per channel: the decay logits, then the decay, and the gate inputs.
+    pub(crate) decay_in: &'a DeviceBuffer,
+    pub(crate) decay: &'a DeviceBuffer,
+    pub(crate) gate_in: &'a DeviceBuffer,
+    /// Rows of one float per head.
+    pub(crate) beta_rows: &'a DeviceBuffer,
+    pub(crate) delta_rows: &'a DeviceBuffer,
+    /// The `[gate | strength]` rows the scan reads.
+    pub(crate) strengths: &'a DeviceBuffer,
 }
 
 impl Delta<'_> {
@@ -58,7 +124,7 @@ impl Delta<'_> {
 pub(crate) struct DeltaRows<'a> {
     /// The normed input rows.
     pub(crate) input: Rows<'a>,
-    /// The strided `[fused | strengths]` rows.
+    /// The strided rows the projections write.
     pub(crate) proj: &'a DeviceBuffer,
     pub(crate) conv_out: &'a DeviceBuffer,
     /// What the rule reads from the record, and its q8_1 rows.
@@ -84,18 +150,26 @@ pub(crate) fn mix(
     n: usize,
     p0: usize,
 ) -> Result<(), EngError> {
-    let (fused, strengths) = (layer.qkvz.n_rows(), layer.beta_alpha.n_rows());
-    let (hidden, ld) = (layer.out.n_rows(), fused + strengths);
     let (vh, vd, conv_dim) = (layer.value_heads, layer.value_dim, layer.conv_dim);
-    let read_floats = vh * vd;
-    let Some(read_f32) = rows.read.f32 else {
-        return Err(EngError::BadRequest(format!(
-            "{}: the delta rule needs f32 rows for what it reads",
-            io.family
-        )));
+    let (hidden, read_floats) = (layer.out.n_rows(), vh * vd);
+    let read_f32 = f32_rows(io, rows.read.f32, "what it reads")?;
+    // The row the convolution reads: `ld` floats apart, the projections at their columns.
+    let (ld, parts) = match layer.rule {
+        Rule::Heads { qkvz, beta_alpha } => (
+            qkvz.n_rows() + beta_alpha.n_rows(),
+            [Some((qkvz, 0)), Some((beta_alpha, qkvz.n_rows())), None],
+        ),
+        Rule::Channels(c) => (
+            conv_dim,
+            [
+                Some((c.q, 0)),
+                Some((c.k, c.q.n_rows())),
+                Some((c.v, c.q.n_rows() + c.k.n_rows())),
+            ],
+        ),
     };
     let proj = floats(rows.proj, n * ld)?;
-    for (weight, col_off) in [(layer.qkvz, 0), (layer.beta_alpha, fused)] {
+    for (weight, col_off) in parts.into_iter().flatten() {
         let out = Out {
             dst: proj,
             ld,
@@ -103,89 +177,156 @@ pub(crate) fn mix(
         };
         io.project_into(weight, rows.input, n, out)?;
     }
-    io.ctx.gdn_conv(
-        io.stream,
-        ConvCall {
-            shape: ConvShape {
-                m: n,
-                channels: conv_dim,
-                ld,
-            },
-            // One row hands over the convolved columns alone.
-            proj: floats(rows.proj, if n == 1 { conv_dim } else { n * ld })?,
-            weights: floats(layer.conv, conv_dim * layer.conv_kernel)?,
-            state: state.ring,
-            out: floats(rows.conv_out, n * conv_dim)?,
+    let conv_call = ConvCall {
+        shape: ConvShape {
+            m: n,
+            channels: conv_dim,
+            ld,
         },
-    )?;
+        // One row hands over the convolved columns alone.
+        proj: floats(rows.proj, if n == 1 { conv_dim } else { n * ld })?,
+        weights: layer.conv.slice(0, conv_dim * layer.conv_kernel * F32)?,
+        state: state.ring,
+        out: floats(rows.conv_out, n * conv_dim)?,
+    };
+    if n >= CONV_ROWS_PER_THREAD {
+        io.ctx
+            .gdn_conv_rows(io.stream, conv_call, CONV_ROWS_PER_THREAD)?;
+    } else {
+        io.ctx.gdn_conv(io.stream, conv_call)?;
+    }
     let (conv, read) = (
         floats(rows.conv_out, n * conv_dim)?,
         floats(read_f32, n * read_floats)?,
     );
-    let (a, dt_bias, norm_w) = (
-        floats(layer.a, vh)?,
-        floats(layer.dt_bias, vh)?,
-        floats(layer.norm, vd)?,
-    );
-    if n == 1 {
-        io.ctx.gdn_delta(
-            io.stream,
-            DeltaCall {
-                shape: DeltaShape {
-                    m: 1,
-                    n_k_heads: layer.key_heads,
-                    n_v_heads: vh,
-                    conv_ld: conv_dim,
-                    ld,
-                    z_off: conv_dim,
-                    beta_off: fused,
-                    alpha_off: fused + vh,
+    let (a, norm_w) = (layer.a.slice(0, vh * F32)?, layer.norm.slice(0, vd * F32)?);
+    let shape = |ld: usize, z_off: usize, beta_off: usize, alpha_off: usize| ScanShape {
+        m: n,
+        p0: p0 as i64,
+        ctx_tokens: state.context,
+        n_k_heads: layer.key_heads,
+        n_v_heads: vh,
+        head_dim: vd,
+        conv_ld: conv_dim,
+        ld,
+        z_off,
+        beta_off,
+        alpha_off,
+    };
+    match layer.rule {
+        Rule::Heads { qkvz, .. } => {
+            let fused = qkvz.n_rows();
+            let dt_bias = layer.dt_bias.slice(0, vh * F32)?;
+            if n == 1 {
+                io.ctx.gdn_delta(
+                    io.stream,
+                    DeltaCall {
+                        shape: DeltaShape {
+                            m: 1,
+                            n_k_heads: layer.key_heads,
+                            n_v_heads: vh,
+                            conv_ld: conv_dim,
+                            ld,
+                            z_off: conv_dim,
+                            beta_off: fused,
+                            alpha_off: fused + vh,
+                        },
+                        eps: GDN_EPS,
+                        conv,
+                        proj,
+                        weights: DeltaWeights { a, dt_bias, norm_w },
+                        state: state.record,
+                        out: read,
+                    },
+                )?;
+            } else {
+                io.ctx.gdn_scan_seq(
+                    io.stream,
+                    GdnScanSeqCall {
+                        shape: shape(ld, conv_dim, fused, fused + vh),
+                        eps: GDN_SCAN_EPS,
+                        conv,
+                        proj,
+                        weights: ScanWeights { a, dt_bias, norm_w },
+                        state: state.record,
+                        o_out: read,
+                        status: None,
+                    },
+                )?;
+            }
+        }
+        Rule::Channels(c) => {
+            let x = f32_rows(io, rows.input.f32, "its low-rank projections")?;
+            let (width, in_dim) = (read_floats, c.q.k());
+            io.project(c.gate, rows.input, c.gate_in, n)?;
+            io.f16_project(c.decay_a, x, c.low, n, c.rank, in_dim)?;
+            io.f16_project(c.decay_b, c.low, c.decay_in, n, width, c.rank)?;
+            io.f16_project(c.beta, x, c.beta_rows, n, vh, in_dim)?;
+            io.f16_project(c.delta, x, c.delta_rows, n, vh, in_dim)?;
+            let (decay, strengths) = (
+                floats(c.decay, n * width)?,
+                floats(c.strengths, n * (width + vh))?,
+            );
+            io.run(BlockOp::rda_pack(
+                n,
+                vh,
+                vd,
+                c.lower_bound,
+                RdaInputs {
+                    g1: floats(c.decay_in, n * width)?,
+                    dt_bias: layer.dt_bias.slice(0, width * F32)?,
+                    a,
+                    beta: floats(c.beta_rows, n * vh)?,
+                    delta: floats(c.delta_rows, n * vh)?,
+                    g2: floats(c.gate_in, n * width)?,
                 },
-                eps: GDN_EPS,
-                conv,
-                proj,
-                weights: DeltaWeights { a, dt_bias, norm_w },
-                state: state.record,
-                out: read,
-            },
-        )?;
-    } else {
-        io.ctx.gdn_scan_seq(
-            io.stream,
-            GdnScanSeqCall {
-                shape: ScanShape {
-                    m: n,
-                    p0: p0 as i64,
-                    ctx_tokens: state.context,
-                    n_k_heads: layer.key_heads,
-                    n_v_heads: vh,
-                    head_dim: vd,
-                    conv_ld: conv_dim,
-                    ld,
-                    z_off: conv_dim,
-                    beta_off: fused,
-                    alpha_off: fused + vh,
+                RdaPacked {
+                    qkv: conv,
+                    decay,
+                    proj: strengths,
                 },
-                eps: GDN_SCAN_EPS,
-                conv,
-                proj,
-                weights: ScanWeights { a, dt_bias, norm_w },
-                state: state.record,
-                o_out: read,
-                status: None,
-            },
-        )?;
+            )?)?;
+            // The q and k L2 norms in the ggml form, a sigmoid output gate over the per-head
+            // RMS norm.
+            io.ctx.gdn_scan_seq_channel_decay(
+                io.stream,
+                GdnChannelScanCall {
+                    shape: shape(width + vh, 0, width, width),
+                    eps: GDN_SCAN_EPS,
+                    norm_eps: c.norm_eps,
+                    conv,
+                    proj: strengths,
+                    decay,
+                    norm_w,
+                    state: state.record,
+                    o_out: read,
+                    status: None,
+                },
+                GdnForm {
+                    key_heads: GdnKeyHeads::Tiled,
+                    l2: GdnL2::Ggml,
+                    gate: GdnGate::Sigmoid,
+                },
+            )?;
+        }
     }
     if io.reads_q8(layer.out, rows.read, n) {
-        io.ctx.quantize_q8_1(
-            io.stream,
-            QuantizeCall {
-                x: read,
-                y: rows.read.q8.range(0, q8(read_floats, n))?,
-                k: read_floats,
-                ncols: n,
-            },
-        )?;
+        // Each rule keeps the quantizer its rows were first served with: the two round a tie
+        // differently, and a model's bytes follow the one it reads.
+        match layer.rule {
+            Rule::Heads { .. } => io.ctx.quantize_q8_1(
+                io.stream,
+                QuantizeCall {
+                    x: read,
+                    y: rows.read.q8.range(0, q8(read_floats, n))?,
+                    k: read_floats,
+                    ncols: n,
+                },
+            )?,
+            Rule::Channels(_) => {
+                io.quantize(n, read_floats, read_f32, None, Rows::q8(rows.read.q8))?;
+            }
+        }
     }
     io.project_into(layer.out, rows.read, n, Out::packed(rows.out, n, hidden)?)
 }

@@ -226,13 +226,13 @@ __global__ void fill_kernel(float *p, int count, float value) {
 
 /* The shared sequential scan (prefill/gdn_scan_seq, CHANNEL_DECAY form) reads the conv rows as
  * [q | k | v] of width 3 * w, a projection row [z | beta logits] and one decay value per key
- * channel. One block per token writes those from the Raon inputs: q and k copied, v scaled by the
- * per-head fold of its beta and delta logits, the decay exp(lower_bound * sigmoid(-(g1 + dt_bias)
- * * a)) of every channel, z copied from the output-gate rows and the beta logits. */
+ * channel. One block per token finishes those from the layer's rows: v of the conv row scaled in
+ * place by the per-head fold of its beta and delta logits, the decay exp(lower_bound *
+ * sigmoid(-(g1 + dt_bias) * a)) of every channel, z copied from the output-gate rows and the beta
+ * logits. */
 __global__ void __launch_bounds__(256) rda_pack_kernel(
-    const float *q, const float *k, const float *v, const float *g1, const float *dt_bias,
-    const float *a, const float *beta, const float *delta, const float *g2, float *qkv,
-    float *decay, float *proj, int heads, float lower_bound) {
+    const float *g1, const float *dt_bias, const float *a, const float *beta, const float *delta,
+    const float *g2, float *qkv, float *decay, float *proj, int heads, float lower_bound) {
     __shared__ float fold[256];
     const int t = blockIdx.x;
     const int w = heads * kRdaDim;
@@ -245,12 +245,10 @@ __global__ void __launch_bounds__(256) rda_pack_kernel(
         proj[proj_row + w + threadIdx.x] = bi;
     }
     __syncthreads();
+    float *v = qkv + (size_t)t * 3 * w + 2 * w;
     for (int i = threadIdx.x; i < w; i += blockDim.x) {
         const int h = i / kRdaDim;
-        float *dst = qkv + (size_t)t * 3 * w;
-        dst[i] = q[row + i];
-        dst[w + i] = k[row + i];
-        dst[2 * w + i] = v[row + i] * fold[h];
+        v[i] = v[i] * fold[h];
         const float raw = (g1[row + i] + dt_bias[i]) * a[h];
         decay[row + i] = expf(lower_bound * sigmoid_f(-raw));
         proj[proj_row + i] = g2[row + i];
@@ -519,21 +517,20 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             if (n < 1 || n > 65536 || heads < 1 || heads > 256 || hd != kRdaDim)
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
             const long long w = heads * hd;
-            for (int slot = 0; slot < 4; ++slot) slots.use(slot, n * w * 4, false);
-            slots.use(4, w * 4, false);
-            slots.use(5, heads * 4, false);
-            slots.use(6, n * heads * 4, false);
-            slots.use(7, n * heads * 4, false);
-            slots.use(8, n * w * 4, false);
-            slots.use(9, n * 3 * w * 4, true);
-            slots.use(10, n * w * 4, true);
-            slots.use(11, n * (w + heads) * 4, true);
+            slots.use(0, n * w * 4, false);
+            slots.use(1, w * 4, false);
+            slots.use(2, heads * 4, false);
+            slots.use(3, n * heads * 4, false);
+            slots.use(4, n * heads * 4, false);
+            slots.use(5, n * w * 4, false);
+            slots.use(6, n * 3 * w * 4, true);
+            slots.use(7, n * w * 4, true);
+            slots.use(8, n * (w + heads) * 4, true);
             if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
             rda_pack_kernel<<<(unsigned)n, 256, 0, s>>>(
                 (const float *)p[0], (const float *)p[1], (const float *)p[2], (const float *)p[3],
-                (const float *)p[4], (const float *)p[5], (const float *)p[6], (const float *)p[7],
-                (const float *)p[8], (float *)p[9], (float *)p[10], (float *)p[11], (int)heads,
-                f[0]);
+                (const float *)p[4], (const float *)p[5], (float *)p[6], (float *)p[7],
+                (float *)p[8], (int)heads, f[0]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB: {
