@@ -296,6 +296,7 @@ impl CudaContext {
     }
 
     /// Opts this lease into bounded backing reuse; other constructors stay uncached.
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     pub(crate) fn with_admission_cache(
         admission: &Admission,
         enabled: bool,
@@ -303,6 +304,7 @@ impl CudaContext {
         Self::with_admission(admission)?.attach_alloc_cache(enabled)
     }
 
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     pub(crate) fn alloc_cache_reserve(enabled: bool) -> u64 {
         if enabled {
             alloc_cache::MAX_IDLE_BYTES as u64
@@ -312,12 +314,14 @@ impl CudaContext {
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     pub(crate) fn alloc_cache_enabled(&self) -> bool {
         self.alloc_cache.is_some()
     }
 
     /// Lets cached blocks go idle without a device synchronize while the adapter owns one stream.
     /// A no-op without the cache.
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     pub(crate) fn set_lazy_alloc_return(&self, lazy: bool) {
         if let Some(cache) = &self.alloc_cache {
             cache.set_lazy_return(lazy);
@@ -327,6 +331,7 @@ impl CudaContext {
     /// Raises what the allocation cache serves and keeps, for a pass whose frames are tall: blocks
     /// up to `max_block` bytes, `max_idle` bytes idle. The caller charges `max_idle` to its
     /// work reserve. A no-op without the cache.
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     pub(crate) fn set_alloc_cache_limits(&self, max_block: usize, max_idle: usize) {
         if let Some(cache) = &self.alloc_cache {
             cache.set_limits(alloc_cache::CacheLimits {
@@ -336,6 +341,7 @@ impl CudaContext {
         }
     }
 
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     pub(crate) fn drain_alloc_cache(&self) -> Result<(), EngError> {
         match &self.alloc_cache {
             Some(cache) => cache.drain(),
@@ -360,6 +366,7 @@ impl CudaContext {
         Self::with_workspace(caps)?.attach_alloc_cache(enabled)
     }
 
+    #[allow(dead_code, reason = "no start enables the allocation cache since the Flint CUDA executor was removed")]
     fn attach_alloc_cache(mut self, enabled: bool) -> Result<Self, EngError> {
         if enabled {
             self.alloc_cache = Some(Rc::new(alloc_cache::AllocCache::new(Rc::clone(

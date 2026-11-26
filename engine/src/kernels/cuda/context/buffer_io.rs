@@ -109,34 +109,6 @@ fn take_health_fault(lease: usize, reads: usize) -> Option<(usize, u32)> {
 }
 
 impl CudaContext {
-    #[cfg(test)]
-    pub(crate) fn test_poison_scalar_read_after(&self, skip: usize, status: u32) {
-        let lease = std::rc::Rc::as_ptr(&self.lease) as usize;
-        let target = self
-            .scalar_read_requests()
-            .checked_add(skip)
-            .unwrap()
-            .checked_add(1)
-            .unwrap();
-        TEST_HEALTH_FAULT.with_borrow_mut(|faults| {
-            assert!(
-                faults.insert(lease, (target, status)).is_none(),
-                "unconsumed health fault"
-            );
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_take_health_fault(&self, reads: usize) -> Option<(usize, u32)> {
-        take_health_fault(std::rc::Rc::as_ptr(&self.lease) as usize, reads)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_health_fault_pending(&self) -> bool {
-        TEST_HEALTH_FAULT
-            .with_borrow(|faults| faults.contains_key(&(std::rc::Rc::as_ptr(&self.lease) as usize)))
-    }
-
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(crate) fn buffer_requests(&self) -> BufferRequests {
         BUFFER_REQUESTS.with_borrow(|counts| {

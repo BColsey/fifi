@@ -41,11 +41,6 @@ pub(crate) fn rows_kernel(max_rows: usize) -> Option<RowsKernel> {
     }
 }
 
-/// The kernel a `window`-row dense projection of the K-row path runs: its group has `window` rows.
-pub(crate) fn expected_rows_kernel(window: usize) -> Option<RowsKernel> {
-    rows_kernel(window)
-}
-
 /// The decoded value of the native answer (`inference_cuda_exl3_rows_kernel`: 0, 1, 2, 4 or 8).
 pub(crate) fn rows_kernel_from_native(code: i32) -> Option<RowsKernel> {
     match code {
@@ -118,21 +113,6 @@ impl RowLaunches {
             RowKernel::ShortlistRows => &mut self.shortlist_rows,
         };
         *slot += 1;
-    }
-
-    /// The launches of the projection kernel `kernel`.
-    pub(crate) fn projection(&self, kernel: RowsKernel) -> u64 {
-        match kernel {
-            RowsKernel::SmallWide1 => self.small_wide1,
-            RowsKernel::Rows2 => self.rows2,
-            RowsKernel::Rows4 => self.rows4,
-            RowsKernel::Rows8 => self.rows8,
-        }
-    }
-
-    /// Launches of `grouped_project_rows<R>` of any R: the rows kernels, not the one-row body.
-    pub(crate) fn rows_kernels(&self) -> u64 {
-        self.rows2 + self.rows4 + self.rows8
     }
 
     /// One line for a record.

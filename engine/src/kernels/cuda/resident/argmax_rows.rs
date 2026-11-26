@@ -29,6 +29,10 @@
 //! the K-row shortlist, the advance. The fold must be the last kernel that writes the status word;
 //! the two after it write no status.
 
+// The window fold and the greedy verify have no caller since the K-row verify step was removed;
+// their tests run them. `argmax_rows` itself serves the draft head.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::argmax_rows::{

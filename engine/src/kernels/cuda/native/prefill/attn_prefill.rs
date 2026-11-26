@@ -208,6 +208,7 @@ pub(in crate::kernels::cuda) enum AttnPrefillLaunch {
     /// when FIFI_FLINT_CUDA_Q8_TILED is armed; `use_tiled = false` is the same-entry
     /// old-path form the route test exercises. Predicate rejects fall back inside the
     /// entry and count into [`Q8_TILED_FALLBACKS`].
+    #[allow(dead_code, reason = "no caller since the Flint CUDA executor was removed")]
     Q8TiledRoute {
         use_tiled: bool,
     },

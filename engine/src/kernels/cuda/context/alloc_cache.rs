@@ -573,27 +573,6 @@ fn free_backing(
 
 #[cfg(test)]
 impl super::CudaContext {
-    pub(crate) fn test_watch_poisoned_cache_block(&self, buffer: &DeviceBuffer) {
-        let cache = self.alloc_cache.as_ref().expect("cache enabled");
-        assert!(Rc::ptr_eq(
-            cache,
-            buffer.alloc_cache.as_ref().expect("cached backing")
-        ));
-        let address = buffer
-            .raw
-            .as_ref()
-            .expect("live poisoned backing")
-            .address();
-        let mut pending = cache.poisoned_pending.borrow_mut();
-        assert!(!pending.contains(&address), "distinct poisoned backing");
-        pending.push(address);
-    }
-
-    pub(crate) fn test_poisoned_cache_hits(&self) -> usize {
-        self.alloc_cache
-            .as_ref()
-            .map_or(0, |cache| cache.poisoned_hits.get())
-    }
 }
 
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
