@@ -874,7 +874,38 @@ impl VisitState {
         self.ring_only = false;
     }
 
-    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    /// Adopts what a device-resident prefill pass read back (`INVARIANTS.md` of the pass lane,
+    /// section 1): `keys` and `values` newest first, as the ring yields them reversed; the four
+    /// raw convolution histories oldest first with three rows each, of which the last `valid`
+    /// exist; and the cursor `position`.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn publish_pass(
+        &mut self,
+        (keys, values): (Vec<Vec<f32>>, Vec<Vec<f32>>),
+        [k, v, attn, mlp]: [Vec<Vec<f32>>; 4],
+        (valid, capacity, position): (usize, usize, usize),
+    ) {
+        self.keys = keys.into_iter().map(Arc::new).collect();
+        self.values = values.into_iter().map(Arc::new).collect();
+        self.keys.truncate(capacity);
+        self.values.truncate(capacity);
+        for (history, rows) in [
+            &mut self.conv.k.0,
+            &mut self.conv.v.0,
+            &mut self.conv.attn.0,
+            &mut self.conv.mlp.0,
+        ]
+        .into_iter()
+        .zip([k, v, attn, mlp])
+        {
+            *history = rows.into_iter().rev().take(valid).collect();
+            history.truncate(past_rows());
+        }
+        self.position = position;
+        self.resident = false;
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_history_identity(&self) -> Option<std::sync::Weak<Vec<f32>>> {
         self.keys.front().map(Arc::downgrade)
     }
@@ -1360,6 +1391,12 @@ pub(super) fn note_resident_queries(chained: bool) {
             "Inkling CUDA kept {path} prefill attention Q, relative, sinks and gates resident"
         )
     });
+}
+
+/// Rows a convolution history keeps between groups (`taps - 1` of the four-tap kernels).
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) fn past_rows() -> usize {
+    3
 }
 
 pub(super) fn clip_rows(rows: &mut [f32], width: usize, limit: f32) {
