@@ -24,8 +24,10 @@ fn download(buffer: &DeviceBuffer, stream: &DeviceStream, range: DeviceRange<'_>
     buffer
         .read_at(stream, range.offset(), &mut out)
         .unwrap();
-    out.chunks_exact(4)
-        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+    out.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_ne_bytes(*b))
         .collect()
 }
 
@@ -230,10 +232,11 @@ fn mix_seal_and_add_match_the_host_stream() {
                     &current[r],
                     &format!("seal blocks {blocks}, row {r}: current"),
                 );
-                for b in 0..=blocks {
+                assert_eq!(sealed[r].len(), blocks + 1);
+                for (b, sealed_row) in sealed[r].iter().enumerate() {
                     assert_within(
                         row(&sealed_device, b * rows + r, WIDTH),
-                        &sealed[r][b],
+                        sealed_row,
                         &format!("seal blocks {blocks}, row {r}: sealed {b}"),
                     );
                 }
@@ -280,6 +283,7 @@ struct PrepHost {
 }
 
 impl PrepHost {
+    #[allow(clippy::too_many_arguments)]
     fn convolve(
         &mut self,
         plane: usize,
@@ -323,7 +327,7 @@ impl PrepHost {
                 *result = (*result + x) * norm;
             }
             let value_plane = plane == 1;
-            for head in output.chunks_exact_mut(HEAD) {
+            for head in output.as_chunks_mut::<HEAD>().0 {
                 let squares: f32 = head.iter().map(|v| v * v).sum();
                 let scale = if value_plane {
                     (squares / HEAD as f32 + eps).sqrt().recip()

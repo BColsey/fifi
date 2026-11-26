@@ -43,7 +43,7 @@ fn fingerprint(
         }
     }
     let mut parts = serde_json::json!({"parts": parts, "detail": detail});
-    if let Some(slots) = env::var("FIFI_INKLING_PASS_DUMP_SLOTS").ok() {
+    if let Ok(slots) = env::var("FIFI_INKLING_PASS_DUMP_SLOTS") {
         // Every row of the named visits (a per-row comparison; large).
         let rows: Vec<serde_json::Value> = slots
             .split(',')
@@ -292,8 +292,8 @@ fn resident_pass_parity() {
         fs::write(out, serde_json::to_vec(&copy).unwrap()).unwrap();
     }
     assert_eq!(visits.len(), expected_visits.len());
-    if unequal_visits != 0 {
-        if let Some(out) = env::var_os("FIFI_INKLING_PASS_PARTS_OUT") {
+    if unequal_visits != 0 && let Some(out) = env::var_os("FIFI_INKLING_PASS_PARTS_OUT") {
+        {
             fs::write(out, serde_json::to_vec(&serde_json::json!({"pass": value["parts"], "host": expected["parts"]})).unwrap()).unwrap();
         }
     }
