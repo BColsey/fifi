@@ -197,9 +197,15 @@ impl CpuForward {
         for block in tokens.chunks(MAX_ROWS) {
             let rows = block.len();
             let mut state = std::mem::take(&mut self.state);
-            let outcome = self
-                .pass_workspace(cuda, MAX_ROWS)
-                .and_then(|()| self.run_block(weights, cuda, block, &mut state));
+            let started = std::time::Instant::now();
+            let outcome = self.pass_workspace(cuda, MAX_ROWS).and_then(|()| {
+                let plan_us = started.elapsed().as_micros() as u64;
+                self.run_block(weights, cuda, block, &mut state)
+                    .map(|report| {
+                        report.plan_us.set(plan_us);
+                        report
+                    })
+            });
             self.state = state;
             match outcome {
                 Ok(report) => {
@@ -209,7 +215,9 @@ impl CpuForward {
                         eprintln!(
                             "Inkling CUDA resident pass {}",
                             serde_json::json!({"rows": rows, "launches": report.launches.get(),
-                                "readbacks": report.readbacks.get()})
+                                "readbacks": report.readbacks.get(), "plan_us": report.plan_us.get(),
+                                "launch_us": report.launch_us.get(), "fence_us": report.fence_us.get(),
+                                "publish_us": report.publish_us.get()})
                         );
                     }
                 }
@@ -427,6 +435,7 @@ impl CpuForward {
         let position = self.position;
         let h = self.hidden();
         let mut report = Report::default();
+        let started = std::time::Instant::now();
         let mut pass = self.pass.borrow_mut();
         let plan = pass.as_mut().expect("admitted plan");
         let stream: &DeviceStream = &plan.stream;
@@ -554,11 +563,22 @@ impl CpuForward {
             block.mix(live, blocks, 0, &mlp_mix, h, mlp_input)?;
             self.pass_mlp(&mut block, readback, weights, cuda, &layer, index, position, bank)?;
         }
+        block.report.launch_us.set(started.elapsed().as_micros() as u64);
+        let fenced = std::time::Instant::now();
         self.pass_fence(&mut block, readback, rows)?;
+        block
+            .report
+            .fence_us
+            .set(fenced.elapsed().as_micros() as u64);
+        let published = std::time::Instant::now();
+        self.pass_publish(&mut block, attention, state, position)?;
         for slot in 0..self.visits.len() {
             cuda.resident_attention().expect("admitted").1.certify(slot, position + rows);
         }
-        self.pass_publish(&mut block, attention, state, position)?;
+        block
+            .report
+            .publish_us
+            .set(published.elapsed().as_micros() as u64);
         drop(block);
         plan.tails_from = 1 - plan.tails_from;
         Ok(report)
@@ -1144,6 +1164,12 @@ impl CpuForward {
 struct Report {
     launches: std::cell::Cell<usize>,
     readbacks: std::cell::Cell<usize>,
+    /// Wall-clock split of one block, microseconds: the plan (first block only), the host side of
+    /// the launches (the stream keeps running), the fence wait, and the publish.
+    plan_us: std::cell::Cell<u64>,
+    launch_us: std::cell::Cell<u64>,
+    fence_us: std::cell::Cell<u64>,
+    publish_us: std::cell::Cell<u64>,
 }
 
 /// The device planes of one block, borrowed from the plan.
