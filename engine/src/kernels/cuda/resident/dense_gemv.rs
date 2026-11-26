@@ -123,7 +123,9 @@ fn group_kernel(
     let kernel = if exact_tile
         && matches!(
             dtype,
-            DenseDtype::PackedGguf(GgufType::Iq2Xxs | GgufType::Q20)
+            DenseDtype::PackedGguf(
+                GgufType::Iq2Xxs | GgufType::Q20 | GgufType::Iq4Nl | GgufType::Q80
+            )
         )
         && (2..=512).contains(&shape.m)
         && shape.rows <= 2304
@@ -475,7 +477,13 @@ mod group_tests {
         assert_eq!(kernel(down(512), q2, None, true), GroupKernel::ExactTile);
         assert_eq!(kernel(gate(1), iq2, None, true), GroupKernel::Gemv);
         assert_eq!(kernel(gate(513), iq2, None, true), GroupKernel::Gemv);
-        assert_eq!(kernel(gate(4), q8, Some(2), true), GroupKernel::Gemv);
+        let q6 = DenseDtype::PackedGguf(GgufType::Q6K);
+        assert_eq!(kernel(gate(4), q6, None, true), GroupKernel::Gemv);
+        for dtype in [q8, DenseDtype::PackedGguf(GgufType::Iq4Nl)] {
+            assert_eq!(kernel(gate(4), dtype, None, true), GroupKernel::ExactTile);
+            assert_eq!(kernel(down(31), dtype, None, true), GroupKernel::ExactTile);
+            assert_eq!(kernel(gate(4), dtype, None, false), GroupKernel::Gemv);
+        }
         for shape in [
             DenseGemvShape::packed(4, 2305, 2304),
             DenseGemvShape::packed(4, 2304, 2560),
@@ -562,6 +570,58 @@ mod group_tests {
         }
     }
 
+    /// The exact expert tiles of the block-32 types give the ordinary GEMV's bits at the expert
+    /// gate and down shapes, for pairs, quads and their tails.
+    #[test]
+    fn block32_expert_tiles_match_the_gemv_bit_for_bit() {
+        use crate::kernels::cuda::testkit::{device_present, read_bytes, upload_bytes};
+        if !device_present("Inkling block-32 exact expert tiles") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        if ctx.device_attributes().unwrap().compute_capability < (7, 5) {
+            return;
+        }
+        let stream = ctx.stream().unwrap();
+        for (ty, payload) in [(GgufType::Iq4Nl, 16), (GgufType::Q80, 32)] {
+            for [rows, cols] in [[2304, 2304], [2304, 1152]] {
+                let mut weight = Vec::new();
+                for block in 0..rows * cols / 32 {
+                    let scale = half::f16::from_f32((1 + block % 13) as f32 / 1024.0);
+                    weight.extend(scale.to_bits().to_ne_bytes());
+                    weight.extend((0..payload).map(|i| ((i * 31 + block * 13) % 255) as u8));
+                }
+                let w = upload_bytes(&ctx, &weight);
+                for m in [2, 3, 5, 31] {
+                    let shape = DenseGemvShape::packed(m, rows, cols);
+                    let xs: Vec<_> = (0..m * cols)
+                        .map(|i| ((i as f32 * 0.071).sin() * (1.0 + (i % 19) as f32)).to_ne_bytes())
+                        .collect();
+                    let x = upload_bytes(&ctx, xs.as_flattened());
+                    let run = |tile| {
+                        let y = ctx.allocate(m * rows * 4).unwrap();
+                        let call = DenseGemvCall {
+                            shape,
+                            dtype: DenseDtype::PackedGguf(ty),
+                            w: w.range(0, w.bytes()).unwrap(),
+                            x: x.range(0, x.bytes()).unwrap(),
+                            y: y.range(0, y.bytes()).unwrap(),
+                        };
+                        let counts = ctx
+                            .dense_gemv_group_with_tiles(&stream, &[call], None, tile)
+                            .unwrap();
+                        stream.synchronize().unwrap();
+                        (counts.exact_tiles, read_bytes(&ctx, &y, y.bytes()))
+                    };
+                    let (plain, expected) = run(false);
+                    let (tiles, actual) = run(true);
+                    assert_eq!((plain, tiles), (0, 1), "{ty:?} {rows}x{cols} rows {m}");
+                    assert!(actual == expected, "{ty:?} {rows}x{cols} rows {m}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn q8_row_pairs_are_opt_in_and_select_only_measured_windows() {
         let q8 = DenseDtype::PackedGguf(GgufType::Q80);
@@ -576,7 +636,8 @@ mod group_tests {
                 let mut shape = DenseGemvShape::packed(m, rows, cols);
                 shape.ld_x += 3;
                 shape.ld_y += 7;
-                let (kernel, need) = group_kernel(shape, q8, Some(2), true, true).unwrap();
+                // Attention projections ask for row pairs without expert tiles.
+                let (kernel, need) = group_kernel(shape, q8, Some(2), false, true).unwrap();
                 let expected = if (first..=last).contains(&m) {
                     GroupKernel::Q8RowPair
                 } else {
@@ -587,8 +648,18 @@ mod group_tests {
                 assert_eq!(need.x, ((m - 1) * shape.ld_x + cols) * 4);
                 assert_eq!(need.y, ((m - 1) * shape.ld_y + rows) * 4);
                 assert_eq!(
-                    group_kernel(shape, q8, Some(2), true, false).unwrap().0,
+                    group_kernel(shape, q8, Some(2), false, false).unwrap().0,
                     GroupKernel::Gemv
+                );
+                // Outside the window, expert tiles take the shapes they fit.
+                let tiled = m >= 2 && rows <= 2304 && cols <= 2304;
+                assert_eq!(
+                    group_kernel(shape, q8, Some(2), true, false).unwrap().0,
+                    if tiled {
+                        GroupKernel::ExactTile
+                    } else {
+                        GroupKernel::Gemv
+                    }
                 );
             }
         }

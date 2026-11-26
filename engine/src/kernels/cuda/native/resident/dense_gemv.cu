@@ -229,21 +229,27 @@ constexpr int exact_expert_tile(int type, int m, int rows, int cols) {
         // Inkling attention projections at the measured narrow and wide tile shapes.
         return rows == 3072 && cols == 2304 && (m == 8 || m == 63 || m == 64) ? 2 : 0;
     }
+    const bool block32 = type == 42 || type == 20 || type == 8;  // Q2_0, IQ4_NL, Q8_0
     if (m < 2 || m > 512 || rows > kInklingGateWidth || cols > kInklingGateWidth ||
-        (type != 16 && type != 42)) return 0;
+        (type != 16 && !block32)) return 0;
     // At most 18 KiB of activation staging per CTA.
-    return type == 42 && cols <= kInklingGateWidth / 2 && m >= 4 ? 4 : 2;
+    return block32 && cols <= kInklingGateWidth / 2 && m >= 4 ? 4 : 2;
 }
 
 static_assert(exact_expert_tile(16, 512, 2304, 2304) == 2 &&
               exact_expert_tile(42, 5, 2304, 1152) == 4 &&
               exact_expert_tile(42, 3, 2304, 1152) == 2 &&
-              exact_expert_tile(42, 5, 2304, 1216) == 2);
+              exact_expert_tile(42, 5, 2304, 1216) == 2 &&
+              exact_expert_tile(20, 5, 2304, 1152) == 4 &&
+              exact_expert_tile(20, 5, 2304, 2304) == 2 &&
+              exact_expert_tile(8, 2, 2304, 2304) == 2 &&
+              exact_expert_tile(8, 31, 2304, 1152) == 4);
 static_assert(exact_expert_tile(16, 1, 2304, 2304) == 0 &&
               exact_expert_tile(16, 513, 2304, 2304) == 0 &&
               exact_expert_tile(16, 2, 2305, 2304) == 0 &&
               exact_expert_tile(16, 2, 2304, 2560) == 0 &&
-              exact_expert_tile(8, 2, 2304, 2304) == 0);
+              exact_expert_tile(13, 2, 2304, 2304) == 0 &&
+              exact_expert_tile(20, 1, 2304, 2304) == 0);
 static_assert(exact_expert_tile(14, 8, 3072, 2304) == 2 &&
               exact_expert_tile(14, 63, 3072, 2304) == 2 &&
               exact_expert_tile(14, 64, 3072, 2304) == 2 &&
@@ -1347,6 +1353,12 @@ extern "C" int inference_cuda_gguf_exact_expert_tile_launch(
             gguf_exact_expert_tile<14, 256, 210, 2><<<grid, kWarps * 32, shared, s>>>(a);
         } else if (type == 16) {
             gguf_exact_expert_tile<16, 256, 66, 2><<<grid, kWarps * 32, shared, s>>>(a);
+        } else if (type == 20) {
+            if (tile == 4) gguf_exact_expert_tile<20, 32, 18, 4><<<grid, kWarps * 32, shared, s>>>(a);
+            else gguf_exact_expert_tile<20, 32, 18, 2><<<grid, kWarps * 32, shared, s>>>(a);
+        } else if (type == 8) {
+            if (tile == 4) gguf_exact_expert_tile<8, 32, 34, 4><<<grid, kWarps * 32, shared, s>>>(a);
+            else gguf_exact_expert_tile<8, 32, 34, 2><<<grid, kWarps * 32, shared, s>>>(a);
         } else if (tile == 4) {
             gguf_exact_expert_tile<42, 64, 18, 4><<<grid, kWarps * 32, shared, s>>>(a);
         } else {
