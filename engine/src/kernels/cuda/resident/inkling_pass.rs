@@ -431,16 +431,16 @@ impl CudaContext {
         &self,
         stream: &DeviceStream,
         [source, old, out]: [DeviceRange<'_>; 3],
-        [rows, width, past]: [usize; 3],
+        [rows, stride, width, past]: [usize; 4],
     ) -> Result<(), EngError> {
         let row = width_row(width)?;
-        if rows == 0 || past >= TAPS {
+        if rows == 0 || past >= TAPS || stride < width {
             return Err(EngError::BadRequest(
                 "the Inkling pass tails need rows and fewer past rows than taps".into(),
             ));
         }
         let parts = [
-            Part { name: "Inkling pass tails source", range: source, bytes: rows * row, writer: false },
+            Part { name: "Inkling pass tails source", range: source, bytes: ((rows - 1) * stride + 1) * row, writer: false },
             Part { name: "Inkling pass tails old", range: old, bytes: (TAPS - 1) * row, writer: false },
             Part { name: "Inkling pass tails output", range: out, bytes: (TAPS - 1) * row, writer: true },
         ];
@@ -448,7 +448,7 @@ impl CudaContext {
         self.ensure_usable()?;
         let ranges = [self.raw_range(&parts[0].range)?, self.raw_range(&parts[1].range)?,
             self.raw_range(&parts[2].range)?];
-        self.launch_on(stream, |stream| native::tails(stream, ranges, [rows, width, width, past]))
+        self.launch_on(stream, |stream| native::tails(stream, ranges, [rows, stride, width, past]))
     }
 
     /// `side[r * stride + pos_at] = u32(first + r)`: the position words of one visit's
