@@ -14,9 +14,20 @@ use super::super::{MessageBank, TapRow, rms_norm_with_scale};
 /// Decode steps whose logits the reference keeps, besides the last step.
 const LOGIT_STEPS: usize = 3;
 
-fn fingerprint(model: &mut CpuForward, tokens: &[u32], prefix_rows: usize) -> serde_json::Value {
+fn fingerprint(
+    model: &mut CpuForward,
+    tokens: &[u32],
+    prefix_rows: usize,
+    one_row_as_token: bool,
+) -> serde_json::Value {
     let start = std::time::Instant::now();
-    model.prefill_grouped(&tokens[..prefix_rows]).unwrap();
+    if one_row_as_token {
+        // Flag off refuses a one-row prefill (one token takes the token path), so that path is
+        // the reference of a one-row block. The logits of this call are not a step's.
+        model.token(tokens[0], true).unwrap();
+    } else {
+        model.prefill_grouped(&tokens[..prefix_rows]).unwrap();
+    }
     let prefill_us = start.elapsed().as_micros() as u64;
     let visits: Vec<String> = (0..model.state.len())
         .map(|slot| format!("{:016x}", model.state[slot].parity_fingerprint()))
@@ -95,13 +106,13 @@ fn resident_pass_parity() {
     let rows: usize = env::var("FIFI_INKLING_PASS_ROWS")
         .map(|value| value.parse().expect("rows"))
         .unwrap_or(64);
-    assert!((2..=512).contains(&rows) && rows < tokens.len());
+    assert!((1..=512).contains(&rows) && rows < tokens.len());
     let reference = env::var_os("FIFI_INKLING_PASS_PARITY_REF");
     let output = env::var_os("FIFI_INKLING_PASS_PARITY_OUT");
     assert_ne!(reference.is_none(), output.is_none(), "set exactly one of REF or OUT");
     let mut model = CpuForward::open(Path::new(&checkpoint), tokens.len()).unwrap();
     model.enable_cuda(0).unwrap();
-    let value = fingerprint(&mut model, &tokens, rows);
+    let value = fingerprint(&mut model, &tokens, rows, rows == 1 && output.is_some());
     // The host-side dumps belong to the run that writes the reference; a comparing arm always
     // goes on to the comparison.
     if let Some(out) = env::var_os("FIFI_INKLING_PASS_HOST_VISIT0_OUT").filter(|_| output.is_some()) {

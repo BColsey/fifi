@@ -25,10 +25,11 @@
 //! checked); the K/V rows follow from the visit rings. The host `VisitState` and the device
 //! cursors both end the block holding the rows.
 //!
-//! Blocks of 2 to [`MAX_ROWS`] rows share one plan; only the `rows` argument of each launch
-//! changes. One row stays on the existing token path (the attention tile kernel refuses a
-//! single row). The router logits are the one readback inside a block: the routed-expert
-//! operation takes host route ids.
+//! Blocks of 1 to [`MAX_ROWS`] rows share one plan; only the `rows` argument of each launch
+//! changes. A single row runs as a block of two (the token twice), because the attention tile
+//! refuses one query row; the padded row is never committed (tails, ring cursors and the rows
+//! published take the one). The router logits are the one readback inside a block: the
+//! routed-expert operation takes host route ids.
 
 use std::ops::Range;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -453,7 +454,11 @@ impl CpuForward {
         tokens: &[u32],
         state: &mut [VisitState],
     ) -> Result<Report, EngError> {
-        let rows = tokens.len();
+        let committed = tokens.len();
+        // One row runs as two (the same embedding twice): the attention tile refuses a single
+        // query row. Rows are independent inside a block (attention is causal), so the first
+        // row is what a one-row block computes; the padded row is never committed.
+        let rows = committed.max(2);
         let position = self.position;
         let h = self.hidden();
         let mut report = Report::default();
@@ -476,6 +481,7 @@ impl CpuForward {
             tails: [&plan.tails[plan.tails_from], &plan.tails[1 - plan.tails_from]],
             visits: &plan.visits,
             rows,
+            committed,
             h,
             live: std::cell::Cell::new(0),
             report: &mut report,
@@ -486,8 +492,8 @@ impl CpuForward {
 
         // Embeddings, and the tails of the previous block when the host state owns them.
         let mut embedded = Vec::with_capacity(rows * h);
-        for &id in tokens {
-            embedded.extend_from_slice(self.embed(id)?.current());
+        for id in tokens.iter().chain(tokens.last().filter(|_| committed == 1)) {
+            embedded.extend_from_slice(self.embed(*id)?.current());
         }
         plan.current[0].write_at(&stream, 0, &bytes(&embedded))?;
         if !plan.tails_valid {
@@ -615,7 +621,7 @@ impl CpuForward {
         let published = std::time::Instant::now();
         self.pass_publish(&mut block, attention, state, position)?;
         for slot in 0..self.visits.len() {
-            cuda.resident_attention().expect("admitted").1.certify(slot, position + rows);
+            cuda.resident_attention().expect("admitted").1.certify(slot, position + committed);
         }
         block
             .report
@@ -668,7 +674,8 @@ impl CpuForward {
         let mut tails = vec![0u8; PAST * 2 * block.h * WORD];
         for (visit, consts) in self.visits.iter().zip(block.visits) {
             let slot = visit.state_slot;
-            let (keys, values) = attention.download_ring(&block.stream, slot, position + block.rows)?;
+            let (keys, values) =
+                attention.download_ring(&block.stream, slot, position + block.committed)?;
             let widths = [
                 consts.heads[1] * HEAD_DIM,
                 consts.heads[1] * HEAD_DIM,
@@ -694,9 +701,9 @@ impl CpuForward {
                 (keys, values),
                 [k, v, attn, mlp],
                 (
-                    PAST.min(position + block.rows),
+                    PAST.min(position + block.committed),
                     self.kv_capacity(visit.attention),
-                    position + block.rows,
+                    position + block.committed,
                 ),
             );
             block.report.readbacks.set(block.report.readbacks.get() + 3);
@@ -857,7 +864,7 @@ impl CpuForward {
                     block.tail(1, index, which)?,
                 ],
                 // The raw plane rows hold K and V side by side.
-                [rows, raw_stride, kv_channels, past],
+                [block.committed, raw_stride, kv_channels, past],
             )?;
         }
 
@@ -982,7 +989,7 @@ impl CpuForward {
                 block.tail(0, index, 2)?,
                 block.tail(1, index, 2)?,
             ],
-            [rows, h, h, past],
+            [block.committed, h, h, past],
         )?;
         block.report.launches.set(block.report.launches.get() + 3);
         Ok(())
@@ -1284,7 +1291,7 @@ impl CpuForward {
                 block.tail(0, index, 3)?,
                 block.tail(1, index, 3)?,
             ],
-            [rows, h, h, past],
+            [block.committed, h, h, past],
         )?;
         block.pass_add_to_current(block.at(l.mlp_conv, rows * h)?)?;
         block.report.launches.set(block.report.launches.get() + 3);
@@ -1319,7 +1326,10 @@ struct Block<'a> {
     /// `[read, write]`: the previous block's tails and the ones this block writes.
     tails: [&'a DeviceBuffer; 2],
     visits: &'a [VisitPlan],
+    /// Rows every launch shapes (2 for a one-row block: see [`CpuForward::run_block`]).
     rows: usize,
+    /// Rows the block commits (tails, cursors, publication).
+    committed: usize,
     h: usize,
     /// The live depth stream's buffer index.
     live: std::cell::Cell<usize>,
