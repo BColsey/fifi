@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "resident/inkling_stream.h"
+#include "resident/ordered_sum.cuh"
 
 #include "abi.h"
 #include "device.h"
@@ -295,30 +296,9 @@ __global__ void inkling_stream_norm(const float *src, float *dst, float *health,
 // current row and write the outputs, and the states of a prompt keep the card busy.
 constexpr int ordered_max_width = 4096;
 
-// Products per batch of an ordered sum. One lane adds in element order, so each add waits for
-// the one before it; the batch's loads and products are independent of the sum and are issued
-// together, so a row read from global memory costs one memory latency per batch, not per element.
-constexpr int ordered_batch = 16;
-
-// sum(x[i] * y[i]) in element order from -0.0, the host's `dot`.
-__device__ float ordered_dot(const float *__restrict__ x, const float *__restrict__ y, int width) {
-    float sum = -0.0f;
-    int i = 0;
-    for (; i + ordered_batch <= width; i += ordered_batch) {
-        float products[ordered_batch];
-        #pragma unroll
-        for (int j = 0; j < ordered_batch; ++j) products[j] = __fmul_rn(x[i + j], y[i + j]);
-        #pragma unroll
-        for (int j = 0; j < ordered_batch; ++j) sum = __fadd_rn(sum, products[j]);
-    }
-    for (; i < width; ++i) sum = __fadd_rn(sum, __fmul_rn(x[i], y[i]));
-    return sum;
-}
-
 // The host's rms_norm_with_scale scale, summed in element order on the calling lane.
 __device__ float ordered_scale(const float *row, int width, float eps) {
-    const float squares = ordered_dot(row, row, width);
-    return __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(squares, static_cast<float>(width)), eps)));
+    return ordered_rms_scale(ordered_dot(row, row, width), width, eps);
 }
 
 // out = norm(mix) * gamma when `gamma` is set, else the mix. Without a query the mix is the raw

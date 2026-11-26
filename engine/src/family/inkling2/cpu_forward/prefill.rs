@@ -87,12 +87,14 @@ impl DeviceRun {
     }
 
     /// A core pass starts (`Some(pass)`) or the coda does (`None`): true when the device streams
-    /// made the change. Otherwise the rows hold the host streams, and the host makes it.
+    /// made the change. Otherwise the rows hold the host streams, and the host makes it. A pass
+    /// after the first hands over to the host here when its banked visits cannot run on the
+    /// device (`banked` false), before the device copies the bank.
     fn boundary(
         &mut self,
         weights: &GgufTextWeights,
         rows: &mut [PromptRow<'_>],
-        pass: Option<usize>,
+        (pass, banked): (Option<usize>, bool),
     ) -> Result<bool, EngError> {
         let Some(prompt) = self.prompt.as_mut() else {
             return Ok(false);
@@ -101,7 +103,8 @@ impl DeviceRun {
             prompt.end_passes();
             return Ok(true);
         };
-        if let Some((context, _)) = weights.resident_attention()
+        if (pass == 0 || banked)
+            && let Some((context, _)) = weights.resident_attention()
             && prompt.begin_pass(context, pass)?
         {
             return Ok(true);
@@ -162,30 +165,76 @@ impl DeviceRun {
     }
 }
 
-/// The most sealed blocks a state holds over the visits from `index`, starting from `blocks`:
-/// each core pass after the first restarts from the blocks at the first pass's start.
+/// The most sealed blocks a state holds over the visits from `index`, starting from `blocks`.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn peak_blocks(forward: &CpuForward, index: usize, blocks: usize) -> usize {
     let core = &forward.spec.core;
-    let width = core.core_end - core.core_start;
-    let end = core.core_start + width * core.num_passes;
-    let block = forward.spec.n_layers_per_attn_res_block;
+    count_peak_blocks(
+        forward.visits[index..]
+            .iter()
+            .map(|visit| (visit.state_slot, visit.weight_layer)),
+        (
+            core.core_start,
+            core.core_end - core.core_start,
+            core.num_passes,
+        ),
+        forward.spec.n_layers_per_attn_res_block,
+        blocks,
+    )
+}
+
+/// [`peak_blocks`] over (state slot, weight layer) visits: a visit whose weight layer is a
+/// multiple of `block` seals one, and each core pass after the first restarts from the blocks
+/// at the first pass's start, as `PromptRow::begin_pass` does.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn count_peak_blocks(
+    visits: impl Iterator<Item = (usize, usize)>,
+    (start, width, passes): (usize, usize, usize),
+    block: usize,
+    blocks: usize,
+) -> usize {
     let (mut now, mut peak, mut prelude) = (blocks, blocks, None);
-    for visit in &forward.visits[index..] {
-        let slot = visit.state_slot;
-        if (core.core_start..end).contains(&slot) && (slot - core.core_start).is_multiple_of(width)
-        {
+    for (slot, layer) in visits {
+        if (start..start + width * passes).contains(&slot) && (slot - start).is_multiple_of(width) {
             match prelude {
                 None => prelude = Some(now),
                 Some(blocks) => now = blocks,
             }
         }
-        if visit.weight_layer.is_multiple_of(block) {
+        if layer.is_multiple_of(block) {
             now += 1;
             peak = peak.max(now);
         }
     }
     peak
+}
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod peak_tests {
+    use super::count_peak_blocks;
+
+    /// Six prelude visits, three passes over twelve core layers, six coda layers.
+    fn visits() -> impl Iterator<Item = (usize, usize)> {
+        let prelude = (0..6).map(|layer| (layer, layer));
+        let core = (0..36).map(|i| (6 + i, 6 + i % 12));
+        let coda = (0..6).map(|i| (42 + i, 18 + i));
+        prelude.chain(core).chain(coda)
+    }
+
+    #[test]
+    fn peak_blocks_restart_each_pass_from_the_prelude() {
+        // Seals at layers 0, 4 (prelude), 8, 12, 16 (each pass) and 20 (coda): two before the
+        // passes, five at each pass's end, six after the coda.
+        assert_eq!(count_peak_blocks(visits(), (6, 12, 3), 4, 0), 6);
+        assert_eq!(count_peak_blocks(visits(), (6, 12, 3), 4, 3), 9);
+        // From the second pass's start the prelude is that pass's own start.
+        assert_eq!(count_peak_blocks(visits().skip(18), (6, 12, 3), 4, 2), 6);
+        // One pass: no restart.
+        let one = (0..6)
+            .map(|layer| (layer, layer))
+            .chain((0..12).map(|i| (6 + i, 6 + i)));
+        assert_eq!(count_peak_blocks(one, (6, 12, 1), 4, 0), 5);
+    }
 }
 
 struct MlpRow {
@@ -412,8 +461,18 @@ impl CpuForward {
                 && (slot - core.core_start).is_multiple_of(width);
             let pass = pass_start.then(|| (slot - core.core_start) / width);
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            let on_device =
-                (pass_start || slot == end) && device.boundary(weights, &mut rows, pass)?;
+            let on_device = (pass_start || slot == end)
+                && device.boundary(
+                    weights,
+                    &mut rows,
+                    (
+                        pass,
+                        device_visit::banked_enabled()
+                            && resident_mlp
+                                .as_ref()
+                                .is_some_and(resident_mlp::Workspace::usable),
+                    ),
+                )?;
             #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
             let on_device = false;
             // The device streams made the pass or coda change already when they are open.

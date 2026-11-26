@@ -42,6 +42,11 @@ pub(super) struct Visit<'a> {
 }
 
 impl Workspace {
+    /// Whether a visit may still be admitted.
+    pub(super) fn usable(&self) -> bool {
+        !matches!(self, Self::Declined)
+    }
+
     pub(super) fn admit<'a>(
         &'a mut self,
         forward: &'a CpuForward,

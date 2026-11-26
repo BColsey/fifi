@@ -4,6 +4,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "resident/ordered_sum.cuh"
 
 namespace {
 constexpr int threads = 256;
@@ -21,7 +22,10 @@ __global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
 // One CTA per gate half. Keep the original pair for applying gain/forget;
 // broadcasting gamma here avoids uploading the same weight for every row. The gate is the
 // host's `control_input_from` half, bit for bit: the half is staged in shared memory and one
-// lane sums its squares in element order from -0.0, as `rms_norm_with_scale` does.
+// lane sums its squares in element order from -0.0, as `rms_norm_with_scale` does. The other
+// lanes wait for that sum; the exact order is the point. Unlike the host, a half whose squares
+// or variance overflow (the host then scales by zero) fails the health word, so the visit
+// stops with an error instead of carrying a degenerate gate.
 __global__ void inkling_prepare_controller(const float *pairs, const float *gamma,
                                            float *triples, float *gates, float *health,
                                            int width, float eps) {
@@ -46,10 +50,9 @@ __global__ void inkling_prepare_controller(const float *pairs, const float *gamm
     }
     __syncthreads();
     if (lane == 0) {
-        float squares = -0.0f;
-        for (int i = 0; i < width; ++i) squares = __fadd_rn(squares, __fmul_rn(staged[i], staged[i]));
+        const float squares = ordered_dot(staged, staged, width);
         const float variance = __fadd_rn(__fdiv_rn(squares, static_cast<float>(width)), eps);
-        const float scale = __frcp_rn(__fsqrt_rn(variance));
+        const float scale = ordered_rms_scale(squares, width, eps);
         shared_scale = scale;
         // A square or the sum can overflow while the gate stays finite.
         shared_invalid = !isfinite(squares) || !isfinite(variance) || !isfinite(scale);

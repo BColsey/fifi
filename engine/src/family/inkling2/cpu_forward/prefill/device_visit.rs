@@ -16,6 +16,8 @@ use crate::kernels::cuda::{
 
 mod banked;
 
+pub(super) use banked::banked_enabled;
+
 const WORD: usize = size_of::<f32>();
 /// Constant rows per visit: three attention queries (0..3) and norms (3..6), the MLP query (6)
 /// and norm (7); banked visits add the three attention control queries (8..11) and the MLP

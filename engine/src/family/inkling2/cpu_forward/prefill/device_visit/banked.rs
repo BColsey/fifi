@@ -18,6 +18,17 @@ use crate::family::inkling2::{
 };
 use crate::kernels::cuda::CudaContext;
 
+/// Whether banked visits may run on the device: their switch and the switches of the host's
+/// chained controller attention, which they replace.
+pub(in super::super) fn banked_enabled() -> bool {
+    Switch::PrefillDeviceBanked.on()
+        && Switch::GroupedChainAttention.on()
+        && controller_batch_enabled()
+        && multirow_controllers_enabled()
+        && prefill::resident_query_enabled()
+        && std::env::var("FIFI_INKLING_DEBUG_CHAIN_COMPARE").as_deref() != Ok("1")
+}
+
 impl DevicePrompt {
     /// The banked visits' controller pairs, allocated once; none when they do not fit.
     fn controls(&mut self, context: &CudaContext, width: usize) -> Result<bool, EngError> {
@@ -57,16 +68,7 @@ impl CpuForward {
         let width = self.hidden();
         let physical = visit.weight_layer;
         let seal = physical.is_multiple_of(self.spec.n_layers_per_attn_res_block);
-        // The host's chained controller attention and its switches.
-        if prompt.bank.is_none()
-            || (seal && !prompt.streams.has_room())
-            || !Switch::PrefillDeviceBanked.on()
-            || !Switch::GroupedChainAttention.on()
-            || !controller_batch_enabled()
-            || !multirow_controllers_enabled()
-            || !prefill::resident_query_enabled()
-            || std::env::var("FIFI_INKLING_DEBUG_CHAIN_COMPARE").as_deref() == Ok("1")
-        {
+        if prompt.bank.is_none() || (seal && !prompt.streams.has_room()) || !banked_enabled() {
             return Ok(false);
         }
         let Some((context, attention)) = weights.resident_attention() else {
