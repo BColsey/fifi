@@ -10,7 +10,7 @@ fn decode_attention_group_checks_all_cross_call_writes_before_launch() {
     let rig = Rig::new();
     let rows = [3072, 1024, 1024, 384, 24, 3072, 32, 32];
     let mut blocks = vec![0u8; 3072 * 2304 / 32 * 34];
-    for (i, b) in blocks.chunks_exact_mut(34).enumerate() {
+    for (i, b) in blocks.as_chunks_mut::<34>().0.iter_mut().enumerate() {
         b[..2].copy_from_slice(&0x2800u16.to_le_bytes());
         for (k, v) in b[2..].iter_mut().enumerate() {
             *v = ((i + k) % 27) as u8;
@@ -41,9 +41,9 @@ fn decode_attention_group_checks_all_cross_call_writes_before_launch() {
         x: input,
         y,
     };
-    for i in 0..8 {
+    for (i, out) in reference.iter().enumerate() {
         rig.ctx
-            .dense_gemv(&rig.stream, make(i, x.all(), reference[i].all()))
+            .dense_gemv(&rig.stream, make(i, x.all(), out.all()))
             .unwrap();
     }
     let attempt = |mode: usize, n| {
@@ -83,9 +83,9 @@ fn decode_attention_group_checks_all_cross_call_writes_before_launch() {
         if rows[i] <= 32 {
             assert_eq!(r, d, "the BF16 logical lane order must match serial GEMV");
         }
-        for (a, b) in r.chunks_exact(4).zip(d.chunks_exact(4)) {
-            let a = f32::from_le_bytes(a.try_into().unwrap());
-            let b = f32::from_le_bytes(b.try_into().unwrap());
+        for (a, b) in r.as_chunks::<4>().0.iter().zip(d.as_chunks::<4>().0) {
+            let a = f32::from_le_bytes(*a);
+            let b = f32::from_le_bytes(*b);
             assert!(b.is_finite() && (a - b).abs() <= 1e-4 + 2e-5 * a.abs());
         }
     }

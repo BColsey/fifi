@@ -50,6 +50,7 @@ pub(in super::super) struct TokenWorkspace {
 }
 
 impl TokenWorkspace {
+    #[allow(clippy::type_complexity)]
     fn layout(f: &CpuForward) -> Vec<(bool, bool, usize, Option<(usize, usize)>, usize)> {
         let c = &f.spec.core;
         let width = c.core_end - c.core_start;
@@ -427,7 +428,7 @@ impl TokenWorkspace {
         cursor: Cursor<'_>,
     ) -> Result<(), EngError> {
         let Cursor {
-            mut states,
+            states,
             position,
             past,
             capacities,
@@ -463,8 +464,10 @@ impl TokenWorkspace {
                     .chunks_exact(width * WORD)
                     .take(rows)
                     .map(|row| {
-                        row.chunks_exact(WORD)
-                            .map(|w| f32::from_ne_bytes(w.try_into().unwrap()))
+                        row.as_chunks::<WORD>()
+                            .0
+                            .iter()
+                            .map(|w| f32::from_ne_bytes(*w))
                             .collect()
                     })
                     .collect();

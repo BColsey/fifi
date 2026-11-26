@@ -61,8 +61,10 @@ fn real_effective_tap_kernel_preserves_dynamic_convolution() {
         let mut bytes = vec![0; out.bytes()];
         out.read_at(&stream, 0, &mut bytes).unwrap();
         let effective: Vec<_> = bytes
-            .chunks_exact(WORD)
-            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<WORD>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
             .collect();
         for past in 0..4 {
             for channel in 0..width {

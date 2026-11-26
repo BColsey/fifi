@@ -781,7 +781,7 @@ impl VisitState {
         self.resident = false;
     }
 
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_history_identity(&self) -> Option<std::sync::Weak<Vec<f32>>> {
         self.keys.front().map(Arc::downgrade)
     }
@@ -831,10 +831,10 @@ impl VisitState {
     /// `shadow_rows` by plane: keys, values, then the four convolution histories.
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn shadow_planes(&self) -> [Vec<&[f32]>; 6] {
-        fn owned<'a>(rows: &'a VecDeque<Arc<Vec<f32>>>) -> Vec<&'a [f32]> {
+        fn owned(rows: &VecDeque<Arc<Vec<f32>>>) -> Vec<&[f32]> {
             rows.iter().map(|row| row.as_slice()).collect()
         }
-        fn conv<'a>(rows: &'a VecDeque<Vec<f32>>) -> Vec<&'a [f32]> {
+        fn conv(rows: &VecDeque<Vec<f32>>) -> Vec<&[f32]> {
             rows.iter().map(Vec::as_slice).collect()
         }
         [

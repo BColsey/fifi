@@ -298,8 +298,10 @@ impl Rows {
             .read_at(&self.stream, EXPERTS * 4, &mut status)
             .unwrap();
         let out: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
             .collect();
         (
             out,
@@ -388,7 +390,7 @@ fn resident_mlp_chain_reports_a_nan_input_through_health_output_and_status() {
         return;
     }
     let cuda = load();
-    let rows = Rows::new(cuda.context(), &vec![f32::NAN; HIDDEN], &message());
+    let rows = Rows::new(cuda.context(), &[f32::NAN; HIDDEN], &message());
     cuda.enqueue_controlled_mlp(&rows.stream, rows.request())
         .unwrap();
     let (out, health, status) = rows.read_out();

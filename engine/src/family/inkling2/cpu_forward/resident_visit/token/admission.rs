@@ -19,6 +19,7 @@ impl TokenWorkspace {
             && !states.is_empty()
             && f.visits.iter().enumerate().all(|(i, v)| v.state_slot == i)
     }
+    #[allow(clippy::type_complexity)]
     pub(super) fn fits(
         f: &CpuForward,
         cuda: &GgufCuda,

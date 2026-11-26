@@ -407,8 +407,10 @@ mod tests {
             let actual = read_bytes(&ctx, &y, y.bytes());
             for (r, row) in actual.chunks_exact(width * 4).enumerate() {
                 let row = row
-                    .chunks_exact(4)
-                    .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| u32::from_ne_bytes(*v));
                 assert!(
                     row.eq(ordered_norm(&input[r * width..][..width], &gamma, eps)),
                     "{rows} rows, width {width}, row {r}"

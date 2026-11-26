@@ -23,6 +23,7 @@ pub(super) fn enabled() -> bool {
     })
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 pub(super) enum Workspace {
     #[default]

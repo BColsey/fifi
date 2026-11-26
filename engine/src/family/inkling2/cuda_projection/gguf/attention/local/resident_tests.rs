@@ -130,8 +130,10 @@ fn read(buffer: &DeviceBuffer, stream: &DeviceStream, words: usize) -> Vec<f32> 
     let mut bytes = vec![0; words * WORD];
     buffer.read_at(stream, 0, &mut bytes).unwrap();
     bytes
-        .chunks_exact(WORD)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<WORD>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect()
 }
 

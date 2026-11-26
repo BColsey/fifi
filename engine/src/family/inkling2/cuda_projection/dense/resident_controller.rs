@@ -146,7 +146,7 @@ impl ResidentController {
                 .zip(messages)
                 .flat_map(|(x, message)| x.iter().chain(message))
                 .chain(gamma);
-            for (dst, value) in bytes.chunks_exact_mut(WORD).zip(source) {
+            for (dst, value) in bytes.as_chunks_mut::<WORD>().0.iter_mut().zip(source) {
                 dst.copy_from_slice(&value.to_ne_bytes());
             }
             Ok(())

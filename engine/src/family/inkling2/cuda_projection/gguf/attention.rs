@@ -356,6 +356,7 @@ impl ResidentAttention {
     /// The K and V rows of one visit's ring at `position`, oldest last, read behind the work
     /// queued on `stream`, which must be the stream that appended the rows. Only explicit host
     /// events call it; a chain token keeps these rows on the device.
+    #[allow(clippy::type_complexity)]
     pub(in crate::family::inkling2) fn download_ring(
         &self,
         stream: &DeviceStream,
@@ -370,7 +371,6 @@ impl ResidentAttention {
         let row_bytes = visit.cache_bytes / capacity;
         let first = position.saturating_sub(capacity);
         let rows = position - first;
-        let row_words = row_bytes / size_of::<f32>();
         let mut planes = Vec::with_capacity(2);
         for plane in 0..2 {
             let base = visit.cache_at + plane * visit.cache_bytes;
@@ -390,8 +390,10 @@ impl ResidentAttention {
                 bytes
                     .chunks_exact(row_bytes)
                     .map(|row| {
-                        row.chunks_exact(size_of::<f32>())
-                            .map(|word| f32::from_ne_bytes(word.try_into().unwrap()))
+                        row.as_chunks::<{ size_of::<f32>() }>()
+                            .0
+                            .iter()
+                            .map(|word| f32::from_ne_bytes(*word))
                             .collect::<Vec<f32>>()
                     })
                     .collect::<Vec<Vec<f32>>>(),
