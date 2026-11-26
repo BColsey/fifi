@@ -101,8 +101,11 @@ impl Default for CacheLimits {
 
 impl CacheLimits {
     /// Whether a returned block of `bytes` goes idle, given `slots` blocks and `idle` bytes held.
+    /// A block larger than the cache serves is freed: no allocation could reuse it.
     pub(super) fn keeps(&self, slots: usize, idle: usize, bytes: usize) -> bool {
-        slots < MAX_IDLE_SLOTS && bytes <= self.max_idle.saturating_sub(idle)
+        slots < MAX_IDLE_SLOTS
+            && bytes <= self.max_block
+            && bytes <= self.max_idle.saturating_sub(idle)
     }
 }
 
@@ -472,7 +475,6 @@ impl AllocCache {
     pub(super) fn misses(&self) -> usize {
         self.misses.get()
     }
-    #[cfg(test)]
     pub(super) fn idle_bytes(&self) -> usize {
         self.idle_bytes.get()
     }
@@ -600,6 +602,10 @@ mod tests {
         assert!(default.keeps(0, MAX_IDLE_BYTES - 5, 5));
         assert!(!default.keeps(0, MAX_IDLE_BYTES - 5, 6));
         assert!(!default.keeps(MAX_IDLE_SLOTS, 0, 1));
+        assert!(
+            !default.keeps(0, 0, MAX_BLOCK_BYTES + 1),
+            "a block the cache cannot serve"
+        );
         let tall = CacheLimits {
             max_block: 64 << 20,
             max_idle: 320 << 20,
@@ -769,7 +775,7 @@ mod tests {
         let caps = Activations { x: 4, xf: 4, y: 4 };
         let ctx = CudaContext::with_workspace_cache(caps, true).expect("cache context");
         let cache = Rc::clone(ctx.alloc_cache.as_ref().expect("the cache"));
-        let tall = 2 * MAX_BLOCK_BYTES;
+        let tall = 32 * MAX_BLOCK_BYTES;
         drop(ctx.allocate(tall).expect("a tall block before the scope"));
         assert_eq!(
             cache.idle_bytes(),
@@ -780,9 +786,17 @@ mod tests {
             let _raised = ctx.raise_alloc_cache(tall, 2 * tall);
             drop(ctx.allocate(tall).expect("a tall block"));
             assert_eq!(cache.idle_bytes(), tall);
+            // Idle bytes count as free: checking the block out again (a hit, no native call)
+            // takes them off the free count. Other device users can move it meanwhile.
+            let with_idle = ctx.memory_info().expect("memory").free;
             let hits = cache.hits();
             let again = ctx.allocate(tall).expect("the reissued block");
+            let without_idle = ctx.memory_info().expect("memory").free;
             assert_eq!((cache.hits() - hits, cache.idle_bytes()), (1, 0));
+            assert!(
+                with_idle.saturating_sub(without_idle).abs_diff(tall) < tall / 4,
+                "{with_idle} - {without_idle} against {tall}"
+            );
             drop(again);
             assert_eq!(cache.idle_bytes(), tall);
         }

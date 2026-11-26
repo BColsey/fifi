@@ -435,8 +435,8 @@ impl CpuForward {
         };
         // Visits reuse the prompt-sized buffers of the visits before; freed when the prefill ends.
         let _reuse = weights.resident_attention().map(|(context, _)| {
-            let block = 4 * (tokens.len() + self.math.sconv_kernel_size - 1) * self.hidden();
-            context.raise_alloc_cache(block, 4 * block)
+            let rows = tokens.len() + self.math.sconv_kernel_size.saturating_sub(1);
+            context.raise_alloc_cache(4 * rows * self.hidden(), 16 * rows * self.hidden())
         });
         let mut rows = tokens
             .iter()

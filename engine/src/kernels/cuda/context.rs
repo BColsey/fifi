@@ -206,6 +206,7 @@ pub(crate) struct CudaContext {
 }
 
 /// Raised allocation cache limits; see [`CudaContext::raise_alloc_cache`].
+#[must_use = "the raised limits end when this guard drops"]
 pub(crate) struct RaisedAllocCache<'a>(&'a CudaContext);
 
 impl Drop for RaisedAllocCache<'_> {
@@ -320,32 +321,14 @@ impl CudaContext {
         Self::with_admission(admission)?.attach_alloc_cache(enabled)
     }
 
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
-    )]
-    pub(crate) fn alloc_cache_reserve(enabled: bool) -> u64 {
-        if enabled {
-            alloc_cache::MAX_IDLE_BYTES as u64
-        } else {
-            0
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
-    )]
-    pub(crate) fn alloc_cache_enabled(&self) -> bool {
-        self.alloc_cache.is_some()
-    }
-
     /// Lets cached blocks go idle without a device synchronize while the adapter owns one stream.
     /// A no-op without the cache.
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "no start owns a single stream, only the cache tests call it"
+        )
     )]
     pub(crate) fn set_lazy_alloc_return(&self, lazy: bool) {
         if let Some(cache) = &self.alloc_cache {
@@ -355,8 +338,9 @@ impl CudaContext {
 
     /// Raises what the allocation cache serves and keeps, for a pass whose frames are tall: blocks
     /// up to `max_block` bytes, `max_idle` bytes idle beyond the default. When the scope ends the
-    /// default limits return and the idle blocks are freed. The caller charges the raised idle
-    /// bytes to its work reserve. A no-op without the cache.
+    /// default limits return and the idle blocks are freed. Idle blocks count as free in
+    /// [`Self::memory_info`], and an allocation the card cannot fit frees them and tries again.
+    /// A no-op without the cache.
     pub(crate) fn raise_alloc_cache(
         &self,
         max_block: usize,
@@ -372,10 +356,6 @@ impl CudaContext {
         RaisedAllocCache(self)
     }
 
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
-    )]
     pub(crate) fn drain_alloc_cache(&self) -> Result<(), EngError> {
         match &self.alloc_cache {
             Some(cache) => cache.drain(),
@@ -471,7 +451,15 @@ impl CudaContext {
         let _dispatch = self.enter()?;
         let (free, total) = native::memory_info()
             .map_err(|status| native_error(&TERMINAL, memory_info_operation(status), status))?;
-        Ok(MemoryInfo { free, total })
+        // Idle cache blocks are free to whoever asks next: an allocation frees them if it must.
+        let idle = self
+            .alloc_cache
+            .as_ref()
+            .map_or(0, |cache| cache.idle_bytes());
+        Ok(MemoryInfo {
+            free: free.saturating_add(idle).min(total),
+            total,
+        })
     }
 
     /// The device's static facts for the load-time tuner: multiprocessor
@@ -1237,10 +1225,27 @@ impl CudaContext {
         )
     }
 
+    /// Whether freeing the allocation cache's idle blocks leaves room for `bytes`.
+    fn idle_makes_room(&self, bytes: usize) -> bool {
+        self.alloc_cache
+            .as_ref()
+            .is_some_and(|cache| cache.idle_bytes() > 0)
+            && self.memory_info().is_ok_and(|info| bytes <= info.free)
+    }
+
     fn alloc(&self, bytes: usize) -> Result<DeviceBuffer, EngError> {
-        let buffer = match &self.alloc_cache {
-            Some(cache) if bytes <= cache.max_block() => cache.allocate(bytes)?,
-            _ => DeviceBuffer::allocate(&self.lease, bytes)?,
+        let attempt = || match &self.alloc_cache {
+            Some(cache) if bytes <= cache.max_block() => cache.allocate(bytes),
+            _ => DeviceBuffer::allocate(&self.lease, bytes),
+        };
+        let buffer = match attempt() {
+            // Idle cache blocks count as free memory: a card they fill frees them and tries
+            // again when that leaves room for the block.
+            Err(EngError::MemoryPlan(_)) if self.idle_makes_room(bytes) => {
+                self.drain_alloc_cache()?;
+                attempt()?
+            }
+            result => result?,
         };
         #[cfg(all(test, feature = "native-cuda"))]
         self.successful_allocations
