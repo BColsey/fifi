@@ -181,6 +181,11 @@ struct Geometry {
     relative: usize,
 }
 
+/// Whether the block report line is wanted (`FIFI_INKLING_RESIDENT_PASS_REPORT`).
+fn reporting() -> bool {
+    std::env::var_os("FIFI_INKLING_RESIDENT_PASS_REPORT").is_some_and(|value| !value.is_empty())
+}
+
 impl CpuForward {
     /// Runs one prompt through the device plan in blocks of at most [`MAX_ROWS`] rows when
     /// admitted; `Ok(false)` leaves the sequence untouched for the flag-off path.
@@ -214,13 +219,13 @@ impl CpuForward {
                 Ok(report) => {
                     self.position += rows;
                     self.failed = false;
-                    if std::env::var_os("FIFI_INKLING_RESIDENT_PASS_REPORT").is_some_and(|v| !v.is_empty()) {
+                    if reporting() {
                         eprintln!(
                             "Inkling CUDA resident pass {}",
                             serde_json::json!({"rows": rows, "launches": report.launches.get(),
                                 "readbacks": report.readbacks.get(), "plan_us": report.plan_us.get(),
                                 "launch_us": report.launch_us.get(), "fence_us": report.fence_us.get(),
-                                "publish_us": report.publish_us.get()})
+                                "publish_us": report.publish_us.get(), "block_us": report.block_us.get()})
                         );
                     }
                 }
@@ -515,6 +520,15 @@ impl CpuForward {
         let mut prelude: Option<(usize, usize)> = None;
         let _ = blocks_pre;
         let mut bank: Option<(usize, usize, usize)> = None;
+        // With `FIFI_INKLING_RESIDENT_PASS_REPORT`, two timing events bracket the sweep: the
+        // stream time from the first launch to the last kernel, read once the fence has completed.
+        let block_start = if reporting() {
+            let start = context.event_timing()?;
+            stream.record_timing(&start)?;
+            Some(start)
+        } else {
+            None
+        };
         let attention = cuda.resident_attention().expect("admitted").1;
         for (index, &visit) in self.visits.iter().enumerate() {
             let slot = visit.state_slot;
@@ -580,6 +594,13 @@ impl CpuForward {
             block.mix(live, blocks, 0, &mlp_mix, h, mlp_input)?;
             self.pass_mlp(&mut block, readback, weights, cuda, &layer, index, position, bank)?;
         }
+        let block_end = if block_start.is_some() {
+            let end = context.event_timing()?;
+            stream.record_timing(&end)?;
+            Some(end)
+        } else {
+            None
+        };
         block.report.launch_us.set(started.elapsed().as_micros() as u64);
         let fenced = std::time::Instant::now();
         self.pass_fence(&mut block, readback, rows)?;
@@ -587,6 +608,10 @@ impl CpuForward {
             .report
             .fence_us
             .set(fenced.elapsed().as_micros() as u64);
+        if let (Some(start), Some(end)) = (block_start.as_ref(), block_end.as_ref()) {
+            let us = start.elapsed_ms_since(end)? * 1e3;
+            block.report.block_us.set(us.round() as u64);
+        }
         let published = std::time::Instant::now();
         self.pass_publish(&mut block, attention, state, position)?;
         for slot in 0..self.visits.len() {
@@ -1278,6 +1303,8 @@ struct Report {
     launch_us: std::cell::Cell<u64>,
     fence_us: std::cell::Cell<u64>,
     publish_us: std::cell::Cell<u64>,
+    /// The stream time of the sweep (first launch to the last kernel's end), microseconds.
+    block_us: std::cell::Cell<u64>,
 }
 
 /// The device planes of one block, borrowed from the plan.
