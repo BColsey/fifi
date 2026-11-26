@@ -9,7 +9,8 @@ use super::{
 };
 use crate::family::inkling2::{cuda_projection::gguf::attention::prefill, switches::Switch};
 use crate::kernels::cuda::{
-    DeviceBuffer, DeviceRange, DeviceStream, resident::inkling_stream::MAX_BLOCKS,
+    DeviceBuffer, DeviceRange, DeviceStream,
+    resident::inkling_stream::{MAX_BLOCKS, MAX_STATES},
 };
 
 const WORD: usize = size_of::<f32>();
@@ -28,8 +29,8 @@ pub(super) struct DevicePrompt {
 }
 
 impl DevicePrompt {
-    /// Uploads the rows' streams, or declines when the device path is off or does not fit.
-    /// `seals` is how many more blocks the coming visits may seal.
+    /// Uploads the rows' streams, or declines when the device path or one it uses is off, or
+    /// the prompt does not fit. `seals` is how many more blocks the coming visits may seal.
     pub(super) fn open(
         forward: &CpuForward,
         weights: &GgufTextWeights,
@@ -42,11 +43,17 @@ impl DevicePrompt {
         let Some(first) = rows.first() else {
             return Ok(None);
         };
-        let capacity = (first.stream.block_count() + seals).min(MAX_BLOCKS);
+        let blocks = first.stream.block_count();
+        let capacity = (blocks + seals).min(MAX_BLOCKS);
+        // The visits project and attend through the batched prefill bridge, so its switches
+        // decline the device prompt as they decline the host's grouped visits.
         if !Switch::PrefillDevicePrompt.on()
             || !prefill::enabled()
+            || !super::prefill_projection_batch_enabled()
+            || (!prefill::resident_query_enabled() && !prefill::device_side_enabled())
             || forward.draft_window_enabled()
-            || rows.len() < 2
+            || !(2..=MAX_STATES).contains(&rows.len())
+            || blocks > capacity
             || !forward.taps.is_empty()
             || rows
                 .iter()
