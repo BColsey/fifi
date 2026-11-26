@@ -112,7 +112,7 @@ impl Block<'_> {
         rope(&mut k, start);
         let mut out = vec![vec![0.; 4096]; x.len()];
         for (i, row) in q.iter().enumerate() {
-            for (h, a) in row.chunks_exact(128).enumerate() {
+            for (h, a) in row.as_chunks::<128>().0.iter().enumerate() {
                 let r = h / 4 * 128..(h / 4 + 1) * 128;
                 let mut scores: Vec<_> = k
                     .iter()
@@ -177,7 +177,7 @@ impl Block<'_> {
 }
 fn rope(rows: &mut Rows, start: usize) {
     for (t, row) in rows.iter_mut().enumerate() {
-        for h in row.chunks_exact_mut(128) {
+        for h in row.as_chunks_mut::<128>().0 {
             for j in 0..64 {
                 let (s, c) = ((t + start) as f32 * 10000f32.powf(-(j as f32) / 64.)).sin_cos();
                 let (a, b) = (h[j], h[64 + j]);
@@ -240,8 +240,11 @@ fn block_oracle() {
         let b = std::fs::read(root.join(n)).unwrap();
         b.chunks_exact(width * 4)
             .map(|r| {
-                r.chunks_exact(4)
-                    .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                r.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes)
                     .collect()
             })
             .collect()
