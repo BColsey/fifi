@@ -720,7 +720,10 @@ impl CpuForward {
                 block.report.launches.set(block.report.launches.get() + 1);
                 Ok(())
             };
-            if consts.mix[role].is_empty() {
+            // The first layer has no residual mix: its input is the normed current row. Every
+            // other visit mixes first and takes the norm below (or the controller's, if banked).
+            let from_current = consts.mix[role].is_empty();
+            if from_current {
                 let current = block.current_range(live)?;
                 block.context.inkling_pass_apply(
                     &block.stream,
@@ -755,7 +758,7 @@ impl CpuForward {
                     true,
                 )?;
                 block.report.launches.set(block.report.launches.get() + 2);
-            } else {
+            } else if !from_current {
                 norm_only()?;
             }
         }
