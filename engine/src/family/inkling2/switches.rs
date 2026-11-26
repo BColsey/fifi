@@ -8,6 +8,7 @@ crate::family::switch_table::switch_table! {
         allow(dead_code, reason = "most paths exist only in CUDA builds")
     )]
     pub(crate) enum Switch {
+        AllocCache = "FIFI_INKLING_CUDA_ALLOC_CACHE", true;
         BatchAttentionProjections = "FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS", true;
         BatchControllers = "FIFI_INKLING_CUDA_BATCH_CONTROLLERS", true;
         BatchExperts = "FIFI_INKLING_CUDA_BATCH_EXPERTS", true;

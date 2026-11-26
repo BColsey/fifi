@@ -38,6 +38,24 @@ pub(super) const PROMPT_ROW_SPLIT: crate::family::host_rows::RowSplit =
     };
 pub(super) const ROUTE_NORMALIZATION_FLOOR: f32 = 1.0 / 16384.0;
 
+/// The route of one row's router logits, without recording it.
+fn route_scores(mut scores: Vec<f32>, bias: &[f32], top_k: usize) -> Result<MoeRoute, EngError> {
+    for score in &mut scores {
+        *score = sigmoid(*score);
+    }
+    let selected = route(&scores, bias, top_k)?;
+    let total = selected
+        .iter()
+        .map(|&id| scores[id])
+        .sum::<f32>()
+        .max(ROUTE_NORMALIZATION_FLOOR);
+    Ok(MoeRoute {
+        selected,
+        scores,
+        total,
+    })
+}
+
 #[derive(Deserialize)]
 struct CpuConfig {
     eos_token_id: u32,
@@ -889,29 +907,22 @@ impl CpuForward {
     fn moe_route_from_logits(
         &self,
         layer: usize,
-        mut scores: Vec<f32>,
+        scores: Vec<f32>,
         bias: &[f32],
     ) -> Result<MoeRoute, EngError> {
-        for score in &mut scores {
-            *score = sigmoid(*score);
-        }
-        let selected = route(&scores, bias, self.spec.num_experts_per_tok as usize)?;
-        let total = selected
-            .iter()
-            .map(|&id| scores[id])
-            .sum::<f32>()
-            .max(ROUTE_NORMALIZATION_FLOOR);
+        let route = route_scores(scores, bias, self.spec.num_experts_per_tok as usize)?;
+        self.observe_route(layer, &route);
+        Ok(route)
+    }
+
+    /// Records a route's experts for the streamed expert cache.
+    fn observe_route(&self, layer: usize, route: &MoeRoute) {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Weights::Gguf(weights) = &self.weights {
-            weights.observe_experts(layer, &selected);
+            weights.observe_experts(layer, &route.selected);
         }
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
-        let _ = layer;
-        Ok(MoeRoute {
-            selected,
-            scores,
-            total,
-        })
+        let _ = (layer, route);
     }
 
     fn moe(

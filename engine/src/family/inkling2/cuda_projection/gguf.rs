@@ -641,7 +641,7 @@ impl GgufCuda {
             .partition(|item| item.dtype != DenseDtype::F32);
         let tensors = projection_bytes(&required);
         let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
-        let context = CudaContext::with_admission(&admission)?;
+        let context = CudaContext::with_admission_cache(&admission, Switch::AllocCache.on())?;
         context.set_dense_group_policy(super::dense_group_policy());
         let prefill_resident = packed && Switch::ResidentPrefill.on();
         let device_prefill = packed && Switch::DeviceExpertPrefill.on();

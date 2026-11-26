@@ -433,6 +433,11 @@ impl CpuForward {
         let Weights::Gguf(weights) = &self.weights else {
             return Err(bad("grouped execution needs CUDA GGUF weights"));
         };
+        // Visits reuse the prompt-sized buffers of the visits before; freed when the prefill ends.
+        let _reuse = weights.resident_attention().map(|(context, _)| {
+            let block = 4 * (tokens.len() + self.math.sconv_kernel_size - 1) * self.hidden();
+            context.raise_alloc_cache(block, 4 * block)
+        });
         let mut rows = tokens
             .iter()
             .map(|&id| {
@@ -467,10 +472,7 @@ impl CpuForward {
                     &mut rows,
                     (
                         pass,
-                        device_visit::banked_enabled()
-                            && resident_mlp
-                                .as_ref()
-                                .is_some_and(resident_mlp::Workspace::usable),
+                        device_visit::banked_enabled() && resident_mlp.is_some(),
                     ),
                 )?;
             #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
@@ -824,10 +826,18 @@ impl CpuForward {
         if bias.is_empty() || rows.checked_mul(bias.len()) != Some(logits.len()) {
             return Err(bad("unexpected Inkling grouped router logit extent"));
         }
-        let routes = logits
-            .chunks_exact(bias.len())
-            .map(|scores| self.moe_route_from_logits(layer, scores.to_vec(), bias))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Rows route independently on several threads; the expert cache records them in row
+        // order, as one thread would.
+        let scores: Vec<_> = logits.chunks_exact(bias.len()).collect();
+        let top_k = self.spec.num_experts_per_tok as usize;
+        let routes = crate::family::host_rows::map_shared(&scores, PROMPT_ROW_SPLIT, |scores| {
+            super::route_scores(scores.to_vec(), bias, top_k)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        for route in &routes {
+            self.observe_route(layer, route);
+        }
         if std::env::var("FIFI_INKLING_DEBUG_PREFILL_ROUTES").as_deref() == Ok("1") {
             let routes: Vec<_> = routes.iter().map(|route| &route.selected).collect();
             eprintln!(

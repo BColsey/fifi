@@ -765,6 +765,37 @@ mod tests {
 
     #[test]
     #[ignore = "requires native CUDA and an exclusive test process (--test-threads=1)"]
+    fn a_raised_cache_reuses_tall_blocks_until_its_scope_ends() {
+        let caps = Activations { x: 4, xf: 4, y: 4 };
+        let ctx = CudaContext::with_workspace_cache(caps, true).expect("cache context");
+        let cache = Rc::clone(ctx.alloc_cache.as_ref().expect("the cache"));
+        let tall = 2 * MAX_BLOCK_BYTES;
+        drop(ctx.allocate(tall).expect("a tall block before the scope"));
+        assert_eq!(
+            cache.idle_bytes(),
+            0,
+            "default limits do not serve tall blocks"
+        );
+        {
+            let _raised = ctx.raise_alloc_cache(tall, 2 * tall);
+            drop(ctx.allocate(tall).expect("a tall block"));
+            assert_eq!(cache.idle_bytes(), tall);
+            let hits = cache.hits();
+            let again = ctx.allocate(tall).expect("the reissued block");
+            assert_eq!((cache.hits() - hits, cache.idle_bytes()), (1, 0));
+            drop(again);
+            assert_eq!(cache.idle_bytes(), tall);
+        }
+        assert_eq!(cache.idle_bytes(), 0, "the scope frees what it kept");
+        assert_eq!(
+            cache.max_block(),
+            MAX_BLOCK_BYTES,
+            "the default limits return"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires native CUDA and an exclusive test process (--test-threads=1)"]
     fn the_poison_switch_fills_a_fresh_allocation_and_the_reissued_block() {
         let _hooks = HookGuard;
         native::poison_test_hooks::force(Some(true));

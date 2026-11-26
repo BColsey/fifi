@@ -205,6 +205,19 @@ pub(crate) struct CudaContext {
     pinned_stage_admission: Option<pinned_stage::StageAdmission>,
 }
 
+/// Raised allocation cache limits; see [`CudaContext::raise_alloc_cache`].
+pub(crate) struct RaisedAllocCache<'a>(&'a CudaContext);
+
+impl Drop for RaisedAllocCache<'_> {
+    fn drop(&mut self) {
+        if let Some(cache) = &self.0.alloc_cache {
+            cache.set_limits(alloc_cache::CacheLimits::default());
+            // A failed free leaves the cache terminal, and the next allocation reports it.
+            let _ = cache.drain();
+        }
+    }
+}
+
 pub(crate) struct DeviceBuffer {
     raw: Option<RawDevice>,
     mapped: Option<native::resident::mailbox::RawMapped>,
@@ -300,10 +313,6 @@ impl CudaContext {
     }
 
     /// Opts this lease into bounded backing reuse; other constructors stay uncached.
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
-    )]
     pub(crate) fn with_admission_cache(
         admission: &Admission,
         enabled: bool,
@@ -345,19 +354,22 @@ impl CudaContext {
     }
 
     /// Raises what the allocation cache serves and keeps, for a pass whose frames are tall: blocks
-    /// up to `max_block` bytes, `max_idle` bytes idle. The caller charges `max_idle` to its
-    /// work reserve. A no-op without the cache.
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
-    )]
-    pub(crate) fn set_alloc_cache_limits(&self, max_block: usize, max_idle: usize) {
+    /// up to `max_block` bytes, `max_idle` bytes idle beyond the default. When the scope ends the
+    /// default limits return and the idle blocks are freed. The caller charges the raised idle
+    /// bytes to its work reserve. A no-op without the cache.
+    pub(crate) fn raise_alloc_cache(
+        &self,
+        max_block: usize,
+        max_idle: usize,
+    ) -> RaisedAllocCache<'_> {
         if let Some(cache) = &self.alloc_cache {
+            let default = alloc_cache::CacheLimits::default();
             cache.set_limits(alloc_cache::CacheLimits {
-                max_block,
-                max_idle,
+                max_block: max_block.max(default.max_block),
+                max_idle: max_idle.saturating_add(default.max_idle),
             });
         }
+        RaisedAllocCache(self)
     }
 
     #[allow(
@@ -388,10 +400,6 @@ impl CudaContext {
         Self::with_workspace(caps)?.attach_alloc_cache(enabled)
     }
 
-    #[allow(
-        dead_code,
-        reason = "no start enables the allocation cache since the Flint CUDA executor was removed"
-    )]
     fn attach_alloc_cache(mut self, enabled: bool) -> Result<Self, EngError> {
         if enabled {
             self.alloc_cache = Some(Rc::new(alloc_cache::AllocCache::new(Rc::clone(
