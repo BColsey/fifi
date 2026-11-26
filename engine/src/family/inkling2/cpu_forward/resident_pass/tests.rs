@@ -18,6 +18,17 @@ fn fingerprint(model: &mut CpuForward, tokens: &[u32], prefix_rows: usize) -> se
     let visits: Vec<String> = (0..model.state.len())
         .map(|slot| format!("{:016x}", model.state[slot].parity_fingerprint()))
         .collect();
+    // Per-part fingerprints of every visit, and the rows of the visits a dump names (default: the
+    // first visit and the first banked one), so a differing run shows which part differs first.
+    let (mut parts, mut detail) = (Vec::new(), serde_json::Map::new());
+    for slot in 0..model.state.len() {
+        let (slot_parts, slot_detail) = model.state[slot].parity_parts();
+        parts.push(serde_json::json!(slot_parts));
+        if [0, 18].contains(&slot) {
+            detail.insert(slot.to_string(), slot_detail);
+        }
+    }
+    let parts = serde_json::json!({"parts": parts, "detail": detail});
     // Every decode step is teacher-forced; the logits of the first steps and of the last step are
     // kept (the full vocabulary), so the reference stays small for any block size.
     let steps = tokens.len() - prefix_rows;
@@ -45,6 +56,7 @@ fn fingerprint(model: &mut CpuForward, tokens: &[u32], prefix_rows: usize) -> se
         "logits": kept,
         "argmax": argmax,
         "steps": steps,
+        "parts": parts,
     })
 }
 
@@ -98,6 +110,11 @@ fn resident_pass_parity() {
             "prefill_us_pass": value["prefill_us"], "prefill_us_host": expected["prefill_us"]})
     );
     assert_eq!(visits.len(), expected_visits.len());
+    if unequal_visits != 0 {
+        if let Some(out) = env::var_os("FIFI_INKLING_PASS_PARTS_OUT") {
+            fs::write(out, serde_json::to_vec(&serde_json::json!({"pass": value["parts"], "host": expected["parts"]})).unwrap()).unwrap();
+        }
+    }
     assert_eq!(unequal_visits, 0, "visit state differs from the flag-off path");
     assert!(max_abs < 1e-2, "logits differ from the flag-off path by {max_abs}");
     assert_eq!(argmax, expected_argmax, "a greedy decode step picks another token");

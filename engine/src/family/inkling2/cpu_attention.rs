@@ -984,6 +984,59 @@ impl VisitState {
         ]
     }
 
+    /// Per-part fingerprints (`keys, values, k, v, attn, mlp`) and the full first and last K/V
+    /// rows and history rows of the visit, for a parity run that must name the differing part.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn parity_parts(&self) -> (Vec<(&'static str, usize, u64)>, serde_json::Value) {
+        fn plane<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> (usize, u64) {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hash = DefaultHasher::new();
+            let mut len = 0;
+            for row in rows {
+                len += 1;
+                for &value in row {
+                    value.to_bits().hash(&mut hash);
+                }
+            }
+            (len, hash.finish())
+        }
+        let keys: Vec<_> = self.keys.iter().map(Arc::as_ref).collect();
+        let values: Vec<_> = self.values.iter().map(Arc::as_ref).collect();
+        let parts = vec![
+            ("keys", plane(keys.iter().copied())),
+            ("values", plane(values.iter().copied())),
+            ("k", plane(self.conv.k.0.iter())),
+            ("v", plane(self.conv.v.0.iter())),
+            ("attn", plane(self.conv.attn.0.iter())),
+            ("mlp", plane(self.conv.mlp.0.iter())),
+        ]
+        .into_iter()
+        .map(|(name, (len, hash))| (name, len, hash))
+        .collect();
+        fn bits<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> serde_json::Value {
+            serde_json::json!(rows
+                .into_iter()
+                .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>())
+        }
+        fn firsts<'a>(rows: &[&'a Vec<f32>]) -> Vec<&'a Vec<f32>> {
+            match rows {
+                [] => Vec::new(),
+                rows => vec![rows[0], rows[rows.len() - 1]],
+            }
+        }
+        let detail = serde_json::json!({
+            "position": self.position,
+            "keys": bits(firsts(&keys).into_iter()),
+            "values": bits(firsts(&values).into_iter()),
+            "k": bits(self.conv.k.0.iter()),
+            "v": bits(self.conv.v.0.iter()),
+            "attn": bits(self.conv.attn.0.iter()),
+            "mlp": bits(self.conv.mlp.0.iter()),
+        });
+        (parts, detail)
+    }
+
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn parity_fingerprint(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
