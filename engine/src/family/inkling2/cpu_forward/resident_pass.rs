@@ -191,7 +191,7 @@ impl CpuForward {
         let Some(cuda) = weights.cuda() else {
             return Ok(false);
         };
-        if !self.pass_admitted(weights, cuda) {
+        if !self.pass_admitted(weights, cuda)? {
             return Ok(false);
         }
         for block in tokens.chunks(MAX_ROWS) {
@@ -222,31 +222,56 @@ impl CpuForward {
         Ok(true)
     }
 
-    fn pass_admitted(&self, weights: &GgufTextWeights, cuda: &GgufCuda) -> bool {
+    /// Names one refusal of the pass once per process when
+    /// `FIFI_INKLING_RESIDENT_PASS_REPORT` is set, so a silent fall-through is diagnosable.
+    fn pass_refused(&self, reason: std::fmt::Arguments<'_>) -> bool {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            if std::env::var_os("FIFI_INKLING_RESIDENT_PASS_REPORT").is_some_and(|v| !v.is_empty()) {
+                eprintln!("Inkling resident pass refused: {reason}");
+            }
+        });
+        false
+    }
+
+    fn pass_admitted(&self, weights: &GgufTextWeights, cuda: &GgufCuda) -> Result<bool, EngError> {
         let core = &self.spec.core;
         let width = core.core_end.checked_sub(core.core_start).unwrap_or(0);
         let Some(end) = width
             .checked_mul(core.num_passes.max(1))
             .and_then(|n| n.checked_add(core.core_start))
         else {
-            return false;
+            return Ok(self.pass_refused(format_args!("core geometry")));
         };
-        self.math.validate(self.context, &self.spec).is_ok()
-            && core.core_start < core.core_end
-            && core.num_passes > 0
-            && end <= self.visits.len()
-            && self.state.len() == self.visits.len()
-            && self.state.iter().enumerate().all(|(slot, state)| {
-                state.position() == self.position
-                    && !state.is_resident()
-                    && cuda
-                        .resident_attention()
-                        .is_some_and(|(_, attention)| attention.tile_parts(slot).is_some())
-            })
-            && self
-                .visits
-                .iter()
-                .all(|visit| self.pass_visit_admitted(weights, cuda, *visit))
+        let checks = [
+            ("math", self.math.validate(self.context, &self.spec).is_ok()),
+            ("core range", core.core_start < core.core_end && core.num_passes > 0),
+            ("visit count", end <= self.visits.len() && self.state.len() == self.visits.len()),
+            ("resident attention", cuda.resident_attention().is_some()),
+        ];
+        for (name, ok) in checks {
+            if !ok {
+                return Ok(self.pass_refused(format_args!("{name}")));
+            }
+        }
+        for (slot, state) in self.state.iter().enumerate() {
+            let certified = state.position() == self.position && !state.is_resident();
+            let parts = cuda
+                .resident_attention()
+                .is_some_and(|(_, attention)| attention.tile_parts(slot).is_some());
+            if !certified || !parts {
+                return Ok(self.pass_refused(format_args!(
+                    "visit {slot}: {}",
+                    if !certified { "state position, or resident rows" } else { "no ring" }
+                )));
+            }
+        }
+        for (index, &visit) in self.visits.iter().enumerate() {
+            if !self.pass_visit_admitted(weights, cuda, visit, index)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn pass_visit_admitted(
@@ -254,14 +279,16 @@ impl CpuForward {
         weights: &GgufTextWeights,
         cuda: &GgufCuda,
         visit: LayerVisit,
-    ) -> bool {
+        index: usize,
+    ) -> Result<bool, EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let h = self.hidden();
         let heads = self.pass_heads(visit.attention);
         let dynamic = visit.attention == Attention::Global;
+        let refused = |why: &str| self.pass_refused(format_args!("visit {index} (layer {physical}): {why}"));
         let Some(requests) = self.pass_requests(&layer, visit.attention, heads) else {
-            return false;
+            return Ok(refused("projection geometry"));
         };
         let requests: [Option<Projection<'_>>; 8] =
             requests.each_ref().map(|r| r.as_ref().map(|p| Projection {
@@ -270,22 +297,29 @@ impl CpuForward {
                 rows: p.rows,
             }));
         let Some(Ok(projections)) = cuda.attention_group([h; 3], requests) else {
-            return false;
+            return Ok(refused("attention weights not grouped"));
         };
         if projections.iter().flatten().count() != if dynamic { 8 } else { 6 } {
-            return false;
+            return Ok(refused("attention projection shapes"));
         }
         let output = format!("{layer}.attn.wo_ud.weight");
-        let projected = matches!(
+        if !matches!(
             cuda.relative_attention_projection(&output, [h, heads[0] * HEAD_DIM]),
             Ok(Some(projection)) if projection.rows == h
-        );
+        ) {
+            return Ok(refused("attention output projection"));
+        }
         let names = control_names(&layer, Role::Mlp);
-        let controllers = cuda.controller_weights(
-            names.each_ref().map(String::as_str),
-            2 * h,
-            [self.spec.core.gate_rank as usize, h],
-        );
+        if !cuda
+            .controller_weights(
+                names.each_ref().map(String::as_str),
+                2 * h,
+                [self.spec.core.gate_rank as usize, h],
+            )
+            .is_some_and(|result| result.is_ok())
+        {
+            return Ok(refused("MLP controller weights"));
+        }
         let prefix = format!("{layer}.mlp");
         let experts = [
             format!("{prefix}.experts.w13_weight"),
@@ -302,15 +336,18 @@ impl CpuForward {
             ],
             [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
         );
-        projected
-            && controllers.is_some_and(|result| result.is_ok())
-            && matches!(admitted, Ok(true))
-            && cuda
-                .router_weight(&format!("{prefix}.gate.weight"))
-                .is_some_and(|(_, dtype, shape)| {
-                    dtype == DenseDtype::F32
-                        && shape == [self.spec.n_routed_experts as usize, h]
-                })
+        if !matches!(admitted, Ok(true)) {
+            return Ok(refused("expert window not admitted for 512 rows"));
+        }
+        if !cuda
+            .router_weight(&format!("{prefix}.gate.weight"))
+            .is_some_and(|(_, dtype, shape)| {
+                dtype == DenseDtype::F32 && shape == [self.spec.n_routed_experts as usize, h]
+            })
+        {
+            return Ok(refused("router weight"));
+        }
+        Ok(true)
     }
 
     fn pass_heads(&self, attention: Attention) -> [usize; 2] {
