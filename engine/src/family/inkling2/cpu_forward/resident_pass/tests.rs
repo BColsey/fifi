@@ -326,3 +326,13 @@ fn pass_constant_names() {
     }
     eprintln!("Inkling resident pass constants resolve for {} visits: {} words", model.visits.len(), consts.bytes.len());
 }
+
+#[test]
+fn feature_switches_need_exactly_one() {
+    // The serving A/B turns the pass off with `=0`; anything but `1` must leave it off.
+    assert!(super::on(Some("1".into())));
+    for value in ["0", "", "true", "yes"] {
+        assert!(!super::on(Some(value.into())), "{value:?}");
+    }
+    assert!(!super::on(None));
+}
