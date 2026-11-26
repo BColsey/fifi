@@ -146,6 +146,7 @@ pub(crate) mod swiglu_pack;
 pub(crate) mod swiglu_q8;
 pub(crate) mod tiered_classify;
 pub(crate) mod tiered_wait_add;
+pub(crate) mod word_rows;
 
 #[cfg(test)]
 mod gemma4_reference_tests;

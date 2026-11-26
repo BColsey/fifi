@@ -124,6 +124,7 @@ pub(in crate::kernels::cuda) mod swiglu_pack;
 pub(in crate::kernels::cuda) mod swiglu_q8;
 pub(in crate::kernels::cuda) mod tiered_classify;
 pub(in crate::kernels::cuda) mod tiered_wait_add;
+pub(in crate::kernels::cuda) mod word_rows;
 
 #[derive(Debug)]
 #[must_use = "a stream must be passed to stream_destroy"]

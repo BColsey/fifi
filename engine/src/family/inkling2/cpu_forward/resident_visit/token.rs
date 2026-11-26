@@ -7,7 +7,10 @@
 mod admission;
 mod shadow;
 use super::*;
-use crate::kernels::cuda::{NativeWeight, resident::embed::EmbedNativeCall};
+use crate::kernels::cuda::{
+    NativeWeight,
+    resident::{embed::EmbedNativeCall, word_rows::MAX_WORD_ROWS},
+};
 
 /// Declines the whole-token path; the first decline of each reason is logged once per process.
 fn declined<T>(reason: &'static str) -> Result<Option<T>, EngError> {
@@ -186,13 +189,8 @@ impl TokenWorkspace {
             append(&mut c, &f.weights.vec(name, h)?);
         }
         let constants = ctx.upload(&c)?;
-        let zeros = slots
-            .iter()
-            .map(|s| s.status_bytes)
-            .max()
-            .unwrap_or(0)
-            .max(health.bytes);
-        let params = ctx.upload(&vec![0; 8 + zeros])?;
+        // The device word pair: the token id and the position.
+        let params = ctx.upload(&[0; 8])?;
         let depth = [ctx.allocate(depth_bytes)?, ctx.allocate(depth_bytes)?];
         let prelude = ctx.allocate(prelude_bytes)?;
         let journal = ctx.allocate(end)?;
@@ -301,11 +299,22 @@ impl TokenWorkspace {
                     w.arena.range(w.layout.histories[0].start, bytes)?,
                 )?;
             }
-            ctx.copy_device(
-                stream,
-                params.range(8, self.health.bytes)?,
-                self.health.device(&self.journal)?,
-            )?;
+            // One launch clears the token's health words and every visit's status words before
+            // any chain, and one gathers the status words into the journal after the last.
+            let statuses = self
+                .slots
+                .iter()
+                .map(|s| {
+                    s.w.arena
+                        .range(s.w.layout.attention_status.start, s.status_bytes)
+                })
+                .collect::<Result<Vec<_>, EngError>>()?;
+            let cleared: Vec<_> = std::iter::once(self.health.device(&self.journal))
+                .chain(statuses.iter().copied().map(Ok))
+                .collect::<Result<_, EngError>>()?;
+            for rows in cleared.chunks(MAX_WORD_ROWS) {
+                ctx.zero_word_rows(stream, rows)?;
+            }
             let raw = self.scratch.range(0, row)?;
             ctx.embed_native(
                 stream,
@@ -346,8 +355,6 @@ impl TokenWorkspace {
                         d.range(0, self.prelude_bytes)?,
                     )?;
                 }
-                let status = w.arena.range(l.attention_status.start, s.status_bytes)?;
-                ctx.copy_device(stream, params.range(8, s.status_bytes)?, status)?;
                 let b = &self.depth[s.active ^ 1];
                 Execution {
                     plan: &w.plan,
@@ -363,7 +370,15 @@ impl TokenWorkspace {
                     }),
                 }
                 .enqueue(cuda, f.position)?;
-                ctx.copy_device(stream, status, s.receipt.device(&self.journal)?)?;
+            }
+            let receipts = self
+                .slots
+                .iter()
+                .zip(&statuses)
+                .map(|(s, &status)| Ok((status, s.receipt.device(&self.journal)?)))
+                .collect::<Result<Vec<_>, EngError>>()?;
+            for pairs in receipts.chunks(MAX_WORD_ROWS) {
+                ctx.copy_word_rows(stream, pairs)?;
             }
             let last = self.slots.last().ok_or_else(|| bad("empty token chain"))?;
             let shape = last.w.plan.shape;
