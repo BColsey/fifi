@@ -6,7 +6,7 @@
 //! FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS=1 FIFI_INKLING_PASS_PARITY_REF=ref.json cargo test ...
 //! ```
 use super::*;
-use std::{env, fs, path::Path};
+use std::{env, fs, io::Write, path::Path};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::super::{MessageBank, TapRow, rms_norm_with_scale};
@@ -56,6 +56,18 @@ fn fingerprint(model: &mut CpuForward, tokens: &[u32], prefix_rows: usize) -> se
         logits.extend(full);
     }
     let vocab = logits.len() / steps;
+    // `FIFI_INKLING_PASS_PARITY_DUMP_LOGITS=all` also leaves every step's logits as raw f32
+    // beside the value file, for the per-step analysis of an arm's deviation.
+    if let Some(path) = env::var_os("FIFI_INKLING_PASS_PARITY_DUMP")
+        && env::var("FIFI_INKLING_PASS_PARITY_DUMP_LOGITS").as_deref() == Ok("all")
+    {
+        let path = Path::new(&path);
+        if let Ok(mut sink) = std::fs::File::create(path.with_extension("logits.f32")) {
+            for step in 0..steps {
+                sink.write_all(&bytes(&logits[step * vocab..(step + 1) * vocab])).unwrap();
+            }
+        }
+    }
     let kept: Vec<u32> = (0..steps)
         .filter(|&step| step < LOGIT_STEPS || step + 1 == steps)
         .flat_map(|step| logits[step * vocab..(step + 1) * vocab].iter().map(|x| x.to_bits()))
@@ -90,7 +102,9 @@ fn resident_pass_parity() {
     let mut model = CpuForward::open(Path::new(&checkpoint), tokens.len()).unwrap();
     model.enable_cuda(0).unwrap();
     let value = fingerprint(&mut model, &tokens, rows);
-    if let Some(out) = env::var_os("FIFI_INKLING_PASS_HOST_VISIT0_OUT") {
+    // The host-side dumps belong to the run that writes the reference; a comparing arm always
+    // goes on to the comparison.
+    if let Some(out) = env::var_os("FIFI_INKLING_PASS_HOST_VISIT0_OUT").filter(|_| output.is_some()) {
         // The host's attention input, raw K/V and prepared rows of the first visit for every
         // prompt row (`FIFI_INKLING_PASS_DUMP_VISIT=0:path` carries the pass's side).
         let visit = model.visits[0];
