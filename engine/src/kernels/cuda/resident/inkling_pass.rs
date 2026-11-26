@@ -258,7 +258,7 @@ impl CudaContext {
         let history = (TAPS - 1) * channels * word;
         let kernel = channels * TAPS * word;
         let dynamic_bytes = dynamic
-            .then(|| ((rows - 1) * dynamic_stride + kv_heads * TAPS) * word)
+            .then(|| ((rows - 1) * dynamic_stride + 2 * kv_heads * TAPS) * word)
             .unwrap_or(word);
         let status = rows * size_of::<u32>();
         require_fit("Inkling pass prep raw", &call.raw, raw, word)?;

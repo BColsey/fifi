@@ -1037,6 +1037,25 @@ impl VisitState {
         (parts, detail)
     }
 
+    /// Every K/V row and history row of the visit, as bits (for a per-row parity comparison).
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn parity_rows(&self) -> serde_json::Value {
+        fn bits<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> serde_json::Value {
+            serde_json::json!(rows
+                .into_iter()
+                .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>())
+        }
+        serde_json::json!({
+            "keys": bits(self.keys.iter().map(Arc::as_ref)),
+            "values": bits(self.values.iter().map(Arc::as_ref)),
+            "k": bits(self.conv.k.0.iter()),
+            "v": bits(self.conv.v.0.iter()),
+            "attn": bits(self.conv.attn.0.iter()),
+            "mlp": bits(self.conv.mlp.0.iter()),
+        })
+    }
+
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn parity_fingerprint(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
