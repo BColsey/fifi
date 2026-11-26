@@ -46,6 +46,9 @@ pub(in crate::family::inkling2) struct ResidentMlpRequest<'a> {
     pub health: DeviceRange<'a>,
     pub gate_health: DeviceRange<'a>,
     pub status: DeviceRange<'a>,
+    /// The plain MLP only: the weighted norm of `input`, already on the device, so the MLP
+    /// skips its own norm launch and reads this row instead.
+    pub pre_normed: Option<DeviceRange<'a>>,
 }
 
 /// What `routed_expert_group` resolves for the router and the experts of one layer.
@@ -172,6 +175,7 @@ impl GgufCuda {
             health,
             gate_health,
             status,
+            pre_normed: _,
         } = request;
         require_packed(dtypes)?;
         let routed = self.routed(layer)?;
@@ -229,17 +233,23 @@ impl GgufCuda {
     ) -> Result<(), EngError> {
         require_packed(r.dtypes)?;
         let routed = self.routed(r.layer)?;
-        self.context.enqueue_row_weighted_norm(
-            stream,
-            [r.input, r.gamma, r.message, r.health],
-            routed.shape.hidden,
-            r.eps,
-        )?;
+        let x = match r.pre_normed {
+            Some(normed) => normed,
+            None => {
+                self.context.enqueue_row_weighted_norm(
+                    stream,
+                    [r.input, r.gamma, r.message, r.health],
+                    routed.shape.hidden,
+                    r.eps,
+                )?;
+                r.message
+            }
+        };
         self.enqueue_routed(
             stream,
             &routed,
             (r.dtypes, (r.caps, r.scale)),
-            [r.message, r.bias, r.status, r.out],
+            [x, r.bias, r.status, r.out],
         )
     }
 

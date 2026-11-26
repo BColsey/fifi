@@ -105,17 +105,28 @@ constexpr int kMixShared = kMixWords * sizeof(float);
 constexpr int kMaxMixJobs = 8;
 
 // Independent mixes of one visit: the bank queries and the attention query read different
-// stream states, so one block each runs them in parallel in one launch.
+// stream states, so one block each runs them in parallel in one launch. A job may add a row
+// into the current row of its state first and norm its output (`mix_one`); null means no.
 struct MixJobs {
     const float *state[kMaxMixJobs];
     const float *query[kMaxMixJobs];
     float *out[kMaxMixJobs];
     float *health[kMaxMixJobs];
+    const float *addend[kMaxMixJobs];
+    const float *gamma[kMaxMixJobs];
+    float *normed[kMaxMixJobs];
+    float norm_eps[kMaxMixJobs];
     int first_block[kMaxMixJobs];
     int blocks[kMaxMixJobs];
 };
 
-__device__ void mix_one(const float *state, const float *query, float *out, float *health,
+// `addend` is null or a row added into the current row of `state` before anything else: the
+// host's `add_current`, one rounded add, the bits of inkling_stream_add. The mix then reads the
+// sum, and the current row keeps it. `gamma` and `normed` are null or the mix also writes
+// `normed[i] = (out[i] * scale) * gamma[i]` with the host's weighted RMSNorm scale of `out`
+// (`rms_norm_with_scale` with `norm_eps`), the row inkling_weighted_norm would produce.
+__device__ void mix_one(const float *state, const float *addend, const float *query, float *out,
+                        const float *gamma, float *normed, float norm_eps, float *health,
                         int first_block, int blocks, int width, float eps, float *shared) {
     float *const scratch = shared;
     float *const scores = shared + threads;
@@ -126,6 +137,15 @@ __device__ void mix_one(const float *state, const float *query, float *out, floa
     const int sub = lane & 31;
     const int rows = blocks - first_block + 1;
     int invalid = 0;
+    // The host's add_current of `addend` into the current row comes first; every later read
+    // of the row sees the sum (the block sums below are barriers).
+    if (addend) {
+        float *const current = const_cast<float *>(state);
+        for (int i = lane; i < width; i += threads) {
+            current[i] = __fadd_rn(current[i], addend[i]);
+        }
+        __syncthreads();
+    }
     // Rust rms_norm_with_scale on the current row: scale = (dot(x, x) / len + eps).sqrt().recip().
     {
         float squares = 0.0f;
@@ -283,6 +303,30 @@ __device__ void mix_one(const float *state, const float *query, float *out, floa
         out[i] = value;
         invalid |= !isfinite(value);
     }
+    if (normed) {
+        // The host's weighted RMSNorm of the output, from the row just written.
+        const float scale = rms_scale(out, width, norm_eps, scratch, invalid);
+        int i = lane;
+        for (; i + threads * (kSquareLoads - 1) < width; i += threads * kSquareLoads) {
+            float value[kSquareLoads], weight[kSquareLoads];
+            #pragma unroll
+            for (int u = 0; u < kSquareLoads; ++u) {
+                value[u] = out[i + threads * u];
+                weight[u] = gamma[i + threads * u];
+            }
+            #pragma unroll
+            for (int u = 0; u < kSquareLoads; ++u) {
+                const float result = __fmul_rn(__fmul_rn(value[u], scale), weight[u]);
+                normed[i + threads * u] = result;
+                invalid |= !isfinite(result);
+            }
+        }
+        for (; i < width; i += threads) {
+            const float result = __fmul_rn(__fmul_rn(out[i], scale), gamma[i]);
+            normed[i] = result;
+            invalid |= !isfinite(result);
+        }
+    }
     report(health, invalid);
 }
 
@@ -290,14 +334,16 @@ __global__ void inkling_stream_mix(const float *state, const float *query, float
                                    float *health, int first_block, int blocks, int width,
                                    float eps) {
     extern __shared__ float shared[];
-    mix_one(state, query, out, health, first_block, blocks, width, eps, shared);
+    mix_one(state, nullptr, query, out, nullptr, nullptr, 0.0f, health, first_block, blocks,
+            width, eps, shared);
 }
 
 __global__ void inkling_stream_mix_jobs(MixJobs jobs, int width, float eps) {
     extern __shared__ float shared[];
     const int j = blockIdx.x;
-    mix_one(jobs.state[j], jobs.query[j], jobs.out[j], jobs.health[j], jobs.first_block[j],
-            jobs.blocks[j], width, eps, shared);
+    mix_one(jobs.state[j], jobs.addend[j], jobs.query[j], jobs.out[j], jobs.gamma[j],
+            jobs.normed[j], jobs.norm_eps[j], jobs.health[j], jobs.first_block[j], jobs.blocks[j],
+            width, eps, shared);
 }
 
 __global__ void inkling_stream_seal(float *state, const float *next, float *health, int blocks,
@@ -408,58 +454,98 @@ extern "C" int inference_cuda_inkling_stream_mix(const float *state, const float
 }
 
 extern "C" int inference_cuda_inkling_stream_mix_jobs(const void *const *ranges, const int *shape,
-                                                       int count, int width, float eps,
-                                                       void *stream, int *out_stage) {
+                                                       const float *norm_eps, int count, int width,
+                                                       float eps, void *stream, int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-    // `ranges` holds `state, query, out, health` per job and `shape` its `first_block, blocks`.
+    // `ranges` holds `state, query, out, health, addend, gamma, normed` per job, `shape` its
+    // `first_block, blocks` and `norm_eps` its epsilon when it norms its output; the last three
+    // pointers are null or (for gamma and normed) both set.
     if (!ranges || !shape || !stream || count < 1 || count > kMaxMixJobs || !valid_shape(width, eps)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     MixJobs jobs{};
     for (int j = 0; j < count; ++j) {
-        const void *const *r = ranges + 4 * j;
+        const void *const *r = ranges + 7 * j;
         const int first_block = shape[2 * j], blocks = shape[2 * j + 1];
         if (!r[0] || !r[1] || !r[2] || !r[3] || !aligned(r[0]) || !aligned(r[1]) ||
             !aligned(r[2]) || !aligned(r[3]) || first_block < 0 || blocks < first_block ||
-            blocks > max_blocks) {
+            blocks > max_blocks || (r[4] && !aligned(r[4])) ||
+            (!r[5] != !r[6]) || (r[5] && (!aligned(r[5]) || !aligned(r[6]))) ||
+            (!norm_eps && (r[5] || r[6])) || !isfinite(norm_eps ? norm_eps[j] : 0.0f)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         jobs.state[j] = static_cast<const float *>(r[0]);
         jobs.query[j] = static_cast<const float *>(r[1]);
         jobs.out[j] = static_cast<float *>(const_cast<void *>(r[2]));
         jobs.health[j] = static_cast<float *>(const_cast<void *>(r[3]));
+        jobs.addend[j] = static_cast<const float *>(r[4]);
+        jobs.gamma[j] = static_cast<const float *>(r[5]);
+        jobs.normed[j] = static_cast<float *>(const_cast<void *>(r[6]));
+        jobs.norm_eps[j] = norm_eps ? norm_eps[j] : 0.0f;
         jobs.first_block[j] = first_block;
         jobs.blocks[j] = blocks;
     }
     const size_t row = static_cast<size_t>(width) * sizeof(float);
+    const size_t health = sizeof(float);
     for (int j = 0; j < count; ++j) {
         const size_t state_bytes = (static_cast<size_t>(jobs.blocks[j]) + 1) * row;
-        if (overlaps(jobs.out[j], row, jobs.state[j], state_bytes) ||
-            overlaps(jobs.out[j], row, jobs.query[j], row) ||
-            overlaps(jobs.health[j], sizeof(float), jobs.state[j], state_bytes) ||
-            overlaps(jobs.health[j], sizeof(float), jobs.query[j], row) ||
-            overlaps(jobs.health[j], sizeof(float), jobs.out[j], row) ||
-            overlaps(jobs.state[j], state_bytes, jobs.query[j], row)) {
+        // The job's written ranges (its output, its normalized row, its health word and, with
+        // an addend, the current row of its state) share no byte with any of its other ranges.
+        const float *const written[] = {jobs.out[j], jobs.normed[j], jobs.health[j]};
+        const size_t written_bytes[] = {row, row, health};
+        const float *const others[] = {jobs.state[j], jobs.query[j], jobs.addend[j], jobs.gamma[j]};
+        const size_t other_bytes[] = {state_bytes, row, row, row};
+        for (int w = 0; w < 3; ++w) {
+            if (!written[w]) continue;
+            for (int r = 0; r < 4; ++r) {
+                if (others[r] && overlaps(written[w], written_bytes[w], others[r], other_bytes[r]))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+            for (int v = w + 1; v < 3; ++v) {
+                if (written[v] && overlaps(written[w], written_bytes[w], written[v], written_bytes[v]))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
+        if (jobs.addend[j] &&
+            overlaps(jobs.state[j], state_bytes, jobs.addend[j], row)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         // No job writes into a row another job reads; the health word may be shared (every
         // writer stores the same quiet NaN) and the outputs must be distinct rows.
         for (int k = j + 1; k < count; ++k) {
-            const size_t other_bytes = (static_cast<size_t>(jobs.blocks[k]) + 1) * row;
+            const size_t other_state = (static_cast<size_t>(jobs.blocks[k]) + 1) * row;
             const bool shared_health = jobs.health[j] == jobs.health[k];
-            if (overlaps(jobs.out[j], row, jobs.out[k], row) ||
-                (!shared_health && (overlaps(jobs.out[j], row, jobs.health[k], sizeof(float)) ||
-                                    overlaps(jobs.out[k], row, jobs.health[j], sizeof(float)) ||
-                                    overlaps(jobs.health[j], sizeof(float), jobs.health[k], sizeof(float)))) ||
-                overlaps(jobs.out[j], row, jobs.state[k], other_bytes) ||
-                overlaps(jobs.out[j], row, jobs.query[k], row) ||
-                overlaps(jobs.out[k], row, jobs.state[j], state_bytes) ||
-                overlaps(jobs.out[k], row, jobs.query[j], row) ||
-                overlaps(jobs.health[j], sizeof(float), jobs.state[k], other_bytes) ||
-                overlaps(jobs.health[j], sizeof(float), jobs.query[k], row) ||
-                overlaps(jobs.health[k], sizeof(float), jobs.state[j], state_bytes) ||
-                overlaps(jobs.health[k], sizeof(float), jobs.query[j], row)) {
-                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            const float *const writes[2][4] = {
+                {jobs.out[j], jobs.normed[j], jobs.addend[j] ? jobs.state[j] : nullptr, jobs.health[j]},
+                {jobs.out[k], jobs.normed[k], jobs.addend[k] ? jobs.state[k] : nullptr, jobs.health[k]}};
+            const size_t write_bytes[2][4] = {{row, row, row, health}, {row, row, row, health}};
+            const float *const reads[2][4] = {
+                {jobs.state[j], jobs.query[j], jobs.addend[j], jobs.gamma[j]},
+                {jobs.state[k], jobs.query[k], jobs.addend[k], jobs.gamma[k]}};
+            const size_t read_bytes[2][4] = {{state_bytes, row, row, row}, {other_state, row, row, row}};
+            for (int side = 0; side < 2; ++side) {
+                const int a = side, b = 1 - side;
+                for (int w = 0; w < 4; ++w) {
+                    if (!writes[a][w]) continue;
+                    for (int r = 0; r < 4; ++r) {
+                        if (!reads[b][r]) continue;
+                        // A current row written by one job is read by the other job only if
+                        // both name the same state rows: two addends into one row, refused.
+                        if (reads[b][r] == writes[a][w]) {
+                            if (w == 2 && r == 0) return INFERENCE_CUDA_INVALID_ARGUMENT;
+                            continue;
+                        }
+                        if (overlaps(writes[a][w], write_bytes[a][w], reads[b][r], read_bytes[b][r]))
+                            return INFERENCE_CUDA_INVALID_ARGUMENT;
+                    }
+                    for (int v = 0; v < 4; ++v) {
+                        // The shared health word: both writers store the same value.
+                        if (!writes[b][v] || (shared_health && w == 3 && v == 3)) continue;
+                        if (writes[a][w] == writes[b][v]) continue;
+                        if (overlaps(writes[a][w], write_bytes[a][w], writes[b][v], write_bytes[b][v]))
+                            return INFERENCE_CUDA_INVALID_ARGUMENT;
+                    }
+                }
             }
         }
     }

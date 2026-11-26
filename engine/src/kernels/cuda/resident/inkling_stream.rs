@@ -19,7 +19,7 @@ use crate::kernels::cuda::{
 
 pub(crate) use super::super::native::resident::inkling_stream::MAX_BLOCKS;
 use super::super::native::resident::inkling_stream::{
-    self as native, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_WORD_ROWS,
+    self as native, MAX_MIX_JOBS, MAX_NORM_ROWS, MAX_WORD_ROWS, MixJobRaw,
 };
 
 const MAX_WIDTH: usize = 8192;
@@ -32,13 +32,26 @@ pub(crate) struct MixCall<'a> {
     pub(crate) health: DeviceRange<'a>,
 }
 
+/// The norm epilogue of a mix job: `normed = out * rms_scale(out, eps) * gamma`, the host's
+/// weighted RMSNorm of the mix output, written by the mix itself.
+#[derive(Clone, Copy)]
+pub(crate) struct MixNorm<'a> {
+    pub(crate) gamma: DeviceRange<'a>,
+    pub(crate) normed: DeviceRange<'a>,
+    pub(crate) eps: f32,
+}
+
 /// One mix of a `inkling_stream_mix_jobs` launch: the ranges of [`MixCall`] with the first and
-/// last sealed rows of [`MixShape`]; the width and eps belong to the launch.
+/// last sealed rows of [`MixShape`]; the width and eps belong to the launch. `addend` is added
+/// into the current row of `state` before the mix (the host's `add_current`); `norm` makes the
+/// job write the weighted norm of its output too.
 pub(crate) struct MixJob<'a> {
     pub(crate) state: DeviceRange<'a>,
     pub(crate) query: DeviceRange<'a>,
     pub(crate) out: DeviceRange<'a>,
     pub(crate) health: DeviceRange<'a>,
+    pub(crate) addend: Option<DeviceRange<'a>>,
+    pub(crate) norm: Option<MixNorm<'a>>,
     pub(crate) first_block: usize,
     pub(crate) blocks: usize,
 }
@@ -210,6 +223,11 @@ fn same_start(a: &DeviceRange<'_>, b: &DeviceRange<'_>) -> bool {
     std::ptr::eq(a.buffer(), b.buffer()) && a.offset() == b.offset()
 }
 
+/// The claim of a range for its whole extent.
+fn claim<'a>(name: &'static str, range: &'a DeviceRange<'a>) -> Claim<'a> {
+    Claim::of(name, range, range.bytes())
+}
+
 impl CudaContext {
     /// `Stream::mix(first_block, query)` of the host: the softmax-weighted mean of the sealed
     /// rows `first_block..blocks` (newest first) and the normalized current row, each scored by
@@ -262,9 +280,11 @@ impl CudaContext {
     }
 
     /// Independent [`Self::inkling_stream_mix`] launches in one: one block per job, every job
-    /// over the same `width` and `eps`. Each job passes the checks of the single mix; no job's
-    /// output or health word shares a byte with another job's row, output or health word, unless
-    /// jobs name the same health word (each would store the same quiet NaN).
+    /// over the same `width` and `eps`. Each job passes the checks of the single mix, and its
+    /// optional addend row and norm epilogue (gamma read, normed row written) hold the row and
+    /// share no byte with the job. No range a job writes (its output, health word, normed row
+    /// and, with an addend, the current row of its state) shares a byte with any range of
+    /// another job, unless jobs name the same health word (each would store the same NaN).
     pub(crate) fn inkling_stream_mix_jobs(
         &self,
         stream: &DeviceStream,
@@ -279,7 +299,7 @@ impl CudaContext {
         }
         let row = width * size_of::<f32>();
         let health = size_of::<f32>();
-        let mut claims = Vec::with_capacity(jobs.len());
+        let mut checked_jobs = Vec::with_capacity(jobs.len());
         for job in jobs {
             check_shape("mix", job.first_block, job.blocks, width, eps)?;
             let state = (job.blocks + 1) * row;
@@ -287,52 +307,121 @@ impl CudaContext {
             check_row("Inkling stream query", &job.query, row)?;
             check_row("Inkling stream mix output", &job.out, row)?;
             check_row("Inkling stream health", &job.health, health)?;
-            let (state, query) = (
-                Claim::of("Inkling stream state", &job.state, state),
-                Claim::of("Inkling stream query", &job.query, row),
-            );
-            let (out, health) = (
-                Claim::of("Inkling stream mix output", &job.out, row),
-                Claim::of("Inkling stream health", &job.health, health),
-            );
-            writes_apart([out, health], [state, query])?;
-            claims.push([state, query, out, health]);
-        }
-        for (i, [state, query, out, health]) in claims.iter().enumerate() {
-            for (other, [other_state, other_query, other_out, other_health]) in
-                claims[i + 1..].iter().enumerate()
-            {
-                require_apart(out, other_out)?;
-                require_apart(out, other_state)?;
-                require_apart(out, other_query)?;
-                require_apart(other_out, state)?;
-                require_apart(other_out, query)?;
-                if !same_start(&jobs[i].health, &jobs[i + 1 + other].health) {
-                    require_apart(out, other_health)?;
-                    require_apart(other_out, health)?;
-                    require_apart(health, other_health)?;
+            if let Some(addend) = &job.addend {
+                check_row("Inkling stream mix addend", addend, row)?;
+            }
+            if let Some(norm) = &job.norm {
+                if !norm.eps.is_finite() || norm.eps <= 0.0 {
+                    return Err(EngError::BadRequest(
+                        "the CUDA Inkling stream mix norm needs a finite positive eps".into(),
+                    ));
                 }
-                require_apart(health, other_state)?;
-                require_apart(health, other_query)?;
-                require_apart(other_health, state)?;
-                require_apart(other_health, query)?;
+                check_row("Inkling stream mix gamma", &norm.gamma, row)?;
+                check_row("Inkling stream mix normed row", &norm.normed, row)?;
+            }
+            // Named ranges; `claim` names a range in the error of `require_apart`.
+            let mut reads: Vec<(&'static str, DeviceRange<'_>)> = vec![
+                ("Inkling stream state", job.state.clone()),
+                ("Inkling stream query", job.query.clone()),
+            ];
+            if let Some(addend) = &job.addend {
+                reads.push(("Inkling stream mix addend", addend.clone()));
+            }
+            if let Some(norm) = &job.norm {
+                reads.push(("Inkling stream mix gamma", norm.gamma.clone()));
+            }
+            // Named ranges and whether a written range is the current row of the state.
+            let mut writes: Vec<(&'static str, DeviceRange<'_>, bool)> = vec![
+                ("Inkling stream mix output", job.out.clone(), false),
+                ("Inkling stream health", job.health.clone(), false),
+            ];
+            if let Some(norm) = &job.norm {
+                writes.push(("Inkling stream mix normed row", norm.normed.clone(), false));
+            }
+            // With an addend the job writes the current row, the first row of its state.
+            if job.addend.is_some() {
+                writes.push((
+                    "Inkling stream current row",
+                    job.state.clone().slice(0, row)?,
+                    true,
+                ));
+            }
+            let state_range = job.state.clone();
+            for (i, write) in writes.iter().enumerate() {
+                for (_, other, _) in &writes[i + 1..] {
+                    require_apart(&claim(write.0, &write.1), &claim(write.0, other))?;
+                }
+                for (name, read) in &reads {
+                    // The current row is the first row of the state the job reads.
+                    if write.2 && same_start(read, &state_range) {
+                        continue;
+                    }
+                    require_apart(&claim(write.0, &write.1), &claim(name, read))?;
+                }
+            }
+            checked_jobs.push((reads, writes, job.health.clone()));
+        }
+        for (i, (_, writes, health)) in checked_jobs.iter().enumerate() {
+            for (reads, other_writes, other_health) in &checked_jobs[i + 1..] {
+                let shared_health = same_start(health, other_health);
+                let both_health = |a: &DeviceRange<'_>, b: &DeviceRange<'_>| {
+                    shared_health && same_start(a, health) && same_start(b, other_health)
+                };
+                let other_claims = reads
+                    .iter()
+                    .map(|(name, range)| (*name, range.clone()))
+                    .chain(
+                        other_writes
+                            .iter()
+                            .map(|(name, range, _)| (*name, range.clone())),
+                    )
+                    .collect::<Vec<_>>();
+                let my_claims = checked_jobs[i]
+                    .0
+                    .iter()
+                    .map(|(name, range)| (*name, range.clone()))
+                    .chain(writes.iter().map(|(name, range, _)| (*name, range.clone())))
+                    .collect::<Vec<_>>();
+                for (name, write) in writes.iter().map(|(n, r, _)| (*n, r.clone())) {
+                    for (other_name, other) in &other_claims {
+                        if !both_health(&write, other) {
+                            require_apart(&claim(name, &write), &claim(other_name, other))?;
+                        }
+                    }
+                }
+                for (name, write, _) in other_writes {
+                    for (other_name, other) in &my_claims {
+                        if !both_health(write, other) {
+                            require_apart(&claim(name, write), &claim(other_name, other))?;
+                        }
+                    }
+                }
             }
         }
         self.ensure_usable()?;
-        let raw: Vec<([RawRange<'_>; 4], [usize; 2])> = jobs
+        let raw = jobs
             .iter()
             .map(|job| {
-                Ok((
-                    [
-                        self.raw_range(&job.state)?,
-                        self.raw_range(&job.query)?,
-                        self.raw_range(&job.out)?,
-                        self.raw_range(&job.health)?,
-                    ],
-                    [job.first_block, job.blocks],
-                ))
+                let [state, query, out, health] = [&job.state, &job.query, &job.out, &job.health]
+                    .each_ref()
+                    .map(|r| self.raw_range(r));
+                let ranges = [state?, query?, out?, health?];
+                let addend = job.addend.as_ref().map(|r| self.raw_range(r)).transpose()?;
+                let norm = match &job.norm {
+                    Some(n) => Some((
+                        [self.raw_range(&n.gamma)?, self.raw_range(&n.normed)?],
+                        n.eps,
+                    )),
+                    None => None,
+                };
+                Ok(MixJobRaw {
+                    ranges,
+                    addend,
+                    norm,
+                    shape: [job.first_block, job.blocks],
+                })
             })
-            .collect::<Result<_, EngError>>()?;
+            .collect::<Result<Vec<_>, EngError>>()?;
         self.launch_on(stream, |s| native::mix_jobs(s, &raw, (width, eps)))
     }
 

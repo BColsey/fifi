@@ -25,7 +25,7 @@ use crate::{
             inkling_conv::ConvCall,
             inkling_local_prep::PrepMath,
             inkling_stream::{
-                AddCall, MAX_BLOCKS, MixCall, MixJob, MixShape, SealCall, StreamShape,
+                AddCall, MAX_BLOCKS, MixCall, MixJob, MixNorm, MixShape, SealCall, StreamShape,
             },
         },
     },
@@ -123,6 +123,8 @@ struct Layout {
     attention_out: Region,
     mlp_input: Region,
     mlp_conv: Region,
+    /// The plain visits' MLP input: the norm the depth mix writes itself.
+    mlp_normed: Region,
     bytes: usize,
 }
 
@@ -161,6 +163,7 @@ impl Layout {
             attention_out: take(h),
             mlp_input: take(h),
             mlp_conv: take(h),
+            mlp_normed: take(h),
             bytes: end,
         }
     }
@@ -654,6 +657,8 @@ impl Execution<'_> {
                 query: self.weights.row(query)?,
                 out: self.row(out)?,
                 health: self.row(l.glue_health)?,
+                addend: None,
+                norm: None,
                 first_block: shape.bank_first,
                 blocks: shape.bank_blocks,
             });
@@ -665,6 +670,8 @@ impl Execution<'_> {
                     query: self.weights.row(query)?,
                     out: self.row(l.attention_input)?,
                     health: self.row(l.glue_health)?,
+                    addend: None,
+                    norm: None,
                     first_block: 0,
                     blocks: shape.blocks,
                 });
@@ -677,10 +684,36 @@ impl Execution<'_> {
                 .inkling_stream_mix_jobs(self.stream, &jobs, (width, MIX_EPS))?;
         }
         self.attention(cuda, position, input)?;
-        let blocks = self.advance_depth()?;
+        let plain = self.weights.attention_query.is_none();
+        let (blocks, addend) = self.advance_depth(plain)?;
+        if plain {
+            // The depth mix adds the attention output itself (the host's add) and writes the
+            // weighted norm of its output, so the plain MLP reads that row without a norm launch.
+            self.context.inkling_stream_mix_jobs(
+                self.stream,
+                &[MixJob {
+                    state: self.row(l.depth.row((blocks + 1) * width))?,
+                    query: self.weights.row(self.weights.mlp_query)?,
+                    out: self.row(l.mlp_input)?,
+                    health: self.row(l.glue_health)?,
+                    addend: match addend {
+                        Some(region) => Some(self.row(region)?),
+                        None => None,
+                    },
+                    norm: Some(MixNorm {
+                        gamma: self.weights.row(self.weights.mlp[0])?,
+                        normed: self.row(l.mlp_normed)?,
+                        eps: self.plan.math.eps,
+                    }),
+                    first_block: 0,
+                    blocks,
+                }],
+                (width, MIX_EPS),
+            )?;
+            return self.mlp(cuda, l.mlp_normed);
+        }
         self.mix((l.depth, 0), blocks, self.weights.mlp_query, l.mlp_input)?;
-        self.mlp(cuda)?;
-        self.add(l.mlp_conv)
+        self.mlp(cuda, l.mlp_input)
     }
 
     fn mix(
@@ -780,12 +813,17 @@ impl Execution<'_> {
         cuda.enqueue_local_decode(self.stream, request)
     }
 
-    fn advance_depth(&self) -> Result<usize, EngError> {
+    /// Seal or leave the depth stream alone after the attention; a plain visit without a seal
+    /// gets the attention output back as the addend of its depth mix instead of an add launch.
+    fn advance_depth(&self, plain: bool) -> Result<(usize, Option<Region>), EngError> {
         let shape = self.plan.shape;
         let l = self.layout;
         if !shape.seal {
+            if plain {
+                return Ok((shape.blocks, Some(l.attention_out)));
+            }
             self.add(l.attention_out)?;
-            return Ok(shape.blocks);
+            return Ok((shape.blocks, None));
         }
         self.context.inkling_stream_seal(
             self.stream,
@@ -800,7 +838,7 @@ impl Execution<'_> {
                 eps: MIX_EPS,
             },
         )?;
-        Ok(shape.blocks + 1)
+        Ok((shape.blocks + 1, None))
     }
 
     fn add(&self, addend: Region) -> Result<(), EngError> {
@@ -816,11 +854,12 @@ impl Execution<'_> {
         )
     }
 
-    fn mlp(&self, cuda: &GgufCuda) -> Result<(), EngError> {
+    fn mlp(&self, cuda: &GgufCuda, normed: Region) -> Result<(), EngError> {
         let l = self.layout;
         let [gamma, bias, conv] = self.weights.mlp;
+        let plain = self.weights.attention_query.is_none();
         let controls = &self.plan.controls;
-        let request = ResidentMlpRequest {
+        let mut request = ResidentMlpRequest {
             layer: self.plan.visit.weight_layer as u32,
             caps: controls.caps,
             scale: controls.scale,
@@ -836,20 +875,27 @@ impl Execution<'_> {
             health: self.row(l.mlp_health)?,
             gate_health: self.row(l.glue_health)?,
             status: self.row(l.mlp_status)?,
+            pre_normed: None,
         };
         if self.plan.shape.banked {
             cuda.enqueue_controlled_mlp(self.stream, request)?;
+        } else if plain {
+            let normed = self.row(normed)?;
+            request.pre_normed = Some(normed);
+            cuda.enqueue_plain_mlp(self.stream, request)?;
         } else {
             cuda.enqueue_plain_mlp(self.stream, request)?;
         }
         let shape = self.plan.shape.widths;
         self.context.inkling_conv(
             self.stream,
+            // The convolution adds its row into the depth stream's current row itself.
             ConvCall {
                 input: self.row(l.mlp_raw)?,
                 kernel: self.weights.row(conv)?,
                 history: self.row(l.histories[3])?,
                 out: self.row(l.mlp_conv)?,
+                state: Some(self.row(l.depth.row(shape.hidden))?),
                 health: self.row(l.glue_health)?,
             },
             (shape.hidden, shape.taps),

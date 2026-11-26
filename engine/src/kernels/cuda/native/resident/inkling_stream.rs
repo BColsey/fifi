@@ -14,6 +14,7 @@ unsafe extern "C" {
     fn inference_cuda_inkling_stream_mix_jobs(
         ranges: *const *const c_void,
         shape: *const c_int,
+        norm_eps: *const f32,
         count: c_int,
         width: c_int,
         eps: f32,
@@ -162,58 +163,177 @@ pub(in crate::kernels::cuda) fn mix(
 /// Largest number of mixes of one `mix_jobs` launch.
 pub(in crate::kernels::cuda) const MAX_MIX_JOBS: usize = 8;
 
-/// Independent mixes over one `width` in one launch, one block each: every job holds
-/// `(state, query, out, health)` and `[first_block, blocks]`. Each job passes the checks of
-/// [`mix`]; no output or health word of a job shares a byte with another job's row, output
-/// or health word, unless two jobs name the same health word (they would store the same NaN).
+/// One mix of a `mix_jobs` launch: `(state, query, out, health)` with `[first_block, blocks]`,
+/// an optional addend row and an optional norm epilogue `(gamma, normed, eps)`.
+pub(in crate::kernels::cuda) struct MixJobRaw<'a> {
+    pub(in crate::kernels::cuda) ranges: [RawRange<'a>; 4],
+    pub(in crate::kernels::cuda) addend: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) norm: Option<([RawRange<'a>; 2], f32)>,
+    pub(in crate::kernels::cuda) shape: [usize; 2],
+}
+
+/// The spans of one checked job.
+struct JobSpans<'a> {
+    state: Span<'a>,
+    query: Span<'a>,
+    out: Span<'a>,
+    health: Span<'a>,
+    addend: Option<Span<'a>>,
+    norm: Option<[Span<'a>; 2]>,
+}
+
+fn copy_span<'a>(s: &Span<'a>) -> Span<'a> {
+    Span {
+        device: s.device,
+        start: s.start,
+        len: s.len,
+    }
+}
+
+impl JobSpans<'_> {
+    /// The spans the job writes, each with whether it is the current row of its state: the
+    /// output, the health word, the normalized row and (with an addend) that current row.
+    fn writes(&self) -> Vec<(Span<'_>, bool)> {
+        let mut writes = vec![
+            (copy_span(&self.out), false),
+            (copy_span(&self.health), false),
+        ];
+        if let Some(n) = &self.norm {
+            writes.push((copy_span(&n[1]), false));
+        }
+        if self.addend.is_some() {
+            writes.push((
+                Span {
+                    device: self.state.device,
+                    start: self.state.start,
+                    len: self.query.len,
+                },
+                true,
+            ));
+        }
+        writes
+    }
+
+    /// Every span the job reads: the state, the query, the addend and the gamma.
+    fn reads(&self) -> Vec<Span<'_>> {
+        [
+            Some(copy_span(&self.state)),
+            Some(copy_span(&self.query)),
+            self.addend.as_ref().map(copy_span),
+            self.norm.as_ref().map(|n| copy_span(&n[0])),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+fn same_span(a: &Span<'_>, b: &Span<'_>) -> bool {
+    std::ptr::eq(a.device, b.device) && a.start == b.start && a.len == b.len
+}
+
+/// Independent mixes over one `width` in one launch, one block each. Each job passes the checks
+/// of [`mix`]; its optional addend row (added into the current row of its state first) and its
+/// optional norm epilogue (gamma read, normed row written) hold the row and share no byte with
+/// the job. No span a job writes shares a byte with any span of another job, unless two jobs
+/// name the same health word (they would store the same NaN).
 pub(in crate::kernels::cuda) fn mix_jobs(
     stream: &RawStream,
-    jobs: &[([RawRange<'_>; 4], [usize; 2])],
+    jobs: &[MixJobRaw<'_>],
     (width, eps): (usize, f32),
 ) -> Result<(), DeviceFailure> {
     if jobs.is_empty() || jobs.len() > MAX_MIX_JOBS {
         return Err(invalid_argument());
     }
-    let spans: Vec<MixSpans<'_>> = jobs
-        .iter()
-        .map(|(ranges, [first_block, blocks])| {
-            mix_spans(ranges, [*first_block, *blocks, width], eps)
-        })
-        .collect::<Result<_, _>>()?;
-    let apart = |a: &Span<'_>, b: &Span<'_>| a.apart(b);
-    for (i, job) in spans.iter().enumerate() {
-        let [_, _, out, health] = job;
-        for other in &spans[i + 1..] {
-            let [state, query, other_out, other_health] = other;
-            let same_health = std::ptr::eq(health.0.device, other_health.0.device)
-                && health.0.start == other_health.0.start
-                && health.0.len == other_health.0.len;
-            let health_apart = same_health || apart(&health.0, &other_health.0);
-            if !(apart(&out.0, &other_out.0)
-                && health_apart
-                && apart(&out.0, &other_health.0)
-                && apart(&other_out.0, &health.0)
-                && apart(&out.0, &state.0)
-                && apart(&out.0, &query.0)
-                && apart(&other_out.0, &job[0].0)
-                && apart(&other_out.0, &job[1].0)
-                && apart(&health.0, &state.0)
-                && apart(&health.0, &query.0)
-                && apart(&other_health.0, &job[0].0)
-                && apart(&other_health.0, &job[1].0))
-            {
-                return Err(invalid_argument());
+    let row = width * size_of::<f32>();
+    let mut spans = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let [first_block, blocks] = job.shape;
+        let [state, query, out, health] =
+            mix_spans(&job.ranges, [first_block, blocks, width], eps)?;
+        let addend = job.addend.map(|r| Span::of(&r, row));
+        let norm = job
+            .norm
+            .map(|(ranges, eps)| {
+                if !eps.is_finite() || eps <= 0.0 {
+                    return Err(invalid_argument());
+                }
+                Ok([Span::of(&ranges[0], row), Span::of(&ranges[1], row)])
+            })
+            .transpose()?;
+        let own = JobSpans {
+            state: state.0,
+            query: query.0,
+            out: out.0,
+            health: health.0,
+            addend,
+            norm,
+        };
+        let writes = own.writes();
+        let reads = own.reads();
+        for (i, (w, _)) in writes.iter().enumerate() {
+            for (r, _) in &writes[i + 1..] {
+                if !w.apart(r) {
+                    return Err(invalid_argument());
+                }
+            }
+        }
+        for (w, current) in &writes {
+            for r in &reads {
+                // The current row a job adds into is part of the state it reads.
+                if *current && same_span(r, &own.state) {
+                    continue;
+                }
+                if !w.apart(r) {
+                    return Err(invalid_argument());
+                }
+            }
+        }
+        spans.push(own);
+    }
+    for (i, a) in spans.iter().enumerate() {
+        for b in &spans[i + 1..] {
+            let shared_health = same_span(&a.health, &b.health);
+            let a_writes = a.writes();
+            let b_writes = b.writes();
+            for (x, x_writes, x_health) in [(a, &a_writes, &a.health), (b, &b_writes, &b.health)] {
+                let (y, y_writes, y_health) = if std::ptr::eq(x, a) {
+                    (b, &b_writes, &b.health)
+                } else {
+                    (a, &a_writes, &a.health)
+                };
+                for (w, _) in x_writes {
+                    for r in y.reads().iter().chain(y_writes.iter().map(|(r, _)| r)) {
+                        if shared_health && same_span(w, x_health) && same_span(r, y_health) {
+                            continue;
+                        }
+                        if !w.apart(r) {
+                            return Err(invalid_argument());
+                        }
+                    }
+                }
             }
         }
     }
-    let mut pointers = [std::ptr::null::<c_void>(); 4 * MAX_MIX_JOBS];
+    let mut pointers = [std::ptr::null::<c_void>(); 7 * MAX_MIX_JOBS];
     let mut shape = [0; 2 * MAX_MIX_JOBS];
-    for (i, (ranges, [first_block, blocks])) in jobs.iter().enumerate() {
-        for (slot, range) in pointers[4 * i..4 * i + 4].iter_mut().zip(ranges) {
+    let mut norm_eps = [0.0f32; MAX_MIX_JOBS];
+    let mut any_norm = false;
+    for (i, job) in jobs.iter().enumerate() {
+        for (slot, range) in pointers[7 * i..7 * i + 4].iter_mut().zip(&job.ranges) {
             *slot = range.address() as *const c_void;
         }
-        shape[2 * i] = *first_block as c_int;
-        shape[2 * i + 1] = *blocks as c_int;
+        if let Some(a) = &job.addend {
+            pointers[7 * i + 4] = a.address() as *const c_void;
+        }
+        if let Some((ranges, eps)) = &job.norm {
+            pointers[7 * i + 5] = ranges[0].address() as *const c_void;
+            pointers[7 * i + 6] = ranges[1].address() as *const c_void;
+            norm_eps[i] = *eps;
+            any_norm = true;
+        }
+        shape[2 * i] = job.shape[0] as c_int;
+        shape[2 * i + 1] = job.shape[1] as c_int;
     }
     let mut stage = STAGE_NONE;
     // SAFETY: every job passed the checks of a single mix and no two jobs share a written byte.
@@ -221,6 +341,11 @@ pub(in crate::kernels::cuda) fn mix_jobs(
         inference_cuda_inkling_stream_mix_jobs(
             pointers.as_ptr(),
             shape.as_ptr(),
+            if any_norm {
+                norm_eps.as_ptr()
+            } else {
+                std::ptr::null()
+            },
             jobs.len() as c_int,
             width as c_int,
             eps,

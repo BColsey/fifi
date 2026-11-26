@@ -62,8 +62,12 @@ int inference_cuda_inkling_stream_mix(const float *state, const float *query, fl
                                       float *health, int first_block, int blocks, int width,
                                       float eps, void *stream, int *out_stage);
 
-int inference_cuda_inkling_stream_mix_jobs(const void *const *ranges, const int *shape, int count,
-                                           int width, float eps, void *stream, int *out_stage);
+/* Per job `state, query, out, health, addend, gamma, normed`: an addend row is added into the
+ * current row of `state` first (the host's add_current); gamma and normed, both null or both
+ * set, make the job also write `normed = out * rms_scale(out, norm_eps[j]) * gamma`. */
+int inference_cuda_inkling_stream_mix_jobs(const void *const *ranges, const int *shape,
+                                           const float *norm_eps, int count, int width, float eps,
+                                           void *stream, int *out_stage);
 
 int inference_cuda_inkling_stream_seal(float *state, const float *next, float *health, int blocks,
                                        int width, float eps, void *stream, int *out_stage);

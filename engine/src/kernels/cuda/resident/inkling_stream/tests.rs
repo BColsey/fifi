@@ -3,7 +3,7 @@ use std::mem::size_of;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
 use super::{
-    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_WORD_ROWS, MixCall, MixJob, MixShape, NormCall,
+    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_WORD_ROWS, MixCall, MixJob, MixNorm, MixShape, NormCall,
     SealCall, StreamShape,
 };
 
@@ -659,6 +659,8 @@ fn mix_jobs_equal_the_single_launches_bit_for_bit() {
             query: queries.range(j * row, row).unwrap(),
             out: single.range(j * row, row).unwrap(),
             health: health.range(0, word).unwrap(),
+            addend: None,
+            norm: None,
             first_block,
             blocks,
         };
@@ -701,6 +703,8 @@ fn mix_jobs_equal_the_single_launches_bit_for_bit() {
             query: job.query.clone(),
             out: job.out.clone(),
             health: job.health.clone(),
+            addend: None,
+            norm: None,
             first_block: job.first_block,
             blocks: job.blocks,
         });
@@ -783,4 +787,140 @@ fn word_rows_zero_and_copy_whole_words_in_one_launch() {
         .map(|_| zeros[0].clone())
         .collect::<Vec<_>>();
     assert!(ctx.inkling_zero_words(&stream, &many).is_err());
+}
+
+/// A job with an addend and a norm epilogue is the host's add, then mix, then weighted norm of
+/// the mix output: the current row is bit-exact, the output and the normed row are within the
+/// rounding of the single launches, and the health word stays clear. Two jobs sharing a health
+/// word pass; a job whose normed row is its output, or one whose addend is a row another job of
+/// the launch writes, is refused before any launch.
+#[test]
+fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
+    use crate::EngError;
+
+    if !device_present("Inkling stream mix jobs with addend and norm") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut rng = Rng::new(0xadd0_57a7);
+    let width = 2304;
+    let row = row_bytes(width);
+    let blocks = 6;
+    let buffers = Buffers::new(&ctx, width);
+    let twin = Buffers::new(&ctx, width);
+    let extra = ctx.allocate(row * 3).unwrap();
+    let [add, gamma, normed] = [0, 1, 2].map(|i| extra.range(i * row, row).unwrap());
+    let addend: Vec<f32> = (0..width).map(|_| 0.25 * rng.normal() as f32).collect();
+    let gains: Vec<f32> = (0..width)
+        .map(|_| (0.75 + 0.25 * rng.normal().tanh()) as f32)
+        .collect();
+    let query = normal_row(&mut rng, width);
+    let twin_query = normal_row(&mut rng, width);
+    let state = job_state(&mut rng, width, blocks);
+    let twin_state = job_state(&mut rng, width, blocks);
+    let rows = state.len() / width;
+    let sealed: Vec<Vec<f32>> = state[..(rows - 1) * width]
+        .chunks_exact(width)
+        .map(<[f32]>::to_vec)
+        .collect();
+    let host_current: Vec<f32> = state[(rows - 1) * width..]
+        .iter()
+        .zip(&addend)
+        .map(|(a, b)| a + b)
+        .collect();
+    let host_twin_current = twin_state[(rows - 1) * width..].to_vec();
+    upload(&buffers.state, &stream, &state);
+    upload(&twin.state, &stream, &twin_state);
+    upload(&buffers.query, &stream, &query);
+    upload(&twin.query, &stream, &twin_query);
+    extra.write_at(&stream, 0, &bytes(&addend)).unwrap();
+    extra.write_at(&stream, row, &bytes(&gains)).unwrap();
+    buffers.clear_health(&stream);
+    let health = buffers.health.range(0, size_of::<f32>()).unwrap();
+    let job = MixJob {
+        state: buffers.state.range(0, row * (blocks + 1)).unwrap(),
+        query: buffers.query.range(0, row).unwrap(),
+        out: buffers.out.range(0, row).unwrap(),
+        health: health.clone(),
+        addend: Some(add.clone()),
+        norm: Some(MixNorm {
+            gamma: gamma.clone(),
+            normed: normed.clone(),
+            eps: EPS,
+        }),
+        first_block: 2,
+        blocks,
+    };
+    let twin_job = MixJob {
+        state: twin.state.range(0, row * (blocks + 1)).unwrap(),
+        query: twin.query.range(0, row).unwrap(),
+        out: twin.out.range(0, row).unwrap(),
+        health: health.clone(),
+        addend: None,
+        norm: None,
+        first_block: 0,
+        blocks,
+    };
+    // A job whose normed row is its own output writes the row twice: refused.
+    let mut clash = copy_job(&job);
+    clash.norm = Some(MixNorm {
+        gamma: gamma.clone(),
+        normed: job.out.clone(),
+        eps: EPS,
+    });
+    let error = ctx.inkling_stream_mix_jobs(&stream, &[clash], (width, EPS));
+    assert!(matches!(error, Err(EngError::BadRequest(_))), "{error:?}");
+    // A twin whose addend is a row the first job writes: refused before any launch.
+    let mut clash = copy_job(&twin_job);
+    clash.addend = Some(job.out.clone());
+    let error = ctx.inkling_stream_mix_jobs(&stream, &[copy_job(&job), clash], (width, EPS));
+    assert!(matches!(error, Err(EngError::BadRequest(_))), "{error:?}");
+    let refused = download(&buffers.out, &stream, 0, width);
+    assert!(refused.iter().all(|v| v.to_bits() == 0), "nothing ran");
+    // The first job with its addend and norm, next to the twin that shares the health word.
+    ctx.inkling_stream_mix_jobs(&stream, &[job, twin_job], (width, EPS))
+        .unwrap();
+    let out = download(&buffers.out, &stream, 0, width);
+    let current = download(&buffers.state, &stream, 0, width);
+    let normed_row = download(&extra, &stream, 2 * row, width);
+    let twin_out = download(&twin.out, &stream, 0, width);
+    let expected = host::mix(&sealed, &host_current, 2, &query, EPS);
+    let twin_sealed: Vec<Vec<f32>> = twin_state[..(rows - 1) * width]
+        .chunks_exact(width)
+        .map(<[f32]>::to_vec)
+        .collect();
+    let twin_expected = host::mix(&twin_sealed, &host_twin_current, 0, &twin_query, EPS);
+    assert!(max_error(&out, &expected) <= 1e-6, "mix output {out:?}");
+    assert!(
+        max_error(&twin_out, &twin_expected) <= 1e-6,
+        "twin mix output"
+    );
+    let expected_norm: Vec<f32> = host::norm(&expected, EPS)
+        .iter()
+        .zip(&gains)
+        .map(|(a, g)| a * g)
+        .collect();
+    for (i, (a, b)) in normed_row.iter().zip(&expected_norm).enumerate() {
+        assert!(
+            (a - b).abs() <= 4e-6 * (1.0 + b.abs()),
+            "normed element {i}: {a} vs {b}"
+        );
+    }
+    assert_eq!(current, host_current, "the add is bit-exact");
+    assert_eq!(buffers.health(&stream).to_bits(), 0);
+}
+
+/// A copy of `job` over the same ranges.
+fn copy_job<'a>(job: &MixJob<'a>) -> MixJob<'a> {
+    MixJob {
+        state: job.state.clone(),
+        query: job.query.clone(),
+        out: job.out.clone(),
+        health: job.health.clone(),
+        addend: job.addend.clone(),
+        norm: job.norm.clone(),
+        first_block: job.first_block,
+        blocks: job.blocks,
+    }
 }
