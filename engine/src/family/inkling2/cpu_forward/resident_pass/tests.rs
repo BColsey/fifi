@@ -8,6 +8,9 @@
 use super::*;
 use std::{env, fs, path::Path};
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use super::super::TapRow;
+
 /// Decode steps whose logits the reference keeps, besides the last step.
 const LOGIT_STEPS: usize = 3;
 
@@ -103,10 +106,36 @@ fn resident_pass_parity() {
             raw_v.extend(projected[2].iter().map(|x| x.to_bits()));
             model.attention(&layer, visit, &mut state, projected).unwrap();
         }
+        // A second model without CUDA replays the first two layers of every prompt row on the
+        // host and keeps the stream after each, with the second layer's attention input.
+        let mut host = CpuForward::open(Path::new(&checkpoint), rows).unwrap();
+        let mut host_state: Vec<VisitState> =
+            (0..host.state.len()).map(|_| VisitState::default()).collect();
+        let (mut after, mut inputs) = (Vec::new(), Vec::new());
+        for &id in &tokens[..rows] {
+            let mut stream = host.embed(id).unwrap();
+            let mut taps = TapRow::new(&[], host.hidden());
+            for (n, visit) in host.visits[..2].iter().enumerate() {
+                let layer = format!("model.llm.layers.{}", visit.weight_layer);
+                if n == 1 {
+                    inputs.extend(
+                        host.attention_inputs(*visit, &layer, &stream, None)
+                            .unwrap()[0]
+                            .iter()
+                            .map(|x| x.to_bits()),
+                    );
+                }
+                host.run_visits(&host.visits[n..n + 1], &mut host_state, &mut stream, None, &mut taps, false)
+                    .unwrap();
+                after.extend(stream.current().iter().map(|x| x.to_bits()));
+            }
+        }
         fs::write(
             out,
             serde_json::to_vec(&serde_json::json!({
                 "input": input, "raw_k": raw_k, "raw_v": raw_v, "state": state.parity_rows(),
+                "h": host.hidden(), "input1": inputs,
+                "after": after,
             }))
             .unwrap(),
         )
