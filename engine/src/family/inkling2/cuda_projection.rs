@@ -28,7 +28,7 @@ use crate::{
 
 mod dense;
 pub(super) mod gguf;
-mod q8_row_reuse;
+pub(in crate::family::inkling2) mod q8_row_reuse;
 
 use dense::{DensePlan, DenseStep};
 
@@ -264,9 +264,9 @@ fn stages(spec: &TextSpec) -> Result<Vec<Stage>, EngError> {
         .collect()
 }
 
-struct Resident {
-    codes: DeviceBuffer,
-    shape: [usize; 2],
+pub(in crate::family::inkling2) struct Resident {
+    pub(in crate::family::inkling2) codes: DeviceBuffer,
+    pub(in crate::family::inkling2) shape: [usize; 2],
 }
 
 struct PackedBuffers {

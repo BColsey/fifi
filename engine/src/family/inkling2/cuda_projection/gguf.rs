@@ -1138,7 +1138,7 @@ impl GgufCuda {
         )
     }
 
-    fn attention_group<const N: usize>(
+    pub(in crate::family::inkling2) fn attention_group<const N: usize>(
         &self,
         widths: [usize; 3],
         requests: [Option<Projection<'_>>; N],
@@ -1177,7 +1177,7 @@ impl GgufCuda {
         )
     }
 
-    fn controller_weights(
+    pub(in crate::family::inkling2) fn controller_weights(
         &self,
         names: [&str; 3],
         input_width: usize,
