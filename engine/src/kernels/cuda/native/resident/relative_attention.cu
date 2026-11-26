@@ -209,20 +209,23 @@ __global__ void snapshot_commit(Args a, int first, int count, int input_stride) 
 
 // The host uses an ordered FP32 sum, not a parallel reduction. Parallelize
 // across heads and channels without changing the accumulation or rounding.
+// Side rows hold Q, `gap` other words, relative coefficients, sinks and gates.
 __global__ void clip_prefill_queries(float *side, const float *scales, uint32_t *status,
-                                     int heads, int dims, float q_limit, float rel_limit) {
+                                     int heads, int dims, int gap, float q_limit,
+                                     float rel_limit) {
     const int row = blockIdx.y, d = threadIdx.x;
     const bool relative = int(blockIdx.x) >= heads;
     const int head = blockIdx.x % heads;
     const int width = relative ? dims : kHeadDim;
     const int query_words = heads * kHeadDim;
-    const int stride = 2 * query_words + heads * (dims + 1);
-    const int at = (relative ? query_words : 0) + head * width + d;
+    const int stride = 2 * query_words + gap + heads * (dims + 1);
+    const int at = (relative ? query_words + gap : 0) + head * width + d;
+    const int scale_at = (relative ? query_words : 0) + head * width + d;
     __shared__ float squares[kHeadDim], factor;
     float raw = 0.f, x = 0.f;
     if (d < width) {
         raw = side[row * stride + at];
-        x = __fmul_rn(raw, scales[at]);
+        x = __fmul_rn(raw, scales[scale_at]);
         squares[d] = __fmul_rn(x, x);
     }
     __syncthreads();
@@ -260,16 +263,17 @@ bool valid(const inference_cuda_relative_attention_args &a) {
 
 extern "C" int inference_cuda_relative_attention_clip_queries(
     float *side, const float *scales, uint32_t *status, int rows, int heads,
-    int dims, float q_limit, float rel_limit, void *stream, int *out_stage) {
+    int dims, int gap, float q_limit, float rel_limit, void *stream, int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
     if (side == nullptr || scales == nullptr || status == nullptr || stream == nullptr ||
         (uintptr_t(side) | uintptr_t(scales) | uintptr_t(status)) % 4 != 0 ||
         rows < 1 || rows > 512 || heads < 1 || heads > kMaxHeads || dims < 1 || dims > kWarp ||
+        gap < 0 ||
         !isfinite(q_limit) || q_limit <= 0.f || !isfinite(rel_limit) || rel_limit <= 0.f) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     clip_prefill_queries<<<dim3(2 * heads, rows), kHeadDim, 0, (cudaStream_t)stream>>>(
-        side, scales, status, heads, dims, q_limit, rel_limit);
+        side, scales, status, heads, dims, gap, q_limit, rel_limit);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

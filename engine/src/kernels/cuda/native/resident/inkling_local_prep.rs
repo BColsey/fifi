@@ -2,7 +2,7 @@ use std::ffi::{c_int, c_void};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::resident::inkling_local_prep::{
-    DepthShape, OutputConvShape, PrepMath, PrepShape,
+    DepthShape, KvPrepShape, OutputConvShape, PrepMath, PrepShape,
 };
 
 unsafe extern "C" {
@@ -44,6 +44,14 @@ unsafe extern "C" {
         width: c_int,
         history: c_int,
         scale: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+    fn inference_cuda_inkling_kv_prep_rows(
+        ranges: *const *mut c_void,
+        shape: *const c_int,
+        limit: f32,
+        eps: f32,
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
@@ -192,6 +200,31 @@ pub(in crate::kernels::cuda) fn output_conv(
             shape.width as c_int,
             shape.history as c_int,
             scale,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+pub(in crate::kernels::cuda) fn kv_prep_rows(
+    stream: &RawStream,
+    ranges: [RawRange<'_>; 5],
+    shape: KvPrepShape,
+) -> Result<(), DeviceFailure> {
+    let words = shape.words().ok_or_else(invalid_argument)?;
+    validate_f32_ranges(&ranges, words)?;
+    let pointers = ranges.map(|range| range.address());
+    let geometry = shape.geometry().map(|n| n as c_int);
+    let mut stage = STAGE_NONE;
+    // SAFETY: words() bounds every index the kernel forms for this geometry, and the five
+    // spans are exact, aligned and distinct; both arrays outlive the call.
+    let status = unsafe {
+        inference_cuda_inkling_kv_prep_rows(
+            pointers.as_ptr(),
+            geometry.as_ptr(),
+            shape.limit,
+            shape.eps,
             stream.0.as_ptr(),
             &mut stage,
         )

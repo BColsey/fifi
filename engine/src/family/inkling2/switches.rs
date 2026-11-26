@@ -47,6 +47,7 @@ crate::family::switch_table::switch_table! {
         PrefillQueryTiles = "FIFI_INKLING_CUDA_PREFILL_QUERY_TILES", true;
         PrefillRebuildGates = "FIFI_INKLING_CUDA_PREFILL_REBUILD_GATES", true;
         PrefillResidentExpertConv = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_EXPERT_CONV", true;
+        PrefillKvPrep = "FIFI_INKLING_CUDA_PREFILL_KV_PREP", true;
         PrefillResidentFirstVisit = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_FIRST_VISIT", true;
         PrefillResidentQuery = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_QUERY", true;
         PrefillReuseExpertStage = "FIFI_INKLING_CUDA_PREFILL_REUSE_EXPERT_STAGE", true;

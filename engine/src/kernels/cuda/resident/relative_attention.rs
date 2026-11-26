@@ -125,7 +125,7 @@ impl CudaContext {
         &self,
         stream: &DeviceStream,
         shape: RelativeAttentionShape,
-        rows: usize,
+        [rows, gap]: [usize; 2],
         limits: [f32; 2],
         [side, scales, status]: [DeviceRange<'_>; 3],
     ) -> Result<(), EngError> {
@@ -141,7 +141,7 @@ impl CudaContext {
             (
                 "relative attention sidecar",
                 side,
-                (q + rel + sink + gate) * rows,
+                (q + gap + rel + sink + gate) * rows,
             ),
             ("relative attention clip scales", scales, q + rel),
             ("relative attention clip status", status, rows * 4),
@@ -161,7 +161,9 @@ impl CudaContext {
             self.raw_range(&scales)?,
             self.raw_range(&status)?,
         ];
-        self.launch_on(stream, |raw| clip_queries(raw, ranges, shape, rows, limits))
+        self.launch_on(stream, |raw| {
+            clip_queries(raw, ranges, shape, [rows, gap], limits)
+        })
     }
 
     /// Queues the relative-attention step in one launch, with no copies or waits.

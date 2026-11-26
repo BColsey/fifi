@@ -11,6 +11,8 @@ use crate::EngError;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::{cpu_weights::Weights, cuda_projection::gguf::attention};
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::kernels::cuda::resident::inkling_local_prep::PrepShape;
 
 pub(super) type AttentionProjection = [Vec<f32>; 8];
 
@@ -189,13 +191,45 @@ impl CpuForward {
         })
     }
 
+    /// [`Self::prepare_attention_row`] without K and V, which the device prepares: their slots
+    /// stay zero until the device's rows replace them.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn prepare_attention_query(
+        &self,
+        attn: &str,
+        heads: Heads,
+        projected: AttentionProjection,
+        resident_query: bool,
+    ) -> Result<PreparedAttention, EngError> {
+        let [mut q, _, _, mut relative, sinks, gates, _, _] = projected;
+        if !resident_query {
+            self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
+            clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
+            self.scale_channels(&mut relative, &format!("{attn}.rel_l2_clip.scale"))?;
+            clip_rows(
+                &mut relative,
+                self.math.d_rel,
+                self.math.rel_l2_clip_threshold,
+            );
+        }
+        let slot = vec![0.0; heads.kv_channels()];
+        Ok(PreparedAttention {
+            q,
+            k: slot.clone(),
+            v: slot,
+            relative,
+            sinks,
+            gates,
+        })
+    }
+
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn local_decode_prep<'a>(
         &self,
         state: &'a VisitState,
         read_weights: &'a attention::LocalReadWeights<'a>,
     ) -> attention::LocalPrep<'a> {
-        use crate::kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape};
+        use crate::kernels::cuda::resident::inkling_local_prep::PrepMath;
         debug_assert_eq!(self.math.sconv_kernel_size, PrepShape::TAPS);
         attention::LocalPrep {
             math: PrepMath {
@@ -408,7 +442,7 @@ impl CpuForward {
         let Some(bridge) = self.prefill_bridge(layer, visit, resident_query)? else {
             return Ok(None);
         };
-        let keep = attention::prefill::projection_side(resident_query);
+        let keep = bridge.keep();
         let capacity = bridge
             .capacity
             .min(projector.capacity(inputs[0].each_ref().map(Vec::as_slice), keep)?);
@@ -465,6 +499,10 @@ impl CpuForward {
         let heads = self.heads(visit.attention);
         let prefix = format!("{layer}.attn");
         let output_name = format!("{prefix}.wo_ud.weight");
+        // The device convolves, clips and normalizes K and V of whole tiles.
+        let kv = Switch::PrefillKvPrep.on()
+            && self.math.sconv_kernel_size == PrepShape::TAPS
+            && heads.width == PrepShape::WIDTH;
         // Without a resident output projection, host fallback can reuse the logits scratch.
         let Some(projection) = weights
             .relative_attention_projection(&output_name, [self.hidden(), heads.q_channels()])?
@@ -475,7 +513,7 @@ impl CpuForward {
             context,
             visit.state_slot,
             Some(&projection),
-            attention::prefill::projection_side(resident_query),
+            attention::prefill::projection_side(resident_query, kv),
         )?;
         if capacity < 2 {
             return Ok(None);
@@ -495,6 +533,7 @@ impl CpuForward {
             capacity,
             stride,
             scales,
+            kv,
         }))
     }
 
@@ -954,6 +993,7 @@ pub(super) struct PrefillBridge<'a> {
     capacity: usize,
     stride: usize,
     scales: Option<[std::borrow::Cow<'a, [f32]>; 2]>,
+    kv: bool,
 }
 
 /// The MLP output convolution of a prompt visit on the device: the experts write their raw rows
@@ -1026,6 +1066,11 @@ impl CpuForward {
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 impl PrefillBridge<'_> {
+    /// The projection outputs this bridge keeps on the device.
+    pub(super) fn keep(&self) -> &'static [usize] {
+        attention::prefill::projection_side(self.scales.is_some(), self.kv)
+    }
+
     pub(super) fn admit_conv(
         &self,
         forward: &CpuForward,
@@ -1041,6 +1086,37 @@ impl PrefillBridge<'_> {
             .vec(&format!("{}.attn_sconv.weight", self.layer), width * 4)?;
         self.device
             .admit_prefill_conv(self.context, [rows, width], &state.conv.attn.0, &filter)
+    }
+
+    /// The device K/V preparation of one sub-tile: the visit's raw history and weights, and the
+    /// dynamic taps of each row when the visit has them.
+    fn kv_prep<'s>(
+        &'s self,
+        forward: &'s CpuForward,
+        state: &'s VisitState,
+        coefficients: Vec<f32>,
+    ) -> Result<attention::prefill::KvPrep<'s>, EngError> {
+        let heads = self.heads;
+        let channels = heads.kv_channels();
+        let taps = forward.math.sconv_kernel_size;
+        let dynamic = self.visit.attention == super::Attention::Global;
+        let name = if dynamic { "static_w" } else { "weight" };
+        let [k, v] = ["k", "v"].map(|plane| {
+            forward.weights.vec(
+                &format!("{}.{plane}_sconv.{name}", self.prefix),
+                taps * channels,
+            )
+        });
+        let coefficients = dynamic.then_some(coefficients);
+        Ok(attention::prefill::KvPrep {
+            kv_heads: heads.kv,
+            history: [&state.conv.k.0, &state.conv.v.0],
+            weights: [k?, v?],
+            coefficients,
+            limit: forward.math.qk_l2_clip_threshold,
+            eps: forward.math.rms_norm_eps,
+            prepared: std::cell::Cell::new(None),
+        })
     }
 
     pub(super) fn publish_conv_tail(
@@ -1088,7 +1164,11 @@ impl PrefillBridge<'_> {
                 forward,
                 state,
                 host.by_ref().take(count),
-                attention::prefill::Sidecar { range: sub, query },
+                attention::prefill::Sidecar {
+                    range: sub,
+                    query,
+                    kv: None,
+                },
                 conv.as_mut().map(|(conv, read)| (&mut **conv, *read)),
             )?);
         }
@@ -1103,17 +1183,25 @@ impl PrefillBridge<'_> {
         side: attention::prefill::Sidecar<'_>,
         conv: Option<(&mut attention::prefill::PrefillConv, bool)>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
-        let prepared = host
-            .map(|p| {
-                forward.prepare_attention_row(
-                    &self.prefix,
-                    self.heads,
-                    state,
-                    p,
-                    side.query.is_some(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let resident_query = side.query.is_some();
+        let mut prepared = Vec::new();
+        let mut coefficients = Vec::new();
+        for p in host {
+            prepared.push(if self.kv {
+                coefficients.extend(p[6].iter().chain(&p[7]));
+                forward.prepare_attention_query(&self.prefix, self.heads, p, resident_query)?
+            } else {
+                forward.prepare_attention_row(&self.prefix, self.heads, state, p, resident_query)?
+            });
+        }
+        let kv = self
+            .kv
+            .then(|| self.kv_prep(forward, state, coefficients))
+            .transpose()?;
+        let side = attention::prefill::Sidecar {
+            kv: kv.as_ref(),
+            ..side
+        };
         let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
         let convolved = conv.is_some();
         let status_only = matches!(conv, Some((_, false)));
@@ -1144,6 +1232,23 @@ impl PrefillBridge<'_> {
                 )?
             }
         };
+        drop(rows);
+        if let Some(kv) = kv {
+            let device = kv
+                .prepared
+                .into_inner()
+                .ok_or_else(|| super::bad("missing CUDA K/V preparation readback"))?;
+            for (row, [k, v]) in prepared.iter_mut().zip(device.rows) {
+                (row.k, row.v) = (k, v);
+            }
+            let past = forward.math.sconv_kernel_size - 1;
+            for [k, v] in device.raw_tail {
+                for (history, raw) in [(&mut state.conv.k.0, k), (&mut state.conv.v.0, v)] {
+                    history.push_front(raw);
+                    history.truncate(past);
+                }
+            }
+        }
         // The device ring is only a cache: publish the prepared host K/V
         // after the device status and output have passed validation.
         let capacity = forward.kv_capacity(self.visit.attention);

@@ -253,11 +253,7 @@ impl CpuForward {
                     let admitted = controllers.grouped_chained_tiles(
                         &inputs,
                         calls,
-                        (
-                            self.math.rms_norm_eps,
-                            prefill::projection_side(true),
-                            scales.as_deref(),
-                        ),
+                        (self.math.rms_norm_eps, bridge.keep(), scales.as_deref()),
                         |host, range| {
                             let range =
                                 range.ok_or_else(|| bad("missing resident Inkling query tile"))?;

@@ -61,7 +61,7 @@ impl PrefillProjection<'_> {
             true,
         )?;
         Ok((
-            layout.host_rows(&values).collect(),
+            layout.host_rows(&values, inputs.len()).collect(),
             side.ok_or_else(|| bad("missing Inkling attention sidecar"))?,
         ))
     }
@@ -91,8 +91,15 @@ impl<const N: usize> Layout<N> {
         }
     }
 
-    fn host_rows<'a>(&'a self, values: &'a [f32]) -> impl Iterator<Item = [Vec<f32>; N]> + 'a {
-        values.chunks_exact(self.host.iter().sum()).map(|row| {
+    /// The `m` host rows of `values`, which are empty when every output stays on the device.
+    fn host_rows<'a>(
+        &'a self,
+        values: &'a [f32],
+        m: usize,
+    ) -> impl Iterator<Item = [Vec<f32>; N]> + 'a {
+        let width: usize = self.host.iter().sum();
+        (0..m).map(move |r| {
+            let row = &values[r * width..][..width];
             let mut offset = 0;
             self.host.map(|width| {
                 let result = row[offset..offset + width].to_vec();
@@ -129,7 +136,7 @@ impl DenseStep {
                 None,
                 allow_q8_row_reuse,
             )?;
-            rows.extend(layout.host_rows(&values));
+            rows.extend(layout.host_rows(&values, chunk.len()));
         }
         Ok(Some(rows))
     }
@@ -185,7 +192,10 @@ impl DenseStep {
             None => self.range(Slot::Output, offset, len),
         };
         let input = range(0, input_words)?;
-        let output = range(input_words, m * ld_host)?;
+        // Local visits with Q, K and V on the device leave no host output.
+        let output = (ld_host > 0)
+            .then(|| range(input_words, m * ld_host))
+            .transpose()?;
         let side = (ld_side > 0)
             .then(|| range(side_at, m * ld_side))
             .transpose()?;
@@ -241,10 +251,14 @@ impl DenseStep {
                 encoded.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
             }
             buffer.write_at(&self.stream, input.offset(), &encoded)?;
-            let mut bytes = vec![[0; 4]; output.bytes() / 4];
+            let mut bytes = vec![[0; 4]; output.map_or(0, |o| o.bytes()) / 4];
             finish_borrowed(&self.stream, || {
                 project()?;
-                buffer.read_at(&self.stream, output.offset(), bytes.as_flattened_mut())
+                match output {
+                    Some(o) => buffer.read_at(&self.stream, o.offset(), bytes.as_flattened_mut()),
+                    // Attention reads the sidecar on its own stream.
+                    None => self.stream.synchronize(),
+                }
             })?;
             let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
             if !values.iter().all(|v| v.is_finite()) {
@@ -252,7 +266,7 @@ impl DenseStep {
             }
             values
         } else {
-            self.run_rows(context, &self.stream, &input_rows, [input, output], project)?
+            self.run_rows_into(context, &self.stream, &input_rows, (input, output), project)?
         };
         // run_rows fenced the producer stream; attention may consume this range on its own stream.
         Ok((values, side))
@@ -386,7 +400,10 @@ mod tests {
             .project_group_tile(&context, &input, weights, &layout, Some(&scratch), true)
             .unwrap();
         assert!(side.is_none());
-        assert_eq!(layout.host_rows(&values).collect::<Vec<_>>(), scalar);
+        assert_eq!(
+            layout.host_rows(&values, scalar.len()).collect::<Vec<_>>(),
+            scalar
+        );
         // The cold expert path overwrites the stage with new weights after attention.
         let cold: Vec<_> = (0..7 * 32)
             .flat_map(|i| (((i % 17) as f32 - 8.0) * 0.25).to_ne_bytes())

@@ -48,7 +48,7 @@ int inference_cuda_relative_attention_tile_launch(
  * and clip the first two planes in place; OR errors into the per-row status. */
 int inference_cuda_relative_attention_clip_queries(
     float *side, const float *scales, uint32_t *status, int rows, int heads,
-    int dims, float q_limit, float rel_limit, void *stream, int *out_stage);
+    int dims, int gap, float q_limit, float rel_limit, void *stream, int *out_stage);
 
 #ifdef __cplusplus
 }

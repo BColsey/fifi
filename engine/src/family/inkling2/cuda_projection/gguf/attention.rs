@@ -928,6 +928,7 @@ mod tests {
         let device_side = Some(prefill::Sidecar {
             range: side_in,
             query: None,
+            kv: None,
         });
         let ring = || {
             let mut bytes = vec![0; 2 * cache_bytes];
@@ -1213,6 +1214,7 @@ mod tests {
             Some(prefill::Sidecar {
                 range: resident.range(start, packed.len()).unwrap(),
                 query: Some(query),
+                kv: None,
             })
         };
         let host_rows = std::array::from_fn::<_, 4, _>(|i| Row {

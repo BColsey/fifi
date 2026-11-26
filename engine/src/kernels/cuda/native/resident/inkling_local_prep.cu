@@ -112,6 +112,59 @@ __global__ void inkling_output_conv(const float *raw, const float *past, const f
     const int invalid = __syncthreads_or(bad);
     if (threadIdx.x == 0 && invalid) atomicOr(status + row, 1u);
 }
+struct KvRowsArgs {
+    const float *raw, *past, *weights, *coefficients;
+    float *out;
+    uint32_t *status;
+    int rows, kv, history, dynamic;
+    int raw_stride, raw_k, raw_v, out_stride, out_k, out_v;
+    float limit, eps;
+};
+
+// One block per row, plane and head of 128 channels. Raw K and V rows of the tile and the
+// visit's raw history (right-aligned, oldest first) feed the causal convolution in the host's
+// tap order; K heads are then L2-clipped and V heads RMS-normalized with the host's sequential
+// sum. Rows write their own slots, so the raw rows are never overwritten.
+__global__ void inkling_kv_prep_rows(KvRowsArgs a) {
+    __shared__ float squares[kWidth], scale;
+    const int d = threadIdx.x, row = blockIdx.y;
+    const int heads = a.kv / kWidth;
+    const int plane = blockIdx.x / heads, head = blockIdx.x % heads;
+    const int at = head * kWidth + d;
+    const int raw_at = plane ? a.raw_v : a.raw_k;
+    const float *weights = a.weights + plane * kTaps * a.kv;
+    float conv = 0.f;
+    for (int lag = 0; lag <= min(kTaps - 1, row + a.history); ++lag) {
+        const int source = row - lag;
+        const float x = source >= 0
+            ? a.raw[(size_t)source * a.raw_stride + raw_at + at]
+            : a.past[(plane * (kTaps - 1) + kTaps - 1 + source) * a.kv + at];
+        const float w = a.dynamic
+            ? __fadd_rn(weights[lag * a.kv + at],
+                        a.coefficients[((size_t)row * 2 + plane) * heads * kTaps + head * kTaps + lag])
+            : weights[at * kTaps + kTaps - 1 - lag];
+        conv = __fadd_rn(conv, __fmul_rn(w, x));
+    }
+    const float raw = a.raw[(size_t)row * a.raw_stride + raw_at + at];
+    const float norm = 1.f / sqrtf(float(a.dynamic ? 2 * kTaps + 1 : kTaps + 1));
+    const float x = __fmul_rn(__fadd_rn(conv, raw), norm);
+    squares[d] = __fmul_rn(x, x);
+    __syncthreads();
+    bool valid = true;
+    if (d == 0) {
+        float sum = 0.f;
+        for (int i = 0; i < kWidth; ++i) sum = __fadd_rn(sum, squares[i]);
+        scale = plane ? 1.f / sqrtf(sum / kWidth + a.eps)
+                      : fminf(1.f, a.limit / (sqrtf(sum) + 1.e-6f));
+        valid = isfinite(sum);
+    }
+    __syncthreads();
+    const float result = __fmul_rn(x, scale);
+    a.out[(size_t)row * a.out_stride + (plane ? a.out_v : a.out_k) + at] = result;
+    const int invalid = __syncthreads_or(!valid || !isfinite(x) || !isfinite(result));
+    if (d == 0 && invalid) atomicOr(a.status + row, 1u);
+}
+
 __device__ float ordered_rms_scale(const float *x, int width, float eps) {
     float squares = -0.f;
     for (int i = 0; i < width; ++i)
@@ -242,6 +295,25 @@ extern "C" int inference_cuda_inkling_output_conv(void *const *p, int rows, int 
         static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
         static_cast<const float *>(p[2]), static_cast<float *>(p[3]),
         static_cast<uint32_t *>(p[4]), rows, width, history, scale);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+// p: raw rows, history, taps (K then V weights, then per-row coefficients when dynamic), out,
+// status. shape: rows, kv, history, dynamic, raw stride, raw K, raw V, out stride, out K, out V
+// (floats).
+extern "C" int inference_cuda_inkling_kv_prep_rows(void *const *p, const int *shape,
+    float limit, float eps, void *stream, int *out_stage) {
+    const float *taps = static_cast<const float *>(p[2]);
+    KvRowsArgs args{static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+                    taps, taps + 2 * kTaps * shape[1],
+                    static_cast<float *>(p[3]), static_cast<uint32_t *>(p[4]),
+                    shape[0], shape[1], shape[2], shape[3], shape[4], shape[5], shape[6],
+                    shape[7], shape[8], shape[9], limit, eps};
+    inkling_kv_prep_rows<<<dim3(2 * (args.kv / kWidth), args.rows), kWidth, 0,
+                           (cudaStream_t)stream>>>(args);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

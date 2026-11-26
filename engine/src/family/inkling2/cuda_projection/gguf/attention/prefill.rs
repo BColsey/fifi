@@ -5,7 +5,7 @@ use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
     kernels::cuda::resident::{
-        inkling_local_prep::{OutputConvShape, PrepShape},
+        inkling_local_prep::{KvPrepShape, OutputConvShape, PrepShape},
         relative_attention::{QUERY_TILE_LIMIT, RelativeAttentionTile},
     },
 };
@@ -86,6 +86,29 @@ pub(in crate::family::inkling2) struct QueryClip<'a> {
 pub(in crate::family::inkling2) struct Sidecar<'a> {
     pub range: DeviceRange<'a>,
     pub query: Option<QueryClip<'a>>,
+    /// Set when the rows hold raw K and V, which the device prepares before attention.
+    pub kv: Option<&'a KvPrep<'a>>,
+}
+
+/// The host's inputs to the device preparation of a sub-tile's K and V, and its results.
+pub(in crate::family::inkling2) struct KvPrep<'a> {
+    pub kv_heads: usize,
+    /// Raw history of each plane, newest first, at most three rows.
+    pub history: [&'a VecDeque<Vec<f32>>; 2],
+    /// Static taps channel-major, or lag-major static weights when `coefficients` is set.
+    pub weights: [std::borrow::Cow<'a, [f32]>; 2],
+    /// Per row, the K taps then the V taps, four for each head.
+    pub coefficients: Option<Vec<f32>>,
+    pub limit: f32,
+    pub eps: f32,
+    pub prepared: std::cell::Cell<Option<KvPrepared>>,
+}
+
+pub(in crate::family::inkling2) struct KvPrepared {
+    /// The prepared K and V of each row.
+    pub rows: Vec<[Vec<f32>; 2]>,
+    /// The raw K and V of the last rows, at most three, oldest first.
+    pub raw_tail: Vec<[Vec<f32>; 2]>,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +222,88 @@ impl ResidentOutput<'_> {
     }
 }
 
+/// Appends the K/V preparation's raw history (right-aligned, oldest first, K then V), weights and
+/// per-row taps after the query scales. Returns the rows of history.
+fn encode_kv_prep(
+    bytes: &mut Vec<u8>,
+    kv: &KvPrep<'_>,
+    layout: Layout,
+    count: usize,
+) -> Result<usize, EngError> {
+    let width = layout.resident[1] / size_of::<f32>();
+    let past = PrepShape::TAPS - 1;
+    let history = kv.history[0].len();
+    let heads_taps = 2 * PrepShape::TAPS * kv.kv_heads;
+    if !layout.raw_kv
+        || kv.kv_heads * PrepShape::WIDTH != width
+        || kv.history[1].len() != history
+        || history > past
+        || kv
+            .history
+            .iter()
+            .flat_map(|h| h.iter())
+            .any(|row| row.len() != width)
+        || kv
+            .weights
+            .iter()
+            .any(|w| w.len() != PrepShape::TAPS * width)
+        || kv
+            .coefficients
+            .as_ref()
+            .is_some_and(|c| c.len() != count * heads_taps)
+    {
+        return Err(bad("incorrect CUDA K/V preparation inputs"));
+    }
+    for plane in kv.history {
+        bytes.resize(bytes.len() + 4 * width * (past - history), 0);
+        for row in plane.iter().rev() {
+            extend_words(bytes, row);
+        }
+    }
+    for weights in &kv.weights {
+        extend_words(bytes, weights);
+    }
+    if let Some(coefficients) = &kv.coefficients {
+        extend_words(bytes, coefficients);
+    }
+    Ok(history)
+}
+
+/// The prepared K and V of every row and the raw tail, read from the pinned readback.
+fn read_kv_prep(
+    transfer: &PinnedBuf,
+    layout: Layout,
+    offsets: &[[usize; 8]],
+) -> Result<KvPrepared, EngError> {
+    let count = offsets.len();
+    let width = layout.resident[1] / size_of::<f32>();
+    let rows_at = count * (4 + layout.output);
+    let tail_at = rows_at + count * layout.input;
+    let read = |at: usize| {
+        let mut row = vec![0.0; width];
+        transfer.read_f32(at, &mut row)?;
+        if row.iter().all(|x| x.is_finite()) {
+            Ok(row)
+        } else {
+            Err(bad("non-finite CUDA K/V preparation row"))
+        }
+    };
+    let rows = offsets
+        .iter()
+        .map(|row| Ok([read(rows_at + row[1])?, read(rows_at + row[2])?]))
+        .collect::<Result<_, EngError>>()?;
+    let tail = count.min(PrepShape::TAPS - 1);
+    let stride = layout.side_stride();
+    let k = layout.resident[0];
+    let raw_tail = (0..tail)
+        .map(|j| {
+            let at = tail_at + j * stride + k;
+            Ok([read(at)?, read(at + layout.resident[1])?])
+        })
+        .collect::<Result<_, EngError>>()?;
+    Ok(KvPrepared { rows, raw_tail })
+}
+
 /// Rows of `stride` bytes of native-endian floats, refused when any value is not finite.
 fn finite_rows(bytes: &[u8], stride: usize, error: &str) -> Result<Vec<Vec<f32>>, EngError> {
     bytes
@@ -218,8 +323,15 @@ fn finite_rows(bytes: &[u8], stride: usize, error: &str) -> Result<Vec<Vec<f32>>
         .collect()
 }
 
-pub(in crate::family::inkling2) fn projection_side(query: bool) -> &'static [usize] {
-    if query { &[0, 3, 4, 5] } else { &[4, 5] }
+/// The projection outputs that stay on the device: sinks and gates always, Q and relative
+/// coefficients when the query is clipped there, raw K and V when the device prepares them.
+pub(in crate::family::inkling2) fn projection_side(query: bool, kv: bool) -> &'static [usize] {
+    match (query, kv) {
+        (true, true) => &[0, 1, 2, 3, 4, 5],
+        (true, false) => &[0, 3, 4, 5],
+        (false, true) => &[1, 2, 4, 5],
+        (false, false) => &[4, 5],
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +342,8 @@ struct Layout {
     attention: usize,
     output: usize,
     projected: bool,
+    // The side rows hold raw K and V; the host rows keep slots for the prepared ones.
+    raw_kv: bool,
 }
 
 impl Layout {
@@ -244,13 +358,19 @@ impl Layout {
         for &i in keep {
             resident[i] = widths[i];
         }
+        let raw_kv = resident[1] != 0 && resident[2] != 0;
+        if raw_kv != (resident[1] != 0 || resident[2] != 0) {
+            return None;
+        }
+        let slots = if raw_kv { k + v } else { 0 };
         Some(Self {
-            input: widths.iter().sum::<usize>() + pos - resident.iter().sum::<usize>(),
+            input: widths.iter().sum::<usize>() + pos - resident.iter().sum::<usize>() + slots,
             scales: resident[0] + resident[3],
             resident,
             attention,
             output: output_rows.map_or(Some(attention), |n| n.checked_mul(4))?,
             projected: output_rows.is_some(),
+            raw_kv,
         })
     }
 
@@ -258,9 +378,36 @@ impl Layout {
         self.resident.iter().sum()
     }
 
+    /// Which inputs the host rows leave out because the side rows carry them for attention.
+    fn side_slots(self) -> [bool; 6] {
+        std::array::from_fn(|i| self.resident[i] != 0 && !(self.raw_kv && (i == 1 || i == 2)))
+    }
+
+    /// Words of the K/V preparation's history and weights, and of each row's taps.
+    fn kv_prep_words(self) -> [usize; 2] {
+        if !self.raw_kv {
+            return [0, 0];
+        }
+        let kv = self.resident[1] / size_of::<f32>();
+        let taps = PrepShape::TAPS;
+        [2 * (2 * taps - 1) * kv, 2 * taps * (kv / PrepShape::WIDTH)]
+    }
+
     fn row_bytes(self) -> Option<usize> {
         let projected = if self.projected { self.attention } else { 0 };
-        (self.input + 4 + projected).checked_add(self.output)
+        let taps = 4 * self.kv_prep_words()[1];
+        (self.input + 4 + projected + taps).checked_add(self.output)
+    }
+
+    /// Bytes every tile needs besides its rows: query scales, the K/V preparation's history
+    /// and weights, and the readback of the last three raw side rows.
+    fn fixed_bytes(self) -> usize {
+        let tail = if self.raw_kv {
+            (PrepShape::TAPS - 1) * self.side_stride()
+        } else {
+            0
+        };
+        self.scales + 4 * self.kv_prep_words()[0] + tail
     }
 
     fn capacity(self, query_tiles: bool) -> usize {
@@ -275,7 +422,7 @@ impl Layout {
         };
         limit
             .min(DenseGemvShape::MAX_ACTIVATION_ROWS)
-            .min((ARENA_BYTES - self.scales) / row_bytes)
+            .min(ARENA_BYTES.saturating_sub(self.fixed_bytes()) / row_bytes)
     }
 
     fn row_inputs<'a>(
@@ -287,10 +434,9 @@ impl Layout {
         row: usize,
     ) -> Result<[DeviceRange<'a>; 6], EngError> {
         let mut side_at = side.map_or(0, |s| s.range.offset()) + row * self.side_stride();
+        let side_slots = self.side_slots();
         let mut next = |i: usize| {
-            if self.resident[i] == 0 {
-                work.range(offsets[i], widths[i])
-            } else {
+            if side_slots[i] {
                 let side = side.ok_or_else(|| bad("missing CUDA attention sidecar"))?;
                 let relative_at = side_at - side.range.offset();
                 if relative_at
@@ -302,6 +448,10 @@ impl Layout {
                 let range = side.range.buffer().range(side_at, widths[i]);
                 side_at += self.resident[i];
                 range
+            } else {
+                // Raw K and V columns of the side rows are the preparation's input only.
+                side_at += self.resident[i];
+                work.range(offsets[i], widths[i])
             }
         };
         Ok([next(0)?, next(1)?, next(2)?, next(3)?, next(4)?, next(5)?])
@@ -545,9 +695,9 @@ impl ResidentAttention {
         (query_tiles, destination): (bool, Option<ResidentOutput<'_>>),
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let visit = self.visits[slot];
-        let keep = side
-            .as_ref()
-            .map_or(&[][..], |s| projection_side(s.query.is_some()));
+        let keep = side.as_ref().map_or(&[][..], |s| {
+            projection_side(s.query.is_some(), s.kv.is_some())
+        });
         let layout = Layout::new(visit.shape, projection.map(|p| p.rows), keep)
             .ok_or_else(|| bad("invalid CUDA relative attention batch layout"))?;
         if let Some(side) = &side
@@ -605,7 +755,7 @@ impl ResidentAttention {
                 visit.shape,
                 (position + i) as i32,
                 &mut work.encoded,
-                layout.resident.map(|n| n != 0),
+                layout.side_slots(),
             )?);
         }
         if let Some(query) = side.as_ref().and_then(|s| s.query) {
@@ -616,6 +766,11 @@ impl ResidentAttention {
                 extend_words(&mut work.encoded, scale);
             }
         }
+        let kv = side.as_ref().and_then(|s| s.kv);
+        let kv_history = match kv {
+            Some(kv) => Some(encode_kv_prep(&mut work.encoded, kv, layout, count)?),
+            None => None,
+        };
         self.invalidate_local_aux(slot);
         let mut state = self.state.borrow_mut();
         let cursor = state.next_position[slot].take();
@@ -634,7 +789,7 @@ impl ResidentAttention {
             visit,
             layout,
             work,
-            (&offsets, side),
+            (&offsets, side, kv.zip(kv_history)),
             (projection, tile, destination),
         )?;
         // The ring is independent of the projection output. Publish its cursor
@@ -656,7 +811,11 @@ impl ResidentAttention {
         visit: Visit,
         layout: Layout,
         work: &mut Workspace,
-        (offsets, side): (&[[usize; 8]], Option<Sidecar<'_>>),
+        (offsets, side, kv): (
+            &[[usize; 8]],
+            Option<Sidecar<'_>>,
+            Option<(&KvPrep<'_>, usize)>,
+        ),
         (projection, tile, destination): (
             Option<&OutputProjection<'_>>,
             Option<(RelativeAttentionTile, [usize; 12])>,
@@ -669,7 +828,14 @@ impl ResidentAttention {
             .filter(|c| c.read_convolved)
             .map(|c| c.planes[2]);
         let scales_at = layout.input * count;
-        let status_at = scales_at + layout.scales;
+        let prep_at = scales_at + layout.scales;
+        let [fixed_words, tap_words] = layout.kv_prep_words();
+        let prep_words = if kv.is_some_and(|(kv, _)| kv.coefficients.is_some()) {
+            fixed_words + count * tap_words
+        } else {
+            fixed_words
+        };
+        let status_at = prep_at + 4 * prep_words;
         let out_at = status_at + 4 * count;
         let attention_at = if layout.projected {
             out_at + layout.output * count
@@ -718,13 +884,48 @@ impl ResidentAttention {
                 context.relative_attention_clip_queries(
                     &self.stream,
                     visit.shape,
-                    count,
+                    [count, layout.resident[1] + layout.resident[2]],
                     query.limits,
                     [
                         side.range,
                         work.device.range(scales_at, layout.scales)?,
                         work.device.range(status_at, 4 * count)?,
                     ],
+                )?;
+            }
+            if let Some((kv, history)) = kv {
+                let side = side
+                    .as_ref()
+                    .ok_or_else(|| bad("K/V preparation lacks side rows"))?;
+                let kv_bytes = layout.resident[1];
+                let [k_at, v_at] = [offsets[0][1], offsets[0][2]];
+                if offsets.iter().enumerate().any(|(i, row)| {
+                    [row[1], row[2]] != [k_at, v_at].map(|at| at + i * layout.input)
+                }) {
+                    return Err(bad("CUDA K/V preparation rows are not evenly spaced"));
+                }
+                let past = 2 * 3 * kv_bytes;
+                context.inkling_kv_prep_rows(
+                    &self.stream,
+                    [
+                        side.range,
+                        device.range(prep_at, past)?,
+                        device.range(prep_at + past, 4 * prep_words - past)?,
+                        device.range(0, count * layout.input)?,
+                        device.range(status_at, 4 * count)?,
+                    ],
+                    KvPrepShape {
+                        rows: count,
+                        kv_heads: kv.kv_heads,
+                        history,
+                        dynamic: kv.coefficients.is_some(),
+                        raw_stride: layout.side_stride() / 4,
+                        raw: [layout.resident[0] / 4, (layout.resident[0] + kv_bytes) / 4],
+                        out_stride: layout.input / 4,
+                        out: [k_at / 4, v_at / 4],
+                        limit: kv.limit,
+                        eps: kv.eps,
+                    },
                 )?;
             }
             // Prep ORs into the same status checked by snapshot commit. No
@@ -787,7 +988,28 @@ impl ResidentAttention {
                 work.device.range(status_at, readback)?,
                 &mut work.transfer,
                 0,
-            )
+            )?;
+            if kv.is_some() {
+                let side = side
+                    .as_ref()
+                    .ok_or_else(|| bad("K/V preparation lacks side rows"))?;
+                let rows_at = count * (4 + layout.output);
+                context.copy_to_pinned(
+                    &self.stream,
+                    work.device.range(0, count * layout.input)?,
+                    &mut work.transfer,
+                    rows_at,
+                )?;
+                let tail = count.min(PrepShape::TAPS - 1);
+                let stride = layout.side_stride();
+                context.copy_to_pinned(
+                    &self.stream,
+                    side.range.slice((count - tail) * stride, tail * stride)?,
+                    &mut work.transfer,
+                    rows_at + count * layout.input,
+                )?;
+            }
+            Ok(())
         })();
         // A later enqueue can fail after queries or commit were accepted. Drain
         // before the borrowed sidecar or pinned workspace can be reused. Do not
@@ -798,6 +1020,10 @@ impl ResidentAttention {
         work.transfer.read(0, &mut status)?;
         if status.into_iter().any(|byte| byte != 0) {
             return Err(bad("invalid CUDA relative attention batch state"));
+        }
+        if let Some((kv, _)) = kv {
+            kv.prepared
+                .set(Some(read_kv_prep(&work.transfer, layout, offsets)?));
         }
         if destination.is_some() && convolved_readback.is_none() {
             return Ok(Vec::new());
@@ -837,8 +1063,8 @@ mod tests {
         let pos = size_of::<i32>();
         let projected = Some(16384);
         let host = Layout::new(shape, projected, &[]).unwrap();
-        let side = Layout::new(shape, projected, projection_side(false)).unwrap();
-        let query = Layout::new(shape, projected, projection_side(true)).unwrap();
+        let side = Layout::new(shape, projected, projection_side(false, false)).unwrap();
+        let query = Layout::new(shape, projected, projection_side(true, false)).unwrap();
         assert_eq!((host.side_stride(), host.scales), (0, 0));
         assert_eq!((side.side_stride(), side.scales), (sinks + q, 0));
         assert_eq!(query.resident, [q, 0, 0, relative, sinks, q]);

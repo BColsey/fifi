@@ -837,6 +837,19 @@ impl DenseStep {
         [input, output]: [DeviceRange<'_>; 2],
         enqueue: impl FnOnce() -> Result<(), EngError>,
     ) -> Result<Vec<f32>, EngError> {
+        self.run_rows_into(context, stream, inputs, (input, Some(output)), enqueue)
+    }
+
+    /// [`Self::run_rows`] whose readback may be empty: without an output range the call
+    /// uploads, enqueues and fences the stream, and returns no values.
+    fn run_rows_into(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        inputs: &[&[f32]],
+        (input, output): (DeviceRange<'_>, Option<DeviceRange<'_>>),
+        enqueue: impl FnOnce() -> Result<(), EngError>,
+    ) -> Result<Vec<f32>, EngError> {
         let mut bytes = Vec::with_capacity(input.bytes() / size_of::<f32>());
         for row in inputs {
             if !row.iter().all(|value| value.is_finite()) {
@@ -847,14 +860,16 @@ impl DenseStep {
         let mut transfer = self.transfer.borrow_mut();
         transfer.write(0, bytes.as_flattened())?;
         context.copy_from_pinned(stream, &mut transfer, 0, input)?;
-        let result =
-            enqueue().and_then(|()| context.copy_to_pinned(stream, output, &mut transfer, 0));
+        let result = enqueue().and_then(|()| match output {
+            Some(output) => context.copy_to_pinned(stream, output, &mut transfer, 0),
+            None => Ok(()),
+        });
         // Even a refused launch may follow an accepted input copy.
         let waited = transfer.synchronize(stream);
         result?;
         waited?;
 
-        read_projection_rows(&transfer, output.bytes())
+        read_projection_rows(&transfer, output.map_or(0, |output| output.bytes()))
     }
 
     fn range(&self, slot: Slot, skip: usize, len: usize) -> Result<DeviceRange<'_>, EngError> {

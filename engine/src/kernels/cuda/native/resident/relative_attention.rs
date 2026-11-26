@@ -51,6 +51,7 @@ unsafe extern "C" {
         rows: c_int,
         heads: c_int,
         dims: c_int,
+        gap: c_int,
         q_limit: f32,
         rel_limit: f32,
         stream: *mut c_void,
@@ -62,15 +63,19 @@ pub(in crate::kernels::cuda) fn clip_queries(
     stream: &RawStream,
     ranges: [RawRange<'_>; 3],
     shape: RelativeAttentionShape,
-    rows: usize,
+    [rows, gap]: [usize; 2],
     limits: [f32; 2],
 ) -> Result<(), DeviceFailure> {
     let [_, _, _, _, q, _, _, rel, _, sink, gate, _] =
         shape.region_bytes().ok_or_else(invalid_argument)?;
-    if !(1..=512).contains(&rows) || !limits.iter().all(|x| x.is_finite() && *x > 0.0) {
+    if !(1..=512).contains(&rows)
+        || !limits.iter().all(|x| x.is_finite() && *x > 0.0)
+        || !gap.is_multiple_of(4)
+        || c_int::try_from(gap / 4).is_err()
+    {
         return Err(invalid_argument());
     }
-    let bytes = [(q + rel + sink + gate) * rows, q + rel, rows * 4];
+    let bytes = [(q + gap + rel + sink + gate) * rows, q + rel, rows * 4];
     let spans = ranges.each_ref().map(|r| Span::of(r, r.bytes()));
     for (i, range) in ranges.iter().enumerate() {
         if range.bytes() != bytes[i]
@@ -91,6 +96,7 @@ pub(in crate::kernels::cuda) fn clip_queries(
             rows as c_int,
             shape.query_heads as c_int,
             shape.relative_dims as c_int,
+            (gap / 4) as c_int,
             limits[0],
             limits[1],
             stream.as_ptr(),

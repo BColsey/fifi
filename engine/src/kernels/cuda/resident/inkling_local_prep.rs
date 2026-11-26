@@ -69,6 +69,79 @@ impl OutputConvShape {
     }
 }
 
+/// The prompt rows of one K/V preparation launch: each row's raw K and V sit `raw` floats into
+/// rows `raw_stride` floats apart, and the prepared rows go to the same places of `out`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KvPrepShape {
+    pub rows: usize,
+    pub kv_heads: usize,
+    /// Raw rows of history before the first row, at most three.
+    pub history: usize,
+    /// Per-row taps added to lag-major static weights, as global visits use them.
+    pub dynamic: bool,
+    pub raw_stride: usize,
+    pub raw: [usize; 2],
+    pub out_stride: usize,
+    pub out: [usize; 2],
+    pub limit: f32,
+    pub eps: f32,
+}
+
+impl KvPrepShape {
+    pub(crate) const MAX_ROWS: usize = 4096;
+
+    /// Words of raw rows, history, taps (weights, then per-row coefficients when dynamic),
+    /// output rows and status.
+    pub(crate) fn words(self) -> Option<[usize; 5]> {
+        let taps = PrepShape::TAPS;
+        let kv = self.kv_heads.checked_mul(PrepShape::WIDTH)?;
+        let fits = |stride: usize, [k, v]: [usize; 2]| {
+            stride <= i32::MAX as usize
+                && k.checked_add(kv).is_some_and(|end| end <= stride)
+                && v.checked_add(kv).is_some_and(|end| end <= stride)
+                && (k + kv <= v || v + kv <= k)
+        };
+        if !(1..=Self::MAX_ROWS).contains(&self.rows)
+            || !(1..=64).contains(&self.kv_heads)
+            || self.history >= taps
+            || !fits(self.raw_stride, self.raw)
+            || !fits(self.out_stride, self.out)
+            || !(self.limit.is_finite() && self.limit > 0.0)
+            || !(self.eps.is_finite() && self.eps > 0.0)
+        {
+            return None;
+        }
+        let coefficients = if self.dynamic {
+            self.rows * 2 * self.kv_heads * taps
+        } else {
+            0
+        };
+        Some([
+            self.rows.checked_mul(self.raw_stride)?,
+            2 * (taps - 1) * kv,
+            2 * taps * kv + coefficients,
+            self.rows.checked_mul(self.out_stride)?,
+            self.rows,
+        ])
+    }
+
+    /// The integer arguments of the launch, in the kernel's order.
+    pub(crate) fn geometry(self) -> [usize; 10] {
+        [
+            self.rows,
+            self.kv_heads * PrepShape::WIDTH,
+            self.history,
+            usize::from(self.dynamic),
+            self.raw_stride,
+            self.raw[0],
+            self.raw[1],
+            self.out_stride,
+            self.out[0],
+            self.out[1],
+        ]
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct DepthShape {
     pub rows: usize,
@@ -280,6 +353,23 @@ impl CudaContext {
         })
     }
 
+    /// Convolve, clip and normalize the raw K and V of prompt rows, as the host prepares each
+    /// row in turn. Ranges: raw rows, raw history, taps, output rows, status. The caller
+    /// initializes status, which the kernel only ORs into.
+    pub(crate) fn inkling_kv_prep_rows(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 5],
+        shape: KvPrepShape,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let [a, b, c, d, e] = ranges.each_ref().map(|r| self.raw_range(r));
+        let ranges = [a?, b?, c?, d?, e?];
+        self.launch_on(stream, |stream| {
+            resident::inkling_local_prep::kv_prep_rows(stream, ranges, shape)
+        })
+    }
+
     pub(crate) fn inkling_effective_taps(
         &self,
         stream: &DeviceStream,
@@ -467,6 +557,228 @@ mod tests {
                 assert!(
                     row.eq(reference(&planes, &query, shape, r)),
                     "{rows}x{width} depth {depth} row {r}"
+                );
+            }
+        }
+    }
+
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn take(&mut self, n: usize) -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (self.0 >> 8) as f32 * (1.0 / 4194304.0) - 2.0
+                })
+                .collect()
+        }
+    }
+
+    /// The host's causal convolution of one row: `rows[0]` is the row, then its history newest
+    /// first; `tap(lag, channel)` is the weight, and `norm` the final scale.
+    fn host_conv(rows: &[&[f32]], tap: impl Fn(usize, usize) -> f32, norm: f32) -> Vec<f32> {
+        let mut output = vec![0.0f32; rows[0].len()];
+        for (lag, row) in rows.iter().enumerate() {
+            for (channel, (result, &x)) in output.iter_mut().zip(row.iter()).enumerate() {
+                *result += tap(lag, channel) * x;
+            }
+        }
+        for (result, x) in output.iter_mut().zip(rows[0]) {
+            *result = (*result + x) * norm;
+        }
+        output
+    }
+
+    fn host_dot(x: &[f32]) -> f32 {
+        x.iter().map(|v| v * v).sum()
+    }
+
+    /// The device convolves, clips and normalizes K and V of several rows with a history, from
+    /// strided raw rows into strided output rows, with the bits of the host's row-by-row order.
+    #[test]
+    fn kv_prep_rows_match_the_host_order_bit_for_bit() {
+        if !device_present("Inkling CUDA K/V preparation") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let mut lcg = Lcg(7);
+        let (kv_heads, rows) = (2, 5);
+        let kv = kv_heads * PrepShape::WIDTH;
+        let taps = PrepShape::TAPS;
+        let (limit, eps) = (1.5f32, 1.0e-6f32);
+        for dynamic in [false, true] {
+            for history in 0..taps {
+                // Raw rows carry 7 other words before K and between K and V.
+                let (raw_stride, raw) = (2 * kv + 19, [7, kv + 14]);
+                let (out_stride, out) = (2 * kv + 3, [kv + 3, 0]);
+                let raw_rows = lcg.take(rows * raw_stride);
+                let past = lcg.take(2 * (taps - 1) * kv);
+                let weights = lcg.take(2 * taps * kv);
+                let coefficients = if dynamic {
+                    lcg.take(rows * 2 * kv_heads * taps)
+                } else {
+                    Vec::new()
+                };
+                let mut all_taps = weights.clone();
+                all_taps.extend(&coefficients);
+                let shape = KvPrepShape {
+                    rows,
+                    kv_heads,
+                    history,
+                    dynamic,
+                    raw_stride,
+                    raw,
+                    out_stride,
+                    out,
+                    limit,
+                    eps,
+                };
+                let words = shape.words().unwrap();
+                let up = |v: &[f32]| upload_bytes(&ctx, bytes(v).as_flattened());
+                let out_rows = ctx.allocate(words[3] * 4).unwrap();
+                let status = up(&vec![0.0; rows]);
+                let [r, h, w] = [&raw_rows, &past, &all_taps].map(|v| up(v));
+                ctx.inkling_kv_prep_rows(
+                    &stream,
+                    [
+                        r.range(0, words[0] * 4).unwrap(),
+                        h.range(0, words[1] * 4).unwrap(),
+                        w.range(0, words[2] * 4).unwrap(),
+                        out_rows.range(0, words[3] * 4).unwrap(),
+                        status.range(0, rows * 4).unwrap(),
+                    ],
+                    shape,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+                let got: Vec<f32> = read_bytes(&ctx, &out_rows, words[3] * 4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_ne_bytes(*b))
+                    .collect();
+                let flags = read_bytes(&ctx, &status, rows * 4);
+                assert!(flags.iter().all(|&b| b == 0), "status {flags:?}");
+                for plane in 0..2 {
+                    let row_of = |row: usize| &raw_rows[row * raw_stride + raw[plane]..][..kv];
+                    // History rows newest first: the last of the right-aligned plane.
+                    let old: Vec<&[f32]> = (0..history)
+                        .map(|lag| &past[(plane * (taps - 1) + taps - 2 - lag) * kv..][..kv])
+                        .collect();
+                    let w = &weights[plane * taps * kv..][..taps * kv];
+                    for row in 0..rows {
+                        let mut chain: Vec<&[f32]> = (0..=row).rev().map(row_of).collect();
+                        chain.extend(&old);
+                        chain.truncate(taps);
+                        let norm = ((if dynamic { 2 * taps } else { taps } + 1) as f32)
+                            .sqrt()
+                            .recip();
+                        let mut x = host_conv(
+                            &chain,
+                            |lag, channel| {
+                                if dynamic {
+                                    let c = &coefficients[(row * 2 + plane) * kv_heads * taps..];
+                                    w[lag * kv + channel]
+                                        + c[channel / PrepShape::WIDTH * taps + lag]
+                                } else {
+                                    w[channel * taps + taps - 1 - lag]
+                                }
+                            },
+                            norm,
+                        );
+                        for head in x.as_chunks_mut::<{ PrepShape::WIDTH }>().0 {
+                            let dot = host_dot(head);
+                            let scale = if plane == 0 {
+                                (limit / (dot.sqrt() + 1e-6)).min(1.0)
+                            } else {
+                                (dot / PrepShape::WIDTH as f32 + eps).sqrt().recip()
+                            };
+                            for value in head {
+                                *value *= scale;
+                            }
+                        }
+                        let device = &got[row * out_stride + out[plane]..][..kv];
+                        assert!(
+                            device
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .eq(x.iter().map(|v| v.to_bits())),
+                            "plane {plane} row {row} history {history} dynamic {dynamic}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The static output convolution over rows with a history gives the host's bits.
+    #[test]
+    fn output_conv_matches_the_host_order_bit_for_bit() {
+        if !device_present("Inkling CUDA output convolution") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let mut lcg = Lcg(11);
+        let taps = PrepShape::TAPS;
+        let (rows, width) = (6, 300);
+        for history in 0..taps {
+            let shape = OutputConvShape {
+                rows,
+                width,
+                history,
+            };
+            let [plane, past_words, tap_words, _, _] = shape.words().unwrap();
+            let raw = lcg.take(plane);
+            let past = lcg.take(past_words);
+            let weights = lcg.take(tap_words);
+            let up = |v: &[f32]| upload_bytes(&ctx, bytes(v).as_flattened());
+            let [r, h, w] = [&raw, &past, &weights].map(|v| up(v));
+            let result = ctx.allocate(plane * 4).unwrap();
+            let status = up(&vec![0.0; rows]);
+            ctx.inkling_output_conv(
+                &stream,
+                [
+                    r.range(0, plane * 4).unwrap(),
+                    h.range(0, past_words * 4).unwrap(),
+                    w.range(0, tap_words * 4).unwrap(),
+                    result.range(0, plane * 4).unwrap(),
+                    status.range(0, rows * 4).unwrap(),
+                ],
+                shape,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let got: Vec<u32> = read_bytes(&ctx, &result, plane * 4)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_ne_bytes(*b))
+                .collect();
+            let old: Vec<&[f32]> = (0..history)
+                .map(|lag| &past[(taps - 2 - lag) * width..][..width])
+                .collect();
+            let norm = ((taps + 1) as f32).sqrt().recip();
+            for row in 0..rows {
+                let mut chain: Vec<&[f32]> = (0..=row)
+                    .rev()
+                    .map(|r| &raw[r * width..][..width])
+                    .collect();
+                chain.extend(&old);
+                chain.truncate(taps);
+                let host = host_conv(
+                    &chain,
+                    |lag, channel| weights[channel * taps + taps - 1 - lag],
+                    norm,
+                );
+                assert!(
+                    got[row * width..][..width]
+                        .iter()
+                        .copied()
+                        .eq(host.iter().map(|v| v.to_bits())),
+                    "row {row} history {history}"
                 );
             }
         }
