@@ -1429,18 +1429,18 @@ fn q36_preflight(
 
     // What a CUDA start refuses before it reads a weight (an EXL3 pack, the speculative window)
     // is refused here with the start's own message.
-    if backend == Backend::Cuda {
-        if let Err(error) = crate::family::qwen::qwen36::settings::check_cuda_serves(&settings) {
-            checks.push(Check::new(
-                "settings",
-                CheckStatus::Fail,
-                format!(
-                    "the engine would refuse these settings: {}",
-                    super::describe_error(&error)
-                ),
-            ));
-            return finish(checks, None, Vec::new(), Qualification::Unverified);
-        }
+    if backend == Backend::Cuda
+        && let Err(error) = crate::family::qwen::qwen36::settings::check_cuda_serves(&settings)
+    {
+        checks.push(Check::new(
+            "settings",
+            CheckStatus::Fail,
+            format!(
+                "the engine would refuse these settings: {}",
+                super::describe_error(&error)
+            ),
+        ));
+        return finish(checks, None, Vec::new(), Qualification::Unverified);
     }
 
     // The tokenizer verdict is the loader's: bundle load under the

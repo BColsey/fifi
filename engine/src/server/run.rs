@@ -1491,10 +1491,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(
-        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
-        all(feature = "native-cuda", target_os = "linux")
-    )))]
+    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn unsupported_flint_is_recognized_and_refused_before_file_reads() {
         let dir = tempfile::tempdir().expect("temporary config directory");
@@ -1522,7 +1519,7 @@ mod tests {
         ) {
             Err(crate::EngError::BadRequest(message)) => assert_eq!(
                 message,
-                "engine config: Flint requires --features native-mlx on Apple Silicon or --features native-cuda on Linux"
+                "engine config: Flint requires --features native-mlx on Apple Silicon"
             ),
             Err(other) => panic!("expected explicit backend refusal, got {other:?}"),
             Ok(_) => panic!("staged Flint must not start a fake or native engine"),
@@ -1534,7 +1531,7 @@ mod tests {
         match super::start_engines(&config) {
             Err(error) => assert_eq!(
                 error.0,
-                "engine flint failed to start: engine config: Flint requires --features native-mlx on Apple Silicon or --features native-cuda on Linux"
+                "engine flint failed to start: engine config: Flint requires --features native-mlx on Apple Silicon"
             ),
             Ok(_) => panic!("staged Flint must refuse before sampling-default reads"),
         }

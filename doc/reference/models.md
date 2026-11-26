@@ -110,7 +110,6 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | GGUF Q8_0, and K-quant conversions of it | Bolt E4B on CUDA |
 | GGUF, matrices dequantized on demand | SenseNova-Loop on CPU (the published Q4_K_M file) |
 | GGUF, mainline `inkling2_loop` or older `inkling2` layout | Inkling 2 Mini on Apple Silicon, and on CPU or CUDA with family `inkling2_loop` |
-| EXL3 | Flint on CUDA |
 | NVFP4 safetensors | Nemotron 3.5 Super |
 | Mixed NVFP4 and MXFP8 safetensors | Inkling 2 Mini on Apple Silicon |
 
