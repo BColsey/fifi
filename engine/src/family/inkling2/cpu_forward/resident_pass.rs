@@ -1225,22 +1225,29 @@ struct Block<'a> {
 }
 
 impl Block<'_> {
-    /// Test aid (`FIFI_INKLING_PASS_DUMP_VISIT=index:path`): after its K/V preparation, the
+    /// Test aid (`FIFI_INKLING_PASS_DUMP_VISIT=index:path[,index:path]`): after its K/V
+    /// preparation, the
     /// visit's live stream, attention input, raw K/V and prepared side rows, as bits, for a host
     /// comparison.
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     fn dump_planes(&self, index: usize) -> Result<(), EngError> {
-        static DUMP: std::sync::OnceLock<Option<(usize, std::path::PathBuf)>> =
+        static DUMP: std::sync::OnceLock<Vec<(usize, std::path::PathBuf)>> =
             std::sync::OnceLock::new();
-        let Some((_, path)) = DUMP
-            .get_or_init(|| {
-                let value = std::env::var("FIFI_INKLING_PASS_DUMP_VISIT").ok()?;
-                let (index, path) = value.split_once(':')?;
-                Some((index.parse().ok()?, std::path::PathBuf::from(path)))
-            })
-            .as_ref()
-            .filter(|(wanted, _)| *wanted == index)
-        else {
+        let dumps = DUMP.get_or_init(|| {
+            std::env::var("FIFI_INKLING_PASS_DUMP_VISIT")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|item| {
+                            let (index, path) = item.split_once(':')?;
+                            Some((index.parse().ok()?, std::path::PathBuf::from(path)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        let Some((_, path)) = dumps.iter().find(|(wanted, _)| *wanted == index) else {
             return Ok(());
         };
         let read = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, words: usize| {
