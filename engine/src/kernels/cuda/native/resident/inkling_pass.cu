@@ -224,7 +224,9 @@ __global__ void inkling_pass_prep(PrepArgs a) {
                     : kernel[channel * taps + taps - 1 - lag];
         sum = __fadd_rn(sum, __fmul_rn(weight, x));
     }
-    const float norm = __frcp_rn(__fsqrt_rn(static_cast<float>(taps + 1)));
+    // The host norm counts the dynamic taps as a second kernel: (2 * taps + 1) with them.
+    const float norm = __frcp_rn(__fsqrt_rn(
+        static_cast<float>(a.dynamic_taps ? 2 * taps + 1 : taps + 1)));
     const float convolved = __fmul_rn(__fadd_rn(sum, raw[0]), norm);
     const int warp = lane >> 5;
     float squares = warp_sum(__fmul_rn(convolved, convolved));
