@@ -1389,6 +1389,8 @@ extern "C" int inference_cuda_gguf_wmma_launch(const inference_cuda_dense_gemv_a
     }
 }
 
+#include "inkling_routed_prefill.cuh"
+
 extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                                const inference_cuda_gguf_moe_matrices *matrices,
                                                void *stream, int *out_stage,
