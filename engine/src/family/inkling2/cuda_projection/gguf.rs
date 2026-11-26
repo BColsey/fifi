@@ -1177,6 +1177,16 @@ impl GgufCuda {
         )
     }
 
+    /// The F32 router matrix `[n_expert][hidden]` of `name`, for a device-resident caller.
+    pub(in crate::family::inkling2) fn router_weight(
+        &self,
+        name: &str,
+    ) -> Option<(&Resident, DenseDtype, [usize; 2])> {
+        self.dense
+            .get(name)
+            .map(|(weight, dtype)| (weight, *dtype, weight.shape))
+    }
+
     pub(in crate::family::inkling2) fn controller_weights(
         &self,
         names: [&str; 3],
