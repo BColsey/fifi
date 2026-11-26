@@ -400,7 +400,6 @@ impl ResidentAttention {
         let row_bytes = visit.cache_bytes / capacity;
         let first = position.saturating_sub(capacity);
         let rows = position - first;
-        let row_words = row_bytes / size_of::<f32>();
         let mut planes = Vec::with_capacity(2);
         for plane in 0..2 {
             let base = visit.cache_at + plane * visit.cache_bytes;
