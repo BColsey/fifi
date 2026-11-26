@@ -404,6 +404,7 @@ impl CudaContext {
 }
 
 mod moe;
+pub(crate) mod routed_prefill;
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::moe::{
     GgufGate, GgufMoeSchedule,
 };
