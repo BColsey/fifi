@@ -319,8 +319,10 @@ mod tests {
         let context = CudaContext::new().unwrap();
         let stream = context.stream().unwrap();
         let mut rng = Lcg(7);
-        let (width, rows, eps) = (2304, 256, 1e-5);
-        for sealed in [0, 1, 6] {
+        let (rows, eps) = (256, 1e-5);
+        // Widths with a partial last chunk of products, and enough sealed rows that their
+        // ordered sums span two warps.
+        for (width, sealed) in [(2304, 0), (2304, 1), (2304, 6), (1000, 6), (1000, 40)] {
             let mut host: Vec<Stream> = (0..rows)
                 .map(|_| {
                     let mut s = Stream::new(rng.row(width));
@@ -331,7 +333,8 @@ mod tests {
                 })
                 .collect();
             let refs: Vec<&Stream> = host.iter().collect();
-            let mut device = PromptStreams::upload(&context, &stream, &refs, 8).unwrap();
+            let mut device =
+                PromptStreams::upload(&context, &stream, &refs, sealed.max(6) + 2).unwrap();
             let query = rng.row(width);
             let gamma = rng.row(width);
             let (q, g) = (
@@ -341,7 +344,12 @@ mod tests {
             // Mixes from every first block, with and without the norm, into a strided output.
             let stride = width + 5;
             let out = context.allocate(rows * stride * WORD).unwrap();
-            for first in 0..=sealed {
+            let firsts: Vec<usize> = if sealed > 8 {
+                vec![0, 1, sealed / 2, sealed]
+            } else {
+                (0..=sealed).collect()
+            };
+            for first in firsts {
                 for norm in [false, true] {
                     device
                         .mix(

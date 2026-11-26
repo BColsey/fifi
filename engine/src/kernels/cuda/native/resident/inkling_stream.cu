@@ -291,15 +291,18 @@ __global__ void inkling_stream_norm(const float *src, float *dst, float *health,
 }
 
 // Host-ordered variants of the mix and the seal (`Stream::mix`, `Stream::seal` and
-// `CpuForward::norm` of the host): every reduction runs on one lane in the host's element order,
-// so the results are the host's bits. One block per state; the other lanes stage the normalized
-// current row and write the outputs, and the states of a prompt keep the card busy.
+// `CpuForward::norm` of the host): every reduction adds in the host's element order on one lane,
+// so the results are the host's bits. One block per state; all lanes stage the products and the
+// normalized current row and write the outputs, and the states of a prompt keep the card busy.
 constexpr int ordered_max_width = 4096;
 
-// The host's rms_norm_with_scale scale, summed in element order on the calling lane.
-__device__ float ordered_scale(const float *row, int width, float eps) {
-    return ordered_rms_scale(ordered_dot(row, row, width), width, eps);
+// Dynamic shared bytes of an ordered mix of `rows` mix rows: the current row, then the staged
+// products of one sum per mix row.
+size_t ordered_mix_shared_bytes(int width, int rows) {
+    return (static_cast<size_t>(width) + ordered_staged_floats(rows)) * sizeof(float);
 }
+static_assert((ordered_max_width + ordered_staged_floats(max_rows)) * sizeof(float) <= 48 * 1024,
+              "the widest ordered mix of the most rows must fit the default shared memory");
 
 // out = norm(mix) * gamma when `gamma` is set, else the mix. Without a query the mix is the raw
 // current row (the first visit's input). Output rows are `out_stride` floats apart.
@@ -310,8 +313,10 @@ __global__ void inkling_stream_mix_ordered(const float *state, const float *quer
     state += static_cast<size_t>(blockIdx.x) * stride * width;
     out += static_cast<size_t>(blockIdx.x) * out_stride;
     extern __shared__ float ordered[];
-    float *current = ordered;
-    float *mixed = ordered + width;
+    // The current row, normalized, then the mix in place: each lane reads its own columns of the
+    // current row before it writes them.
+    float *mixed = ordered;
+    float *staged = ordered + width;
     __shared__ float scores[max_rows];
     __shared__ float weights[max_rows];
     __shared__ float scalars[2];
@@ -319,22 +324,31 @@ __global__ void inkling_stream_mix_ordered(const float *state, const float *quer
     int invalid = 0;
     if (query) {
         const int rows = blocks - first_block + 1;
-        // Lane 0 scales the current row while warp 1 scores the sealed rows, one lane each.
+        // Sum 0 is the current row's squares; sum k > 0 scores sealed mix row k - 1.
+        const float first = ordered_dots(
+            [&](int k, int i) {
+                return k == 0 ? __fmul_rn(state[i], state[i])
+                              : __fmul_rn(mix_row(state, blocks, rows, k - 1, width)[i], query[i]);
+            },
+            rows, width, staged);
         if (lane == 0) {
-            scalars[0] = ordered_scale(state, width, mix_eps);
-        } else if (lane >= 32 && lane - 32 < rows - 1) {
-            scores[lane - 32] = ordered_dot(mix_row(state, blocks, rows, lane - 32, width), query, width);
+            scalars[0] = ordered_rms_scale(first, width, mix_eps);
+        } else if (lane < rows) {
+            scores[lane - 1] = first;
         }
         __syncthreads();
         const float scale = scalars[0];
         for (int i = lane; i < width; i += threads) {
             const float value = state[i];
             invalid |= !isfinite(value);
-            current[i] = __fmul_rn(value, scale);
+            mixed[i] = __fmul_rn(value, scale);
         }
         __syncthreads();
+        const float current_score =
+            ordered_dots([&](int, int i) { return __fmul_rn(mixed[i], query[i]); }, 1, width,
+                         staged);
         if (lane == 0) {
-            scores[rows - 1] = ordered_dot(current, query, width);
+            scores[rows - 1] = current_score;
             const float inverse = __frcp_rn(__fsqrt_rn(static_cast<float>(width)));
             float peak = -INFINITY;
             for (int r = 0; r < rows; ++r) {
@@ -357,7 +371,7 @@ __global__ void inkling_stream_mix_ordered(const float *state, const float *quer
             for (int r = 0; r < rows - 1; ++r) {
                 sum = __fadd_rn(sum, __fmul_rn(weights[r], mix_row(state, blocks, rows, r, width)[c]));
             }
-            sum = __fadd_rn(sum, __fmul_rn(weights[rows - 1], current[c]));
+            sum = __fadd_rn(sum, __fmul_rn(weights[rows - 1], mixed[c]));
             mixed[c] = __fdiv_rn(sum, mass);
         }
     } else {
@@ -365,7 +379,10 @@ __global__ void inkling_stream_mix_ordered(const float *state, const float *quer
     }
     __syncthreads();
     if (gamma) {
-        if (lane == 0) scalars[0] = ordered_scale(mixed, width, norm_eps);
+        const float squares =
+            ordered_dots([&](int, int i) { return __fmul_rn(mixed[i], mixed[i]); }, 1, width,
+                         staged);
+        if (lane == 0) scalars[0] = ordered_rms_scale(squares, width, norm_eps);
         __syncthreads();
         const float scale = scalars[0];
         for (int c = lane; c < width; c += threads) {
@@ -387,8 +404,11 @@ __global__ void inkling_stream_seal_ordered(float *state, const float *next, flo
     state += static_cast<size_t>(blockIdx.x) * stride * width;
     next += static_cast<size_t>(blockIdx.x) * width;
     __shared__ float shared_scale;
+    __shared__ float staged[ordered_staged_floats(1)];
     const int lane = threadIdx.x;
-    if (lane == 0) shared_scale = ordered_scale(state, width, eps);
+    const float squares =
+        ordered_dots([&](int, int i) { return __fmul_rn(state[i], state[i]); }, 1, width, staged);
+    if (lane == 0) shared_scale = ordered_rms_scale(squares, width, eps);
     __syncthreads();
     const float scale = shared_scale;
     float *sealed = state + (static_cast<size_t>(blocks) + 1) * width;
@@ -541,7 +561,8 @@ extern "C" int inference_cuda_inkling_stream_mix_ordered(
         overlaps(health, sizeof(float), out, out_bytes)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    inkling_stream_mix_ordered<<<rows, threads, 2 * row, static_cast<cudaStream_t>(stream)>>>(
+    const size_t shared = ordered_mix_shared_bytes(width, query ? blocks - first_block + 1 : 1);
+    inkling_stream_mix_ordered<<<rows, threads, shared, static_cast<cudaStream_t>(stream)>>>(
         state, query, gamma, out, health, first_block, blocks, width, mix_eps, norm_eps, stride,
         out_stride);
     Failure failure;
