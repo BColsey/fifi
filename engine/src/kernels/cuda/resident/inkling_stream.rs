@@ -465,7 +465,13 @@ impl CudaContext {
         })
     }
 
-    /// `Stream::add_current(row)` of the host: `current = current + row`, bit-identical.
+    /// `Stream::add_current(row)` of the host: `current = current + row`, bit-identical. The
+    /// resident chain folds its adds into the convolution and the mix jobs; this entry stays
+    /// as the reference the tests measure those fusions against.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the reference for the fused adds")
+    )]
     pub(crate) fn inkling_stream_add(
         &self,
         stream: &DeviceStream,

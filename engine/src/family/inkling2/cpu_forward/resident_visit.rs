@@ -25,7 +25,7 @@ use crate::{
             inkling_conv::ConvCall,
             inkling_local_prep::PrepMath,
             inkling_stream::{
-                AddCall, MAX_BLOCKS, MixCall, MixJob, MixNorm, MixShape, SealCall, StreamShape,
+                MAX_BLOCKS, MixCall, MixJob, MixNorm, MixShape, SealCall, StreamShape,
             },
         },
     },
@@ -685,7 +685,11 @@ impl Execution<'_> {
         }
         self.attention(cuda, position, input)?;
         let plain = self.weights.attention_query.is_none();
-        let (blocks, addend) = self.advance_depth(plain)?;
+        let (blocks, addend) = self.advance_depth()?;
+        let addend = match addend {
+            Some(region) => Some(self.row(region)?),
+            None => None,
+        };
         if plain {
             // The depth mix adds the attention output itself (the host's add) and writes the
             // weighted norm of its output, so the plain MLP reads that row without a norm launch.
@@ -696,10 +700,7 @@ impl Execution<'_> {
                     query: self.weights.row(self.weights.mlp_query)?,
                     out: self.row(l.mlp_input)?,
                     health: self.row(l.glue_health)?,
-                    addend: match addend {
-                        Some(region) => Some(self.row(region)?),
-                        None => None,
-                    },
+                    addend,
                     norm: Some(MixNorm {
                         gamma: self.weights.row(self.weights.mlp[0])?,
                         normed: self.row(l.mlp_normed)?,
@@ -712,7 +713,22 @@ impl Execution<'_> {
             )?;
             return self.mlp(cuda, l.mlp_normed);
         }
-        self.mix((l.depth, 0), blocks, self.weights.mlp_query, l.mlp_input)?;
+        // A controlled visit without a seal: its depth mix takes the attention output as the
+        // addend too.
+        self.context.inkling_stream_mix_jobs(
+            self.stream,
+            &[MixJob {
+                state: self.row(l.depth.row((blocks + 1) * width))?,
+                query: self.weights.row(self.weights.mlp_query)?,
+                out: self.row(l.mlp_input)?,
+                health: self.row(l.glue_health)?,
+                addend,
+                norm: None,
+                first_block: 0,
+                blocks,
+            }],
+            (width, MIX_EPS),
+        )?;
         self.mlp(cuda, l.mlp_input)
     }
 
@@ -813,17 +829,13 @@ impl Execution<'_> {
         cuda.enqueue_local_decode(self.stream, request)
     }
 
-    /// Seal or leave the depth stream alone after the attention; a plain visit without a seal
-    /// gets the attention output back as the addend of its depth mix instead of an add launch.
-    fn advance_depth(&self, plain: bool) -> Result<(usize, Option<Region>), EngError> {
+    /// Seal or leave the depth stream alone after the attention; a visit without a seal gets
+    /// the attention output back as the addend of its depth mix instead of an add launch.
+    fn advance_depth(&self) -> Result<(usize, Option<Region>), EngError> {
         let shape = self.plan.shape;
         let l = self.layout;
         if !shape.seal {
-            if plain {
-                return Ok((shape.blocks, Some(l.attention_out)));
-            }
-            self.add(l.attention_out)?;
-            return Ok((shape.blocks, None));
+            return Ok((shape.blocks, Some(l.attention_out)));
         }
         self.context.inkling_stream_seal(
             self.stream,
@@ -839,19 +851,6 @@ impl Execution<'_> {
             },
         )?;
         Ok((shape.blocks + 1, None))
-    }
-
-    fn add(&self, addend: Region) -> Result<(), EngError> {
-        let width = self.plan.shape.widths.hidden;
-        self.context.inkling_stream_add(
-            self.stream,
-            AddCall {
-                state: self.row(self.layout.depth.row(width))?,
-                row: self.row(addend)?,
-                health: self.row(self.layout.glue_health)?,
-            },
-            width,
-        )
     }
 
     fn mlp(&self, cuda: &GgufCuda, normed: Region) -> Result<(), EngError> {
