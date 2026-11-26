@@ -226,11 +226,6 @@ impl StateBook {
         self.tokens
     }
 
-    /// True when no step is pending (rule 4): the predicate of `require_idle`.
-    pub(in crate::family) fn is_idle(&self) -> bool {
-        self.pending.advances.is_empty()
-    }
-
     pub(in crate::family) fn pending_rows(&self) -> usize {
         self.pending.advances.iter().sum()
     }

@@ -45,7 +45,6 @@ pub(super) mod export;
 pub(super) mod grow;
 pub(super) mod pinned;
 pub(super) mod prefix;
-pub(super) mod rollback;
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod grow_tests;

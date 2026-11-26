@@ -281,12 +281,10 @@ impl RigWeights {
                 weight: &self.tiles[i],
                 experts: DIMS.n_expert,
             }),
-            WeightLayout::Exl3 => panic!("GGUF rig cannot fabricate EXL3 expert components"),
             WeightLayout::Native => StackWeights::Native(&self.stacks[i]),
         };
         let dense = |i: usize| match layout {
             WeightLayout::Tiled => DenseWeight::Tiled(&self.tiles[3 + i]),
-            WeightLayout::Exl3 => panic!("GGUF rig cannot fabricate EXL3 matrix components"),
             WeightLayout::Native => DenseWeight::Native(&self.denses[i]),
         };
         Ok(MoeLayerWeights {

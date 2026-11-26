@@ -38,42 +38,10 @@ mod card_weights;
 mod card_weights_tests;
 #[cfg(test)]
 mod common_tests;
-#[cfg(test)]
-mod d1_window_device_tests;
 mod dims;
-mod eager_window;
-#[cfg(test)]
-mod eager_window_device_tests;
 mod executor;
 #[cfg(test)]
 mod executor_tests;
-pub(in crate::family) mod exl3_bank;
-#[cfg(test)]
-mod exl3_bank_krow_device_tests;
-#[cfg(test)]
-mod exl3_bank_step_device_tests;
-#[cfg(test)]
-mod exl3_bank_timing_probe;
-#[cfg(test)]
-mod exl3_device_tests;
-mod exl3_load;
-#[cfg(test)]
-mod exl3_load_device_tests;
-#[cfg(test)]
-mod kv_bytes_golden_host_tests;
-use crate::family::exl3::moe as exl3_moe;
-#[cfg(test)]
-mod exl3_moe_device_tests;
-#[cfg(test)]
-mod exl3_moe_merge_device_tests;
-#[cfg(test)]
-mod exl3_moe_rows_device_tests;
-use crate::family::exl3::moe_source as exl3_moe_source;
-pub(in crate::family) mod exl3_source;
-#[cfg(test)]
-mod exl3_step_device_tests;
-#[cfg(test)]
-mod exl3_step_merge_device_tests;
 #[cfg(test)]
 mod export_tests;
 pub mod gate;
@@ -82,14 +50,9 @@ mod geometry_tests;
 #[cfg(test)]
 mod grow_step_device_tests;
 #[cfg(test)]
-mod krow_alpha_device_tests;
-#[cfg(test)]
-mod krow_device_tests;
-mod krow_ops;
-#[cfg(test)]
-mod krow_step_device_tests;
-#[cfg(test)]
 mod kv8_step_device_tests;
+#[cfg(test)]
+mod kv_bytes_golden_host_tests;
 #[cfg(all(test, feature = "native-cuda"))]
 mod kv_quality_run;
 pub(in crate::family) mod layer_table;
@@ -105,9 +68,6 @@ mod mixer_shapes;
 mod mixer_tests;
 pub(in crate::family) mod mixer_weights;
 pub(in crate::family) mod moe;
-mod mtp_load;
-#[cfg(test)]
-mod mtp_load_device_tests;
 mod multi;
 #[cfg(test)]
 mod native_device_rig;
@@ -159,12 +119,6 @@ mod prefill_device_tests;
 mod prefill_driver;
 #[cfg(test)]
 mod prefill_driver_tests;
-#[cfg(test)]
-mod prefill_exl3_step_device_tests;
-#[cfg(test)]
-mod prefill_golden_device_tests;
-#[cfg(test)]
-mod prefill_golden_host_tests;
 mod prefill_plan;
 #[cfg(test)]
 mod prefill_plan_tests;
@@ -183,8 +137,6 @@ mod r5_fmt;
 mod resources;
 #[cfg(test)]
 mod resources_tests;
-#[cfg(test)]
-mod rollback_window_device_tests;
 #[cfg(test)]
 mod routed_device_tests;
 #[cfg(test)]
@@ -206,8 +158,6 @@ mod shape_tests;
 mod sparse_exec;
 #[cfg(test)]
 mod sparse_step_device_tests;
-#[cfg(test)]
-mod spec_window_device_tests;
 pub(crate) mod start;
 #[cfg(test)]
 mod start_health_tests;
@@ -228,5 +178,3 @@ mod tests;
 mod tiered_load;
 mod tiered_step;
 mod trace;
-#[cfg(test)]
-mod window_bench_device_tests;

@@ -18,7 +18,7 @@ use crate::{
     EngError,
     family::{
         gguf_model::Role,
-        project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Weight},
+        project::cuda::{CudaWeight, CudaWeights, WeightLayout},
     },
     kernels::cuda::{DeviceRange, NativeWeight, TiledWeight},
     weights::GgufType,
@@ -32,7 +32,6 @@ const F32: usize = size_of::<f32>();
 pub(in crate::family) enum DenseWeight<'w> {
     Tiled(&'w TiledWeight),
     Native(&'w NativeWeight),
-    Exl3(&'w Exl3Weight),
 }
 
 pub(super) struct LayerWeights<'w> {
@@ -46,9 +45,6 @@ impl<'w> LayerWeights<'w> {
     pub(super) fn dense(&self, role: Role) -> Result<&'w TiledWeight, EngError> {
         match self.entry(role)? {
             DenseWeight::Tiled(weight) => Ok(weight),
-            DenseWeight::Exl3(_) => Err(EngError::BadRequest(format!(
-                "mixer: {role:?} is EXL3; the tiled matmul reads tiles"
-            ))),
             DenseWeight::Native(_) => Err(EngError::BadRequest(format!(
                 "mixer: {role:?} is loaded in the native layout; the tiled matmul reads tiles"
             ))),
@@ -59,20 +55,8 @@ impl<'w> LayerWeights<'w> {
     pub(super) fn native(&self, role: Role) -> Result<&'w NativeWeight, EngError> {
         match self.entry(role)? {
             DenseWeight::Native(weight) => Ok(weight),
-            DenseWeight::Exl3(_) => Err(EngError::BadRequest(format!(
-                "mixer: {role:?} is EXL3; the native matvec reads blocks"
-            ))),
             DenseWeight::Tiled(_) => Err(EngError::BadRequest(format!(
                 "mixer: {role:?} is loaded in the tiled layout; the native matvec reads blocks"
-            ))),
-        }
-    }
-
-    pub(super) fn exl3(&self, role: Role) -> Result<&'w Exl3Weight, EngError> {
-        match self.entry(role)? {
-            DenseWeight::Exl3(weight) => Ok(weight),
-            _ => Err(EngError::BadRequest(format!(
-                "mixer: {role:?} is not an EXL3 matrix"
             ))),
         }
     }
@@ -176,11 +160,6 @@ impl<'w> MixerWeights<'w> {
                 raw_f32(weights, table.name(layer, spec.role)?, spec.values)?,
             ));
         }
-        // The plain gates of an EXL3 layer are raw F32 matrices read by their own projection.
-        for spec in g.plain_specs(layout, kind) {
-            let name = table.name(layer, spec.role)?;
-            raw.push((spec.role, raw_f32(weights, name, spec.rows * spec.k)?));
-        }
         Ok(LayerWeights { dense, raw })
     }
 }
@@ -221,19 +200,16 @@ pub(super) fn dense_weight<'w>(
             check_dense(name, (weight.n_rows(), weight.k(), *experts), spec)?;
             Ok(DenseWeight::Tiled(weight))
         }
-        (Some(CudaWeight::Exl3 { weight, .. }), WeightLayout::Exl3) => {
-            check_dense(name, (weight.shape[1], weight.shape[0], None), spec)?;
-            Ok(DenseWeight::Exl3(weight))
-        }
-        (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _)
-        | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
-            "mixer weights: {name} does not match the requested EXL3 layout"
-        ))),
         // (Tiled, Native) never reaches here: the first arm already accepted it (a dense Tiled
         // weight runs in a Native session - the hybrid seam), so only the reverse refuses.
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("mixer weights: {name} is loaded in the native layout, the step runs tiled"),
         )),
+        (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _) => {
+            Err(EngError::Checkpoint(format!(
+                "mixer weights: {name} is an EXL3 matrix; the GGUF step serves GGUF blocks"
+            )))
+        }
         (Some(CudaWeight::Raw { .. }), _) | (None, _) => Err(EngError::Checkpoint(format!(
             "mixer weights: {name} is not a quantized tensor"
         ))),

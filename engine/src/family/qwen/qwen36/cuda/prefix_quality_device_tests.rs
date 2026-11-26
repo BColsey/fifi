@@ -1,6 +1,4 @@
 //! FP16 prefix restore against cold chunked prefill on the unchanged oracle cohort.
-#[path = "prefill_exl3_restore_device_tests.rs"]
-mod exl3_restore;
 #[path = "prefix_quality_kv8_device_tests.rs"]
 mod kv8;
 #[path = "prefix_quality_partition_device_tests.rs"]

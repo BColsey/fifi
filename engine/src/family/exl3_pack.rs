@@ -6,9 +6,8 @@
 //! the current component set (trellis, `suh`, `svh`, one codebook marker) and every matrix of a
 //! pack must name the same codebook. A family's own walk decides which tensors to visit.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
 
-use crate::weights::exl3::COMPONENT_SUFFIXES;
 use crate::{EngError, tensor::Dtype, weights::StreamedCheckpoint};
 
 const LAYER_ROOT: &str = "model.language_model.layers";
@@ -176,131 +175,16 @@ impl Visit {
     /// Every pack tensor this visit stands for: a plain or host visit is its own name; a matrix
     /// visit under a prefix stands for that prefix's stored components, present or not, because
     /// the reader selects the components it knows and refuses the legacy ones. The loader's
-    /// check indexes the visits instead (see [`coverage`]); this expansion is the survey's.
+    /// check indexes the visits instead; this expansion is the survey's.
     pub(in crate::family) fn tensor_names(&self) -> Vec<String> {
         match self.kind {
-            VisitKind::Matrix { .. } => COMPONENT_SUFFIXES
+            VisitKind::Matrix { .. } => crate::weights::exl3::COMPONENT_SUFFIXES
                 .iter()
                 .map(|suffix| format!("{}.{suffix}", self.name))
                 .collect(),
             VisitKind::Plain { .. } | VisitKind::Host { .. } => vec![self.name.clone()],
         }
     }
-}
-
-/// Splits a load's read names against the walk's visits: `unrecorded` holds reads no visit
-/// stands for (a served load refuses on them), `unread` holds visit names no read touched (the
-/// load reports them). A read `prefix.suffix` is covered by the matrix visit under `prefix`.
-/// The visits are indexed by borrowed name, never expanded into the ~9 owned names per
-/// matrix visit, because a real load holds tens of thousands of reads.
-pub(in crate::family) fn coverage(
-    reads: &BTreeSet<String>,
-    visits: &[Visit],
-) -> (Vec<String>, Vec<String>) {
-    let mut plain: HashMap<&str, usize> = HashMap::with_capacity(visits.len());
-    let mut matrices: HashMap<&str, usize> = HashMap::new();
-    for (index, visit) in visits.iter().enumerate() {
-        match visit.kind {
-            VisitKind::Matrix { .. } => {
-                matrices.insert(visit.name.as_str(), index);
-            }
-            VisitKind::Plain { .. } | VisitKind::Host { .. } => {
-                plain.insert(visit.name.as_str(), index);
-            }
-        }
-    }
-    let mut touched = vec![false; visits.len()];
-    let mut unrecorded = Vec::new();
-    for read in reads.iter().map(String::as_str) {
-        let mut covered = false;
-        if let Some(&index) = plain.get(read) {
-            touched[index] = true;
-            covered = true;
-        }
-        for suffix in COMPONENT_SUFFIXES {
-            let Some(stem) = read.strip_suffix(suffix) else {
-                continue;
-            };
-            let Some(prefix) = stem.strip_suffix('.') else {
-                continue;
-            };
-            if let Some(&index) = matrices.get(prefix) {
-                touched[index] = true;
-                covered = true;
-            }
-        }
-        if !covered {
-            unrecorded.push(read.to_owned());
-        }
-    }
-    let unread = visits
-        .iter()
-        .zip(touched)
-        .filter(|&(_, was_touched)| !was_touched)
-        .map(|(visit, _)| visit.name.clone())
-        .collect();
-    (unrecorded, unread)
-}
-
-/// Up to twenty names plus the count of the rest: a refusal or report line never carries
-/// tens of thousands of names, and a wrong root would otherwise put every pack tensor into
-/// one error.
-fn capped_names(names: &[String]) -> String {
-    let shown = names.len().min(20);
-    let shown_names = names[..shown].join(", ");
-    if names.len() > shown {
-        format!("{shown_names} (+{})", names.len() - shown)
-    } else {
-        shown_names
-    }
-}
-
-/// The load's coverage decision in printable form: the refusal for reads the walk never
-/// stood for and the report line for visits no read touched, both capped by
-/// [`capped_names`] and naming the pack. Pure over borrowed name sets, so a host test pins
-/// the words the served path prints and refuses with.
-pub(in crate::family) struct CoverageVerdict {
-    pub(in crate::family) result: Result<(), EngError>,
-    pub(in crate::family) report: Option<String>,
-}
-
-/// See [`CoverageVerdict`]. An empty `visits` is itself a refusal: only a recording walk
-/// may feed the check, and a future non-recording caller would otherwise see every read
-/// reported as unrecorded.
-pub(in crate::family) fn coverage_verdict(
-    reads: &BTreeSet<String>,
-    visits: &[Visit],
-    pack: &str,
-) -> CoverageVerdict {
-    if visits.is_empty() {
-        return CoverageVerdict {
-            result: Err(EngError::Checkpoint(format!(
-                "EXL3 load of {pack}: the coverage check ran with no recorded visits; \
-                 only a recording walk may feed it"
-            ))),
-            report: None,
-        };
-    }
-    let (unrecorded, unread) = coverage(reads, visits);
-    let result = if unrecorded.is_empty() {
-        Ok(())
-    } else {
-        Err(EngError::Checkpoint(format!(
-            "EXL3 load of {pack}: the pack walk never recorded {} read tensor{}: {}",
-            unrecorded.len(),
-            if unrecorded.len() == 1 { "" } else { "s" },
-            capped_names(&unrecorded),
-        )))
-    };
-    let report = (!unread.is_empty()).then(|| {
-        format!(
-            "EXL3 load of {pack}: {} recorded tensor{} left unread: {}",
-            unread.len(),
-            if unread.len() == 1 { "" } else { "s" },
-            capped_names(&unread),
-        )
-    });
-    CoverageVerdict { result, report }
 }
 
 /// The codebook marker tensor a matrix carries.

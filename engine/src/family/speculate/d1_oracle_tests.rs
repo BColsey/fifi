@@ -1,13 +1,11 @@
 //! Host tests of the D1 oracle: a fake model that is correct by construction passes every check,
-//! and flawed copies of it fail the check that is meant to catch the flaw. The real-pack versions
-//! of the checks are device tests that have not run (`qwen36/cuda/d1_window_device_tests.rs`).
+//! and flawed copies of it fail the check that is meant to catch the flaw.
 
 use super::{
     d1_oracle::{
         D1Failure, D1Subject, FAKE_TOKENIZER_JSON, Fault, Observed, Setup, Tally, accepted_prefix,
         describe_pass, failure_recovery, first_bit_difference, first_byte_difference, full_logits,
-        host_greedy, later_rows_isolated, near_tie, observed_difference, tied_at_maximum,
-        ties_break_low,
+        host_greedy, later_rows_isolated, observed_difference, tied_at_maximum, ties_break_low,
     },
     driver::WindowModel,
     window::Commit,
@@ -20,9 +18,6 @@ use crate::{
     },
     tokenizer::Tokenizer,
 };
-
-#[path = "d1_slot_tests.rs"]
-mod slots;
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -544,53 +539,6 @@ fn the_tie_rule_is_stated_twice_and_both_statements_agree_on_constructed_rows() 
     }
     // An id past the vocabulary never wins, even above everything.
     assert_eq!(host_greedy(&[1.0, 2.0, 99.0], 2), 1);
-}
-
-#[test]
-fn the_near_tie_of_the_fixture_breaks_to_the_lower_id_on_an_exact_tie() {
-    let vocab = 248_077;
-    let mut row = vec![0.0f32; vocab];
-    row[near_tie::TIED_IDS[0] as usize] = near_tie::EXLLAMAV3_TIED_LOGIT;
-    row[near_tie::TIED_IDS[1] as usize] = near_tie::EXLLAMAV3_TIED_LOGIT;
-    assert_eq!(host_greedy(&row, vocab), near_tie::FORCED_TOKEN);
-    assert_eq!(
-        Sampler::greedy().sample(&row).expect("sample"),
-        near_tie::FORCED_TOKEN
-    );
-    assert_eq!(tied_at_maximum(&row, vocab), 2);
-    // One fp16 step above the tie (stock exllamav3's row 0 of the 4-row window) is a different
-    // token: the window and the one-row step must therefore agree bit for bit, not nearly.
-    row[near_tie::TIED_IDS[1] as usize] = 22.6875;
-    assert_eq!(host_greedy(&row, vocab), near_tie::TIED_IDS[1]);
-    assert_eq!(
-        near_tie::ABSOLUTE_POSITION,
-        near_tie::PROMPT_LEN + near_tie::FORCED_PREFIX_LEN
-    );
-}
-
-#[test]
-fn the_fixture_loader_refuses_a_file_whose_facts_do_not_hold() {
-    assert!(near_tie::parse("not json").is_err());
-    let empty = near_tie::parse("{}").expect_err("no ids");
-    assert!(empty.contains("prompt_token_ids"), "{empty}");
-    let short = r#"{"prefix":{"prompt_token_ids":[1,2],"forced_prefix_token_ids":[3],
-        "forced_token_at_index":494},"source":{"absolute_position":3853},
-        "paths":{"control_1":{"top2_ids":[494,1510]}}}"#;
-    let wrong = near_tie::parse(short).expect_err("wrong lengths");
-    assert!(wrong.contains("prompt length"), "{wrong}");
-}
-
-/// Run with `FIFI_D1_NEAR_TIE_FIXTURE` naming `d1-near-tie-exllamav3-4row-vs-1row.json`: the
-/// file must hold the facts that the constants and the device test state.
-#[test]
-#[ignore = "needs FIFI_D1_NEAR_TIE_FIXTURE, the path of the fixture JSON"]
-fn the_fixture_file_holds_the_facts_the_constants_state() {
-    let path = std::env::var("FIFI_D1_NEAR_TIE_FIXTURE").expect("FIFI_D1_NEAR_TIE_FIXTURE");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let fixture = near_tie::parse(&text).expect("the fixture facts");
-    assert_eq!(fixture.prompt.len(), near_tie::PROMPT_LEN);
-    assert_eq!(fixture.forced_prefix.len(), near_tie::FORCED_PREFIX_LEN);
-    assert!(fixture.prompt.iter().all(|&id| id < 248_320));
 }
 
 #[test]

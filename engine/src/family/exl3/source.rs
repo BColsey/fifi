@@ -11,8 +11,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use crate::family::exl3_pack::Root;
-use crate::family::exl3_pack::{CoverageVerdict, Visit, coverage_verdict};
 use crate::family::exl3_tensors::{effective_norm_bytes, f32_le_bytes, norm_layout, widen_f32};
 use crate::{
     EngError,
@@ -23,7 +21,7 @@ use crate::{
     tensor::Tensor,
     weights::{
         GgufType, WeightSource,
-        exl3::{Axis, COMPONENT_SUFFIXES, Checkpoint, Matrix},
+        exl3::{COMPONENT_SUFFIXES, Checkpoint, Matrix},
     },
 };
 
@@ -59,7 +57,6 @@ pub(in crate::family) struct PackReader<'a> {
     pub(in crate::family) projector: &'a CudaProjector,
     pub(in crate::family) checkpoint: &'a Checkpoint,
     reserve: Reserve,
-    root: Root,
     /// The pack tensor names this reader has read, for the load's coverage check. A load is
     /// single-threaded, so the interior mutability is unshared.
     reads: RefCell<BTreeSet<String>>,
@@ -75,43 +72,12 @@ impl<'a> PackReader<'a> {
             projector,
             checkpoint,
             reserve,
-            root: Root::Layers,
             reads: RefCell::new(BTreeSet::new()),
         }
     }
 
     fn record_read(&self, name: &str) {
         self.reads.borrow_mut().insert(name.to_owned());
-    }
-
-    /// Proves this reader's coverage against the recording walk's `visits`, naming `pack` in
-    /// the refusal and the report: a read the walk never stood for refuses the load (the walk
-    /// and the reader have drifted, or the pack is not what the walk checked); the visits no
-    /// read touched are reported on stderr, because extra tensors are a property of the pack,
-    /// not a defect of the load. The words come from [`coverage_verdict`], pinned by a host
-    /// test.
-    pub(in crate::family) fn check_coverage(
-        &self,
-        visits: &[Visit],
-        pack: &str,
-    ) -> Result<(), EngError> {
-        let reads = self.reads.borrow();
-        let verdict: CoverageVerdict = coverage_verdict(&reads, visits, pack);
-        if let Some(report) = verdict.report {
-            eprintln!("{report}");
-        }
-        verdict.result
-    }
-
-    /// Reads the layers from `root` instead of the model's own: the MTP head's block.
-    pub(in crate::family) fn under(mut self, root: Root) -> Self {
-        self.root = root;
-        self
-    }
-
-    /// Where the layers of this pack are named.
-    pub(in crate::family) fn root(&self) -> Root {
-        self.root
     }
 
     /// Admits `bytes` of weights against the free device memory and the reserve of the load.
@@ -151,23 +117,6 @@ impl<'a> PackReader<'a> {
         selected.tensor(name).ok_or_else(missing)
     }
 
-    pub(in crate::family) fn exl3(
-        &self,
-        name: String,
-        prefix: &str,
-        want: &DenseSpec,
-        reorder: Option<(Axis, &[usize])>,
-    ) -> Result<CudaWeight, EngError> {
-        let matrix = self.matrix(prefix)?;
-        let [k, n] = matrix.shape();
-        check_dense(prefix, (n, k, None), want)?;
-        let matrix = match reorder {
-            Some((axis, order)) => matrix.reorder_groups(axis, order)?,
-            None => matrix,
-        };
-        self.upload(name, &matrix)
-    }
-
     /// Uploads `matrix` as it is stored (no geometry check, no reorder): the caller has checked
     /// its shape, as the Flash-Next trunk does through the pack's header walk.
     pub(in crate::family) fn upload(
@@ -177,18 +126,6 @@ impl<'a> PackReader<'a> {
     ) -> Result<CudaWeight, EngError> {
         let weight = self.projector.upload_exl3(matrix, self.reserve)?;
         Ok(CudaWeight::Exl3 { name, weight })
-    }
-
-    pub(in crate::family) fn bank(
-        &self,
-        name: String,
-        count: usize,
-        member: impl FnMut(usize) -> Result<Matrix, EngError>,
-    ) -> Result<CudaWeight, EngError> {
-        let bank = self
-            .projector
-            .upload_exl3_bank(count, self.reserve, member)?;
-        Ok(CudaWeight::Exl3Bank { name, bank })
     }
 
     fn raw_bytes(&self, name: String, bytes: &[u8]) -> Result<CudaWeight, EngError> {

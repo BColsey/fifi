@@ -15,6 +15,7 @@ use crate::{
 };
 
 /// Exact source vectors, not reshapes of another tensor with the same byte count.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) fn norm_layout(
     dtype: Dtype,
     shape: &[u32],
@@ -36,6 +37,7 @@ pub(in crate::family) fn norm_layout(
 }
 
 /// Convert actual storage to F32, then add one in F32, never in F16 or BF16.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) fn effective_norm_bytes(
     tensor: &Tensor,
     values: usize,
@@ -141,42 +143,6 @@ pub(in crate::family) fn decay_from_log(log: &[f32]) -> Result<Vec<f32>, EngErro
     ))
 }
 
-/// For each value head `t` of the kernel's tiled order, the head it takes from the pack's
-/// grouped order.
-pub(in crate::family) fn tiled_head_order(
-    key_heads: usize,
-    value_heads: usize,
-) -> Result<Vec<usize>, EngError> {
-    if key_heads == 0 || value_heads == 0 || !value_heads.is_multiple_of(key_heads) {
-        return Err(EngError::Checkpoint(format!(
-            "DeltaNet heads: {value_heads} value heads do not group under {key_heads} key heads"
-        )));
-    }
-    let rep = value_heads / key_heads;
-    Ok((0..value_heads)
-        .map(|tiled| (tiled % key_heads) * rep + tiled / key_heads)
-        .collect())
-}
-
-pub(in crate::family) fn permute_blocks<T: Copy>(
-    values: &[T],
-    block: usize,
-    order: &[usize],
-) -> Result<Vec<T>, EngError> {
-    if block == 0 || values.len() != block * order.len() {
-        return Err(EngError::Checkpoint(format!(
-            "EXL3 head order: {} values do not form {} blocks of {block}",
-            values.len(),
-            order.len()
-        )));
-    }
-    crate::weights::exl3::check_order(order, order.len())?;
-    Ok(order
-        .iter()
-        .flat_map(|&old| values[old * block..(old + 1) * block].iter().copied())
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,48 +161,6 @@ mod tests {
                 "{bad}: {error:?}"
             );
         }
-    }
-
-    #[test]
-    fn tiled_order_regroups_value_heads_under_their_key_head() {
-        // Two key heads, four value heads: grouped [g0v0, g0v1, g1v0, g1v1] becomes tiled
-        // [g0v0, g1v0, g0v1, g1v1].
-        assert_eq!(tiled_head_order(2, 4).unwrap(), [0, 2, 1, 3]);
-        // The model's 16 key and 32 value heads.
-        let order = tiled_head_order(16, 32).unwrap();
-        assert_eq!(order[..4], [0, 2, 4, 6]);
-        assert_eq!(order[16..20], [1, 3, 5, 7]);
-        let mut sorted = order.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..32).collect::<Vec<_>>());
-        // Every tiled head `t` reads the key head the grouped head it holds belongs to.
-        for (tiled, &grouped) in order.iter().enumerate() {
-            assert_eq!(tiled % 16, grouped / 2);
-        }
-        assert_eq!(tiled_head_order(4, 4).unwrap(), [0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn tiled_order_refuses_heads_that_do_not_group() {
-        for (keys, values) in [(0, 4), (4, 0), (3, 4), (4, 2)] {
-            assert!(matches!(
-                tiled_head_order(keys, values),
-                Err(EngError::Checkpoint(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn blocks_move_whole_and_a_bad_shape_or_order_is_refused() {
-        let values = [10, 11, 20, 21, 30, 31];
-        assert_eq!(
-            permute_blocks(&values, 2, &[2, 0, 1]).unwrap(),
-            [30, 31, 10, 11, 20, 21]
-        );
-        assert!(permute_blocks(&values, 4, &[0, 1]).is_err());
-        assert!(permute_blocks(&values, 2, &[0, 1]).is_err());
-        assert!(permute_blocks(&values, 2, &[0, 0, 1]).is_err());
-        assert!(permute_blocks(&values, 0, &[0, 1, 2]).is_err());
     }
 
     #[test]

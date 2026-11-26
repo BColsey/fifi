@@ -1427,6 +1427,22 @@ fn q36_preflight(
         }
     };
 
+    // What a CUDA start refuses before it reads a weight (an EXL3 pack, the speculative window)
+    // is refused here with the start's own message.
+    if backend == Backend::Cuda {
+        if let Err(error) = crate::family::qwen::qwen36::settings::check_cuda_serves(&settings) {
+            checks.push(Check::new(
+                "settings",
+                CheckStatus::Fail,
+                format!(
+                    "the engine would refuse these settings: {}",
+                    super::describe_error(&error)
+                ),
+            ));
+            return finish(checks, None, Vec::new(), Qualification::Unverified);
+        }
+    }
+
     // The tokenizer verdict is the loader's: bundle load under the
     // family's pin refuses any file that differs from the tested release.
     match crate::family::qwen::qwen36::settings::tokenizer_pin()
@@ -1447,14 +1463,9 @@ fn q36_preflight(
         )),
     }
 
-    // Qualification of this exact combination, from the project's own
-    // gates: the EXL3 pack's quality against the GGUF engine is not yet
-    // measured (doc/explanation/status.md), so it stays experimental
-    // until that gate passes.
-    let qualification = match settings.weights {
-        crate::family::qwen::qwen36::settings::WeightFormat::Exl3 => Qualification::Experimental,
-        crate::family::qwen::qwen36::settings::WeightFormat::Gguf => Qualification::Qualified,
-    };
+    // Qualification of this exact combination: the GGUF engine is the qualified one; the
+    // EXL3 pack is refused above.
+    let qualification = Qualification::Qualified;
 
     // Format vs. directory shape: the resolved weight format must have
     // its files here. Exact checkpoint identity stays the loader's check.
@@ -1487,11 +1498,6 @@ fn q36_preflight(
             CheckStatus::Fail,
             "weight_format is gguf but no readable .gguf file is in the directory".to_string(),
         )),
-        WeightFormat::Exl3 if inspection.safetensors_files == 0 => checks.push(Check::new(
-            "weight format",
-            CheckStatus::Fail,
-            "weight_format is exl3 but no .safetensors shards are in the directory".to_string(),
-        )),
         _ => checks.push(Check::new(
             "weight format",
             CheckStatus::Pass,
@@ -1507,37 +1513,7 @@ fn q36_preflight(
     }
 
     let spec = settings.spec;
-    let disk_bytes = selected_gguf_bytes.unwrap_or_else(|| inspection.weight_bytes());
-    // The EXL3 planning figure is the loader's own header walk, not the
-    // bytes on disk: the walk counts the widening to F32 the load
-    // performs, and refuses a pack of another size, rate, codebook or
-    // layout exactly as the load would, before the first upload. The
-    // walk needs the EXL3 weights layer, compiled with the CUDA backend
-    // (and into every test build); a build without it never reaches an
-    // EXL3 estimate: EXL3 loads need the CUDA backend, which such a
-    // build either fails (no backend at all) or refuses in the settings
-    // check above (the MLX arm has no EXL3).
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-    let (weight_bytes, exl3_plan) = if settings.weights == WeightFormat::Exl3 {
-        match crate::family::qwen::qwen36::exl3_plan(model_dir) {
-            Ok(plan) => (plan.device_bytes, Some(plan)),
-            Err(error) => {
-                checks.push(Check::new(
-                    "exl3 pack",
-                    CheckStatus::Fail,
-                    format!(
-                        "the load would refuse this pack: {}",
-                        super::describe_error(&error)
-                    ),
-                ));
-                return finish(checks, None, Vec::new(), qualification);
-            }
-        }
-    } else {
-        (disk_bytes, None)
-    };
-    #[cfg(not(any(test, all(feature = "native-cuda", target_os = "linux"))))]
-    let weight_bytes = disk_bytes;
+    let weight_bytes = selected_gguf_bytes.unwrap_or_else(|| inspection.weight_bytes());
     let estimate = match estimate_q36(&spec, &settings, weight_bytes, backend, facts) {
         Ok(estimate) => estimate,
         Err(error) => {
@@ -1595,38 +1571,7 @@ fn q36_preflight(
             ),
         )),
     }
-    // Only the rows come from the family entry; the checks and the stored
-    // estimate above stay this arm's. The entry re-runs the same settings
-    // resolution, walk and search through the shared request — the second
-    // call of one implementation, never a second copy of the math.
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-    let decisions = match exl3_plan.as_ref() {
-        Some(_) => match crate::family::qwen::qwen36::preflight::preflight_rows(&RowsRequest {
-            model_dir,
-            tokenizer_dir,
-            context: candidate.context_limit,
-            kv_dtype: candidate.kv_dtype.as_deref(),
-            prefill_rows: candidate.prefill_rows,
-            facts,
-        }) {
-            Ok((rows, _note, _fit)) => rows,
-            Err(error) => {
-                checks.push(Check::new(
-                    "exl3 pack",
-                    CheckStatus::Fail,
-                    format!(
-                        "the load would refuse this pack: {}",
-                        super::describe_error(&error)
-                    ),
-                ));
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
-    #[cfg(not(any(test, all(feature = "native-cuda", target_os = "linux"))))]
-    let decisions = Vec::new();
-    finish(checks, Some(estimate), decisions, qualification)
+    finish(checks, Some(estimate), Vec::new(), qualification)
 }
 
 /// The Flint deep path: the only family with a three-way load decision
@@ -3047,151 +2992,6 @@ mod tests {
                 mem_provenance: None,
                 cpu_threads: 1,
             },
-        }
-    }
-
-    /// The estimate and the rows each call the one search, so on a real
-    /// pack the row's proposal and the estimate's largest fitting context
-    /// are the same value. The free bytes sit under the pack's demand so
-    /// the row carries a proposal at all.
-    /// The row's proposal equals the estimate's value, on a synthetic
-    /// plan: the entry's own composition past the walk (rows_from_walk)
-    /// runs against the estimate on the same settings, so a build without
-    /// a real pack protects the equality.
-    #[test]
-    fn the_rows_proposal_equals_the_estimates_value_on_a_synthetic_fixture() {
-        use crate::family::exl3_pack::PackPlan;
-        use crate::family::plan_rows::RowsFit;
-        use crate::family::qwen::qwen36::preflight::rows_from_walk;
-        use crate::family::qwen::qwen36::settings::{
-            Backend as Q36Backend, Q36Env, Q36Options, Q36Settings,
-        };
-        use std::collections::BTreeMap;
-
-        let dir = tempfile::tempdir().unwrap();
-        let options = Q36Options {
-            context_limit: Some(262_144),
-            weight_format: Some("exl3".to_string()),
-            ..Q36Options::default()
-        };
-        let settings = Q36Settings::new(
-            dir.path(),
-            dir.path(),
-            Some(&options),
-            &Q36Env::default(),
-            Q36Backend::Cuda,
-        )
-        .expect("the pinned spec resolves without a pack");
-        let plan = PackPlan {
-            device_bytes: 21_000_000_000,
-            expert_bytes: 20_000_000_000,
-            matrices: 1_976,
-            rates: BTreeMap::new(),
-            codebook: "Mcg",
-        };
-        let facts = cuda_facts(23u64 << 30);
-        let estimate = super::estimate_q36(
-            &settings.spec,
-            &settings,
-            plan.device_bytes,
-            Q36Backend::Cuda,
-            &facts,
-        )
-        .expect("the estimate");
-        let (rows, fit) = rows_from_walk(
-            &settings,
-            &plan,
-            20_000_000_000,
-            &facts.cuda.first_device_free_bytes,
-        )
-        .expect("the rows");
-        let context = rows
-            .iter()
-            .find(|decision| decision.name == "context")
-            .expect("context row");
-        match estimate.largest_fitting_context {
-            Some(largest) => {
-                assert_eq!(context.alternatives.len(), 1);
-                assert_eq!(
-                    context.alternatives[0].option,
-                    format!("{largest} positions")
-                );
-                assert!(matches!(
-                    fit,
-                    RowsFit::Constrained {
-                        requested: 262_144,
-                        largest: largest_at
-                    } if largest_at == largest
-                ));
-            }
-            None => panic!(
-                "the fixture free bytes must demand a proposal; an empty equality proves nothing"
-            ),
-        }
-    }
-
-    /// The same equality on the real pack: the full entry (settings,
-    /// walk, inventory, rows) against the estimate.
-    #[test]
-    #[ignore = "reads a real pack in FIFI_EXL3_CHECKPOINT"]
-    fn the_rows_proposal_equals_the_estimates_value_on_one_fixture() {
-        use crate::family::plan_rows::RowsRequest;
-        use crate::family::qwen::qwen36::settings::{
-            Backend as Q36Backend, Q36Env, Q36Options, Q36Settings,
-        };
-
-        let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
-        let dir = std::path::PathBuf::from(dir);
-        let facts = cuda_facts(23u64 << 30);
-        let options = Q36Options {
-            context_limit: Some(262_144),
-            weight_format: Some("exl3".to_string()),
-            ..Q36Options::default()
-        };
-        let settings = Q36Settings::new(
-            &dir,
-            &dir,
-            Some(&options),
-            &Q36Env::default(),
-            Q36Backend::Cuda,
-        )
-        .expect("the pack's settings resolve");
-        let plan = crate::family::qwen::qwen36::exl3_plan(&dir).expect("the pack walks");
-        let estimate = super::estimate_q36(
-            &settings.spec,
-            &settings,
-            plan.device_bytes,
-            Q36Backend::Cuda,
-            &facts,
-        )
-        .expect("the estimate");
-        let (rows, _note, _fit) =
-            crate::family::qwen::qwen36::preflight::preflight_rows(&RowsRequest {
-                model_dir: &dir,
-                tokenizer_dir: &dir,
-                context: Some(262_144),
-                kv_dtype: None,
-                prefill_rows: None,
-                facts: &facts,
-            })
-            .expect("the rows");
-        let context = rows
-            .iter()
-            .find(|decision| decision.name == "context")
-            .expect("context row");
-        assert!(
-            estimate.largest_fitting_context.is_some(),
-            "the fixture free bytes must demand a proposal; an empty equality proves nothing"
-        );
-        match estimate.largest_fitting_context {
-            Some(largest) => {
-                assert_eq!(context.alternatives.len(), 1);
-                assert_eq!(
-                    context.alternatives[0].option,
-                    format!("{largest} positions")
-                );
-            }
-            None => assert!(context.alternatives.is_empty()),
         }
     }
 

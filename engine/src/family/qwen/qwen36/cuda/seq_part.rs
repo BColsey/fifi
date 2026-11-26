@@ -27,7 +27,6 @@ pub(crate) struct SeqPart<'a> {
     graph: Option<GraphExec<'a>>,
     state: ResidentState,
     warmed: bool,
-    needs_reset: bool,
     report: RunReport,
     prefill_report: PrefillReport,
 }
@@ -45,10 +44,6 @@ struct SessionForms {
     paged: bool,
     sparse: bool,
     tiered: bool,
-    banked: bool,
-    krow: bool,
-    rollback: bool,
-    speculative: bool,
 }
 
 /// The form that keeps state outside the part a session owns, when the step runs one. The
@@ -60,14 +55,6 @@ fn session_refusal(forms: SessionForms) -> Option<&'static str> {
         Some("paged KV")
     } else if forms.sparse {
         Some("sparse decode")
-    } else if forms.banked {
-        Some("banked EXL3 experts")
-    } else if forms.krow {
-        Some("the K-row verify window")
-    } else if forms.rollback {
-        Some("device rollback")
-    } else if forms.speculative {
-        Some("speculative decoding")
     } else {
         None
     }
@@ -76,17 +63,13 @@ fn session_refusal(forms: SessionForms) -> Option<&'static str> {
 impl<'a> QwenResidentStep<'a> {
     /// Whether this step can serve more than one session: the plain and the tiered resident
     /// step. The tiered runtime (banks, host pool, staging, scratch) is the step's own and is used
-    /// inside one call, so sessions share it as they share the weights. The paged, sparse,
-    /// banked, K-row, rollback and speculative forms keep state outside the part a session owns.
+    /// inside one call, so sessions share it as they share the weights. The paged and sparse
+    /// forms keep state outside the part a session owns.
     pub(crate) fn check_sessions(&self) -> Result<(), EngError> {
         let refused = session_refusal(SessionForms {
             paged: self.res.paged.is_some(),
             sparse: self.res.sparse.is_some(),
             tiered: self.tiered_mode,
-            banked: self.exl3_bank.is_some(),
-            krow: self.res.krow.is_some() || self.krow_wanted,
-            rollback: self.rollback_wanted || self.rollback.is_some(),
-            speculative: self.speculator.is_some(),
         });
         match refused {
             Some(what) => Err(EngError::BadRequest(format!(
@@ -106,7 +89,6 @@ impl<'a> QwenResidentStep<'a> {
             graph: None,
             state,
             warmed: false,
-            needs_reset: false,
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
         };
@@ -123,7 +105,6 @@ impl<'a> QwenResidentStep<'a> {
         std::mem::swap(&mut self.graph, &mut part.graph);
         std::mem::swap(&mut self.state, &mut part.state);
         std::mem::swap(&mut self.warmed, &mut part.warmed);
-        std::mem::swap(&mut self.needs_reset, &mut part.needs_reset);
         std::mem::swap(&mut self.report, &mut part.report);
         std::mem::swap(&mut self.prefill_report, &mut part.prefill_report);
     }
@@ -282,34 +263,6 @@ mod tests {
                     ..SessionForms::default()
                 },
                 "sparse decode",
-            ),
-            (
-                SessionForms {
-                    banked: true,
-                    ..SessionForms::default()
-                },
-                "banked EXL3 experts",
-            ),
-            (
-                SessionForms {
-                    krow: true,
-                    ..SessionForms::default()
-                },
-                "the K-row verify window",
-            ),
-            (
-                SessionForms {
-                    rollback: true,
-                    ..SessionForms::default()
-                },
-                "device rollback",
-            ),
-            (
-                SessionForms {
-                    speculative: true,
-                    ..SessionForms::default()
-                },
-                "speculative decoding",
             ),
         ];
         for (forms, what) in refusing {

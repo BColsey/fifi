@@ -1543,12 +1543,6 @@ fn shared_prefill_pass(
     let (dense_bytes, perm_bytes) =
         exl3_job_bytes(dims.rows, 256, dims.n_expert, dims.top_k).expect("job sizes");
     let ctx = launch.ctx;
-    let y = ctx
-        .upload(&vec![
-            0u8;
-            dims.rows * dims.hidden.max(dims.shared_inter) * F32
-        ])
-        .expect("dense scratch");
     let jobs = ctx.upload(&vec![0u8; dense_bytes]).expect("dense jobs");
     let guarded = ctx
         .upload(&vec![0xA5; perm_bytes + 16])
@@ -1556,7 +1550,6 @@ fn shared_prefill_pass(
     let scratch = Exl3Scratch {
         xh: bufs.scratch.xh,
         z: bufs.scratch.z,
-        y: y.range(0, y.bytes()).expect("y range"),
         flag: bufs.scratch.flag,
         jobs: jobs.range(0, jobs.bytes()).expect("jobs range"),
     };

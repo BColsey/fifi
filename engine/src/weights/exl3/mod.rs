@@ -16,7 +16,7 @@ pub use header::Matrix;
 pub use reference::Codebook;
 pub use reorder::{Axis, GROUP, check_order};
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) use source::{CONFIG_LIMIT, Checkpoint};
+pub(crate) use source::Checkpoint;
 
 /// Stored components, including legacy forms that Matrix::load must explicitly refuse.
 pub const COMPONENT_SUFFIXES: [&str; 9] = [

@@ -462,7 +462,6 @@ fn fused_gdn_inproj_collapses_the_sibling_launches_only() {
                         op,
                         BlockOp::Project { role: r, .. }
                         | BlockOp::ProjectQ { role: r, .. }
-                        | BlockOp::ProjectExl3 { role: r, .. }
                             if *r == role
                     )
                 })
@@ -489,9 +488,6 @@ fn fused_gdn_inproj_collapses_the_sibling_launches_only() {
                             role: Role::AttnGate | Role::SsmBeta | Role::SsmAlpha,
                             ..
                         } | BlockOp::ProjectQ {
-                            role: Role::AttnGate | Role::SsmBeta | Role::SsmAlpha,
-                            ..
-                        } | BlockOp::ProjectExl3 {
                             role: Role::AttnGate | Role::SsmBeta | Role::SsmAlpha,
                             ..
                         }

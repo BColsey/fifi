@@ -439,6 +439,35 @@ pub(crate) fn weight_format_of(text: Option<&str>) -> Result<WeightFormat, EngEr
     }
 }
 
+/// An EXL3 pack handed to a CUDA start.
+pub(crate) fn exl3_refusal(artifact: &Path) -> EngError {
+    EngError::BadRequest(format!(
+        "engine config: Qwen3.6 on CUDA serves a GGUF checkpoint, and {} is an EXL3 pack; use the \
+         model's GGUF file",
+        artifact.display()
+    ))
+}
+
+/// What a Qwen3.6 CUDA start or check refuses by name before any weight is read: an EXL3 pack, and the speculative
+/// verify window (the n-gram draft, the K-row verify and the device rollback), which ran on the
+/// EXL3 layout only and returns through the step's many-rows path.
+pub(crate) fn check_cuda_serves(settings: &Q36Settings) -> Result<(), EngError> {
+    if settings.weights == WeightFormat::Exl3 {
+        return Err(exl3_refusal(&settings.artifact));
+    }
+    if settings.speculation.enabled()
+        || settings.draft_verify == VerifyMode::Krow
+        || settings.draft_rollback == RollbackMode::Device
+    {
+        return Err(EngError::BadRequest(
+            "engine config: Qwen3.6 CUDA speculative verify is removed until the step's \
+             many-rows path brings it back; unset the draft options"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses the combinations of an EXL3 entry that have no implementation: the MLX arm has no
 /// EXL3 reader, and the tiered and host-paged KV modes read GGUF blocks. Graph capture is allowed:
 /// a captured EXL3 step reads the picked experts on the device.

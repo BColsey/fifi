@@ -8,10 +8,8 @@
 //! nothing"): the row after a refused call is byte-identical.
 //!
 //! Host-only, modelless, GPUless. `FIFI_GOLDEN_UPDATE=1` rewrites this family's golden
-//! file `testdata/pick-goldens.json` atomically with sorted keys (the Q36 pick golden in
-//! `qwen36/cuda/exl3_bank/exl3_bank_pick_golden_host_tests.rs` owns its own file, same
-//! format; one golden mechanism, same switch as the prefill golden harness); without it
-//! the compile-time pin is compared.
+//! file `testdata/pick-goldens.json` atomically with sorted keys (one golden mechanism, the
+//! same switch as the other golden harnesses); without it the compile-time pin is compared.
 
 use crate::family::expert_bank::*;
 use sha2::{Digest, Sha256};

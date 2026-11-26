@@ -77,11 +77,6 @@ pub(super) fn block_bufs(
         zero_buf(ctx, DIMS.hidden * 4)?,
     ];
     let packs: Vec<DeviceBuffer> = match layout {
-        WeightLayout::Exl3 => {
-            return Err(EngError::BadRequest(
-                "GGUF MoE fixture has no EXL3 components".into(),
-            ));
-        }
         WeightLayout::Tiled => vec![
             zero_buf(
                 ctx,
@@ -135,11 +130,6 @@ pub(super) fn moe_bufs(b: &BlockBufs, layout: WeightLayout) -> Result<MoeBuffers
         },
         expert: ExpertBufs {
             packs: match layout {
-                WeightLayout::Exl3 => {
-                    return Err(EngError::BadRequest(
-                        "GGUF MoE fixture has no EXL3 activation slots".into(),
-                    ));
-                }
                 WeightLayout::Tiled => Packs::Xf {
                     moe: range(&b.packs[0])?,
                     down: range(&b.packs[1])?,
@@ -167,11 +157,6 @@ pub(super) fn produce(
     layout: WeightLayout,
 ) -> Result<(), EngError> {
     match layout {
-        WeightLayout::Exl3 => {
-            return Err(EngError::BadRequest(
-                "EXL3 reads F32, not a GGUF activation pack".into(),
-            ));
-        }
         WeightLayout::Tiled => ctx.pack(
             stream,
             PackCall {

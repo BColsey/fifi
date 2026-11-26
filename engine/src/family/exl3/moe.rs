@@ -22,20 +22,14 @@
 //! queued as consecutive launches of at most that many in group order. Qwen3.6's 8 picks make
 //! one launch, as before.
 
-pub(in crate::family) mod merge;
-
 use super::launch::{Launch, MoeDims, RouteBufs};
-use super::layer_table::LayerTable;
 use crate::{
     EngError,
     family::{
         gguf_model::Role,
-        project::{
-            cuda::{
-                CudaWeight, CudaWeights,
-                exl3::{Exl3Bank, Exl3BankSpan, Exl3Io, Exl3Weight},
-            },
-            exl3_jobs_plan::MAX_EXL3_ROWS,
+        project::cuda::{
+            CudaWeight, CudaWeights,
+            exl3::{Exl3Bank, Exl3BankSpan, Exl3Io, Exl3Weight},
         },
     },
     kernels::cuda::{
@@ -50,12 +44,6 @@ use crate::{
 
 const F32: usize = size_of::<f32>();
 
-/// The most rows one down-projection group of the rows kernel takes (`grouped_max_rows`,
-/// exl3.cu `grouped_project_rows`); a wider window splits at this width.
-const GROUPED_MAX_ROWS: usize = 8;
-/// The most one-row pairs one grouped launch takes (`exl3.rs` `grouped_raw`); the shared
-/// expert's gate/up runs in row batches of `GROUPED_PAIRS / 2` rows.
-pub(crate) const GROUPED_PAIRS: usize = crate::kernels::cuda::resident::exl3::GROUPED_PAIRS_MAX;
 const I32: usize = size_of::<i32>();
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
@@ -72,27 +60,6 @@ pub(in crate::family) struct Exl3MoeWeights<'w> {
 }
 
 impl<'w> Exl3MoeWeights<'w> {
-    pub(in crate::family) fn resolve(
-        weights: &'w CudaWeights,
-        table: &LayerTable,
-        layer: usize,
-        moe: &MoeDims,
-    ) -> Result<Self, EngError> {
-        Self::resolve_by(weights, layer, moe, |role| table.name(layer, role))
-    }
-
-    /// The block of `layer` of a banked load: the routed banks hold `members` slots, not the
-    /// full expert count, and the host miss resolver feeds the launches slot indices.
-    pub(in crate::family) fn resolve_banked(
-        weights: &'w CudaWeights,
-        table: &LayerTable,
-        layer: usize,
-        moe: &MoeDims,
-        members: usize,
-    ) -> Result<Self, EngError> {
-        Self::resolve_by_members(weights, layer, moe, |role| table.name(layer, role), members)
-    }
-
     /// The block of `layer` in `weights`, where `name` gives the key of each role's tensor.
     pub(in crate::family) fn resolve_by<'n>(
         weights: &'w CudaWeights,
@@ -193,18 +160,6 @@ fn row<'b>(
     range.buffer().range(range.offset() + index * width, width)
 }
 
-/// The `width` rows of `range` starting at row `r0` of `row_bytes` each.
-fn span<'b>(
-    range: &DeviceRange<'b>,
-    row_bytes: usize,
-    r0: usize,
-    width: usize,
-) -> Result<DeviceRange<'b>, EngError> {
-    range
-        .buffer()
-        .range(range.offset() + r0 * row_bytes, width * row_bytes)
-}
-
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
@@ -253,12 +208,6 @@ struct Pair<'a> {
 /// fill-limited decode lever - so outputs differ from 2 in the last ulp; keep 2
 /// wherever the byte pins must hold.
 static GROUP_SPLIT_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Test-only override of [`group_split`] (the env is process-wide and OnceLock-cached).
-#[cfg(test)]
-pub(in crate::family) fn set_group_split_override(split: u32) {
-    GROUP_SPLIT_OVERRIDE.store(split, std::sync::atomic::Ordering::Relaxed);
-}
 
 pub(in crate::family) fn group_split() -> u32 {
     let set = GROUP_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
@@ -583,98 +532,6 @@ pub(in crate::family) struct SharedWeights<'w> {
     pub(in crate::family) down: &'w Exl3Weight,
 }
 
-/// The ranges of the shared expert of a `rows`-row window. `norm_row` holds `rows` rows of the
-/// hidden width; `gu` holds `rows` rows of `[gate | up]` (`2 * shared_inter` values each), `act`
-/// `rows` rows of `shared_inter` and `out` `rows` rows of the hidden width.
-pub(in crate::family) struct SharedRowsIo<'b> {
-    pub(in crate::family) norm_row: DeviceRange<'b>,
-    pub(in crate::family) gu: DeviceRange<'b>,
-    pub(in crate::family) act: DeviceRange<'b>,
-    pub(in crate::family) out: DeviceRange<'b>,
-    pub(in crate::family) scratch: Scratch<'b>,
-}
-
-/// The gate/up row batches of a `rows`-wide shared-expert window: the grouped launch takes at
-/// most `GROUPED_PAIRS` one-row pairs, so a batch is at most `GROUPED_PAIRS / 2` rows wide. The
-/// pairs of a batch are row-disjoint in `gu`, and each batch reuses the xh/z scratch from
-/// row 0, so wider windows need no extra scratch.
-fn shared_row_batches(rows: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..rows).step_by(GROUPED_PAIRS / 2).map(move |b0| {
-        let width = (rows - b0).min(GROUPED_PAIRS / 2);
-        (b0, width)
-    })
-}
-
-/// The shared expert of a K-row verify window, `rows` in 2 to [`MAX_EXL3_ROWS`].
-///
-/// Gate and up are `2 * rows` one-row pairs in grouped launches of at most `GROUPED_PAIRS`
-/// pairs (batches of `GROUPED_PAIRS / 2` rows, [`shared_row_batches`]), ordered
-/// `[gate_0, up_0, gate_1, up_1, ...]` like the routed block (row `r` owns the pairs `2 r` and
-/// `2 r + 1`), so each row's `[gate | up]` is contiguous and ONE `swiglu_rows` over `rows` rows
-/// reads it with `ld_in = 2 s`, `up_off = s`, the layout of the one-row block: no relaxation of the
-/// SwiGLU's validation. Every pair is exactly the one-row computation (a group of one row, the
-/// one-tile wide body). The down projection runs in row-disjoint groups of at most
-/// `GROUPED_MAX_ROWS` rows (the rows kernel's group bound - `ceil(rows / 8)` groups for a
-/// 64-row window, one call at 8 rows or fewer). Two
-/// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
-/// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
-///
-/// The one-row block [`shared`] is untouched; the test compares this one to `rows` runs of it.
-pub(in crate::family) fn shared_rows(
-    launch: &Launch<'_>,
-    weights: &SharedWeights<'_>,
-    io: &SharedRowsIo<'_>,
-    (hidden, shared_inter, rows): (usize, usize, usize),
-) -> Result<(), EngError> {
-    if rows < 2 {
-        return Err(refuse(format!(
-            "the K-row shared expert takes at least 2 rows, got {rows}"
-        )));
-    }
-    if rows > MAX_EXL3_ROWS {
-        return Err(refuse(format!(
-            "the K-row shared expert takes at most {MAX_EXL3_ROWS} rows, got {rows}"
-        )));
-    }
-    let s = shared_inter;
-    for (b0, width) in shared_row_batches(rows) {
-        let mut group = Vec::with_capacity(2 * width);
-        for r in b0..b0 + width {
-            for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
-                group.push(Pair {
-                    view: weight.view()?,
-                    x: row(&io.norm_row, hidden * F32, r)?,
-                    out: row(&io.gu, s * F32, 2 * r + half)?,
-                });
-            }
-        }
-        grouped(launch, &group, &io.scratch)?;
-    }
-    swiglu(launch, io.gu, io.act, (rows, s))?;
-    // The down projection's rows kernel takes one group of at most `GROUPED_MAX_ROWS` rows
-    // (`grouped_project_rows`, exl3.cu). Gate and up above are one-row groups, so only the
-    // down splits: `ceil(rows / 8)` row-disjoint groups, each exactly the computation the
-    // one-group launch ran for those rows. A window of at most 8 rows keeps the single call.
-    let view = weights.down.view()?;
-    let [k, n] = view.shape;
-    for r0 in (0..rows).step_by(GROUPED_MAX_ROWS) {
-        let width = (rows - r0).min(GROUPED_MAX_ROWS);
-        let down = Exl3Io {
-            x: span(&io.act, s * F32, r0, width)?,
-            xh: span(&io.scratch.xh, k * F32, r0, width)?,
-            z: span(&io.scratch.z, n * F32, r0, width)?,
-            out: span(&io.out, n * F32, r0, width)?,
-            flag: io.scratch.flag,
-            rows: width,
-            fused: false,
-        };
-        launch
-            .ctx
-            .exl3_grouped_step(launch.stream, &[view.linear_call(&down)])?;
-    }
-    Ok(())
-}
-
 /// `resid_out = resid_in + (picks in pick order + gate * shared)`, as the GGUF block combines.
 fn combine(launch: &Launch<'_>, bufs: &Exl3MoeBufs<'_>, dims: &MoeDims) -> Result<(), EngError> {
     combine_ranges(
@@ -781,174 +638,6 @@ pub(in crate::family) fn run_exl3_moe(
     combine(launch, bufs, dims)
 }
 
-/// The ranges of row `index` of the K-row buffers, as the one-row block takes them: every
-/// per-row buffer offset by `index` rows. The scratch and the status word are shared (the rows run
-/// in stream order).
-fn row_bufs<'b>(
-    bufs: &Exl3MoeBufs<'b>,
-    dims: &MoeDims,
-    index: usize,
-) -> Result<Exl3MoeBufs<'b>, EngError> {
-    let (h, i, s, k) = (dims.hidden, dims.inter, dims.shared_inter, dims.top_k);
-    let route = &bufs.route;
-    Ok(Exl3MoeBufs {
-        route: RouteBufs {
-            resid_in: row(&route.resid_in, h * F32, index)?,
-            resid_out: row(&route.resid_out, h * F32, index)?,
-            norm_row: row(&route.norm_row, h * F32, index)?,
-            logits: row(&route.logits, (dims.n_expert + 1) * F32, index)?,
-            ids: row(&route.ids, k * I32, index)?,
-            weights: row(&route.weights, k * F32, index)?,
-            shared_gate: row(&route.shared_gate, F32, index)?,
-            status: route.status,
-        },
-        expert_gu: row(&bufs.expert_gu, k * 2 * i * F32, index)?,
-        expert_act: row(&bufs.expert_act, k * i * F32, index)?,
-        expert_down: row(&bufs.expert_down, k * h * F32, index)?,
-        shared_gu: row(&bufs.shared_gu, 2 * s * F32, index)?,
-        shared_act: row(&bufs.shared_act, s * F32, index)?,
-        shared_out: row(&bufs.shared_out, h * F32, index)?,
-        scratch: bufs.scratch,
-    })
-}
-
-/// The router of a K-row block: one launch over every row, its picks to the id array.
-fn route_rows(
-    launch: &Launch<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Exl3MoeBufs<'_>,
-    rows: usize,
-    dims: &MoeDims,
-) -> Result<(), EngError> {
-    let route = &bufs.route;
-    launch.ctx.router_rows(
-        launch.stream,
-        RouterCall {
-            shape: RouterShape {
-                m: rows,
-                hidden: dims.hidden,
-                n_expert: dims.n_expert,
-                top_k: dims.top_k,
-            },
-            x: route.norm_row,
-            weights: RouterWeights {
-                w: whole(weights.router)?,
-                w_shared: Some(whole(weights.router_shared)?),
-            },
-            logits: route.logits,
-            out: RouterOut {
-                ids: route.ids,
-                weights: route.weights,
-                shared_gate: Some(route.shared_gate),
-                status: route.status,
-            },
-        },
-    )
-}
-
-/// The block of one layer of a K-row verify window (`dims.rows` rows, 2 to 8) on the one stream.
-/// `bufs` holds the K-row buffers: row `r` of each per-row buffer is at `r` rows from its start.
-///
-/// The router runs once for all rows (the decode kernel at every row count: below 8 rows one
-/// launch, from 8 rows chunks of 4). The routed experts differ per row, so each row runs its own
-/// chain of id-indexed launches on its own ranges, exactly the launches of the one-row block with
-/// other pointers; the results of every row stay in their own buffers until the combine. The
-/// shared expert and the combine take all rows at once. The picks stay on the device, so the block
-/// waits for nothing.
-pub(in crate::family) fn run_exl3_moe_rows(
-    launch: &Launch<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Exl3MoeBufs<'_>,
-    dims: &MoeDims,
-) -> Result<(), EngError> {
-    let rows = dims.rows;
-    if !(2..=8).contains(&rows) {
-        return Err(refuse(format!(
-            "the K-row block takes 2 to 8 rows, got {rows}"
-        )));
-    }
-    route_rows(launch, weights, bufs, rows, dims)?;
-    let one = MoeDims { rows: 1, ..*dims };
-    for index in 0..rows {
-        routed_on_device(launch, weights, &row_bufs(bufs, dims, index)?, &one)?;
-    }
-    let route = &bufs.route;
-    shared_rows(
-        launch,
-        &SharedWeights {
-            gate: weights.shared_gate,
-            up: weights.shared_up,
-            down: weights.shared_down,
-        },
-        &SharedRowsIo {
-            norm_row: route.norm_row,
-            gu: bufs.shared_gu,
-            act: bufs.shared_act,
-            out: bufs.shared_out,
-            scratch: bufs.scratch,
-        },
-        (dims.hidden, dims.shared_inter, rows),
-    )?;
-    combine(launch, bufs, dims)
-}
-
-/// The block of one layer of a K-row verify window on a banked engine: the router, the shared
-/// expert and the combine are the resident body's. The routed experts differ: the picks of
-/// every row are read back once — the one drain of the layer — then each row runs the host-pick
-/// chain of the one-row banked block over its own ranges, its picks mapped through the layer's
-/// slot table (refilling missed slots from the host store first), so the grouped launches read
-/// the slot members of the bank views exactly as the resident body reads its expert members.
-/// The body waits for the host inside every layer, so a banked step never captures it.
-pub(in crate::family) fn run_exl3_moe_rows_banked(
-    launch: &Launch<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Exl3MoeBufs<'_>,
-    dims: &MoeDims,
-    bank: &mut crate::family::exl3::bank::LayerResolver<'_, '_>,
-) -> Result<(), EngError> {
-    let rows = dims.rows;
-    if !(2..=8).contains(&rows) {
-        return Err(refuse(format!(
-            "the K-row block takes 2 to 8 rows, got {rows}"
-        )));
-    }
-    route_rows(launch, weights, bufs, rows, dims)?;
-    let picks = read_picks(launch, &bufs.route.ids, rows * dims.top_k, dims.n_expert)?;
-    let one = MoeDims { rows: 1, ..*dims };
-    for (index, row) in picks.chunks(dims.top_k).enumerate() {
-        #[cfg(test)]
-        let began = std::time::Instant::now();
-        let mapped = bank.resolve(launch.stream, row)?;
-        #[cfg(test)]
-        crate::family::exl3::bank::probe::resolve(began.elapsed());
-        routed(
-            launch,
-            weights,
-            &row_bufs(bufs, dims, index)?,
-            (&mapped, &one),
-            None,
-        )?;
-    }
-    let route = &bufs.route;
-    shared_rows(
-        launch,
-        &SharedWeights {
-            gate: weights.shared_gate,
-            up: weights.shared_up,
-            down: weights.shared_down,
-        },
-        &SharedRowsIo {
-            norm_row: route.norm_row,
-            gu: bufs.shared_gu,
-            act: bufs.shared_act,
-            out: bufs.shared_out,
-            scratch: bufs.scratch,
-        },
-        (dims.hidden, dims.shared_inter, rows),
-    )?;
-    combine(launch, bufs, dims)
-}
-
 #[cfg(test)]
 mod indexed_step_tests {
     use super::*;
@@ -972,31 +661,5 @@ mod indexed_step_tests {
         // 128); the max(1) in the divisor still guards the division, and the byte budget
         // alone decides the step.
         assert_eq!(indexed_step(16, rows(64), 0), 16);
-    }
-}
-
-#[cfg(test)]
-mod shared_rows_tests {
-    use super::*;
-
-    /// The gate/up batches split at the grouped launch's pair bound: 24 rows is one batch,
-    /// 25 splits 24+1, 49 splits 24+24+1, and the widest planned window (64) splits 24+24+16.
-    #[test]
-    fn gate_up_row_batches_split_at_the_pair_bound() {
-        let widths = |rows: usize| shared_row_batches(rows).map(|(_, w)| w).collect::<Vec<_>>();
-        assert_eq!(widths(2), [2]);
-        assert_eq!(widths(24), [24]);
-        assert_eq!(widths(25), [24, 1]);
-        assert_eq!(widths(48), [24, 24]);
-        assert_eq!(widths(49), [24, 24, 1]);
-        assert_eq!(widths(64), [24, 24, 16]);
-        for rows in 2..=MAX_EXL3_ROWS {
-            let batches = shared_row_batches(rows).collect::<Vec<_>>();
-            assert_eq!(batches.iter().map(|&(_, w)| w).sum::<usize>(), rows);
-            assert!(batches.iter().all(|&(_, w)| w <= GROUPED_PAIRS / 2));
-            for pair in batches.windows(2) {
-                assert!(pair[0].0 + pair[0].1 == pair[1].0);
-            }
-        }
     }
 }

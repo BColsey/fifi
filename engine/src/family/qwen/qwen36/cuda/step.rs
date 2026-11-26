@@ -34,15 +34,9 @@
 //! event and the stream; `Drop` synchronizes the stream first.
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
-use std::cell::RefCell;
 
 use super::{
     dims::{KvMode, StepOptions},
-    exl3_moe::{
-        Exl3MoeBufs, Exl3MoeWeights, Scratch,
-        merge::{SharedMerge, run_exl3_moe_merged},
-        run_exl3_moe,
-    },
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_weights::MixerWeights,
     moe::{
@@ -55,7 +49,7 @@ use super::{
         fixed_chunk_rows, fixed_staging_rows, ledger_line, needs_arena, stage_label,
         wide_stage_candidate,
     },
-    prefill_plan::{PART_CHARGE, SPARE_MIN, chunk_costs, exl3_chunk_costs, state_bytes},
+    prefill_plan::{PART_CHARGE, SPARE_MIN, chunk_costs, state_bytes},
     prefix::{CudaPrefillPath, CudaSavedPrefix, PendingPrefix},
     readback::{
         ReadbackPlan, SHORTLIST_VAR, SYNC_EACH_VAR, captured_report, check_mode,
@@ -81,19 +75,10 @@ use crate::family::decode_step::state_layout::StateLayout;
 use crate::family::state_words::Word;
 use crate::{
     EngError,
-    family::exl3::bank::Exl3SlotResolver,
-    family::exl3_merge_plan::{
-        Intent, Source, load_suffix, resolve_switch, shared_in_routed_explicit,
-    },
-    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
+    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout},
+    family::qwen::qwen36::settings::DEFAULT_CUDA_PREFILL_CHUNK,
     family::qwen::qwen36::tiered::{host::TieredHost, report::TokenReport},
-    family::qwen::qwen36::window_logic,
     family::session::{PrefixIdentity, PrefixSlot},
-    family::speculate::{
-        config::SpecConfig,
-        driver::{RepeatDrafter, Speculator},
-    },
     family::{AttentionKind, gguf_model::Role, sampler::Sampler},
     kernels::cuda::{
         CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
@@ -102,10 +87,9 @@ use crate::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
             embed::{EmbedCall, EmbedNativeCall},
-            embed_bf16::EmbedBf16Call,
             sample::{SampleShortlistCall, ShortlistDraw},
             shortlist::{self, ShortlistCall, ShortlistMassCall},
-            step_params::{ArgmaxCall, ResultPair, STATUS_EXL3_ARITHMETIC, StepParams, StepStatus},
+            step_params::{ArgmaxCall, ResultPair, StepParams, StepStatus},
         },
     },
 };
@@ -119,10 +103,6 @@ const F32: usize = size_of::<f32>();
 #[cfg(all(test, feature = "native-cuda"))]
 #[path = "prefill_kv8_target_device_tests.rs"]
 mod kv8_target;
-
-/// The routed expert ids of one MoE block: the layer and its `top_k` ids (test builds only).
-#[cfg(test)]
-pub(super) type MoePicks = (usize, Vec<i32>);
 
 /// Capture settings of the step; distinct from `dims::StepOptions` (the dimensions options of
 /// `new`).
@@ -337,31 +317,6 @@ pub(super) fn tiered_capture_refusal(tiered_mode: bool, capture: bool) -> Result
     Ok(())
 }
 
-/// The id-indexed launch holds 16 pairs (gate and up of every pick), so a captured EXL3 step
-/// supports at most 8 picks per token.
-pub(super) fn exl3_device_pick_refusal(
-    layout: WeightLayout,
-    capture: bool,
-    top_k: usize,
-) -> Result<(), EngError> {
-    if layout == WeightLayout::Exl3 && capture && 2 * top_k > 16 {
-        return Err(EngError::BadRequest(format!(
-            "step: a captured EXL3 step reads at most 8 picks per token on the device, got {top_k}"
-        )));
-    }
-    Ok(())
-}
-
-use crate::family::graph_state::book::exl3_flag_error;
-
-/// The refusal of a result pair whose status carries the EXL3 arithmetic verdict (mask 16). It is
-/// taken before `decide` sees the pair, so a flagged EXL3 token never commits, whatever other
-/// bits the status holds. Only an EXL3 step folds the flag into the status.
-pub(super) fn exl3_pair_refusal(layout: WeightLayout, pair: ResultPair) -> Option<EngError> {
-    (layout == WeightLayout::Exl3 && pair.status.0 & STATUS_EXL3_ARITHMETIC != 0)
-        .then(exl3_flag_error)
-}
-
 fn sync_each_from_env() -> Result<bool, EngError> {
     match std::env::var(SYNC_EACH_VAR) {
         Ok(value) => parse_sync_each(Some(&value)),
@@ -377,23 +332,11 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The leaked pin slice of the weights and the arena slot: one leaked slice per new step (one
     /// step per session); the graph bakes their addresses in.
     pins: &'a [&'a DeviceBuffer],
-    /// The pins of a K-row graph: the pins above and the K-row arena. Leaked at `enable_krow`
-    /// (one slice per armed step); empty until then.
-    krow_pins: &'a [&'a DeviceBuffer],
     /// The replayable body, once a capture has succeeded. Declared BEFORE the state field: the
     /// graph (which keeps the arena holds and borrows the pin slice) drops first, and that
     /// covers the state buffers by drop order -- they live inside the step and never move
     /// after they are built, so the pin list need not name them.
     graph: Option<GraphExec<'a>>,
-    /// The graphs of the K-row body, one per window length (`krow_graph`). Declared right after
-    /// `graph` and before `krow`, `state` and `rollback`: a graph bakes in the addresses of the
-    /// K-row buffer, the state and the rollback slots, so every graph must drop first. A test
-    /// pins this order (`krow_graph_tests::the_k_row_graphs_are_declared_before_the_buffers_they_bake_in`).
-    krow_graphs: krow_graph::GraphTable<GraphExec<'a>>,
-    /// The K-row verify window (`draft_verify = krow`), once armed. Declared after the graphs and
-    /// before the state: a captured K-row body bakes in the addresses of its small buffer, so
-    /// any graph of it must drop first.
-    krow: Option<krow_step::KrowRuntime>,
     #[cfg(feature = "research-activation")]
     activation: std::cell::RefCell<Option<super::super::activation::Capture>>,
     /// The section-timing marks: `None` unless the capture config asked for them. Declared after
@@ -404,29 +347,6 @@ pub(crate) struct QwenResidentStep<'a> {
     res: &'a StepResources,
     mixers: Mixers<'a>,
     moe: Vec<MoeLayerWeights<'a>>,
-    /// The MoE weights of each layer of an EXL3 load, whose experts the grouped EXL3 launches
-    /// read; `moe` is empty then.
-    exl3_moe: Vec<Exl3MoeWeights<'a>>,
-    /// The banked EXL3 decode state: every layer's slot tables with the host store, behind a
-    /// `RefCell` because the decode runs through a shared step view. `None` is the resident
-    /// step; when set, the eager MoE blocks map their read picks through the tables and
-    /// refill missed slots before the launches (the engine thread is the only borrower).
-    exl3_bank: Option<&'a std::cell::RefCell<Exl3SlotResolver<'a>>>,
-    /// Tokens decoded since the last banked hits/misses log line (a banked step only).
-    banked_echo: u32,
-    /// The working buffer of the MoE block that queues the shared expert inside the routed launches
-    /// (the default of an EXL3 load; `FIFI_EXL3_SHARED_IN_ROUTED=0` or a load that cannot run it
-    /// leaves `None`, which keeps the reference block).
-    ///
-    /// Declared after `graph`, so the graph drops first: a captured body bakes in this buffer's
-    /// address and its replay must never outlive the buffer.
-    exl3_merge: Option<SharedMerge>,
-    /// What `FIFI_EXL3_SHARED_IN_ROUTED` asked of this load, as resolved at the build
-    /// (`Intent::Off` for every layout but EXL3). `request_krow_verify` reads it to tell a merged
-    /// block built by the default (which yields to krow) from an explicit `1` (which krow refuses).
-    merge_intent: Intent,
-    /// Where the mode of the merged block came from, for the load line.
-    merge_source: Source,
     /// The tiered mode: the options asked for it. The routed expert stacks are then not loaded,
     /// `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of each
     /// token syncs with the host: about 0.8 ms per token over the plain step when every expert is
@@ -471,9 +391,6 @@ pub(crate) struct QwenResidentStep<'a> {
     /// warm; the warm-up retries).
     warmed: bool,
     capture_on: bool,
-    /// An EXL3 step reads the router's picks on the device (no host read in the MoE block); set
-    /// with the capture config, which needs a body that makes no host read.
-    exl3_device_ids: bool,
     /// The sticky refusal flag: set only by a refused capture, never cleared -- `reset_state`
     /// and `import_state` are `ResidentState` methods and cannot touch it.
     refused: bool,
@@ -485,30 +402,6 @@ pub(crate) struct QwenResidentStep<'a> {
     /// later change wires the config member `qwen36.prefill_chunk` into it.
     m_sess_cap: u32,
     kv8_chunked_prefill: bool,
-    /// The window that has run and awaits its verdict (see `eager_window`).
-    pub(super) window: Option<super::eager_window::EagerWindow>,
-    /// A fault armed for the next window or commit: test builds only, so a serving build
-    /// carries neither the field nor the check (see `eager_window::inject_fault`).
-    #[cfg(test)]
-    pub(super) window_fault: Option<crate::family::speculate::d1_oracle::Fault>,
-    /// The host and device time of the last window, by part (test builds only).
-    #[cfg(test)]
-    pub(super) window_trace: super::eager_window::WindowTrace,
-    /// The routed expert ids of each EXL3 MoE block, `(layer, top_k ids)` in launch order, filled
-    /// only while the measurement tests switch it on (`None` is off). It reads the ids back after
-    /// each block, so it is valid for the eager body only (test builds only).
-    #[cfg(test)]
-    pub(super) moe_pick_tap: std::cell::RefCell<Option<Vec<MoePicks>>>,
-    /// The per-layer residual taps of the next eager body, when a test turned them on (test
-    /// builds only; the bisect aid of the K-row checks, absent from the serving path).
-    #[cfg(test)]
-    taps: std::cell::RefCell<Option<Vec<krow_step::LayerTap>>>,
-    /// Drain the stream after each device-rollback capture, so the copy's time shows in the trace
-    /// (test builds only; the copy otherwise overlaps the host's next work).
-    #[cfg(test)]
-    pub(super) trace_sync_capture: bool,
-    /// The speculative decode step, when the settings asked for one.
-    pub(super) speculator: Option<Speculator<RepeatDrafter>>,
     #[cfg(test)]
     chunk_kernel_class: super::prefill::ChunkKernelClass,
     /// The bytes of the last logits row read back (little-endian f32).
@@ -548,21 +441,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The tier of the last restore from memory, taken when its report is built.
     restore_source: Option<crate::sched::job::PrefixSource>,
     device_tip: Option<super::state::device_tip::DeviceTip>,
-    /// `qwen36.draft_rollback = device` asked for: a verify window rolls back through `rollback`.
-    /// A window on a step that wants it and holds no slots is refused before any state change.
-    rollback_wanted: bool,
-    /// `qwen36.draft_verify = krow` asked for (`rollback_runtime`): the merged MoE block is refused.
-    krow_wanted: bool,
     /// The options asked for experts on branch streams (refused in stage 1 at resource creation,
     /// and refused again when the device rollback is armed, which orders its copies on one stream).
     forked_experts: bool,
-    /// The device rollback slots (see `rollback_runtime`), armed before the first token. Armed means
-    /// `Some`; the shared `Speculator` knows nothing of it.
-    rollback: Option<super::state::rollback::RollbackSlots>,
     pending_prefix: Option<PendingPrefix>,
-    /// The recovery gate: a failed or indeterminate window commit set it. Only `reset_state`
-    /// clears it (see `window_gate`).
-    needs_reset: bool,
 }
 
 pub(super) use crate::family::decode_step::ChunkVerdict;
@@ -726,19 +608,15 @@ impl<'a> QwenResidentStep<'a> {
         options: &StepOptions,
         rules: QwenRules,
     ) -> Result<Self, EngError> {
-        Self::build(context, res, weights, options, rules, None)
+        Self::build(context, res, weights, options, rules)
     }
 
-    /// The build shared by both constructors; `banked` names the slot count and the resolver
-    /// of a banked EXL3 load (`None` is the resident step, whose banks must hold every
-    /// expert).
     fn build(
         context: &'a CudaContext,
         res: &'a StepResources,
         weights: &'a CudaWeights,
         options: &StepOptions,
         rules: QwenRules,
-        banked: Option<(usize, &'a RefCell<Exl3SlotResolver<'a>>)>,
     ) -> Result<Self, EngError> {
         let widths = validate_step_inputs(options, res.dims.shape.vocab, &rules)?;
         // The mode follows the loaded weights: the options carry the same layout, derived from
@@ -753,10 +631,6 @@ impl<'a> QwenResidentStep<'a> {
             ));
         }
         let sync_each = sync_each_from_env()?;
-        if options.layout == WeightLayout::Exl3 {
-            // A bad FIFI_EXL3_SINGLE_GATHER stops the start, not the first token.
-            context.check_single_gather()?;
-        }
         let stream = context.stream()?;
         let state = match &res.paged {
             Some(paged) => ResidentState::allocate_from_plan(context, &stream, &paged.state)?,
@@ -800,40 +674,12 @@ impl<'a> QwenResidentStep<'a> {
         };
         let specs = MoeSpecs::new(&res.dims)?;
         let tiered_mode = options.tiered.is_some();
-        let exl3_moe = if options.layout == WeightLayout::Exl3 {
-            let dims = moe_dims(&res.dims);
-            layers
-                .iter()
-                .map(|&layer| match banked.as_ref().map(|(slots, _)| *slots) {
-                    Some(slots) => {
-                        Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
-                    }
-                    None => Exl3MoeWeights::resolve(weights, &res.table, layer, &dims),
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
-        // The merged shared-expert block: on by default for an EXL3 load (a load that cannot run it
-        // falls back to the reference block with a logged reason), off with
-        // `FIFI_EXL3_SHARED_IN_ROUTED=0`, refused if `=1` cannot be honoured. A bad value of the
-        // switch stops the start, not the first token.
-        let (exl3_merge, merge_intent, merge_source) = if options.layout == WeightLayout::Exl3 {
-            let intent = resolve_switch(shared_in_routed_explicit(), true)?;
-            let (merge, source) =
-                SharedMerge::choose(context, &moe_dims(&res.dims), &exl3_moe, intent)?;
-            (merge, intent, source)
-        } else {
-            (None, Intent::Off, Source::Explicit)
-        };
         let (moe, tiered_parts) = if tiered_mode {
             let parts = layers
                 .iter()
                 .map(|&layer| moe_layer_parts(&res.table, weights, &specs, layer, options.layout))
                 .collect::<Result<Vec<_>, _>>()?;
             (Vec::new(), Some(parts))
-        } else if options.layout == WeightLayout::Exl3 {
-            (Vec::new(), None)
         } else {
             let moe = layers
                 .iter()
@@ -856,10 +702,9 @@ impl<'a> QwenResidentStep<'a> {
                 .ok()
                 .as_deref(),
         );
-        // EXL3 and tiered are refused at step time (their MoE arms are not staged); the stage
-        // is not even allocated for them.
-        let route_stage = if route_stage_on && options.layout != WeightLayout::Exl3 && !tiered_mode
-        {
+        // Tiered is refused at step time (its MoE arm is not staged); the stage is not even
+        // allocated for it.
+        let route_stage = if route_stage_on && !tiered_mode {
             let dims = moe_dims(&res.dims);
             let stage = new_route_stage(context, layers.len(), dims.top_k)?;
             super::super::route_stage::set_facts(layers.len(), dims.top_k, dims.n_expert);
@@ -875,22 +720,13 @@ impl<'a> QwenResidentStep<'a> {
         let pins: &'a [&'a DeviceBuffer] = Box::leak(pinned.into_boxed_slice());
         let step = Self {
             pins,
-            krow_pins: &[],
             graph: None,
-            krow_graphs: krow_graph::GraphTable::default(),
-            krow: None,
             #[cfg(feature = "research-activation")]
             activation: std::cell::RefCell::new(None),
             context,
             res,
             mixers: Mixers::new(context, parts)?,
             moe,
-            exl3_moe,
-            exl3_bank: banked.map(|(_, bank)| bank),
-            banked_echo: 0,
-            exl3_merge,
-            merge_intent,
-            merge_source,
             tiered_mode,
             tiered_chunk: false,
             tiered_parts,
@@ -918,22 +754,11 @@ impl<'a> QwenResidentStep<'a> {
             started: false,
             warmed: false,
             capture_on: false,
-            exl3_device_ids: false,
             refused: false,
             marks: None,
             rules,
             widths,
             kv8_chunked_prefill: false,
-            window: None,
-            #[cfg(test)]
-            window_fault: None,
-            #[cfg(test)]
-            window_trace: Default::default(),
-            #[cfg(test)]
-            moe_pick_tap: Default::default(),
-            #[cfg(test)]
-            taps: Default::default(),
-            speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
             shortlist_on: device_shortlist_enabled(std::env::var(SHORTLIST_VAR).ok().as_deref()),
@@ -957,76 +782,12 @@ impl<'a> QwenResidentStep<'a> {
             background_error_at: None,
             restore_source: None,
             device_tip: None,
-            #[cfg(test)]
-            trace_sync_capture: false,
-            rollback_wanted: false,
-            krow_wanted: false,
             forked_experts: options.forked_experts,
-            rollback: None,
             pending_prefix: None,
-            needs_reset: false,
         };
         let mut step = step;
         step.refill_prefill_report();
         Ok(step)
-    }
-
-    /// [`Self::new`] for a banked EXL3 load: the routed banks hold `slots` members (resolved
-    /// against that count) and the decode maps every layer's picks through `bank`'s slot
-    /// tables, refilling missed slots from its host store.
-    pub(crate) fn new_banked(
-        context: &'a CudaContext,
-        res: &'a StepResources,
-        weights: &'a CudaWeights,
-        options: &StepOptions,
-        rules: QwenRules,
-        slots: usize,
-        bank: &'a RefCell<Exl3SlotResolver<'a>>,
-    ) -> Result<Self, EngError> {
-        Self::build(context, res, weights, options, rules, Some((slots, bank)))
-    }
-
-    /// The load-line suffix of the merged MoE block: the resolved mode and its source on an EXL3
-    /// load (` exl3_shared_in_routed=on source=default`), nothing on any other layout.
-    pub(crate) fn shared_in_routed_suffix(&self) -> String {
-        if self.layout == WeightLayout::Exl3 {
-            load_suffix(self.exl3_merge.is_some(), self.merge_source)
-        } else {
-            String::new()
-        }
-    }
-
-    /// Test builds: puts the shared expert in the routed launches (or back) on this step, which
-    /// the process-wide switch cannot do twice in one process. Before the first token only.
-    #[cfg(test)]
-    pub(crate) fn set_shared_in_routed(&mut self, on: bool) -> Result<(), EngError> {
-        if self.started {
-            return Err(EngError::BadRequest(
-                "step: the MoE block is fixed once the session runs".to_owned(),
-            ));
-        }
-        if on && self.layout != WeightLayout::Exl3 {
-            return Err(EngError::BadRequest(
-                "step: the shared expert rides in the routed launches of an EXL3 step only"
-                    .to_owned(),
-            ));
-        }
-        if on && self.krow_wanted {
-            // The same refusal as the variable: the K-row path is qualified without the block.
-            super::super::krow::check_krow_switches(None, true)?;
-        }
-        self.merge_source = Source::Explicit;
-        self.merge_intent = if on { Intent::Explicit } else { Intent::Off };
-        self.exl3_merge = if on {
-            Some(SharedMerge::new(
-                self.context,
-                &self.moe_dims,
-                &self.exl3_moe,
-            )?)
-        } else {
-            None
-        };
-        Ok(())
     }
 
     /// Sets the capture settings; refuses after the first token and refuses
@@ -1044,26 +805,18 @@ impl<'a> QwenResidentStep<'a> {
                 "step: the capture mode is fixed once the session runs".to_owned(),
             ));
         }
-        exl3_device_pick_refusal(self.layout, config.capture, self.moe_dims.top_k)?;
         // B2: the sparse chain clears and reads its status word with blocking, stream-
         // ordered copies — a captured body forbids both. While sparse is admitted the
         // session stays EAGER, so the chain is never silently absent from a replay graph.
         if config.capture && self.res.sparse.is_some() {
             eprintln!("q36 cuda: capture off — the sparse attention chain is admitted");
         }
-        // A banked engine never captures: the slot resolver works on the host between the
-        // readback and the launches, which a graph cannot do (the settings force capture off;
-        // this guard holds for any caller).
-        self.capture_on = config.capture && self.res.sparse.is_none() && self.exl3_bank.is_none();
-        // A captured body cannot wait for the host inside a layer: the EXL3 MoE blocks read the
-        // picks from device memory then.
-        self.exl3_device_ids =
-            config.capture && self.layout == WeightLayout::Exl3 && self.exl3_bank.is_none();
+        self.capture_on = config.capture && self.res.sparse.is_none();
         // Created here, before the first token: the events must exist before the capture that
         // records them, and their addresses stay stable for the session's life.
         self.marks = if config.section_marks {
-            // The MoE sub-split exists only on the native resident path: the exl3 and tiered
-            // arms never run `run_moe_block_marked`, so their sub events would never record.
+            // The MoE sub-split exists only on the native resident path: the tiered arm never
+            // runs `run_moe_block_marked`, so its sub events would never record.
             Some(SectionMarks::new(
                 self.context,
                 &self.res.dims.shape.kinds,
@@ -1072,14 +825,6 @@ impl<'a> QwenResidentStep<'a> {
         } else {
             None
         };
-        Ok(())
-    }
-
-    /// Arms the speculative decode step the settings ask for. Call it before the first token. The
-    /// n-gram mode drafts from the committed tokens; the MTP mode has no draft step yet and is
-    /// refused. A window of more than 8 rows is refused (`check_window_rows`).
-    pub(crate) fn set_speculation(&mut self, config: &SpecConfig) -> Result<(), EngError> {
-        self.speculator = speculator_of(config)?;
         Ok(())
     }
 
@@ -1149,7 +894,7 @@ impl<'a> QwenResidentStep<'a> {
         }
         let mut admit = AdmitFacts {
             budget: budget.device_free,
-            decode_arena: self.res.arena.bytes() + self.res.krow_arena_bytes(),
+            decode_arena: self.res.arena.bytes(),
             state_planned: state_bytes(
                 &self.res.dims,
                 layout.kv.mode,
@@ -1176,11 +921,7 @@ impl<'a> QwenResidentStep<'a> {
             admit.cap = fixed_chunk_rows(layout.kv.capacity, admit.cap);
         }
         let facts = self.context.mmq_device_facts()?;
-        let mut costs = if self.layout == WeightLayout::Exl3 {
-            exl3_chunk_costs(&self.res.dims, facts.nsm)?
-        } else {
-            chunk_costs(&self.res.dims, facts.nsm)?
-        };
+        let mut costs = chunk_costs(&self.res.dims, facts.nsm)?;
         if admit.cap == 4096 {
             costs.insert(
                 0,
@@ -1317,12 +1058,7 @@ impl<'a> QwenResidentStep<'a> {
             }
             return Ok(self.chunk_ready());
         };
-        let allocate = if self.layout == WeightLayout::Exl3 {
-            PrefillArena::allocate_exl3
-        } else {
-            PrefillArena::allocate
-        };
-        let mut arena = allocate(
+        let mut arena = PrefillArena::allocate(
             self.context,
             &self.stream,
             &self.res.dims,
@@ -1564,8 +1300,6 @@ impl<'a> QwenResidentStep<'a> {
         use super::prefill_plan::ChunkSlot;
         use crate::family::prefill::chunk_loop::{ChunkOrder, StatusClear, drive_chunk};
 
-        // A chunk advances the live state: refused through a gated state or an awaiting window.
-        self.state_usable()?;
         #[cfg(test)]
         let kernel_class = self.chunk_kernel_class;
         let Self {
@@ -1573,7 +1307,6 @@ impl<'a> QwenResidentStep<'a> {
             prefill,
             mixers,
             moe,
-            exl3_moe,
             globals,
             context,
             stream,
@@ -1584,8 +1317,6 @@ impl<'a> QwenResidentStep<'a> {
             ..
         } = self;
         // 1. Host checks. Nothing touches the device before all of them pass.
-        // A banked chunk runs its MoE stage in sub-blocks (see prefill_exl3::moe_block), so
-        // any admitted chunk row count serves.
         check_chunk_start(p0, state.tokens())?;
         let arena = prefill
             .as_ref()
@@ -1602,12 +1333,9 @@ impl<'a> QwenResidentStep<'a> {
             super::resources::GlobalWeight::Native(embed) => {
                 ChunkWeights::new(mixers.weights(), moe, embed).with_shared(&shared_types)
             }
-            super::resources::GlobalWeight::Bf16(table) => {
-                ChunkWeights::exl3(mixers.weights(), exl3_moe, table)
-            }
-            super::resources::GlobalWeight::Tiled(_) | super::resources::GlobalWeight::Exl3(_) => {
+            super::resources::GlobalWeight::Tiled(_) => {
                 return Err(EngError::BadRequest(
-                    "prefill chunk: the embedding is neither native nor an EXL3 table".to_owned(),
+                    "prefill chunk: the embedding is not a native table".to_owned(),
                 ));
             }
         };
@@ -1635,7 +1363,6 @@ impl<'a> QwenResidentStep<'a> {
         // read (`tiered_load::tiered_chunk_arm`).
         let tiered_chunk = self.tiered.as_ref().filter(|_| self.tiered_chunk);
         let mut fam = Q36ChunkFamily::new(
-            self.exl3_bank,
             tiered_chunk,
             #[cfg(test)]
             kernel_class,
@@ -1767,11 +1494,7 @@ impl<'a> QwenResidentStep<'a> {
     pub(crate) fn reset_state(&mut self) -> Result<(), EngError> {
         // Exempt from `state_usable`: the one recovery of a failed commit must not be refused by
         // the state it recovers.
-        window_logic::reset_prologue(self)?;
         self.state.reset(&self.stream)?;
-        // A reset is the one recovery of a failed window commit: the gate opens only when the
-        // state really was zeroed.
-        window_logic::reset_epilogue(self);
         // R3: the position restarts at zero; the sketch-valid prefix follows (the
         // re-appends rewrite every consumed cell, but the binding stays honest).
         if let Some(sp) = self.res.sparse.as_ref() {
@@ -1793,18 +1516,11 @@ impl<'a> QwenResidentStep<'a> {
 
     /// The committed state as a host value, for the checkpoint store.
     pub(crate) fn export_state(&self) -> Result<ExportedState, EngError> {
-        window_logic::export_gate(self)?;
         self.state.export_state(&self.stream)
     }
 
-    /// Replaces the committed state with `exported`: every restore goes through here. The order
-    /// and the refusals live in `window_logic::import_state`.
+    /// Replaces the committed state with `exported`: every restore goes through here.
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
-        window_logic::import_state(self, exported)
-    }
-
-    /// The device writes of an import (see `window_gate`).
-    pub(super) fn overwrite_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
         self.state.import_state(&self.stream, exported)?;
         // R3: the checkpoint restored the KV planes and the position, but NOT the
         // sparse sketch (it belongs to this session's SparseExec): the sketch-valid
@@ -1848,42 +1564,6 @@ impl<'a> QwenResidentStep<'a> {
             shared_gate: view(Slot::SharedGate)?,
             status: self.state.step_status()?,
         })
-    }
-
-    /// The ranges of the EXL3 MoE block of the layers whose residual input is buffer `parity`.
-    fn exl3_moe_buffers(&self, parity: usize) -> Result<Exl3MoeBufs<'_>, EngError> {
-        Ok(Exl3MoeBufs {
-            route: self.route_bufs(parity)?,
-            expert_gu: self.view(Slot::ExpertGu)?,
-            expert_act: self.view(Slot::ExpertAct)?,
-            expert_down: self.view(Slot::ExpertDown)?,
-            shared_gu: self.view(Slot::SharedGu)?,
-            shared_act: self.view(Slot::SharedAct)?,
-            shared_out: self.view(Slot::SharedOut)?,
-            scratch: self.exl3_scratch()?,
-        })
-    }
-
-    fn exl3_scratch(&self) -> Result<Scratch<'_>, EngError> {
-        Ok(Scratch {
-            xh: self.view(Slot::Exl3Xh)?,
-            z: self.view(Slot::Exl3Z)?,
-            flag: self.view(Slot::Exl3Flag)?,
-        })
-    }
-
-    /// Queues the clearing of the sticky arithmetic flag of the EXL3 projections, right after
-    /// `step_begin`.
-    fn clear_exl3_flag(&self) -> Result<(), EngError> {
-        self.context
-            .exl3_flag_clear(&self.stream, self.view(Slot::Exl3Flag)?)
-    }
-
-    /// Queues the fold of the flag into the status word, after the last EXL3 projection and
-    /// before `argmax`, so the result pair carries the verdict (mask 16).
-    fn fold_exl3_flag(&self, params: DeviceRange<'_>) -> Result<(), EngError> {
-        self.context
-            .exl3_flag_fold(&self.stream, params, self.view(Slot::Exl3Flag)?)
     }
 
     /// Whether this load overrode the expert stacks to tiles (the tiled-experts hybrid): the
@@ -1939,18 +1619,6 @@ impl<'a> QwenResidentStep<'a> {
         want_logits: bool,
         want_shortlist: bool,
     ) -> Result<u32, EngError> {
-        if let Some(bank) = self.exl3_bank {
-            // The banked session's pulse: one line every 256 tokens, the cumulative hit/miss
-            // counts that explain its speed (a miss is a host-store refill).
-            self.banked_echo += 1;
-            if self.banked_echo.is_multiple_of(256) {
-                let (hits, misses) = bank.borrow().stats();
-                eprintln!(
-                    "q36 cuda: EXL3 expert bank after {} tokens: hits {hits}, misses {misses}",
-                    self.banked_echo
-                );
-            }
-        }
         let ran = self.run_token_inner(token, want_logits, want_shortlist);
         if ran.is_err() {
             self.abort_tiered_token();
@@ -1983,9 +1651,6 @@ impl<'a> QwenResidentStep<'a> {
         want_shortlist: bool,
     ) -> Result<u32, EngError> {
         check_token_id(token, self.widths.verdict)?;
-        // A window that waits for its verdict leaves the state ahead of the lineage, and a failed
-        // commit leaves the recovery gate set: a decode step through either is refused.
-        window_logic::step_gate(self)?;
         if self.tiered_mode && self.tiered.is_none() {
             return Err(EngError::BadRequest(
                 "step: a tiered step needs attach_tiered before its first token".to_owned(),
@@ -1994,12 +1659,10 @@ impl<'a> QwenResidentStep<'a> {
         // The spike instruments the plain gguf MoE arm only, so it refuses the layouts it
         // cannot record (silently partial picks would poison the measurement). The stage is
         // refused with it: it stages the same arm.
-        if (self.route_capture || self.route_stage_on)
-            && (self.layout == WeightLayout::Exl3 || self.tiered_mode)
-        {
+        if (self.route_capture || self.route_stage_on) && self.tiered_mode {
             return Err(EngError::BadRequest(
                 "step: Q36_ROUTE_CAPTURE and Q36_ROUTE_STAGE cover the plain MoE arm only, not \
-                 EXL3 or tiered"
+                 tiered"
                     .to_owned(),
             ));
         }
@@ -2096,10 +1759,6 @@ impl<'a> QwenResidentStep<'a> {
                 );
             }
             super::super::route_stage::store(step, picks);
-        }
-        if let Some(error) = exl3_pair_refusal(self.layout, pair) {
-            self.state.poison();
-            return Err(error);
         }
         if let Some(marks) = self.marks.as_mut() {
             marks.readable = true;
@@ -2297,12 +1956,7 @@ impl<'a> QwenResidentStep<'a> {
         entered: &mut usize,
         trace_step: Option<u32>,
     ) -> Result<(), EngError> {
-        // An EXL3 plan has no packs: its MoE blocks build their own ranges.
-        let bufs = if self.layout == WeightLayout::Exl3 {
-            None
-        } else {
-            Some([self.moe_buffers(0)?, self.moe_buffers(1)?])
-        };
+        let bufs = Some([self.moe_buffers(0)?, self.moe_buffers(1)?]);
         let params = self.state.word(Word::StepParams)?;
         for op in token_ops(self.res.table.len()) {
             *entered += 1;
@@ -2313,8 +1967,6 @@ impl<'a> QwenResidentStep<'a> {
                 marks.record_before(op, &self.stream)?;
             }
             self.run_op(op, admit_pos, bufs.as_ref(), params, trace_step)?;
-            #[cfg(test)]
-            self.tap_after(op, 1, false)?;
             #[cfg(feature = "research-activation")]
             if let StepOp::Moe(super::super::activation::LAYER) = op {
                 self.capture_activation(admit_pos)?;
@@ -2456,15 +2108,12 @@ impl<'a> QwenResidentStep<'a> {
         let (ctx, s) = (self.context, &self.stream);
         let packs = || {
             bufs.ok_or_else(|| {
-                EngError::BadRequest("step: the EXL3 plan holds no pack buffers".to_owned())
+                EngError::BadRequest("step: the plan holds no pack buffers".to_owned())
             })
         };
         match op {
             StepOp::Begin => {
                 ctx.step_begin(s, params)?;
-                if self.layout == WeightLayout::Exl3 {
-                    self.clear_exl3_flag()?;
-                }
                 Ok(())
             }
             StepOp::Embed => {
@@ -2492,21 +2141,6 @@ impl<'a> QwenResidentStep<'a> {
                             m: STEP_ROWS,
                         },
                     ),
-                    EmbedWeight::Bf16(table) => ctx.embed_bf16(
-                        s,
-                        EmbedBf16Call {
-                            table: table.range(0, table.bytes())?,
-                            ids,
-                            x,
-                            status,
-                            m: STEP_ROWS,
-                            n_rows: self.res.dims.shape.vocab,
-                            k: self.res.geometry.hidden,
-                        },
-                    ),
-                    EmbedWeight::Exl3(_) => Err(EngError::Checkpoint(
-                        "step weights: an EXL3 matrix is not an embedding table".to_owned(),
-                    )),
                 }
             }
             StepOp::Mixer(layer) => {
@@ -2530,60 +2164,6 @@ impl<'a> QwenResidentStep<'a> {
                     None
                 };
                 self.mixers.run_block(s, &self.state, layer, io, core_marks)
-            }
-            StepOp::Moe(layer) if self.layout == WeightLayout::Exl3 => {
-                let weights = self.exl3_moe.get(layer).ok_or_else(|| {
-                    EngError::BadRequest(format!("step: layer {layer} has no EXL3 MoE weights"))
-                })?;
-                let launch = Launch { ctx, stream: s };
-                let bufs = self.exl3_moe_buffers(layer % 2)?;
-                if let Some(step) = trace_step {
-                    self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
-                }
-                let mut bank_guard = self.exl3_bank.map(|bank| bank.borrow_mut());
-                // The overlap fact travels with the resolver: the start armed it from the
-                // environment, the block splits its launches around the copy-stream refills.
-                let overlap = bank_guard
-                    .as_ref()
-                    .is_some_and(|guard| guard.overlap_armed());
-                let mut bank = bank_guard.as_mut().map(|guard| guard.layer(layer));
-                let block = if let Some(merge) = &self.exl3_merge {
-                    run_exl3_moe_merged(
-                        &launch,
-                        (weights, &bufs, merge),
-                        &self.moe_dims,
-                        self.exl3_device_ids,
-                        bank.as_mut(),
-                        overlap,
-                    )
-                } else {
-                    run_exl3_moe(
-                        &launch,
-                        weights,
-                        &bufs,
-                        &self.moe_dims,
-                        self.exl3_device_ids,
-                        bank.as_mut(),
-                        overlap,
-                    )
-                };
-                #[cfg(test)]
-                if block.is_ok()
-                    && let Some(taps) = self.moe_pick_tap.borrow_mut().as_mut()
-                {
-                    let ids = bufs.route.ids;
-                    let mut raw = vec![0u8; self.moe_dims.top_k * size_of::<i32>()];
-                    ids.buffer().read_at(s, ids.offset(), &mut raw)?;
-                    taps.push((
-                        layer,
-                        raw.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|word| i32::from_le_bytes(*word))
-                            .collect(),
-                    ));
-                }
-                block
             }
             StepOp::Moe(layer) if self.tiered_mode => {
                 let runtime = self.tiered.as_ref().ok_or_else(|| {
@@ -2630,9 +2210,6 @@ impl<'a> QwenResidentStep<'a> {
             StepOp::FinalNorm => self.final_norm(),
             StepOp::LmHead => self.lm_head(),
             StepOp::Argmax => {
-                if self.layout == WeightLayout::Exl3 {
-                    self.fold_exl3_flag(params)?;
-                }
                 // The logits row of a traced step feeds the top-2 margin check (the near-tie
                 // question of the chunk-split diagnostic); `read_at` orders on the stream.
                 if let Some(step) = trace_step {
@@ -2661,20 +2238,6 @@ impl<'a> QwenResidentStep<'a> {
         let h = self.view(final_resid(layers))?;
         let weight = norm.range(0, norm.bytes())?;
         match self.layout {
-            // The pack is discarded; the EXL3 head reads the F32 row beside it.
-            WeightLayout::Exl3 => self.context.add_norm_pack(
-                &self.stream,
-                AddNormCall {
-                    m: STEP_ROWS,
-                    n: self.res.geometry.hidden,
-                    eps: self.res.geometry.eps,
-                    h,
-                    delta: None,
-                    weight,
-                    xf: self.view(Slot::XfFinal)?,
-                    norm_out: Some(self.view(Slot::FinalNormRow)?),
-                },
-            ),
             WeightLayout::Tiled => self.context.add_norm_pack(
                 &self.stream,
                 AddNormCall {
@@ -2696,7 +2259,7 @@ impl<'a> QwenResidentStep<'a> {
             //
             // The decode-only tiled-head hybrid: when the load overrode the head to tiles, the
             // final norm emits the tiled pack beside the f32 row (the vendored head matmul reads
-            // the pack, not the row), exactly the Exl3 producer shape.
+            // the pack, not the row), the same producer shape as the tiled layout.
             WeightLayout::Native if self.head_is_tiled() => self.context.add_norm_pack(
                 &self.stream,
                 AddNormCall {
@@ -2731,20 +2294,6 @@ impl<'a> QwenResidentStep<'a> {
         // bytes (the matvec head never reads it), and a lookup before the match is only needed
         // by the arms that use it.
         let y = self.view(Slot::Logits)?;
-        if let HeadWeight::Exl3(head) = self.globals.head {
-            let io = Exl3Io {
-                x: self.view(Slot::FinalNormRow)?,
-                xh: self.view(Slot::Exl3Xh)?,
-                z: self.view(Slot::Exl3Z)?,
-                out: y,
-                flag: self.view(Slot::Exl3Flag)?,
-                rows: STEP_ROWS,
-                fused: false,
-            };
-            return self
-                .context
-                .exl3_linear(&self.stream, head.view()?.linear_call(&io));
-        }
         match self.globals.head {
             HeadWeight::Tiled(head) => self.context.matmul(
                 &self.stream,
@@ -2766,9 +2315,6 @@ impl<'a> QwenResidentStep<'a> {
                 y,
                 STEP_ROWS,
             ),
-            HeadWeight::Bf16(_) | HeadWeight::Exl3(_) => Err(EngError::Checkpoint(
-                "step weights: the head of this load is not a quantized matrix".to_owned(),
-            )),
         }
     }
 
@@ -2990,32 +2536,8 @@ mod prefix_disk;
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
 
-use crate::family::graph_state::krow_graph;
-
-// The K-row table's capacity must equal the family's window cap: three literals
-// exist (settings, this table, rollback's alias of settings); this ties them at compile time.
-const _: () = assert!(krow_graph::MAX_ROWS == super::super::settings::QWEN36_MAX_WINDOW_ROWS);
-
-#[path = "krow_step.rs"]
-mod krow_step;
-
-#[cfg(test)]
-pub(super) use krow_graph::GraphStats;
-#[cfg(test)]
-pub(super) use krow_step::{Injection, LayerTap};
-
-#[path = "rollback_runtime.rs"]
-mod rollback_runtime;
-
-#[path = "window_gate.rs"]
-mod window_gate;
-
 #[path = "seq_part.rs"]
 pub(super) mod seq_part;
-
-#[cfg(test)]
-#[path = "window_gate_device_tests.rs"]
-mod window_gate_device_tests;
 
 #[cfg(test)]
 #[path = "prefix_quality_device_tests.rs"]

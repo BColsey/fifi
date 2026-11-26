@@ -23,8 +23,8 @@
 //! `attn_prep_rows` and `kv8_append` read `pos`, and `attn_decode_q8` reads `kv_len`. The
 //! embedding reads `token_id` only and has its own bad-id path (NaN row and status mask 4).
 
-use super::step_plan::{MAX_STEP_ROWS, Phase, Slot, writes_status};
-use crate::{EngError, family::AttentionKind};
+use super::step_plan::{Phase, Slot, writes_status};
+use crate::family::AttentionKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepOp {
@@ -59,84 +59,6 @@ pub(super) fn token_ops(layers: usize) -> Vec<StepOp> {
         StepOp::Advance,
     ]);
     ops
-}
-
-/// One launch group of a K-row verify window (`draft_verify = krow`): a launch group of the
-/// one-row step, or one of the two that replace its `Argmax`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RowsOp {
-    /// An op of the one-row list. In a K-row window its kernels take `m = K` where they are
-    /// row-independent, and the MoE and attention blocks chain K one-row launches (stage 1).
-    Step(StepOp),
-    /// `argmax_rows`: one argmax per logits row. Writes each row's own status bits into its result
-    /// pair and nothing into the shared status word, so no pair can show another row's bits.
-    ArgmaxRows,
-    /// `window_status_fold`: ORs every pair's bits and the EXL3 flag into the status word, once.
-    /// The LAST status writer of the window.
-    StatusFold,
-    /// `verify_greedy`: compares each pair's token with the next window id on the device and stores
-    /// the accepted run and the bonus token in the result table. Reads the pairs, writes no status.
-    VerifyGreedy,
-    /// `shortlist_rows`: the top-20 record of every logits row, stored contiguously after the
-    /// result table for the one read. Skipped when the one-row shortlist is switched off. Uses the
-    /// argmax partials of the K-row plan as scratch, so it runs after `ArgmaxRows`. Writes no status.
-    ShortlistRows,
-}
-
-/// The launches of one K-row verify window as DATA, the K-row twin of [`token_ops`]: the same
-/// body, then `argmax_rows`, `window_status_fold`, `verify_greedy` and `shortlist_rows` in place of
-/// `argmax`, then the advance by `rows`. `rows` is the window's K, 2 to 8; the op list does not depend on it (K is the `m` of
-/// the launches and the number of chains), so it only gates the call.
-pub(super) fn token_ops_rows(layers: usize, rows: usize) -> Result<Vec<RowsOp>, EngError> {
-    if !(2..=MAX_STEP_ROWS).contains(&rows) {
-        return Err(EngError::BadRequest(format!(
-            "step ops: a K-row window has 2 to {MAX_STEP_ROWS} rows, got {rows}"
-        )));
-    }
-    let mut ops: Vec<RowsOp> = token_ops(layers).into_iter().map(RowsOp::Step).collect();
-    // `token_ops` ends `..., Argmax, Advance`; the K-row list replaces the argmax.
-    let advance = ops.pop();
-    let argmax = ops.pop();
-    debug_assert_eq!(argmax, Some(RowsOp::Step(StepOp::Argmax)));
-    ops.extend([
-        RowsOp::ArgmaxRows,
-        RowsOp::StatusFold,
-        RowsOp::VerifyGreedy,
-        RowsOp::ShortlistRows,
-    ]);
-    ops.extend(advance);
-    Ok(ops)
-}
-
-impl RowsOp {
-    /// The phases of `step_plan.rs` the op runs through. Both K-row argmax ops run in the plan's
-    /// `Argmax` phase: the pair table and the window word live in the words block, not in the
-    /// plan, and `ArgmaxPart` is the only plan slot they use.
-    pub(super) fn phases(self, kind: AttentionKind) -> Vec<Phase> {
-        match self {
-            Self::Step(op) => op.phases(kind),
-            Self::ArgmaxRows | Self::StatusFold | Self::VerifyGreedy | Self::ShortlistRows => {
-                vec![Phase::Argmax]
-            }
-        }
-    }
-
-    /// Whether any kernel of the op writes the shared status word. `argmax_rows` writes row-local
-    /// bits into the pairs only, so it does not; neither do `verify_greedy` and `shortlist_rows`.
-    pub(super) fn writes_status(self, kind: AttentionKind) -> bool {
-        match self {
-            Self::Step(op) => op.writes_status(kind),
-            Self::ArgmaxRows | Self::VerifyGreedy | Self::ShortlistRows => false,
-            Self::StatusFold => true,
-        }
-    }
-
-    pub(super) fn layer(self) -> Option<usize> {
-        match self {
-            Self::Step(op) => op.layer(),
-            Self::ArgmaxRows | Self::StatusFold | Self::VerifyGreedy | Self::ShortlistRows => None,
-        }
-    }
 }
 
 impl StepOp {

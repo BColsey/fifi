@@ -9,50 +9,11 @@
 //! banking stays with the family that owns its settings.
 
 pub(crate) use crate::family::expert_bank::policy::LayerSlots;
-// The sentinels serve only the pick-golden tests, so the re-export stays test-gated.
-#[cfg(test)]
-pub(in crate::family) use crate::family::expert_bank::policy::{DECAY_CALLS, EMPTY, NO_SLOT};
 
 use crate::{
     EngError,
-    family::project::cuda::exl3::{Exl3Bank, Exl3MemberStaging, exl3_member_layout},
-    kernels::cuda::{
-        DeviceBuffer, DeviceEvent, DeviceStream, device_synchronize, host_register, host_unregister,
-    },
+    kernels::cuda::{DeviceBuffer, DeviceEvent, DeviceStream, device_synchronize, host_unregister},
 };
-
-/// The refusal helper of this module: every admission error names its numbers.
-fn refuse(detail: String) -> EngError {
-    EngError::MemoryPlan(format!("EXL3 expert bank: {detail}"))
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.2} GiB", bytes as f64 / (1 << 30) as f64)
-}
-
-pub(in crate::family) fn per_member_bytes(
-    routed: u64,
-    layers: usize,
-    n_expert: usize,
-) -> Result<u64, EngError> {
-    if layers == 0 || n_expert == 0 {
-        return Err(refuse("the model has no layers or no experts".into()));
-    }
-    let per_layer = routed / layers as u64;
-    if per_layer * layers as u64 != routed {
-        return Err(refuse(format!(
-            "the routed figure {} does not divide over {layers} layers",
-            gib(routed),
-        )));
-    }
-    let per_member = per_layer / n_expert as u64;
-    if per_member * n_expert as u64 != per_layer {
-        return Err(refuse(
-            "the routed figure does not divide evenly over the experts".into(),
-        ));
-    }
-    Ok(per_member)
-}
 
 /// Every routed expert of one projection of one layer, one record per member in the exact
 /// device-bank layout: member `i`'s `[trellis, scales]` bytes at `i * record`, so a slot
@@ -60,88 +21,14 @@ pub(in crate::family) fn per_member_bytes(
 pub(in crate::family) struct PartStore {
     records: Vec<u8>,
     pub(in crate::family) record: usize,
-    trellis: usize,
-    scale_stride: usize,
     pinned: bool,
-    /// Set when [`Self::pin`] runs: the load is over and refill DMAs may read
-    /// `records` concurrently, so no write may touch it again (a pinned source
-    /// must stay valid and unmodified until its copy completes).
-    sealed: bool,
 }
 
 impl PartStore {
-    pub(in crate::family) fn new(shape: [usize; 2], bits_twice: u8, members: usize) -> Self {
-        let (trellis, scale_stride) = exl3_member_layout(shape, bits_twice);
-        let record = trellis + scale_stride;
-        Self {
-            records: vec![0; record * members],
-            record,
-            trellis,
-            scale_stride,
-            pinned: false,
-            sealed: false,
-        }
-    }
-
-    /// Writes member `member`'s staged bytes as its record. The length checks are the
-    /// store's own rate guard: a member whose staged bytes disagree with the first member's
-    /// strides is refused, not mis-laid.
-    pub(in crate::family) fn put(
-        &mut self,
-        member: usize,
-        staged: &Exl3MemberStaging,
-    ) -> Result<(), EngError> {
-        if self.sealed {
-            return Err(EngError::Checkpoint(format!(
-                "EXL3 expert bank: member {member} put after the store was pinned; \
-                 a sealed store is the source of in-flight refill copies and may \
-                 not be written",
-            )));
-        }
-        if staged.trellis.len() != self.trellis || staged.scales.len() != self.scale_stride {
-            return Err(EngError::Checkpoint(format!(
-                "EXL3 expert bank: member {member} stages {} trellis and {} scale bytes, \
-                 the bank layout holds {} and {}",
-                staged.trellis.len(),
-                staged.scales.len(),
-                self.trellis,
-                self.scale_stride,
-            )));
-        }
-        let at = member * self.record;
-        self.records[at..at + self.trellis].copy_from_slice(&staged.trellis);
-        self.records[at + self.trellis..at + self.record].copy_from_slice(&staged.scales);
-        Ok(())
-    }
-
     /// Member `member`'s record bytes, the source of a miss copy.
     pub(in crate::family) fn member(&self, member: usize) -> &[u8] {
         let at = member * self.record;
         &self.records[at..at + self.record]
-    }
-
-    pub(in crate::family) fn bytes(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Page-locks the record storage, best effort: a store that fails to pin
-    /// stays pageable, and a pageable copy source is consumed at enqueue, so the
-    /// refills still work, only staged. The vector never moves after the load, so
-    /// the registered pointer stays the buffer's own. Returns whether the pin
-    /// took. Also seals the store (see [`Self::put`]); a second call is harmless
-    /// and reports the first call's outcome without re-registering.
-    pub(in crate::family) fn pin(&mut self) -> bool {
-        // The seal is set whether or not the registration takes: refills read
-        // this store either way, so the load is over the moment pin runs. A
-        // second call just reports the first outcome, never re-registering.
-        if self.sealed {
-            return self.pinned;
-        }
-        self.sealed = true;
-        if host_register(&self.records).is_ok() {
-            self.pinned = true;
-        }
-        self.pinned
     }
 }
 
@@ -165,43 +52,8 @@ pub(crate) struct ExpertStore {
 }
 
 impl ExpertStore {
-    pub(crate) fn with_layers(layers: usize) -> Self {
-        Self {
-            layers: Vec::with_capacity(layers),
-        }
-    }
-
-    /// Appends one layer's three part stores; the load fills them layer by layer.
-    pub(in crate::family) fn push_layer(&mut self, parts: [PartStore; 3]) {
-        self.layers.push(parts);
-    }
-
-    pub(crate) fn layers(&self) -> usize {
-        self.layers.len()
-    }
-
     pub(crate) fn layer(&self, layer: usize) -> &[PartStore; 3] {
         &self.layers[layer]
-    }
-
-    /// Page-locks every member's storage (see [`PartStore::pin`]); true when every
-    /// member pinned. Every part is pinned even when some registrations fail:
-    /// `Iterator::all` would short-circuit past the first failure, and the parts
-    /// it skipped would never seal, leaving them writable while refills read
-    /// them.
-    pub(crate) fn pin_all(&mut self) -> bool {
-        self.layers
-            .iter_mut()
-            .flat_map(|parts| parts.iter_mut())
-            .fold(true, |all, part| part.pin() & all)
-    }
-
-    /// The whole store's bytes, for the start line and the admission's echo.
-    pub(crate) fn host_bytes(&self) -> u64 {
-        self.layers
-            .iter()
-            .map(|parts| parts.iter().map(PartStore::bytes).sum::<usize>())
-            .sum::<usize>() as u64
     }
 }
 
@@ -210,15 +62,6 @@ impl ExpertStore {
 struct BankTarget<'w> {
     bank: &'w DeviceBuffer,
     pub(in crate::family) record: usize,
-}
-
-/// The upload target of one bank, by shared layout (a plain fn so the borrowed buffers keep
-/// the resolver's lifetime).
-fn target_of<'w>(bank: &'w Exl3Bank) -> BankTarget<'w> {
-    BankTarget {
-        bank: bank.bank_buffer(),
-        record: bank.record_bytes(),
-    }
 }
 
 /// The banked decode state: every layer's slot table with its three banks' upload targets,
@@ -237,79 +80,6 @@ pub(crate) struct Exl3SlotResolver<'w> {
 }
 
 impl<'w> Exl3SlotResolver<'w> {
-    /// Builds the resolver from one resolved [`Exl3MoeWeights`](crate::family::exl3::moe::Exl3MoeWeights)
-    /// per layer (banked: banks of `slots` members) and the matching store, so table, banks and
-    /// store agree on the layer order and the part order (gate, up, down).
-    pub(crate) fn new(
-        store: ExpertStore,
-        blocks: &[crate::family::exl3::moe::Exl3MoeWeights<'w>],
-        experts: usize,
-        sticky: usize,
-    ) -> Result<Self, EngError> {
-        if store.layers() != blocks.len() {
-            return Err(EngError::MemoryPlan(format!(
-                "EXL3 expert bank: the store holds {} layers, the step resolved {}",
-                store.layers(),
-                blocks.len()
-            )));
-        }
-        let layers = blocks
-            .iter()
-            .map(|block| {
-                let slots = block.gate.count();
-                for bank in [block.gate, block.up, block.down] {
-                    if bank.count() != slots {
-                        return Err(EngError::MemoryPlan(format!(
-                            "EXL3 expert bank: a layer's banks hold {} gate, {} up and {} down \
-                             slots",
-                            slots,
-                            block.up.count(),
-                            block.down.count()
-                        )));
-                    }
-                }
-                Ok((
-                    LayerSlots::new(experts, slots, sticky),
-                    [
-                        target_of(block.gate),
-                        target_of(block.up),
-                        target_of(block.down),
-                    ],
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            layers,
-            store,
-            hits: 0,
-            misses: 0,
-            overlap: None,
-        })
-    }
-
-    /// Arms the overlap pair of [`LayerResolver::resolve_split`]: one copy stream for miss
-    /// refills, one event to gate the launches that read them. The start of a banked session
-    /// whose environment asked for it arms this once, before the first token; a later arm
-    /// stays safe (every resolve_split sits at the readback quiescence anchor), but the
-    /// start never does it and callers should not rely on mid-session arming.
-    pub(crate) fn enable_overlap(
-        &mut self,
-        context: &crate::kernels::cuda::CudaContext,
-    ) -> Result<(), EngError> {
-        if self.overlap.is_some() {
-            return Ok(());
-        }
-        self.overlap = Some((context.stream()?, context.event()?));
-        Ok(())
-    }
-
-    /// Whether [`LayerResolver::resolve_split`] refills on the copy stream (the start armed
-    /// the pair from `Q36_CUDA_BANK_OVERLAP=1`); the MoE blocks read this to split their
-    /// launches around the refills.
-    pub(crate) fn overlap_armed(&self) -> bool {
-        self.overlap.is_some()
-    }
-
     /// Drains the overlap copy stream (see [`LayerResolver::fence_copy_stream`]); a no-op
     /// without the pair armed.
     pub(crate) fn fence_copy_stream(&mut self) {
@@ -318,27 +88,6 @@ impl<'w> Exl3SlotResolver<'w> {
         {
             eprintln!("q36 cuda: overlap fence failed: {error:?}");
         }
-    }
-
-    /// One layer's resolver view, what the MoE block hooks take.
-    pub(crate) fn layer(&mut self, layer: usize) -> LayerResolver<'_, 'w> {
-        LayerResolver {
-            resolver: self,
-            layer,
-        }
-    }
-
-    /// The slot count of every layer's bank (the prefill sub-block arithmetic).
-    pub(crate) fn slots(&self) -> usize {
-        self.layers
-            .first()
-            .map(|(slots, _)| slots.slots)
-            .unwrap_or(0)
-    }
-
-    /// The hit/miss counts of the session, for the start-line echo and the report.
-    pub(crate) fn stats(&self) -> (u64, u64) {
-        (self.hits, self.misses)
     }
 }
 
@@ -354,14 +103,6 @@ pub(crate) struct LayerResolver<'r, 'w> {
 type ResolveOutcome<'a> = Result<(Vec<usize>, Vec<usize>, Option<&'a DeviceEvent>), EngError>;
 
 impl LayerResolver<'_, '_> {
-    /// Whether this resolver's calls refill on the copy stream (the arming of the resolver
-    /// it borrows); the launch builders read this to split around the refills. Every reader
-    /// lives in test or device-harness code today, so the passthrough itself is test-gated.
-    #[cfg(test)]
-    pub(crate) fn overlap_armed(&self) -> bool {
-        self.resolver.overlap_armed()
-    }
-
     /// Drains the overlap copy stream. The error path out of a split MoE block queues no
     /// wait, so its refills keep writing with no fence; a later token's hit on a refilling
     /// slot could read torn bytes, because only the launch stream is drained at the next
@@ -544,11 +285,6 @@ pub(crate) mod trace {
         static CALLS: RefCell<Vec<(usize, Vec<u32>)>> = const { RefCell::new(Vec::new()) };
     }
 
-    pub(crate) fn arm() {
-        ARMED.store(true, Ordering::Relaxed);
-        CALLS.with(|c| c.borrow_mut().clear());
-    }
-
     pub(crate) fn armed() -> bool {
         ARMED.load(Ordering::Relaxed)
     }
@@ -559,30 +295,8 @@ pub(crate) mod trace {
                 .push((layer, picks.iter().map(|&e| e as u32).collect()));
         });
     }
-
-    /// One line per resolve call: `layer pick pick ...`.
-    pub(crate) fn dump(path: &std::path::Path) -> std::io::Result<usize> {
-        use std::io::Write;
-        let mut lines = 0;
-        CALLS.with(|c| {
-            let calls = c.borrow();
-            let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-            for (layer, picks) in calls.iter() {
-                write!(out, "{layer}")?;
-                for &e in picks {
-                    write!(out, " {e}")?;
-                }
-                writeln!(out)?;
-                lines += 1;
-            }
-            out.flush()
-        })?;
-        ARMED.store(false, Ordering::Relaxed);
-        Ok(lines)
-    }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 pub(crate) mod probe {
     //! Test-only timing of the banked readback and resolve, so a decode probe can report
@@ -606,115 +320,5 @@ pub(crate) mod probe {
             let (calls, nanos) = cell.get();
             cell.set((calls + 1, nanos + spent.as_nanos() as u64));
         });
-    }
-
-    /// The accumulated `(calls, nanos)` of each phase since the last take.
-    pub(crate) fn take() -> ((u64, u64), (u64, u64)) {
-        (
-            READBACK.with(|cell| cell.replace((0, 0))),
-            RESOLVE.with(|cell| cell.replace((0, 0))),
-        )
-    }
-}
-
-#[cfg(test)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_store_lays_members_as_contiguous_records() {
-        let shape = [64usize, 32];
-        let (stride, scale_stride) = exl3_member_layout(shape, 8);
-        let mut store = PartStore::new(shape, 8, 4);
-        let member = |trellis_byte: u8| Exl3MemberStaging {
-            trellis: vec![trellis_byte; stride],
-            scales: vec![trellis_byte + 1; scale_stride],
-        };
-        for i in 0..4u8 {
-            store.put(i as usize, &member(i)).unwrap();
-        }
-        for i in 0..4u8 {
-            let record = store.member(i as usize);
-            // One contiguous record per member: its trellis then its scales, adjacent.
-            assert_eq!(record.len(), stride + scale_stride);
-            assert!(record[..stride].iter().all(|&byte| byte == i));
-            assert!(record[stride..].iter().all(|&byte| byte == i + 1));
-        }
-        // A member staged at another rate is refused, not mis-laid.
-        let error = format!(
-            "{:?}",
-            store
-                .put(
-                    2,
-                    &Exl3MemberStaging {
-                        trellis: vec![0; stride - 1],
-                        scales: vec![0; scale_stride],
-                    },
-                )
-                .unwrap_err()
-        );
-        assert!(error.contains("member 2"), "{error}");
-    }
-
-    #[test]
-    fn pin_seals_the_store_against_writes() {
-        let shape = [64usize, 32];
-        let (stride, scale_stride) = exl3_member_layout(shape, 8);
-        let staged = Exl3MemberStaging {
-            trellis: vec![7u8; stride],
-            scales: vec![8u8; scale_stride],
-        };
-        // An unsealed store accepts writes.
-        let mut fresh = PartStore::new(shape, 8, 2);
-        fresh
-            .put(0, &staged)
-            .expect("an unsealed store accepts writes");
-        // pin() seals whether or not the registration takes (a machine with no
-        // visible device refuses the register; the seal must hold regardless).
-        let _pinned = fresh.pin();
-        let refusal = format!(
-            "{:?}",
-            fresh
-                .put(1, &staged)
-                .expect_err("a pinned store refuses writes")
-        );
-        assert!(refusal.contains("member 1"), "{refusal}");
-        assert!(refusal.contains("sealed"), "{refusal}");
-        // The refused write left member 1 zeroed, and the record written before
-        // the seal is untouched: its trellis half and scale half separately,
-        // as member() returns one whole record.
-        assert!(fresh.member(1).iter().all(|&byte| byte == 0));
-        let record = fresh.member(0);
-        assert!(record[..stride].iter().all(|&byte| byte == 7));
-        assert!(record[stride..].iter().all(|&byte| byte == 8));
-        // A second pin() is harmless: same answer, no re-registration.
-        assert_eq!(fresh.pin(), fresh.pin());
-    }
-
-    #[test]
-    fn pin_all_seals_every_part_even_when_registrations_fail() {
-        let shape = [64usize, 32];
-        let (stride, scale_stride) = exl3_member_layout(shape, 8);
-        let staged = Exl3MemberStaging {
-            trellis: vec![7u8; stride],
-            scales: vec![8u8; scale_stride],
-        };
-        let part = || PartStore::new(shape, 8, 2);
-        let mut store = ExpertStore::with_layers(1);
-        store.push_layer([part(), part(), part()]);
-        // On a host with no visible device every registration fails; on a GPU
-        // host they all succeed. Either way, every part must seal: Iterator::all
-        // short-circuits past the first failure and left the rest writable.
-        let _ = store.pin_all();
-        let last = 2;
-        let refusal = format!(
-            "{:?}",
-            store.layers[0][last]
-                .put(1, &staged)
-                .expect_err("pin_all seals every part, the last included")
-        );
-        assert!(refusal.contains("member 1"), "{refusal}");
-        assert!(refusal.contains("sealed"), "{refusal}");
     }
 }

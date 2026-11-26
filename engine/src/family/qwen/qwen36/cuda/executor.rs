@@ -208,14 +208,8 @@ impl ExecutorOps for QwenResidentStep<'_> {
             context_limit: self.context_limit(),
         };
         self.log_prefill_job();
-        let Some(mut speculator) = self.speculator.take() else {
-            let batch = st.decode(self, generation, &limits);
-            self.mark_free_vram("a decode batch");
-            return batch;
-        };
-        let batch = speculator.decode(st, self, generation, &limits);
-        self.speculator = Some(speculator);
-        self.mark_free_vram("a speculative decode batch");
+        let batch = st.decode(self, generation, &limits);
+        self.mark_free_vram("a decode batch");
         batch
     }
 
@@ -245,13 +239,8 @@ impl ExecutorOps for QwenResidentStep<'_> {
         self.drain_disk();
     }
 
-    /// No transient routing or draft state exists: the step keeps nothing between turns. A
-    /// speculative step reports its counters.
-    fn boundary(&mut self, _st: &mut DecodeSession) {
-        if let Some(speculator) = self.speculator.as_ref().filter(|s| s.stats.used()) {
-            eprintln!("q36 cuda: {}", speculator.stats.line());
-        }
-    }
+    /// No transient routing or draft state exists: the step keeps nothing between turns.
+    fn boundary(&mut self, _st: &mut DecodeSession) {}
 
     /// Pinned CUDA stages Block and Tip entries; the admitted limits determine how many entries
     /// remain. The caller supplies `kind`, and the session rules validate the save point.

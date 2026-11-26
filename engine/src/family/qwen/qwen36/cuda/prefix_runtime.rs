@@ -12,7 +12,6 @@ use crate::family::{executor::ExecutorOps, graph_state::book::Health};
 use crate::{
     EngError,
     family::mem::HostFacts,
-    family::qwen::qwen36::window_logic,
     family::session::{
         DecodeSession, PrefixIdentity, PrefixSlot, SaveKind, StoreLimits, shadow_block_lcp_enabled,
     },
@@ -278,7 +277,6 @@ impl QwenResidentStep<'_> {
         kind: SaveKind,
         path: (super::super::prefix::CudaPrefillPath, PrefixIdentity),
     ) -> Result<bool, EngError> {
-        self.state_usable()?;
         let fed = self.tokens();
         let frozen = session.prepare_prefix_save(key, fed)?;
         self.complete_prefix_save()?;
@@ -310,7 +308,6 @@ impl QwenResidentStep<'_> {
             Err(error) => return Err(error),
         };
         // The tip copies the live state: refused through a gated state or an awaiting window.
-        self.state_usable()?;
         if let Some(device) = self.device_tip.as_mut() {
             let key = device.capture(self.context, &self.stream, &mut self.state)?;
             state.attach_device_tip(key)?;
@@ -325,8 +322,12 @@ impl QwenResidentStep<'_> {
         Ok(true)
     }
 
+    /// Drops a pending pinned-prefix save without finishing it.
+    pub(crate) fn drop_pending_prefix(&mut self) {
+        self.pending_prefix = None;
+    }
+
     pub(crate) fn complete_prefix_save(&mut self) -> Result<(), EngError> {
-        self.state_usable()?;
         let Some(pending) = self.pending_prefix.take() else {
             return Ok(());
         };
@@ -370,9 +371,6 @@ impl QwenResidentStep<'_> {
     }
 
     pub(crate) fn restore_pinned_prefix(&mut self, saved: &PinnedSnapshot) -> Result<(), EngError> {
-        // Refused, before the first fallible call, while the recovery gate is set or a window is
-        // unresolved: only a reset recovers it (DESIGN 17.10).
-        window_logic::restore_gate(self)?;
         self.complete_prefix_save()?;
         let device = self
             .prefix_pins

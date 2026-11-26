@@ -48,5 +48,4 @@ pub(in crate::kernels::cuda) mod mmq_facts;
 pub(in crate::kernels::cuda) mod mmq_mmid;
 pub(in crate::kernels::cuda) mod mmq_quant;
 pub(in crate::kernels::cuda) mod row_ops;
-pub(in crate::kernels::cuda) mod scatter_cols;
 pub(in crate::kernels::cuda) mod swiglu_rows;

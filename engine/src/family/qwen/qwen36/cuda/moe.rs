@@ -938,12 +938,10 @@ impl MoeLayerWeights<'_> {
             rows: match w {
                 DenseWeight::Tiled(t) => t.n_rows(),
                 DenseWeight::Native(n) => n.n_rows(),
-                DenseWeight::Exl3(weight) => weight.shape[1],
             },
             k: match w {
                 DenseWeight::Tiled(t) => t.k(),
                 DenseWeight::Native(n) => n.k(),
-                DenseWeight::Exl3(weight) => weight.shape[0],
             },
         };
         WeightFacts {
@@ -1018,9 +1016,6 @@ fn native_stack(weight: &NativeWeight) -> Result<DeviceRange<'_>, EngError> {
 fn shared_tiled<'w>(w: &DenseWeight<'w>) -> Result<&'w TiledWeight, EngError> {
     match w {
         DenseWeight::Tiled(weight) => Ok(weight),
-        DenseWeight::Exl3(_) => Err(refuse(
-            "EXL3 needs its F32 projection, not tiled matmul".into(),
-        )),
         DenseWeight::Native(_) => Err(refuse(
             "the shared projection is loaded native; the tiled matmul reads tiles".to_owned(),
         )),
@@ -1031,9 +1026,6 @@ fn shared_tiled<'w>(w: &DenseWeight<'w>) -> Result<&'w TiledWeight, EngError> {
 fn shared_native<'w>(w: &DenseWeight<'w>) -> Result<&'w NativeWeight, EngError> {
     match w {
         DenseWeight::Native(weight) => Ok(weight),
-        DenseWeight::Exl3(_) => Err(refuse(
-            "EXL3 needs its F32 projection, not native matvec".into(),
-        )),
         DenseWeight::Tiled(_) => Err(refuse(
             "the shared projection is loaded tiled; the native matvec reads blocks".to_owned(),
         )),

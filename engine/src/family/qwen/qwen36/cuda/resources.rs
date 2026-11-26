@@ -17,7 +17,7 @@ use super::{
     paging_plan::PagingPlan,
     paging_store::device_first::DeviceCachePlan,
     state::PagedStatePlan,
-    step_plan::{KernelScratch, MAX_STEP_ROWS, StepPlan},
+    step_plan::{KernelScratch, StepPlan},
     tiered_step::LayerParts,
 };
 use crate::family::decode_step::mixer_geometry::{MixerGeometry, check_native_dense};
@@ -30,7 +30,7 @@ use crate::{
     family::spec::AttentionKind,
     family::{
         gguf_model::{Inventory, Role},
-        project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Weight},
+        project::cuda::{CudaWeight, CudaWeights, WeightLayout},
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceBuffer, NativeWeight, TiledWeight,
@@ -386,15 +386,6 @@ pub(super) struct PagedResources {
     pub(super) options: StepOptions,
 }
 
-/// The activation arena of the K-row verify window (`qwen36.draft_verify = krow`): the plan of a
-/// window of the longest length, over its own arena. A window of `k` rows uses the first `k` rows
-/// of every slot (all slots are row-major), so one plan serves every window length. The one-row
-/// plan and arena are not touched.
-pub(super) struct KrowResources {
-    pub(super) plan: StepPlan,
-    pub(super) arena: DeviceArena,
-}
-
 /// Everything a session builds once and the step borrows.
 pub(super) struct StepResources {
     pub(super) dims: StepDims,
@@ -407,36 +398,9 @@ pub(super) struct StepResources {
     /// The query-aware sparse decode resources, present only when the env flag armed them,
     /// the KV mode is the q8 resident path, and VRAM admission passed (R3, fail-open).
     pub(super) sparse: Option<SparseExec>,
-    /// The K-row arena, present only when [`Self::with_krow`] built it.
-    pub(super) krow: Option<KrowResources>,
 }
 
 impl StepResources {
-    /// Adds the arena of the K-row verify window. Refused for the paged and the sparse
-    /// resources, which have no K-row body. Allocation happens here, before the first token.
-    pub(super) fn with_krow(
-        mut self,
-        context: &CudaContext,
-        options: &StepOptions,
-    ) -> Result<Self, EngError> {
-        if self.paged.is_some() || self.sparse.is_some() {
-            return Err(EngError::BadRequest(
-                "step resources: the K-row window needs the resident KV without the sparse chain"
-                    .to_owned(),
-            ));
-        }
-        let scratch = KernelScratch::for_verify(&self.dims, MAX_STEP_ROWS, options.kv_mode)?;
-        let plan = StepPlan::new_verify(&self.dims, MAX_STEP_ROWS, options, &scratch)?;
-        let arena = context.arena(&plan.arena_tensors())?;
-        self.krow = Some(KrowResources { plan, arena });
-        Ok(self)
-    }
-
-    /// Device bytes of the K-row arena: zero when there is none.
-    pub(super) fn krow_arena_bytes(&self) -> usize {
-        self.krow.as_ref().map_or(0, |krow| krow.arena.bytes())
-    }
-
     /// Allocation happens here and never inside a token.
     pub(super) fn new(
         context: &CudaContext,
@@ -461,7 +425,6 @@ impl StepResources {
             names,
             paged: None,
             sparse,
-            krow: None,
         })
     }
 
@@ -485,7 +448,6 @@ impl StepResources {
                 options: planned.options,
             }),
             sparse: None,
-            krow: None,
         })
     }
 }
@@ -611,15 +573,16 @@ fn stack_of<'w>(
                 experts: want.experts,
             }))
         }
-        (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _)
-        | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
-            "moe weights: {name} needs EXL3 per-expert dispatch"
-        ))),
         // (Tiled, Native) never reaches here: the first arm already accepted it (the hybrid
         // seam serves Tiled expert stacks in a Native session).
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("moe weights: {name} is loaded in the other layout than the session"),
         )),
+        (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _) => {
+            Err(EngError::Checkpoint(format!(
+                "moe weights: {name} is an EXL3 stack; the GGUF step serves GGUF blocks"
+            )))
+        }
         (Some(CudaWeight::Raw { .. }), _) | (None, _) => Err(EngError::Checkpoint(format!(
             "moe weights: {name} is not a quantized stack"
         ))),
@@ -690,8 +653,6 @@ pub(super) fn moe_layer_parts<'w>(
 pub(super) enum GlobalWeight<'w> {
     Tiled(&'w TiledWeight),
     Native(&'w NativeWeight),
-    Bf16(&'w DeviceBuffer),
-    Exl3(&'w Exl3Weight),
 }
 
 pub(super) type EmbedWeight<'w> = GlobalWeight<'w>;
@@ -705,10 +666,6 @@ impl GlobalWeight<'_> {
                 "step weights: the global tensor is loaded native; the tiled gather reads tiles"
                     .to_owned(),
             )),
-            Self::Bf16(_) | Self::Exl3(_) => Err(EngError::Checkpoint(
-                "step weights: the global tensor is loaded EXL3; the tiled gather reads tiles"
-                    .to_owned(),
-            )),
         }
     }
 
@@ -719,33 +676,7 @@ impl GlobalWeight<'_> {
                 "step weights: the global tensor is loaded tiled; the native gather reads blocks"
                     .to_owned(),
             )),
-            Self::Bf16(_) | Self::Exl3(_) => Err(EngError::Checkpoint(
-                "step weights: the global tensor is loaded EXL3; the native gather reads blocks"
-                    .to_owned(),
-            )),
         }
-    }
-}
-
-fn exl3_global<'w>(
-    weights: &'w CudaWeights,
-    name: &str,
-    spec: &DenseSpec,
-) -> Result<GlobalWeight<'w>, EngError> {
-    match (weights.get(name), spec.role) {
-        (Some(CudaWeight::Exl3 { weight, .. }), Role::Output) => {
-            check_dense(name, (weight.shape[1], weight.shape[0], None), spec)?;
-            Ok(GlobalWeight::Exl3(weight))
-        }
-        (Some(CudaWeight::Raw { ty, buffer, .. }), Role::TokenEmbd)
-            if *ty == GgufType::Bf16 && buffer.bytes() == spec.rows * spec.k * 2 =>
-        {
-            Ok(GlobalWeight::Bf16(buffer))
-        }
-        _ => Err(EngError::Checkpoint(format!(
-            "step weights: {name} is not the EXL3 {:?} tensor of {} rows of {}",
-            spec.role, spec.rows, spec.k
-        ))),
     }
 }
 
@@ -764,7 +695,6 @@ impl<'w> GlobalWeights<'w> {
     ) -> Result<Self, EngError> {
         let global = |name: &str, spec: &DenseSpec| -> Result<GlobalWeight<'w>, EngError> {
             match layout {
-                WeightLayout::Exl3 => exl3_global(weights, name, spec),
                 WeightLayout::Tiled => Ok(GlobalWeight::Tiled(dense(weights, name, spec)?)),
                 WeightLayout::Native => match weights.get(name) {
                     Some(CudaWeight::Native { weight, .. }) => {

@@ -420,45 +420,6 @@ fn the_gate_refuses_without_an_arena() {
     );
 }
 
-/// An EXL3 session takes the chunk gate like a Native one: it needs an admitted arena, and the
-/// same KV rule and refusals apply.
-#[test]
-fn an_exl3_session_takes_the_chunk_gate_of_a_native_one() {
-    let exl3 = || ChunkFacts {
-        layout: WeightLayout::Exl3,
-        kv_mode: KvMode::Fp16,
-        kv8_chunked_prefill: false,
-        tiered: false,
-        m_sess_cap: 2048,
-        arena: None,
-    };
-    assert_eq!(chunk_verdict(&exl3()), ChunkVerdict::NoArena);
-    assert_eq!(
-        chunk_verdict(&ChunkFacts {
-            arena: Some(1024),
-            ..exl3()
-        }),
-        ChunkVerdict::Ready { m_sess: 1024 }
-    );
-    assert_eq!(
-        chunk_verdict(&ChunkFacts {
-            kv_mode: KvMode::Int8G32,
-            arena: Some(1024),
-            ..exl3()
-        }),
-        ChunkVerdict::Kv8,
-        "Int8G32 needs the opt-in for an EXL3 pack too"
-    );
-    assert_eq!(
-        chunk_verdict(&ChunkFacts {
-            layout: WeightLayout::Tiled,
-            arena: Some(1024),
-            ..exl3()
-        }),
-        ChunkVerdict::TiledLayout
-    );
-}
-
 /// Only an otherwise-ready session plans an arena — one false row per condition of the pre-arena
 /// half.
 #[test]
@@ -469,7 +430,6 @@ fn only_an_otherwise_ready_session_plans_an_arena() {
         false,
         false,
     ));
-    assert!(needs_arena(WeightLayout::Exl3, KvMode::Fp16, false, false,));
     assert!(!needs_arena(
         WeightLayout::Tiled,
         KvMode::Fp16,
@@ -478,12 +438,6 @@ fn only_an_otherwise_ready_session_plans_an_arena() {
     ));
     assert!(!needs_arena(
         WeightLayout::Native,
-        KvMode::Int8G32,
-        false,
-        false,
-    ));
-    assert!(!needs_arena(
-        WeightLayout::Exl3,
         KvMode::Int8G32,
         false,
         false,
@@ -500,12 +454,6 @@ fn only_an_otherwise_ready_session_plans_an_arena() {
 fn kv8_opt_in_plans_an_arena_without_bypassing_layout_or_weight_guards() {
     assert!(needs_arena(
         WeightLayout::Native,
-        KvMode::Int8G32,
-        false,
-        true,
-    ));
-    assert!(needs_arena(
-        WeightLayout::Exl3,
         KvMode::Int8G32,
         false,
         true,

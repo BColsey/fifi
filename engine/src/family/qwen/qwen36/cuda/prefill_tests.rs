@@ -156,15 +156,12 @@ fn prefill_views_cover_every_slot_once() {
 
 #[test]
 fn zero_row_is_admitted_only_for_card_views() {
-    use super::prefill_plan::{ChunkSlot, EXL3_SLOTS};
+    use super::prefill_plan::ChunkSlot;
     // A single-device list carrying Zero is refused even when otherwise valid.
     let mut native = ALL_SLOTS.to_vec();
     native.push(ChunkSlot::Zero);
     assert!(check_view_list(native.len(), &native, false).is_err());
     assert!(check_view_list(native.len(), &native, true).is_ok());
-    let mut exl3 = EXL3_SLOTS.to_vec();
-    exl3.push(ChunkSlot::Zero);
-    assert!(check_view_list(exl3.len(), &exl3, true).is_err());
 }
 
 /// One row per guard of `ChunkRows::new`, each with the others satisfied, plus the accepting edges.
@@ -195,36 +192,6 @@ fn chunk_rows_refuse_each_bound() {
         matches!(&error, EngError::ContextLimit(text) if text.contains("prefill chunk: rows")),
         "{error:?} is not the ContextLimit refusal"
     );
-}
-
-/// The EXL3 list is accepted by its own slot set and by no other: a missing slot is refused, and
-/// so is a slot of the other set in either list.
-#[test]
-fn view_list_checks_the_exl3_slot_set() {
-    use super::prefill_plan::{ChunkSlot, EXL3_SLOTS};
-    let slots = EXL3_SLOTS.to_vec();
-    let text = |arena_len: usize, slots: &[ChunkSlot]| {
-        let EngError::BadRequest(text) =
-            check_view_list(arena_len, slots, false).expect_err("refused")
-        else {
-            panic!("not a BadRequest");
-        };
-        text
-    };
-    assert!(check_view_list(slots.len(), &slots, false).is_ok());
-    let short: Vec<_> = slots
-        .iter()
-        .copied()
-        .filter(|s| *s != ChunkSlot::ExpertPerm)
-        .collect();
-    assert!(text(short.len(), &short).contains("ExpertPerm is missing"));
-    let mut foreign = slots.clone();
-    foreign.push(ChunkSlot::Q8X);
-    assert!(text(foreign.len(), &foreign).contains("Q8X does not belong"));
-    // A GGUF list that carries an EXL3 scratch slot.
-    let mut native = ALL_SLOTS.to_vec();
-    native.push(ChunkSlot::Exl3Y);
-    assert!(text(native.len(), &native).contains("Exl3Y does not belong"));
 }
 
 /// One row per guard of the view checks, each with every earlier guard satisfied; then
@@ -1221,34 +1188,9 @@ fn prefill_stages_pass_the_prefill_word() {
     }
     let route = body("fn run_chunk_route(");
     assert_eq!(count(&route, "status:io.status"), 1, "the router word");
-    // The embedding takes the resolved word by shorthand, once in each gather: the Q4_K table of a
-    // Native load and the BF16 table of an EXL3 pack.
+    // The embedding takes the resolved word by shorthand, once, in the Q4_K gather.
     let embed = body("fn chunk_embed(");
-    assert_eq!(count(&embed, "status,"), 2, "the embedding");
-}
-
-/// The shared projection rows of the model satisfy the column scatter's multiples of four, and a
-/// width, offset or stride that does not is refused at admission, not in the middle of a chunk.
-/// Mutation: dropping the stride term of the check, or checking only the widths, fails one of the
-/// three refusals.
-#[test]
-fn the_exl3_column_layout_is_checked_for_the_column_scatter() {
-    use super::prefill::check_exl3_columns;
-    use crate::family::decode_step::mixer_geometry::MixerGeometry;
-    let geometry = MixerGeometry::new(&common_tests::dims()).expect("geometry");
-    assert!(check_exl3_columns(&geometry).is_ok());
-    let refused = |edit: &dyn Fn(&mut MixerGeometry), what: &str| {
-        let mut bent = geometry;
-        edit(&mut bent);
-        let error = check_exl3_columns(&bent).expect_err("refused");
-        assert!(
-            matches!(&error, EngError::BadRequest(text) if text.contains("prefill chunk: columns")),
-            "{what}: {error:?}"
-        );
-    };
-    refused(&|g| g.delta.z_rows += 2, "a width");
-    refused(&|g| g.delta.z_off += 1, "an offset");
-    refused(&|g| g.attn.ld += 2, "a stride");
+    assert_eq!(count(&embed, "status,"), 1, "the embedding");
 }
 
 /// The tiered miss spread must never land a miss on a slot its own row already holds a

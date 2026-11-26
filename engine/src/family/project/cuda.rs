@@ -70,7 +70,6 @@ pub(crate) enum WeightLayout {
     Tiled,
     /// Read by the resident step through [`CudaWeights::layout`].
     Native,
-    Exl3,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -264,7 +263,11 @@ impl CudaWeights {
         };
         let names: Vec<_> = loaded.weights.iter().map(CudaWeight::name).collect();
         loaded.index = load_index(&names)?;
-        if loaded.layout()? != WeightLayout::Exl3 {
+        if !loaded
+            .weights
+            .iter()
+            .any(|weight| weight.kind() == TensorKind::Exl3)
+        {
             return Err(EngError::Checkpoint(
                 "EXL3 load has no EXL3 matrices".into(),
             ));
@@ -349,7 +352,11 @@ pub(crate) fn load_layout<'a>(
             TensorKind::Tiled => WeightLayout::Tiled,
             TensorKind::Native => WeightLayout::Native,
             TensorKind::Raw => continue,
-            TensorKind::Exl3 => WeightLayout::Exl3,
+            TensorKind::Exl3 => {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {name} is an EXL3 matrix: the resident GGUF step has no layout for it"
+                )));
+            }
         };
         let earlier = layout.replace(this);
         if earlier.is_some_and(|earlier| earlier != this) {
@@ -844,9 +851,6 @@ impl CudaProjector {
                     weight,
                 })
             }
-            WeightLayout::Exl3 => Err(EngError::Checkpoint(format!(
-                "tensor {name}: GGUF blocks cannot be uploaded as EXL3"
-            ))),
         }
     }
 }
@@ -1079,11 +1083,6 @@ fn planned<'w>(
     let bytes = match layout {
         WeightLayout::Tiled => plan::device_bytes(name, tensor.ggml_type(), tensor.dims())?,
         WeightLayout::Native => plan::native_device_bytes(name, tensor.ggml_type(), tensor.dims())?,
-        WeightLayout::Exl3 => {
-            return Err(EngError::Checkpoint(format!(
-                "tensor {name}: EXL3 admission requires its stored components"
-            )));
-        }
     };
     if layout == WeightLayout::Tiled
         && let &[_, out, _] = tensor.dims()
@@ -1289,11 +1288,6 @@ fn load_inner(
     host_expert_bytes: u64,
 ) -> Result<CudaWeights, EngError> {
     knobs.context.ensure_usable()?;
-    if options.layout == WeightLayout::Exl3 {
-        return Err(EngError::Checkpoint(
-            "EXL3 weights require selected EXL3 components, not GGUF blocks".into(),
-        ));
-    }
     load_index(names)?; // the duplicate-name refusal still covers the whole request
     let layout = options.layout;
     // The tiled-head hybrid (`INFERENCE_CUDA_TILED_HEAD`): tensor names that upload in the
@@ -1801,9 +1795,6 @@ fn upload_quant(
                 weight,
             })
         }
-        WeightLayout::Exl3 => Err(EngError::Checkpoint(format!(
-            "tensor {name}: GGUF blocks cannot be uploaded as EXL3"
-        ))),
     }
 }
 

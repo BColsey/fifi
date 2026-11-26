@@ -19,9 +19,7 @@
 //! pack). Every non-pack slot is shared but `NormRow`, which the NATIVE plan holds live across the
 //! whole step because the fused `add_rmsnorm_q8` always writes the f32 normalized row (the MIXER
 //! PROLOGUE writes it as scratch beside Q8Mix; the final norm writes its own FinalNormRow instead).
-//! The Native plan exists at one row only (`check_layout_rows`). So does the EXL3 plan of
-//! [`StepPlan::new`]; the K-row verify window of `qwen36.draft_verify = krow` has its own explicit
-//! constructor, [`StepPlan::new_verify`], so that the default path cannot drift into several rows.
+//! The Native plan exists at one row only (`check_layout_rows`).
 //!
 //! # Rows
 //!
@@ -136,19 +134,6 @@ impl KernelScratch {
         Self::new(dims, rows, router, kv_mode)
     }
 
-    /// The scratch of a K-row verify window: every size of [`Self::for_dims`] at `rows` rows, and
-    /// one `argmax_part` set per row (the per-row argmax of `argmax_rows` reduces each logits row
-    /// into its own partials).
-    pub(crate) fn for_verify(
-        dims: &StepDims,
-        rows: usize,
-        kv_mode: KvMode,
-    ) -> Result<Self, EngError> {
-        let mut scratch = Self::for_dims(dims, rows, kv_mode)?;
-        scratch.argmax_part = product(&[rows, ARGMAX_PART_BYTES])?;
-        Ok(scratch)
-    }
-
     pub(crate) fn new(
         dims: &StepDims,
         rows: usize,
@@ -216,9 +201,6 @@ pub(crate) enum Slot {
     XfMix,
     /// The padded q8_1 row feeding the Native mixer in-projections (`k` = hidden).
     Q8Mix,
-    Exl3Xh,
-    Exl3Z,
-    Exl3Flag,
     /// f32 `[rows][delta_proj]`: qkv, z, beta, alpha side by side.
     DeltaProj,
     DeltaConv,
@@ -263,11 +245,7 @@ pub(crate) enum Slot {
     /// The padded q8_1 rows of the eight expert slots (`k` = inter).
     Q8Down,
     ExpertDown,
-    /// f32 `[top_k][inter]`: the SwiGLU of the routed experts, the EXL3 down projections' input.
-    ExpertAct,
     SharedGu,
-    /// f32 `[shared_inter]`: the SwiGLU of the shared expert (EXL3 plans only).
-    SharedAct,
     XfShared,
     /// The padded q8_1 row of the shared expert (`k` = shared inter).
     Q8Shared,
@@ -471,83 +449,6 @@ impl StepPlan {
         Self::from_slots(rows, slots)
     }
 
-    /// The plan of a K-row verify window (`draft_verify = krow`) over the EXL3 layout: `rows` in
-    /// 2 to [`MAX_STEP_ROWS`]. [`Self::new`] keeps refusing several rows for this layout. Refused:
-    /// another layout, forked experts, and a scratch that was not sized for the window
-    /// ([`KernelScratch::for_verify`]: one `argmax_part` set per row). Host planning only: the
-    /// sizes follow the K-row design (dense and head launches take K rows, the routed experts and
-    /// the attention chain K one-row launches); the device checks them when the K-row step exists.
-    pub(crate) fn new_verify(
-        dims: &StepDims,
-        rows: usize,
-        options: &StepOptions,
-        scratch: &KernelScratch,
-    ) -> Result<Self, EngError> {
-        if options.layout != WeightLayout::Exl3 {
-            return Err(EngError::BadRequest(
-                "step plan: a K-row verify plan needs the EXL3 layout".to_owned(),
-            ));
-        }
-        if !(2..=MAX_STEP_ROWS).contains(&rows) {
-            return Err(EngError::BadRequest(format!(
-                "step plan: a K-row verify plan has 2 to {MAX_STEP_ROWS} rows, got {rows}"
-            )));
-        }
-        if options.forked_experts {
-            return Err(EngError::BadRequest(
-                "step plan: the EXL3 layout takes the single merged expert down pack".to_owned(),
-            ));
-        }
-        let want_argmax = product(&[rows, ARGMAX_PART_BYTES])?;
-        if scratch.argmax_part < want_argmax {
-            return Err(EngError::BadRequest(format!(
-                "step plan: the kernel scratch holds {} argmax bytes, a {rows}-row window needs \
-                 {want_argmax} (one set per row)",
-                scratch.argmax_part
-            )));
-        }
-        scratch.check(dims, rows, options.kv_mode)?;
-        let slots = list_slots(dims, rows, options, scratch)?;
-        Self::from_slots(rows, slots)
-    }
-
-    /// Explicit EXL3 mixer-only arena; the MoE and serving step are not admitted by this plan.
-    pub(super) fn exl3_mixers(
-        dims: &StepDims,
-        options: &StepOptions,
-        scratch: &KernelScratch,
-    ) -> Result<Self, EngError> {
-        if options.layout != WeightLayout::Exl3 {
-            return Err(EngError::BadRequest(
-                "EXL3 mixer plan needs EXL3 weights".into(),
-            ));
-        }
-        scratch.check(dims, 1, options.kv_mode)?;
-        let mut list = SlotList {
-            rows: 1,
-            slots: Vec::new(),
-        };
-        list_mixers(&mut list, dims, options, scratch)?;
-        list.add(
-            Slot::NormRow,
-            list.row(dims.shape.hidden),
-            MIX_PACK,
-            ADD_NORM,
-        )?;
-        // The fused norm still emits its tiled pack, which the EXL3 projections never read.
-        list.add(Slot::XfMoe, list.xf(dims.shape.hidden), ADD_NORM, ADD_NORM)?;
-        let g = crate::family::decode_step::mixer_geometry::MixerGeometry::new(dims)?;
-        let specs = g
-            .dense_specs(WeightLayout::Exl3, crate::family::AttentionKind::DeltaNet)?
-            .into_iter()
-            .chain(g.dense_specs(WeightLayout::Exl3, crate::family::AttentionKind::Full)?);
-        let (k, n) = specs.fold((0, 0), |(k, n), s| (k.max(s.k), n.max(s.rows)));
-        list.add(Slot::Exl3Xh, list.row(k), DELTA_IN, ATTN_OUT)?;
-        list.add(Slot::Exl3Z, list.row(n), DELTA_IN, ATTN_OUT)?;
-        list.add(Slot::Exl3Flag, Ok(4), MIX_PACK, ATTN_OUT)?;
-        Self::from_slots(1, list.slots)
-    }
-
     /// Paged attention owns its bounded partials outside the activation arena.
     pub(crate) fn new_paged(
         dims: &StepDims,
@@ -722,12 +623,8 @@ impl SlotList {
 /// row, `check_stage1_options`); the plan refuses them on its own so no caller can build a
 /// half-tiled plan.
 fn check_layout_rows(rows: usize, options: &StepOptions) -> Result<(), EngError> {
-    let single_row = matches!(options.layout, WeightLayout::Native | WeightLayout::Exl3);
-    // The GGUF Native refusals keep their original wording.
-    let name = match options.layout {
-        WeightLayout::Exl3 => "EXL3",
-        _ => "native",
-    };
+    let single_row = options.layout == WeightLayout::Native;
+    let name = "native";
     if single_row && rows != 1 {
         return Err(EngError::BadRequest(format!(
             "step plan: the {name} layout takes one row, got {rows}"
@@ -776,13 +673,6 @@ fn list_slots(
             // plan cannot know the head's kind.
             list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?;
         }
-        WeightLayout::Exl3 => {
-            // The fused norm still emits its tiled pack, which the EXL3 head never reads; the
-            // head reads the F32 row the producer writes beside it.
-            list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, FINAL_NORM)?;
-            list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, LM_HEAD)?;
-            list_exl3_scratch(&mut list, dims)?;
-        }
     }
     list.add(Slot::Logits, list.row(dims.shape.vocab), LM_HEAD, ARGMAX)?;
     list.add(Slot::ArgmaxPart, Ok(scratch.argmax_part), ARGMAX, ARGMAX)?;
@@ -802,7 +692,6 @@ fn list_mixers(
     match options.layout {
         WeightLayout::Tiled => list.add(Slot::XfMix, list.xf(h), MIX_PACK, ATTN_IN)?,
         WeightLayout::Native => list.add(Slot::Q8Mix, list.q8(h, 1), MIX_PACK, ATTN_IN)?,
-        WeightLayout::Exl3 => list.add(Slot::XfMix, list.xf(h), MIX_PACK, MIX_PACK)?,
     }
     list.add(
         Slot::DeltaProj,
@@ -820,11 +709,7 @@ fn list_mixers(
         Slot::DeltaCore,
         list.row(value_width),
         DELTA_RULE,
-        if options.layout == WeightLayout::Exl3 {
-            DELTA_OUT
-        } else {
-            DELTA_PACK
-        },
+        DELTA_PACK,
     )?;
     match options.layout {
         WeightLayout::Tiled => list.add(
@@ -839,7 +724,6 @@ fn list_mixers(
             DELTA_PACK,
             DELTA_OUT,
         )?,
-        WeightLayout::Exl3 => {}
     }
     list.add(Slot::AttnProj, list.row(dims.attn_proj), ATTN_IN, ATTN_CORE)?;
     list.add(Slot::AttnQ, list.row(q_width), ATTN_PREP, ATTN_CORE)?;
@@ -851,22 +735,12 @@ fn list_mixers(
         list.add(Slot::VRows, list.row(kv_width), ATTN_PREP, KV8_APPEND)?;
     }
     list.add(Slot::AttnPart, Ok(scratch.attn_part), ATTN_CORE, ATTN_CORE)?;
-    list.add(
-        Slot::AttnCore,
-        list.row(q_width),
-        ATTN_CORE,
-        if options.layout == WeightLayout::Exl3 {
-            ATTN_OUT
-        } else {
-            ATTN_PACK
-        },
-    )?;
+    list.add(Slot::AttnCore, list.row(q_width), ATTN_CORE, ATTN_PACK)?;
     match options.layout {
         WeightLayout::Tiled => list.add(Slot::XfAttnOut, list.xf(q_width), ATTN_PACK, ATTN_OUT)?,
         WeightLayout::Native => {
             list.add(Slot::Q8AttnOut, list.q8(q_width, 1), ATTN_PACK, ATTN_OUT)?
         }
-        WeightLayout::Exl3 => {}
     }
     list.add(Slot::MixOut, list.row(h), DELTA_OUT, ADD_NORM)
 }
@@ -897,8 +771,6 @@ fn list_moe(
             // native load - dead bytes (~h x 2) when the hybrid is off.
             list.add(Slot::XfMoe, list.xf(h), ADD_NORM, GATE_UP)?;
         }
-        // The fused norm still emits its tiled pack, which the EXL3 projections never read.
-        WeightLayout::Exl3 => list.add(Slot::XfMoe, list.xf(h), ADD_NORM, ADD_NORM)?,
     }
     match options.layout {
         // The fused `add_rmsnorm_q8` always writes the f32 normalized row, so the NATIVE
@@ -907,26 +779,13 @@ fn list_moe(
         // final norm does NOT touch it - it writes the plan's own FinalNormRow.
         WeightLayout::Tiled => list.add(Slot::NormRow, list.row(h), ADD_NORM, ROUTE)?,
         WeightLayout::Native => list.add(Slot::NormRow, list.row(h), MIX_PACK, ARGMAX)?,
-        // The mixer prologue writes the row as the EXL3 projections' input, the epilogue rewrites
-        // it for the router and for every expert's gate and up projection.
-        // The shared expert's gate and up read the row after the routed experts' down launch, so
-        // the row stays live to the combine.
-        WeightLayout::Exl3 => list.add(Slot::NormRow, list.row(h), MIX_PACK, COMBINE)?,
     }
     list.add(Slot::RouterLogits, Ok(scratch.router_logits), ROUTE, ROUTE)?;
     list.add(Slot::TopkId, product(&[m, e.top_k, I32]), ROUTE, COMBINE)?;
     list.add(Slot::TopkWeight, list.row(e.top_k), ROUTE, COMBINE)?;
     list.add(Slot::SharedGate, list.row(1), ROUTE, COMBINE)?;
     let gate_up = product(&[m, e.top_k, 2 * e.inter, F32]);
-    // The EXL3 block runs the routed experts and then the shared expert as one op, in stream
-    // order: every intermediate it touches is live from the first launch to the combine, so no
-    // later launch of the block writes over an earlier one's result.
-    let (gu_last, block_first) = if options.layout == WeightLayout::Exl3 {
-        (COMBINE, GATE_UP)
-    } else {
-        (DOWN, SWIGLU)
-    };
-    list.add(Slot::ExpertGu, gate_up, GATE_UP, gu_last)?;
+    list.add(Slot::ExpertGu, gate_up, GATE_UP, DOWN)?;
     match options.layout {
         WeightLayout::Tiled => {
             let branches = if options.forked_experts { e.top_k } else { 1 };
@@ -941,32 +800,10 @@ fn list_moe(
             // The hybrid's per-slot swiglu pack (branch 0: native never forks).
             list.add(Slot::XfDown(0), list.xf(e.inter), SWIGLU, DOWN)?;
         }
-        // One F32 row per pick feeds the grouped down launch.
-        WeightLayout::Exl3 => list.add(
-            Slot::ExpertAct,
-            product(&[m, e.top_k, e.inter, F32]),
-            block_first,
-            COMBINE,
-        )?,
     }
     let down = product(&[m, e.top_k, h, F32]);
-    let down_first = if options.layout == WeightLayout::Exl3 {
-        GATE_UP
-    } else {
-        DOWN
-    };
-    list.add(Slot::ExpertDown, down, down_first, COMBINE)?;
-    let shared_last = if options.layout == WeightLayout::Exl3 {
-        COMBINE
-    } else {
-        DOWN
-    };
-    list.add(
-        Slot::SharedGu,
-        list.row(2 * e.shared_inter),
-        GATE_UP,
-        shared_last,
-    )?;
+    list.add(Slot::ExpertDown, down, DOWN, COMBINE)?;
+    list.add(Slot::SharedGu, list.row(2 * e.shared_inter), GATE_UP, DOWN)?;
     match options.layout {
         WeightLayout::Tiled => list.add(Slot::XfShared, list.xf(e.shared_inter), SWIGLU, DOWN)?,
         WeightLayout::Native => {
@@ -974,14 +811,8 @@ fn list_moe(
             // The hybrid's shared-expert pack (the overridden shared stacks read it).
             list.add(Slot::XfShared, list.xf(e.shared_inter), SWIGLU, DOWN)?;
         }
-        WeightLayout::Exl3 => list.add(
-            Slot::SharedAct,
-            list.row(e.shared_inter),
-            block_first,
-            COMBINE,
-        )?,
     }
-    list.add(Slot::SharedOut, list.row(h), down_first, COMBINE)
+    list.add(Slot::SharedOut, list.row(h), DOWN, COMBINE)
 }
 
 /// The card variant of [`list_mixers`] for the Native multi-device step: every width is the
@@ -1067,52 +898,4 @@ fn list_card_moe(
     list.add(Slot::Q8Shared, list.q8(shared_inter, 1), SWIGLU, DOWN)?;
     list.add(Slot::XfShared, list.xf(shared_inter), SWIGLU, DOWN)?;
     list.add(Slot::SharedOut, list.row(h), DOWN, COMBINE)
-}
-/// the rotated inputs, the split-K partial and the sticky arithmetic flag. The sizes are the
-/// largest any projection of the step needs: mixers, grouped expert launches, the head.
-fn list_exl3_scratch(list: &mut SlotList, dims: &StepDims) -> Result<(), EngError> {
-    let geometry = crate::family::decode_step::mixer_geometry::MixerGeometry::new(dims)?;
-    let (h, e) = (dims.shape.hidden, &dims.shape.moe);
-    // A K-row window: the dense, shared-expert and head launches take K rows at once (the shared
-    // gate and up as 2K one-row groups), while the routed experts run one chain per row, in
-    // stream order, so their rotated inputs and partials are reused row after row.
-    let k = list.rows;
-    // (rows of the launch, input width, output width) of every projection kind.
-    let mut launches = vec![
-        (k, h, dims.shape.vocab),
-        (2 * e.top_k, h, e.inter),
-        (e.top_k, e.inter, h),
-        (2 * k, h, e.shared_inter),
-        (k, e.shared_inter, h),
-    ];
-    for kind in [
-        crate::family::AttentionKind::DeltaNet,
-        crate::family::AttentionKind::Full,
-    ] {
-        for spec in geometry.dense_specs(WeightLayout::Exl3, kind)? {
-            launches.push((k, spec.k, spec.rows));
-        }
-    }
-    let xh = launches
-        .iter()
-        .map(|&(rows, k, _)| rows * k)
-        .max()
-        .unwrap_or(0);
-    let z = launches
-        .iter()
-        .map(|&(rows, _, n)| rows * n)
-        .max()
-        .unwrap_or(0);
-    // The grouped MoE launches carry split_k - 1 partial banks per pair (FIFI_EXL3_GROUP_SPLIT);
-    // the dense specs stay at split 2 whatever the env says, so only their one bank counts,
-    // but scaling the whole slot by the launch max keeps that simple and safe.
-    let banks = (super::exl3_moe::group_split() as usize - 1).max(1);
-    list.add(Slot::Exl3Xh, product(&[xh, F32]), MIX_PACK, LM_HEAD)?;
-    list.add(Slot::Exl3Z, product(&[z, F32 * banks]), MIX_PACK, LM_HEAD)?;
-    // The step clears this word at StepBegin, before its declared birth at MIX_PACK, and folds it
-    // into the status just before the argmax. That is safe because the plan has no slot whose
-    // lifetime ends before MIX_PACK that could share these bytes; the old host write at the start
-    // of the token had the same property. A slot with such a lifetime would need the clear moved
-    // to the first op that uses the flag.
-    list.add(Slot::Exl3Flag, Ok(4), MIX_PACK, ARGMAX)
 }

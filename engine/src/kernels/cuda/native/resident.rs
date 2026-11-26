@@ -62,7 +62,6 @@ pub(in crate::kernels::cuda) mod correct_draft_logits_bf16;
 pub(in crate::kernels::cuda) mod dense_gemv;
 pub(in crate::kernels::cuda) mod draft_attention_bf16;
 pub(in crate::kernels::cuda) mod embed;
-pub(in crate::kernels::cuda) mod embed_bf16;
 pub(in crate::kernels::cuda) mod exl3;
 pub(in crate::kernels::cuda) mod expert_activation;
 pub(in crate::kernels::cuda) mod gdn_conv;

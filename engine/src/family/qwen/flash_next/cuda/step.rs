@@ -505,7 +505,6 @@ impl<'a> FlashStep<'a> {
             scratch: Exl3Scratch {
                 xh: self.slot(Slot::Exl3Xh)?,
                 z: self.slot(Slot::Exl3Z)?,
-                y: self.slot(Slot::PrefillY)?,
                 flag: self.slot(Slot::Exl3Flag)?,
                 jobs: self.slot(Slot::Exl3Jobs)?,
             },

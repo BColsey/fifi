@@ -6,9 +6,6 @@
 use super::run_report::CaptureOutcome;
 use super::state::StepField;
 use super::step::{HowRan, fold_capture, reported_outcome};
-use super::verdict::{FailureAction, action_for};
-use crate::EngError;
-use crate::family::graph_state::krow_graph::{ENTERED_BY_GRAPH, Facts, GraphTable, MAX_ROWS};
 use crate::family::graph_state::{Mode, next_mode};
 use crate::family::state_words::Word;
 use crate::kernels::cuda::resident::step_params::{
@@ -156,92 +153,6 @@ fn the_start_block_and_the_result_pair_have_their_own_words() {
     assert_eq!(Word::StepParams.bytes(), STEP_PARAMS_BYTES);
     assert_eq!(Word::ResultPair.bytes(), 8);
     assert_ne!(Word::StepParams.offset(), Word::ResultPair.offset());
-}
-
-#[test]
-fn only_an_exl3_step_refuses_a_pair_with_the_arithmetic_mask() {
-    use super::step::exl3_pair_refusal;
-    use crate::family::project::cuda::WeightLayout;
-    use crate::kernels::cuda::resident::step_params::{ResultPair, StepStatus};
-    let pair = |status| ResultPair {
-        token: 7,
-        status: StepStatus(status),
-    };
-    for status in [16, 16 | 1, 16 | 2, 16 | 4, 16 | 8] {
-        match exl3_pair_refusal(WeightLayout::Exl3, pair(status)) {
-            Some(crate::EngError::ModelOutput(message)) => {
-                assert_eq!(
-                    message, "EXL3 projection flagged invalid arithmetic",
-                    "{status}"
-                )
-            }
-            other => panic!("status {status}: expected the flag error, got {other:?}"),
-        }
-    }
-    for status in [0, 1, 2, 4, 8, 1 | 2 | 4 | 8] {
-        assert!(
-            exl3_pair_refusal(WeightLayout::Exl3, pair(status)).is_none(),
-            "{status}"
-        );
-    }
-    for layout in [WeightLayout::Native, WeightLayout::Tiled] {
-        assert!(exl3_pair_refusal(layout, pair(16)).is_none(), "{layout:?}");
-    }
-}
-
-/// The routed and shared expert groups of the EXL3 block go through the step's grouped entry, so
-/// the wide kernel serves them when the switch names it.
-#[test]
-fn the_exl3_moe_block_launches_its_groups_through_the_step_entry() {
-    let source = include_str!("../../../exl3/moe.rs");
-    let start = source.find("fn grouped(").expect("the grouped helper");
-    let body = &source[start..start + 1200];
-    assert!(body.contains("exl3_grouped_step("), "{body}");
-    assert!(!body.contains("exl3_grouped("), "{body}");
-}
-
-/// A refused pair poisons the state before the error returns, so no later token starts from it.
-#[test]
-fn a_refused_exl3_pair_poisons_the_state() {
-    let body = fn_section("fn run_token_inner(");
-    let check = body.find("exl3_pair_refusal(").expect("the pair check");
-    let after = &body[check..];
-    let poison = after
-        .find("self.state.poison()")
-        .expect("poison after the check");
-    let ret = after
-        .find("return Err(error)")
-        .expect("the return of the refusal");
-    assert!(poison < ret, "{after}");
-}
-
-/// The start refuses a bad `FIFI_EXL3_SINGLE_GATHER` before it allocates a stream.
-#[test]
-fn the_step_start_checks_the_single_row_switch_before_the_stream() {
-    let source = include_str!("step.rs");
-    let start = source.find("pub(crate) fn new(").expect("new");
-    let body = &source[start..];
-    let check = body
-        .find("check_single_gather()")
-        .expect("the switch check in new");
-    let stream = body.find("context.stream()").expect("the stream in new");
-    assert!(
-        check < stream,
-        "check_single_gather() must precede context.stream()"
-    );
-}
-
-/// The pair check runs before `decide`, so a flagged EXL3 token never reaches the commit.
-#[test]
-fn the_pair_check_precedes_the_decision() {
-    let body = fn_section("fn run_token_inner(");
-    let refusal = body
-        .find("exl3_pair_refusal(")
-        .expect("the pair check is in the token body");
-    let decision = body
-        .find("decide(pair")
-        .expect("the decision is in the token body");
-    assert!(refusal < decision, "exl3_pair_refusal must precede decide");
 }
 
 #[test]
@@ -721,75 +632,6 @@ fn capture_once_folds_the_attempt_through_the_seam_and_reruns_on_none() {
     }
 }
 
-/// An EXL3 step may capture: the MoE blocks read the picks on the device when the capture config
-/// asks for a graph, and the step keeps no refusal of the EXL3 layout.
-#[test]
-fn an_exl3_step_captures_with_device_picks() {
-    let source = include_str!("step.rs");
-    assert!(
-        !source.contains("exl3_capture_refusal"),
-        "the EXL3 capture refusal is gone"
-    );
-    let squeeze = |text: &str| text.split_whitespace().collect::<String>();
-    let config = squeeze(fn_section("pub(crate) fn set_capture_config("));
-    assert!(
-        config.contains(
-            "self.exl3_device_ids=config.capture&&self.layout==WeightLayout::Exl3&&self.exl3_bank.is_none();",
-        ),
-        "{config}"
-    );
-    let run = squeeze(fn_section("fn run_op("));
-    let call = run.find("run_exl3_moe(").expect("the EXL3 MoE call");
-    assert!(
-        run[call..call + 90].contains("self.moe_dims,self.exl3_device_ids"),
-        "{run}"
-    );
-}
-
-/// A captured EXL3 step holds at most 8 picks; more is refused when the capture is configured.
-#[test]
-fn a_captured_exl3_step_refuses_more_than_eight_picks() {
-    use super::step::exl3_device_pick_refusal;
-    use crate::family::project::cuda::WeightLayout;
-    assert!(exl3_device_pick_refusal(WeightLayout::Exl3, true, 8).is_ok());
-    assert!(exl3_device_pick_refusal(WeightLayout::Exl3, true, 9).is_err());
-    assert!(exl3_device_pick_refusal(WeightLayout::Exl3, false, 9).is_ok());
-    assert!(exl3_device_pick_refusal(WeightLayout::Native, true, 9).is_ok());
-    let config = fn_section("pub(crate) fn set_capture_config(");
-    assert!(config.contains("exl3_device_pick_refusal("), "{config}");
-}
-
-/// The block's device-pick path makes no host read and no wait: a captured body cannot.
-#[test]
-fn the_device_pick_path_of_the_exl3_moe_block_never_waits_for_the_host() {
-    let source = include_str!("../../../exl3/moe.rs");
-    for name in [
-        "fn routed_on_device(",
-        "fn grouped_indexed(",
-        "fn indexed_launch(",
-        "fn route(",
-        "fn shared(",
-        "fn combine(",
-        "fn swiglu(",
-    ] {
-        let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
-        let rest = &source[start..];
-        let end = rest.find("\n}\n").map_or(rest.len(), |at| at + 3);
-        let body = &rest[..end];
-        for forbidden in ["read_at(", "write_at(", "synchronize(", "read_picks("] {
-            assert!(!body.contains(forbidden), "{name} calls {forbidden}");
-        }
-    }
-    let block = source.find("fn run_exl3_moe(").expect("run_exl3_moe");
-    let body = &source[block..];
-    let device = body.find("if device_ids {").expect("the device branch");
-    let host = body.find("read_picks(").expect("the host branch");
-    assert!(
-        device < host,
-        "the device branch comes first and the host read is in the else arm"
-    );
-}
-
 #[test]
 fn tiered_step_refuses_capture_with_a_typed_error() {
     use super::step::tiered_capture_refusal;
@@ -813,99 +655,10 @@ fn tiered_step_refuses_capture_with_a_typed_error() {
     }
 }
 
-fn table_mode(table: &GraphTable<usize>, rows: usize, capture_on: bool) -> &'static str {
-    match table.mode(rows, capture_on).expect("a served length") {
-        Mode::Replay => "replay",
-        Mode::Capture => "capture",
-        Mode::Eager => "eager",
-    }
-}
-
+/// The one-row graph's drop-order cover: `graph` bakes in the state's addresses without pinning
+/// them, so it must be declared before the state and drop first.
 #[test]
-fn a_refused_capture_is_sticky_for_every_length_and_leaves_captured_graphs_alone() {
-    let facts = |nodes: usize, vram_bytes: u64| Facts { nodes, vram_bytes };
-    let mut table = GraphTable::<usize>::default();
-    for rows in [2, 3, 4] {
-        table.note_eager(rows);
-    }
-    table.store(3, 3, facts(0, 0)).expect("store");
-    // The capture of 4 rows is refused by the device: the shared fold sets the flag and reports
-    // that the body must run again, eagerly.
-    let mut entered = 17;
-    let kept = fold_capture::<usize>(
-        Err(EngError::BadRequest("cuda capture: refused".to_owned())),
-        crate::kernels::cuda::is_capture_refusal,
-        &mut entered,
-        table.refused_mut(),
-    )
-    .expect("a refusal is not an error");
-    assert!(kept.is_none());
-    assert_eq!(entered, 0, "the attempt's op count is discarded");
-    assert_eq!(
-        table_mode(&table, 3, true),
-        "replay",
-        "the captured graph still serves its length"
-    );
-    assert_eq!(
-        table_mode(&table, 2, true),
-        "eager",
-        "warm but refused: no capture of 2"
-    );
-    assert_eq!(table_mode(&table, 4, true), "eager");
-    assert_eq!(table_mode(&table, MAX_ROWS, true), "eager");
-}
-
-#[test]
-fn a_failed_launch_of_a_graph_is_judged_after_the_launch() {
-    // The graph is the whole body, so the count the failure rule sees must be one that poisons the
-    // state; a count of 0 or 1 would take the step back as if the first op had refused to launch.
-    assert_eq!(action_for(ENTERED_BY_GRAPH), FailureAction::Poison);
-    assert_eq!(
-        action_for(0),
-        FailureAction::Cancel,
-        "the rule itself is unchanged"
-    );
-    assert_eq!(action_for(1), FailureAction::Cancel);
-}
-
-/// The field order of `QwenResidentStep` is its drop order: the K-row graphs bake in the addresses
-/// of the K-row buffer, the state and the rollback slots, so they must be declared before all
-/// three. Fields are found by name, not by line.
-#[test]
-fn the_k_row_graphs_are_declared_before_the_buffers_they_bake_in() {
-    let source = include_str!("step.rs");
-    let start = source
-        .find("pub(crate) struct QwenResidentStep<'a> {")
-        .expect("the step struct");
-    let end = start
-        + source[start..]
-            .find("\n}\n")
-            .expect("the end of the struct");
-    let fields = &source[start..end];
-    let declared = |name: &str| -> usize {
-        let needle = format!("\n    {name}: ");
-        fields
-            .find(&needle)
-            .unwrap_or_else(|| panic!("the field {name:?} is not declared in the step struct"))
-    };
-    let graphs = declared("krow_graphs");
-    for later in ["krow", "state", "rollback", "context", "stream"] {
-        assert!(
-            graphs < declared(later),
-            "krow_graphs must be declared before {later}: it drops first"
-        );
-    }
-    assert!(
-        declared("graph") < graphs,
-        "the K-row graphs sit next to the one-row graph, after it"
-    );
-}
-
-/// The one-row graph's drop-order cover: `graph` bakes in the state's and the
-/// rollback slots' addresses without pinning them, so it must be declared
-/// before both and drop first (the K-row order above is the same argument).
-#[test]
-fn the_step_graph_is_declared_before_the_state_and_rollback_slots() {
+fn the_step_graph_is_declared_before_the_state() {
     let source = include_str!("step.rs");
     let start = source
         .find("pub(crate) struct QwenResidentStep<'a> {")
@@ -922,7 +675,7 @@ fn the_step_graph_is_declared_before_the_state_and_rollback_slots() {
             .unwrap_or_else(|| panic!("the field {name:?} is not declared in the step struct"))
     };
     let graph = declared("graph");
-    for later in ["state", "rollback", "context", "stream"] {
+    for later in ["state", "context", "stream"] {
         assert!(
             graph < declared(later),
             "the one-row graph must be declared before {later}: it drops first"

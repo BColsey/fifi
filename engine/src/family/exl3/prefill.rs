@@ -8,8 +8,7 @@
 //!
 //! The DeltaNet and attention input rows hold several projections side by side; the job-table
 //! output lands in its columns through the output row stride and column offset, so no scatter is
-//! needed. Only the two plain gates, which are not EXL3 matrices, go through the router's dot
-//! kernel and `scatter_cols`.
+//! needed.
 //!
 //! Nothing here allocates. The arithmetic flag of the projections is sticky: the chunk driver
 //! clears it before the first layer and reads it once after the last.
@@ -23,17 +22,8 @@ use crate::{
         exl3::launch::Launch,
         project::cuda::{Exl3JobsIo, exl3::Exl3Weight},
     },
-    kernels::cuda::{
-        DeviceRange,
-        prefill::scatter_cols::{ScatterColsCall, ScatterColsShape},
-        resident::{
-            exl3::Exl3Job,
-            router::{RouterLogitsCall, RouterShape},
-        },
-    },
+    kernels::cuda::{DeviceRange, resident::exl3::Exl3Job},
 };
-
-pub(in crate::family) const F32: usize = size_of::<f32>();
 
 /// The scratch of the projections of one chunk, caller-owned and disjoint from every operand.
 #[derive(Clone, Copy)]
@@ -42,8 +32,6 @@ pub(in crate::family) struct Exl3Scratch<'b> {
     pub(in crate::family) xh: DeviceRange<'b>,
     /// F32 `[m][n]` for the widest `n`: the partials.
     pub(in crate::family) z: DeviceRange<'b>,
-    /// F32 `[m][n]` of a plain gate, which waits here for `scatter_cols`.
-    pub(in crate::family) y: DeviceRange<'b>,
     /// The sticky arithmetic flag, four bytes.
     pub(in crate::family) flag: DeviceRange<'b>,
     /// The job table of the dense projections, written by [`write_dense_jobs`].
@@ -153,78 +141,6 @@ impl Projector<'_> {
             .ctx
             .exl3_jobs(self.launch.stream, members.jobs_call(&io))
     }
-
-    fn scatter(
-        &self,
-        src: DeviceRange<'_>,
-        dst: DeviceRange<'_>,
-        (rows, n, ld, col_off): (usize, usize, usize, usize),
-    ) -> Result<(), EngError> {
-        split::count("scatter_cols calls");
-        self.launch.ctx.scatter_cols(
-            self.launch.stream,
-            ScatterColsCall {
-                shape: ScatterColsShape {
-                    rows,
-                    n,
-                    ld,
-                    col_off,
-                },
-                src,
-                dst,
-            },
-        )
-    }
-
-    /// The plain F32 gate `w` (`n` rows of `k` values) over `rows` rows of `x`, into columns
-    /// `col_off..col_off + n` of `dst`. The plain gates are not EXL3 matrices; the router's dot
-    /// kernel evaluates them at any row count.
-    pub(in crate::family) fn plain(
-        &self,
-        w: DeviceRange<'_>,
-        x: DeviceRange<'_>,
-        shape: RouterShape,
-        out: (DeviceRange<'_>, usize, usize),
-    ) -> Result<(), EngError> {
-        let (dst, ld, col_off) = out;
-        let y = window(self.scratch.y, 0, shape.m * shape.n_expert * F32)?;
-        self.launch.ctx.router_logits_rows(
-            self.launch.stream,
-            RouterLogitsCall {
-                shape,
-                x,
-                w,
-                logits: y,
-            },
-        )?;
-        self.scatter(y, dst, (shape.m, shape.n_expert, ld, col_off))
-    }
-}
-
-/// Clears the sticky arithmetic flag before the first layer. The write waits for the stream.
-pub(in crate::family) fn clear_flag(
-    launch: &Launch<'_>,
-    flag: DeviceRange<'_>,
-) -> Result<(), EngError> {
-    flag.buffer()
-        .write_at(launch.stream, flag.offset(), &0u32.to_le_bytes())
-}
-
-/// Refuses a chunk whose projections flagged an invalid value: one read after the last
-/// layer, which waits for the stream.
-pub(in crate::family) fn check_flag(
-    launch: &Launch<'_>,
-    flag: DeviceRange<'_>,
-) -> Result<(), EngError> {
-    let mut word = [0u8; 4];
-    flag.buffer()
-        .read_at(launch.stream, flag.offset(), &mut word)?;
-    if u32::from_le_bytes(word) != 0 {
-        return Err(EngError::ModelOutput(
-            "EXL3 chunk projection flagged invalid arithmetic".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 /// Test-only section timer of the EXL3 chunk: once enabled, each mark waits for the stream and
@@ -246,19 +162,6 @@ pub(in crate::family) mod split {
 
     thread_local! {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-    }
-
-    pub(in crate::family) fn enable() {
-        STATE.with(|state| *state.borrow_mut() = Some(State::default()));
-    }
-
-    /// Ends timing and returns the seconds and the call counts per bucket.
-    pub(in crate::family) fn take() -> (BTreeMap<&'static str, f64>, BTreeMap<&'static str, usize>)
-    {
-        STATE
-            .with(|state| state.borrow_mut().take())
-            .map(|state| (state.seconds, state.calls))
-            .unwrap_or_default()
     }
 
     /// Waits for `stream` and charges the time since the last mark to `bucket`.

@@ -25,7 +25,6 @@ use crate::family::graph_state::book::Health;
 
 use super::super::host::HostShape;
 use super::dims::{KvMode, StepDims, StepOptions, TieredPlan};
-use super::exl3_load::load_exl3_dir;
 use super::native_device_rig::{Rng, device_present};
 use super::pinned::{ROTARY_DIM, head_rows_of};
 use super::resources::StepResources;
@@ -48,7 +47,7 @@ use crate::{
         qwen::qwen36::settings::tokenizer_pin,
         session::{DecodeSession, SaveKind},
     },
-    kernels::cuda::{CudaContext, resident::exl3::SingleRow},
+    kernels::cuda::CudaContext,
     tokenizer::{DecodeFinish, IncrementalDecoder, TokenizerBundle},
 };
 use sha2::{Digest, Sha256};
@@ -509,41 +508,6 @@ fn synthetic_ids(n: usize) -> Vec<u32> {
         .collect()
 }
 
-/// D1c on the real EXL3 pack with the default FP16 KV: the same four turns on a step that
-/// serves the pack's projections, captured. Every existing captured-restore test above runs
-/// native GGUF weights.
-fn exl3_mid_piece_phase() -> Result<(Vec<u32>, Vec<Turn>), EngError> {
-    let pack = std::env::var_os("FIFI_EXL3_CHECKPOINT")
-        .map(PathBuf::from)
-        .ok_or_else(|| EngError::Checkpoint("FIFI_EXL3_CHECKPOINT is not set".into()))?;
-    let tokenizer_dir = gguf_path()?;
-    let bundle = TokenizerBundle::load(
-        tokenizer_dir.parent().unwrap_or(Path::new(".")),
-        &tokenizer_pin()?,
-    )?;
-    let rules = rules_for(&bundle)?;
-    let projector = CudaProjector::new()?;
-    let weights = load_exl3_dir(&projector, &pack, Reserve::default())?;
-    // The kernel a served pack runs: the start registers wide1 on its context.
-    projector
-        .context()
-        .set_single_row_default(SingleRow::Wide(1));
-    let mut opts = options(KvMode::Fp16, CONTEXT, None);
-    opts.layout = WeightLayout::Exl3;
-    let res = StepResources::new(
-        projector.context(),
-        dims()?,
-        &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
-        &opts,
-    )?;
-    let mut step = QwenResidentStep::new(projector.context(), &res, &weights, &opts, rules)?;
-    step.set_capture_config(CaptureConfig {
-        capture: true,
-        section_marks: false,
-    })?;
-    mid_piece_turns(&mut step, &bundle, &synthetic_ids(612))
-}
-
 #[test]
 #[ignore = "the 3090, held exclusively: loads the real model"]
 fn restore_mid_piece_is_bitwise_eager() {
@@ -622,45 +586,6 @@ fn restore_mid_piece_is_bitwise_captured() {
     assert_chain_length("reference", reference);
     assert_same_bits("a save does not perturb the captured turn", cold, reference);
     assert_same_bits("the captured restore replays bitwise", restored, reference);
-}
-
-#[test]
-#[ignore = "the 3090, held exclusively: loads the real EXL3 pack from FIFI_EXL3_CHECKPOINT"]
-fn restore_mid_piece_is_bitwise_captured_on_the_exl3_pack() {
-    if !device_present("restore_mid_piece_is_bitwise_captured_on_the_exl3_pack") {
-        return;
-    }
-    let (prompt, turns) =
-        exl3_mid_piece_phase().unwrap_or_else(|e| panic!("D1c EXL3 device phase: {e:?}"));
-    let (cold, z, restored, reference) = (&turns[0], &turns[1], &turns[2], &turns[3]);
-    assert_eq!(cold.covered, 0);
-    assert_eq!(cold.saved, Some(true));
-    assert_eq!(z.covered, 0);
-    assert_eq!(z.saved, None);
-    assert_eq!(restored.covered, 37);
-    assert_eq!(restored.key_len, Some(37));
-    let after = restored
-        .restored
-        .as_ref()
-        .expect("the restore was observed");
-    assert_eq!(after.history, prompt[..37]);
-    assert_eq!(after.pending, Some(prompt[36]));
-    assert_eq!(after.tokens, 36);
-    for (what, got) in [
-        ("cold", cold),
-        ("Z", z),
-        ("restored", restored),
-        ("reference", reference),
-    ] {
-        assert_captured(what, got);
-        assert_chain_length(what, got);
-    }
-    assert_same_bits("a save does not perturb the EXL3 turn", cold, reference);
-    assert_same_bits(
-        "the captured EXL3 restore replays bitwise",
-        restored,
-        reference,
-    );
 }
 
 /// D2/D5's device phase: T1 = P5[..340] with the boundary 300, then T2 = P5[..560] with the

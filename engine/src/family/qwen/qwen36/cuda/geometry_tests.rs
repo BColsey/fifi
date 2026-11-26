@@ -337,18 +337,16 @@ fn card_plans_gather_full_row_kv_and_tile_the_sharded_widths() {
 #[test]
 fn card_plans_refuse_the_non_native_layouts() {
     let d = dims();
-    for layout in [WeightLayout::Tiled, WeightLayout::Exl3] {
-        let options = StepOptions {
-            layout,
-            ..native_options(KvMode::Fp16)
-        };
-        let table = ShardTable::new(&d.shape, 2, 32).expect("table");
-        let scratch = KernelScratch::for_dims(&d, 1, KvMode::Fp16).expect("scratch");
-        let error = StepPlan::for_card(&d, &table, 0, &options, &scratch)
-            .expect_err("non-native card plan");
-        assert!(
-            format!("{error:?}").contains("multi-device step takes the native layout"),
-            "{error:?}"
-        );
-    }
+    let options = StepOptions {
+        layout: WeightLayout::Tiled,
+        ..native_options(KvMode::Fp16)
+    };
+    let table = ShardTable::new(&d.shape, 2, 32).expect("table");
+    let scratch = KernelScratch::for_dims(&d, 1, KvMode::Fp16).expect("scratch");
+    let error =
+        StepPlan::for_card(&d, &table, 0, &options, &scratch).expect_err("non-native card plan");
+    assert!(
+        format!("{error:?}").contains("multi-device step takes the native layout"),
+        "{error:?}"
+    );
 }

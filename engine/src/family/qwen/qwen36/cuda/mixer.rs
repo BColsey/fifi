@@ -23,7 +23,7 @@ use crate::family::exl3::layer_table::LayerTable;
 use super::{
     dims::KvMode,
     mixer_ops::{BLOCK_ROWS, BlockOp, CardOp, block_ops, block_ops_card},
-    mixer_shapes::{attn_decode_shape, attn_prep_shape, plain_shape},
+    mixer_shapes::{attn_decode_shape, attn_prep_shape},
     mixer_shapes::{attn_q8_shape, check_delta_eps, conv_shape, delta_shape, kv8_shape},
     mixer_weights::{LayerWeights, MixerWeights},
     paging_store::{PageAttention, PageId, PageToken},
@@ -38,10 +38,7 @@ use crate::family::decode_step::state_layout::Plane;
 use crate::family::state_words::Word;
 use crate::{
     EngError,
-    family::{
-        AttentionKind,
-        project::cuda::{WeightLayout, exl3::Exl3Io},
-    },
+    family::{AttentionKind, project::cuda::WeightLayout},
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceRange, DeviceStream, MatmulIo, PackCall, Projection,
         TimingEvent,
@@ -57,7 +54,6 @@ use crate::{
             kv8_append::Kv8Data,
             matvec_q::MatvecCall,
             quantize_q8_1::QuantizeCall,
-            router::RouterLogitsCall,
             sparse_decode::SparseDecodeData,
             sparse_decode::SparseDecodeShape,
             sparse_score::{SparseScoreData, SparseScoreShape},
@@ -542,32 +538,6 @@ impl<'a> Mixers<'a> {
                 };
                 ctx.matmul(stream, projection, io)
             }
-            BlockOp::ProjectExl3 {
-                role, x, y, col, ..
-            } => {
-                let weight = run.weights.exl3(role)?.view()?;
-                let io = Exl3Io {
-                    x: self.view(x)?,
-                    xh: self.view(Slot::Exl3Xh)?,
-                    z: self.view(Slot::Exl3Z)?,
-                    out: tail(self.view(y)?, col)?,
-                    flag: self.view(Slot::Exl3Flag)?,
-                    rows: BLOCK_ROWS,
-                    fused: false,
-                };
-                ctx.exl3_linear(stream, weight.linear_call(&io))
-            }
-            BlockOp::ProjectPlain {
-                role, x, y, col, ..
-            } => ctx.router_logits_rows(
-                stream,
-                RouterLogitsCall {
-                    shape: plain_shape(g, role)?,
-                    x: self.view(x)?,
-                    w: run.weights.raw(role)?,
-                    logits: tail(self.view(y)?, col)?,
-                },
-            ),
             BlockOp::Pack { x, xf, k, .. } => ctx.pack(
                 stream,
                 PackCall {

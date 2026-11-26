@@ -89,7 +89,6 @@ pub(crate) mod correct_draft_logits_bf16;
 pub(crate) mod dense_gemv;
 pub(crate) mod draft_attention_bf16;
 pub(crate) mod embed;
-pub(crate) mod embed_bf16;
 pub(crate) mod exl3;
 pub(crate) mod expert_activation;
 pub(crate) mod gdn_conv;
@@ -150,9 +149,6 @@ mod gemma4_reference_tests;
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod krow_attention_tests;
-
-#[cfg(all(test, feature = "native-cuda"))]
-mod krow_rows_tests;
 
 #[cfg(test)]
 mod top_logits;

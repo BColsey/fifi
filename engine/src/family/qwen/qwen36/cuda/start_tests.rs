@@ -424,22 +424,6 @@ fn the_kv_mode_of_the_config_maps_f32_to_fp16_and_q8_to_int8g32() {
 }
 
 #[test]
-fn exl3_serving_takes_the_kv_modes_of_the_native_layout() {
-    assert_eq!(
-        kv_mode_of(KvDtype::F32, WeightLayout::Exl3).expect("f32"),
-        KvMode::Fp16
-    );
-    assert_eq!(
-        kv_mode_of(KvDtype::Q8, WeightLayout::Exl3).expect("q8"),
-        KvMode::Int8G32
-    );
-    match kv_mode_of(KvDtype::Bf16, WeightLayout::Exl3) {
-        Err(EngError::BadRequest(text)) => assert!(text.contains("bf16"), "{text}"),
-        other => panic!("a bf16 KV start must be refused on CUDA: {other:?}"),
-    }
-}
-
-#[test]
 fn bf16_kv_is_refused_on_the_cuda_arm() {
     for layout in [WeightLayout::Tiled, WeightLayout::Native] {
         match kv_mode_of(KvDtype::Bf16, layout) {
@@ -628,4 +612,47 @@ fn the_card_plan_charges_the_cache_rates_the_pool_lays_out() {
             kv_dtype_name(kv)
         );
     }
+}
+
+/// A directory shaped like an EXL3 pack: a `config.json` and one safetensors shard that holds the
+/// `.trellis`, `.suh` and `.svh` tensors of one quantized matrix.
+fn exl3_shaped_directory() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type":"qwen3_5_moe"}"#,
+    )
+    .expect("config.json");
+    let header = r#"{"w.trellis":{"dtype":"I16","shape":[1],"data_offsets":[0,2]},"w.suh":{"dtype":"F16","shape":[1],"data_offsets":[2,4]},"w.svh":{"dtype":"F16","shape":[1],"data_offsets":[4,6]}}"#;
+    let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+    shard.extend_from_slice(header.as_bytes());
+    shard.extend_from_slice(&[0u8; 6]);
+    std::fs::write(dir.path().join("model-00001.safetensors"), shard).expect("shard");
+    dir
+}
+
+#[test]
+fn an_exl3_pack_given_to_a_cuda_start_is_refused_by_a_message_naming_gguf() {
+    use super::super::settings::check_cuda_serves;
+    let dir = exl3_shaped_directory();
+    let options: Q36Options =
+        serde_json::from_str(r#"{"weight_format":"exl3"}"#).expect("a valid qwen36 object");
+    let settings = Q36Settings::new(
+        dir.path(),
+        dir.path(),
+        Some(&options),
+        &Q36Env::default(),
+        Backend::Cuda,
+    )
+    .expect("valid CUDA settings");
+    let text = check_cuda_serves(&settings)
+        .expect_err("an EXL3 pack")
+        .describe();
+    assert!(text.contains("GGUF"), "{text}");
+    assert!(text.contains("EXL3"), "{text}");
+    assert!(
+        text.contains(&dir.path().display().to_string()),
+        "the refusal names the directory: {text}"
+    );
+    check_cuda_serves(&cuda_settings(r#"{"capture":false}"#)).expect("a GGUF start is served");
 }

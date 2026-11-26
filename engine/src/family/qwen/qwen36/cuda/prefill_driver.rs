@@ -16,7 +16,7 @@ use super::{
     dims::{KvMode, StepDims},
     prefill_plan::{
         Admission, ChunkCost, ChunkSlot, Extra, LARGE_M_LADDER, M_LADDER, PART_CHARGE, SPARE_MIN,
-        chunk_tensors, exl3_chunk_tensors,
+        chunk_tensors,
     },
 };
 use crate::family::exl3::launch::Launch;
@@ -525,7 +525,7 @@ pub(super) fn require_fixed_room(
     Ok(())
 }
 
-/// The pre-arena gate accepts a Native or EXL3 layout, `Fp16` or opted-in `Int8G32`, and a
+/// The pre-arena gate accepts a Native layout, `Fp16` or opted-in `Int8G32`, and a
 /// non-tiered session. These conditions match the first three `chunk_verdict` checks. A rejected session needs no arena. `admit_prefill` runs this check before
 /// device queries or arena allocation.
 pub(super) fn needs_arena(
@@ -595,20 +595,6 @@ impl PrefillArena {
         budget: usize,
     ) -> Result<Self, EngError> {
         let list = chunk_tensors(dims, m_sess, facts.nsm)?;
-        Self::allocate_list(ctx, stream, list, (m_sess, facts, budget))
-    }
-
-    /// The same for an EXL3 pack: the tensor list of [`exl3_chunk_tensors`], which has no MMQ
-    /// scratch. `facts` keeps the device facts the attention plan reads.
-    pub(super) fn allocate_exl3(
-        ctx: &CudaContext,
-        stream: &DeviceStream,
-        dims: &StepDims,
-        m_sess: usize,
-        facts: MmqFacts,
-        budget: usize,
-    ) -> Result<Self, EngError> {
-        let list = exl3_chunk_tensors(dims, m_sess)?;
         Self::allocate_list(ctx, stream, list, (m_sess, facts, budget))
     }
 
@@ -803,7 +789,6 @@ pub(super) struct Q36ChunkCtx<'a, 'w> {
 /// `segmented_parts` for the step's report (a Qwen3.6-only figure, so it stays here and not in
 /// the trait).
 pub(super) struct Q36ChunkFamily<'a, 'w> {
-    bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
     tiered: Option<&'a std::cell::RefCell<TieredRuntime<'w>>>,
     #[cfg(test)]
     kernel_class: super::prefill::ChunkKernelClass,
@@ -812,12 +797,10 @@ pub(super) struct Q36ChunkFamily<'a, 'w> {
 
 impl<'a, 'w> Q36ChunkFamily<'a, 'w> {
     pub(super) fn new(
-        bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
         tiered: Option<&'a std::cell::RefCell<TieredRuntime<'w>>>,
         #[cfg(test)] kernel_class: super::prefill::ChunkKernelClass,
     ) -> Self {
         Self {
-            bank,
             tiered,
             #[cfg(test)]
             kernel_class,
@@ -851,10 +834,7 @@ impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
 
     fn run_layers(&mut self, ctx: &mut Self::Ctx, _p0: usize, _m: usize) -> Result<(), EngError> {
         let run = super::prefill::ChunkRun::new(&*ctx.state, ctx.model, ctx.bufs, ctx.chunk_rows)?;
-        let run = run
-            .with_bank(self.bank)
-            .with_tiered(self.tiered)
-            .with_sparse(ctx.sparse.take());
+        let run = run.with_tiered(self.tiered).with_sparse(ctx.sparse.take());
         #[cfg(test)]
         let run = run.with_kernel_class(self.kernel_class);
         super::prefill::run_chunk_body(&ctx.launch, &run)?;
@@ -881,9 +861,5 @@ impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
                 .inspect_err(|_| ctx.state.poison())?;
         }
         Ok(())
-    }
-
-    fn bank_misses(&self) -> Option<u64> {
-        self.bank.as_ref().map(|bank| bank.borrow().stats().1)
     }
 }

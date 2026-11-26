@@ -7,8 +7,8 @@
 //! move only when a decision moves.
 //!
 //! Host-only, modelless, GPUless. `FIFI_GOLDEN_UPDATE=1` rewrites this family's golden
-//! `testdata/pick-goldens.json` (own file, same mechanism as the Flash-Next and Q36 pick
-//! goldens); without it the compile-time pin is compared.
+//! `testdata/pick-goldens.json` (own file, same mechanism as the Flash-Next pick
+//! golden); without it the compile-time pin is compared.
 
 use super::*;
 use sha2::{Digest, Sha256};

@@ -12,11 +12,9 @@ use crate::family::exl3::layer_table::LayerTable;
 
 use super::super::admission_sketch::{CudaFitAsk, choose_cuda_fit};
 use super::super::card_short::{self, CardFigures, CardShort, CardVerdict};
-use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
-use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
     DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, VerifyMode,
-    WeightFormat, tokenizer_pin, weight_format_name,
+    WeightFormat, check_cuda_serves, exl3_refusal, tokenizer_pin, weight_format_name,
 };
 use super::{
     card_load::card_loads,
@@ -24,13 +22,11 @@ use super::{
     card_step::CardStack,
     card_weights::{load_card_weights, load_card_weights_mapped},
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
-    exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
-    exl3_moe::Exl3MoeWeights,
     pinned::{ROTARY_DIM, head_rows_of, min_free_after_load},
     placement::{PlacementPolicy, PlacementRequest, plan_placement, profiles_from_facts},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
-    resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes, moe_dims},
+    resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes},
     rules::QwenRules,
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
@@ -42,14 +38,10 @@ use super::{
 use crate::family::decode_step::shard::ShardTable;
 use crate::family::decode_step::state_layout::{KvPool, StateLayout};
 use crate::family::engine_announce::{Announcement, announce_failure, await_announced};
-use crate::family::exl3_merge_plan::{
-    SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
-};
 use crate::{
     EngError,
     family::{
         QWEN3_6_35B_A3B,
-        exl3::bank::{Exl3SlotResolver, ExpertStore},
         gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
         mem::Facts,
         project::cuda::{
@@ -58,10 +50,8 @@ use crate::{
         },
         qwen::qwen36::host::HostShape,
         session::DecodeSession,
-        speculate::config::DraftMode,
     },
     kernels::cuda::peer::{check_peer_facts, enable_peer_access, probe_device_set},
-    kernels::cuda::resident::exl3::{SERVED_SINGLE_ROW, ServedKernels},
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::TokenizerBundle,
 };
@@ -687,7 +677,7 @@ pub(super) fn check_tiered_start(settings: &Q36Settings) -> Result<(), EngError>
 pub(super) fn kv_mode_of(kv: KvDtype, layout: WeightLayout) -> Result<KvMode, EngError> {
     match (kv, layout) {
         (KvDtype::F32, _) => Ok(KvMode::Fp16),
-        (KvDtype::Q8, WeightLayout::Native | WeightLayout::Exl3) => Ok(KvMode::Int8G32),
+        (KvDtype::Q8, WeightLayout::Native) => Ok(KvMode::Int8G32),
         (KvDtype::Q8, WeightLayout::Tiled) => Err(EngError::BadRequest(
             "engine config: kv_dtype q8 builds the Int8G32 KV mode, which takes the native \
              layout; Tiled is the fp16 control path"
@@ -885,20 +875,6 @@ pub(crate) fn start(
     // Likewise the unpinned admission: a bad `Q36_ALLOW_UNPINNED_GGUF` spelling stops the start
     // before any weight is read; unset stays off.
     let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
-    // Likewise `FIFI_EXL3_SHARED_IN_ROUTED`: a bad value, or `1` on a GGUF checkpoint, stops the
-    // start before any weight is read. Unset on a GGUF checkpoint is off and is not refused.
-    resolve_switch(
-        shared_in_routed_explicit(),
-        matches!(settings.weights, WeightFormat::Exl3),
-    )?;
-    // `draft_verify = krow`: the one qualified configuration is checked before any weight is read.
-    // The step's own checks of its fields run later, once the slots are armed.
-    if settings.draft_verify == VerifyMode::Krow {
-        check_krow_env(
-            std::env::var_os(SINGLE_GATHER_NAME).as_deref(),
-            std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
-        )?;
-    }
     let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
     let plan = startup_plan_of(settings, verify, allow_unpinned)?;
     for key in &settings.ignored_mlx_keys {
@@ -1015,8 +991,9 @@ fn p2p_host_expert_bytes(name: &str, value: Option<&std::ffi::OsStr>) -> Result<
 /// per-card loads through the session's own contexts, the free-memory floor
 /// on every card, then the leaks, the `BuildGuard` commit and the session.
 ///
-/// v1 refuses what the card path has no plan for: EXL3 packs, tiered expert
-/// banks, host-paged KV, graph capture and speculative decoding. The card
+/// v1 refuses what the card path has no plan for: tiered expert banks, host-paged
+/// KV and graph capture (an EXL3 pack and speculative decoding are refused for every start by
+/// `check_cuda_serves`). The card
 /// kernels are native-layout only, so `kv_mode_of` sees `Native` exactly as
 /// the resident step's load does.
 fn make_multi(
@@ -1026,12 +1003,6 @@ fn make_multi(
     plan: StartupPlan,
     mut guard: BuildGuard,
 ) -> Result<(Q36CudaStep, DecodeSession), EngError> {
-    if let WeightFormat::Exl3 = settings.weights {
-        return Err(EngError::BadRequest(
-            "cuda_devices: multi-device serving takes the GGUF checkpoint; EXL3 packs are single-device"
-                .into(),
-        ));
-    }
     if settings.tiered.is_some() {
         return Err(EngError::BadRequest(
             "cuda_devices: multi-device serving refuses the tiered expert banks".into(),
@@ -1046,11 +1017,6 @@ fn make_multi(
     if settings.capture {
         return Err(EngError::BadRequest(
             "cuda_devices: multi-device serving refuses graph capture".into(),
-        ));
-    }
-    if settings.speculation.mode != DraftMode::Disabled {
-        return Err(EngError::BadRequest(
-            "cuda_devices: multi-device serving refuses speculative decoding".into(),
         ));
     }
     check_fused_inproj(
@@ -1783,12 +1749,15 @@ fn card_fit(
     Ok(Some((choice.variant, choice.plan)))
 }
 
-/// The startup plan of settings: the same one `start` builds before it reads the card.
+/// The startup plan of settings: the same one `start` builds before it reads the card, so `start`
+/// and `check` refuse an EXL3 pack or a speculative window with the same message, before any
+/// weight is read.
 fn startup_plan_of(
     settings: &Q36Settings,
     verify: bool,
     allow_unpinned: bool,
 ) -> Result<StartupPlan, EngError> {
+    check_cuda_serves(settings)?;
     let modes = runtime_modes(settings)?;
     let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
     if device_first {
@@ -1803,9 +1772,6 @@ fn startup_plan_of(
 /// of the checkpoint the start selects. `None` when the settings fix both, the card fits no form,
 /// or the checkpoint cannot be opened (the load reports that itself).
 pub(crate) fn planned_fit(settings: &Q36Settings) -> Result<Option<(KvDtype, u32)>, EngError> {
-    if settings.weights != WeightFormat::Gguf {
-        return Ok(None);
-    }
     let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
     let plan = startup_plan_of(settings, false, allow_unpinned)?;
     let (gguf, _, _) = select_gguf_noted(&settings.artifact, allow_unpinned)?;
@@ -1921,31 +1887,26 @@ fn make(
     let before = projector.memory_info()?;
     stages.begin("loading weights");
     let gguf = match settings.weights {
-        WeightFormat::Gguf => Some(open_gguf(
+        WeightFormat::Gguf => open_gguf(
             &settings.artifact,
             verify,
             allow_unpinned,
             settings.gguf_sha256.as_deref(),
-        )?),
-        WeightFormat::Exl3 => None,
+        )?,
+        WeightFormat::Exl3 => return Err(exl3_refusal(&settings.artifact)),
     };
     // The cache form and context the config left open come from the free card.
-    let (settings, plan) = match gguf.as_ref() {
-        Some((model, _)) => match card_fit(&projector, &settings, &plan, model)? {
-            Some((variant, variant_plan)) => (variant, variant_plan),
-            None => (settings, plan),
-        },
+    let (settings, plan) = match card_fit(&projector, &settings, &plan, &gguf.0)? {
+        Some((variant, variant_plan)) => (variant, variant_plan),
         None => (settings, plan),
     };
     // The lower rung: a GGUF start the card cannot carry whole serves the tiered path when card
     // plus host can, instead of refusing at the load's admission.
-    let (mut settings, mut plan, card_short) = match gguf.as_ref() {
-        Some((model, _)) => match lower_rung(&projector, &settings, &plan, model, on_demand)? {
+    let (mut settings, mut plan, card_short) =
+        match lower_rung(&projector, &settings, &plan, &gguf.0, on_demand)? {
             Some((variant, variant_plan, short)) => (variant, variant_plan, Some(short)),
             None => (settings, plan, None),
-        },
-        None => (settings, plan, None),
-    };
+        };
     if let Some(announce) = announce {
         // A full slot means `start` already has an answer; a closed channel means it gave up.
         let _ = announce.try_send(Ok(settings.clone()));
@@ -1953,67 +1914,10 @@ fn make(
     let mut kv_cache = plan.reserve;
     let mut fixed_admission = plan.modes.fixed_admission;
     let tiered = tiered_plan_of(&settings);
-    // The banked EXL3 load's leftovers (None on every resident path): the host store and the
-    // figures the resolver build below needs. Declared here because the load match's arms are
-    // separate blocks.
-    let mut banked_load: Option<(ExpertStore, usize, usize)> = None;
     // A tiered load leaves the routed expert stacks in the file: the banks hold the hot ones.
-    let device = match (&gguf, tiered) {
-        (None, _) => {
-            let reserve = load_options(kv_cache, fixed_admission).reserve;
-            let began = Instant::now();
-            // A served EXL3 pack runs its projections on the wide kernel unless the operator names
-            // another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); bit-identical output.
-            // The shared applier runs the launch-switch check the step build also runs, so a bad
-            // switch combination refuses the open before the weight load instead of at step build.
-            projector.context().register_served_kernels(ServedKernels {
-                single_row: SERVED_SINGLE_ROW,
-                indexed: None,
-                odd_rates: false,
-            })?;
-            let mut banked_inner: Option<(ExpertStore, usize, usize)> = None;
-            let device = match load_exl3_dir_decided(
-                &projector,
-                &settings.artifact,
-                settings.expert_bank.as_ref(),
-                reserve,
-            )? {
-                DecidedLoad::Resident(device) => device,
-                DecidedLoad::Banked(banked) => {
-                    let sticky = settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky);
-                    eprintln!(
-                        "q36 cuda: EXL3 expert bank: {} of {} experts per layer resident, \
-                         sticky {} (device {:.2} GiB incl. dense {:.2} GiB), host store {:.2} GiB, \
-                         loaded from {} in {:.1} s",
-                        banked.slots,
-                        banked.experts,
-                        sticky.min(banked.slots.saturating_sub(1)),
-                        banked.weights.device_bytes() as f64 / (1 << 30) as f64,
-                        banked.dense_bytes as f64 / (1 << 30) as f64,
-                        banked.store.host_bytes() as f64 / (1 << 30) as f64,
-                        settings.artifact.display(),
-                        began.elapsed().as_secs_f64(),
-                    );
-                    let BankedModel {
-                        weights,
-                        store,
-                        slots,
-                        experts,
-                        dense_bytes: _,
-                    } = *banked;
-                    banked_inner = Some((store, slots, experts));
-                    weights
-                }
-            };
-            banked_load = banked_inner;
-            eprintln!(
-                "q36 cuda: EXL3 weights loaded from {} in {:.1} s",
-                settings.artifact.display(),
-                began.elapsed().as_secs_f64()
-            );
-            device
-        }
-        (Some((model, _)), None) => {
+    let (model, _) = &gguf;
+    let device = match tiered {
+        None => {
             match projector.load_model(model, load_options(kv_cache, fixed_admission)) {
                 Ok(loaded) => loaded.device,
                 // The card shrank between the plan and the load (a desktop process grew): plan
@@ -2035,7 +1939,7 @@ fn make(
                 Err(other) => return Err(other),
             }
         }
-        (Some((model, _)), Some(_)) => {
+        Some(_) => {
             let names = model.plan().device_names();
             let names = names_without_experts(&names);
             projector.load(
@@ -2088,14 +1992,7 @@ fn make(
     }
     let res = match paged {
         Some(plan) => StepResources::allocate_paged(projector.context(), plan)?,
-        None => {
-            let res = StepResources::new(projector.context(), dims, &inventory, &options)?;
-            if settings.draft_verify == VerifyMode::Krow {
-                res.with_krow(projector.context(), &options)?
-            } else {
-                res
-            }
-        }
+        None => StepResources::new(projector.context(), dims, &inventory, &options)?,
     };
     // LEAK: the three owners are leaked for the process lifetime, giving
     // `QwenResidentStep<'static>`; an owning `Arc` variant would rewrite the qualified step
@@ -2106,66 +2003,24 @@ fn make(
     let projector: &'static CudaProjector = Box::leak(Box::new(projector));
     let weights: &'static CudaWeights = Box::leak(Box::new(device));
     let res: &'static StepResources = Box::leak(Box::new(res));
-    // The banked resolver, from the leaked weights: per-layer slot tables over the load's slot
-    // banks and the host store. Leaked like its owners, for the step's life.
-    let mut banked_slots = 0;
-    let bank = match banked_load {
-        Some((store, slots, experts)) => {
-            banked_slots = slots;
-            let dims = moe_dims(&res.dims);
-            let blocks = (0..res.table.len())
-                .map(|layer| {
-                    Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let resolver = Exl3SlotResolver::new(
-                store,
-                &blocks,
-                experts,
-                settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky),
-            )?;
-            // A bad value stops the start, not the first token (the other flags' rule);
-            // the arming happens before the leak so no `RefCell` borrow crosses it.
-            let overlap = bank_overlap_wanted(std::env::var_os(BANK_OVERLAP_VAR).as_deref())?;
-            let mut resolver = resolver;
-            if overlap {
-                resolver.enable_overlap(projector.context())?;
-            }
-            Some(Box::leak(Box::new(std::cell::RefCell::new(resolver))))
-        }
-        None => None,
-    };
     guard.commit();
-    let mut step = match bank {
-        Some(bank) => QwenResidentStep::new_banked(
-            projector.context(),
-            res,
-            weights,
-            &options,
-            rules,
-            banked_slots,
-            bank,
-        )?,
-        None => QwenResidentStep::new(projector.context(), res, weights, &options, rules)?,
-    };
+    let mut step = QwenResidentStep::new(projector.context(), res, weights, &options, rules)?;
     if initial_cells.is_some() {
         // The state is built small; the context the config named is what a session may grow to.
         step.set_ceiling_cells(ceiling_cells);
     }
-    if let Some((model, path)) = gguf.as_ref() {
-        step.set_prefix_identity(gguf_prefix_identity(
-            &model.weights,
-            path,
-            settings.gguf_sha256.as_deref(),
-        )?);
-    }
+    let (model, path) = &gguf;
+    step.set_prefix_identity(gguf_prefix_identity(
+        &model.weights,
+        path,
+        settings.gguf_sha256.as_deref(),
+    )?);
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
         // The section-timing marks stay off on the serve path: the timer is a measurement harness,
         // not a serving feature.
         section_marks: false,
     })?;
-    step.set_speculation(&settings.speculation)?;
     // Q8 chunking defaults on at 1024 rows; overrides use the supported row ladder.
     // Other sessions keep DEFAULT_CUDA_PREFILL_CHUNK; MLX `prefill_chunk` is ignored.
     let kv8_chunked = modes.chunked && kv_mode == KvMode::Int8G32;
@@ -2180,13 +2035,6 @@ fn make(
     // snapshot less the selected headroom. Fixed mode also checks live free VRAM and refuses an
     // undersized plan; legacy mode may keep the per-token arm.
     if let Some(host_limit) = settings.kv_offload_host_bytes {
-        if settings.draft_rollback == RollbackMode::Device {
-            return Err(EngError::BadRequest(
-                "engine config: draft_rollback device needs the resident KV plane; kv_offload_host_bytes \
-                 is set"
-                    .into(),
-            ));
-        }
         if device_first {
             if let Some(rows) = res
                 .paged
@@ -2212,52 +2060,18 @@ fn make(
             step.enable_pinned_prefix()?;
             enable_kv_disk(&mut step, &settings)?;
         }
-        let mut tip_bytes = 0;
         if modes.prefix == PrefixMemory::DeviceTip && step.pinned_prefix_enabled() {
-            tip_bytes = step.enable_device_tip()?;
+            let tip_bytes = step.enable_device_tip()?;
             extras.push(Extra {
                 name: "device-prefix-delta",
                 fixed: tip_bytes,
                 bytes_per_token: 0,
             });
         }
-        // The rollback slots: charged as an extra when the prefill arena is admitted; otherwise
-        // (FP16 KV with chunk prefill off) nothing admits them and the load reserve that no arena
-        // consumes covers them, which `enable_device_rollback` enforces before it allocates. A
-        // refusal here refuses the start: there is no fallback to the host rollback.
         let arena = arena_wanted(kv_mode, modes.chunk_off);
-        let mut rollback_cover = None;
-        if settings.draft_rollback == RollbackMode::Device {
-            let cover = if arena {
-                Cover::Arena
-            } else {
-                Cover::Reserve {
-                    headroom: prefill_headroom(modes.fixed_admission),
-                }
-            };
-            step.request_device_rollback();
-            let bytes =
-                step.enable_device_rollback(settings.speculation.max_rows, cover, tip_bytes)?;
-            if arena {
-                extras.push(Extra {
-                    name: "device-rollback-slots",
-                    fixed: bytes,
-                    bytes_per_token: 0,
-                });
-            }
-            rollback_cover = Some(cover);
-        }
-        // `draft_verify = krow` needs the armed slots above: ask for it, check the step's own
-        // fields against the one qualified configuration, then arm the K-row path.
-        if settings.draft_verify == VerifyMode::Krow {
-            step.request_krow_verify();
-            step.check_krow_arming(settings.speculation.max_rows)?;
-            step.enable_krow()?;
-        }
-        if tiered.is_some() && gguf.is_some() {
+        if tiered.is_some() {
             step.set_tiered_chunk(tiered_chunk_arm());
         }
-        let mut arena_admitted = None;
         if arena {
             let device_free = after
                 .free
@@ -2271,7 +2085,6 @@ fn make(
                 modes.fixed_admission,
                 modes.wide_stage,
             )?;
-            arena_admitted = Some(matches!(verdict, ChunkVerdict::Ready { .. }));
             let line = if kv_mode == KvMode::Int8G32 {
                 kv8_prefill_start_line(&verdict)
             } else {
@@ -2281,16 +2094,11 @@ fn make(
         } else {
             eprintln!("q36 cuda: prefill chunk off (Q36_CUDA_CHUNK_PREFILL=0): one token per step");
         }
-        if let (Some(cover), Some(plan)) = (rollback_cover, step.device_rollback_plan()) {
-            eprintln!("{}", rollback_startup_line(&plan, cover, arena_admitted)?);
-        }
     }
     let mut tiered_slots = None;
     if let Some(plan) = tiered {
         // The banks come last: they take what the weights, the KV cache and the step state left.
-        let (model, gguf) = gguf.as_ref().ok_or_else(|| {
-            EngError::BadRequest("engine config: tiered experts read the GGUF file".into())
-        })?;
+        let (model, gguf) = &gguf;
         let slots = attach_tiered_parts(
             &mut step,
             projector.context(),
@@ -2336,12 +2144,13 @@ fn make(
             KvMode::Int8G32 => "int8g32",
         },
         if settings.capture { "on" } else { "off" },
-        projector.context().single_gather_suffix() + &step.shared_in_routed_suffix()
+        projector.context().single_gather_suffix()
     );
     // The load's own reading is the first mark; the receipt is a report, never a reason to fail a
     // start that is otherwise good.
     step.record_free_vram("load", u64::try_from(after.free).unwrap_or(0));
-    if let Some((model, _)) = gguf.as_ref() {
+    {
+        let (model, _) = &gguf;
         let cache = crate::family::mem::fill::CacheFigure {
             cells: u64::try_from(options.context_tokens).unwrap_or(0),
             bytes: kv_cache,

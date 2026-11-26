@@ -69,24 +69,6 @@ pub(super) enum BlockOp {
         y: Slot,
         col: usize,
     },
-    /// One EXL3 projection of the unquantized F32 row; scratch is shared in stream order. The
-    /// sticky arithmetic flag is read once per token by the step, not after each projection.
-    ProjectExl3 {
-        phase: Phase,
-        role: Role,
-        x: Slot,
-        y: Slot,
-        col: usize,
-    },
-    /// One plain F32 matrix times the F32 row, for the DeltaNet gates an EXL3 pack leaves
-    /// unquantized: the weight is the role's raw tensor, `rows` columns land at `col` of `y`.
-    ProjectPlain {
-        phase: Phase,
-        role: Role,
-        x: Slot,
-        y: Slot,
-        col: usize,
-    },
     /// `pack` of the f32 row `x` (`k` values) into `xf`.
     Pack {
         phase: Phase,
@@ -244,8 +226,6 @@ impl BlockOp {
             | Self::NormQ8 { phase, .. }
             | Self::Project { phase, .. }
             | Self::ProjectQ { phase, .. }
-            | Self::ProjectExl3 { phase, .. }
-            | Self::ProjectPlain { phase, .. }
             | Self::Pack { phase, .. }
             | Self::QuantizeQ8 { phase, .. } => phase,
             Self::Conv { .. } => Phase::DeltaConv,
@@ -268,8 +248,6 @@ impl BlockOp {
             }
             Self::Project { xf, .. } => vec![xf],
             Self::ProjectQ { x_q8, .. } => vec![x_q8],
-            Self::ProjectExl3 { x, .. } => vec![x, Slot::Exl3Flag],
-            Self::ProjectPlain { x, .. } => vec![x],
             Self::Pack { x, .. } | Self::QuantizeQ8 { x, .. } => vec![x],
             Self::Conv { proj, .. } => vec![proj],
             Self::Delta { conv, proj, .. } => vec![conv, proj],
@@ -294,10 +272,6 @@ impl BlockOp {
             }
             Self::NormQ8 { q8, norm_out, .. } => vec![q8, norm_out],
             Self::Project { y, .. } | Self::ProjectQ { y, .. } => vec![y],
-            Self::ProjectExl3 { y, .. } => {
-                vec![y, Slot::Exl3Xh, Slot::Exl3Z, Slot::Exl3Flag]
-            }
-            Self::ProjectPlain { y, .. } => vec![y],
             Self::Pack { xf, .. } => vec![xf],
             Self::QuantizeQ8 { q8, .. } => vec![q8],
             Self::Conv { out, .. } | Self::Delta { out, .. } => vec![out],
@@ -350,7 +324,7 @@ pub(super) fn check_native_column(
 fn project_op(
     phase: Phase,
     role: Role,
-    (xf, x_q8, x_f32): (Slot, Slot, Slot),
+    (xf, x_q8, _): (Slot, Slot, Slot),
     y: Slot,
     col: usize,
     layout: WeightLayout,
@@ -370,23 +344,6 @@ fn project_op(
             y,
             col,
         },
-        // The pack keeps the 32-row DeltaNet gates as plain matrices.
-        WeightLayout::Exl3 if matches!(role, Role::SsmBeta | Role::SsmAlpha) => {
-            BlockOp::ProjectPlain {
-                phase,
-                role,
-                x: x_f32,
-                y,
-                col,
-            }
-        }
-        WeightLayout::Exl3 => BlockOp::ProjectExl3 {
-            phase,
-            role,
-            x: x_f32,
-            y,
-            col,
-        },
     }
 }
 
@@ -403,7 +360,6 @@ fn pack_op(
     match layout {
         WeightLayout::Tiled => Some(BlockOp::Pack { phase, x, xf, k }),
         WeightLayout::Native => Some(BlockOp::QuantizeQ8 { phase, x, q8, k }),
-        WeightLayout::Exl3 => None,
     }
 }
 
@@ -423,14 +379,6 @@ fn prologue(layout: WeightLayout) -> BlockOp {
             q8: Slot::Q8Mix,
             norm_out: Slot::NormRow,
         },
-        // The pack is discarded; EXL3 reads the producer's F32 `norm_out` only.
-        WeightLayout::Exl3 => BlockOp::NormPack {
-            phase: Phase::MixPack,
-            weight: Role::AttnNorm,
-            delta: None,
-            xf: Slot::XfMix,
-            norm_out: Some(Slot::NormRow),
-        },
     }
 }
 
@@ -445,7 +393,7 @@ fn epilogue(layout: WeightLayout, moe_tiled: bool) -> BlockOp {
             norm_out: Some(Slot::NormRow),
         },
         // The tiled-experts hybrid: the overridden expert stacks read the fp16 pack, so the
-        // epilogue produces it even beside the native session (the Exl3 shape).
+        // epilogue produces it even beside the native session.
         WeightLayout::Native if moe_tiled => BlockOp::NormPack {
             phase: Phase::AddNorm,
             weight: Role::PostAttentionNorm,
@@ -459,13 +407,6 @@ fn epilogue(layout: WeightLayout, moe_tiled: bool) -> BlockOp {
             delta: Some(Slot::MixOut),
             q8: Slot::Q8Moe,
             norm_out: Slot::NormRow,
-        },
-        WeightLayout::Exl3 => BlockOp::NormPack {
-            phase: Phase::AddNorm,
-            weight: Role::PostAttentionNorm,
-            delta: Some(Slot::MixOut),
-            xf: Slot::XfMoe,
-            norm_out: Some(Slot::NormRow),
         },
     }
 }

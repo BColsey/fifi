@@ -31,7 +31,7 @@
 use super::prefill::{Output, Projector, split, window};
 use crate::family::exl3::{
     bank::LayerResolver,
-    moe::{Exl3MoeWeights, SharedWeights},
+    moe::SharedWeights,
     shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu},
 };
 use crate::family::project::cuda::exl3_jobs::{
@@ -41,10 +41,7 @@ use crate::family::project::cuda::exl3_jobs::{
 use crate::family::project::exl3_jobs_plan::plan_subset_pairs;
 use crate::{
     EngError,
-    family::{
-        exl3::launch::MoeDims,
-        project::cuda::exl3::{Exl3Bank, Exl3Members},
-    },
+    family::{exl3::launch::MoeDims, project::cuda::exl3::Exl3Members},
     kernels::cuda::{
         DeviceRange, DeviceStream,
         prefill::swiglu_rows::SwigluRowsCall,
@@ -117,35 +114,6 @@ pub(in crate::family) trait PrefillStore: SlotResolver {
     }
 }
 
-struct ResidentStore<'r, 'w, R> {
-    resolver: &'r mut R,
-    banks: [&'w Exl3Bank; 3],
-}
-
-impl<R: SlotResolver> SlotResolver for ResidentStore<'_, '_, R> {
-    fn resolve_slots(
-        &mut self,
-        stream: &crate::kernels::cuda::DeviceStream,
-        picks: &[usize],
-    ) -> Result<Vec<usize>, EngError> {
-        self.resolver.resolve_slots(stream, picks)
-    }
-}
-
-impl<R: SlotResolver> PrefillStore for ResidentStore<'_, '_, R> {
-    fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError> {
-        bank_members(self.banks)
-    }
-}
-
-fn bank_members(banks: [&Exl3Bank; 3]) -> Result<[Exl3Members<'_>; 3], EngError> {
-    Ok([
-        banks[0].members()?,
-        banks[1].members()?,
-        banks[2].members()?,
-    ])
-}
-
 pub(in crate::family) struct Bufs<'b> {
     /// F32 `[m][hidden]`: the normalized rows, read only.
     pub(in crate::family) x2: DeviceRange<'b>,
@@ -176,22 +144,6 @@ pub(in crate::family) struct Bufs<'b> {
     pub(in crate::family) shared_act: DeviceRange<'b>,
     /// F32 `[m][hidden]`.
     pub(in crate::family) shared_out: DeviceRange<'b>,
-}
-
-/// Reads the picks of the chunk back, which waits for the stream, and sorts them. Keeps the
-/// device-test probe of the readback around the shared reader.
-fn read_plan(
-    projector: &Projector<'_>,
-    ids: DeviceRange<'_>,
-    dims: &MoeDims,
-) -> Result<PairPlan, EngError> {
-    #[cfg(test)]
-    let began = std::time::Instant::now();
-    let picks = read_ids(projector.launch, ids, dims)?;
-    #[cfg(test)]
-    crate::family::exl3::bank::probe::readback(began.elapsed());
-    // A fault-marked id (-1) falls through to the sort's refusal.
-    plan_pairs(&picks, dims.n_expert, dims.top_k)
 }
 
 /// The shared expert: gate and up into the halves of `shared_gu`, the SwiGLU, down.
@@ -258,44 +210,6 @@ fn project_jobs(
         .launch
         .ctx
         .exl3_jobs(projector.launch.stream, launch)
-}
-
-/// The routed experts: the sort, gate and up reading the chunk rows through a list, one SwiGLU,
-/// down writing each pair row to its place through a list.
-fn routed(
-    projector: &Projector<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Bufs<'_>,
-    dims: &MoeDims,
-) -> Result<(), EngError> {
-    routed_with(
-        projector,
-        weights,
-        bufs,
-        dims,
-        projector.launch.ctx.exl3_jobs_pair_enabled()?,
-    )
-    .map(|_| ())
-}
-
-/// [`routed`] with the pair request given; returns whether the gate and up projections rotated
-/// their rows together (the request was on, the scratch fit, and the buffers were aligned).
-pub(in crate::family) fn routed_with(
-    projector: &Projector<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Bufs<'_>,
-    dims: &MoeDims,
-    pair: bool,
-) -> Result<bool, EngError> {
-    let plan = read_plan(projector, bufs.ids, dims)?;
-    routed_plan(
-        projector,
-        bank_members([weights.gate, weights.up, weights.down])?,
-        bufs,
-        dims,
-        plan,
-        pair,
-    )
 }
 
 /// [`routed_with`] with the pair plan given: the caller has already read (and possibly
@@ -427,27 +341,6 @@ fn combine(projector: &Projector<'_>, bufs: &Bufs<'_>, dims: &MoeDims) -> Result
     )
 }
 
-/// Stages 10-17 of one layer of a chunk, after the router has written the picks: the shared
-/// expert, the routed experts and the combine. It waits for the stream once, to read the picks.
-pub(in crate::family) fn run(
-    projector: &Projector<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Bufs<'_>,
-    dims: &MoeDims,
-) -> Result<(), EngError> {
-    let shared_weights = SharedWeights {
-        gate: weights.shared_gate,
-        up: weights.shared_up,
-        down: weights.shared_down,
-    };
-    shared(projector, &shared_weights, bufs, dims)?;
-    split::mark(projector.launch.stream, "shared expert");
-    routed(projector, weights, bufs, dims)?;
-    combine(projector, bufs, dims)?;
-    split::mark(projector.launch.stream, "combine");
-    Ok(())
-}
-
 /// The per-row slice of every row-scaled buffer of `bufs` at chunk row `r0`, for `sub.rows`
 /// rows. The `perm` scratch stays whole: each sub-block rewrites and consumes it on the one
 /// stream before the next sub-block's launches, so no slice is needed.
@@ -505,32 +398,6 @@ fn run_expert_waves(
     combine(projector, bufs, dims)?;
     split::mark(projector.launch.stream, "combine");
     Ok(())
-}
-
-/// Stages 10-17 of one banked chunk layer: the shared expert once for the whole chunk, then the
-/// routed experts and the combine per sub-block, because the launches of one block read every
-/// pick of its rows together and the bank holds only `slots` members. The whole chunk's picks
-/// are read back once; each sub-block's picks are then mapped through the slot table
-/// (refilling missed slots from the host store) and grouped as slot ids. `sub` carries each
-/// sub-block's first row and its dims, built by the caller from its own chunk model.
-pub(in crate::family) fn run_banked(
-    projector: &Projector<'_>,
-    weights: &Exl3MoeWeights<'_>,
-    bufs: &Bufs<'_>,
-    dims: &MoeDims,
-    sub: &[(usize, MoeDims)],
-    bank: &mut impl SlotResolver,
-) -> Result<(), EngError> {
-    let shared_weights = SharedWeights {
-        gate: weights.shared_gate,
-        up: weights.shared_up,
-        down: weights.shared_down,
-    };
-    let mut store = ResidentStore {
-        resolver: bank,
-        banks: [weights.gate, weights.up, weights.down],
-    };
-    run_store(projector, &shared_weights, bufs, dims, sub, &mut store)
 }
 
 /// The same banked pass over a store that lends typed, possibly interleaved routed views.

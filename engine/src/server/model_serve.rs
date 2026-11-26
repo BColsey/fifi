@@ -819,7 +819,7 @@ fn select_weight_format(has_gguf: bool, has_safetensors: bool) -> &'static str {
     if has_gguf {
         if has_safetensors {
             eprintln!(
-                "weights: the directory holds GGUF and EXL3 shards; serving the qualified GGUF default (EXL3 is experimental — select it with --config and weight_format exl3)"
+                "weights: the directory holds GGUF and safetensors shards; serving the GGUF file (Qwen3.6 on CUDA serves GGUF only)"
             );
         }
         "gguf"

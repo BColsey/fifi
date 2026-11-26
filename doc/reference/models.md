@@ -2,7 +2,7 @@
 
 | `family` | Model | Apple Silicon | NVIDIA CUDA | Checkpoint |
 | --- | --- | --- | --- | --- |
-| `qwen3_6_35b_a3b` | Qwen3.6-35B-A3B | yes | yes | MLX: `mlx-community/Qwen3.6-35B-A3B-4bit`. CUDA: `Qwen3.6-35B-A3B-Q4_K_M.gguf` from `ggml-org/Qwen3.6-35B-A3B-GGUF`, or an [EXL3 pack](configuration.md#exl3-pack-cuda). |
+| `qwen3_6_35b_a3b` | Qwen3.6-35B-A3B | yes | yes | MLX: `mlx-community/Qwen3.6-35B-A3B-4bit`. CUDA: `Qwen3.6-35B-A3B-Q4_K_M.gguf` from `ggml-org/Qwen3.6-35B-A3B-GGUF`. CUDA serves only the GGUF format for this model. |
 | `flint` | Flint, 39.8B total, 2.5B active | yes | pilot | MLX: `RecursiveSI/flint-int4`. CUDA: `0xBakeer/TandemLLM-Flint-EXL3-4.0`. |
 | `nemotron35` | Nemotron 3.5 Super, 120B total, 12B active | no | yes, greedy only | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` at revision `8a115b9d`. |
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
@@ -99,7 +99,7 @@ Set `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT=1` to reduce the DSpark draft width afte
 A `raon1` engine reads its tokenizer and chat template from the GGUF file instead.
 Every other engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.
 For the three validated families, startup compares the files with the SHA-256 hashes of the tested release and refuses others.
-For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4bit` with either the GGUF file or the EXL3 pack. The other validated checkpoints listed above include matching files.
+For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4bit` with the GGUF file. The other validated checkpoints listed above include matching files.
 
 ## Weight formats
 
@@ -110,7 +110,7 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | GGUF Q8_0, and K-quant conversions of it | Bolt E4B on CUDA |
 | GGUF, matrices dequantized on demand | SenseNova-Loop on CPU (the published Q4_K_M file) |
 | GGUF, mainline `inkling2_loop` or older `inkling2` layout | Inkling 2 Mini on Apple Silicon, and on CPU or CUDA with family `inkling2_loop` |
-| EXL3 | Qwen3.6 and Flint on CUDA |
+| EXL3 | Flint on CUDA |
 | NVFP4 safetensors | Nemotron 3.5 Super |
 | Mixed NVFP4 and MXFP8 safetensors | Inkling 2 Mini on Apple Silicon |
 

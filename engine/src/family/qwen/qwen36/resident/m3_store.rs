@@ -251,19 +251,6 @@ pub(in super::super) fn registered_ids_sha() -> &'static str {
     IDS_SHA
 }
 
-/// The frozen arm-4 trace input: i64 LE ids, sha and count registered.
-pub(in super::super) const TRACE_IDS: usize = 1119;
-const TRACE_SHA: &str = "0c04651f0c9d7a85a7dee46c3ae5007518aa13bd13497991dbe27cd145858a7a";
-
-pub(in super::super) fn registered_trace_sha() -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let hex = |c: u8| (c as char).to_digit(16).expect("hex digit") as u8;
-        *slot = (hex(TRACE_SHA.as_bytes()[i * 2]) << 4) | hex(TRACE_SHA.as_bytes()[i * 2 + 1]);
-    }
-    out
-}
-
 /// The sidecar bytes of one window: header + rows + trailing sha256.
 pub(in super::super) fn sidecar_bytes(
     window: usize,
@@ -530,77 +517,6 @@ fn run_compare(
         ),
         verdict,
     ))
-}
-
-/// The arm-4 gate: the two trace legs' digest files (one sha256 per
-/// position's full f32 row) must be byte-identical. The legs write a
-/// `trace_identity.txt` next to the digests; the compare first asserts the
-/// pair really is (gather off, gather on) of the SAME build, trace input
-/// and count — a mismatched pair aborts before the bitwise compare.
-/// `#[ignore]`d host entry: M3_TRACE_COMPARE=dir_a:dir_b.
-#[test]
-#[ignore = "two trace leg outputs: M3_TRACE_COMPARE=arm2_dir:arm4_dir"]
-fn m3_trace_compare() {
-    let spec = std::env::var("M3_TRACE_COMPARE").expect("M3_TRACE_COMPARE=dir_a:dir_b");
-    let parts: Vec<&str> = spec.split(':').collect();
-    let identity_of = |dir: &str| -> std::collections::BTreeMap<String, String> {
-        let text = std::fs::read_to_string(Path::new(dir).join("trace_identity.txt"))
-            .expect("trace_identity.txt");
-        text.lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    };
-    let a = identity_of(parts[0]);
-    let b = identity_of(parts[1]);
-    for key in ["build_sha256", "trace_sha256", "ids"] {
-        assert_eq!(
-            a.get(key),
-            b.get(key),
-            "the trace pair disagrees on {key}: {:?} vs {:?}",
-            a.get(key),
-            b.get(key)
-        );
-    }
-    // Normalize the gather vocabulary: identity files written before the
-    // canonical-writer fix spell the two states "off" and "1"; later ones
-    // write "false" and "true". Both spell one on/off pair.
-    let norm = |v: Option<&str>| -> Option<String> {
-        match v {
-            Some("off") | Some("false") => Some("off".into()),
-            Some("1") | Some("true") | Some("on") => Some("on".into()),
-            other => other.map(str::to_string),
-        }
-    };
-    let mut gathers = [
-        norm(a.get("gather").map(String::as_str)),
-        norm(b.get("gather").map(String::as_str)),
-    ];
-    gathers.sort_unstable();
-    assert_eq!(
-        gathers,
-        [Some("off".to_string()), Some("on".to_string())],
-        "the pair must be one gather=off leg and one gather=on leg"
-    );
-    let a = std::fs::read(Path::new(parts[0]).join("trace_rows.sha256"))
-        .expect("arm a trace_rows.sha256");
-    let b = std::fs::read(Path::new(parts[1]).join("trace_rows.sha256"))
-        .expect("arm b trace_rows.sha256");
-    assert_eq!(a.len(), b.len(), "the trace legs scored different lengths");
-    assert!(
-        a.len().is_multiple_of(32) && !a.is_empty(),
-        "not a digest file"
-    );
-    for (i, (x, y)) in a
-        .as_chunks::<32>()
-        .0
-        .iter()
-        .zip(b.as_chunks::<32>().0)
-        .enumerate()
-    {
-        assert_eq!(x, y, "trace position {i}: row bits differ");
-    }
-    println!("m3 trace: {} positions bitwise-identical", a.len() / 32);
 }
 
 #[cfg(test)]

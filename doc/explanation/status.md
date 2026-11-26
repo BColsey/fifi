@@ -117,8 +117,8 @@ A 31,650-token prompt over the tuned 16,384 cap refuses with the same `context_l
 
 ## Models without a current measurement here
 
-- **Qwen3.6 EXL3 4.00 bpw on the 3090**: not measured — no pack on the host during the 20 Nov 2026 sweep; the rows from the October sweeps were removed with this rewrite. The format is merged and selected with `"weight_format": "exl3"`; a same-day figure needs the pack present.
-- **Qwen3.6 EXL3 2.08 bpw on an RTX 4050 laptop**: not measured — the engine's pinned tokenizer check refuses the pack's `tokenizer.json`.
+- **Qwen3.6 EXL3 4.00 bpw on the 3090**: not served. Qwen3.6 on CUDA serves the GGUF checkpoint only, and `"weight_format": "exl3"` is refused before any weight is read. The October sweep rows were removed with this rewrite.
+- **Qwen3.6 EXL3 2.08 bpw on an RTX 4050 laptop**: not served, for the same reason.
 - **Flint on the 3090**: not measured — no Flint pack on that host.
 - **Bolt e4b on the 3090**: refused — "gemma4 serve: 4 .gguf files in the model directory; exactly one expected" (the store keeps four quantizations of this model in one directory and the loader accepts exactly one file).
 - **Nemotron 3.5 Super on the 3090**: refused — the loader for this family is safetensors-based and the store holds only a GGUF conversion: "config.json: No such file" then "open shard: No such file".

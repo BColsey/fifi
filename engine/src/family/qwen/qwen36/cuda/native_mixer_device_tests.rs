@@ -200,7 +200,6 @@ fn run_block(
             let t_at = tiled_index(&specs, spec.role);
             let weight = match layout {
                 WeightLayout::Tiled => DenseWeight::Tiled(&tiled[t_at]),
-                WeightLayout::Exl3 => panic!("GGUF fixture cannot fabricate EXL3 components"),
                 WeightLayout::Native => {
                     // Under the fused ops the siblings have no native weight; they are
                     // simply absent from the map (nothing asks for them).

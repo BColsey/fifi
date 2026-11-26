@@ -18,17 +18,9 @@ mod d1_oracle_tests;
 pub(crate) mod driver;
 #[cfg(target_pointer_width = "64")]
 pub(crate) mod dspark;
-#[cfg(test)]
-pub(crate) mod krow_measure;
-#[cfg(test)]
-mod krow_measure_tests;
 pub(crate) mod mtp;
 pub(crate) mod repeat;
 pub(crate) mod stats;
 #[cfg(test)]
 mod study;
 pub(crate) mod window;
-#[cfg(test)]
-pub(crate) mod window_cost;
-#[cfg(test)]
-mod window_cost_tests;

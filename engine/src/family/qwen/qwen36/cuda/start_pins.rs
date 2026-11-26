@@ -353,29 +353,25 @@ fn the_rules_are_built_before_the_first_device_call() {
     assert!(make.contains("rules:QwenRules") && make.contains("QwenResidentStep::new("));
 }
 
-/// The weight format picks the load: a GGUF entry opens the pinned file, an EXL3 entry opens no
-/// GGUF and loads the pack before the layout is read from the device weights.
+/// The weight format picks the load: a GGUF entry opens the pinned file, and an EXL3 entry is
+/// refused with the message naming GGUF before any weight is read.
 #[test]
 fn the_weight_format_selects_the_load_in_make() {
     let make = pinned(fn_section("fn make("));
+    assert!(make.contains("WeightFormat::Gguf=>open_gguf("), "{make}");
     assert!(
-        make.contains("WeightFormat::Gguf=>Some(open_gguf("),
+        make.contains("WeightFormat::Exl3=>returnErr(exl3_refusal("),
         "{make}"
     );
-    assert!(make.contains("WeightFormat::Exl3=>None"), "{make}");
     let device = make
         .find("CudaProjector::new()")
         .expect("make opens the device");
-    let pack = make
-        .find("load_exl3_dir_decided(")
-        .expect("make loads the pack");
+    let gguf = make.find("open_gguf(").expect("make opens the GGUF");
     let layout = make
         .find("device.layout()?")
         .expect("make reads the layout");
-    assert!(device < pack && pack < layout, "{device} {pack} {layout}");
-    // Only the GGUF arm reaches the file-based loads.
+    assert!(device < gguf && gguf < layout, "{device} {gguf} {layout}");
     assert_eq!(make.matches("open_gguf(").count(), 1);
-    assert_eq!(make.matches("load_exl3_dir_decided(").count(), 1);
 }
 
 #[test]

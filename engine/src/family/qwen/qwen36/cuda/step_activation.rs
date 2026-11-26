@@ -26,7 +26,6 @@ impl QwenResidentStep<'_> {
             ("tiered experts", self.tiered_mode),
             ("paged KV", self.res.paged.is_some()),
             ("sparse attention", self.res.sparse.is_some()),
-            ("speculative decode", self.speculator.is_some()),
             ("row window", self.window.is_some()),
             ("layer trace", super::super::super::trace::trace_enabled()),
         ] {

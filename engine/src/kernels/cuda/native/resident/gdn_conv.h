@@ -43,30 +43,7 @@ int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args *args, voi
 int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv_args *args, void *stream,
                                         int *out_stage, int rows_per_thread);
 
-/* The same step with per-token state snapshots stored at a stride (the K-row verify window). After
- * token t < m - 1 the planar state [3][channels] is also stored at snap + t * snap_stride bytes, so
- * a K-row window writes the state after each row straight into its rollback slot. The kernel is the
- * kSnap = true instantiation of the vendored conv_silu_k (patch GDN-snap-stride); the entry above
- * keeps launching the original instantiation. The snapshot rows are stores only: out and state are
- * the bytes of the entry above. Needs m >= 2, snap 4-byte aligned, snap_stride a multiple of 4 and
- * at least 12 * channels bytes, and snap_bytes >= (m - 2) * snap_stride + 12 * channels. snap must
- * overlap no other range. */
-typedef struct inference_cuda_gdn_conv_snap_args {
-    inference_cuda_gdn_conv_args conv;
-    void *snap;
-    size_t snap_stride;
-    size_t snap_bytes;
-} inference_cuda_gdn_conv_snap_args;
-
-int inference_cuda_gdn_conv_snap_launch(const inference_cuda_gdn_conv_snap_args *args, void *stream,
-                                        int *out_stage);
-
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_gdn_conv_snap_args) == 72 &&
-                  offsetof(inference_cuda_gdn_conv_snap_args, snap) == 48 &&
-                  offsetof(inference_cuda_gdn_conv_snap_args, snap_stride) == 56 &&
-                  offsetof(inference_cuda_gdn_conv_snap_args, snap_bytes) == 64,
-              "inference_cuda_gdn_conv_snap_args layout");
 }
 #endif
 

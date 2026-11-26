@@ -7,7 +7,6 @@
 pub(in crate::family) mod book;
 #[cfg(test)]
 mod book_tests;
-pub(in crate::family) mod krow_graph;
 
 /// How a window of the K-row body runs: replay a captured graph, attempt the
 /// capture, or run the eager body.
