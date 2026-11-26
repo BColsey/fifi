@@ -2115,3 +2115,54 @@ fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
         "a reset must fill on the stream and upload nothing: {fills} fills, {uploads} uploads"
     );
 }
+
+/// Decode as a chunk of one row against the one-row decode walk: after the same 512-token
+/// prompt on two cards, 64 greedy steps on each. Reports the time of a step on both routes and
+/// the worst logits difference; the ids must agree.
+#[test]
+fn card_chunk_of_one_against_the_decode_walk() {
+    const PROMPT_TOKENS: usize = 512;
+    const STEPS: usize = 64;
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova chunk of one") else {
+        return;
+    };
+    let vocab = weights.shape().vocab;
+    let ids: Vec<u32> = (1..=PROMPT_TOKENS as u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) >> 7)
+        .map(|id| id % vocab as u32)
+        .collect();
+    let embed = projector.rows(weights.token_embd(), &ids).unwrap();
+    let cache = PROMPT_TOKENS + STEPS + 1;
+    let mut walked = open_card(&ctx, &loaded, &weights, cache);
+    let mut chunked = open_card(&ctx, &loaded, &weights, cache);
+    walked.prefill(&embed, 0).unwrap();
+    chunked.prefill(&embed, 0).unwrap();
+    let mut token = argmax(&drain_row(&ctx, &walked));
+    assert_eq!(token, argmax(&drain_row(&ctx, &chunked)));
+    let (mut walk_s, mut chunk_s, mut worst) = (0.0f64, 0.0f64, 0.0f32);
+    let mut differing = 0;
+    for step in 0..STEPS {
+        let pos = PROMPT_TOKENS + step;
+        let row = projector.rows(weights.token_embd(), &[token]).unwrap();
+        let t0 = std::time::Instant::now();
+        walked.decode(&row, pos).unwrap();
+        let a = drain_row(&ctx, &walked);
+        walk_s += t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        chunked.prefill(&row, pos).unwrap();
+        let b = drain_row(&ctx, &chunked);
+        chunk_s += t0.elapsed().as_secs_f64();
+        worst = worst.max(max_abs_diff(&a, &b));
+        if argmax(&a) != argmax(&b) {
+            differing += 1;
+        }
+        token = argmax(&a);
+    }
+    eprintln!(
+        "decode walk {:.2} ms/step ({:.1} tok/s) | chunk of one {:.2} ms/step ({:.1} tok/s) | worst |diff| {worst:.4} | differing ids {differing} of {STEPS}",
+        walk_s * 1e3 / STEPS as f64,
+        STEPS as f64 / walk_s,
+        chunk_s * 1e3 / STEPS as f64,
+        STEPS as f64 / chunk_s,
+    );
+}
