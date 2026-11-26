@@ -467,4 +467,40 @@ mod tests {
             "{text}"
         );
     }
+
+    /// The tokenizer manifest sits where the pack's lookup finds it (the tokenizer directory
+    /// here), and that lookup would keep the pack's start. The factory must still route the
+    /// checkpoint to this start: the pack's start cannot serve a GGUF directory. The witness is
+    /// the first refusal of `plan`, which comes before any card is opened; the pack's start
+    /// answers the same entry with other text.
+    #[test]
+    fn the_factory_routes_the_checkpoint_to_this_start_beside_a_manifest() {
+        let fixture = write_flash(&Spec::default());
+        let tokenizer_dir = tempfile::tempdir().unwrap();
+        std::fs::write(tokenizer_dir.path().join("download-manifest.json"), "{}").unwrap();
+        let env = FlashEnv {
+            gguf_serve: Some("1".into()),
+            ..FlashEnv::default()
+        };
+        let options = FlashOptions {
+            cuda_decode: Some(false),
+            ..FlashOptions::default()
+        };
+        let error = match crate::family::qwen::flash_next::factory::start_engine_resolved(
+            &fixture.first,
+            tokenizer_dir.path(),
+            Some(&options),
+            &env,
+            false,
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a CUDA decoder switched off must refuse the start"),
+        };
+        assert_eq!(
+            error.describe(),
+            "engine config: the Flash-Next CUDA decoder is off; set flash_next.cuda_decode to \
+             true to serve on a card"
+        );
+    }
 }

@@ -58,17 +58,24 @@ pub(crate) fn start_engine_resolved(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(StartedEngine, Option<FlashSettings>), EngError> {
-    // A directory that starts from a pack keeps the pack's start, whatever GGUF lies beside it.
-    // A GGUF checkpoint alone has no manifest and no `config.json`: it plans from its own
-    // metadata and tensor table and takes its own start, without settings of the pack's kind.
+    // A directory that starts from a pack keeps the pack's start, whatever GGUF lies beside it,
+    // unless `INFERENCE_FLASH_NEXT_GGUF_SERVE` is on: the staged start pins its tokenizer through
+    // the same manifest lookup and cannot run without one, so with the switch on a GGUF
+    // checkpoint takes that start whether or not a manifest is found. Where a manifest is found
+    // the switch is read here, so one that is set and is not an enable word is refused before
+    // the directory is opened, a pack's as well as a checkpoint's. Without the switch a GGUF
+    // checkpoint alone has no manifest and no `config.json`: it plans from its own metadata and
+    // tensor table and takes its own start, without settings of the pack's kind.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    if !super::settings::pack_start(options, env, model_dir, tokenizer_dir)
+    if !(super::settings::pack_start(options, env, model_dir, tokenizer_dir)
+        && !env.gguf_serve()?)
         && let Some(model) = super::load::gguf::GgufModel::open(model_dir)?
     {
         use super::load::gguf::start::StartInput;
         // `INFERENCE_FLASH_NEXT_GGUF_SERVE` selects the staged GGUF decode modules; without it
         // the start takes the path behind `FIFI_FLASH_NEXT_GGUF` (`check_opt_in`). A mis-set
-        // switch is refused here, before the card is opened.
+        // switch is refused before the card is opened: here where no manifest was found, at the
+        // gate otherwise.
         let (engine, bundle, context_limit) = if env.gguf_serve()? {
             super::load::gguf::start::start_staged(
                 model,
