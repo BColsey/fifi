@@ -256,6 +256,13 @@ fn resident_pass_parity() {
             "logits_max_abs": max_abs, "argmax_mismatches": argmax_mismatches, "steps": argmax.len(),
             "prefill_us_pass": value["prefill_us"], "prefill_us_host": expected["prefill_us"]})
     );
+    // `FIFI_INKLING_PASS_PARITY_DUMP=<path>`: this arm's fingerprints and logits, for per-step
+    // comparisons outside the test.
+    if let Some(out) = env::var_os("FIFI_INKLING_PASS_PARITY_DUMP") {
+        let mut copy = value.clone();
+        copy.as_object_mut().map(|object| object.remove("parts"));
+        fs::write(out, serde_json::to_vec(&copy).unwrap()).unwrap();
+    }
     assert_eq!(visits.len(), expected_visits.len());
     if unequal_visits != 0 {
         if let Some(out) = env::var_os("FIFI_INKLING_PASS_PARTS_OUT") {
