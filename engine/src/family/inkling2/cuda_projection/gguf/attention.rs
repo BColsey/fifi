@@ -350,6 +350,17 @@ impl ResidentAttention {
         }
     }
 
+    /// [`Self::download_ring`] behind this attention's own stream, which appends the rows of a
+    /// device prompt visit.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::family::inkling2) fn download_prompt_ring(
+        &self,
+        slot: usize,
+        position: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), EngError> {
+        self.download_ring(&self.stream, slot, position)
+    }
+
     /// The K and V rows of one visit's ring at `position`, oldest last, read behind the work
     /// queued on `stream`, which must be the stream that appended the rows. Only explicit host
     /// events call it; a chain token keeps these rows on the device.
@@ -575,17 +586,19 @@ impl Row<'_> {
         bytes: &mut Vec<u8>,
     ) -> Result<[usize; 8], EngError> {
         bytes.clear();
-        let offsets = self.append_inputs(shape, position, bytes, [false; 6])?;
+        let offsets = self.append_inputs(shape, position, bytes, ([false; 6], false))?;
         bytes.extend_from_slice(&0_u32.to_ne_bytes());
         Ok(offsets)
     }
 
+    /// Appends the row's host inputs. Slots marked `resident` take no bytes; with `device_kv`
+    /// an empty K or V row is a zero slot the device's K/V preparation fills.
     fn append_inputs(
         &self,
         shape: RelativeAttentionShape,
         position: i32,
         bytes: &mut Vec<u8>,
-        resident: [bool; 6],
+        (resident, device_kv): ([bool; 6], bool),
     ) -> Result<[usize; 8], EngError> {
         let slices = [
             self.query,
@@ -610,13 +623,18 @@ impl Row<'_> {
                 *size = 0;
             }
         }
-        if slices.each_ref().map(|slice| slice.len()) != sizes {
+        let filled = |i: usize| device_kv && (i == 1 || i == 2) && slices[i].is_empty();
+        if (0..6).any(|i| slices[i].len() != sizes[i] && !filled(i)) {
             return Err(bad("incorrect CUDA relative attention input shape"));
         }
         let mut offsets = [0; 8];
-        for (offset, slice) in offsets.iter_mut().zip(slices) {
+        for (i, (offset, slice)) in offsets.iter_mut().zip(slices).enumerate() {
             *offset = bytes.len();
-            extend_words(bytes, slice);
+            if filled(i) {
+                bytes.resize(bytes.len() + sizes[i] * size_of::<f32>(), 0);
+            } else {
+                extend_words(bytes, slice);
+            }
         }
         offsets[6] = bytes.len();
         bytes.extend_from_slice(&position.to_ne_bytes());

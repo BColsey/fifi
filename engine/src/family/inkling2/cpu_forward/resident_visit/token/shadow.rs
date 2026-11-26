@@ -70,9 +70,49 @@ impl CpuForward {
 }
 
 impl CpuForward {
-    /// Brings rows that only the device holds after a chain token back to the host state.
-    /// Every host-orchestrated consumer calls it first; it is a no-op while no visit is resident.
+    /// Brings rows that only the device holds back to the host state: those of a chain token
+    /// and the K/V of device prompt visits. Every host-orchestrated consumer calls it first; it
+    /// is a no-op while no visit is resident or ring-only.
     pub(in crate::family::inkling2::cpu_forward) fn materialize_resident(
+        &mut self,
+    ) -> Result<(), EngError> {
+        self.materialize_token_rows()?;
+        let mut states = std::mem::take(&mut self.state);
+        let outcome = states
+            .iter_mut()
+            .enumerate()
+            .try_for_each(|(slot, state)| self.materialize_ring(slot, state));
+        self.state = states;
+        outcome
+    }
+
+    /// The K/V rows of one ring-only visit, read back into its host state.
+    pub(in crate::family::inkling2::cpu_forward) fn materialize_ring(
+        &self,
+        slot: usize,
+        state: &mut VisitState,
+    ) -> Result<(), EngError> {
+        if !state.is_ring_only() {
+            return Ok(());
+        }
+        let Weights::Gguf(w) = &self.weights else {
+            return Err(bad("ring-only rows without GGUF weights"));
+        };
+        let Some((_, attention)) = w.cuda().and_then(|cuda| cuda.resident_attention()) else {
+            return Err(bad("ring-only rows without the device attention"));
+        };
+        let capacity = self
+            .visits
+            .iter()
+            .find(|v| v.state_slot == slot)
+            .map_or(0, |v| self.kv_capacity(v.attention));
+        let rows = attention.download_prompt_ring(slot, state.position())?;
+        state.adopt_ring(rows, capacity);
+        Ok(())
+    }
+
+    /// Brings the rows of a chain token back to the host state; ring-only visits stay so.
+    pub(in crate::family::inkling2::cpu_forward) fn materialize_token_rows(
         &mut self,
     ) -> Result<(), EngError> {
         if !self.state.iter().any(VisitState::is_resident) {

@@ -85,6 +85,12 @@ pub(super) struct VisitState {
     /// host-orchestrated consumer calls `CpuForward::materialize_resident` first.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     resident: bool,
+    /// Set while the K/V rows of this visit exist only in the device ring, so the deques above
+    /// are empty, and the convolution histories are on the host: a device prompt visit leaves
+    /// its state so. Host consumers of the rows call `CpuForward::materialize_resident`, or
+    /// `CpuForward::materialize_ring` for one visit, first.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    ring_only: bool,
 }
 
 /// The parts of one visit overwritten by one forward row.
@@ -196,8 +202,8 @@ impl CpuForward {
         })
     }
 
-    /// [`Self::prepare_attention_row`] without K and V, which the device prepares: their slots
-    /// stay zero until the device's rows replace them.
+    /// [`Self::prepare_attention_row`] without K and V, which the device prepares: their rows
+    /// stay empty until the device's rows replace them.
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     fn prepare_attention_query(
         &self,
@@ -217,11 +223,10 @@ impl CpuForward {
                 self.math.rel_l2_clip_threshold,
             );
         }
-        let slot = vec![0.0; heads.kv_channels()];
         Ok(PreparedAttention {
             q,
-            k: slot.clone(),
-            v: slot,
+            k: Vec::new(),
+            v: Vec::new(),
             relative,
             sinks,
             gates,
@@ -803,6 +808,39 @@ impl VisitState {
         self.conv = VisitConvs::default();
         self.position += 1;
         self.resident = true;
+        self.ring_only = false;
+    }
+
+    /// Whether the K/V rows exist only in the device ring.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn is_ring_only(&self) -> bool {
+        self.ring_only
+    }
+
+    /// The device ring committed the K/V rows of the next `rows` positions; the host keeps
+    /// none of the visit's rows and its convolution histories as they are.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn advance_ring(&mut self, rows: usize) {
+        self.keys.clear();
+        self.values.clear();
+        self.position += rows;
+        self.ring_only = true;
+    }
+
+    /// Adopts the ring's K/V rows read back from the device, oldest last as the ring yields
+    /// them; the deques run newest first.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn adopt_ring(
+        &mut self,
+        (keys, values): (Vec<Vec<f32>>, Vec<Vec<f32>>),
+        capacity: usize,
+    ) {
+        debug_assert!(self.ring_only && self.keys.is_empty() && !self.resident);
+        self.keys = keys.into_iter().rev().map(Arc::new).collect();
+        self.values = values.into_iter().rev().map(Arc::new).collect();
+        self.keys.truncate(capacity);
+        self.values.truncate(capacity);
+        self.ring_only = false;
     }
 
     /// Adopts rows read back from the device. `keys` and `values` run oldest last, as the
@@ -833,6 +871,7 @@ impl VisitState {
             history.truncate(past);
         }
         self.resident = false;
+        self.ring_only = false;
     }
 
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -963,7 +1002,7 @@ impl VisitState {
         }
         // A resident state has no host rows to undo; its first host consumer materializes.
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        debug_assert!(!self.resident);
+        debug_assert!(!self.resident && !self.ring_only);
         self.conv = VisitConvs {
             k,
             v,
@@ -973,6 +1012,11 @@ impl VisitState {
     }
 
     fn push(&mut self, key: Vec<f32>, value: Vec<f32>, length: usize) {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        debug_assert!(
+            !self.ring_only,
+            "a host row joined rows only the device ring holds"
+        );
         self.keys.push_front(Arc::new(key));
         self.values.push_front(Arc::new(value));
         self.keys.truncate(length);
@@ -1105,6 +1149,7 @@ impl PrefillBridge<'_> {
         forward: &'s CpuForward,
         state: &'s VisitState,
         coefficients: Vec<f32>,
+        read_rows: bool,
     ) -> Result<attention::prefill::KvPrep<'s>, EngError> {
         let heads = self.heads;
         let channels = heads.kv_channels();
@@ -1132,6 +1177,7 @@ impl PrefillBridge<'_> {
             coefficients,
             limit: forward.math.qk_l2_clip_threshold,
             eps: forward.math.rms_norm_eps,
+            read_rows,
             prepared: std::cell::Cell::new(None),
         })
     }
@@ -1201,6 +1247,15 @@ impl PrefillBridge<'_> {
         conv: Option<(&mut attention::prefill::PrefillConv, bool)>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
         let resident_query = side.query.is_some();
+        let status_only = matches!(conv, Some((_, false)));
+        // A device prompt visit leaves the K/V it prepares in the ring alone; every other
+        // consumer adopts them as host rows.
+        let ring_only = status_only && self.kv;
+        if state.is_ring_only() && !ring_only {
+            return Err(super::bad(
+                "Inkling host attention rows reached a visit whose K/V only the ring holds",
+            ));
+        }
         let mut prepared = Vec::new();
         let mut coefficients = Vec::new();
         for p in host {
@@ -1213,7 +1268,7 @@ impl PrefillBridge<'_> {
         }
         let kv = self
             .kv
-            .then(|| self.kv_prep(forward, state, coefficients))
+            .then(|| self.kv_prep(forward, state, coefficients, !ring_only))
             .transpose()?;
         let side = attention::prefill::Sidecar {
             kv: kv.as_ref(),
@@ -1221,7 +1276,6 @@ impl PrefillBridge<'_> {
         };
         let rows: Vec<_> = prepared.iter().map(PreparedAttention::device_row).collect();
         let convolved = conv.is_some();
-        let status_only = matches!(conv, Some((_, false)));
         let values = {
             let _span = forward.phase_span(Work::DeviceAttention);
             let history = attention::History {
@@ -1264,8 +1318,12 @@ impl PrefillBridge<'_> {
                 state.conv.v.remember(v, taps);
             }
         }
-        // The device ring is only a cache: publish the prepared host K/V
-        // after the device status and output have passed validation.
+        // Publish the cursor or the prepared host K/V after the device status and output have
+        // passed validation.
+        if ring_only {
+            state.advance_ring(prepared.len());
+            return Ok(values);
+        }
         let capacity = forward.kv_capacity(self.visit.attention);
         if status_only {
             for row in prepared {

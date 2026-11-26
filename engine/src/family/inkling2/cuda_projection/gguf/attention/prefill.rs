@@ -101,11 +101,13 @@ pub(in crate::family::inkling2) struct KvPrep<'a> {
     pub coefficients: Option<Vec<f32>>,
     pub limit: f32,
     pub eps: f32,
+    /// Whether the prepared rows come back to the host; the raw tail always does.
+    pub read_rows: bool,
     pub prepared: std::cell::Cell<Option<KvPrepared>>,
 }
 
 pub(in crate::family::inkling2) struct KvPrepared {
-    /// The prepared K and V of each row.
+    /// The prepared K and V of each row, empty unless `KvPrep::read_rows` asked for them.
     pub rows: Vec<[Vec<f32>; 2]>,
     /// The raw K and V of the last rows, at most three, oldest first.
     pub raw_tail: Vec<[Vec<f32>; 2]>,
@@ -274,6 +276,7 @@ fn read_kv_prep(
     transfer: &PinnedBuf,
     layout: Layout,
     offsets: &[[usize; 8]],
+    read_rows: bool,
 ) -> Result<KvPrepared, EngError> {
     let count = offsets.len();
     let width = layout.resident[1] / size_of::<f32>();
@@ -290,6 +293,7 @@ fn read_kv_prep(
     };
     let rows = offsets
         .iter()
+        .filter(|_| read_rows)
         .map(|row| Ok([read(rows_at + row[1])?, read(rows_at + row[2])?]))
         .collect::<Result<_, EngError>>()?;
     let tail = count.min(PrepShape::TAPS - 1);
@@ -755,7 +759,10 @@ impl ResidentAttention {
                 visit.shape,
                 (position + i) as i32,
                 &mut work.encoded,
-                layout.side_slots(),
+                (
+                    layout.side_slots(),
+                    side.as_ref().is_some_and(|s| s.kv.is_some()),
+                ),
             )?);
         }
         if let Some(query) = side.as_ref().and_then(|s| s.query) {
@@ -989,17 +996,19 @@ impl ResidentAttention {
                 &mut work.transfer,
                 0,
             )?;
-            if kv.is_some() {
+            if let Some((kv, _)) = kv {
                 let side = side
                     .as_ref()
                     .ok_or_else(|| bad("K/V preparation lacks side rows"))?;
                 let rows_at = count * (4 + layout.output);
-                context.copy_to_pinned(
-                    &self.stream,
-                    work.device.range(0, count * layout.input)?,
-                    &mut work.transfer,
-                    rows_at,
-                )?;
+                if kv.read_rows {
+                    context.copy_to_pinned(
+                        &self.stream,
+                        work.device.range(0, count * layout.input)?,
+                        &mut work.transfer,
+                        rows_at,
+                    )?;
+                }
                 let tail = count.min(PrepShape::TAPS - 1);
                 let stride = layout.side_stride();
                 context.copy_to_pinned(
@@ -1022,8 +1031,12 @@ impl ResidentAttention {
             return Err(bad("invalid CUDA relative attention batch state"));
         }
         if let Some((kv, _)) = kv {
-            kv.prepared
-                .set(Some(read_kv_prep(&work.transfer, layout, offsets)?));
+            kv.prepared.set(Some(read_kv_prep(
+                &work.transfer,
+                layout,
+                offsets,
+                kv.read_rows,
+            )?));
         }
         if destination.is_some() && convolved_readback.is_none() {
             return Ok(Vec::new());

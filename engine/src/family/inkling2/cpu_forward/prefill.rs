@@ -375,9 +375,10 @@ impl CpuForward {
                 "a previous Inkling forward invalidated the sequence state",
             ));
         }
-        // Prefill reads host rows; a chain token left them on the device.
+        // Prefill reads the host conv histories, which a chain token left on the device. The
+        // K/V of a ring-only visit stay in the ring until a host visit needs them.
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        self.materialize_resident()?;
+        self.materialize_token_rows()?;
         if tokens.len() < 2
             || tokens.len() > self.context.saturating_sub(self.position)
             || tokens
@@ -500,6 +501,8 @@ impl CpuForward {
             )? {
                 continue;
             }
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            self.materialize_ring(slot, &mut state[slot])?;
             self.prompt_visit(
                 visit,
                 &mut state[slot],
