@@ -355,6 +355,34 @@ impl BankDevice for BankFill<'_> {
     }
 }
 
+/// The prefill warm-up's one-shot switch: `Q36_TIERED_PREFILL_WARM=1` arms it for the
+/// session, it fires for the first chunk that commits with at least [`WARM_MIN_ROWS`]
+/// rows, and it stays off afterwards. A shorter chunk carries too few rows for its last
+/// 32 to mean anything.
+pub(super) struct WarmGate {
+    armed: bool,
+}
+
+/// The first chunk size that fires the warm-up.
+const WARM_MIN_ROWS: usize = 64;
+
+impl WarmGate {
+    pub(super) fn from_env(value: Option<&std::ffi::OsStr>) -> Self {
+        Self {
+            armed: value == Some(std::ffi::OsStr::new("1")),
+        }
+    }
+
+    /// True once, for the first chunk of at least [`WARM_MIN_ROWS`] rows.
+    pub(super) fn fire(&mut self, rows: usize) -> bool {
+        if !self.armed || rows < WARM_MIN_ROWS {
+            return false;
+        }
+        self.armed = false;
+        true
+    }
+}
+
 pub(super) struct TieredRuntime<'w> {
     /// The copy stream the bank fills run on. First, so it drops (and waits its last copy)
     /// before the host releases the memory those copies read.
@@ -368,6 +396,8 @@ pub(super) struct TieredRuntime<'w> {
     cold: ColdSet,
     /// The bank depth (slots per layer) every bank was built with.
     slot_count: usize,
+    /// The prefill warm-up's one-shot switch (Q36_TIERED_PREFILL_WARM=1).
+    warm: WarmGate,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
     syncs: HostSyncs,
     /// The TCAP sync-vs-drain probe's state (Q36_TIERED_PROBE=1 only): the previous
@@ -463,6 +493,7 @@ impl<'w> TieredRuntime<'w> {
             fills,
             cold,
             slot_count,
+            warm: WarmGate::from_env(std::env::var_os("Q36_TIERED_PREFILL_WARM").as_deref()),
             syncs: HostSyncs::default(),
             probe_start: None,
             probe_end: None,
@@ -1067,5 +1098,50 @@ impl<'w> TieredRuntime<'w> {
             self.probe_report.merge(&report);
         }
         Ok(report)
+    }
+
+    /// The prefill warm-up, once per session after a chunk commits
+    /// (Q36_TIERED_PREFILL_WARM=1): the commit's revalidation synchronized the compute
+    /// stream, so the chunk's bank readers are done before any fill overwrites a slot.
+    /// Returns the swaps it made.
+    pub(super) fn warm_after_prefill(&mut self, rows: usize) -> Result<usize, EngError> {
+        if !self.warm.fire(rows) {
+            return Ok(0);
+        }
+        let start = std::time::Instant::now();
+        let mut fills = BankFill {
+            banks: &self.banks,
+            queue: &mut self.fills,
+        };
+        let swaps = self.host.warm_prefill(&mut fills).map_err(host_error)?;
+        eprintln!(
+            "tiered-prefill-warm: {swaps} swaps in {:.1} ms",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(swaps)
+    }
+}
+
+#[cfg(test)]
+mod warm_gate_tests {
+    use super::{WARM_MIN_ROWS, WarmGate};
+
+    #[test]
+    fn the_warm_gate_fires_once_and_only_for_a_chunk_of_the_minimum_rows() {
+        assert_eq!(WARM_MIN_ROWS, 64, "the documented minimum");
+        let mut gate = WarmGate::from_env(Some(std::ffi::OsStr::new("1")));
+        assert!(!gate.fire(WARM_MIN_ROWS - 1));
+        assert!(gate.fire(WARM_MIN_ROWS));
+        assert!(!gate.fire(4096), "the warm-up runs once per session");
+    }
+
+    #[test]
+    fn only_one_arms_the_warm_gate() {
+        for value in ["0", "true", "yes", ""] {
+            let mut gate = WarmGate::from_env(Some(std::ffi::OsStr::new(value)));
+            assert!(!gate.fire(4096), "{value:?}");
+        }
+        let mut unset = WarmGate::from_env(None);
+        assert!(!unset.fire(4096));
     }
 }

@@ -290,6 +290,51 @@ impl ExpertPolicy {
         swaps
     }
 
+    /// The swaps of the prefill warm-up (Q36_TIERED_PREFILL_WARM=1): the non-resident
+    /// picks among the last 32 * top_k picks a chunk stored for a layer are scored on the
+    /// policy's scores (a resident pick adds nothing): the layer's last 32 rows when every
+    /// row routes a full top-k. At most four experts the banks do not hold go to
+    /// [`Self::advise`] in score order, id first among equals. Free slots fill, a full bank
+    /// gives up its lowest-score resident only to a candidate that outscores it, and the
+    /// token boundary's swap credit is not touched, so the first decode token keeps it
+    /// whole. The gate runs this only after a chunk commits; a decode token's one-row
+    /// routes never reach it.
+    pub fn prefill_warm_swaps(&mut self, routes: &[Vec<u16>]) -> Vec<Swap> {
+        /// The rows at the end of the chunk whose picks the warm-up scores.
+        const TAIL_ROWS: usize = 32;
+        /// The most experts one layer is offered from the warm-up.
+        const PROMOTES: usize = 4;
+        let top_k = self.cfg.top_k.max(1);
+        let mut swaps = Vec::new();
+        for (layer, rows) in routes.iter().enumerate().take(self.cfg.layers) {
+            let start = rows.len().saturating_sub(TAIL_ROWS * top_k);
+            let mut misses: Vec<u16> = Vec::new();
+            for &expert in &rows[start..] {
+                let e = usize::from(expert);
+                if e >= self.cfg.experts || self.resident[layer][e] {
+                    continue;
+                }
+                self.scores[layer][e] += self.scale;
+                if !misses.contains(&expert) {
+                    misses.push(expert);
+                }
+            }
+            let rank = |a: &u16, b: &u16| {
+                let (a, b) = (usize::from(*a), usize::from(*b));
+                self.scores[layer][b]
+                    .total_cmp(&self.scores[layer][a])
+                    .then_with(|| a.cmp(&b))
+            };
+            misses.sort_by(rank);
+            for expert in misses.into_iter().take(PROMOTES) {
+                if let Some(swap) = self.advise(layer, expert) {
+                    swaps.push(swap);
+                }
+            }
+        }
+        swaps
+    }
+
     /// Decides the promotion of ONE candidate outside the token boundary: a router guess
     /// offers `expert` for `layer` before the layer's route is known. Free bank: the
     /// promotion is free, exactly a warm-up fill of `boundary`. Full bank: the victim is
@@ -687,6 +732,34 @@ mod tests {
             fixed.preload(0, 1).is_err(),
             "a static policy refuses a preload"
         );
+    }
+
+    #[test]
+    fn the_prefill_warm_up_leaves_the_swap_credit_whole() {
+        let mut policy = ExpertPolicy::new(&adaptive(2, 0.25), None).unwrap();
+        let mut token = vec![Vec::new(); 2];
+        token[0] = vec![1, 3];
+        policy.observe(&token);
+        policy.boundary();
+        policy.credit = 0.25;
+        let mut rows = vec![Vec::new(); 2];
+        rows[0] = vec![5, 6, 5, 6, 1, 3];
+        assert!(!policy.prefill_warm_swaps(&rows).is_empty());
+        assert_eq!(policy.credit, 0.25);
+    }
+
+    #[test]
+    fn the_prefill_warm_up_offers_at_most_four_experts_per_layer() {
+        // Five free slots and five distinct misses: all could fill, the fifth is not offered.
+        let mut policy = ExpertPolicy::new(&adaptive(5, 0.25), None).unwrap();
+        let mut rows = vec![Vec::new(); 2];
+        rows[0] = vec![5, 4, 3, 2, 1, 1];
+        let swaps: Vec<u16> = policy
+            .prefill_warm_swaps(&rows)
+            .into_iter()
+            .map(|swap| swap.promote)
+            .collect();
+        assert_eq!(swaps, [1, 2, 3, 4]);
     }
 
     #[test]

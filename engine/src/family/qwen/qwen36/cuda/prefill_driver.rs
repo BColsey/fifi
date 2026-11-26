@@ -873,7 +873,14 @@ impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
         m: usize,
         status: i32,
     ) -> Result<(), EngError> {
-        ctx.state.revalidate(ctx.launch.stream, p0 + m, status)
+        ctx.state.revalidate(ctx.launch.stream, p0 + m, status)?;
+        if let Some(runtime) = self.tiered {
+            runtime
+                .borrow_mut()
+                .warm_after_prefill(m)
+                .inspect_err(|_| ctx.state.poison())?;
+        }
+        Ok(())
     }
 
     fn bank_misses(&self) -> Option<u64> {

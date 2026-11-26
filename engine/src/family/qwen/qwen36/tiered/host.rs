@@ -967,6 +967,45 @@ impl TieredHost {
         Ok(report)
     }
 
+    /// The prefill warm-up after a chunk commits (Q36_TIERED_PREFILL_WARM=1; the runtime
+    /// runs it once per session): the policy promotes the non-resident picks of each layer's
+    /// last rows
+    /// outside the swap credit ([`ExpertPolicy::prefill_warm_swaps`]), and the fills are
+    /// waited and published here, so the ledger is settled before the next chunk's plan
+    /// reads it. A failed swap or wait poisons the host as in `end_token`. Returns the swaps.
+    pub fn warm_prefill(&mut self, device: &mut dyn BankDevice) -> Result<usize, HostError> {
+        if self.poisoned {
+            return Err(HostError::Poisoned);
+        }
+        if let Some(open) = &self.in_flight {
+            return Err(HostError::Order(format!(
+                "warm_prefill while layer {} is in flight",
+                open.layer
+            )));
+        }
+        let swaps = self.policy.prefill_warm_swaps(&self.routes);
+        for swap in &swaps {
+            // As in `end_token`: a victim that an earlier swap of this warm-up queued is
+            // still filling, and `unpublish` refuses anything but a Published slot.
+            if let Some(evict) = swap.evict
+                && self.table.lookup(usize::from(swap.layer), evict).is_none()
+            {
+                self.drain_fills(device)?;
+            }
+            if let Err(error) = self.apply_swap(device, swap) {
+                self.poisoned = true;
+                self.table.publish_ready();
+                return Err(error);
+            }
+        }
+        // The last drain always runs: a device that defers publication would otherwise
+        // leave the promotees Filling until the next token boundary.
+        if !swaps.is_empty() {
+            self.drain_fills(device)?;
+        }
+        Ok(swaps.len())
+    }
+
     /// Fills the banks before the first token: for `e` in `0..min(slots, experts)` expert `e` goes
     /// into a slot of every layer, each fill through the full residency state machine, then
     /// everything is published at once. Returns the number of fills. WHY: a gate that compares
@@ -1890,6 +1929,122 @@ mod tests {
         let report = run_token(&mut f, &picks, &mut device).unwrap();
         assert_eq!((report.bank_hits, report.cpu_served), (9, 3));
         f.host.check_consistency().unwrap();
+    }
+
+    /// A committed 72-row chunk on every layer: the first 40 rows route to the experts the
+    /// banks hold, the last 32 to four experts they do not.
+    fn route_warm_chunk(f: &mut Fixture) {
+        let row = |ids: [i32; 4]| ChunkRouteRow {
+            ids: ids.to_vec(),
+            weights: vec![0.25; 4],
+        };
+        for layer in 0..LAYERS {
+            let rows: Vec<ChunkRouteRow> = (0..72)
+                .map(|r| {
+                    if r < 40 {
+                        row([3, 0, 1, 2])
+                    } else {
+                        row([7, 6, 5, 4])
+                    }
+                })
+                .collect();
+            // Planning the layer stores its rows' picks; the device and pool stages leave
+            // nothing the warm-up reads.
+            f.host.begin_chunk_layer(layer, &rows, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_prefill_warm_up_promotes_the_last_rows_picks_and_leaves_the_credit_whole() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        route_warm_chunk(&mut f);
+        // Three slots per layer: the three best recent misses of each layer take the
+        // places of the preloaded experts. The fourth ties with them and stays out, and
+        // so does the expert of the older rows, which was routed to 40 times.
+        assert_eq!(f.host.warm_prefill(&mut device).unwrap(), 3 * LAYERS);
+        let fills = filled(&device, &f.reference);
+        let promoted: Vec<(usize, usize)> = fills[SLOTS * LAYERS..]
+            .iter()
+            .map(|(layer, _, expert)| (*layer, *expert))
+            .collect();
+        let want: Vec<(usize, usize)> = (0..LAYERS)
+            .flat_map(|layer| [(layer, 4), (layer, 5), (layer, 6)])
+            .collect();
+        assert_eq!(promoted, want);
+        assert_eq!(fills.len(), SLOTS * LAYERS + 3 * LAYERS);
+        for layer in 0..LAYERS {
+            assert!((4..=6).all(|expert| f.host.is_resident(layer, expert)));
+            assert!(
+                (0..=3)
+                    .chain(7..8)
+                    .all(|expert| !f.host.is_resident(layer, expert))
+            );
+        }
+        f.host.check_consistency().unwrap();
+        // The credit is whole: at a quarter swap per token the fourth token buys layer 0's
+        // one swap. The other layers keep to their residents, so no second swap follows.
+        // The credit is the policy's own; its test checks that the warm-up leaves it as it
+        // was. This count sees a warm-up that added credit.
+        let picks = vec![vec![7, 3, 2, 1], vec![4, 5, 6, 3], vec![4, 5, 6, 3]];
+        let swaps: Vec<u32> = (0..8)
+            .map(|_| run_token(&mut f, &picks, &mut device).unwrap().swaps)
+            .collect();
+        assert_eq!(swaps, [0, 0, 0, 1, 0, 0, 0, 0]);
+        f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn the_prefill_warm_up_publishes_its_fills_before_it_returns_on_a_deferring_device() {
+        let mut f = fixture();
+        let mut device = DeferredDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        route_warm_chunk(&mut f);
+        assert_eq!(f.host.warm_prefill(&mut device).unwrap(), 3 * LAYERS);
+        // Nothing else ran: the promotees are resident because the warm-up's own drain
+        // waited the copies.
+        assert!(f.host.is_resident(0, 4) && !f.host.is_resident(0, 0));
+        f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn a_failed_wait_at_the_last_drain_leaves_no_fill_pending() {
+        let mut f = fixture();
+        // The drain before the boundary's fills succeeds; the one after them fails.
+        let mut device = MockDevice {
+            fail_wait_at: Some(1),
+            ..MockDevice::default()
+        };
+        let picks = vec![vec![0, 1], vec![2], vec![3]];
+        assert_eq!(
+            run_token(&mut f, &picks, &mut device),
+            Err(HostError::Device(String::from("mock wait failure")))
+        );
+        assert_eq!(device.fills.len(), 4);
+        // The four queued fills are neither published nor kept for a later drain.
+        assert!(f.host.pending_fills.is_empty());
+        assert!(!f.host.is_resident(0, 0) && !f.host.is_resident(0, 1));
+        f.host.table.check_partition().unwrap();
+        assert_eq!(f.host.end_token(&mut device), Err(HostError::Poisoned));
+    }
+
+    #[test]
+    fn warm_prefill_is_refused_while_a_layer_is_in_flight_and_changes_nothing() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        route_warm_chunk(&mut f);
+        let fills = device.fills.len();
+        f.host
+            .begin_layer(1, &[3], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
+        assert!(matches!(
+            f.host.warm_prefill(&mut device),
+            Err(HostError::Order(_))
+        ));
+        assert!(f.host.in_flight.is_some());
+        assert_eq!(device.fills.len(), fills, "no swap was queued");
     }
 
     /// A device that copies on a stream of its own: its fills land only when waited.

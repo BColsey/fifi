@@ -188,12 +188,17 @@ pub(super) fn admit_banks(
 /// formula yields 0 there and the operator funds the staging by dropping 2 slots per
 /// layer (two slot-sets free 141,557,760 B >= the 138,018,816 B of 78 experts).
 pub(super) fn cold_cap_for(
+    request: &SlotRequest,
+    chunk_arm: bool,
     free: u64,
     geometry: ExpertBankGeometry,
     (layers, stagings): (usize, usize),
     slots_per_layer: usize,
     reserve: u64,
 ) -> usize {
+    if !funds_cold_staging(request, chunk_arm) {
+        return 0;
+    }
     /// The measured maximum of DISTINCT cold experts serving one layer's picks.
     const COLD_TARGET: usize = super::prefill::COLD_CHANNELS_MAX;
     let per_expert = ExpertBank::bytes_for(geometry, geometry.top_k).unwrap_or(u64::MAX)
@@ -347,11 +352,15 @@ pub(super) fn attach_tiered_parts(
         SlotRequest::Fit => geometry.top_k,
         SlotRequest::Exactly(count) => count,
     };
-    let cold_cap = if funds_cold_staging(&plan.slots, tiered_chunk_arm()) {
-        cold_cap_for(free, geometry, (layers, distinct.len()), planned, reserve)
-    } else {
-        0
-    };
+    let cold_cap = cold_cap_for(
+        &plan.slots,
+        tiered_chunk_arm(),
+        free,
+        geometry,
+        (layers, distinct.len()),
+        planned,
+        reserve,
+    );
     // Charge the staging the plan is about to allocate, so the reserve the banks leave
     // behind still covers the loader's headroom after the staging exists.
     let mut cold_bytes = 0u64;
@@ -538,6 +547,25 @@ mod tests {
         assert!(funds_cold_staging(&SlotRequest::Fit, true));
         assert!(!funds_cold_staging(&SlotRequest::Fit, false));
         assert!(funds_cold_staging(&SlotRequest::Exactly(8), false));
+        // The plan itself: with room for the whole target, every plan but a `Fit` one on
+        // the one-token arm funds it.
+        let dims = dims();
+        let geometry = geometry_of(&dims, [GgufType::Q4K; 3]);
+        let stagings = (dims.shape.kinds.len(), 1);
+        let funded = |request: &SlotRequest, chunk_arm: bool| {
+            cold_cap_for(
+                request,
+                chunk_arm,
+                u64::MAX,
+                geometry,
+                stagings,
+                geometry.top_k,
+                0,
+            )
+        };
+        assert!(funded(&SlotRequest::Fit, true) > 0);
+        assert_eq!(funded(&SlotRequest::Fit, false), 0);
+        assert!(funded(&SlotRequest::Exactly(8), false) > 0);
     }
 
     #[test]
