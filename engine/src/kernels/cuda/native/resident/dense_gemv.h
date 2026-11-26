@@ -39,7 +39,12 @@ typedef struct inference_cuda_dense_gemv_args {
     int ld_x;
     int ld_y;
     int weight_dtype;
+    /* INFERENCE_CUDA_DENSE_GEMV_* bits chosen by the caller's context. */
+    int flags;
 } inference_cuda_dense_gemv_args;
+
+/* The single-row split kernels: one CTA per output with K across four warps. */
+enum { INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT = 1 };
 
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
@@ -152,13 +157,21 @@ typedef struct inference_cuda_gguf_moe_matrices {
 /* Optional in/out schedule: gate bits 0–1 encode packed (0), grouped IQ2 (1),
  * or integer dot (2); bit 2 requests the exact Q2_0 down schedule independently.
  * Reports only the kernels enqueued. NULL always uses the baseline. */
-enum { INFERENCE_CUDA_GGUF_MOE_GATE_MASK = 3, INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN = 4 };
+enum {
+    INFERENCE_CUDA_GGUF_MOE_GATE_MASK = 3,
+    INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN = 4,
+    /* Request only: the gate, down and packed launches take the split kernels. */
+    INFERENCE_CUDA_GGUF_MOE_DECODE_SPLIT = 8
+};
 int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                   const inference_cuda_gguf_moe_matrices *matrices,
                                   void *stream, int *out_stage, int *schedule);
 
 #ifdef __cplusplus
 }
+static_assert(sizeof(inference_cuda_dense_gemv_args) == 56 &&
+              offsetof(inference_cuda_dense_gemv_args, flags) == 48,
+              "dense GEMV args layout");
 static_assert(sizeof(inference_cuda_gguf_moe_args) == 232 &&
               offsetof(inference_cuda_gguf_moe_args, device_ids) == 200 &&
               offsetof(inference_cuda_gguf_moe_args, device_weights) == 208 &&

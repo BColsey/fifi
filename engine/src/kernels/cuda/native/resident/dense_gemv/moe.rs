@@ -157,6 +157,7 @@ impl GgufMoeSchedule {
     // INFERENCE_CUDA_GGUF_MOE_* in dense_gemv.h.
     const GATE_MASK: c_int = 3;
     const EXACT_Q2_DOWN: c_int = 4;
+    const DECODE_SPLIT: c_int = 8;
 
     fn bits(self) -> c_int {
         self.gate as c_int
@@ -184,6 +185,7 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     stream: &RawStream,
     call: GgufMoeRaw<'_>,
     schedule: GgufMoeSchedule,
+    decode_split: bool,
 ) -> Result<GgufMoeSchedule, DeviceFailure> {
     let mut picks = [GgufMoePick::default(); MAX_GGUF_MOE_PICKS];
     let (count, device_ids, device_weights, [gate_scales, down_scales]) = match call.picks {
@@ -248,7 +250,12 @@ pub(in crate::kernels::cuda) fn launch_gguf_moe(
     let matrices = matrices
         .as_ref()
         .map_or(std::ptr::null(), std::ptr::from_ref);
-    let mut bits = schedule.bits();
+    let mut bits = schedule.bits()
+        | if decode_split {
+            GgufMoeSchedule::DECODE_SPLIT
+        } else {
+            0
+        };
     let request = if bits == 0 {
         std::ptr::null_mut()
     } else {

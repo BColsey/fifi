@@ -182,6 +182,10 @@ pub(crate) struct CudaContext {
         std::cell::Cell<Option<super::resident::exl3::IndexedOptions>>,
     /// Whether the one-tile wide launches may take the rate 10 and rate 6 body of book 2.
     pub(in crate::kernels::cuda) exl3_odd_rates: std::cell::Cell<bool>,
+    /// The dense matvec kernels the session that owns this context chose: the plain kernels until
+    /// it sets them, so two engines in one process choose apart.
+    pub(in crate::kernels::cuda) dense_group_policy:
+        std::cell::Cell<super::resident::dense_gemv::DenseGroupPolicy>,
     /// Launches per single-row EXL3 variant (test builds; see `kernels/single_row.rs`).
     #[cfg(test)]
     pub(in crate::kernels::cuda) exl3_launches:
@@ -439,6 +443,7 @@ impl CudaContext {
             exl3_single_row_default: std::cell::Cell::new(None),
             exl3_indexed_default: std::cell::Cell::new(None),
             exl3_odd_rates: std::cell::Cell::new(false),
+            dense_group_policy: std::cell::Cell::new(Default::default()),
             #[cfg(test)]
             exl3_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]

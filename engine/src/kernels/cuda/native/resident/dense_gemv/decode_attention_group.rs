@@ -60,6 +60,7 @@ pub(in crate::kernels::cuda) fn try_attention_group<'a, 'b: 'a>(
             ld_x: 2304,
             ld_y: p.dims.rows as c_int,
             weight_dtype: p.dtype.code(),
+            flags: super::flags(p),
         });
     }
     for (i, (_, _, dst)) in spans.iter().enumerate() {

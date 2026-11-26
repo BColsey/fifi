@@ -7,6 +7,7 @@ use super::{
     controller_batch::{ChainedAttention, controller_batch_enabled, multirow_controllers_enabled},
     window::PendingRow,
 };
+use crate::family::inkling2::switches::Switch;
 use crate::kernels::cuda::DeviceRange;
 use crate::{
     EngError,
@@ -790,10 +791,7 @@ impl CpuForward {
 }
 
 fn prefill_projection_batch_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS").as_deref() == Ok("1")
-    })
+    Switch::BatchAttentionProjections.on()
 }
 
 #[test]

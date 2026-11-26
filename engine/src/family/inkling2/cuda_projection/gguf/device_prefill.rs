@@ -1,4 +1,5 @@
 //! Keep resident GGUF expert intermediates on the device during grouped prefill.
+use crate::family::inkling2::switches::Switch;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
@@ -838,10 +839,7 @@ impl Scratch {
                 })
             })
             .collect::<Result<Vec<_>, EngError>>()?;
-        static PANELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *PANELS.get_or_init(|| {
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_PANELS").as_deref() == Ok("1")
-        }) {
+        if Switch::PrefillWeightPanels.on() {
             // Down is unwritten during gate; gate is dead after row_clipped_expert.
             // Both stages and all users of these spans are ordered on self.stream.
             let dead = if stage == 0 { &l.down } else { &l.gate };

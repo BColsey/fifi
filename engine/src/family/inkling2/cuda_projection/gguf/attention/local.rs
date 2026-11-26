@@ -4,6 +4,7 @@ use super::{
     super::super::dense::{LocalInputs, LocalProjection, LocalTargets},
     *,
 };
+use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, upload_tensor},
     kernels::cuda::{
@@ -105,7 +106,7 @@ pub(in crate::family::inkling2) struct LocalResult {
 }
 
 fn decode_split_enabled() -> bool {
-    std::env::var("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref() == Ok("1")
+    Switch::DecodeSplit.on()
 }
 
 struct Layout {

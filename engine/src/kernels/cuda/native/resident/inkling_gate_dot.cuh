@@ -111,7 +111,7 @@ void launch_decode_gate(const GateDigits *packed, const uint8_t *gate, float *ou
 }
 
 bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
-                             float *temporary, cudaStream_t stream, Failure &failure) {
+                             float *temporary, bool split, cudaStream_t stream, Failure &failure) {
     constexpr int width = kInklingGateWidth;
     if (a.hidden != width || 2 * a.middle != width || a.count != 8) return false;
     const int type = a.gate_dtype - fifi_gguf::kDtypeBase;
@@ -124,7 +124,7 @@ bool launch_inkling_gate_dot(const inference_cuda_gguf_moe_args &a, DeviceSelect
     if (!failure.ok()) return true;
     const dim3 grid(width / kWarps, a.count);
 #define GATE_DOT(id, bytes) \
-    case id: if (decode_split_enabled()) \
+    case id: if (split) \
         launch_decode_gate<id,bytes>(packed, static_cast<const uint8_t *>(a.gate), a.scratch, index, stream); \
         else inkling_gate_dot<id, bytes><<<grid, kWarps * 32, 0, stream>>>( \
             packed, static_cast<const uint8_t *>(a.gate), a.scratch, index); break;

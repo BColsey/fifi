@@ -1,17 +1,13 @@
 //! Admission is read-only with respect to the sequence. After commitment there
 //! is no fallback even for an enqueue error: a kernel may have appended K/V.
 use super::*;
+use crate::family::inkling2::switches::Switch;
 
 impl CpuForward {
     pub(in crate::family::inkling2::cpu_forward) fn admit_resident_token(
         &mut self,
     ) -> Result<bool, EngError> {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !*ENABLED
-            .get_or_init(|| std::env::var("FIFI_INKLING_CUDA_RESIDENT_TOKEN").as_deref() == Ok("1"))
-            || self.draft_window_enabled()
-            || !self.taps.is_empty()
-        {
+        if !Switch::ResidentToken.on() || self.draft_window_enabled() || !self.taps.is_empty() {
             return Ok(false);
         }
         let Weights::Gguf(w) = &self.weights else {

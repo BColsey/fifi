@@ -1,6 +1,7 @@
 //! Batch independent Q/K/V cross-pass controllers before host attention.
 
-use std::sync::{Once, OnceLock};
+use crate::family::inkling2::switches::Switch;
+use std::sync::Once;
 
 use super::{
     ATTENTION_ROLES, Attention, ControlInput, CpuForward, LayerVisit, MessageBank, Stream,
@@ -132,12 +133,7 @@ impl CpuForward {
             [ControlledAttentionInput<'_>; 3],
         ) -> Result<Option<R>, EngError>,
     ) -> Result<Option<R>, EngError> {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !controller_batch_enabled()
-            || !*ENABLED.get_or_init(|| {
-                std::env::var("FIFI_INKLING_CUDA_CHAIN_ATTENTION_INPUT").as_deref() == Ok("1")
-            })
-        {
+        if !controller_batch_enabled() || !Switch::ChainAttentionInput.on() {
             return Ok(None);
         }
         let Weights::Gguf(weights) = &self.weights else {
@@ -182,10 +178,8 @@ impl CpuForward {
         rows: impl ExactSizeIterator<Item = (&'a Stream, Option<&'a MessageBank>)>,
         state: &mut VisitState,
     ) -> Result<Option<ChainedAttention>, EngError> {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !*ENABLED.get_or_init(|| {
-            std::env::var("FIFI_INKLING_CUDA_GROUPED_CHAIN_ATTENTION").as_deref() == Ok("1")
-        }) || !controller_batch_enabled()
+        if !Switch::GroupedChainAttention.on()
+            || !controller_batch_enabled()
             || !multirow_controllers_enabled()
             || rows.len() < 2
         {
@@ -247,11 +241,7 @@ impl CpuForward {
         let result =
             self.attention_requests(layer, visit.attention, |calls| -> Result<_, EngError> {
                 if let Some(bridge) = &bridge {
-                    static REBUILD: OnceLock<bool> = OnceLock::new();
-                    let rebuild = *REBUILD.get_or_init(|| {
-                        std::env::var("FIFI_INKLING_CUDA_PREFILL_REBUILD_GATES").as_deref()
-                            == Ok("1")
-                    });
+                    let rebuild = Switch::PrefillRebuildGates.on();
                     let scales: Option<Vec<_>> = rebuild.then(|| {
                         prepared
                             .iter()
@@ -497,14 +487,9 @@ fn name_refs(names: &[[String; 3]; 3]) -> [[&str; 3]; 3] {
 }
 
 pub(super) fn multirow_controllers_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_MULTIROW_CONTROLLERS").as_deref() == Ok("1")
-    })
+    Switch::MultirowControllers.on()
 }
 
 pub(super) fn controller_batch_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("FIFI_INKLING_CUDA_BATCH_CONTROLLERS").as_deref() == Ok("1"))
+    Switch::BatchControllers.on()
 }

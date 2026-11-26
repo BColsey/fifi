@@ -47,6 +47,7 @@ pub(in crate::kernels::cuda) fn try_control_pair(
         ld_x: 64,
         ld_y: 2304,
         weight_dtype: DenseDtype::F32.code(),
+        flags: super::flags(p),
     };
     let (a, b) = (args(a), args(b));
     let mut stage = STAGE_NONE;

@@ -1,5 +1,6 @@
 //! Retain frequently selected expert pairs in the admitted VRAM left after whole layers.
 use super::{GgufCuda, bad, streaming::Matrix};
+use crate::family::inkling2::switches::Switch;
 use crate::{
     EngError,
     expert_tier::{CudaBankLease, ExpertId, VRAM_HEADROOM_BYTES},
@@ -186,7 +187,7 @@ impl GgufCuda {
         let spare = (self.context.memory_info()?.free as u64).saturating_sub(VRAM_HEADROOM_BYTES);
         let cap = spare.min(expert_budget.saturating_sub(self.resident.bytes()));
         let slots = slot_counts(&layout, cap as usize, spec.n_routed_experts as usize);
-        let profile = std::env::var("FIFI_INKLING_CUDA_PROFILE").as_deref() == Ok("1");
+        let profile = Switch::Profile.on();
         let cache = self.cache.get_mut();
         for ((layer, parts), n) in layout.into_iter().zip(slots).filter(|(_, n)| *n > 0) {
             let free = self.context.memory_info()?.free as u64;

@@ -6,6 +6,7 @@ use super::{
     CpuForward, EngError, ExpertPrefillRows, GgufTextWeights, LayerVisit, PromptRow, VisitState,
     bad,
 };
+use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::gguf::attention::prefill,
     kernels::cuda::{
@@ -13,10 +14,7 @@ use crate::{
         resident::{inkling_local_prep::DepthShape, row_add::RowAddCall},
     },
 };
-use std::sync::{Once, OnceLock};
-
-const ENABLED: &str = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_FIRST_VISIT";
-const EXPERT_CONV: &str = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_EXPERT_CONV";
+use std::sync::Once;
 
 struct Scratch {
     shape: DepthShape,
@@ -147,8 +145,7 @@ impl CpuForward {
         (layer, prefix): (&str, &str),
         inputs: &[[Vec<f32>; 3]],
     ) -> Result<bool, EngError> {
-        static ENABLE: OnceLock<bool> = OnceLock::new();
-        if !*ENABLE.get_or_init(|| std::env::var(ENABLED).as_deref() == Ok("1"))
+        if !Switch::PrefillResidentFirstVisit.on()
             || visit.state_slot != 0
             || visit.weight_layer != 0
             || rows
@@ -189,9 +186,7 @@ impl CpuForward {
         let Some([_, _, _, plane]) = shape.words() else {
             return Ok(false);
         };
-        static DEVICE_CONV: OnceLock<bool> = OnceLock::new();
-        let device_conv =
-            *DEVICE_CONV.get_or_init(|| std::env::var(EXPERT_CONV).as_deref() == Ok("1"));
+        let device_conv = Switch::PrefillResidentExpertConv.on();
         if device_conv && !plane.is_multiple_of(32) {
             return Ok(false);
         }

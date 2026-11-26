@@ -4,13 +4,14 @@ use super::{
     CudaContext, DEVICE_HEADROOM, DenseDtype, EngError, GgufDenseUpload, Projections,
     device_prefill, projection_bytes, upload_projections,
 };
+use crate::family::inkling2::switches::Switch;
 
 use crate::family::mem::DEVICE;
 
 const MAX_CHARGE: u64 = 64 << 20;
 
 pub(super) fn enabled() -> bool {
-    std::env::var("FIFI_INKLING_CUDA_RESIDENT_CONTROLLERS").as_deref() == Ok("1")
+    Switch::ResidentControllers.on()
 }
 
 pub(super) fn admit(

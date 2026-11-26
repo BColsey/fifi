@@ -1,10 +1,8 @@
 //! Keep a banked prefill MLP's normalized rows on device until expert dispatch.
 //! Attention, message mixing, route selection and final residuals stay on the host.
 
-use std::{
-    borrow::Cow,
-    sync::{Once, OnceLock},
-};
+use crate::family::inkling2::switches::Switch;
+use std::{borrow::Cow, sync::Once};
 
 use super::{CpuForward, GgufTextWeights, PromptRow, Role, bad, control_names};
 use crate::{
@@ -17,10 +15,7 @@ use crate::{
 };
 
 pub(super) fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_RESIDENT_PREFILL_MLP").as_deref() == Ok("1")
-    })
+    Switch::ResidentPrefillMlp.on()
 }
 
 #[allow(clippy::large_enum_variant)]

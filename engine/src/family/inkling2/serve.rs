@@ -1,9 +1,8 @@
 //! Both reference backends use the shared token session and sampler.
 
+use crate::family::inkling2::switches::Switch;
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
-use super::DEFAULT_TEXT_CONTEXT;
 use super::{
     TextBackend,
     cpu_forward::{CpuForward, PrefixState},
@@ -67,7 +66,7 @@ pub(crate) fn start_engine(
         };
         let grouped_verify_requested = backend == TextBackend::Cuda
             && forward.draft_window_enabled()
-            && std::env::var("FIFI_INKLING_CUDA_GROUPED_VERIFY").as_deref() == Ok("1");
+            && Switch::GroupedVerify.on();
         let plan = settings.host_prefill_plan(
             &forward,
             planning_rows,
@@ -188,13 +187,17 @@ fn cuda_forward(_forward: CpuForward, _host_reserve: u64) -> Result<CpuForward, 
     ))
 }
 
+/// The prompt rows a CUDA prefill group requests unless `FIFI_INKLING_CUDA_PREFILL_ROWS` sets
+/// them; the host memory plan admits fewer when the state does not fit.
+const CUDA_PREFILL_ROWS: usize = 512;
+
 fn prefill_rows(backend: TextBackend) -> Result<usize, EngError> {
     const NAME: &str = "FIFI_INKLING_CUDA_PREFILL_ROWS";
     if backend != TextBackend::Cuda {
         return Ok(1);
     }
     let Some(value) = std::env::var_os(NAME) else {
-        return Ok(1);
+        return Ok(CUDA_PREFILL_ROWS);
     };
     value
         .to_str()
@@ -295,6 +298,10 @@ pub(crate) struct InklingDraft {
     pub(super) workspace_bytes: u64,
 }
 
+/// The longest context whose host state is small enough to start without a host memory plan.
+#[cfg(target_os = "linux")]
+const UNPLANNED_TEXT_CONTEXT: u32 = 128;
+
 struct HostPrefillPlan {
     prefill_rows: usize,
     host_reserve: u64,
@@ -350,7 +357,7 @@ impl TextSettings {
         {
             const LABEL: &str = "Inkling text state";
             let state_needs_admission =
-                self.context > DEFAULT_TEXT_CONTEXT || self.prefix_reuse || window_bytes != 0;
+                self.context > UNPLANNED_TEXT_CONTEXT || self.prefix_reuse || window_bytes != 0;
             if state_needs_admission || requested_rows > 1 {
                 let admission = match crate::family::mem::HostFacts::read(LABEL, "Inkling") {
                     Ok(admission) => admission,

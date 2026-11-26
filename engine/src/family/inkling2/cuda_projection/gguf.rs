@@ -1,5 +1,6 @@
 //! Project directly from mapped GGUF matrices. Cold experts reuse fixed staging buffers.
 
+use crate::family::inkling2::switches::Switch;
 use std::{cell::RefCell, collections::BTreeMap};
 
 use super::{
@@ -535,8 +536,7 @@ impl GgufCuda {
         });
         let elements = rows * hidden.max(ff);
         let stage = [2 * elements, elements / 16];
-        let group_attention =
-            std::env::var("FIFI_INKLING_CUDA_GROUP_ATTENTION").as_deref() == Ok("1");
+        let group_attention = Switch::GroupAttention.on();
         let [rows, columns] = shape;
         let attention_rows = dense
             .iter()
@@ -549,12 +549,11 @@ impl GgufCuda {
         } else {
             rows
         };
-        let batch_experts =
-            packed && std::env::var("FIFI_INKLING_CUDA_BATCH_EXPERTS").as_deref() == Ok("1");
+        let batch_experts = packed && Switch::BatchExperts.on();
         let device_route = allow_device_routing
             && group_projections
             && batch_experts
-            && std::env::var("FIFI_INKLING_CUDA_DEVICE_ROUTING").as_deref() == Ok("1");
+            && Switch::DeviceRouting.on();
         let route_shape = device_route.then(|| router::route_shape(spec));
         let route_plan = route_shape
             .map(|shape| router::RoutePlan::new(shape, &layers))
@@ -572,10 +571,9 @@ impl GgufCuda {
         let tensors = projection_bytes(&required);
         let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
         let context = CudaContext::with_admission(&admission)?;
-        let prefill_resident =
-            packed && std::env::var("FIFI_INKLING_CUDA_RESIDENT_PREFILL").as_deref() == Ok("1");
-        let device_prefill = packed
-            && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL").as_deref() == Ok("1");
+        context.set_dense_group_policy(super::dense_group_policy());
+        let prefill_resident = packed && Switch::ResidentPrefill.on();
+        let device_prefill = packed && Switch::DeviceExpertPrefill.on();
         let stream_plan = stream.then(|| streaming::plan(hidden, ff)).transpose()?;
         let mut stream_bytes = stream_plan.map_or(0, |plan| plan.device_bytes());
         let moe_shape = GgufMoeShape {
@@ -598,8 +596,7 @@ impl GgufCuda {
             headroom: DEVICE_HEADROOM,
         };
         admit(&demand, context.memory_info()?.free as u64)?;
-        let q8_activations =
-            std::env::var("FIFI_INKLING_CUDA_Q8_ACTIVATIONS").as_deref() == Ok("1");
+        let q8_activations = Switch::Q8Activations.on();
         let step = DenseStep::new(&context, &plan)?.with_q8_activations(q8_activations);
         let expert_codes = context.allocate(stage[0])?;
         let expert_scales = context.allocate(stage[1])?;
@@ -623,7 +620,7 @@ impl GgufCuda {
         // A streamed group needs one larger slot; the second still serves serial prefill.
         if batch_experts
             && !full_expert_fit
-            && std::env::var("FIFI_INKLING_CUDA_BATCH_STREAMED_EXPERTS").as_deref() == Ok("1")
+            && Switch::BatchStreamedExperts.on()
             && let (Some(banks), Some(original)) = (&mut stream_banks, stream_plan)
         {
             let plan = streaming::group_plan(
@@ -659,9 +656,7 @@ impl GgufCuda {
         };
         let resident_attention = match resident_attention {
             Some(plan) if resident.placement().full_layers().len() == spec.stored_layers() => {
-                let charge_reserve = std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION_RESERVE")
-                    .as_deref()
-                    == Ok("1");
+                let charge_reserve = Switch::ResidentAttentionReserve.on();
                 plan.load(&context, charge_reserve)?
             }
             Some(_) => {
@@ -729,7 +724,7 @@ impl GgufCuda {
                 "resident_expert_layers": resident.placement().full_layers(),
                 "resident_expert_count": resident.placement().resident_experts()})
         );
-        let profile = stream && std::env::var("FIFI_INKLING_CUDA_PROFILE").as_deref() == Ok("1");
+        let profile = stream && Switch::Profile.on();
         if profile {
             let admitted: Vec<_> = optional
                 .iter()
@@ -744,7 +739,7 @@ impl GgufCuda {
         let cold_controller = if full_expert_fit
             && group_projections
             && spec.core.gate_rank != 0
-            && std::env::var("FIFI_INKLING_CUDA_STAGE_PREFILL_CONTROLLERS").as_deref() == Ok("1")
+            && Switch::StagePrefillControllers.on()
             && optional.iter().any(|item| {
                 item.matrix.name.contains(".controllers.") && !dense.contains_key(item.matrix.name)
             }) {
@@ -775,7 +770,7 @@ impl GgufCuda {
         let token_controllers = if full_expert_fit
             && group_projections
             && resident_attention.is_some()
-            && std::env::var("FIFI_INKLING_CUDA_RESIDENT_TOKEN").as_deref() == Ok("1")
+            && Switch::ResidentToken.on()
         {
             token_controllers::load(
                 &context,
@@ -795,35 +790,29 @@ impl GgufCuda {
             packed_gguf: packed,
             group_projections,
             group_attention,
-            batch_router: std::env::var("FIFI_INKLING_CUDA_BATCH_ROUTER").as_deref() == Ok("1"),
+            batch_router: Switch::BatchRouter.on(),
             resident_attention,
             hidden,
             gate_rank: spec.core.gate_rank as usize,
             moe_scratch,
             decode_exact_q2_down: route_scratch.is_some()
-                && std::env::var("FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN").as_deref() == Ok("1")
+                && Switch::DecodeExactQ2Down.on()
                 && context
                     .device_attributes()
                     .is_ok_and(|attrs| attrs.compute_capability >= (7, 5)),
             route_scratch,
             batch_streamed,
             prefill_resident,
-            reuse_router_input: device_prefill
-                && std::env::var("FIFI_INKLING_CUDA_PREFILL_ROUTER_INPUT_REUSE").as_deref()
-                    == Ok("1"),
+            reuse_router_input: device_prefill && Switch::PrefillRouterInputReuse.on(),
             device_prefill: device_prefill.then(RefCell::default),
-            device_prefill_wmma: device_prefill
-                && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_WMMA").as_deref()
-                    == Ok("1"),
+            device_prefill_wmma: device_prefill && Switch::DeviceExpertPrefillWmma.on(),
             device_prefill_grouped_dq: device_prefill
-                && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_GROUPED_DQ").as_deref()
-                    == Ok("1")
+                && Switch::DeviceExpertPrefillGroupedDq.on()
                 && context
                     .device_attributes()
                     .is_ok_and(|attrs| attrs.compute_capability >= (7, 5)),
             device_prefill_exact_tile: device_prefill
-                && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_EXACT_TILE").as_deref()
-                    == Ok("1")
+                && Switch::DeviceExpertPrefillExactTile.on()
                 // The kernels use SM75 tensor-core instructions. A refused diagnostic keeps
                 // the baseline.
                 && context
@@ -1072,10 +1061,7 @@ impl GgufCuda {
         if weights[..6].iter().any(Option::is_none) {
             return Ok(None);
         }
-        static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let reuse = *REUSE.get_or_init(|| {
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_REUSE_EXPERT_STAGE").as_deref() == Ok("1")
-        });
+        let reuse = Switch::PrefillReuseExpertStage.on();
         if reuse {
             static USED: std::sync::Once = std::sync::Once::new();
             USED.call_once(|| {
@@ -1278,13 +1264,10 @@ impl GgufCuda {
         };
         // The chained attention tile was synchronously consumed before the
         // MLP controller. Borrow its workspace, not any resident weights.
-        static WIDE_MLP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let target = controller_workspace::target_rows();
         let mut selected = (&self.step, capacity);
         if target > capacity
-            && *WIDE_MLP.get_or_init(|| {
-                std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_MLP").as_deref() == Ok("1")
-            })
+            && Switch::PrefillWeightMlp.on()
             && let Some(wide) = &self.controlled_attention_step
         {
             let cap = wide.controller_batch_capacity(shape)?.min(target);

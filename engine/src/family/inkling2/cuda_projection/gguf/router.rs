@@ -1,3 +1,4 @@
+use crate::family::inkling2::switches::Switch;
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -322,9 +323,9 @@ impl GgufCuda {
 pub(super) fn gate_schedule() -> GgufGate {
     static SCHEDULE: OnceLock<GgufGate> = OnceLock::new();
     *SCHEDULE.get_or_init(|| {
-        if std::env::var("FIFI_INKLING_CUDA_GATE_DOT").as_deref() == Ok("1") {
+        if Switch::GateDot.on() {
             GgufGate::IntegerDot
-        } else if std::env::var("FIFI_INKLING_CUDA_IQ2_GATE").as_deref() == Ok("1") {
+        } else if Switch::Iq2Gate.on() {
             GgufGate::GroupedIq2
         } else {
             GgufGate::Packed

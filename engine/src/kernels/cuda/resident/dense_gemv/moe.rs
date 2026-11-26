@@ -72,8 +72,9 @@ impl CudaContext {
     ) -> Result<GgufMoeSchedule, EngError> {
         self.ensure_usable()?;
         let raw = self.plan_gguf_moe(&call)?;
+        let split = self.dense_group_policy().decode_split;
         self.launch_on(stream, |stream_raw| {
-            launch_gguf_moe(stream_raw, raw, schedule)
+            launch_gguf_moe(stream_raw, raw, schedule, split)
         })
     }
 

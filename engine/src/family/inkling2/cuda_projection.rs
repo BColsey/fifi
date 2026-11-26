@@ -4,6 +4,7 @@
 //! selected experts reuse four packed staging pairs. Routing, attention,
 //! and each visit's state stay on the host.
 
+use crate::family::inkling2::switches::Switch;
 use std::{
     cell::Cell,
     collections::BTreeMap,
@@ -111,6 +112,14 @@ fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2]
         })
     };
     Ok([stack("w13")?, stack("w2")?])
+}
+
+/// The dense matvec kernels every Inkling CUDA context takes.
+pub(super) fn dense_group_policy() -> crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
+    crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
+        decode_split: Switch::DecodeSplit.on(),
+        weight_visit: Switch::PrefillQ8Visit.on(),
+    }
 }
 
 pub(super) fn expert_residency_budget() -> Result<u64, EngError> {
@@ -317,10 +326,11 @@ pub(super) struct CudaProjection {
 impl CudaProjection {
     pub(super) fn load(weights: &Weights, spec: &TextSpec) -> Result<Self, EngError> {
         let budget = expert_residency_budget()?;
-        let stream_dense = std::env::var("FIFI_INKLING_CUDA_DENSE_STREAM").as_deref() == Ok("1");
+        let stream_dense = Switch::DenseStream.on();
         let plan = Plan::new(weights, spec, budget, stream_dense)?;
         eprintln!("Inkling CUDA projections {}", plan.receipt()?);
         let context = CudaContext::with_admission(&plan.admission)?;
+        context.set_dense_group_policy(dense_group_policy());
         // The fixed workspace is already charged to cudaMemGetInfo.
         admit(&plan.demand, context.memory_info()?.free as u64)?;
         let dense_step = plan
@@ -373,9 +383,7 @@ impl CudaProjection {
             dense,
             resident,
             stages,
-            times: (std::env::var_os("FIFI_INKLING_CUDA_PROFILE").as_deref()
-                == Some(std::ffi::OsStr::new("1")))
-            .then(Cell::default),
+            times: (Switch::Profile.on()).then(Cell::default),
             context,
         })
     }

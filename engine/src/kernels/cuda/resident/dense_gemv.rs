@@ -15,8 +15,8 @@ pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, 
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
     dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_q8_row_reuse_launch, gguf_wmma_launch,
-    inkling_q8_visit_enabled, try_attention_group, try_control_pair, try_controller_pair,
-    try_expert_panel, try_qkv_pair, try_ragged_pair, typed_gemv_need, typed_wmma_need,
+    try_attention_group, try_control_pair, try_controller_pair, try_expert_panel, try_qkv_pair,
+    try_ragged_pair, typed_gemv_need, typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 use crate::weights::GgufType;
@@ -144,14 +144,15 @@ fn group_kernel(
     Ok((kernel, need))
 }
 
-/// `FIFI_INKLING_CUDA_DECODE_SPLIT=1`, read once per process: every family's
-/// dense matvec group asks.
-fn decode_split_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var_os("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-    })
+/// The fused and weight-visit kernels a context's dense matvec may take. A context starts with
+/// both off; the session that owns it sets them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DenseGroupPolicy {
+    /// One launch for the six or eight attention matvecs of a decode step, and one per
+    /// controller pair.
+    pub(crate) decode_split: bool,
+    /// The weight-visit kernels: measured shapes read their weights once for all rows.
+    pub(crate) weight_visit: bool,
 }
 
 fn invalid_shape(shape: DenseGemvShape) -> EngError {
@@ -176,6 +177,16 @@ impl CudaContext {
         self.ensure_usable()?;
         let raw = self.plan_dense_gemv(&call)?;
         self.launch_on(stream, move |stream_raw| dense_gemv_launch(stream_raw, raw))
+    }
+
+    /// Sets the dense matvec kernels of this context.
+    pub(crate) fn set_dense_group_policy(&self, policy: DenseGroupPolicy) {
+        self.dense_group_policy.set(policy);
+    }
+
+    /// The dense matvec kernels of this context.
+    pub(crate) fn dense_group_policy(&self) -> DenseGroupPolicy {
+        self.dense_group_policy.get()
     }
 
     /// Validates the complete group before enqueuing any matvec. Device-only dependencies
@@ -207,8 +218,8 @@ impl CudaContext {
     }
 
     /// Selects Q8_0 row reuse for one attention projection; returns 0, 2, or 4. With
-    /// `FIFI_INKLING_CUDA_PREFILL_Q8_VISIT=1` a measured Q8 shape takes the weight-visit
-    /// kernel, which reads the weights once for all rows, and the result is that row count.
+    /// the policy's weight visit a measured Q8 shape takes the weight-visit kernel, which reads
+    /// the weights once for all rows, and the result is that row count.
     pub(crate) fn dense_gemv_with_q8_row_reuse(
         &self,
         stream: &DeviceStream,
@@ -261,7 +272,7 @@ impl CudaContext {
                 && a.offset() < scratch.offset() + scratch.bytes()
                 && scratch.offset() < a.offset() + a.bytes()
         };
-        let tmp = if inkling_q8_visit_enabled()
+        let tmp = if self.dense_group_policy().weight_visit
             && !calls
                 .iter()
                 .any(|c| overlaps(c.w) || overlaps(c.x) || overlaps(c.y))
@@ -310,7 +321,8 @@ impl CudaContext {
             .collect::<Result<Vec<_>, _>>()?;
         self.launch_on(stream, |raw_stream| {
             let mut counts = DenseGemvGroupCounts::default();
-            let pair = decode_split_enabled();
+            let policy = self.dense_group_policy();
+            let pair = policy.decode_split;
             if pair
                 && matches!(planned.len(), 6 | 8)
                 && planned
@@ -323,7 +335,7 @@ impl CudaContext {
             let mut planned = planned.into_iter().peekable();
             while let Some((kernel, call)) = planned.next() {
                 if kernel == GroupKernel::ExactTile
-                    && inkling_q8_visit_enabled()
+                    && policy.weight_visit
                     && let Some((GroupKernel::ExactTile, next)) = planned.peek()
                     && try_ragged_pair(raw_stream, &call, next)?
                 {
@@ -332,7 +344,7 @@ impl CudaContext {
                     continue;
                 }
                 if kernel == GroupKernel::Q8RowPair
-                    && inkling_q8_visit_enabled()
+                    && policy.weight_visit
                     && let Some((GroupKernel::Q8RowPair, next)) = planned.peek()
                     && try_qkv_pair(raw_stream, &call, next)?
                 {
@@ -341,7 +353,7 @@ impl CudaContext {
                     continue;
                 }
                 if kernel == GroupKernel::Gemv
-                    && inkling_q8_visit_enabled()
+                    && policy.weight_visit
                     && let Some((GroupKernel::Gemv, next)) = planned.peek()
                     && try_controller_pair(raw_stream, &call, next)?
                 {
@@ -408,6 +420,8 @@ impl CudaContext {
             w: self.raw_range(&call.w)?,
             x: self.raw_range(&call.x)?,
             y: self.raw_range(&call.y)?,
+            weight_visit: self.dense_group_policy().weight_visit,
+            decode_split: self.dense_group_policy().decode_split,
         })
     }
 }
@@ -531,7 +545,7 @@ mod group_tests {
             let (four, actual) = run(true);
             // The opt-in weight-visit kernel serves this shape with every row in one group
             // and reports the row count instead of a reuse width; `four` then has no effect.
-            let visit = super::inkling_q8_visit_enabled();
+            let visit = ctx.dense_group_policy().weight_visit;
             assert_eq!(
                 (pair, four),
                 if visit { (m as i32, m as i32) } else { (2, 4) }

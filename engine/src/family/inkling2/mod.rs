@@ -26,6 +26,8 @@ mod phase_profile;
 mod resident_history;
 #[cfg(target_pointer_width = "64")]
 mod serve;
+#[cfg(target_pointer_width = "64")]
+mod switches;
 
 #[cfg(target_pointer_width = "64")]
 pub(crate) use cpu_forward::{inspect_cpu_config, inspect_gguf_config};
@@ -46,7 +48,9 @@ pub(crate) const FAMILY: &str = "inkling2_loop";
 const OUTPUT_HEAD: &str = "model.llm.unembed.weight";
 const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
 const CUDA_REFERENCE_ENV: &str = "FIFI_INKLING_CUDA_REFERENCE";
-pub(crate) const DEFAULT_TEXT_CONTEXT: u32 = 128;
+/// The released Mini's attention log-scaling floor: the longest context the current attention
+/// implementation takes.
+pub(crate) const DEFAULT_TEXT_CONTEXT: u32 = 8192;
 
 pub(crate) fn text_context() -> Result<u32, EngError> {
     const NAME: &str = "FIFI_INKLING_CONTEXT_TOKENS";
@@ -71,9 +75,25 @@ impl TextBackend {
         Self::select(enabled(CPU_REFERENCE_ENV), enabled(CUDA_REFERENCE_ENV))
     }
 
+    /// The backend of an unset choice: CUDA in a native-cuda Linux build, else the CPU on a
+    /// 64-bit build; `None` where neither serves.
+    fn default_backend() -> Option<Self> {
+        if cfg!(all(
+            feature = "native-cuda",
+            target_os = "linux",
+            target_pointer_width = "64"
+        )) {
+            Some(Self::Cuda)
+        } else if cfg!(target_pointer_width = "64") {
+            Some(Self::Cpu)
+        } else {
+            None
+        }
+    }
+
     fn select(cpu: bool, cuda: bool) -> Result<Option<Self>, EngError> {
         match (cpu, cuda) {
-            (false, false) => Ok(None),
+            (false, false) => Ok(Self::default_backend()),
             (true, true) => Err(EngError::BadRequest(format!(
                 "select one Inkling backend with {CPU_REFERENCE_ENV}=1 or {CUDA_REFERENCE_ENV}=1"
             ))),
@@ -106,9 +126,7 @@ impl TextBackend {
 }
 
 pub(crate) fn enable_text_backend() -> String {
-    format!(
-        "Set {CPU_REFERENCE_ENV}=1 or {CUDA_REFERENCE_ENV}=1 to enable experimental Inkling text serving."
-    )
+    "Inkling text serving needs a 64-bit build.".to_owned()
 }
 
 #[derive(Deserialize)]

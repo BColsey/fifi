@@ -1,5 +1,7 @@
 //! Per-visit state and streaming attention for the native Inkling CPU check.
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::family::inkling2::switches::Switch;
 use std::{collections::VecDeque, sync::Arc};
 
 use super::cpu_forward::{CpuForward, dot, rms_norm, sigmoid};
@@ -954,11 +956,7 @@ impl PrefillBridge<'_> {
         state: &VisitState,
         rows: usize,
     ) -> Result<Option<attention::prefill::PrefillConv>, EngError> {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| {
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_OUTPUT_CONV").as_deref() == Ok("1")
-        }) || forward.math.sconv_kernel_size != 4
-        {
+        if !Switch::PrefillOutputConv.on() || forward.math.sconv_kernel_size != 4 {
             return Ok(None);
         }
         let width = forward.hidden();

@@ -473,7 +473,7 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
     const bool vector = a.cols % (sizeof(uint4) / sizeof(W)) == 0 && aligned(a.w, 16);
     if (a.m == 1 && ((a.cols == 4608 && a.rows == 64 && a.weight_dtype == kDtypeF32) ||
                      (a.cols == 2304 && (a.rows == 24 || a.rows == 32) && a.weight_dtype == kDtypeBf16)) &&
-        decode_split_enabled() && vector && aligned(a.x,16)) {
+        decode_split(a) && vector && aligned(a.x,16)) {
         if constexpr (std::is_same_v<W,float>) decode_controller_down_exact<<<a.rows,256,0,s>>>(a);
         else decode_bf16_exact<<<a.rows,32,0,s>>>(a);
     } else if (vector) {
@@ -491,7 +491,7 @@ void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
                    Failure &failure, Index index) {
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
     const size_t shared = size_t(a.cols) * sizeof(float);
-    if (decode_split_enabled() && launch_decode_split(a, index, stream)) {
+    if (decode_split(a) && launch_decode_split(a, index, stream)) {
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         return;
     }
@@ -611,10 +611,11 @@ __global__ void sum_moe(inference_cuda_gguf_moe_args a, const float *down) {
 }
 
 bool launch_inkling_q2_down(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
-                            const float *middle, float *down, cudaStream_t stream, Failure &failure) {
+                            const float *middle, float *down, bool split, cudaStream_t stream,
+                            Failure &failure) {
     if (!inkling_q2_down_shape(a.hidden, a.middle, a.count, a.down_dtype)) return false;
     const dim3 grid(kInklingDownRows / kQ2RowsPerCta, kInklingDownPicks);
-    if (decode_split_enabled() && aligned(middle, 16)) {
+    if (split && aligned(middle, 16)) {
         decode_q2_pair<<<grid, kWarps * 32, 0, stream>>>(
             static_cast<const uint8_t *>(a.down), middle, down, index);
     } else {
@@ -632,9 +633,11 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
     float *down = middle + size_t(a.count) * a.middle;
     const int request = schedule ? *schedule : 0;
     const int gate_request = request & INFERENCE_CUDA_GGUF_MOE_GATE_MASK;
+    const bool split = (request & INFERENCE_CUDA_GGUF_MOE_DECODE_SPLIT) != 0;
+    const int flags = split ? INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT : 0;
     int selected_gate = 0;
     if constexpr (DevicePicks) {
-        if (gate_request == 2 && launch_inkling_gate_dot(a, gate, middle, stream, failure)) {
+        if (gate_request == 2 && launch_inkling_gate_dot(a, gate, middle, split, stream, failure)) {
             selected_gate = 2;
         } else if (gate_request != 0 && launch_inkling_iq2_gate(a, gate, stream, failure)) {
             selected_gate = 1;
@@ -643,7 +646,7 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
     if (schedule) *schedule = selected_gate;
     if (!selected_gate) {
         launch_packed({a.gate, a.x, a.scratch, a.count, 2 * a.middle, a.hidden,
-                       0, 2 * a.middle, a.gate_dtype}, stream, failure, gate);
+                       0, 2 * a.middle, a.gate_dtype, flags}, stream, failure, gate);
     }
     if (!failure.ok()) return;
 
@@ -656,12 +659,12 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
     bool exact_down = false;
     if constexpr (DevicePicks) {
         exact_down = (request & INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN) &&
-            launch_inkling_q2_down(a, selected_down, middle, down, stream, failure);
+            launch_inkling_q2_down(a, selected_down, middle, down, split, stream, failure);
         if (schedule && exact_down && failure.ok()) *schedule |= INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN;
     }
     if (!exact_down) {
         launch_packed({a.down, middle, down, a.count, a.hidden, a.middle,
-                       a.middle, a.hidden, a.down_dtype}, stream, failure, selected_down);
+                       a.middle, a.hidden, a.down_dtype, flags}, stream, failure, selected_down);
     }
     if (!failure.ok()) return;
 

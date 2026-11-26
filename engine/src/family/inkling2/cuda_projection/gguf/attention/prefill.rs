@@ -1,6 +1,7 @@
 //! Batch transfer and fences, with opt-in immutable-snapshot query tiles.
 
 use super::*;
+use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
     kernels::cuda::resident::{
@@ -12,15 +13,12 @@ use crate::{
 const ARENA_BYTES: usize = 8 << 20;
 
 pub(in crate::family::inkling2) fn enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_BATCH_RELATIVE_ATTENTION").as_deref() == Ok("1")
-    })
+    Switch::BatchRelativeAttention.on()
 }
 
 pub(super) fn query_tiles_enabled(context: &CudaContext) -> bool {
     enabled()
-        && std::env::var("FIFI_INKLING_CUDA_PREFILL_QUERY_TILES").as_deref() == Ok("1")
+        && Switch::PrefillQueryTiles.on()
         // The kernels use SM75 tensor-core instructions.
         && context
             .device_attributes()
@@ -28,19 +26,13 @@ pub(super) fn query_tiles_enabled(context: &CudaContext) -> bool {
 }
 
 pub(in crate::family::inkling2) fn device_side_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_PREFILL_ATTENTION_SIDE").as_deref() == Ok("1")
-    })
+    Switch::PrefillAttentionSide.on()
 }
 
 /// Extends the ordinary batched relative-attention path; does not enable
 /// batching, grouped controllers, or the resident attention cache on its own.
 pub(in crate::family::inkling2) fn resident_query_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_PREFILL_RESIDENT_QUERY").as_deref() == Ok("1")
-    })
+    Switch::PrefillResidentQuery.on()
 }
 
 pub(in crate::family::inkling2) fn host_reserve() -> u64 {

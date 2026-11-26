@@ -1,6 +1,7 @@
 //! Bounded staging for grouped resident controller → attention projections.
 
 use super::{CudaContext, DensePlan, DenseStep, EngError, controller_residency};
+use crate::family::inkling2::switches::Switch;
 
 pub(super) const TILE_ROWS: usize = 8;
 const MAX_BYTES: usize = 4 << 20;
@@ -9,9 +10,7 @@ const MAX_BYTES: usize = 4 << 20;
 pub(super) fn target_rows() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
-        if std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_VISIT").as_deref() == Ok("1")
-            && std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_WIDE").as_deref() == Ok("1")
-        {
+        if Switch::PrefillQ8Visit.on() && Switch::PrefillWeightWide.on() {
             // Larger arena is separately opt-in; unknown settings use 64.
             match std::env::var("FIFI_INKLING_CUDA_PREFILL_WEIGHT_WINDOW").as_deref() {
                 Ok("128") => 128,
@@ -25,7 +24,7 @@ pub(super) fn target_rows() -> usize {
 }
 
 pub(super) fn enabled() -> bool {
-    std::env::var("FIFI_INKLING_CUDA_PREFILL_CONTROLLER_WORKSPACE").as_deref() == Ok("1")
+    Switch::PrefillControllerWorkspace.on()
 }
 
 pub(super) fn admit(

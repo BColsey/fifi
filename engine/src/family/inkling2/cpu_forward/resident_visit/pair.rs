@@ -1,6 +1,7 @@
 //! Bounded cross-visit transaction: distinct per-slot logs, a device depth handoff,
 //! one stream and one pinned owner for all transfers and the completion fence.
 use super::*;
+use crate::family::inkling2::switches::Switch;
 
 #[cfg(test)]
 mod tests;
@@ -21,11 +22,7 @@ impl CpuForward {
         depth: &mut Stream,
         bank: &MessageBank,
     ) -> Result<bool, EngError> {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !*ENABLED
-            .get_or_init(|| std::env::var("FIFI_INKLING_CUDA_RESIDENT_TOKEN").as_deref() == Ok("1"))
-            || self.draft_window_enabled()
-        {
+        if !Switch::ResidentToken.on() || self.draft_window_enabled() {
             return Ok(false);
         }
         let Weights::Gguf(weights) = &self.weights else {

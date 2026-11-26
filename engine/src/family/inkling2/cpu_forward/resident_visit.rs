@@ -2,7 +2,8 @@
 //! boundary; within the visit, one stream orders depth mixing, attention, expert
 //! routing and the residual updates without a host wait between them.
 
-use std::sync::{Once, OnceLock};
+use crate::family::inkling2::switches::Switch;
+use std::sync::Once;
 
 use super::{
     CpuForward, LayerVisit, MIX_EPS, MessageBank, Role, Stream, VisitState, Weights, Work, bad,
@@ -288,11 +289,8 @@ impl CpuForward {
         depth: &mut Stream,
         bank: &MessageBank,
     ) -> Result<bool, EngError> {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
         if visit.attention != Attention::Local
-            || !*ENABLED.get_or_init(|| {
-                std::env::var("FIFI_INKLING_CUDA_RESIDENT_VISIT").as_deref() == Ok("1")
-            })
+            || !Switch::ResidentVisit.on()
             || self.draft_window_enabled()
         {
             return Ok(false);

@@ -1,5 +1,6 @@
 //! Opt-in routing and diagnostics for Inkling's existing multirow attention projections.
 
+use crate::family::inkling2::switches::Switch;
 use std::sync::OnceLock;
 
 use crate::{
@@ -15,9 +16,8 @@ fn flags() -> (bool, bool) {
     static FLAGS: OnceLock<(bool, bool)> = OnceLock::new();
     *FLAGS.get_or_init(|| {
         (
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE").as_deref() == Ok("1")
-                || std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_VISIT").as_deref() == Ok("1"),
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT").as_deref() == Ok("1"),
+            Switch::PrefillQ8RowReuse.on() || Switch::PrefillQ8Visit.on(),
+            Switch::PrefillQ8RowReuseReport.on(),
         )
     })
 }
@@ -28,10 +28,7 @@ pub(super) fn project_group(
     calls: &[DenseGemvCall<'_>],
     stage: &str,
 ) -> Result<(), EngError> {
-    static Q6: OnceLock<bool> = OnceLock::new();
-    let q6 = *Q6.get_or_init(|| {
-        std::env::var("FIFI_INKLING_CUDA_PREFILL_Q6_ROW_REUSE").as_deref() == Ok("1")
-    });
+    let q6 = Switch::PrefillQ6RowReuse.on();
     let (q8, report) = flags();
     let counts = if q8 || q6 {
         context.dense_gemv_group_with_attention_reuse(
@@ -68,10 +65,7 @@ pub(super) fn project_output(
     let shape = call.shape;
     let q8 = call.dtype == DenseDtype::PackedGguf(GgufType::Q80);
     let width = if reuse {
-        static FOUR: OnceLock<bool> = OnceLock::new();
-        let four = *FOUR.get_or_init(|| {
-            std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_OUTPUT_EXACT4").as_deref() == Ok("1")
-        });
+        let four = Switch::PrefillQ8OutputExact4.on();
         context.dense_gemv_with_q8_row_reuse(stream, call, four)?
     } else {
         context.dense_gemv(stream, call)?;

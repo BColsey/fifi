@@ -9,7 +9,7 @@
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
 | `gemma4` | Nemotron Bolt E4B | no | Bolt E4B only | The Bolt E4B Q8_0 GGUF or a K-quant conversion of it; a bare weights file is detected from `general.architecture` = `gemma4`. Other Gemma4 checkpoints are not served. |
 | `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md), or a text GGUF (mainline `inkling2_loop` or older `inkling2` layout) |
-| `inkling2_loop` | Inkling 2 Mini | CPU pilot | opt-in | Native ModelOpt safetensors and tokenizer files from the [pinned release](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7). |
+| `inkling2_loop` | Inkling 2 Mini | CPU | yes | Native ModelOpt safetensors and tokenizer files from the [pinned release](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7). |
 | `sensenova` | SenseNova-Loop-9B (text) | CPU only | opt-in | Experimental host path for [SenseNova-Loop-9B GGUF](https://huggingface.co/sensenova/SenseNova-Loop-9B-GGUF). |
 | `raon1` | Raon-1-mini-preview, 28.8B total, 4.3B active | no | experimental | `raon-1-mini-preview-Q4_K_M.gguf` from `KRAFTON/Raon-1-mini-preview-gguf`. The tokenizer and chat template are read from the GGUF file, so the directory needs no tokenizer files. |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
@@ -45,7 +45,7 @@ card instead. This path is opt-in and not validated end to end.
 
 ## Inkling 2 Mini
 
-Inkling 2 Mini serves on Apple Silicon (family `inkling2_mini`, see [Run Inkling 2 Mini on a Mac](../how-to/inkling.md)) and, as an opt-in pilot, on the CPU or one CUDA device (family `inkling2_loop`, see [Run the Inkling 2 Mini pilot on CPU or CUDA](../how-to/inkling-loop.md)).
+Inkling 2 Mini serves on Apple Silicon (family `inkling2_mini`, see [Run Inkling 2 Mini on a Mac](../how-to/inkling.md)) and on one CUDA device or the CPU (family `inkling2_loop`, see [Run Inkling 2 Mini on CPU or CUDA](../how-to/inkling-loop.md)).
 
 ## Tokenizer files
 

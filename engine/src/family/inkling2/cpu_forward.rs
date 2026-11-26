@@ -1,5 +1,7 @@
 //! Text execution for Inkling 2 Mini, including CUDA-backed projections.
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::family::inkling2::switches::Switch;
 use std::{borrow::Cow, fs, path::Path, sync::Arc};
 
 use serde::Deserialize;
@@ -594,10 +596,7 @@ impl CpuForward {
             ControlledAttentionInput,
             router::{MlpController, RouteInput},
         };
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| {
-            std::env::var("FIFI_INKLING_CUDA_CHAIN_MLP_EXPERTS").as_deref() == Ok("1")
-        }) {
+        if !Switch::ChainMlpExperts.on() {
             return Ok(None);
         }
         let Weights::Gguf(weights) = &self.weights else {
@@ -1239,8 +1238,7 @@ pub(super) fn sigmoid(x: f32) -> f32 {
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn vocab_softcap_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("FIFI_INKLING_CUDA_VOCAB_SOFTCAP").as_deref() == Ok("1"))
+    Switch::VocabSoftcap.on()
 }
 
 fn softcap(x: f32, cap: f32) -> f32 {

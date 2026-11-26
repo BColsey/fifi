@@ -4,6 +4,7 @@
 //! A known device cursor is valid for the current continuation. Prefix restore
 //! invalidates every cursor. Rejection repairs only overwritten visible rows.
 
+use crate::family::inkling2::switches::Switch;
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 
 use crate::{
@@ -143,11 +144,8 @@ impl Plan {
         }
 
         let hidden = spec.hidden_size as usize;
-        let projected_rows = (std::env::var("FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT").as_deref()
-            == Ok("1"))
-        .then_some(hidden);
-        let local_enabled = (1..=4096).contains(&hidden)
-            && std::env::var("FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE").as_deref() == Ok("1");
+        let projected_rows = (Switch::ChainAttentionOutput.on()).then_some(hidden);
+        let local_enabled = (1..=4096).contains(&hidden) && Switch::ChainLocalDecode.on();
         let mut local_workspace = None::<(usize, usize)>;
         let mut visits = Vec::new();
         let mut cache_at = tables.len();
@@ -224,8 +222,7 @@ impl Plan {
         };
         // Keep status and the returned projection contiguous. Only the internal
         // attention row, consumed by the single-row weight kernel, needs padding.
-        let align_projected_input = self.projected_rows.is_some()
-            && std::env::var("FIFI_INKLING_CUDA_DECODE_SPLIT").as_deref() == Ok("1");
+        let align_projected_input = self.projected_rows.is_some() && Switch::DecodeSplit.on();
         let bytes = scratch_at
             .checked_add(self.scratch_bytes)
             .and_then(|n| n.checked_add(if align_projected_input { 12 } else { 0 }))

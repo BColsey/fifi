@@ -33,7 +33,7 @@ and known limitations.
 The model guides cover [Qwen3.6](doc/how-to/qwen36.md),
 [Flint](doc/how-to/flint.md), [Nemotron 3.5 Super](doc/how-to/nemotron.md) and
 Inkling 2 Mini ([Mac](doc/how-to/inkling.md),
-[CPU or CUDA pilot](doc/how-to/inkling-loop.md)). The
+[CUDA or CPU](doc/how-to/inkling-loop.md)). The
 [model reference](doc/reference/models.md) covers the other families.
 
 ## Configuration

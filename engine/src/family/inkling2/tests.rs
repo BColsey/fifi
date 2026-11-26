@@ -88,10 +88,21 @@ fn rejects_variable_loops_invalid_head_geometry_and_duplicate_local_layers() {
 }
 
 #[test]
-fn text_backends_require_a_single_supported_opt_in() {
+fn text_backends_default_to_the_build_and_take_one_override() {
     use super::TextBackend::{self, Cpu, Cuda};
 
-    assert!(matches!(TextBackend::select(false, false), Ok(None)));
+    let default = if cfg!(all(
+        feature = "native-cuda",
+        target_os = "linux",
+        target_pointer_width = "64"
+    )) {
+        Some(Cuda)
+    } else if cfg!(target_pointer_width = "64") {
+        Some(Cpu)
+    } else {
+        None
+    };
+    assert_eq!(TextBackend::select(false, false).unwrap(), default);
     assert!(TextBackend::select(true, true).is_err());
     if cfg!(target_pointer_width = "64") {
         assert!(matches!(TextBackend::select(true, false), Ok(Some(Cpu))));

@@ -103,10 +103,19 @@ struct DenseGemvArgsRaw {
     ld_x: c_int,
     ld_y: c_int,
     weight_dtype: c_int,
+    flags: c_int,
+}
+
+/// `INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT` in dense_gemv.h.
+const DECODE_SPLIT: c_int = 1;
+
+/// The native flag bits of a call.
+fn flags(call: &DenseGemvRaw<'_>) -> c_int {
+    if call.decode_split { DECODE_SPLIT } else { 0 }
 }
 
 const _: () = assert!(
-    size_of::<DenseGemvArgsRaw>() == 48
+    size_of::<DenseGemvArgsRaw>() == 56
         && offset_of!(DenseGemvArgsRaw, w) == 0
         && offset_of!(DenseGemvArgsRaw, x) == 8
         && offset_of!(DenseGemvArgsRaw, y) == 16
@@ -116,6 +125,7 @@ const _: () = assert!(
         && offset_of!(DenseGemvArgsRaw, ld_x) == 36
         && offset_of!(DenseGemvArgsRaw, ld_y) == 40
         && offset_of!(DenseGemvArgsRaw, weight_dtype) == 44
+        && offset_of!(DenseGemvArgsRaw, flags) == 48
 );
 
 unsafe extern "C" {
@@ -217,6 +227,10 @@ pub(in crate::kernels::cuda) struct DenseGemvRaw<'a> {
     pub(in crate::kernels::cuda) w: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) y: RawRange<'a>,
+    /// The context's weight-visit choice (`DenseGroupPolicy::weight_visit`).
+    pub(in crate::kernels::cuda) weight_visit: bool,
+    /// The context's split-kernel choice (`DenseGroupPolicy::decode_split`).
+    pub(in crate::kernels::cuda) decode_split: bool,
 }
 
 /// Bytes each range of a launch must hold.
@@ -332,9 +346,9 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
     let down = call.dtype == DenseDtype::F32
         && (n, k) == (64, 4608)
         && matches!(m, 7 | 8 | 21 | 63 | 64 | 127 | 128 | 255 | 256);
-    let entry = if down && inkling_q8_visit_enabled() {
+    let entry = if down && call.weight_visit {
         ProjectionEntry::ControllerDown
-    } else if (attn || expert) && inkling_q8_visit_enabled() {
+    } else if (attn || expert) && call.weight_visit {
         ProjectionEntry::PackedVisit(3)
     } else {
         ProjectionEntry::Gemv
@@ -364,7 +378,7 @@ pub(in crate::kernels::cuda) fn gguf_exact_expert_tile_launch(
     let visit = match (call.dtype, dims.rows, dims.cols, dims.m) {
         (DenseDtype::PackedGguf(GgufType::Q6K), 3072, 2304, 8 | 63 | 64)
         | (DenseDtype::PackedGguf(GgufType::Iq2Xxs), 2304, 2304, 4..=16)
-        | (DenseDtype::PackedGguf(GgufType::Q20), 2304, 1152, 4..=32) => inkling_q8_visit_enabled(),
+        | (DenseDtype::PackedGguf(GgufType::Q20), 2304, 1152, 4..=32) => call.weight_visit,
         _ => false,
     };
     let entry = if visit {
@@ -392,18 +406,13 @@ pub(in crate::kernels::cuda) fn gguf_wmma_launch(
         && call.dims.m <= 512
         && call.dims.ld_x <= GEMV_MAX_LD
         && call.dims.ld_y <= GEMV_MAX_LD
-        && inkling_q8_visit_enabled()
+        && call.weight_visit
     {
         ProjectionEntry::Iq2Visit
     } else {
         ProjectionEntry::Wmma
     };
     projection_launch(stream, call, need, entry).map(|_| ())
-}
-
-pub(in crate::kernels::cuda) fn inkling_q8_visit_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("FIFI_INKLING_CUDA_PREFILL_Q8_VISIT").as_deref() == Ok("1"))
 }
 
 enum ProjectionEntry {
@@ -433,6 +442,7 @@ fn projection_args(
         ld_x: as_int(dims.ld_x)?,
         ld_y: as_int(dims.ld_y)?,
         weight_dtype: call.dtype.code(),
+        flags: flags(call),
     })
 }
 
@@ -628,11 +638,7 @@ fn projection_launch(
                 stream,
                 &mut stage,
                 &mut selected,
-                if inkling_q8_visit_enabled() {
-                    -1
-                } else {
-                    four.into()
-                },
+                if call.weight_visit { -1 } else { four.into() },
             ),
         }
     };

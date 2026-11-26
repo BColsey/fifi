@@ -1,12 +1,8 @@
 // Included inside dense_gemv.cu's implementation namespace. One CTA per
 // output avoids starving SMs on small projections; four warps partition K.
-// Read once per process: every family's packed GEMV launch asks.
-bool decode_split_enabled() {
-    static const bool enabled = [] {
-        const char *v = std::getenv("FIFI_INKLING_CUDA_DECODE_SPLIT");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
-    return enabled;
+// The caller's context chooses them (INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT).
+inline bool decode_split(const inference_cuda_dense_gemv_args &a) {
+    return (a.flags & INFERENCE_CUDA_DENSE_GEMV_DECODE_SPLIT) != 0;
 }
 
 __device__ void decode_split_store(float acc, float *out) {

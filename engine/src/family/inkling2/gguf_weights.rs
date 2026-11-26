@@ -1,5 +1,7 @@
 //! Bind both fixed-loop Inkling 2 Mini GGUF layouts to the Inkling text graph.
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::family::inkling2::switches::Switch;
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -676,15 +678,13 @@ impl GgufTextWeights {
             draft_target,
         }: CudaConfig,
     ) -> Result<(), EngError> {
-        let resident_attention =
-            if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref() == Ok("1") {
-                Some(attention)
-            } else {
-                None
-            };
-        let packed = std::env::var("FIFI_INKLING_CUDA_PACKED_GGUF").as_deref() == Ok("1");
-        let group_projections =
-            std::env::var("FIFI_INKLING_CUDA_GROUP_PROJECTIONS").as_deref() == Ok("1");
+        let resident_attention = if Switch::ResidentAttention.on() {
+            Some(attention)
+        } else {
+            None
+        };
+        let packed = Switch::PackedGguf.on();
+        let group_projections = Switch::GroupProjections.on();
         let mut uploads = Vec::new();
         for (name, tensor) in &self.tensors {
             let dtype = if group_projections
@@ -723,7 +723,7 @@ impl GgufTextWeights {
             });
         }
         let ram_limit = ram::requested_limit()?;
-        let reuse = std::env::var("FIFI_INKLING_CUDA_CACHE_EXPERTS").as_deref() == Ok("1");
+        let reuse = Switch::CacheExperts.on();
         let tiered = reuse || ram_limit.is_some_and(|limit| limit > 0);
         let budget =
             if tiered && std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB").is_none() {
@@ -731,16 +731,14 @@ impl GgufTextWeights {
             } else {
                 expert_residency_budget()?
             };
-        let direct = std::env::var("FIFI_INKLING_CUDA_DIRECT_RESIDENT").as_deref() == Ok("1");
+        let direct = Switch::DirectResident.on();
         let cache_reserve = if packed && reuse {
             expert_mib_budget("FIFI_INKLING_CUDA_EXPERT_CACHE_RESERVE_MIB")?
         } else {
             Some(0)
         };
         let layers = self.expert_layers(spec, budget, direct, packed)?;
-        let stream = packed
-            || tiered
-            || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
+        let stream = packed || tiered || Switch::StreamExperts.on();
         let resident_attention = match resident_attention {
             Some(config) if packed => attention::Plan::new(self, spec, config)?,
             Some(_) => {
