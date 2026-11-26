@@ -230,6 +230,19 @@ impl CpuForward {
         Ok(true)
     }
 
+    /// Whether a visit reads the message bank and so runs the depth-mix controllers: the passes
+    /// after the first over the core layers (the prelude pass and the suffix layers have none).
+    fn pass_visit_banked(&self, slot: usize) -> bool {
+        let core = &self.spec.core;
+        match core.core_end.checked_sub(core.core_start) {
+            Some(width) if width > 0 => {
+                let end = core.core_start + width * core.num_passes.max(1);
+                (core.core_start + width..end).contains(&slot)
+            }
+            _ => false,
+        }
+    }
+
     /// Names one refusal of the pass once per process when
     /// `FIFI_INKLING_RESIDENT_PASS_REPORT` is set, so a silent fall-through is diagnosable.
     fn pass_refused(&self, reason: std::fmt::Arguments<'_>) -> bool {
@@ -317,16 +330,17 @@ impl CpuForward {
         ) {
             return Ok(refused("attention output projection"));
         }
-        let names = control_names(&layer, Role::Mlp);
-        if !cuda
-            .controller_weights(
-                names.each_ref().map(String::as_str),
-                2 * h,
-                [self.spec.core.gate_rank as usize, h],
-            )
-            .is_some_and(|result| result.is_ok())
-        {
-            return Ok(refused("MLP controller weights"));
+        if self.pass_visit_banked(visit.state_slot) {
+            let rank = self.spec.core.gate_rank as usize;
+            for role in [Role::Query, Role::Key, Role::Value, Role::Mlp] {
+                let names = control_names(&layer, role);
+                if !cuda
+                    .controller_weights(names.each_ref().map(String::as_str), 2 * h, [rank, h])
+                    .is_some_and(|result| result.is_ok())
+                {
+                    return Ok(refused(&format!("{} controller weights not resident", role.name())));
+                }
+            }
         }
         let prefix = format!("{layer}.mlp");
         let experts = [
@@ -1376,8 +1390,13 @@ impl PassWorkspace {
                 }
             }
             let mut control: [Range<usize>; 4] = std::array::from_fn(|_| 0..0);
-            for (range, role) in control.iter_mut().zip([Role::Query, Role::Key, Role::Value, Role::Mlp]) {
-                *range = consts.add(&host.control_query(physical, role)?);
+            if host.pass_visit_banked(visit.state_slot) {
+                for (range, role) in control
+                    .iter_mut()
+                    .zip([Role::Query, Role::Key, Role::Value, Role::Mlp])
+                {
+                    *range = consts.add(&host.control_query(physical, role)?);
+                }
             }
             let mut norms: [Range<usize>; ROLES] = std::array::from_fn(|_| 0..0);
             for (i, range) in norms.iter_mut().enumerate() {
