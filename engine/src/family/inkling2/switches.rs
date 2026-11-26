@@ -49,6 +49,7 @@ crate::family::switch_table::switch_table! {
         PrefillResidentExpertConv = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_EXPERT_CONV", true;
         PrefillKvPrep = "FIFI_INKLING_CUDA_PREFILL_KV_PREP", true;
         PrefillDevicePrompt = "FIFI_INKLING_CUDA_PREFILL_DEVICE_PROMPT", true;
+        PrefillDeviceBanked = "FIFI_INKLING_CUDA_PREFILL_DEVICE_BANKED", true;
         PrefillResidentQuery = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_QUERY", true;
         PrefillReuseExpertStage = "FIFI_INKLING_CUDA_PREFILL_REUSE_EXPERT_STAGE", true;
         PrefillRouterInputReuse = "FIFI_INKLING_CUDA_PREFILL_ROUTER_INPUT_REUSE", true;

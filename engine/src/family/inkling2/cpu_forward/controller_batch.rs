@@ -510,7 +510,7 @@ impl CpuForward {
     }
 }
 
-fn name_refs(names: &[[String; 3]; 3]) -> [[&str; 3]; 3] {
+pub(super) fn name_refs(names: &[[String; 3]; 3]) -> [[&str; 3]; 3] {
     names
         .each_ref()
         .map(|names| names.each_ref().map(String::as_str))

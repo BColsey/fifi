@@ -1,41 +1,65 @@
-//! Prompt visits without a message bank, run on the device prompt streams. The depth mixes,
-//! norms, attention, residual, MLP input, experts and both output convolutions stay on the
-//! device; the host reads the router logits to route, and the K/V rows it mirrors.
+//! Prompt visits run on the device prompt streams. The depth mixes, norms, attention, residual,
+//! MLP input, experts and both output convolutions stay on the device; the host reads the
+//! router logits to route, and the K/V rows it mirrors. The core passes' prelude and message
+//! bank stay on the device too (`banked` runs the visits that read the bank).
 
 use super::super::prompt_streams::{MixTarget, PromptStreams};
 use super::{
-    Attention, CpuForward, EngError, ExpertPrefillRows, GgufTextWeights, LayerVisit, PromptRow,
-    VisitState, attention_norm_name, bad,
+    Attention, CpuForward, EngError, ExpertPrefillRows, GgufTextWeights, LayerVisit, MessageBank,
+    PromptRow, Role, VisitState, attention_norm_name, bad,
 };
 use crate::family::inkling2::{cuda_projection::gguf::attention::prefill, switches::Switch};
 use crate::kernels::cuda::{
-    DeviceBuffer, DeviceRange, DeviceStream,
+    CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
     resident::inkling_stream::{MAX_BLOCKS, MAX_STATES},
 };
 
+mod banked;
+
 const WORD: usize = size_of::<f32>();
-/// Constant rows per visit: three attention queries and norms, the MLP query and norm.
-const CONSTANTS: usize = 8;
+/// Constant rows per visit: three attention queries (0..3) and norms (3..6), the MLP query (6)
+/// and norm (7); banked visits add the three attention control queries (8..11) and the MLP
+/// control query (11).
+const CONSTANTS: usize = 12;
 
 /// A prompt's device streams and the planes its visits reuse.
 pub(super) struct DevicePrompt {
     streams: PromptStreams,
+    /// The streams at the first core pass's start, which each later pass restarts from.
+    prelude: Option<PromptStreams>,
+    /// The previous pass's streams, which a banked visit's controllers read.
+    bank: Option<Bank>,
     stream: DeviceStream,
     /// Each row's three attention inputs, packed.
     inputs: DeviceBuffer,
     /// Each row's MLP input.
     mlp: DeviceBuffer,
     constants: DeviceBuffer,
+    /// The controller pairs of banked visits, allocated by the first.
+    controls: Option<Controls>,
+}
+
+/// The message bank on the device: `MessageBank` of every row.
+struct Bank {
+    streams: PromptStreams,
+    first_block: usize,
+}
+
+/// Each attention role's [input, message] pair per row (role-major), and two health words per
+/// pair for the gates prepared from them.
+struct Controls {
+    pairs: DeviceBuffer,
+    health: DeviceBuffer,
 }
 
 impl DevicePrompt {
     /// Uploads the rows' streams, or declines when the device path or one it uses is off, or
-    /// the prompt does not fit. `seals` is how many more blocks the coming visits may seal.
+    /// the prompt does not fit. `peak` is the most sealed blocks the coming visits reach.
     pub(super) fn open(
         forward: &CpuForward,
         weights: &GgufTextWeights,
         rows: &[PromptRow<'_>],
-        seals: usize,
+        peak: usize,
     ) -> Result<Option<Self>, EngError> {
         let Some((context, _)) = weights.resident_attention() else {
             return Ok(None);
@@ -44,7 +68,7 @@ impl DevicePrompt {
             return Ok(None);
         };
         let blocks = first.stream.block_count();
-        let capacity = (blocks + seals).min(MAX_BLOCKS);
+        let capacity = peak.min(MAX_BLOCKS);
         // The visits project and attend through the batched prefill bridge, so its switches
         // decline the device prompt as they decline the host's grouped visits.
         if !Switch::PrefillDevicePrompt.on()
@@ -57,7 +81,7 @@ impl DevicePrompt {
             || !forward.taps.is_empty()
             || rows
                 .iter()
-                .any(|row| row.bank.is_some() || row.journal.is_some())
+                .any(|row| row.bank.is_some() || row.prelude.is_some() || row.journal.is_some())
         {
             return Ok(None);
         }
@@ -67,9 +91,12 @@ impl DevicePrompt {
             let streams: Vec<_> = rows.iter().map(|row| &row.stream).collect();
             Ok::<_, EngError>(Self {
                 streams: PromptStreams::upload(context, &stream, &streams, capacity)?,
+                prelude: None,
+                bank: None,
                 inputs: context.allocate(rows.len() * 3 * width * WORD)?,
                 mlp: context.allocate(rows.len() * width * WORD)?,
                 constants: context.allocate(CONSTANTS * width * WORD)?,
+                controls: None,
                 stream,
             })
         })();
@@ -80,21 +107,94 @@ impl DevicePrompt {
         }
     }
 
-    /// Writes the device streams back into the rows.
-    pub(super) fn materialize(&self, rows: &mut [PromptRow<'_>]) -> Result<(), EngError> {
-        let streams = self.streams.download(&self.stream)?;
-        if streams.len() != rows.len() {
-            return Err(bad("device prompt streams lost a row"));
+    /// `PromptRow::begin_pass` of every row: the first pass keeps a prelude of the streams,
+    /// a later one banks the streams and restarts them from the prelude. A failed allocation
+    /// declines, with the streams unchanged.
+    pub(super) fn begin_pass(
+        &mut self,
+        context: &CudaContext,
+        pass: usize,
+    ) -> Result<bool, EngError> {
+        let begun = if pass == 0 {
+            self.streams
+                .duplicate(context, &self.stream)
+                .map(|prelude| self.prelude = Some(prelude))
+        } else {
+            let Some(prelude) = &self.prelude else {
+                return Ok(false);
+            };
+            let first_block = prelude.blocks() + 1;
+            prelude.duplicate(context, &self.stream).map(|restart| {
+                let streams = std::mem::replace(&mut self.streams, restart);
+                self.bank = Some(Bank {
+                    streams,
+                    first_block,
+                });
+            })
+        };
+        match begun {
+            Ok(()) => Ok(true),
+            Err(EngError::MemoryPlan(_)) => Ok(false),
+            Err(error) => Err(error),
         }
+    }
+
+    /// Whether the visits read the message bank.
+    pub(super) fn banked(&self) -> bool {
+        self.bank.is_some()
+    }
+
+    /// The coda reads neither the prelude nor the bank.
+    pub(super) fn end_passes(&mut self) {
+        self.prelude = None;
+        self.bank = None;
+    }
+
+    /// Writes the device streams, prelude and bank back into the rows.
+    pub(super) fn materialize(&self, rows: &mut [PromptRow<'_>]) -> Result<(), EngError> {
+        let download = |streams: &PromptStreams| {
+            let streams = streams.download(&self.stream)?;
+            if streams.len() != rows.len() {
+                return Err(bad("device prompt streams lost a row"));
+            }
+            Ok(streams)
+        };
+        let streams = download(&self.streams)?;
+        let mut preludes = self
+            .prelude
+            .as_ref()
+            .map(download)
+            .transpose()?
+            .map(Vec::into_iter);
+        let mut banks = self
+            .bank
+            .as_ref()
+            .map(|bank| Ok::<_, EngError>((download(&bank.streams)?.into_iter(), bank.first_block)))
+            .transpose()?;
         for (row, stream) in rows.iter_mut().zip(streams) {
             row.stream = stream;
+            row.prelude = preludes.as_mut().and_then(Iterator::next);
+            row.bank = banks.as_mut().and_then(|(banks, first_block)| {
+                banks.next().map(|stream| MessageBank {
+                    first_block: *first_block,
+                    stream,
+                })
+            });
         }
         Ok(())
     }
 
     fn constant(&self, index: usize, width: usize) -> Result<DeviceRange<'_>, EngError> {
-        self.constants.range(index * width * WORD, width * WORD)
+        constant(&self.constants, index, width)
     }
+}
+
+fn constant(
+    constants: &DeviceBuffer,
+    index: usize,
+    width: usize,
+) -> Result<DeviceRange<'_>, EngError> {
+    constants.range(index * width * WORD, width * WORD)
 }
 
 impl CpuForward {
@@ -157,7 +257,7 @@ impl CpuForward {
         if !weights.admit_resident_prefill_experts(names, physical as u32, dims, caps)? {
             return Ok(false);
         }
-        self.upload_visit_constants(prompt, visit, layer)?;
+        self.upload_visit_constants(prompt, visit, layer, false)?;
         let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
         let eps = self.math.rms_norm_eps;
         // From here the visit advances state; a failure is an error, not a decline.
@@ -257,13 +357,14 @@ impl CpuForward {
         Ok(true)
     }
 
-    /// The visit's attention queries and norms (one role on local visits) and its MLP query and
-    /// norm, in the order [`DevicePrompt::constant`] reads them.
+    /// The visit's attention queries and norms (one role on local visits), its MLP query and
+    /// norm, and on a banked visit the control queries, in the order of [`CONSTANTS`].
     fn upload_visit_constants(
         &self,
         prompt: &DevicePrompt,
         visit: LayerVisit,
         layer: &str,
+        banked: bool,
     ) -> Result<(), EngError> {
         let width = self.hidden();
         let local = visit.attention == Attention::Local;
@@ -299,6 +400,12 @@ impl CpuForward {
                 .weights
                 .vec(&format!("{layer}.mlp_norm.weight"), width)?,
         );
+        if banked {
+            let roles = [Role::Query, Role::Key, Role::Value, Role::Mlp];
+            for (index, role) in (8..).zip(roles) {
+                put(index, &self.control_query(physical, role)?);
+            }
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
         prompt.constants.write_at(&prompt.stream, 0, &bytes)
     }

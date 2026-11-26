@@ -126,16 +126,14 @@ impl ResidentController {
         ctx: &CudaContext,
         weights: ControllerWeights<'_>,
         (inputs, messages, gamma): (&[Vec<f32>], &[Vec<f32>], &[f32]),
-        (gate_eps, eps): (f32, f32),
+        eps: (f32, f32),
     ) -> Result<DeviceRange<'_>, EngError> {
         let m = inputs.len();
-        let Plan { width: h, rank, .. } = self.plan;
-        if !self.fits([m, h, rank])
-            || messages.len() != m
+        let h = self.plan.width;
+        self.check(weights, m, eps)?;
+        if messages.len() != m
             || gamma.len() != h
             || inputs.iter().chain(messages).any(|row| row.len() != h)
-            || weights.map(|(w, _)| w.shape) != [[rank, 2 * h], [h, rank], [h, rank]]
-            || [gate_eps, eps].iter().any(|&e| !e.is_finite() || e <= 0.0)
         {
             return Err(bad("invalid resident Inkling prefill controller shape"));
         }
@@ -151,10 +149,68 @@ impl ResidentController {
             }
             Ok(())
         })?;
+        let queued = ctx.copy_from_pinned(&self.stream, &mut self.transfer, 0, upload);
+        self.finish(ctx, weights, m, eps, queued)
+    }
+
+    /// Where a device producer writes the `rows` [input, message] pairs and the gamma row that
+    /// [`Self::run_written`] reads.
+    pub(in crate::family::inkling2) fn inputs(
+        &self,
+        rows: usize,
+    ) -> Result<[DeviceRange<'_>; 2], EngError> {
+        let h = self.plan.width;
+        if !self.fits([rows, h, self.plan.rank]) {
+            return Err(bad("invalid resident Inkling prefill controller rows"));
+        }
+        Ok([
+            words(&self.input, 0, 2 * rows * h)?,
+            words(&self.input, 2 * rows * h, h)?,
+        ])
+    }
+
+    /// [`Self::run`] of the `rows` pairs a device producer wrote into [`Self::inputs`]; the
+    /// producer's stream must have finished them.
+    pub(in crate::family::inkling2::cuda_projection) fn run_written(
+        &mut self,
+        ctx: &CudaContext,
+        weights: ControllerWeights<'_>,
+        rows: usize,
+        eps: (f32, f32),
+    ) -> Result<DeviceRange<'_>, EngError> {
+        self.check(weights, rows, eps)?;
+        self.finish(ctx, weights, rows, eps, Ok(()))
+    }
+
+    fn check(
+        &self,
+        weights: ControllerWeights<'_>,
+        rows: usize,
+        (gate_eps, eps): (f32, f32),
+    ) -> Result<(), EngError> {
+        let Plan { width: h, rank, .. } = self.plan;
+        if !self.fits([rows, h, rank])
+            || weights.map(|(w, _)| w.shape) != [[rank, 2 * h], [h, rank], [h, rank]]
+            || [gate_eps, eps].iter().any(|&e| !e.is_finite() || e <= 0.0)
+        {
+            return Err(bad("invalid resident Inkling prefill controller shape"));
+        }
+        Ok(())
+    }
+
+    /// Runs the tiles after `queued` (the input's upload, or nothing), then reads the health.
+    fn finish(
+        &mut self,
+        ctx: &CudaContext,
+        weights: ControllerWeights<'_>,
+        m: usize,
+        eps: (f32, f32),
+        queued: Result<(), EngError>,
+    ) -> Result<DeviceRange<'_>, EngError> {
+        let h = self.plan.width;
         let health = words(&self.output, m * h, 3 * m)?;
-        let queued = ctx
-            .copy_from_pinned(&self.stream, &mut self.transfer, 0, upload)
-            .and_then(|()| self.enqueue(ctx, weights, m, (gate_eps, eps)))
+        let queued = queued
+            .and_then(|()| self.enqueue(ctx, weights, m, eps))
             .and_then(|()| ctx.copy_to_pinned(&self.stream, health, &mut self.transfer, 0));
         self.transfer
             .synchronize_after_enqueue(&self.stream, queued)?;

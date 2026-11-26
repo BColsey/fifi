@@ -38,7 +38,9 @@ pub(in crate::family::inkling2::cuda_projection) use local_attention::{
 };
 pub(in crate::family::inkling2) use resident_controller::ResidentController;
 
-pub(in crate::family::inkling2) use controlled_attention::ControlledAttentionInput;
+pub(in crate::family::inkling2) use controlled_attention::{
+    ControlledAttentionInput, ControlledRows,
+};
 pub(in crate::family::inkling2::cuda_projection) use controlled_mlp::RoutedRows;
 
 pub(super) use draft_head::DraftHead;
@@ -870,6 +872,25 @@ impl DenseStep {
         waited?;
 
         read_projection_rows(&transfer, output.map_or(0, |output| output.bytes()))
+    }
+
+    /// [`Self::run_rows`] whose inputs are already on the device: `enqueue` stages and runs the
+    /// launches on `stream`, then `output` is read back and the stream fenced.
+    fn run_device_rows(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        output: DeviceRange<'_>,
+        enqueue: impl FnOnce() -> Result<(), EngError>,
+    ) -> Result<Vec<f32>, EngError> {
+        let mut transfer = self.transfer.borrow_mut();
+        let result =
+            enqueue().and_then(|()| context.copy_to_pinned(stream, output, &mut transfer, 0));
+        // Even a refused launch may follow accepted ones.
+        let waited = transfer.synchronize(stream);
+        result?;
+        waited?;
+        read_projection_rows(&transfer, output.bytes())
     }
 
     fn range(&self, slot: Slot, skip: usize, len: usize) -> Result<DeviceRange<'_>, EngError> {

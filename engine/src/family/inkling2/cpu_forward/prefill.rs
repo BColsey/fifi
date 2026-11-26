@@ -58,8 +58,8 @@ impl PromptRow<'_> {
     }
 }
 
-/// The device prompt streams of a grouped prefill: open across unbanked visits, written back
-/// to the host rows wherever a host stream is needed.
+/// The device prompt streams of a grouped prefill: open from the first visit through the core
+/// passes and the coda, written back to the host rows when a visit or a pass start declines.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 struct DeviceRun {
     prompt: Option<device_visit::DevicePrompt>,
@@ -86,8 +86,34 @@ impl DeviceRun {
         Ok(())
     }
 
-    /// Runs visit `index` on the device streams when it has no bank; false leaves it, and the
-    /// rows' host streams, to the host path. A decline ends the device run for this prompt.
+    /// A core pass starts (`Some(pass)`) or the coda does (`None`): true when the device streams
+    /// made the change. Otherwise the rows hold the host streams, and the host makes it.
+    fn boundary(
+        &mut self,
+        weights: &GgufTextWeights,
+        rows: &mut [PromptRow<'_>],
+        pass: Option<usize>,
+    ) -> Result<bool, EngError> {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return Ok(false);
+        };
+        let Some(pass) = pass else {
+            prompt.end_passes();
+            return Ok(true);
+        };
+        if let Some((context, _)) = weights.resident_attention()
+            && prompt.begin_pass(context, pass)?
+        {
+            return Ok(true);
+        }
+        self.materialize(rows, true)?;
+        self.enabled = false;
+        Ok(false)
+    }
+
+    /// Runs visit `index` on the device streams; false leaves it, and the rows' host streams,
+    /// to the host path. A decline ends the device run for this prompt.
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         &mut self,
         forward: &CpuForward,
@@ -96,18 +122,15 @@ impl DeviceRun {
         rows: &mut [PromptRow<'_>],
         weights: &GgufTextWeights,
         index: usize,
+        mlp: Option<&mut resident_mlp::Workspace>,
     ) -> Result<bool, EngError> {
-        if !self.enabled || rows.iter().any(|row| row.bank.is_some()) {
+        if !self.enabled {
             return Ok(false);
         }
         if self.prompt.is_none() {
-            // Room for every block the remaining visits could seal.
-            let block = forward.spec.n_layers_per_attn_res_block;
-            let seals = forward.visits[index..]
-                .iter()
-                .filter(|v| v.weight_layer.is_multiple_of(block))
-                .count();
-            self.prompt = device_visit::DevicePrompt::open(forward, weights, rows, seals)?;
+            let blocks = rows.first().map_or(0, |row| row.stream.block_count());
+            let peak = peak_blocks(forward, index, blocks);
+            self.prompt = device_visit::DevicePrompt::open(forward, weights, rows, peak)?;
         }
         let Some(prompt) = self.prompt.as_mut() else {
             self.enabled = false;
@@ -116,13 +139,53 @@ impl DeviceRun {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
         let prefix = format!("{layer}.mlp");
-        if forward.device_prompt_visit(visit, state, prompt, weights, (&layer, &prefix))? {
+        let ran = if prompt.banked() {
+            match mlp {
+                Some(mlp) => forward.device_banked_visit(
+                    visit,
+                    state,
+                    prompt,
+                    weights,
+                    (&layer, &prefix, mlp),
+                )?,
+                None => false,
+            }
+        } else {
+            forward.device_prompt_visit(visit, state, prompt, weights, (&layer, &prefix))?
+        };
+        if ran {
             return Ok(true);
         }
         self.materialize(rows, true)?;
         self.enabled = false;
         Ok(false)
     }
+}
+
+/// The most sealed blocks a state holds over the visits from `index`, starting from `blocks`:
+/// each core pass after the first restarts from the blocks at the first pass's start.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn peak_blocks(forward: &CpuForward, index: usize, blocks: usize) -> usize {
+    let core = &forward.spec.core;
+    let width = core.core_end - core.core_start;
+    let end = core.core_start + width * core.num_passes;
+    let block = forward.spec.n_layers_per_attn_res_block;
+    let (mut now, mut peak, mut prelude) = (blocks, blocks, None);
+    for visit in &forward.visits[index..] {
+        let slot = visit.state_slot;
+        if (core.core_start..end).contains(&slot) && (slot - core.core_start).is_multiple_of(width)
+        {
+            match prelude {
+                None => prelude = Some(now),
+                Some(blocks) => now = blocks,
+            }
+        }
+        if visit.weight_layer.is_multiple_of(block) {
+            now += 1;
+            peak = peak.max(now);
+        }
+    }
+    peak
 }
 
 struct MlpRow {
@@ -347,23 +410,33 @@ impl CpuForward {
             let slot = visit.state_slot;
             let pass_start = (core.core_start..end).contains(&slot)
                 && (slot - core.core_start).is_multiple_of(width);
-            // Passes and the coda start from the host streams.
+            let pass = pass_start.then(|| (slot - core.core_start) / width);
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            if pass_start || slot == end {
-                device.materialize(&mut rows, slot != core.core_start)?;
-            }
-            if pass_start {
+            let on_device =
+                (pass_start || slot == end) && device.boundary(weights, &mut rows, pass)?;
+            #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+            let on_device = false;
+            // The device streams made the pass or coda change already when they are open.
+            if let Some(pass) = pass.filter(|_| !on_device) {
                 for row in &mut rows {
-                    row.begin_pass((slot - core.core_start) / width)?;
+                    row.begin_pass(pass)?;
                 }
-            } else if slot == end {
+            } else if slot == end && !on_device {
                 for row in &mut rows {
                     row.bank = None;
                     row.prelude = None;
                 }
             }
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            if device.visit(self, visit, &mut state[slot], &mut rows, weights, index)? {
+            if device.visit(
+                self,
+                visit,
+                &mut state[slot],
+                &mut rows,
+                weights,
+                index,
+                resident_mlp.as_mut(),
+            )? {
                 continue;
             }
             self.prompt_visit(

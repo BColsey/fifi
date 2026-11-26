@@ -19,7 +19,9 @@ __global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
 }
 
 // One CTA per gate half. Keep the original pair for applying gain/forget;
-// broadcasting gamma here avoids uploading the same weight for every row.
+// broadcasting gamma here avoids uploading the same weight for every row. The gate is the
+// host's `control_input_from` half, bit for bit: the half is staged in shared memory and one
+// lane sums its squares in element order from -0.0, as `rms_norm_with_scale` does.
 __global__ void inkling_prepare_controller(const float *pairs, const float *gamma,
                                            float *triples, float *gates, float *health,
                                            int width, float eps) {
@@ -31,27 +33,32 @@ __global__ void inkling_prepare_controller(const float *pairs, const float *gamm
     float *gate = gates + half * width;
     float *raw_gamma = triples + (3 * role + 2) * width;
     const int lane = threadIdx.x;
-    __shared__ float sums[threads];
-    float sum = 0.0f;
+    extern __shared__ float staged[];
+    __shared__ float shared_scale;
+    __shared__ int shared_invalid;
     bool invalid = false;
     for (int i = lane; i < width; i += threads) {
         const float x = src[i];
         raw[i] = x;
+        staged[i] = x;
         if (side == 0) raw_gamma[i] = gamma[i];
         invalid |= !isfinite(x);
-        sum = __fadd_rn(sum, __fmul_rn(x, x));
     }
-    sums[lane] = sum;
     __syncthreads();
-    for (int stride = threads / 2; stride != 0; stride /= 2) {
-        if (lane < stride) sums[lane] = __fadd_rn(sums[lane], sums[lane + stride]);
-        __syncthreads();
+    if (lane == 0) {
+        float squares = -0.0f;
+        for (int i = 0; i < width; ++i) squares = __fadd_rn(squares, __fmul_rn(staged[i], staged[i]));
+        const float variance = __fadd_rn(__fdiv_rn(squares, static_cast<float>(width)), eps);
+        const float scale = __frcp_rn(__fsqrt_rn(variance));
+        shared_scale = scale;
+        // A square or the sum can overflow while the gate stays finite.
+        shared_invalid = !isfinite(squares) || !isfinite(variance) || !isfinite(scale);
     }
-    const float variance = __fadd_rn(__fdiv_rn(sums[0], static_cast<float>(width)), eps);
-    const float scale = __frcp_rn(__fsqrt_rn(variance));
-    invalid |= !isfinite(variance) || !isfinite(scale);
+    __syncthreads();
+    const float scale = shared_scale;
+    invalid |= shared_invalid != 0;
     for (int i = lane; i < width; i += threads) {
-        const float x = __fmul_rn(src[i], scale);
+        const float x = __fmul_rn(staged[i], scale);
         gate[i] = x;
         invalid |= !isfinite(x);
     }
@@ -171,7 +178,7 @@ extern "C" int inference_cuda_inkling_prepare_controller(
         width < 1 || width > 4096 || roles < 1 || roles > 1536 ||
         !isfinite(eps) || eps <= 0.0f)
         return INFERENCE_CUDA_INVALID_ARGUMENT;
-    inkling_prepare_controller<<<2 * roles, threads, 0, (cudaStream_t)stream>>>(
+    inkling_prepare_controller<<<2 * roles, threads, width * sizeof(float), (cudaStream_t)stream>>>(
         pairs, gamma, triples, gates, health, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

@@ -1,5 +1,6 @@
-//! Keep a banked prefill MLP's normalized rows on device until expert dispatch.
-//! Attention, message mixing, route selection and final residuals stay on the host.
+//! Keep a banked prefill MLP's normalized rows on device until expert dispatch. Route
+//! selection stays on the host. `Visit::execute` mixes the messages on the host and uploads
+//! the pairs; `Visit::execute_device` reads pairs the device prompt streams wrote.
 
 use crate::family::inkling2::switches::Switch;
 use std::{borrow::Cow, sync::Once};
@@ -125,6 +126,18 @@ impl Visit<'_> {
         inputs: &[Vec<f32>],
         destination: Option<DeviceRange<'_>>,
     ) -> Result<Vec<Vec<f32>>, EngError> {
+        let Visit {
+            physical,
+            weights,
+            controller,
+            scratch,
+            query,
+            gamma,
+            router,
+            bias,
+            experts,
+            caps,
+        } = self;
         let control = forward.phase_span(Work::Controller);
         let messages = {
             let _span = forward.phase_span(Work::MlpControlPrepare);
@@ -134,26 +147,115 @@ impl Visit<'_> {
                         .bank
                         .as_ref()
                         .ok_or_else(|| bad("Inkling resident MLP lost its message bank"))?;
-                    Ok(bank.stream.mix(bank.first_block, &self.query))
+                    Ok(bank.stream.mix(bank.first_block, &query))
                 })
                 .collect::<Result<Vec<_>, EngError>>()?
         };
-        let tile = self.scratch.tile_rows();
+        let tile = scratch.tile_rows();
         let activations = {
             let _span = forward.phase_span(Work::MlpControlProject);
-            self.controller.run(
-                self.scratch,
-                (inputs, &messages, &self.gamma),
+            controller.run(
+                scratch,
+                (inputs, &messages, &gamma),
                 (MIX_EPS, forward.math.rms_norm_eps),
             )?
         };
         drop(control);
+        let route = Route {
+            physical,
+            weights,
+            router: &router,
+            bias: &bias,
+            experts: &experts,
+            caps,
+        };
+        let outputs = route.dispatch(forward, rows.len(), activations, destination)?;
+        static USED: Once = Once::new();
+        USED.call_once(|| eprintln!("Inkling CUDA used resident prefill MLP"));
+        if forward.phase_profile.is_some() {
+            eprintln!(
+                "Inkling CUDA resident prefill MLP {}",
+                serde_json::json!({
+                    "layer": physical, "rows": rows.len(), "tile_rows": tile,
+                    "tiles": rows.len().div_ceil(tile),
+                    "coefficient_d2h_bytes_avoided": 2 * activations.bytes(),
+                    "router_input_h2d_bytes_avoided": activations.bytes(),
+                    "input_h2d_bytes": 2 * activations.bytes() + gamma.len() * size_of::<f32>(),
+                    "activation_d2d_bytes": activations.bytes(),
+                    "health_d2h_bytes": 3 * rows.len() * size_of::<f32>(),
+                })
+            );
+        }
+        Ok(outputs)
+    }
+
+    /// [`Self::execute`] of `rows` rows whose [input, message] pairs and gamma row `fill`
+    /// writes on the device into the ranges it is given, finished before it returns. The
+    /// expert output goes to `destination`.
+    pub(super) fn execute_device(
+        self,
+        forward: &CpuForward,
+        rows: usize,
+        fill: impl FnOnce([DeviceRange<'_>; 2]) -> Result<(), EngError>,
+        destination: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let Visit {
+            physical,
+            weights,
+            controller,
+            scratch,
+            router,
+            bias,
+            experts,
+            caps,
+            ..
+        } = self;
+        let control = forward.phase_span(Work::Controller);
+        fill(scratch.inputs(rows)?)?;
+        let activations = {
+            let _span = forward.phase_span(Work::MlpControlProject);
+            controller.run_written(scratch, rows, (MIX_EPS, forward.math.rms_norm_eps))?
+        };
+        drop(control);
+        let route = Route {
+            physical,
+            weights,
+            router: &router,
+            bias: &bias,
+            experts: &experts,
+            caps,
+        };
+        route.dispatch(forward, rows, activations, Some(destination))?;
+        Ok(())
+    }
+}
+
+/// What routing and expert dispatch read of an admitted visit.
+struct Route<'a> {
+    physical: u32,
+    weights: &'a GgufTextWeights,
+    router: &'a str,
+    bias: &'a [f32],
+    experts: &'a [String; 2],
+    caps: [f32; 2],
+}
+
+impl Route<'_> {
+    /// Routes the normalized `activations` and runs their experts; the outputs come back unless
+    /// they go to `destination`.
+    fn dispatch(
+        &self,
+        forward: &CpuForward,
+        rows: usize,
+        activations: DeviceRange<'_>,
+        destination: Option<DeviceRange<'_>>,
+    ) -> Result<Vec<Vec<f32>>, EngError> {
         let routes = {
             let _span = forward.phase_span(Work::Router);
             let logits = self
                 .weights
-                .resident_prefill_router_logits(&self.router, activations)?;
-            forward.route_prefill_logits(self.physical as usize, &logits, &self.bias, rows.len())?
+                .resident_prefill_router_logits(self.router, activations)?;
+            forward.route_prefill_logits(self.physical as usize, &logits, self.bias, rows)?
         };
         let ids: Vec<_> = routes
             .iter()
@@ -178,24 +280,8 @@ impl Visit<'_> {
                 )?
                 .ok_or_else(|| bad("previously admitted Inkling resident MLP experts declined"))?
         };
-        if outputs.len() != if destination.is_some() { 0 } else { rows.len() } {
+        if outputs.len() != if destination.is_some() { 0 } else { rows } {
             return Err(bad("incorrect Inkling resident MLP output rows"));
-        }
-        static USED: Once = Once::new();
-        USED.call_once(|| eprintln!("Inkling CUDA used resident prefill MLP"));
-        if forward.phase_profile.is_some() {
-            eprintln!(
-                "Inkling CUDA resident prefill MLP {}",
-                serde_json::json!({
-                    "layer": self.physical, "rows": rows.len(), "tile_rows": tile,
-                    "tiles": rows.len().div_ceil(tile),
-                    "coefficient_d2h_bytes_avoided": 2 * activations.bytes(),
-                    "router_input_h2d_bytes_avoided": activations.bytes(),
-                    "input_h2d_bytes": 2 * activations.bytes() + self.gamma.len() * size_of::<f32>(),
-                    "activation_d2d_bytes": activations.bytes(),
-                    "health_d2h_bytes": 3 * rows.len() * size_of::<f32>(),
-                })
-            );
         }
         Ok(outputs)
     }

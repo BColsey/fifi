@@ -84,8 +84,38 @@ impl PromptStreams {
         })
     }
 
+    /// A copy of the states on the device, with its own clean health word: a pass's prelude,
+    /// or the restart of a pass from it.
+    pub(super) fn duplicate(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+    ) -> Result<Self, EngError> {
+        let states = context.allocate(self.states.bytes())?;
+        context.copy_device(
+            stream,
+            self.states.range(0, self.states.bytes())?,
+            states.range(0, states.bytes())?,
+        )?;
+        let health = context.allocate(WORD)?;
+        health.write_at(stream, 0, &[0; WORD])?;
+        Ok(Self {
+            states,
+            health,
+            rows: self.rows,
+            width: self.width,
+            blocks: self.blocks,
+            capacity: self.capacity,
+        })
+    }
+
     pub(super) fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// The sealed rows each state holds.
+    pub(super) fn blocks(&self) -> usize {
+        self.blocks
     }
 
     /// Whether another block can be sealed.

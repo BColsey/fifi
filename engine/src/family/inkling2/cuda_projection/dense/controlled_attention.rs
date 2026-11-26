@@ -23,6 +23,49 @@ pub(in crate::family::inkling2) struct ControlledAttentionInput<'a> {
 pub(in crate::family::inkling2::cuda_projection) type ProjectionTile<'a, const N: usize> =
     (Vec<[Vec<f32>; N]>, Option<DeviceRange<'a>>);
 
+/// Controlled attention rows on the device: each role's [input, message] pairs, `rows` per role
+/// (role-major), its norm weight, and health words for the gate preparation (two per pair).
+#[derive(Clone, Copy)]
+pub(in crate::family::inkling2) struct ControlledRows<'a> {
+    pub pairs: DeviceRange<'a>,
+    pub gammas: [DeviceRange<'a>; 3],
+    pub health: DeviceRange<'a>,
+    pub rows: usize,
+    pub hidden: usize,
+    /// The epsilon of the gate halves' RMS norm.
+    pub gate_eps: f32,
+}
+
+/// One controlled attention tile: arena offsets, launches and the readback split.
+struct ControlledPlan<'a, const N: usize> {
+    m: usize,
+    hidden: usize,
+    /// Gate words, then raw triple words, from the start of the output slot.
+    gates: usize,
+    raw: usize,
+    control: Vec<DenseGemvCall<'a>>,
+    projections: Vec<DenseGemvCall<'a>>,
+    workspace: DeviceRange<'a>,
+    health: DeviceRange<'a>,
+    readback: DeviceRange<'a>,
+    side: Option<DeviceRange<'a>>,
+    host_widths: [usize; N],
+}
+
+impl<'a, const N: usize> ControlledPlan<'a, N> {
+    /// The tile's host projections from the readback (past the health words), and the side.
+    fn tile(&self, values: Vec<f32>) -> ProjectionTile<'a, N> {
+        let mut values = values.into_iter().skip(3 * self.m);
+        let host = (0..self.m)
+            .map(|_| {
+                self.host_widths
+                    .map(|width| values.by_ref().take(width).collect())
+            })
+            .collect();
+        (host, self.side)
+    }
+}
+
 impl DenseStep {
     pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch_capacity<
         const N: usize,
@@ -71,21 +114,153 @@ impl DenseStep {
     // Fused transaction for grouped prefill; the caller selects controller arithmetic.
     #[allow(clippy::type_complexity)]
     pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_batch<
+        'a,
         const N: usize,
     >(
-        &self,
+        &'a self,
         context: &CudaContext,
         inputs: &[[ControlledAttentionInput<'_>; 3]],
-        controllers: [ControllerWeights<'_>; 3],
-        weights: [Option<ResidentProjection<'_>>; N],
+        controllers: [ControllerWeights<'a>; 3],
+        weights: [Option<ResidentProjection<'a>>; N],
         (eps, arithmetic, keep, scales): (f32, Arithmetic, &[usize], Option<&[[[f32; 2]; 3]]>),
-    ) -> Result<Option<ProjectionTile<'_, N>>, EngError> {
+    ) -> Result<Option<ProjectionTile<'a, N>>, EngError> {
         let Some(first) = inputs.first() else {
             return Ok(None);
         };
         let hidden = first[0].input.len();
-        let rank = controllers[0][0].0.shape[0];
         let m = inputs.len();
+        if scales.is_some_and(|s| s.len() != m)
+            || inputs.iter().flatten().any(|r| {
+                r.gate.len() != 2 * hidden
+                    || [r.input.len(), r.message.len(), r.gamma.len()] != [hidden; 3]
+            })
+        {
+            return Err(bad("invalid batched CUDA controlled attention shape"));
+        }
+        let Some(plan) = self.controlled_plan([m, hidden], controllers, weights, keep)? else {
+            return Ok(None);
+        };
+        let range = |offset, len| self.range(Slot::Output, offset, len);
+        let (gates, raw) = (plan.gates, plan.raw);
+        // Use the start of the gain scratch for scales; the first kernel reads
+        // them before any controller GEMV writes coefficients into that region.
+        let scale_words = 6 * m;
+        let upload = if scales.is_some() {
+            range(gates, raw + scale_words)?
+        } else {
+            range(0, gates + raw)?
+        };
+        let mut staged = Vec::with_capacity(12 * m);
+        if scales.is_none() {
+            for role in 0..3 {
+                for row in inputs {
+                    staged.push(row[role].gate);
+                }
+            }
+        }
+        for role in 0..3 {
+            for row in inputs {
+                staged.extend([row[role].input, row[role].message, row[role].gamma]);
+            }
+        }
+        if let Some(scales) = scales {
+            for role in 0..3 {
+                staged.extend(scales.iter().map(|row| row[role].as_slice()));
+            }
+        }
+        let rebuild = scales
+            .map(|_| range(0, gates + raw + scale_words))
+            .transpose()?;
+        let values = self.run_rows(
+            context,
+            &self.stream,
+            &staged,
+            [upload, plan.readback],
+            || {
+                if let Some(workspace) = rebuild {
+                    context.inkling_rebuild_gates(&self.stream, workspace, [hidden, 3 * m])?;
+                }
+                self.enqueue_controlled(context, &plan, (eps, arithmetic))
+            },
+        )?;
+        self.capture_first_controller_tile(m, hidden)?;
+        // run_rows fenced the producer; the caller must consume the borrowed tile
+        // before running another dense step that reuses Slot::Output.
+        Ok(Some(plan.tile(values)))
+    }
+
+    /// [`Self::controlled_attention_batch`] of rows `first..first + count` of device planes:
+    /// the tile's gates and raw triples are prepared on the device from each role's
+    /// [input, message] pairs and norm weight, with no host rows.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::family::inkling2::cuda_projection) fn controlled_attention_device_batch<
+        'a,
+        const N: usize,
+    >(
+        &'a self,
+        context: &CudaContext,
+        (rows, (first, count)): (&ControlledRows<'_>, (usize, usize)),
+        controllers: [ControllerWeights<'a>; 3],
+        weights: [Option<ResidentProjection<'a>>; N],
+        (eps, arithmetic, keep): (f32, Arithmetic, &[usize]),
+    ) -> Result<Option<ProjectionTile<'a, N>>, EngError> {
+        let ControlledRows {
+            pairs,
+            gammas,
+            health,
+            rows: total,
+            hidden,
+            gate_eps,
+        } = *rows;
+        if count == 0
+            || first.checked_add(count).is_none_or(|end| end > total)
+            || pairs.bytes() != 3 * total * 2 * hidden * size_of::<f32>()
+            || health.bytes() != 3 * total * 2 * size_of::<f32>()
+            || gammas
+                .iter()
+                .any(|g| g.bytes() != hidden * size_of::<f32>())
+        {
+            return Err(bad("invalid device CUDA controlled attention rows"));
+        }
+        let Some(plan) = self.controlled_plan([count, hidden], controllers, weights, keep)? else {
+            return Ok(None);
+        };
+        let m = count;
+        let words = size_of::<f32>();
+        let values = self.run_device_rows(context, &self.stream, plan.readback, || {
+            for (role, gamma) in gammas.iter().enumerate() {
+                let rows_at = role * total + first;
+                context.inkling_prepare_controller(
+                    &self.stream,
+                    [
+                        pairs.slice(rows_at * 2 * hidden * words, m * 2 * hidden * words)?,
+                        *gamma,
+                        self.range(
+                            Slot::Output,
+                            plan.gates + role * m * 3 * hidden,
+                            m * 3 * hidden,
+                        )?,
+                        self.range(Slot::Output, role * m * 2 * hidden, m * 2 * hidden)?,
+                        health.slice(rows_at * 2 * words, m * 2 * words)?,
+                    ],
+                    ([hidden, m], gate_eps),
+                )?;
+            }
+            self.enqueue_controlled(context, &plan, (eps, arithmetic))
+        })?;
+        Ok(Some(plan.tile(values)))
+    }
+
+    /// The arena layout and launches of one controlled attention tile of `m` rows, or none
+    /// when the tile does not fit the output slot.
+    fn controlled_plan<'a, const N: usize>(
+        &'a self,
+        [m, hidden]: [usize; 2],
+        controllers: [ControllerWeights<'a>; 3],
+        weights: [Option<ResidentProjection<'a>>; N],
+        keep: &[usize],
+    ) -> Result<Option<ControlledPlan<'a, N>>, EngError> {
+        let rank = controllers[0][0].0.shape[0];
         if !(1..=4096).contains(&hidden)
             || rank == 0
             || rank > 4096
@@ -94,18 +269,12 @@ impl DenseStep {
         {
             return Ok(None);
         }
-        if scales.is_some_and(|s| s.len() != m)
-            || controllers.iter().any(|w| {
-                w.map(|(x, _)| x.shape) != [[rank, 2 * hidden], [hidden, rank], [hidden, rank]]
-            })
-            || inputs.iter().flatten().any(|r| {
-                r.gate.len() != 2 * hidden
-                    || [r.input.len(), r.message.len(), r.gamma.len()] != [hidden; 3]
-            })
-            || weights
-                .iter()
-                .flatten()
-                .any(|p| p.input >= 3 || p.weight.shape[1] != hidden)
+        if controllers.iter().any(|w| {
+            w.map(|(x, _)| x.shape) != [[rank, 2 * hidden], [hidden, rank], [hidden, rank]]
+        }) || weights
+            .iter()
+            .flatten()
+            .any(|p| p.input >= 3 || p.weight.shape[1] != hidden)
         {
             return Err(bad("invalid batched CUDA controlled attention shape"));
         }
@@ -128,14 +297,6 @@ impl DenseStep {
         let health_at = reduced + 3 * m * rank;
         let out_at = health_at + 3 * m;
         let range = |offset, len| self.range(Slot::Output, offset, len);
-        // Use the start of the gain scratch for scales; the first kernel reads
-        // them before any controller GEMV writes coefficients into that region.
-        let scale_words = 6 * m;
-        let upload = if scales.is_some() {
-            range(gates, raw + scale_words)?
-        } else {
-            range(0, gates + raw)?
-        };
         let workspace = range(norm, 18 * m * hidden)?;
         let health = range(health_at, 3 * m)?;
         let mut host_widths = widths;
@@ -179,49 +340,37 @@ impl DenseStep {
             let y = base + widths[..i].iter().sum::<usize>();
             projections.push(self.batch_call((p.weight, p.dtype), shape, [x, y])?);
         }
-        let mut staged = Vec::with_capacity(12 * m);
-        if scales.is_none() {
-            for role in 0..3 {
-                for row in inputs {
-                    staged.push(row[role].gate);
-                }
-            }
-        }
-        for role in 0..3 {
-            for row in inputs {
-                staged.extend([row[role].input, row[role].message, row[role].gamma]);
-            }
-        }
-        if let Some(scales) = scales {
-            for role in 0..3 {
-                staged.extend(scales.iter().map(|row| row[role].as_slice()));
-            }
-        }
-        let rebuild = scales
-            .map(|_| range(0, gates + raw + scale_words))
-            .transpose()?;
-        let values = self.run_rows(context, &self.stream, &staged, [upload, readback], || {
-            if let Some(workspace) = rebuild {
-                context.inkling_rebuild_gates(&self.stream, workspace, [hidden, 3 * m])?;
-            }
-            context.dense_gemv_group(&self.stream, &control)?;
-            context.inkling_controller_norm_with_arithmetic(
-                &self.stream,
-                workspace,
-                health,
-                ([hidden, 3 * m], eps),
-                arithmetic,
-            )?;
-            q8_row_reuse::project_group(context, &self.stream, &projections, "controlled_qkv")
-        })?;
-        self.capture_first_controller_tile(m, hidden)?;
-        let mut values = values.into_iter().skip(3 * m);
-        let host = (0..m)
-            .map(|_| host_widths.map(|width| values.by_ref().take(width).collect()))
-            .collect();
-        // run_rows fenced the producer; the caller must consume the borrowed tile
-        // before running another dense step that reuses Slot::Output.
-        Ok(Some((host, side)))
+        Ok(Some(ControlledPlan {
+            m,
+            hidden,
+            gates,
+            raw,
+            control,
+            projections,
+            workspace,
+            health,
+            readback,
+            side,
+            host_widths,
+        }))
+    }
+
+    /// The controller GEMVs, the controlled norm and the projections of a staged tile.
+    fn enqueue_controlled<const N: usize>(
+        &self,
+        context: &CudaContext,
+        plan: &ControlledPlan<'_, N>,
+        (eps, arithmetic): (f32, Arithmetic),
+    ) -> Result<(), EngError> {
+        context.dense_gemv_group(&self.stream, &plan.control)?;
+        context.inkling_controller_norm_with_arithmetic(
+            &self.stream,
+            plan.workspace,
+            plan.health,
+            ([plan.hidden, 3 * plan.m], eps),
+            arithmetic,
+        )?;
+        q8_row_reuse::project_group(context, &self.stream, &plan.projections, "controlled_qkv")
     }
 
     fn capture_first_controller_tile(&self, rows: usize, hidden: usize) -> Result<(), EngError> {

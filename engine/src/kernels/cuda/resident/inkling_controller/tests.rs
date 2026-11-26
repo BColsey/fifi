@@ -170,3 +170,103 @@ fn cpu_parity_controller_norm_reports_invalid_roles() {
     let (out, health) = run(&ctx, [1, 1], &packed, f32::MAX, Arithmetic::CpuParity);
     assert!(out[0].is_finite() && health[0].is_nan());
 }
+
+fn all(buffer: &crate::kernels::cuda::DeviceBuffer) -> crate::kernels::cuda::DeviceRange<'_> {
+    buffer.range(0, buffer.bytes()).unwrap()
+}
+
+/// The host's `rms_norm_with_scale` of one gate half: squares summed in element order.
+fn host_gate(half: &[f32], eps: f32) -> Vec<f32> {
+    let squares: f32 = half.iter().map(|x| x * x).sum();
+    let scale = (squares / half.len() as f32 + eps).sqrt().recip();
+    half.iter().map(|x| x * scale).collect()
+}
+
+#[test]
+fn prepare_controller_gates_are_the_host_rms_norm_bits() {
+    if !device_present("Inkling controller gate preparation") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let upload = |values: &[f32]| {
+        let buffer = ctx.allocate(values.len() * 4).unwrap();
+        let bytes: Vec<_> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        buffer.write_at(&stream, 0, &bytes).unwrap();
+        buffer
+    };
+    let download = |buffer: &crate::kernels::cuda::DeviceBuffer| -> Vec<f32> {
+        let mut bytes = vec![0u8; buffer.bytes()];
+        buffer.read_at(&stream, 0, &mut bytes).unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
+            .collect()
+    };
+    for (width, roles) in [(1, 1), (257, 3), (2304, 4), (4096, 2)] {
+        let mut pairs: Vec<f32> = (0..2 * roles * width)
+            .map(|i| (((i * 7919 + 13) % 1009) as f32 - 504.0) / 97.0)
+            .collect();
+        // The last half's squares overflow while every value stays finite.
+        let broken = 2 * roles - 1;
+        if roles > 1 {
+            pairs[broken * width] = 1.4e19;
+            pairs[broken * width + width - 1] = 1.4e19;
+        }
+        let gamma: Vec<f32> = (0..width).map(|i| 1.0 + i as f32 / 4096.0).collect();
+        let [pairs_d, gamma_d] = [upload(&pairs), upload(&gamma)];
+        let triples = ctx.allocate(3 * roles * width * 4).unwrap();
+        let gates = ctx.allocate(2 * roles * width * 4).unwrap();
+        let health = ctx.allocate(2 * roles * 4).unwrap();
+        ctx.inkling_prepare_controller(
+            &stream,
+            [
+                all(&pairs_d),
+                all(&gamma_d),
+                all(&triples),
+                all(&gates),
+                all(&health),
+            ],
+            ([width, roles], EPS),
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let [gates, triples, health] = [download(&gates), download(&triples), download(&health)];
+        for half in 0..2 * roles {
+            let source = &pairs[half * width..][..width];
+            let failed = roles > 1 && half == broken;
+            assert_eq!(health[half].is_nan(), failed, "width={width} half={half}");
+            if !failed {
+                assert_eq!(health[half].to_bits(), 0, "width={width} half={half}");
+                let expected = host_gate(source, EPS);
+                for (i, (device, host)) in gates[half * width..][..width]
+                    .iter()
+                    .zip(expected)
+                    .enumerate()
+                {
+                    assert_eq!(
+                        device.to_bits(),
+                        host.to_bits(),
+                        "width={width} half={half} col={i}"
+                    );
+                }
+            }
+            let (role, side) = (half / 2, half % 2);
+            let raw = &triples[(3 * role + side) * width..][..width];
+            assert!(
+                raw.iter()
+                    .zip(source)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+            let raw_gamma = &triples[(3 * role + 2) * width..][..width];
+            assert!(
+                raw_gamma
+                    .iter()
+                    .zip(&gamma)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+    }
+}

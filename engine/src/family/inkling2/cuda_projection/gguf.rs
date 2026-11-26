@@ -91,7 +91,7 @@ type Projections = BTreeMap<String, (Resident, DenseDtype)>;
 type ControllerOutput = Option<[Vec<f32>; 2]>;
 
 pub(in crate::family::inkling2) use super::dense::{
-    ControlledAttentionInput, PrefillProjection, ResidentController,
+    ControlledAttentionInput, ControlledRows, PrefillProjection, ResidentController,
 };
 use super::dense::{LocalInputs, LocalProjection};
 
@@ -176,6 +176,16 @@ impl ResidentMlpController<'_> {
     ) -> Result<DeviceRange<'a>, EngError> {
         scratch.run(self.context, self.weights, rows, eps)
     }
+
+    /// [`Self::run`] of `rows` pairs already written into the scratch's inputs.
+    pub(in crate::family::inkling2) fn run_written<'a>(
+        &self,
+        scratch: &'a mut ResidentController,
+        rows: usize,
+        eps: (f32, f32),
+    ) -> Result<DeviceRange<'a>, EngError> {
+        scratch.run_written(self.context, self.weights, rows, eps)
+    }
 }
 
 pub(in crate::family::inkling2) struct AttentionControllers<'a> {
@@ -200,6 +210,79 @@ impl AttentionControllers<'_> {
         Ok(admitted.then_some(result))
     }
 
+    /// The controllers, projections, step and tile rows of a chained tile run over `rows` rows,
+    /// or none when the run does not fit.
+    #[allow(clippy::type_complexity)]
+    fn chained_admission<'s, const N: usize>(
+        &'s self,
+        requests: [Option<Projection<'_>>; N],
+        rows: usize,
+        keep: &[usize],
+    ) -> Result<
+        Option<(
+            [ControllerWeights<'s>; 3],
+            [Option<ResidentProjection<'s>>; N],
+            &'s DenseStep,
+            usize,
+        )>,
+        EngError,
+    > {
+        let [Some(q), Some(k), Some(v)] = self.weights else {
+            return Ok(None);
+        };
+        let Some(weights) = self
+            .cuda
+            .attention_group([self.shape[1]; 3], requests)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        if keep.iter().any(|&i| weights[i].is_none()) {
+            return Ok(None);
+        }
+        let (step, capacity) = self.chained_workspace(&weights, rows, !keep.is_empty())?;
+        Ok((capacity >= 2).then_some(([q, k, v], weights, step, capacity)))
+    }
+
+    /// The chained tiles of controlled rows already on the device; false, with nothing
+    /// launched, when the run does not fit.
+    pub(in crate::family::inkling2) fn grouped_chained_device_tiles<const N: usize>(
+        &self,
+        rows: &ControlledRows<'_>,
+        requests: [Option<Projection<'_>>; N],
+        (eps, keep): (f32, &[usize]),
+        mut consume: impl FnMut(Vec<[Vec<f32>; N]>, Option<DeviceRange<'_>>) -> Result<(), EngError>,
+    ) -> Result<bool, EngError> {
+        if rows.hidden != self.shape[1] {
+            return Ok(false);
+        }
+        let Some((controllers, weights, step, capacity)) =
+            self.chained_admission(requests, rows.rows, keep)?
+        else {
+            return Ok(false);
+        };
+        let arithmetic = grouped_controller_arithmetic::select();
+        for first in (0..rows.rows).step_by(capacity) {
+            let count = (rows.rows - first).min(capacity);
+            let (host, device) = step
+                .controlled_attention_device_batch(
+                    &self.cuda.context,
+                    (rows, (first, count)),
+                    controllers,
+                    weights,
+                    (eps, arithmetic, keep),
+                )?
+                .ok_or_else(|| bad("admitted CUDA controlled attention batch declined"))?;
+            if host.len() != count {
+                return Err(bad(
+                    "CUDA controlled attention batch returned wrong row count",
+                ));
+            }
+            consume(host, device)?;
+        }
+        Ok(true)
+    }
+
     #[allow(clippy::type_complexity)]
     pub(in crate::family::inkling2) fn grouped_chained_tiles<const N: usize>(
         &self,
@@ -208,23 +291,11 @@ impl AttentionControllers<'_> {
         (eps, keep, scales): (f32, &[usize], Option<&[[[f32; 2]; 3]]>),
         mut consume: impl FnMut(Vec<[Vec<f32>; N]>, Option<DeviceRange<'_>>) -> Result<(), EngError>,
     ) -> Result<bool, EngError> {
-        let [Some(q), Some(k), Some(v)] = self.weights else {
-            return Ok(false);
-        };
-        let Some(weights) = self
-            .cuda
-            .attention_group([self.shape[1]; 3], requests)
-            .transpose()?
+        let Some(([q, k, v], weights, step, capacity)) =
+            self.chained_admission(requests, inputs.len(), keep)?
         else {
             return Ok(false);
         };
-        if keep.iter().any(|&i| weights[i].is_none()) {
-            return Ok(false);
-        }
-        let (step, capacity) = self.chained_workspace(&weights, inputs.len(), !keep.is_empty())?;
-        if capacity < 2 {
-            return Ok(false);
-        }
         if scales.is_some_and(|s| s.len() != inputs.len()) {
             return Err(bad("invalid Inkling controller gate scale row count"));
         }
