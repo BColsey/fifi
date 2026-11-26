@@ -360,6 +360,7 @@ fn host_entry(cuda: &GgufCuda, input: &[f32], message: &[f32], bias: &[f32]) -> 
 }
 
 #[test]
+#[ignore = "requires a CUDA device, FIFI_INKLING_CUDA_BATCH_EXPERTS=1 and FIFI_INKLING_CUDA_DEVICE_ROUTING=1"]
 fn resident_mlp_chain_matches_the_host_entry_and_lands_in_the_callers_row() {
     if !device_present("Inkling resident MLP chain") {
         return;
@@ -385,6 +386,7 @@ fn resident_mlp_chain_matches_the_host_entry_and_lands_in_the_callers_row() {
 }
 
 #[test]
+#[ignore = "requires a CUDA device, FIFI_INKLING_CUDA_BATCH_EXPERTS=1 and FIFI_INKLING_CUDA_DEVICE_ROUTING=1"]
 fn resident_mlp_chain_reports_a_nan_input_through_health_output_and_status() {
     if !device_present("Inkling resident MLP chain NaN") {
         return;
@@ -400,6 +402,7 @@ fn resident_mlp_chain_reports_a_nan_input_through_health_output_and_status() {
 }
 
 #[test]
+#[ignore = "requires a CUDA device, FIFI_INKLING_CUDA_BATCH_EXPERTS=1 and FIFI_INKLING_CUDA_DEVICE_ROUTING=1"]
 fn resident_mlp_refuses_before_any_launch_and_reports_support() {
     if !device_present("Inkling resident MLP chain rejections") {
         return;
