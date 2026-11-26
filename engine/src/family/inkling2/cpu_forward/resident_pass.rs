@@ -827,7 +827,8 @@ impl CpuForward {
                     block.tail(0, index, which)?,
                     block.tail(1, index, which)?,
                 ],
-                [rows, kv_channels, past],
+                // The raw plane rows hold K and V side by side.
+                [rows, raw_stride, kv_channels, past],
             )?;
         }
 
@@ -952,7 +953,7 @@ impl CpuForward {
                 block.tail(0, index, 2)?,
                 block.tail(1, index, 2)?,
             ],
-            [rows, h, past],
+            [rows, h, h, past],
         )?;
         block.report.launches.set(block.report.launches.get() + 3);
         Ok(())
@@ -1183,7 +1184,7 @@ impl CpuForward {
                 block.tail(0, index, 3)?,
                 block.tail(1, index, 3)?,
             ],
-            [rows, h, past],
+            [rows, h, h, past],
         )?;
         block.pass_add_to_current(block.at(l.mlp_conv, rows * h)?)?;
         block.report.launches.set(block.report.launches.get() + 3);

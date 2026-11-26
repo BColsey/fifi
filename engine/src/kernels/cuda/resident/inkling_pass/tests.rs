@@ -531,3 +531,60 @@ fn the_pass_kernels_refuse_bad_calls_before_launching() {
         .describe();
     assert!(error.contains("Inkling pass prep raw"), "{error}");
 }
+
+/// The tails of a strided source (the raw K/V plane: row r holds K then V) and of a source
+/// shorter than the taps, where the older rows come from the previous block's plane.
+#[test]
+fn tails_take_the_last_rows_of_a_strided_source_and_the_older_plane() {
+    if !device_present("Inkling pass tails") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let width = 64;
+    let word = size_of::<f32>();
+    let key = |r: usize| vec![r as f32; width];
+    let value = |r: usize| vec![(r + 100) as f32; width];
+    let strided = |rows: usize| {
+        (0..rows)
+            .flat_map(|r| [key(r), value(r)])
+            .flatten()
+            .collect::<Vec<f32>>()
+    };
+    for (rows, past) in [(8, 0), (5, 2), (2, 2)] {
+        // Source row r is [r | r + 100]; the previous plane holds rows 90, 91, 92 oldest first.
+        let source = ctx.upload(&bytes(&strided(rows))).unwrap();
+        let old = ctx.upload(&bytes(&strided_parked(width))).unwrap();
+        let out = ctx.allocate((TAPS - 1) * width * word).unwrap();
+        ctx.inkling_pass_tails(
+            &stream,
+            [
+                plane(&source, rows * 2 * width),
+                plane(&old, (TAPS - 1) * width),
+                plane(&out, (TAPS - 1) * width),
+            ],
+            [rows, 2 * width, width, past],
+        )
+        .unwrap();
+        let got = download(&out, &stream, plane(&out, (TAPS - 1) * width));
+        // Host `CausalConv` rows newest first are 92 (or the last row), then the row before, ...
+        let mut expected = Vec::new();
+        for i in 0..TAPS - 1 {
+            let j = rows + past - TAPS + 1 + i;
+            expected.extend(if j < past { key(90 + TAPS - 1 - past + j) } else { key(j - past) });
+        }
+        assert_eq!(got, expected, "{rows} rows, {past} past");
+    }
+}
+
+fn plane(buffer: &DeviceBuffer, words: usize) -> DeviceRange<'_> {
+    buffer.range(0, words * size_of::<f32>()).unwrap()
+}
+
+/// Rows 90, 91 and 92 of a strided plane, oldest first ([r | r + 100] per row).
+fn strided_parked(width: usize) -> Vec<f32> {
+    (90..93)
+        .flat_map(|r| [vec![r as f32; width], vec![(r + 100) as f32; width]])
+        .flatten()
+        .collect()
+}
