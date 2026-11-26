@@ -288,6 +288,8 @@ async fn flash_next_gguf_http_smoke_greedy_matches_host() {
 
 #[test]
 fn a_reference_reads_the_prompt_and_the_greedy_tokens_of_an_oracle() {
+    use sha2::Digest;
+
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("oracle.json");
     let oracle =
