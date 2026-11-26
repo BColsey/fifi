@@ -958,8 +958,9 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         let h = block.h;
         let rows = block.rows;
+        // The `down` matrix maps one gate row `[norm(in) | norm(msg)]` of `2 * h` words.
         let weights = cuda
-            .controller_weights(names, gate.bytes() / WORD, [rank, h])
+            .controller_weights(names, 2 * h, [rank, h])
             .ok_or_else(|| bad("the resident pass needs grouped controller weights"))??;
         let gain = block.at(block.l.gain, rows * h)?;
         let forget = block.at(block.l.forget, rows * h)?;
