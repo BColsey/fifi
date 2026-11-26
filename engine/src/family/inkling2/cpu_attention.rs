@@ -579,6 +579,8 @@ impl CpuForward {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn invalidate_device_attention(&self) {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        self.pass_tails_stale();
         if let Weights::Gguf(weights) = &self.weights
             && let Some((_, attention)) = weights.resident_attention()
         {
@@ -885,8 +887,8 @@ impl VisitState {
         [k, v, attn, mlp]: [Vec<Vec<f32>>; 4],
         (valid, capacity, position): (usize, usize, usize),
     ) {
-        self.keys = keys.into_iter().map(Arc::new).collect();
-        self.values = values.into_iter().map(Arc::new).collect();
+        self.keys = keys.into_iter().rev().map(Arc::new).collect();
+        self.values = values.into_iter().rev().map(Arc::new).collect();
         self.keys.truncate(capacity);
         self.values.truncate(capacity);
         for (history, rows) in [
@@ -903,6 +905,17 @@ impl VisitState {
         }
         self.position = position;
         self.resident = false;
+    }
+
+    /// The four raw convolution histories, newest first, as the host keeps them.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn histories(&self) -> [Vec<Vec<f32>>; 4] {
+        [
+            self.conv.k.0.iter().cloned().collect(),
+            self.conv.v.0.iter().cloned().collect(),
+            self.conv.attn.0.iter().cloned().collect(),
+            self.conv.mlp.0.iter().cloned().collect(),
+        ]
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

@@ -23,6 +23,8 @@ mod prefill;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prompt_streams;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod resident_pass;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod resident_visit;
 mod window;
 
@@ -113,6 +115,9 @@ pub(super) struct CpuForward {
     resident_visit: std::cell::RefCell<Option<resident_visit::Workspace>>,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     resident_token: Option<resident_visit::TokenWorkspace>,
+    /// The device-resident prefill pass plan (`FIFI_INKLING_CUDA_RESIDENT_PREFILL_PASS`).
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pass: std::cell::RefCell<Option<resident_pass::PassWorkspace>>,
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     resident_pair: [std::cell::RefCell<Option<resident_visit::Pair>>; 2],
 }
@@ -240,6 +245,8 @@ impl CpuForward {
             resident_visit: Default::default(),
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             resident_token: None,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            pass: std::cell::RefCell::new(None),
             #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
             resident_pair: Default::default(),
         })
