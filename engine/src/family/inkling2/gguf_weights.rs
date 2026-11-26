@@ -272,6 +272,7 @@ impl Bindings<'_> {
         let hidden = spec.hidden_size as usize;
         let (core_start, core_end) = (spec.core.core_start, spec.core.core_end);
         let row_bytes = hidden * size_of::<f32>();
+        let query_rows = self.layout.loop_query_rows(core_end - core_start) as u64;
         for (native, streams) in [
             ("middle_cycle_cross_pass_queries", [0, 3]),
             ("middle_cycle_cross_pass_kv_queries", [1, 2]),
@@ -285,13 +286,9 @@ impl Bindings<'_> {
                         .tensor(&name)
                         .ok_or_else(|| bad(format!("GGUF is missing {name}")))?;
                     let dims = tensor.dims();
-                    if tensor.ggml_type() != GgufType::F32
-                        || dims.len() != 2
-                        || dims[0] != hidden as u64
-                        || row as u64 >= dims[1]
-                    {
+                    if tensor.ggml_type() != GgufType::F32 || dims != [hidden as u64, query_rows] {
                         return Err(bad(format!(
-                            "GGUF loop query {name} must be F32 with {hidden} columns and row {row}"
+                            "GGUF loop query {name} must be F32 with shape [{hidden}, {query_rows}]"
                         )));
                     }
                     let start = tensor.abs_range().start as usize + row * row_bytes;

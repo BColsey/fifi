@@ -78,4 +78,56 @@ impl Layout {
             }
         }
     }
+
+    /// Rows in each tensor that holds loop message queries.
+    pub(crate) fn loop_query_rows(self, core_layers: usize) -> usize {
+        match self {
+            Self::Mainline => 4,
+            Self::Fork => 2 * core_layers,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::Layout;
+
+    const CORE: std::ops::Range<usize> = 6..18;
+
+    #[test]
+    fn each_layout_places_every_loop_query_in_its_own_row() {
+        for layout in [Layout::Mainline, Layout::Fork] {
+            let rows = layout.loop_query_rows(CORE.len());
+            let mut seen = BTreeSet::new();
+            for layer in CORE {
+                for stream in 0..4 {
+                    let (name, row) = layout.loop_query(layer, CORE.start, stream);
+                    assert!(row < rows, "{layout:?} layer {layer} stream {stream}");
+                    assert!(
+                        seen.insert((name.into_owned(), row)),
+                        "{layout:?} reuses a row"
+                    );
+                }
+            }
+            let tensors: BTreeSet<_> = seen.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(
+                seen.len(),
+                tensors.len() * rows,
+                "{layout:?} leaves a row unused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fork_pairs_query_with_mlp_and_key_with_value() {
+        let at = |stream| Layout::Fork.loop_query(9, CORE.start, stream);
+        assert_eq!(at(0), ("loop_res_query.weight".into(), 6));
+        assert_eq!(at(3), ("loop_res_query.weight".into(), 7));
+        assert_eq!(at(1), ("loop_kv_res_query.weight".into(), 6));
+        assert_eq!(at(2), ("loop_kv_res_query.weight".into(), 7));
+        let mainline = Layout::Mainline.loop_query(9, CORE.start, 2);
+        assert_eq!(mainline, ("blk.9.loop_msg_query.weight".into(), 2));
+    }
 }

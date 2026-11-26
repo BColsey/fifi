@@ -98,14 +98,12 @@ pub(crate) fn validate_tensors(header: &GgufHeader) -> Result<(), EngError> {
     ] {
         expect(name, &[hidden], Kind::F32)?;
     }
-    if layout == Layout::Fork {
-        for name in ["loop_res_query.weight", "loop_kv_res_query.weight"] {
-            expect(
-                name,
-                &[hidden, (2 * (CORE_END - CORE_START)) as u64],
-                Kind::F32,
-            )?;
-        }
+    let query_rows = layout.loop_query_rows(CORE_END - CORE_START) as u64;
+    let queries: std::collections::BTreeSet<_> = (CORE_START..CORE_END)
+        .flat_map(|layer| (0..4).map(move |stream| layout.loop_query(layer, CORE_START, stream).0))
+        .collect();
+    for name in &queries {
+        expect(name, &[hidden, query_rows], Kind::F32)?;
     }
 
     for i in 0..LAYERS {
@@ -192,9 +190,6 @@ pub(crate) fn validate_tensors(header: &GgufHeader) -> Result<(), EngError> {
                         Kind::F32,
                     )?;
                 }
-            }
-            if layout == Layout::Mainline {
-                layer("loop_msg_query.weight", &[hidden, 4], Kind::F32)?;
             }
         }
     }
