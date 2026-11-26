@@ -21,9 +21,7 @@ fn upload(buffer: &DeviceBuffer, stream: &DeviceStream, offset: usize, values: &
 
 fn download(buffer: &DeviceBuffer, stream: &DeviceStream, range: DeviceRange<'_>) -> Vec<f32> {
     let mut out = vec![0u8; range.bytes()];
-    buffer
-        .read_at(stream, range.offset(), &mut out)
-        .unwrap();
+    buffer.read_at(stream, range.offset(), &mut out).unwrap();
     out.as_chunks::<4>()
         .0
         .iter()
@@ -47,7 +45,13 @@ fn normalize(values: &[f32], eps: f32) -> Vec<f32> {
 }
 
 /// `Stream::mix(first, query)` over sealed rows (oldest first) and the current row.
-fn host_mix(sealed: &[Vec<f32>], current: &[f32], first: usize, query: &[f32], eps: f32) -> Vec<f32> {
+fn host_mix(
+    sealed: &[Vec<f32>],
+    current: &[f32],
+    first: usize,
+    query: &[f32],
+    eps: f32,
+) -> Vec<f32> {
     let scale = (query.len() as f32).sqrt().recip();
     let last = normalize(current, eps);
     let rows: Vec<&[f32]> = sealed[first..]
@@ -119,7 +123,9 @@ impl State {
     }
 
     fn plane<'a>(&self, buffer: &'a DeviceBuffer) -> DeviceRange<'a> {
-        buffer.range(0, self.rows * WIDTH * size_of::<f32>()).unwrap()
+        buffer
+            .range(0, self.rows * WIDTH * size_of::<f32>())
+            .unwrap()
     }
 
     fn mix(
@@ -145,7 +151,11 @@ impl State {
             1e-6,
         )
         .unwrap();
-        download(&self.out, stream, self.out.range(0, self.out.bytes()).unwrap())
+        download(
+            &self.out,
+            stream,
+            self.out.range(0, self.out.bytes()).unwrap(),
+        )
     }
 }
 
@@ -153,7 +163,10 @@ fn assert_healthy(state: &State, stream: &DeviceStream, what: &str) {
     let health = download(
         &state.health,
         stream,
-        state.health.range(0, state.rows * size_of::<f32>()).unwrap(),
+        state
+            .health
+            .range(0, state.rows * size_of::<f32>())
+            .unwrap(),
     );
     for (r, value) in health.iter().enumerate() {
         assert!(value.is_finite(), "{what}: health of row {r}");
@@ -173,9 +186,7 @@ fn mix_seal_and_add_match_the_host_stream() {
     let mut rng = Rng::new(0x5eed_9a55);
     for rows in [1usize, 5] {
         let state = State::new(&ctx, &stream, rows);
-        let mut current: Vec<Vec<f32>> = (0..rows)
-            .map(|_| normal_rows(&mut rng, WIDTH))
-            .collect();
+        let mut current: Vec<Vec<f32>> = (0..rows).map(|_| normal_rows(&mut rng, WIDTH)).collect();
         upload(&state.current, &stream, 0, &current.concat());
         // The prelude of a core pass: one sealed row (the first block) and the current row.
         let mut sealed: Vec<Vec<Vec<f32>>> = current
@@ -400,12 +411,8 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                 .iter()
                 .map(|k| ctx.upload(&bytes(k)).unwrap())
                 .collect();
-            let dynamic_buffer = ctx
-                .upload(&bytes(&coefficients.concat()))
-                .unwrap();
-            let status = ctx
-                .upload(&vec![0u8; rows * size_of::<u32>()])
-                .unwrap();
+            let dynamic_buffer = ctx.upload(&bytes(&coefficients.concat())).unwrap();
+            let status = ctx.upload(&vec![0u8; rows * size_of::<u32>()]).unwrap();
             ctx.inkling_pass_prep(
                 &stream,
                 PassPrepCall {
@@ -429,7 +436,13 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                 },
                 rows,
                 kv_heads,
-                [2 * channels, side_stride, key_at, value_at, 2 * kv_heads * TAPS],
+                [
+                    2 * channels,
+                    side_stride,
+                    key_at,
+                    value_at,
+                    2 * kv_heads * TAPS,
+                ],
                 (4.0, 1e-5),
                 dynamic,
             )
@@ -440,17 +453,27 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                 side_buffer.range(0, side_buffer.bytes()).unwrap(),
             );
             let mut status_bytes = vec![0u8; rows * size_of::<u32>()];
-            status
-                .read_at(&stream, 0, &mut status_bytes)
-                .unwrap();
+            status.read_at(&stream, 0, &mut status_bytes).unwrap();
             assert!(
                 status_bytes.iter().all(|&b| b == 0),
                 "dynamic {dynamic}, history {history_rows}: status"
             );
             // Each row of the dynamic plane holds the K coefficients, then the V coefficients.
-            let dynamic_k = dynamic
-                .then(|| coefficients.iter().map(|row| row[..kv_heads * TAPS].to_vec()).collect::<Vec<_>>());
-            let expected_k = host.convolve(0, &raw[..], &kernels[0], dynamic_k.as_deref(), channels, 4.0, 1e-5);
+            let dynamic_k = dynamic.then(|| {
+                coefficients
+                    .iter()
+                    .map(|row| row[..kv_heads * TAPS].to_vec())
+                    .collect::<Vec<_>>()
+            });
+            let expected_k = host.convolve(
+                0,
+                &raw[..],
+                &kernels[0],
+                dynamic_k.as_deref(),
+                channels,
+                4.0,
+                1e-5,
+            );
             let dynamic_arg = dynamic.then(|| {
                 coefficients
                     .iter()
@@ -479,8 +502,15 @@ fn prep_matches_the_host_for_static_and_dynamic_taps() {
                     &format!("dynamic {dynamic}, history {history_rows}, row {r}"),
                 );
             }
-            drop((raw_buffer, side_buffer, dynamic_buffer, status, history, kernel));
-         }
+            drop((
+                raw_buffer,
+                side_buffer,
+                dynamic_buffer,
+                status,
+                history,
+                kernel,
+            ));
+        }
     }
 }
 
@@ -570,7 +600,9 @@ fn tails_take_the_last_rows_of_a_strided_source_and_the_older_plane() {
         // Source row r is [r | r + 100]; the previous plane holds rows 90, 91, 92 oldest first.
         let source = ctx.upload(&bytes(&strided(rows))).unwrap();
         // The previous plane is packed: one row of `width` words per history row.
-        let old = ctx.upload(&bytes(&(90..93).flat_map(key).collect::<Vec<f32>>())).unwrap();
+        let old = ctx
+            .upload(&bytes(&(90..93).flat_map(key).collect::<Vec<f32>>()))
+            .unwrap();
         let out = ctx.allocate((TAPS - 1) * width * word).unwrap();
         ctx.inkling_pass_tails(
             &stream,
@@ -587,7 +619,11 @@ fn tails_take_the_last_rows_of_a_strided_source_and_the_older_plane() {
         let mut expected = Vec::new();
         for i in 0..TAPS - 1 {
             let j = rows + past - TAPS + 1 + i;
-            expected.extend(if j < past { key(90 + TAPS - 1 - past + j) } else { key(j - past) });
+            expected.extend(if j < past {
+                key(90 + TAPS - 1 - past + j)
+            } else {
+                key(j - past)
+            });
         }
         assert_eq!(got, expected, "{rows} rows, {past} past");
     }
@@ -596,4 +632,3 @@ fn tails_take_the_last_rows_of_a_strided_source_and_the_older_plane() {
 fn plane(buffer: &DeviceBuffer, words: usize) -> DeviceRange<'_> {
     buffer.range(0, words * size_of::<f32>()).unwrap()
 }
-

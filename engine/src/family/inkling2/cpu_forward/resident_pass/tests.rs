@@ -75,13 +75,18 @@ fn fingerprint(
         let path = Path::new(&path);
         if let Ok(mut sink) = std::fs::File::create(path.with_extension("logits.f32")) {
             for step in 0..steps {
-                sink.write_all(&bytes(&logits[step * vocab..(step + 1) * vocab])).unwrap();
+                sink.write_all(&bytes(&logits[step * vocab..(step + 1) * vocab]))
+                    .unwrap();
             }
         }
     }
     let kept: Vec<u32> = (0..steps)
         .filter(|&step| step < LOGIT_STEPS || step + 1 == steps)
-        .flat_map(|step| logits[step * vocab..(step + 1) * vocab].iter().map(|x| x.to_bits()))
+        .flat_map(|step| {
+            logits[step * vocab..(step + 1) * vocab]
+                .iter()
+                .map(|x| x.to_bits())
+        })
         .collect();
     serde_json::json!({
         "rows": prefix_rows,
@@ -109,13 +114,18 @@ fn resident_pass_parity() {
     assert!((1..=512).contains(&rows) && rows < tokens.len());
     let reference = env::var_os("FIFI_INKLING_PASS_PARITY_REF");
     let output = env::var_os("FIFI_INKLING_PASS_PARITY_OUT");
-    assert_ne!(reference.is_none(), output.is_none(), "set exactly one of REF or OUT");
+    assert_ne!(
+        reference.is_none(),
+        output.is_none(),
+        "set exactly one of REF or OUT"
+    );
     let mut model = CpuForward::open(Path::new(&checkpoint), tokens.len()).unwrap();
     model.enable_cuda(0).unwrap();
     let value = fingerprint(&mut model, &tokens, rows, rows == 1 && output.is_some());
     // The host-side dumps belong to the run that writes the reference; a comparing arm always
     // goes on to the comparison.
-    if let Some(out) = env::var_os("FIFI_INKLING_PASS_HOST_VISIT0_OUT").filter(|_| output.is_some()) {
+    if let Some(out) = env::var_os("FIFI_INKLING_PASS_HOST_VISIT0_OUT").filter(|_| output.is_some())
+    {
         // The host's attention input, raw K/V and prepared rows of the first visit for every
         // prompt row (`FIFI_INKLING_PASS_DUMP_VISIT=0:path` carries the pass's side).
         let visit = model.visits[0];
@@ -124,12 +134,18 @@ fn resident_pass_parity() {
         let (mut input, mut raw_k, mut raw_v) = (Vec::new(), Vec::new(), Vec::new());
         for &id in &tokens[..rows] {
             let stream = model.embed(id).unwrap();
-            let inputs = model.attention_inputs(visit, &layer, &stream, None).unwrap();
+            let inputs = model
+                .attention_inputs(visit, &layer, &stream, None)
+                .unwrap();
             input.extend(inputs[0].iter().map(|x| x.to_bits()));
-            let projected = model.project_attention(&layer, visit.attention, &inputs).unwrap();
+            let projected = model
+                .project_attention(&layer, visit.attention, &inputs)
+                .unwrap();
             raw_k.extend(projected[1].iter().map(|x| x.to_bits()));
             raw_v.extend(projected[2].iter().map(|x| x.to_bits()));
-            model.attention(&layer, visit, &mut state, projected).unwrap();
+            model
+                .attention(&layer, visit, &mut state, projected)
+                .unwrap();
         }
         // The host-only replays below cost minutes at 512 rows; `FIFI_INKLING_PASS_HOST_REPLAY=0`
         // keeps just the first visit's rows.
@@ -143,16 +159,17 @@ fn resident_pass_parity() {
                 .unwrap(),
             )
             .unwrap();
-        if let Some(out) = &output {
-            fs::write(out, serde_json::to_vec(&value).unwrap()).unwrap();
-        }
+            if let Some(out) = &output {
+                fs::write(out, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
             return;
         }
         // A second model without CUDA replays the first two layers of every prompt row on the
         // host and keeps the stream after each, with the second layer's attention input.
         let host = CpuForward::open(Path::new(&checkpoint), rows).unwrap();
-        let mut host_state: Vec<VisitState> =
-            (0..host.state.len()).map(|_| VisitState::default()).collect();
+        let mut host_state: Vec<VisitState> = (0..host.state.len())
+            .map(|_| VisitState::default())
+            .collect();
         let (mut after, mut inputs) = (Vec::new(), Vec::new());
         // The second layer's raw K/V and prepared rows, from a fresh visit state.
         let mut raw = Vec::new();
@@ -163,15 +180,27 @@ fn resident_pass_parity() {
             for (n, visit) in host.visits[..2].iter().enumerate() {
                 let layer = format!("model.llm.layers.{}", visit.weight_layer);
                 if n == 1 {
-                    let inputs1 = host.attention_inputs(*visit, &layer, &stream, None).unwrap();
+                    let inputs1 = host
+                        .attention_inputs(*visit, &layer, &stream, None)
+                        .unwrap();
                     inputs.extend(inputs1[0].iter().map(|x| x.to_bits()));
-                    let projected = host.project_attention(&layer, visit.attention, &inputs1).unwrap();
+                    let projected = host
+                        .project_attention(&layer, visit.attention, &inputs1)
+                        .unwrap();
                     raw.extend(projected[1].iter().map(|x| x.to_bits()));
                     raw.extend(projected[2].iter().map(|x| x.to_bits()));
-                    host.attention(&layer, *visit, &mut second, projected).unwrap();
+                    host.attention(&layer, *visit, &mut second, projected)
+                        .unwrap();
                 }
-                host.run_visits(&host.visits[n..n + 1], &mut host_state, &mut stream, None, &mut taps, false)
-                    .unwrap();
+                host.run_visits(
+                    &host.visits[n..n + 1],
+                    &mut host_state,
+                    &mut stream,
+                    None,
+                    &mut taps,
+                    false,
+                )
+                .unwrap();
                 after.extend(stream.current().iter().map(|x| x.to_bits()));
             }
         }
@@ -182,8 +211,9 @@ fn resident_pass_parity() {
         let banked = core.core_start + width;
         let bank_visit = host.visits[banked];
         let bank_layer = format!("model.llm.layers.{}", bank_visit.weight_layer);
-        let mut bank_state: Vec<VisitState> =
-            (0..host.state.len()).map(|_| VisitState::default()).collect();
+        let mut bank_state: Vec<VisitState> = (0..host.state.len())
+            .map(|_| VisitState::default())
+            .collect();
         let (mut before18, mut inputs18, mut raw18) = (Vec::new(), Vec::new(), Vec::new());
         let (mut control18, mut messages18, mut gains18, mut forgets18) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -192,11 +222,25 @@ fn resident_pass_parity() {
         for &id in &tokens[..rows] {
             let mut stream = host.embed(id).unwrap();
             let mut taps = TapRow::new(&[], host.hidden());
-            host.run_visits(&host.visits[..core.core_start], &mut bank_state, &mut stream, None, &mut taps, false)
-                .unwrap();
+            host.run_visits(
+                &host.visits[..core.core_start],
+                &mut bank_state,
+                &mut stream,
+                None,
+                &mut taps,
+                false,
+            )
+            .unwrap();
             let prelude = stream.clone();
-            host.run_visits(&host.visits[core.core_start..banked], &mut bank_state, &mut stream, None, &mut taps, false)
-                .unwrap();
+            host.run_visits(
+                &host.visits[core.core_start..banked],
+                &mut bank_state,
+                &mut stream,
+                None,
+                &mut taps,
+                false,
+            )
+            .unwrap();
             let bank = MessageBank {
                 first_block: prelude.block_count() + 1,
                 stream: std::mem::replace(&mut stream, prelude.clone()),
@@ -204,14 +248,28 @@ fn resident_pass_parity() {
             before18.extend(stream.current().iter().map(|x| x.to_bits()));
             let mut bank_bytes = Vec::new();
             bank.stream.append_device_state(&mut bank_bytes);
-            bank_rows.extend(bank_bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
-            let inputs = host.attention_inputs(bank_visit, &bank_layer, &stream, Some(&bank)).unwrap();
+            bank_rows.extend(
+                bank_bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b)),
+            );
+            let inputs = host
+                .attention_inputs(bank_visit, &bank_layer, &stream, Some(&bank))
+                .unwrap();
             inputs18.extend(inputs.iter().flat_map(|r| r.iter().map(|x| x.to_bits())));
             // The pieces of the controlled input, per role: the residual mix before control, the
             // bank message, the controller's gain and forget rows.
-            for (role, name) in [Role::Query, Role::Key, Role::Value].into_iter().enumerate() {
+            for (role, name) in [Role::Query, Role::Key, Role::Value]
+                .into_iter()
+                .enumerate()
+            {
                 let mut mixed = host.attention_input(bank_visit, &stream, role).unwrap();
-                let message = bank.stream.mix(bank.first_block, &host.control_query(bank_visit.weight_layer, name).unwrap());
+                let message = bank.stream.mix(
+                    bank.first_block,
+                    &host.control_query(bank_visit.weight_layer, name).unwrap(),
+                );
                 rms_norm_with_scale(&mut mixed, MIX_EPS);
                 let mut right = message.clone();
                 rms_norm_with_scale(&mut right, MIX_EPS);
@@ -219,7 +277,13 @@ fn resident_pass_parity() {
                 gate.extend_from_slice(&right);
                 let [gain, forget] = host
                     .weights
-                    .controller(control_names(&bank_layer, name).each_ref().map(String::as_str), &gate, [rank, host.hidden()])
+                    .controller(
+                        control_names(&bank_layer, name)
+                            .each_ref()
+                            .map(String::as_str),
+                        &gate,
+                        [rank, host.hidden()],
+                    )
                     .unwrap();
                 for (to, row) in [
                     &mut control18,
@@ -233,7 +297,9 @@ fn resident_pass_parity() {
                     to.extend(row.iter().map(|x| x.to_bits()));
                 }
             }
-            let projected = host.project_attention(&bank_layer, bank_visit.attention, &inputs).unwrap();
+            let projected = host
+                .project_attention(&bank_layer, bank_visit.attention, &inputs)
+                .unwrap();
             raw18.extend(projected[1].iter().map(|x| x.to_bits()));
             raw18.extend(projected[2].iter().map(|x| x.to_bits()));
         }
@@ -263,7 +329,11 @@ fn resident_pass_parity() {
         serde_json::from_slice(&fs::read(reference.unwrap()).unwrap()).unwrap();
     let visits = value["visits"].as_array().unwrap();
     let expected_visits = expected["visits"].as_array().unwrap();
-    let unequal_visits = visits.iter().zip(expected_visits).filter(|(a, b)| a != b).count();
+    let unequal_visits = visits
+        .iter()
+        .zip(expected_visits)
+        .filter(|(a, b)| a != b)
+        .count();
     let logits: Vec<u32> = serde_json::from_value(value["logits"].clone()).unwrap();
     let expected_logits: Vec<u32> = serde_json::from_value(expected["logits"].clone()).unwrap();
     let max_abs = logits
@@ -292,14 +362,32 @@ fn resident_pass_parity() {
         fs::write(out, serde_json::to_vec(&copy).unwrap()).unwrap();
     }
     assert_eq!(visits.len(), expected_visits.len());
-    if unequal_visits != 0 && let Some(out) = env::var_os("FIFI_INKLING_PASS_PARTS_OUT") {
+    if unequal_visits != 0
+        && let Some(out) = env::var_os("FIFI_INKLING_PASS_PARTS_OUT")
+    {
         {
-            fs::write(out, serde_json::to_vec(&serde_json::json!({"pass": value["parts"], "host": expected["parts"]})).unwrap()).unwrap();
+            fs::write(
+                out,
+                serde_json::to_vec(
+                    &serde_json::json!({"pass": value["parts"], "host": expected["parts"]}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         }
     }
-    assert_eq!(unequal_visits, 0, "visit state differs from the flag-off path");
-    assert!(max_abs < 1e-2, "logits differ from the flag-off path by {max_abs}");
-    assert_eq!(argmax, expected_argmax, "a greedy decode step picks another token");
+    assert_eq!(
+        unequal_visits, 0,
+        "visit state differs from the flag-off path"
+    );
+    assert!(
+        max_abs < 1e-2,
+        "logits differ from the flag-off path by {max_abs}"
+    );
+    assert_eq!(
+        argmax, expected_argmax,
+        "a greedy decode step picks another token"
+    );
 }
 
 /// Every constant the pass plans for every visit resolves in the checkpoint (host only: no CUDA).
@@ -321,10 +409,19 @@ fn pass_constant_names() {
             relative: heads[0] * model.math.d_rel,
         });
         CpuForward::visit_consts(&model, *visit, geometry, &mut consts).unwrap_or_else(|error| {
-            panic!("visit {} (layer {}): {:?}", visit.state_slot, visit.weight_layer, error.describe())
+            panic!(
+                "visit {} (layer {}): {:?}",
+                visit.state_slot,
+                visit.weight_layer,
+                error.describe()
+            )
         });
     }
-    eprintln!("Inkling resident pass constants resolve for {} visits: {} words", model.visits.len(), consts.bytes.len());
+    eprintln!(
+        "Inkling resident pass constants resolve for {} visits: {} words",
+        model.visits.len(),
+        consts.bytes.len()
+    );
 }
 
 #[test]

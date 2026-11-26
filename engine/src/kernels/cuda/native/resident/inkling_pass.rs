@@ -327,7 +327,15 @@ pub(in crate::kernels::cuda) fn add(
 pub(in crate::kernels::cuda) fn prep(
     stream: &RawStream,
     ranges: [RawRange<'_>; 8],
-    [rows, raw_stride, side_stride, key_at, value_at, dynamic_stride, kv_heads]: [usize; 7],
+    [
+        rows,
+        raw_stride,
+        side_stride,
+        key_at,
+        value_at,
+        dynamic_stride,
+        kv_heads,
+    ]: [usize; 7],
     [qk_limit, eps]: [f32; 2],
     dynamic: bool,
 ) -> Result<(), DeviceFailure> {
@@ -340,7 +348,12 @@ pub(in crate::kernels::cuda) fn prep(
         && value_at + channels <= side_stride
         && (!dynamic || dynamic_stride >= kv_heads * TAPS)
         && [qk_limit, eps].iter().all(|&v| v.is_finite() && v > 0.0)
-        && exact(&ranges, 0, ((rows - 1) * raw_stride + 2 * channels) * WORD, false)
+        && exact(
+            &ranges,
+            0,
+            ((rows - 1) * raw_stride + 2 * channels) * WORD,
+            false,
+        )
         && exact(
             &ranges,
             1,
@@ -398,7 +411,9 @@ fn writers_apart(ranges: &[RawRange<'_>], writers: &[usize]) -> bool {
     writers.iter().all(|&w| {
         (0..ranges.len())
             .filter(|&o| o != w && !writers.contains(&o))
-            .all(|o| Span::of(&ranges[w], ranges[w].bytes).apart(&Span::of(&ranges[o], ranges[o].bytes)))
+            .all(|o| {
+                Span::of(&ranges[w], ranges[w].bytes).apart(&Span::of(&ranges[o], ranges[o].bytes))
+            })
     })
 }
 
@@ -480,7 +495,9 @@ pub(in crate::kernels::cuda) fn apply(
     let apart = writers.iter().all(|&w| {
         (0..ranges.len())
             .filter(|&o| o != w && !writers.contains(&o) && !same(&ranges[w], &ranges[o]))
-            .all(|o| Span::of(&ranges[w], ranges[w].bytes).apart(&Span::of(&ranges[o], ranges[o].bytes)))
+            .all(|o| {
+                Span::of(&ranges[w], ranges[w].bytes).apart(&Span::of(&ranges[o], ranges[o].bytes))
+            })
     });
     if !apart {
         return Err(invalid_argument());
