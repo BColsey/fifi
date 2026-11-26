@@ -47,6 +47,11 @@ pub(crate) mod gguf_select;
 // Gated with the CUDA families because the book reads the kernels' resident step params
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
+#[cfg_attr(
+    not(all(feature = "native-cuda", target_os = "linux")),
+    allow(dead_code, reason = "the CUDA prompt paths are the callers")
+)]
+pub(crate) mod host_rows;
 pub(crate) mod host_shape;
 /// The shared plan of a prefix store whose entries live in host memory.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

@@ -2,9 +2,11 @@
 //! order, then computes the routed expert outputs using the shared CUDA banks.
 
 use super::{
-    AttentionInput, CpuForward, LayerVisit, MessageBank, MoeRoute, Role, Stream, TapRow,
-    VisitState, Weights, add, apply_control, bad, control_names,
+    Attention, AttentionInput, CpuForward, LayerVisit, MessageBank, MoeRoute, PROMPT_ROW_SPLIT,
+    Role, Stream, TapRow, VisitState, Weights, add, apply_control, attention_norm_name,
+    attention_residual, bad, control_names,
     controller_batch::{ChainedAttention, controller_batch_enabled, multirow_controllers_enabled},
+    rms_norm,
     window::PendingRow,
 };
 use crate::family::inkling2::switches::Switch;
@@ -525,17 +527,26 @@ impl CpuForward {
         for row in rows.iter_mut() {
             row.taps.capture(visit.state_slot, row.stream.current());
         }
-        rows.iter_mut()
+        if outputs.len() != rows.len() {
+            return Err(bad("Inkling prompt attention returned the wrong row count"));
+        }
+        let seal = physical.is_multiple_of(self.spec.n_layers_per_attn_res_block);
+        let mut residuals: Vec<_> = rows
+            .iter_mut()
+            .map(|row| &mut row.stream)
             .zip(outputs)
-            .map(|(row, attn)| {
-                let input =
-                    self.mlp_residual_after_attention(physical, &mut row.stream, &query, attn);
-                if control_batched {
-                    Ok(input)
-                } else {
-                    self.finish_mlp_input(input, row.bank.as_ref(), physical, layer)
-                }
-            })
+            .collect();
+        let inputs = crate::family::host_rows::map_rows(
+            &mut residuals,
+            PROMPT_ROW_SPLIT,
+            |(stream, attn)| attention_residual(stream, seal, &query, std::mem::take(attn)),
+        );
+        if control_batched {
+            return Ok(inputs);
+        }
+        rows.iter()
+            .zip(inputs)
+            .map(|(row, input)| self.finish_mlp_input(input, row.bank.as_ref(), physical, layer))
             .collect()
     }
 
@@ -701,6 +712,9 @@ impl CpuForward {
         let batched_controllers = grouped.is_some();
         let inputs = match grouped {
             Some(inputs) => inputs,
+            None if rows.iter().all(|row| row.bank.is_none()) => {
+                self.unbanked_attention_inputs(visit, layer, rows)?
+            }
             None => rows
                 .iter()
                 .map(|row| {
@@ -709,6 +723,63 @@ impl CpuForward {
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(Some((inputs, batched_controllers)))
+    }
+
+    /// The attention inputs of rows without a message bank, as `attention_inputs_scalar` makes
+    /// them: each role's depth mix (or the current row on the first visit), RMS-normalized and
+    /// scaled. The weights are read once and the rows are split over host threads.
+    fn unbanked_attention_inputs(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        rows: &[PromptRow<'_>],
+    ) -> Result<Vec<[Vec<f32>; 3]>, EngError> {
+        let local = visit.attention == Attention::Local;
+        let roles = if local { 1 } else { 3 };
+        let hidden = self.hidden();
+        let queries = match visit.weight_layer.checked_sub(1) {
+            None => Vec::new(),
+            Some(query) => (0..roles)
+                .map(|row| {
+                    self.weights.row(
+                        &format!("model.llm.attn_res.attn_queries.{query}"),
+                        row,
+                        hidden,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let gammas = (0..roles)
+            .map(|i| {
+                self.weights
+                    .vec(&attention_norm_name(layer, local, i), hidden)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let eps = self.math.rms_norm_eps;
+        let mut streams: Vec<&Stream> = rows.iter().map(|row| &row.stream).collect();
+        Ok(crate::family::host_rows::map_rows(
+            &mut streams,
+            PROMPT_ROW_SPLIT,
+            |stream| {
+                let input = |role: usize| {
+                    let mut x = match queries.get(role) {
+                        Some(query) => stream.mix(0, query),
+                        None => stream.current().to_vec(),
+                    };
+                    rms_norm(&mut x, eps);
+                    for (value, gamma) in x.iter_mut().zip(gammas[role].iter()) {
+                        *value *= gamma;
+                    }
+                    x
+                };
+                let first = input(0);
+                if local {
+                    [first.clone(), first.clone(), first]
+                } else {
+                    [first, input(1), input(2)]
+                }
+            },
+        ))
     }
 
     fn project_prompt_attention(

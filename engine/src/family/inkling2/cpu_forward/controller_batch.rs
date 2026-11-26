@@ -4,10 +4,12 @@ use crate::family::inkling2::switches::Switch;
 use std::sync::Once;
 
 use super::{
-    ATTENTION_ROLES, Attention, ControlInput, CpuForward, LayerVisit, MessageBank, Stream,
-    VisitState, Weights, Work, apply_control, attention_norm_name, bad, control_names,
+    ATTENTION_ROLES, Attention, ControlInput, CpuForward, LayerVisit, MessageBank,
+    PROMPT_ROW_SPLIT, Stream, VisitState, Weights, Work, apply_control, attention_norm_name, bad,
+    control_input_from, control_names,
 };
 use crate::EngError;
+use crate::family::host_rows::map_rows;
 use crate::family::inkling2::{
     cpu_attention::{AttentionProjection, note_resident_queries},
     cuda_projection::gguf::{
@@ -202,11 +204,11 @@ impl CpuForward {
         let _span = self.phase_span(Work::Controller);
         let prepared = {
             let _subspan = self.phase_span(Work::AttentionControlPrepare);
-            rows.iter()
-                .map(|(stream, bank)| {
-                    self.prepare_attention_controllers(visit, stream, bank.expect("banks checked"))
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            let rows: Vec<_> = rows
+                .iter()
+                .map(|&(stream, bank)| (stream, bank.expect("banks checked")))
+                .collect();
+            self.prepare_attention_rows(visit, &rows)?
         };
         let local = visit.attention == Attention::Local;
         let gamma = |i| {
@@ -326,12 +328,13 @@ impl CpuForward {
         let _span = self.phase_span(Work::Controller);
         let prepared = {
             let _subspan = self.phase_span(Work::AttentionControlPrepare);
-            rows.map(|(stream, bank)| {
-                let bank =
-                    bank.ok_or_else(|| bad("Inkling grouped attention lost a message bank"))?;
-                self.prepare_attention_controllers(visit, stream, bank)
-            })
-            .collect::<Result<Vec<_>, _>>()?
+            let rows = rows
+                .map(|(stream, bank)| {
+                    bank.map(|bank| (stream, bank))
+                        .ok_or_else(|| bad("Inkling grouped attention lost a message bank"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.prepare_attention_rows(visit, &rows)?
         };
         let inputs: Vec<_> = prepared
             .iter()
@@ -451,28 +454,58 @@ impl CpuForward {
         stream: &Stream,
         bank: &MessageBank,
     ) -> Result<[PreparedInput; 3], EngError> {
+        let [row] = self
+            .prepare_attention_rows(visit, &[(stream, bank)])?
+            .try_into()
+            .map_err(|_| bad("Inkling controller preparation lost its row"))?;
+        Ok(row)
+    }
+
+    /// The Q/K/V controller inputs of many rows. The query weights are read once; each row's
+    /// mixes and norms read only its own stream and bank, so the rows are split over host threads.
+    fn prepare_attention_rows(
+        &self,
+        visit: LayerVisit,
+        rows: &[(&Stream, &MessageBank)],
+    ) -> Result<Vec<[PreparedInput; 3]>, EngError> {
         // Local roles share the residual before their separate cross-pass gates.
-        let common = (visit.attention == Attention::Local)
-            .then(|| self.attention_input(visit, stream, 0))
-            .transpose()?;
-        let [q, k, v] = std::array::from_fn(|index| {
-            let input = match &common {
-                Some(input) => input.clone(),
-                None => self.attention_input(visit, stream, index)?,
+        let local = visit.attention == Attention::Local;
+        let hidden = self.hidden();
+        // No queries: the first visit's input is the stream's current row.
+        let attention = match visit.weight_layer.checked_sub(1) {
+            None => Vec::new(),
+            Some(query) => (0..if local { 1 } else { 3 })
+                .map(|row| {
+                    self.weights.row(
+                        &format!("model.llm.attn_res.attn_queries.{query}"),
+                        row,
+                        hidden,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let [q, k, v] =
+            ATTENTION_ROLES.map(|(role, _)| self.control_query(visit.weight_layer, role));
+        let queries = [q?, k?, v?];
+        let prepare = |&(stream, bank): &(&Stream, &MessageBank)| -> [PreparedInput; 3] {
+            let mixed = |index: usize| match attention.get(index) {
+                Some(query) => stream.mix(0, query),
+                None => stream.current().to_vec(),
             };
-            let (control, gate_scales) = self.control_input_with_scales(
-                &input,
-                bank,
-                visit.weight_layer,
-                ATTENTION_ROLES[index].0,
-            )?;
-            Ok::<_, EngError>(PreparedInput {
-                input,
-                control,
-                gate_scales,
+            let common = local.then(|| mixed(0));
+            std::array::from_fn(|index| {
+                let input = common.clone().unwrap_or_else(|| mixed(index));
+                let (control, gate_scales) = control_input_from(&input, bank, &queries[index]);
+                PreparedInput {
+                    input,
+                    control,
+                    gate_scales,
+                }
             })
-        });
-        Ok([q?, k?, v?])
+        };
+        Ok(map_rows(&mut rows.to_vec(), PROMPT_ROW_SPLIT, |row| {
+            prepare(row)
+        }))
     }
 }
 

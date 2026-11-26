@@ -27,6 +27,13 @@ mod window;
 use depth_mix::Stream;
 
 pub(super) const MIX_EPS: f32 = 1e-6;
+/// How a prompt's independent per-row host work is split over threads.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(super) const PROMPT_ROW_SPLIT: crate::family::host_rows::RowSplit =
+    crate::family::host_rows::RowSplit {
+        max_threads: 8,
+        min_rows: 16,
+    };
 pub(super) const ROUTE_NORMALIZATION_FLOOR: f32 = 1.0 / 16384.0;
 
 #[derive(Deserialize)]
@@ -663,13 +670,8 @@ impl CpuForward {
         query: &[f32],
         attn: Vec<f32>,
     ) -> Vec<f32> {
-        if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
-            stream.seal(attn);
-        } else {
-            stream.add_current(&attn);
-        }
-
-        stream.mix(0, query)
+        let seal = physical.is_multiple_of(self.spec.n_layers_per_attn_res_block);
+        attention_residual(stream, seal, query, attn)
     }
 
     fn finish_mlp_input(
@@ -854,15 +856,7 @@ impl CpuForward {
         role: Role,
     ) -> Result<(ControlInput, [f32; 2]), EngError> {
         let query = self.control_query(physical, role)?;
-        let message = bank.stream.mix(bank.first_block, &query);
-        let mut gate = input.to_vec();
-        gate.extend_from_slice(&message);
-        let (left, right) = gate.split_at_mut(self.hidden());
-        let scales = [
-            rms_norm_with_scale(left, MIX_EPS),
-            rms_norm_with_scale(right, MIX_EPS),
-        ];
-        Ok((ControlInput { gate, message }, scales))
+        Ok(control_input_from(input, bank, &query))
     }
 
     fn control_query(&self, physical: usize, role: Role) -> Result<Cow<'_, [f32]>, EngError> {
@@ -1215,6 +1209,35 @@ pub(super) fn dot(x: &[f32], y: &[f32]) -> f32 {
 
 pub(super) fn rms_norm(x: &mut [f32], eps: f32) {
     rms_norm_with_scale(x, eps);
+}
+
+/// Adds the attention output to the stream (sealing a block at a block boundary) and returns the
+/// stream's MLP depth mix for `query`.
+fn attention_residual(stream: &mut Stream, seal: bool, query: &[f32], attn: Vec<f32>) -> Vec<f32> {
+    if seal {
+        stream.seal(attn);
+    } else {
+        stream.add_current(&attn);
+    }
+    stream.mix(0, query)
+}
+
+/// The controller input of one role: the row's input followed by the message the bank mixes for
+/// `query`, each half RMS-normalized, and the two norm scales.
+fn control_input_from(
+    input: &[f32],
+    bank: &MessageBank,
+    query: &[f32],
+) -> (ControlInput, [f32; 2]) {
+    let message = bank.stream.mix(bank.first_block, query);
+    let mut gate = input.to_vec();
+    gate.extend_from_slice(&message);
+    let (left, right) = gate.split_at_mut(input.len());
+    let scales = [
+        rms_norm_with_scale(left, MIX_EPS),
+        rms_norm_with_scale(right, MIX_EPS),
+    ];
+    (ControlInput { gate, message }, scales)
 }
 
 fn rms_norm_with_scale(x: &mut [f32], eps: f32) -> f32 {

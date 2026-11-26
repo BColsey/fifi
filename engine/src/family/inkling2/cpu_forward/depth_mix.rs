@@ -1,6 +1,6 @@
 //! Depth residual blocks are immutable once a layer boundary publishes them.
 
-use std::{cell::OnceCell, sync::Arc};
+use std::sync::{Arc, OnceLock};
 
 use super::{MIX_EPS, add, dot, rms_norm};
 
@@ -12,7 +12,8 @@ use super::{MIX_EPS, add, dot, rms_norm};
 pub(super) struct Stream {
     current: Vec<f32>,
     sealed: Vec<Arc<Vec<f32>>>,
-    normalized: OnceCell<Arc<Vec<f32>>>,
+    // A lock rather than a cell so prompt rows can be mixed on several host threads.
+    normalized: OnceLock<Arc<Vec<f32>>>,
 }
 
 impl Stream {
@@ -20,7 +21,7 @@ impl Stream {
         Self {
             current,
             sealed: Vec::new(),
-            normalized: OnceCell::new(),
+            normalized: OnceLock::new(),
         }
     }
 
