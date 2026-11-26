@@ -2,7 +2,9 @@ use std::mem::size_of;
 
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
-use super::{AddCall, MAX_BLOCKS, MixCall, MixShape, NormCall, SealCall, States, StreamShape};
+use super::{
+    AddCall, MAX_BLOCKS, MAX_NORM_ROWS, MixCall, MixShape, NormCall, SealCall, States, StreamShape,
+};
 
 const EPS: f32 = 1e-5;
 
@@ -517,13 +519,13 @@ fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
     let src = normal_row(&mut Rng::new(0x5eed_5730), width);
     upload(&buffers.row, &stream, &src);
     buffers.clear_health(&stream);
-    ctx.inkling_stream_norm(
+    ctx.inkling_stream_norm_rows(
         &stream,
-        NormCall {
+        &[NormCall {
             src: buffers.row.range(0, row).unwrap(),
             dst: buffers.out.range(0, row).unwrap(),
             health: buffers.health.range(0, word).unwrap(),
-        },
+        }],
         (width, EPS),
     )
     .unwrap();
@@ -537,13 +539,13 @@ fn norm_matches_the_host_scale_and_refuses_to_normalize_in_place() {
     assert_eq!(buffers.health(&stream).to_bits(), 0);
 
     let error = ctx
-        .inkling_stream_norm(
+        .inkling_stream_norm_rows(
             &stream,
-            NormCall {
+            &[NormCall {
                 src: buffers.out.range(0, row).unwrap(),
                 dst: buffers.out.range(0, row).unwrap(),
                 health: buffers.health.range(0, word).unwrap(),
-            },
+            }],
             (width, EPS),
         )
         .map_err(|error| format!("{error:?}"))
@@ -689,4 +691,93 @@ fn states_in_one_launch_match_one_launch_each_bit_for_bit() {
         );
     }
     assert_eq!(download(&health, &stream, 0, 1)[0], 0.0);
+}
+
+/// Six gate halves in one launch, each with its own health word, give each row the bits of its
+/// own one-row launch; then the refusals.
+#[test]
+fn norm_rows_match_one_row_each_bit_for_bit() {
+    if !device_present("Inkling stream norm rows") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut rng = Rng::new(0x0d0e_5ca1);
+    let (width, count) = (2304usize, 6usize);
+    let row = row_bytes(width);
+    let word = size_of::<f32>();
+    let alloc = |words: usize| ctx.allocate(words * size_of::<f32>()).unwrap();
+    let sources: Vec<f32> = (0..count)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let (src, dst, one, health) = (
+        alloc(count * width),
+        alloc(count * width),
+        alloc(width),
+        alloc(count),
+    );
+    upload(&src, &stream, &sources);
+    upload(&health, &stream, &vec![0.0; count]);
+    // Row `r` of `src` normed into `out`, with its own health word. `out` is left to inference
+    // so that every call shares the buffers' lifetime.
+    let call = |r: usize, out| NormCall {
+        src: src.range(r * row, row).unwrap(),
+        dst: out,
+        health: health.range(r * word, word).unwrap(),
+    };
+    let rows: Vec<NormCall<'_>> = (0..count)
+        .map(|r| call(r, dst.range(r * row, row).unwrap()))
+        .collect();
+    ctx.inkling_stream_norm_rows(&stream, &rows, (width, EPS))
+        .unwrap();
+    let together = download(&dst, &stream, 0, count * width);
+    for r in 0..count {
+        ctx.inkling_stream_norm_rows(
+            &stream,
+            &[call(r, one.range(0, row).unwrap())],
+            (width, EPS),
+        )
+        .unwrap();
+        let alone = download(&one, &stream, 0, width);
+        let same = together[r * width..][..width]
+            .iter()
+            .zip(&alone)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "row {r} differs from its own launch");
+        let expected = host::norm(&sources[r * width..][..width], EPS);
+        for (a, b) in alone.iter().zip(&expected) {
+            assert!(
+                (a - b).abs() <= 1e-6 * (1.0 + b.abs()),
+                "row {r}: {a} vs {b}"
+            );
+        }
+    }
+    assert!(
+        download(&health, &stream, 0, count)
+            .iter()
+            .all(|v| v.to_bits() == 0)
+    );
+    let refused = |rows: &[NormCall<'_>]| {
+        ctx.inkling_stream_norm_rows(&stream, rows, (width, EPS))
+            .is_err()
+    };
+    assert!(refused(&[]));
+    let many: Vec<NormCall<'_>> = (0..=MAX_NORM_ROWS)
+        .map(|r| call(r % count, dst.range((r % count) * row, row).unwrap()))
+        .collect();
+    assert!(refused(&many));
+    // Two rows writing one output, an output on another row's source, health on a source.
+    assert!(refused(&[
+        call(0, one.range(0, row).unwrap()),
+        call(1, one.range(0, row).unwrap()),
+    ]));
+    assert!(refused(&[
+        call(0, src.range(row, row).unwrap()),
+        call(1, dst.range(row, row).unwrap()),
+    ]));
+    assert!(refused(&[NormCall {
+        src: src.range(0, row).unwrap(),
+        dst: dst.range(0, row).unwrap(),
+        health: src.range(0, word).unwrap(),
+    }]));
 }

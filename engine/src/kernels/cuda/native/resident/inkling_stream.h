@@ -18,9 +18,9 @@
  * inference_cuda_inkling_stream_add
  *   current = current + row, each sum rounded to nearest even. This is `Stream::add_current(row)`.
  *
- * inference_cuda_inkling_stream_norm
- *   dst = src * rms_scale(src): one row normalized into another range, the gate halves of a
- *   cross-pass controller (`rms_norm_with_scale` of the host). `dst` shares no byte with `src`.
+ * inference_cuda_inkling_stream_norm_rows
+ *   dst = src * rms_scale(src) for up to 8 rows of one width in one launch, a block per row: the
+ *   gate halves of the cross-pass controllers (`rms_norm_with_scale` of the host).
  *
  * RMS scale: (dot(x, x) / width + eps).sqrt().recip(), every operation rounded to nearest even.
  * Reductions are reordered against the host's ordered sums, so results agree with the host
@@ -53,8 +53,11 @@ int inference_cuda_inkling_stream_seal(float *state, const float *next, float *h
 int inference_cuda_inkling_stream_add(float *state, const float *row, float *health, int width,
                                       int rows, int stride, void *stream, int *out_stage);
 
-int inference_cuda_inkling_stream_norm(const float *src, float *dst, float *health, int width,
-                                       float eps, void *stream, int *out_stage);
+/* `ranges` holds `src, dst, health` of each of the `count` rows. Every output shares no byte with
+ * any source or other output, and every health word none with any source or output; rows may
+ * share one health word. */
+int inference_cuda_inkling_stream_norm_rows(const void *const *ranges, int count, int width,
+                                            float eps, void *stream, int *out_stage);
 
 /* Host-ordered mix and seal: the same layouts, with every reduction in the host's element order on
  * one lane, so the results are the host's bits (`Stream::mix`, `Stream::seal`). The mix may take

@@ -276,8 +276,9 @@ __global__ void inkling_stream_add(float *state, const float *row, float *health
 
 bool aligned(const void *pointer) { return reinterpret_cast<uintptr_t>(pointer) % alignof(float) == 0; }
 
-__global__ void inkling_stream_norm(const float *src, float *dst, float *health, int width,
-                                    float eps) {
+// One block's norm, `dst = src * rms_scale(src)`: a row of `inkling_stream_norm_rows`.
+__device__ __forceinline__ void norm_one(const float *src, float *dst, float *health, int width,
+                                         float eps) {
     __shared__ float scratch[threads];
     const int lane = threadIdx.x;
     int invalid = 0;
@@ -288,6 +289,21 @@ __global__ void inkling_stream_norm(const float *src, float *dst, float *health,
         invalid |= !isfinite(value);
     }
     report(health, invalid);
+}
+
+// Independent norms of one width in one launch, a block per row: the gate halves of a visit's
+// controllers. The lists travel in the kernel's parameter space.
+constexpr int max_norm_rows = 8;
+
+struct NormRows {
+    const float *src[max_norm_rows];
+    float *dst[max_norm_rows];
+    float *health[max_norm_rows];
+};
+
+__global__ void inkling_stream_norm_rows(NormRows rows, int width, float eps) {
+    const int r = blockIdx.x;
+    norm_one(rows.src[r], rows.dst[r], rows.health[r], width, eps);
 }
 
 // Host-ordered variants of the mix and the seal (`Stream::mix`, `Stream::seal` and
@@ -522,21 +538,41 @@ extern "C" int inference_cuda_inkling_stream_add(float *state, const float *row,
     return static_cast<int>(failure.err);
 }
 
-extern "C" int inference_cuda_inkling_stream_norm(const float *src, float *dst, float *health,
-                                                   int width, float eps, void *stream,
-                                                   int *out_stage) {
+extern "C" int inference_cuda_inkling_stream_norm_rows(const void *const *ranges, int count,
+                                                        int width, float eps, void *stream,
+                                                        int *out_stage) {
     report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-    if (!src || !dst || !health || !stream || !aligned(src) || !aligned(dst) ||
-        !aligned(health) || !valid_shape(width, eps)) {
+    // `ranges` holds `src, dst, health` per row.
+    if (!ranges || !stream || count < 1 || count > max_norm_rows || !valid_shape(width, eps)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
+    NormRows rows{};
+    for (int r = 0; r < count; ++r) {
+        const void *const *row = ranges + 3 * r;
+        if (!row[0] || !row[1] || !row[2] || !aligned(row[0]) || !aligned(row[1]) ||
+            !aligned(row[2])) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        rows.src[r] = static_cast<const float *>(row[0]);
+        rows.dst[r] = static_cast<float *>(const_cast<void *>(row[1]));
+        rows.health[r] = static_cast<float *>(const_cast<void *>(row[2]));
+    }
+    // Every output is apart from every source and every other output, and every health word
+    // from every source and output. Health words may be one word: each writer stores the same
+    // quiet NaN.
     const size_t row = static_cast<size_t>(width) * sizeof(float);
-    if (overlaps(dst, row, src, row) || overlaps(health, sizeof(float), src, row) ||
-        overlaps(health, sizeof(float), dst, row)) {
-        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    for (int r = 0; r < count; ++r) {
+        for (int k = 0; k < count; ++k) {
+            if (overlaps(rows.dst[r], row, rows.src[k], row) ||
+                (k != r && overlaps(rows.dst[r], row, rows.dst[k], row)) ||
+                overlaps(rows.health[r], sizeof(float), rows.src[k], row) ||
+                overlaps(rows.health[r], sizeof(float), rows.dst[k], row)) {
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
     }
-    inkling_stream_norm<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        src, dst, health, width, eps);
+    inkling_stream_norm_rows<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        rows, width, eps);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

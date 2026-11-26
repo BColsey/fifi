@@ -83,10 +83,9 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
-    fn inference_cuda_inkling_stream_norm(
-        src: *const c_void,
-        dst: *mut c_void,
-        health: *mut c_void,
+    fn inference_cuda_inkling_stream_norm_rows(
+        ranges: *const *const c_void,
+        count: c_int,
         width: c_int,
         eps: f32,
         stream: *mut c_void,
@@ -432,40 +431,75 @@ pub(in crate::kernels::cuda) fn add(
     checked(status, stage)
 }
 
-/// `dst = src * rms_scale(src)`: one gate half of a cross-pass controller.
-pub(in crate::kernels::cuda) fn norm(
+/// Largest number of rows of one [`norm_rows`] launch.
+pub(crate) const MAX_NORM_ROWS: usize = 8;
+
+/// One row of [`norm_rows`]: `dst = src * rms_scale(src)`, health into `health`.
+pub(in crate::kernels::cuda) struct NormRowRaw<'a> {
+    pub(in crate::kernels::cuda) src: RawRange<'a>,
+    pub(in crate::kernels::cuda) dst: RawRange<'a>,
+    pub(in crate::kernels::cuda) health: RawRange<'a>,
+}
+
+/// `dst = src * rms_scale(src)` of each row in one launch, a block per row. Every output shares no byte with a
+/// source or another output, and every health word none with a source or an output; rows may
+/// share one health word.
+pub(in crate::kernels::cuda) fn norm_rows(
     stream: &RawStream,
-    src: RawRange<'_>,
-    dst: RawRange<'_>,
-    health: RawRange<'_>,
+    rows: &[NormRowRaw<'_>],
     width: usize,
     eps: f32,
 ) -> Result<(), DeviceFailure> {
     let row = width * size_of::<f32>();
     let health_bytes = size_of::<f32>();
-    if !shape(0, width, eps)
-        || !sized(&src, row)
-        || !sized(&dst, row)
-        || !sized(&health, health_bytes)
-    {
+    let sized_rows = rows
+        .iter()
+        .all(|r| sized(&r.src, row) && sized(&r.dst, row) && sized(&r.health, health_bytes));
+    if !(1..=MAX_NORM_ROWS).contains(&rows.len()) || !shape(0, width, eps) || !sized_rows {
         return Err(invalid_argument());
     }
-    let (src_span, dst_span, health_span) = (
-        Span::of(&src, row),
-        Span::of(&dst, row),
-        Span::of(&health, health_bytes),
-    );
-    if !dst_span.apart(&src_span) || !health_span.apart(&src_span) || !health_span.apart(&dst_span)
-    {
+    let spans: Vec<[Span<'_>; 3]> = rows
+        .iter()
+        .map(|r| {
+            [
+                Span::of(&r.src, row),
+                Span::of(&r.dst, row),
+                Span::of(&r.health, health_bytes),
+            ]
+        })
+        .collect();
+    let apart = spans.iter().enumerate().all(|(at, [_, dst, health])| {
+        spans
+            .iter()
+            .enumerate()
+            .all(|(other_at, [src, other_dst, _])| {
+                dst.apart(src)
+                    && (at == other_at || dst.apart(other_dst))
+                    && health.apart(src)
+                    && health.apart(other_dst)
+            })
+    });
+    if !apart {
         return Err(invalid_argument());
     }
+    let ranges: Vec<*const c_void> = rows
+        .iter()
+        .flat_map(|r| {
+            [
+                r.src.address() as *const c_void,
+                r.dst.address() as *const c_void,
+                r.health.address() as *const c_void,
+            ]
+        })
+        .collect();
     let mut stage = STAGE_NONE;
-    // SAFETY: the ranges are aligned, hold the extents above and share no byte.
+    // SAFETY: every range is aligned and holds its extent; the outputs and health words share no
+    // byte with a source or an output. The C entry copies the list into the kernel's parameters
+    // before it returns.
     let status = unsafe {
-        inference_cuda_inkling_stream_norm(
-            src.address() as *const c_void,
-            dst.address(),
-            health.address(),
+        inference_cuda_inkling_stream_norm_rows(
+            ranges.as_ptr(),
+            rows.len() as c_int,
             width as c_int,
             eps,
             stream.0.as_ptr(),

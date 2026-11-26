@@ -18,7 +18,7 @@ use crate::kernels::cuda::{
 
 use super::super::native::resident::inkling_stream::{self as native};
 pub(crate) use super::super::native::resident::inkling_stream::{
-    MAX_BLOCKS, MAX_ORDERED_WIDTH, MAX_STATES, States,
+    MAX_BLOCKS, MAX_NORM_ROWS, MAX_ORDERED_WIDTH, MAX_STATES, States,
 };
 
 const MAX_WIDTH: usize = 8192;
@@ -426,35 +426,54 @@ impl CudaContext {
         })
     }
 
-    /// One gate half of a cross-pass controller: `dst = src * rms_scale(src)` with `eps`, the
-    /// host's `rms_norm_with_scale`. Agrees with the host within rounding.
-    pub(crate) fn inkling_stream_norm(
+    /// The gate halves of the cross-pass controllers: `dst = src * rms_scale(src)` with `eps`
+    /// (the host's `rms_norm_with_scale`) for each row in one launch, a block per row. Agrees
+    /// with the host within rounding; rows may share one health word.
+    pub(crate) fn inkling_stream_norm_rows(
         &self,
         stream: &DeviceStream,
-        call: NormCall<'_>,
+        rows: &[NormCall<'_>],
         (width, eps): (usize, f32),
     ) -> Result<(), EngError> {
+        if !(1..=MAX_NORM_ROWS).contains(&rows.len()) {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA Inkling stream norm takes 1 to {MAX_NORM_ROWS} rows per launch, got {}",
+                rows.len()
+            )));
+        }
         check_shape("norm", 0, 0, width, eps)?;
         let row = width * size_of::<f32>();
         let health = size_of::<f32>();
-        check_row("Inkling stream norm source", &call.src, row)?;
-        check_row("Inkling stream norm output", &call.dst, row)?;
-        check_row("Inkling stream health", &call.health, health)?;
-        writes_apart(
-            [
-                Claim::of("Inkling stream norm output", &call.dst, row),
-                Claim::of("Inkling stream health", &call.health, health),
-            ],
-            [Claim::of("Inkling stream norm source", &call.src, row)],
-        )?;
+        for call in rows {
+            check_row("Inkling stream norm source", &call.src, row)?;
+            check_row("Inkling stream norm output", &call.dst, row)?;
+            check_row("Inkling stream health", &call.health, health)?;
+        }
+        for (at, call) in rows.iter().enumerate() {
+            let dst = Claim::of("Inkling stream norm output", &call.dst, row);
+            let words = Claim::of("Inkling stream health", &call.health, health);
+            for (other_at, other) in rows.iter().enumerate() {
+                let src = Claim::of("Inkling stream norm source", &other.src, row);
+                let other_dst = Claim::of("Inkling stream norm output", &other.dst, row);
+                require_apart(&dst, &src)?;
+                require_apart(&words, &src)?;
+                require_apart(&words, &other_dst)?;
+                if at != other_at {
+                    require_apart(&dst, &other_dst)?;
+                }
+            }
+        }
         self.ensure_usable()?;
-        let (src, dst, health) = (
-            self.raw_range(&call.src)?,
-            self.raw_range(&call.dst)?,
-            self.raw_range(&call.health)?,
-        );
-        self.launch_on(stream, |raw| {
-            native::norm(raw, src, dst, health, width, eps)
-        })
+        let raw = rows
+            .iter()
+            .map(|call| {
+                Ok(native::NormRowRaw {
+                    src: self.raw_range(&call.src)?,
+                    dst: self.raw_range(&call.dst)?,
+                    health: self.raw_range(&call.health)?,
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        self.launch_on(stream, |s| native::norm_rows(s, &raw, width, eps))
     }
 }
