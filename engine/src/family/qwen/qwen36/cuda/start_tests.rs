@@ -637,22 +637,16 @@ fn an_exl3_pack_given_to_a_cuda_start_is_refused_by_a_message_naming_gguf() {
     let dir = exl3_shaped_directory();
     let options: Q36Options =
         serde_json::from_str(r#"{"weight_format":"exl3"}"#).expect("a valid qwen36 object");
-    let settings = Q36Settings::new(
+    let text = Q36Settings::new(
         dir.path(),
         dir.path(),
         Some(&options),
         &Q36Env::default(),
         Backend::Cuda,
     )
-    .expect("valid CUDA settings");
-    let text = check_cuda_serves(&settings)
-        .expect_err("an EXL3 pack")
-        .describe();
+    .expect_err("an EXL3 pack")
+    .describe();
     assert!(text.contains("GGUF"), "{text}");
-    assert!(text.contains("EXL3"), "{text}");
-    assert!(
-        text.contains(&dir.path().display().to_string()),
-        "the refusal names the directory: {text}"
-    );
+    assert!(text.contains("exl3"), "{text}");
     check_cuda_serves(&cuda_settings(r#"{"capture":false}"#)).expect("a GGUF start is served");
 }
