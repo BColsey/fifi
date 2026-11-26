@@ -1006,7 +1006,7 @@ impl CpuForward {
         let rows = block.rows;
         let h = block.h;
         let consts = &block.visits[index].consts;
-        let scratch_words = routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))? / WORD;
+        let scratch_words = routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))?.div_ceil(WORD);
         let eps = self.math.rms_norm_eps;
         let rank = self.spec.core.gate_rank as usize;
         let input = block.at(l.mlp_input, rows * h)?;
@@ -1461,9 +1461,11 @@ impl PassWorkspace {
         let dynamic_stride = [2 * geometry(0)?.kv * TAPS, 2 * geometry(1)?.kv * TAPS];
         let side_stride = [raw_stride[0] + 1, raw_stride[1] + 1];
         let mut at = 0usize;
+        // Every plane starts on a 64-byte boundary: the projections take 16-byte aligned rows,
+        // and the routed scratch is sized in bytes that need not be a multiple of four.
         let mut alloc = |words: usize| {
             let start = at;
-            at += words;
+            at += words.next_multiple_of(16);
             start
         };
         let layout = Arena {
@@ -1474,7 +1476,7 @@ impl PassWorkspace {
             logits: alloc(rows * experts),
             ids: alloc(rows * top_k),
             route_weights: alloc(rows * top_k),
-            routed_scratch: alloc(routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))? / WORD),
+            routed_scratch: alloc(routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))?.div_ceil(WORD)),
             inputs: alloc(ROLES * rows * h),
             messages: alloc(4 * rows * h),
             gate: alloc(rows * 2 * h),
