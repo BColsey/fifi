@@ -106,6 +106,20 @@ fn resident_pass_parity() {
             raw_v.extend(projected[2].iter().map(|x| x.to_bits()));
             model.attention(&layer, visit, &mut state, projected).unwrap();
         }
+        // The host-only replays below cost minutes at 512 rows; `FIFI_INKLING_PASS_HOST_REPLAY=0`
+        // keeps just the first visit's rows.
+        if std::env::var("FIFI_INKLING_PASS_HOST_REPLAY").as_deref() == Ok("0") {
+            fs::write(
+                out,
+                serde_json::to_vec(&serde_json::json!({
+                    "input": input, "raw_k": raw_k, "raw_v": raw_v, "state": state.parity_rows(),
+                    "h": model.hidden(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            return;
+        }
         // A second model without CUDA replays the first two layers of every prompt row on the
         // host and keeps the stream after each, with the second layer's attention input.
         let host = CpuForward::open(Path::new(&checkpoint), rows).unwrap();
