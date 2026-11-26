@@ -34,6 +34,18 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `ENGINESRV_NOTICE_TOOLWRAP` | on (switch) | Qwen3.6 only, with think replay on: render system messages that follow an assistant turn as tool responses, so that the chat template keeps the reasoning of earlier tool-calling turns. |
 | `ENGINESRV_SHADOW_BLOCK_LCP` | off (switch) | Read-only observation for the request log: report the longest common prefix the saved block checkpoint would have matched. Never changes restore or save behavior. |
 
+## Model stores and the hub
+
+Read by `enginesrv serve` when `--model` is a name, and by the model page of the web console. See [Serve a model without a config file](../how-to/serve-a-model.md).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FIFI_MODELS_DIR` | `~/models` | The models directory, searched first for a model named without a path. |
+| `OLLAMA_MODELS` | `~/.ollama/models` | The Ollama store, searched second. |
+| `FIFI_HF_HUB` | unset | Location of the Hugging Face hub cache. It wins over `HF_HUB_CACHE`, which wins over the `hub` directory of `HF_HOME`. |
+| `FIFI_HF_ENDPOINT` | unset | Hub address, for a mirror. It wins over `HF_ENDPOINT`. |
+| `HF_TOKEN` | unset | Access token for gated or private repositories. `HUGGING_FACE_HUB_TOKEN` is read when it is unset. |
+
 ## Apple Silicon device sizing
 
 | Variable | Default | Meaning |

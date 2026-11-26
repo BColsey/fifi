@@ -165,5 +165,6 @@ Every real model works the same way; only the engine entry and the build change.
 ## Next steps
 
 - Run a real model: [Qwen3.6](how-to/qwen36.md), [Flint](how-to/flint.md) or [Nemotron 3.5 Super](how-to/nemotron.md).
+- Start a model from a path or a name, without a config file: [Serve a model without a config file](how-to/serve-a-model.md).
 - Point an SDK or another tool at the server: [Connect a client](how-to/clients.md).
 - See every config key: [Configuration reference](reference/configuration.md).

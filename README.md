@@ -13,7 +13,10 @@ It provides OpenAI-style and Anthropic-style HTTP APIs, with streaming and tool
 calls.
 
 Read the [getting-started guide](doc/getting-started.md) to build fifi and run
-the server. To connect an application, see [Connect a client](doc/how-to/clients.md).
+the server. With a build in hand, `enginesrv serve --model <path or name>`
+starts a model without a config file; see
+[Serve a model without a config file](doc/how-to/serve-a-model.md). To connect
+an application, see [Connect a client](doc/how-to/clients.md).
 
 ## Models
 
