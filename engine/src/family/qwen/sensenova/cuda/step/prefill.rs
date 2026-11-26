@@ -14,22 +14,9 @@ use std::cell::Cell;
 
 use super::*;
 use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
-use crate::family::step::{ffn, site};
-use crate::kernels::cuda::prefill::attn_prefill::{
-    AttnKvStorage, AttnPrefillCall, AttnPrefillShape, CPF_ATTN_PART_CAP, CPF_ATTN_Q_TILE,
-    CpfAttnGeometry, CpfAttnSpan, CpfAttnSplit, cpf_attn_launch_plan,
-};
-use crate::kernels::cuda::prefill::attn_prep_chunk::{
-    AttnPrepChunkCall, AttnPrepChunkShape, PrepChunkMode,
-};
-use crate::kernels::cuda::prefill::gdn_scan_seq::{
-    GDN_SCAN_EPS, GdnScanSeqCall, ScanShape, ScanWeights,
-};
-use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
-use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
-use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
+use crate::family::step::{attend, delta, ffn, site};
+use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 /// Rows of one chunk. The mmq chunk cap is 4096; at 1024 the attention partials fit three
 /// splits under the 64 MiB part cap, and `row_add` takes a whole chunk's residual add in one
@@ -76,7 +63,6 @@ pub(super) struct Rows {
     pub(super) act: DeviceBuffer,
     pub(super) ffn_out: DeviceBuffer,
     pub(super) q_out: DeviceBuffer,
-    q8x: DeviceBuffer,
     pub(super) q8d: DeviceBuffer,
     pub(super) q8a: DeviceBuffer,
     pub(super) q8f: DeviceBuffer,
@@ -84,24 +70,6 @@ pub(super) struct Rows {
     pub(super) part: DeviceBuffer,
     /// The SM count the attention launch plan fills.
     nsm: usize,
-}
-
-/// Where one dense projection writes: `m` rows into column `col_off` of `ld`-wide `dst` rows.
-struct Out<'b> {
-    m: usize,
-    dst: DeviceRange<'b>,
-    ld: usize,
-    col_off: usize,
-}
-
-/// The `m` f32 rows of `x`, `stride` floats apart, and the buffer that holds their q8_1
-/// columns once quantized.
-#[derive(Clone)]
-struct Columns<'b> {
-    x: DeviceRange<'b>,
-    stride: usize,
-    m: usize,
-    q8: &'b DeviceBuffer,
 }
 
 /// The resident q8_1 bytes of `rows` rows of `k` values.
@@ -150,7 +118,6 @@ pub(super) fn open_rows(
         act: floats(ff)?,
         ffn_out: floats(h)?,
         q_out: floats(q_width)?,
-        q8x: mmq(h)?,
         q8d: mmq(value_width)?,
         q8a: mmq(q_width)?,
         q8f: mmq(ff)?,
@@ -266,12 +233,7 @@ impl LoopStep<'_> {
                 let cur = self.resid_rows(m)?;
                 self.norm_site(cur, None, self.phys[p].attn_norm, m)?;
             }
-            match &self.phys[p].mixer {
-                Mixer::Delta { .. } if m == 1 => self.gdn(il, p)?,
-                Mixer::Attn { .. } if m == 1 => self.attn(il, p)?,
-                Mixer::Delta { .. } => self.gdn_chunk(il, p, m, p0)?,
-                Mixer::Attn { .. } => self.attn_chunk(il, p, m, p0)?,
-            }
+            self.mixer(il, p, m, p0)?;
             self.snap(&mut trace, &self.rows.mix_out)?;
             if mhc {
                 self.routed()
@@ -369,375 +331,123 @@ impl LoopStep<'_> {
         )
     }
 
-    /// The `m` f32 rows of `x` (`x_stride` floats apart) quantized for `weight`'s type.
-    fn quantize<'b>(
-        &self,
-        weight: &NativeWeight,
-        x: DeviceRange<'b>,
-        x_stride: usize,
-        m: usize,
-        q8: &'b DeviceBuffer,
-    ) -> Result<DeviceRange<'b>, EngError> {
-        let y = bytes_range(q8, mmq_q8_1_bytes(weight.k(), m)?)?;
-        self.ctx.mmq_dense_input(
-            &self.stream,
-            MmqDenseInputCall {
-                packing: MmqPacking::CpuReference,
-                weight,
-                m,
-                row_stride: x_stride,
-                x,
-                y,
-            },
-        )?;
-        Ok(y)
-    }
-
-    /// One dense projection of the quantized rows.
-    fn dense(
-        &self,
-        weight: &NativeWeight,
-        q8_1: DeviceRange<'_>,
-        out: Out<'_>,
-    ) -> Result<(), EngError> {
-        self.ctx.mmq_dense(
-            &self.stream,
-            MmqDenseCall {
-                weight,
-                w_seg: None,
-                m: out.m,
-                q8_1,
-                dst: out.dst,
-                ld: out.ld,
-                col_off: out.col_off,
-                fixup: bytes_range(&self.rows.fixup, self.rows.fixup.bytes())?,
-            },
-        )
-    }
-
-    /// `weight`'s dense projection of the columns; returns the type they now carry. A Q4_K or
-    /// Q6_K weight rides the dequantizing GEMM on the f32 columns themselves: no q8_1 step.
-    /// Every other type takes MMQ, the columns quantized into `cols.q8` unless `typed` says
-    /// they already carry `weight`'s type. The q8_1 scale layout follows the weight type and a
-    /// mismatch gives wrong values, not a fault: Loop's file keeps `v` in Q6_K on the
-    /// attention blocks where `q` and `k` are Q4_K, and `ssm_beta_alpha` in Q4_K under a Q6_K
-    /// fused projection.
-    fn dense_typed(
-        &self,
-        weight: &NativeWeight,
-        typed: Option<QuantType>,
-        cols: Columns<'_>,
-        out: Out<'_>,
-    ) -> Result<QuantType, EngError> {
-        let quant = weight.quant();
-        if exact_gemm() && matches!(quant, QuantType::Q4K | QuantType::Q6K) {
-            return self.gemm_dq(weight, cols, out).map(|()| quant);
-        }
-        let q8_1 = if typed == Some(quant) {
-            bytes_range(cols.q8, mmq_q8_1_bytes(weight.k(), cols.m)?)?
-        } else {
-            self.quantize(weight, cols.x, cols.stride, cols.m, cols.q8)?
-        };
-        self.dense(weight, q8_1, out)?;
-        Ok(quant)
-    }
-
-    /// The dequantizing GEMM: the f32 columns go in as they are, and the f32 output rows
-    /// land at `col_off` of the strided destination.
-    fn gemm_dq(
-        &self,
-        weight: &NativeWeight,
-        cols: Columns<'_>,
-        out: Out<'_>,
-    ) -> Result<(), EngError> {
-        let overflow = || EngError::MemoryPlan("the dense projection size overflows".to_owned());
-        let (k, n) = (weight.k(), weight.n_rows());
-        let row_bytes = weight.quant().weight_bytes(1, k).ok_or_else(overflow)?;
-        let w = weight
-            .buffer()
-            .range(0, n.checked_mul(row_bytes).ok_or_else(overflow)?)?;
-        let y_span = (out.m - 1)
-            .checked_mul(out.ld)
-            .and_then(|head| head.checked_add(n))
-            .and_then(|elems| elems.checked_mul(4))
-            .ok_or_else(overflow)?;
-        let y = out
-            .dst
-            .buffer()
-            .range(out.dst.offset() + out.col_off * 4, y_span)?;
-        self.ctx.gemm_dq(
-            &self.stream,
-            weight.quant(),
-            GemmDqTypedCall {
-                w,
-                x: cols.x,
-                y,
+    /// The mixer of visit `il` over `m` rows whose first row sits at `p0`: the delta rule or
+    /// the attention of physical layer `p`, reading the normed rows.
+    fn mixer(&self, il: usize, p: usize, m: usize, p0: usize) -> Result<(), EngError> {
+        let s = &self.shape;
+        let io = self.io(self.exact(m));
+        let rows = &self.rows;
+        let input = StepRows::both(&rows.norm_q8, &rows.norm_out);
+        match &self.phys[p].mixer {
+            Mixer::Delta {
+                qkvz,
+                beta_alpha,
+                out,
+                conv,
+                a,
+                dt_bias,
+                norm,
+            } => {
+                let layer = delta::Delta {
+                    qkvz,
+                    beta_alpha,
+                    out,
+                    conv,
+                    a,
+                    dt_bias,
+                    norm,
+                    key_heads: s.delta_key_heads,
+                    key_dim: s.delta_key_dim,
+                    value_heads: s.delta_value_heads,
+                    value_dim: s.delta_value_dim,
+                    conv_kernel: s.conv_kernel,
+                    conv_dim: s.conv_dim(),
+                };
+                let (ring, record) = (layer.ring_floats(), layer.record_floats());
+                delta::mix(
+                    &io,
+                    &layer,
+                    &delta::DeltaRows {
+                        input,
+                        proj: &rows.proj,
+                        conv_out: &rows.conv_out,
+                        read: StepRows::both(&rows.q8d, &rows.delta_out),
+                        out: &rows.mix_out,
+                    },
+                    delta::DeltaState {
+                        ring: floats(&self.ring, il * ring, ring)?,
+                        record: floats(&self.rec, il * record, record)?,
+                        context: self.cache_rows,
+                    },
+                    m,
+                    p0,
+                )
+            }
+            Mixer::Attn {
+                q,
                 k,
-                rows: n,
-                ncols: out.m,
-                x_col_stride: cols.stride,
-                y_col_stride: out.ld,
-                x_f32: true,
-            },
-        )
-    }
-
-    /// One GDN visit over the chunk: the fused projection, the causal conv, the scan of the
-    /// layer's own recurrent state, the out projection.
-    fn gdn_chunk(&self, il: usize, p: usize, m: usize, p0: usize) -> Result<(), EngError> {
-        let s = &self.shape;
-        let Mixer::Delta {
-            qkvz,
-            beta_alpha,
-            out,
-            conv,
-            a,
-            dt_bias,
-            norm,
-        } = &self.phys[p].mixer
-        else {
-            unreachable!("the delta view of a recurrent layer")
-        };
-        let (kh, kd, vh, vd, ck) = (
-            s.delta_key_heads,
-            s.delta_key_dim,
-            s.delta_value_heads,
-            s.delta_value_dim,
-            s.conv_kernel,
-        );
-        let (h, conv_dim, qkvz_row_len) = (s.hidden, s.conv_dim(), qkvz_row(s));
-        let ld = qkvz_row_len + 2 * vh;
-        // One strided row holds [qkvz | beta_alpha]: the scan reads z, beta and alpha at
-        // their offsets of the same row.
-        let normed = Columns {
-            x: floats(&self.rows.norm_out, 0, m * h)?,
-            stride: h,
-            m,
-            q8: &self.rows.q8x,
-        };
-        let dst = floats(&self.rows.proj, 0, m * ld)?;
-        let typed = self.dense_typed(
-            qkvz,
-            None,
-            normed.clone(),
-            Out {
-                m,
-                dst,
-                ld,
-                col_off: 0,
-            },
-        )?;
-        self.dense_typed(
-            beta_alpha,
-            Some(typed),
-            normed,
-            Out {
-                m,
-                dst,
-                ld,
-                col_off: qkvz_row_len,
-            },
-        )?;
-        let ring_floats = conv_dim * (ck - 1);
-        self.ctx.gdn_conv(
-            &self.stream,
-            ConvCall {
-                shape: ConvShape {
-                    m,
-                    channels: conv_dim,
-                    ld,
-                },
-                proj: floats(&self.rows.proj, 0, m * ld)?,
-                weights: floats(conv, 0, conv_dim * ck)?,
-                state: floats(&self.ring, il * ring_floats, ring_floats)?,
-                out: floats(&self.rows.conv_out, 0, m * conv_dim)?,
-            },
-        )?;
-        let rec_floats = vh * kd * vd;
-        self.ctx.gdn_scan_seq(
-            &self.stream,
-            GdnScanSeqCall {
-                shape: ScanShape {
-                    m,
-                    p0: p0 as i64,
-                    ctx_tokens: self.cache_rows,
-                    n_k_heads: kh,
-                    n_v_heads: vh,
-                    head_dim: vd,
-                    conv_ld: conv_dim,
-                    ld,
-                    z_off: conv_dim,
-                    beta_off: qkvz_row_len,
-                    alpha_off: qkvz_row_len + vh,
-                },
-                eps: GDN_SCAN_EPS,
-                conv: floats(&self.rows.conv_out, 0, m * conv_dim)?,
-                proj: floats(&self.rows.proj, 0, m * ld)?,
-                weights: ScanWeights {
-                    a: floats(a, 0, vh)?,
-                    dt_bias: floats(dt_bias, 0, vh)?,
-                    norm_w: floats(norm, 0, vd)?,
-                },
-                state: floats(&self.rec, il * rec_floats, rec_floats)?,
-                o_out: floats(&self.rows.delta_out, 0, m * vh * vd)?,
-                status: None,
-            },
-        )?;
-        self.dense_typed(
-            out,
-            None,
-            Columns {
-                x: floats(&self.rows.delta_out, 0, m * vh * vd)?,
-                stride: vh * vd,
-                m,
-                q8: &self.rows.q8d,
-            },
-            Out {
-                m,
-                dst: floats(&self.rows.mix_out, 0, m * h)?,
-                ld: h,
-                col_off: 0,
-            },
-        )?;
-        Ok(())
-    }
-
-    /// One full-attention visit over the chunk: the projections, the prep (per-head norms,
-    /// YaRN rope, cache append), the prefill attention with the in-kernel sigmoid gate, the
-    /// o projection.
-    fn attn_chunk(&self, il: usize, p: usize, m: usize, p0: usize) -> Result<(), EngError> {
-        let s = &self.shape;
-        let Mixer::Attn {
-            q,
-            k,
-            v,
-            o,
-            q_norm,
-            k_norm,
-        } = &self.phys[p].mixer
-        else {
-            unreachable!("the attention view of an attention layer")
-        };
-        let (hq, hkv, hd, h) = (s.heads_q, s.heads_kv, s.head_dim, s.hidden);
-        let (q_rows, kv_rows, row_len) = (hq * 2 * hd, hkv * hd, attn_row(s));
-        let normed = Columns {
-            x: floats(&self.rows.norm_out, 0, m * h)?,
-            stride: h,
-            m,
-            q8: &self.rows.q8x,
-        };
-        let dst = floats(&self.rows.proj, 0, m * row_len)?;
-        let mut typed = None;
-        for (weight, col_off) in [(q, 0), (k, q_rows), (v, q_rows + kv_rows)] {
-            typed = Some(self.dense_typed(
-                weight,
-                typed,
-                normed.clone(),
-                Out {
-                    m,
-                    dst,
-                    ld: row_len,
-                    col_off,
-                },
-            )?);
-        }
-        let slot = self
-            .attn_slot
-            .iter()
-            .position(|&visit| visit == il)
-            .ok_or_else(|| {
-                EngError::BadRequest("the visit has no attention cache slot".to_owned())
-            })?;
-        let (k_cache, v_cache) = (&self.k_cache[slot], &self.v_cache[slot]);
-        let (k_cache, v_cache) = (
-            bytes_range(k_cache, k_cache.bytes())?,
-            bytes_range(v_cache, v_cache.bytes())?,
-        );
-        self.ctx.attn_prep_chunk(
-            &self.stream,
-            AttnPrepChunkCall {
-                shape: AttnPrepChunkShape {
-                    m,
-                    n_head: hq,
-                    n_kv_head: hkv,
-                    head_dim: hd,
-                    n_rot: self.rope.dims,
-                    rows: self.cache_rows,
-                    ld: row_len,
-                    p0: p0 as i64,
-                },
-                rope: RopeParams {
+                v,
+                o,
+                q_norm,
+                k_norm,
+            } => {
+                let slot = self
+                    .attn_slot
+                    .iter()
+                    .position(|&visit| visit == il)
+                    .ok_or_else(|| {
+                        EngError::BadRequest("the visit has no attention cache slot".to_owned())
+                    })?;
+                let layer = attend::Attend {
+                    q,
+                    k,
+                    v,
+                    o,
+                    q_norm,
+                    k_norm,
+                    heads: s.heads_q,
+                    kv_heads: s.heads_kv,
+                    head_dim: s.head_dim,
+                    scale: ATTN_SCALE,
                     eps: s.eps,
-                    rope_base: self.rope.freq_base,
-                },
-                proj: floats(&self.rows.proj, 0, m * row_len)?,
-                q_norm: floats(q_norm, 0, hd)?,
-                k_norm: floats(k_norm, 0, hd)?,
-                q: floats(&self.rows.q_out, 0, m * hq * hd)?,
-                mode: PrepChunkMode::AppendFp16 { k_cache, v_cache },
-                status: None,
-                inv_freq: Some(floats(&self.inv_freq, 0, self.rope.dims / 2)?),
-            },
-        )?;
-        let plan = cpf_attn_launch_plan(
-            CpfAttnGeometry {
-                m,
-                n_head: hq,
-                n_kv_head: hkv,
-                head_dim: hd,
-            },
-            p0 + m,
-            0,
-            self.rows.nsm,
-        )?;
-        self.ctx.attn_prefill(
-            &self.stream,
-            AttnPrefillCall {
-                storage: AttnKvStorage::F16,
-                kv_views: None,
-                shape: AttnPrefillShape {
+                    rot_dims: self.rope.dims,
+                    freq_base: self.rope.freq_base,
+                    inv_freq: &self.inv_freq,
+                    row_splits: MAX_SPLITS,
+                };
+                let at = if m == 1 {
+                    attend::At::Row {
+                        pos: self.params_word(OFFSET_POS)?,
+                        kv_len: self.params_word(OFFSET_KV_LEN)?,
+                        status: self.params_word(OFFSET_STATUS)?,
+                    }
+                } else {
+                    attend::At::Chunk {
+                        p0,
+                        sm_count: rows.nsm,
+                    }
+                };
+                attend::mix(
+                    &io,
+                    &layer,
+                    &attend::AttendRows {
+                        input,
+                        proj: &rows.proj,
+                        query: &rows.q_out,
+                        attended: StepRows::both(&rows.q8a, &rows.attn_out),
+                        part: &rows.part,
+                        out: &rows.mix_out,
+                    },
+                    attend::Cache {
+                        k: &self.k_cache[slot],
+                        v: &self.v_cache[slot],
+                        rows: self.cache_rows,
+                    },
                     m,
-                    n_head: hq,
-                    n_kv_head: hkv,
-                    head_dim: hd,
-                    cache_rows: self.cache_rows,
-                    ld: row_len,
-                    p0: p0 as i64,
-                },
-                span: CpfAttnSpan::FULL,
-                split: CpfAttnSplit {
-                    max_splits: plan.max_splits,
-                    min_keys: plan.min_keys,
-                },
-                q_tile: CPF_ATTN_Q_TILE,
-                scale: ATTN_SCALE,
-                q: floats(&self.rows.q_out, 0, m * hq * hd)?,
-                proj: Some(floats(&self.rows.proj, 0, m * row_len)?),
-                sinks: None,
-                k_cache,
-                v_cache,
-                part: bytes_range(&self.rows.part, self.rows.part.bytes())?,
-                out: floats(&self.rows.attn_out, 0, m * hq * hd)?,
-                status: None,
-            },
-        )?;
-        self.dense_typed(
-            o,
-            None,
-            Columns {
-                x: floats(&self.rows.attn_out, 0, m * hq * hd)?,
-                stride: hq * hd,
-                m,
-                q8: &self.rows.q8a,
-            },
-            Out {
-                m,
-                dst: floats(&self.rows.mix_out, 0, m * h)?,
-                ld: h,
-                col_off: 0,
-            },
-        )?;
-        Ok(())
+                    at,
+                )
+            }
+        }
     }
 
     /// The FFN of physical layer `p` over the chunk: the gate and up projections into one

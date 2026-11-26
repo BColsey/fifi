@@ -10,11 +10,16 @@
 //! expert projections of a chunk, and [`site`] the residual sites: the plain add and the routed
 //! two-stream site.
 //!
+//! [`delta`] and [`attend`] are the mixers of a visit: the gated delta rule and the gated full
+//! attention, each over one row or a chunk.
+//!
 //! [`replay`] records a one-row step once and replays it, so a decode step is one call.
 //!
 //! A model supplies its layers (the mixer and the feed-forward of each visit) and its weights by
 //! name.
 
+pub(crate) mod attend;
+pub(crate) mod delta;
 pub(crate) mod experts;
 pub(crate) mod ffn;
 pub(crate) mod replay;

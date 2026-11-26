@@ -867,6 +867,58 @@ fn card_prefill_throughput() {
     );
 }
 
+/// The cost of a chunk of K rows against one row, at decode depth: after a 512-token prompt,
+/// nine chunks of each K, each drained before the next. Reports the median per chunk and per
+/// row. A verify step of K - 1 drafted tokens is such a chunk, so the ratio to one row is what
+/// a drafter has to beat. The head runs on the last row only.
+#[test]
+fn card_reports_the_cost_of_a_k_row_step() {
+    const PROMPT: usize = 512;
+    const ROWS: [usize; 8] = [1, 2, 4, 5, 8, 9, 16, 32];
+    const REPEATS: usize = 9;
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova k-row step cost") else {
+        return;
+    };
+    let vocab = weights.shape().vocab as u32;
+    let ids = |from: usize, count: usize| -> Vec<u32> {
+        (from as u32 + 1..=(from + count) as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab)
+            .collect()
+    };
+    let total: usize = PROMPT + ROWS.iter().map(|k| k * REPEATS).sum::<usize>();
+    let mut card = open_card(&ctx, &loaded, &weights, total);
+    let embed = projector
+        .rows(weights.token_embd(), &ids(0, PROMPT))
+        .unwrap();
+    card.prefill(&embed, 0).unwrap();
+    card.stream().synchronize().unwrap();
+    let mut pos = PROMPT;
+    let mut one_row = 0.0f64;
+    for k in ROWS {
+        let mut ms = Vec::new();
+        for _ in 0..REPEATS {
+            let embed = projector.rows(weights.token_embd(), &ids(pos, k)).unwrap();
+            let t0 = std::time::Instant::now();
+            card.prefill(&embed, pos).unwrap();
+            card.stream().synchronize().unwrap();
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            pos += k;
+        }
+        ms.sort_by(f64::total_cmp);
+        let median = ms[REPEATS / 2];
+        if k == 1 {
+            one_row = median;
+        }
+        eprintln!(
+            "chunk of {k:>2} rows: {median:6.2} ms, {:5.2} ms per row, {:4.2} times one row",
+            median / k as f64,
+            median / one_row
+        );
+    }
+    let row = download_f32(&ctx, card.logits_row()).unwrap();
+    assert!(worst_abs(&row).is_finite(), "the logits row is not finite");
+}
+
 /// The prefill over a long prompt: 1061 pseudo-random tokens walked one by one on one card
 /// and prefilled on the other in chunks of 1, 63, 192, 256, 512 and 37 rows (a full 1024-row
 /// chunk among them), then four greedy steps on both. Reports the row diff at every cut: the
