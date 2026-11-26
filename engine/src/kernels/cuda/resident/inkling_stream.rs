@@ -510,9 +510,12 @@ impl CudaContext {
             self.raw_range(&call.health)?,
         );
         self.launch_on(stream, |raw| {
-            super::super::native::resident::inkling_stream_baseline::add(
-                raw, state, row, health, width,
-            )
+            let add = if self.dense_group_policy().decode_glue {
+                native::add
+            } else {
+                super::super::native::resident::inkling_stream_baseline::add
+            };
+            add(raw, state, row, health, width)
         })
     }
 
