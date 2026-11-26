@@ -87,6 +87,31 @@ fn resident_pass_parity() {
     let mut model = CpuForward::open(Path::new(&checkpoint), tokens.len()).unwrap();
     model.enable_cuda(0).unwrap();
     let value = fingerprint(&mut model, &tokens, rows);
+    if let Some(out) = env::var_os("FIFI_INKLING_PASS_HOST_VISIT0_OUT") {
+        // The host's attention input, raw K/V and prepared rows of the first visit for every
+        // prompt row (`FIFI_INKLING_PASS_DUMP_VISIT=0:path` carries the pass's side).
+        let visit = model.visits[0];
+        let layer = format!("model.llm.layers.{}", visit.weight_layer);
+        let mut state = VisitState::default();
+        let (mut input, mut raw_k, mut raw_v) = (Vec::new(), Vec::new(), Vec::new());
+        for &id in &tokens[..rows] {
+            let stream = model.embed(id).unwrap();
+            let inputs = model.attention_inputs(visit, &layer, &stream, None).unwrap();
+            input.extend(inputs[0].iter().map(|x| x.to_bits()));
+            let projected = model.project_attention(&layer, visit.attention, &inputs).unwrap();
+            raw_k.extend(projected[1].iter().map(|x| x.to_bits()));
+            raw_v.extend(projected[2].iter().map(|x| x.to_bits()));
+            model.attention(&layer, visit, &mut state, projected).unwrap();
+        }
+        fs::write(
+            out,
+            serde_json::to_vec(&serde_json::json!({
+                "input": input, "raw_k": raw_k, "raw_v": raw_v, "state": state.parity_rows(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
     if let Some(out) = output {
         fs::write(out, serde_json::to_vec(&value).unwrap()).unwrap();
         eprintln!("Inkling resident pass reference written ({rows} rows)");
