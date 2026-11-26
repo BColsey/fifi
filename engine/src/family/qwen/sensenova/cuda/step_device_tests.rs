@@ -848,8 +848,15 @@ fn card_prefill_throughput() {
         assert!(worst.is_finite(), "run {run}: the logits row is not finite");
         let rate = TOKENS as f64 / secs;
         best = best.max(rate);
+        // FNV-1a of the row's bytes: a byte-level mark of the chunk path across builds.
+        let mark = row
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
         eprintln!(
-            "prefill run {run}: {TOKENS} tokens in {:.1} ms = {:.0} tok/s (worst |logit| {worst:.1})",
+            "prefill run {run}: {TOKENS} tokens in {:.1} ms = {:.0} tok/s (worst |logit| {worst:.1}, row mark {mark:016x})",
             secs * 1e3,
             rate
         );
