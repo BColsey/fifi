@@ -1267,6 +1267,7 @@ impl Block<'_> {
         let kind = self.visits[index].kind;
         let value = serde_json::json!({
             "current": read(&self.current[self.live.get()], 0, rows * self.h)?,
+            "inputs": read(self.arena, l.inputs, 3 * rows * self.h)?,
             "input": read(self.arena, l.inputs, rows * self.h)?,
             "raw": read(self.arena, l.raw[kind], rows * l.raw_stride[kind])?,
             "side": read(self.arena, l.side[kind], rows * l.side_stride[kind])?,
