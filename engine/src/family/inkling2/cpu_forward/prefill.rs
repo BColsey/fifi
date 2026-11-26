@@ -197,6 +197,10 @@ impl CpuForward {
         // Prefill reads host rows; a chain token left them on the device.
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         self.materialize_resident()?;
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if self.resident_pass(tokens)? {
+            return Ok(());
+        }
         if tokens.len() < 2
             || tokens.len() > self.context.saturating_sub(self.position)
             || tokens
@@ -580,7 +584,7 @@ impl CpuForward {
         Ok((rows, retained))
     }
 
-    fn route_prefill_logits(
+    pub(super) fn route_prefill_logits(
         &self,
         layer: usize,
         logits: &[f32],
