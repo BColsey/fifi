@@ -1,13 +1,12 @@
-//! The prefill of the Loop trunk: the decode walk of the parent module over a chunk of
-//! rows. Every launch is the rows twin of the decode launch over the same weights and the
+//! The walk of the Loop trunk over a chunk of rows, and the mixers of a chunk of several
+//! rows. Every launch of those is the rows twin of the one-row launch over the same weights and the
 //! same shared state (the per-visit GDN states and conv rings, the attention planes, the
 //! YaRN table): the dense projections are the vendored MMQ over the quantized f32 rows, the
 //! GDN visit is `gdn_conv` then the sequential scan (the kernel's own test equates a chunk
 //! of it to that many decode steps), the attention visit is `attn_prep_chunk` then the
 //! production prefill attention, and the mHC kernels take the row count.
 //!
-//! The scratch is the decode scratch sized for [`PREFILL_ROWS`] rows, allocated with the
-//! step. A prompt walks every chunk through all the visits in order, so each chunk leaves
+//! The scratch holds [`PREFILL_ROWS`] rows, allocated with the step. A prompt walks every chunk through all the visits in order, so each chunk leaves
 //! the shared state where the same tokens decoded one by one would; the head runs on the
 //! last row.
 
@@ -50,37 +49,37 @@ fn exact_gemm() -> bool {
 /// The prefill scratch: every decode row buffer at [`PREFILL_ROWS`] rows, the MMQ q8_1
 /// columns of the four projection widths, and the attention partials at the part cap.
 pub(super) struct Rows {
-    resid: [DeviceBuffer; 2],
-    cur_ix: usize,
+    pub(super) resid: [DeviceBuffer; 2],
+    pub(super) cur_ix: usize,
     /// The two mHC streams of every row, adjacent as `[a || b]`.
-    streams: DeviceBuffer,
+    pub(super) streams: DeviceBuffer,
     /// The routed input rows of the current mHC visit.
-    routed: DeviceBuffer,
-    router_normed: DeviceBuffer,
-    router_q8: DeviceBuffer,
-    router_logits: DeviceBuffer,
-    route_cell: DeviceBuffer,
-    norm_out: DeviceBuffer,
-    norm_q8: DeviceBuffer,
+    pub(super) routed: DeviceBuffer,
+    pub(super) router_normed: DeviceBuffer,
+    pub(super) router_q8: DeviceBuffer,
+    pub(super) router_logits: DeviceBuffer,
+    pub(super) route_cell: DeviceBuffer,
+    pub(super) norm_out: DeviceBuffer,
+    pub(super) norm_q8: DeviceBuffer,
     /// The mixer output rows: the GDN out projection or the attention o projection.
-    mix_out: DeviceBuffer,
+    pub(super) mix_out: DeviceBuffer,
     /// The attention context rows of the chunk, before the o projection.
     attn_out: DeviceBuffer,
-    proj: DeviceBuffer,
-    conv_out: DeviceBuffer,
-    delta_out: DeviceBuffer,
-    gu: DeviceBuffer,
+    pub(super) proj: DeviceBuffer,
+    pub(super) conv_out: DeviceBuffer,
+    pub(super) delta_out: DeviceBuffer,
+    pub(super) gu: DeviceBuffer,
     /// The activation rows; the decode FFN borrows the first row (the column-split SwiGLU
     /// writes it, the vendored quantize reads it).
     pub(super) act: DeviceBuffer,
-    ffn_out: DeviceBuffer,
-    q_out: DeviceBuffer,
+    pub(super) ffn_out: DeviceBuffer,
+    pub(super) q_out: DeviceBuffer,
     q8x: DeviceBuffer,
-    q8d: DeviceBuffer,
-    q8a: DeviceBuffer,
-    q8f: DeviceBuffer,
+    pub(super) q8d: DeviceBuffer,
+    pub(super) q8a: DeviceBuffer,
+    pub(super) q8f: DeviceBuffer,
     fixup: DeviceBuffer,
-    part: DeviceBuffer,
+    pub(super) part: DeviceBuffer,
     /// The SM count the attention launch plan fills.
     nsm: usize,
 }
@@ -174,65 +173,100 @@ impl LoopStep<'_> {
         for (chunk, rows) in embed_rows.chunks(PREFILL_ROWS * h).enumerate() {
             m = rows.len() / h;
             ensure_rows(p0 + chunk * PREFILL_ROWS, m, self.cache_rows)?;
-            self.walk(&le_f32(rows), m, p0 + chunk * PREFILL_ROWS)?;
+            self.walk(&le_f32(rows), m, p0 + chunk * PREFILL_ROWS, None)?;
         }
-        // The output norm and the head, on the last row.
-        let last = floats(&self.rows.resid[self.rows.cur_ix], (m - 1) * h, h)?;
-        self.norm_site(last, None, self.output_norm, 1, false)?;
-        self.ctx.matvec_native(
-            &self.stream,
-            self.head,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.logits, 0, self.shape.vocab)?,
-            1,
-        )
+        self.head(m - 1, false)
     }
 
-    /// One chunk: `m` rows whose first token sits at `p0`, through every visit in order.
-    fn walk(&mut self, embed: &[u8], m: usize, p0: usize) -> Result<(), EngError> {
+    /// The output norm of residual row `row` and the head, into the logits row.
+    pub(super) fn head(&self, row: usize, exact: bool) -> Result<(), EngError> {
+        let h = self.shape.hidden;
+        let last = floats(&self.rows.resid[self.rows.cur_ix], row * h, h)?;
+        self.norm_site(last, None, self.output_norm, 1)?;
+        let x = StepRows::both(&self.rows.norm_q8, &self.rows.norm_out);
+        self.io(exact).project(self.head, x, &self.logits, 1)
+    }
+
+    /// Row 0 of `buffer` joins the trace, once the stream drained.
+    fn snap(
+        &self,
+        trace: &mut Option<&mut Vec<Vec<f32>>>,
+        buffer: &DeviceBuffer,
+    ) -> Result<(), EngError> {
+        let Some(trace) = trace.as_deref_mut() else {
+            return Ok(());
+        };
+        self.stream.synchronize()?;
+        let mut bytes = vec![0u8; self.shape.hidden * F32];
+        self.ctx.download(buffer, &mut bytes)?;
+        let row = bytes.as_chunks::<4>().0.iter();
+        trace.push(row.map(|c| f32::from_le_bytes(*c)).collect());
+        Ok(())
+    }
+
+    /// One chunk: `m` rows whose first token sits at `p0`, through every visit in order. One
+    /// row is a decode step: its mixers are the one-row kernels, which read the position from
+    /// the step parameters. `trace` takes row 0 of every visit's mixer output and residual.
+    pub(super) fn walk(
+        &mut self,
+        embed: &[u8],
+        m: usize,
+        p0: usize,
+        mut trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<(), EngError> {
         let h = self.shape.hidden;
         self.rows.cur_ix = 0;
         // Behind the last chunk's kernels: a blocking copy would land at once, and the
         // chunk before would write its final residual over it.
         self.rows.resid[0].write_at_enqueue(&self.stream, 0, embed)?;
+        if m == 1 {
+            let params = StepParams::new(0, p0 as i32)?;
+            self.params
+                .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
+            self.ctx
+                .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
+        }
         for il in 0..TRUNK_LAYERS {
             let p = self.plan.physical(il);
             let mhc = self.plan.mhc_active(il);
             if mhc && p == self.plan.mhc_start {
-                self.routed(true)
+                self.routed()
                     .fork(&self.io(false), &self.rows.resid[self.rows.cur_ix], m)?;
             }
             if mhc {
-                self.route(p, "hc_attn_fn", m, true)?;
+                self.route(p, "hc_attn_fn", m)?;
                 // The branch consumes the routed input, normed with this layer's attn_norm.
                 let routed = floats(&self.rows.routed, 0, m * h)?;
-                self.norm_site(routed, None, self.phys[p].attn_norm, m, true)?;
+                self.norm_site(routed, None, self.phys[p].attn_norm, m)?;
             } else {
                 let cur = self.resid_rows(m)?;
-                self.norm_site(cur, None, self.phys[p].attn_norm, m, true)?;
+                self.norm_site(cur, None, self.phys[p].attn_norm, m)?;
             }
             match &self.phys[p].mixer {
+                Mixer::Delta { .. } if m == 1 => self.gdn(il, p)?,
+                Mixer::Attn { .. } if m == 1 => self.attn(il, p)?,
                 Mixer::Delta { .. } => self.gdn_chunk(il, p, m, p0)?,
                 Mixer::Attn { .. } => self.attn_chunk(il, p, m, p0)?,
             }
+            self.snap(&mut trace, &self.rows.mix_out)?;
             if mhc {
-                self.routed(true)
+                self.routed()
                     .merge(&self.io(false), &self.rows.mix_out, m)?;
-                self.route(p, "hc_ffn_fn", m, true)?;
+                self.route(p, "hc_ffn_fn", m)?;
                 // The ffn norm reads the routed input the second router wrote.
                 let routed = floats(&self.rows.routed, 0, m * h)?;
-                self.norm_site(routed, None, self.phys[p].post_norm, m, true)?;
-                self.ffn_chunk(p, m)?;
-                self.routed(true)
+                self.norm_site(routed, None, self.phys[p].post_norm, m)?;
+                self.ffn(p, m)?;
+                self.routed()
                     .merge(&self.io(false), &self.rows.ffn_out, m)?;
-                self.routed(true)
+                self.routed()
                     .mean(&self.io(false), self.resid_rows(m)?, m)?;
             } else {
                 // Fused residual add and post norm: the branch lands in the residual.
                 let cur = self.resid_rows(m)?;
                 let branch = Some(floats(&self.rows.mix_out, 0, m * h)?);
-                self.norm_site(cur, branch, self.phys[p].post_norm, m, true)?;
-                self.ffn_chunk(p, m)?;
+                self.norm_site(cur, branch, self.phys[p].post_norm, m)?;
+                self.ffn(p, m)?;
                 // The add writes a distinct out: rotate the residual pair.
                 let next = self.rows.cur_ix ^ 1;
                 let out = floats(&self.rows.resid[next], 0, m * h)?;
@@ -245,6 +279,7 @@ impl LoopStep<'_> {
                 )?;
                 self.rows.cur_ix = next;
             }
+            self.snap(&mut trace, &self.rows.resid[self.rows.cur_ix])?;
         }
         Ok(())
     }
@@ -254,29 +289,9 @@ impl LoopStep<'_> {
         floats(&self.rows.resid[self.rows.cur_ix], 0, m * self.shape.hidden)
     }
 
-    /// The routed site over the prefill rows (`chunk`) or over the decode row, whose branch
-    /// input takes the first half of the router's normed row.
-    pub(super) fn routed(&self, chunk: bool) -> site::Routed<'_> {
+    /// The routed site over the chunk's rows.
+    pub(super) fn routed(&self) -> site::Routed<'_> {
         let rows = &self.rows;
-        let (streams, normed, normed_q8, logits, input, cell) = if chunk {
-            (
-                &rows.streams,
-                &rows.router_normed,
-                &rows.router_q8,
-                &rows.router_logits,
-                &rows.routed,
-                &rows.route_cell,
-            )
-        } else {
-            (
-                &self.streams,
-                &self.router_normed,
-                &self.router_q8,
-                &self.router_logits,
-                &self.router_normed,
-                &self.route_cell,
-            )
-        };
         site::Routed {
             hidden: self.shape.hidden,
             eps: self.shape.eps,
@@ -284,45 +299,33 @@ impl LoopStep<'_> {
             iterations: self.plan.mhc_iterations,
             fixed_identity: self.plan.mhc_fixed_identity,
             ones: &self.ones_router,
-            streams,
-            normed,
-            normed_q8,
-            logits,
-            input,
-            cell,
+            streams: &rows.streams,
+            normed: &rows.router_normed,
+            normed_q8: &rows.router_q8,
+            logits: &rows.router_logits,
+            input: &rows.routed,
+            cell: &rows.route_cell,
         }
     }
 
     /// One router pass of physical layer `p` over `m` rows; `part` names the router.
-    pub(super) fn route(
-        &self,
-        p: usize,
-        part: &str,
-        m: usize,
-        chunk: bool,
-    ) -> Result<(), EngError> {
+    pub(super) fn route(&self, p: usize, part: &str, m: usize) -> Result<(), EngError> {
         let stem = format!("blk.{}", self.plan.block(p));
         let weight = side(self.weights, &format!("{stem}.{part}.weight"))?;
         let bias = side(self.weights, &format!("{stem}.{part}.bias"))?;
-        self.routed(chunk).route(&self.io(false), weight, bias, m)
+        self.routed().route(&self.io(false), weight, bias, m)
     }
 
-    /// The fused add (optional), RMS norm and q8 quantize of `m` rows into the norm rows of
-    /// the prefill scratch (`chunk`) or of the decode row.
+    /// The fused add (optional), RMS norm and q8 quantize of `m` rows into the norm rows.
     pub(super) fn norm_site(
         &self,
         x: DeviceRange<'_>,
         delta: Option<DeviceRange<'_>>,
         weight: &DeviceBuffer,
         m: usize,
-        chunk: bool,
     ) -> Result<(), EngError> {
         let h = self.shape.hidden;
-        let (out, q8) = if chunk {
-            (&self.rows.norm_out, &self.rows.norm_q8)
-        } else {
-            (&self.norm_out, &self.norm_q8)
-        };
+        let (out, q8) = (&self.rows.norm_out, &self.rows.norm_q8);
         let norm = Norm {
             d: h,
             eps: self.shape.eps,
@@ -711,12 +714,12 @@ impl LoopStep<'_> {
 
     /// The FFN of physical layer `p` over the chunk: the gate and up projections into one
     /// strided row, the SwiGLU, the down projection.
-    fn ffn_chunk(&self, p: usize, m: usize) -> Result<(), EngError> {
+    fn ffn(&self, p: usize, m: usize) -> Result<(), EngError> {
         let phys = &self.phys[p];
         let ff = self.shape.feed_forward;
         let gu = floats(&self.rows.gu, 0, m * 2 * ff)?;
         ffn::gated(
-            &self.io(exact_gemm()),
+            &self.io(self.exact(m)),
             phys.ffn(),
             ffn::Join::Swiglu,
             StepRows::both(&self.rows.norm_q8, &self.rows.norm_out),
@@ -738,6 +741,12 @@ impl LoopStep<'_> {
             },
             &self.rows.ffn_out,
         )
+    }
+
+    /// Whether the projections of an `m`-row chunk take the decoding routes: each row count
+    /// has its own switch.
+    fn exact(&self, m: usize) -> bool {
+        if m == 1 { self.dq } else { exact_gemm() }
     }
 
     /// What the shared projections of this step need. `exact` puts them on the decoding

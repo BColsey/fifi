@@ -2116,11 +2116,11 @@ fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
     );
 }
 
-/// Decode as a chunk of one row against the one-row decode walk: after the same 512-token
-/// prompt on two cards, 64 greedy steps on each. Reports the time of a step on both routes and
-/// the worst logits difference. With `SENSENOVA_ROWS_OUT` set, writes the logits rows of both
-/// routes to `<that path>.walk` and `<that path>.chunk` as little-endian f32, for a byte
-/// comparison between two builds.
+/// A decode step is a chunk of one row: after the same 512-token prompt on two cards, 64 greedy
+/// steps through `decode` on one and through a one-row `prefill` on the other give the same
+/// logits bits. Reports the time of a step on both entries. With `SENSENOVA_ROWS_OUT` set,
+/// writes the logits rows of both to `<that path>.walk` and `<that path>.chunk` as
+/// little-endian f32, for a byte comparison between two builds.
 #[test]
 fn card_chunk_of_one_against_the_decode_walk() {
     const PROMPT_TOKENS: usize = 512;
@@ -2171,7 +2171,11 @@ fn card_chunk_of_one_against_the_decode_walk() {
         STEPS as f64 / chunk_s,
     );
     if let Ok(out) = std::env::var("SENSENOVA_ROWS_OUT") {
-        std::fs::write(format!("{out}.walk"), walk_rows).unwrap();
-        std::fs::write(format!("{out}.chunk"), chunk_rows).unwrap();
+        std::fs::write(format!("{out}.walk"), &walk_rows).unwrap();
+        std::fs::write(format!("{out}.chunk"), &chunk_rows).unwrap();
     }
+    assert!(
+        walk_rows == chunk_rows,
+        "a one-row chunk and a decode step differ: worst |diff| {worst}"
+    );
 }

@@ -1,6 +1,6 @@
-//! The trunk decode executor of SenseNova-Loop on the device: one token through the 56
-//! visits, every launch an existing resident kernel plus the two Loop kernel sets
-//! (`attn_decode_loop`, `mhc_route`).
+//! The trunk executor of SenseNova-Loop on the device: a chunk of token rows through the 56
+//! visits. The walk and the chunk mixers are in [`prefill`]; this module holds the step, its
+//! state and the one-row mixers a decode step (a chunk of one row) takes.
 //!
 //! The trunk is the CPU reference's (`super::super::step::token`), visit for visit: mHC
 //! visits keep both streams, route twice (attn, ffn) through the router table, and end with
@@ -15,7 +15,8 @@
 //! the host) and handed to [`LoopStep::decode`] with the position; the logits row stays on
 //! the device.
 //!
-//! Every buffer is allocated once in [`LoopStep::open`]; a step enqueues its launch list and
+//! Every buffer is allocated once in [`LoopStep::open`], and a decode step works in the first
+//! row of the chunk's scratch; a step enqueues its launch list and
 //! returns without synchronizing (the caller drains via [`LoopStep::stream`]), so the same
 //! list is what a later capture slice replays.
 
@@ -23,8 +24,7 @@ use std::{iter::once, rc::Rc};
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
-use crate::family::step::rows::{Out as StepOut, Rows as StepRows};
-use crate::family::step::{ffn, site};
+use crate::family::step::ffn;
 use crate::kernels::cuda::resident::attn_decode::AttnSplit;
 use crate::kernels::cuda::resident::attn_decode_loop::{
     AttnDecodeLoopCall, AttnLoopShape, attn_loop_part_bytes,
@@ -137,29 +137,11 @@ pub(crate) struct LoopStep<'a> {
     v_cache: Vec<DeviceBuffer>,
     // scratch rows
     params: DeviceBuffer,
-    resid: [DeviceBuffer; 2],
-    cur_ix: usize,
-    streams: DeviceBuffer,
-    router_normed: DeviceBuffer,
-    router_q8: DeviceBuffer,
-    router_logits: DeviceBuffer,
-    route_cell: DeviceBuffer,
-    norm_out: DeviceBuffer,
-    norm_q8: DeviceBuffer,
-    branch: DeviceBuffer,
-    out_q8: DeviceBuffer,
-    proj: DeviceBuffer,
-    conv_out: DeviceBuffer,
-    delta_out: DeviceBuffer,
-    gu: DeviceBuffer,
-    gu_q8: DeviceBuffer,
-    ffn_out: DeviceBuffer,
-    q_out: DeviceBuffer,
-    part: DeviceBuffer,
     logits: DeviceBuffer,
     ones_router: DeviceBuffer,
     inv_freq: DeviceBuffer,
-    /// The prefill scratch, sized for `PREFILL_ROWS` rows.
+    /// The scratch rows of a chunk, sized for `PREFILL_ROWS` rows; a decode step works in
+    /// the first row of each.
     rows: prefill::Rows,
 }
 
@@ -232,7 +214,6 @@ impl<'a> LoopStep<'a> {
         let visits = TRUNK_LAYERS;
         let rec_floats = shape.delta_value_heads * shape.delta_key_dim * shape.delta_value_dim;
         let ring_floats = shape.conv_dim() * (shape.conv_kernel - 1);
-        let proj_floats = qkvz_row(shape) + 2 * shape.delta_value_heads.max(attn_row(shape));
         let cache_bytes = cache_rows * shape.heads_kv * shape.head_dim * 2;
         let attn_slot: Vec<usize> = (0..visits)
             .filter(|&il| !plan.recurrent[plan.block(plan.physical(il))])
@@ -288,28 +269,6 @@ impl<'a> LoopStep<'a> {
                 .map(|_| ctx.upload(&vec![0u8; cache_bytes]))
                 .collect::<Result<Vec<_>, _>>()?,
             params: ctx.upload(&[0u8; STEP_PARAMS_BYTES])?,
-            resid: [ctx.upload(&zeros(h))?, ctx.upload(&zeros(h))?],
-            cur_ix: 0,
-            streams: ctx.upload(&zeros(2 * h))?,
-            router_normed: ctx.upload(&zeros(2 * h))?,
-            router_q8: ctx.upload(&vec![0u8; q8_row(2 * h)?])?,
-            router_logits: ctx.upload(&zeros(8))?,
-            route_cell: ctx.upload(&zeros(6))?,
-            norm_out: ctx.upload(&zeros(h))?,
-            norm_q8: ctx.upload(&vec![0u8; q8_row(h)?])?,
-            branch: ctx.upload(&zeros(h))?,
-            out_q8: ctx.upload(&vec![0u8; q8_row(h)?])?,
-            proj: ctx.upload(&zeros(proj_floats))?,
-            conv_out: ctx.upload(&zeros(shape.conv_dim()))?,
-            delta_out: ctx.upload(&zeros(
-                (shape.delta_value_heads * shape.delta_value_dim)
-                    .max(shape.heads_q * shape.head_dim),
-            ))?,
-            gu: ctx.upload(&zeros(2 * shape.feed_forward))?,
-            gu_q8: ctx.upload(&vec![0u8; q8_row(shape.feed_forward)?])?,
-            ffn_out: ctx.upload(&zeros(h))?,
-            q_out: ctx.upload(&zeros(shape.heads_q * shape.head_dim))?,
-            part: ctx.upload(&vec![0u8; attn_loop_part_bytes(1, GROUP, MAX_SPLITS)?])?,
             logits: ctx.upload(&zeros(shape.vocab))?,
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
@@ -372,7 +331,7 @@ impl<'a> LoopStep<'a> {
         &mut self,
         embed_row: &[f32],
         pos: usize,
-        mut trace: Option<&mut Vec<Vec<f32>>>,
+        trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<(), EngError> {
         let h = self.shape.hidden;
         if embed_row.len() != h {
@@ -381,109 +340,8 @@ impl<'a> LoopStep<'a> {
             ));
         }
         ensure_rows(pos, 1, self.cache_rows)?;
-        let cur = self.cur_ix;
-        // Behind the last step's kernels, which still read both.
-        self.resid[cur].write_at_enqueue(&self.stream, 0, &le_f32(embed_row))?;
-        let params = StepParams::new(0, pos as i32)?;
-        self.params
-            .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
-        self.ctx
-            .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
-
-        for il in 0..TRUNK_LAYERS {
-            let p = self.plan.physical(il);
-            let mhc = self.plan.mhc_active(il);
-            if mhc && p == self.plan.mhc_start {
-                self.routed(false)
-                    .fork(&self.io(self.dq), &self.resid[self.cur_ix], 1)?;
-            }
-            if mhc {
-                self.route(p, "hc_attn_fn", 1, false)?;
-                // The branch consumes the routed input the router just wrote, normed
-                // with this layer's attn_norm (the CPU's rms_plain(r.input, attn_norm)).
-                let routed = floats(&self.router_normed, 0, h)?;
-                self.norm_site(routed, None, self.phys[p].attn_norm, 1, false)?;
-            } else {
-                self.norm_site(self.resid_range()?, None, self.phys[p].attn_norm, 1, false)?;
-            }
-            self.branch(il)?;
-            if let Some(trace) = trace.as_deref_mut() {
-                self.stream.synchronize()?;
-                let h = self.shape.hidden;
-                let mut bytes = vec![0u8; self.branch.bytes()];
-                self.ctx.download(&self.branch, &mut bytes)?;
-                trace.push(
-                    bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .take(h)
-                        .map(|c| f32::from_le_bytes(*c))
-                        .collect(),
-                );
-            }
-            if mhc {
-                self.routed(false)
-                    .merge(&self.io(self.dq), &self.branch, 1)?;
-                self.route(p, "hc_ffn_fn", 1, false)?;
-                // The ffn norm reads the routed input the second router wrote.
-                let routed = floats(&self.router_normed, 0, h)?;
-                self.norm_site(routed, None, self.phys[p].post_norm, 1, false)?;
-                self.ffn(p)?;
-                self.routed(false)
-                    .merge(&self.io(self.dq), &self.ffn_out, 1)?;
-                self.routed(false)
-                    .mean(&self.io(self.dq), self.resid_range()?, 1)?;
-            } else {
-                // Fused residual add and post norm: the branch lands in the residual.
-                let branch = Some(floats(&self.branch, 0, h)?);
-                self.norm_site(
-                    self.resid_range()?,
-                    branch,
-                    self.phys[p].post_norm,
-                    1,
-                    false,
-                )?;
-                self.ffn(p)?;
-                // The add writes a distinct out: rotate the residual pair. The read
-                // plane is the CURRENT residual, not the step's starting plane.
-                let next = self.cur_ix ^ 1;
-                site::add(
-                    &self.io(self.dq),
-                    floats(&self.resid[next], 0, h)?,
-                    self.resid_range()?,
-                    floats(&self.ffn_out, 0, h)?,
-                    h,
-                )?;
-                self.cur_ix = next;
-            }
-            if let Some(trace) = trace.as_deref_mut() {
-                self.stream.synchronize()?;
-                let h = self.shape.hidden;
-                let mut bytes = vec![0u8; self.resid[self.cur_ix].bytes()];
-                self.ctx.download(&self.resid[self.cur_ix], &mut bytes)?;
-                trace.push(
-                    bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .take(h)
-                        .map(|c| f32::from_le_bytes(*c))
-                        .collect(),
-                );
-            }
-        }
-
-        // The output norm and the head.
-        let h = self.shape.hidden;
-        self.norm_site(self.resid_range()?, None, self.output_norm, 1, false)?;
-        self.project(
-            self.head,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.logits, 0, self.shape.vocab)?,
-        )?;
-        Ok(())
+        self.walk(&le_f32(embed_row), 1, pos, trace)?;
+        self.head(0, self.dq)
     }
 
     /// The logits row (device floats); valid after the stream drained.
@@ -505,7 +363,7 @@ impl<'a> LoopStep<'a> {
         for buffer in carried {
             buffer.zero_at(&self.stream, 0, buffer.bytes())?;
         }
-        self.cur_ix = 0;
+        self.rows.cur_ix = 0;
         Ok(())
     }
 
@@ -673,7 +531,7 @@ impl<'a> LoopStep<'a> {
         }
         out.push((
             Carried::Hidden,
-            &self.resid[self.cur_ix],
+            &self.rows.resid[self.rows.cur_ix],
             0,
             shape.hidden * 4,
         ));
@@ -683,10 +541,6 @@ impl<'a> LoopStep<'a> {
     /// The step's stream: a read enqueued on it lands behind the step's kernels.
     pub(crate) fn stream(&self) -> &DeviceStream {
         &self.stream
-    }
-
-    fn resid_range(&self) -> Result<DeviceRange<'_>, EngError> {
-        floats(&self.resid[self.cur_ix], 0, self.shape.hidden)
     }
 
     /// One projection of one row: through the matvec over the row's q8_1 bytes, or on the dq
@@ -704,17 +558,8 @@ impl<'a> LoopStep<'a> {
         self.ctx.matvec_native(&self.stream, weight, x_q8, y, 1)
     }
 
-    /// The mixer of visit `il` into `branch`.
-    fn branch(&mut self, il: usize) -> Result<(), EngError> {
-        let p = self.plan.physical(il);
-        match &self.phys[p].mixer {
-            Mixer::Delta { .. } => self.gdn(il, p),
-            Mixer::Attn { .. } => self.attn(il, p),
-        }
-    }
-
     /// One GDN visit: the fused projection, the causal conv, the delta core, the out matvec.
-    fn gdn(&mut self, il: usize, p: usize) -> Result<(), EngError> {
+    fn gdn(&self, il: usize, p: usize) -> Result<(), EngError> {
         let s = &self.shape;
         let (kh, kd, vh, vd, ck) = (
             s.delta_key_heads,
@@ -743,15 +588,15 @@ impl<'a> LoopStep<'a> {
         // alpha at their offsets of the same row.
         self.project(
             qkvz,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.proj, 0, qkvz_row_len)?,
+            bytes_range(&self.rows.norm_q8, q8_row(h)?)?,
+            floats(&self.rows.norm_out, 0, h)?,
+            floats(&self.rows.proj, 0, qkvz_row_len)?,
         )?;
         self.project(
             beta_alpha,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.proj, qkvz_row_len, ba_len)?,
+            bytes_range(&self.rows.norm_q8, q8_row(h)?)?,
+            floats(&self.rows.norm_out, 0, h)?,
+            floats(&self.rows.proj, qkvz_row_len, ba_len)?,
         )?;
         let ring_floats = conv_dim * (ck - 1);
         let ring_at = il * ring_floats;
@@ -763,10 +608,10 @@ impl<'a> LoopStep<'a> {
                     channels: conv_dim,
                     ld: qkvz_row_len + ba_len,
                 },
-                proj: floats(&self.proj, 0, conv_dim)?,
+                proj: floats(&self.rows.proj, 0, conv_dim)?,
                 weights: floats(conv, 0, conv_dim * ck)?,
                 state: floats(&self.ring, ring_at, ring_floats)?,
-                out: floats(&self.conv_out, 0, conv_dim)?,
+                out: floats(&self.rows.conv_out, 0, conv_dim)?,
             },
         )?;
         let rec_floats = vh * kd * vd;
@@ -785,15 +630,15 @@ impl<'a> LoopStep<'a> {
                     alpha_off: qkvz_row_len + vh,
                 },
                 eps,
-                conv: floats(&self.conv_out, 0, conv_dim)?,
-                proj: floats(&self.proj, 0, qkvz_row_len + ba_len)?,
+                conv: floats(&self.rows.conv_out, 0, conv_dim)?,
+                proj: floats(&self.rows.proj, 0, qkvz_row_len + ba_len)?,
                 weights: DeltaWeights {
                     a: floats(a, 0, vh)?,
                     dt_bias: floats(dt_bias, 0, vh)?,
                     norm_w: floats(norm, 0, vd)?,
                 },
                 state: floats(&self.rec, il * rec_floats, rec_floats)?,
-                out: floats(&self.delta_out, 0, vh * vd)?,
+                out: floats(&self.rows.delta_out, 0, vh * vd)?,
             },
         )?;
         let delta_floats = vh * vd;
@@ -801,8 +646,8 @@ impl<'a> LoopStep<'a> {
             self.ctx.quantize_q8_1(
                 &self.stream,
                 crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
-                    x: floats(&self.delta_out, 0, delta_floats)?,
-                    y: bytes_range(&self.out_q8, q8_row(delta_floats)?)?,
+                    x: floats(&self.rows.delta_out, 0, delta_floats)?,
+                    y: bytes_range(&self.rows.q8d, q8_row(delta_floats)?)?,
                     k: delta_floats,
                     ncols: 1,
                 },
@@ -810,15 +655,15 @@ impl<'a> LoopStep<'a> {
         }
         self.project(
             out,
-            bytes_range(&self.out_q8, q8_row(delta_floats)?)?,
-            floats(&self.delta_out, 0, delta_floats)?,
-            floats(&self.branch, 0, h)?,
+            bytes_range(&self.rows.q8d, q8_row(delta_floats)?)?,
+            floats(&self.rows.delta_out, 0, delta_floats)?,
+            floats(&self.rows.mix_out, 0, h)?,
         )
     }
 
     /// One full-attention visit: the projections, the prep (norms, YaRN rope, cache
     /// append), the gated decode attention, the output matvec.
-    fn attn(&mut self, il: usize, p: usize) -> Result<(), EngError> {
+    fn attn(&self, il: usize, p: usize) -> Result<(), EngError> {
         let s = &self.shape;
         let Mixer::Attn {
             q,
@@ -837,21 +682,21 @@ impl<'a> LoopStep<'a> {
         let row_len = attn_row(s);
         self.project(
             q,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.proj, 0, q_rows)?,
+            bytes_range(&self.rows.norm_q8, q8_row(h)?)?,
+            floats(&self.rows.norm_out, 0, h)?,
+            floats(&self.rows.proj, 0, q_rows)?,
         )?;
         self.project(
             k,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.proj, q_rows, kv_rows)?,
+            bytes_range(&self.rows.norm_q8, q8_row(h)?)?,
+            floats(&self.rows.norm_out, 0, h)?,
+            floats(&self.rows.proj, q_rows, kv_rows)?,
         )?;
         self.project(
             v,
-            bytes_range(&self.norm_q8, q8_row(h)?)?,
-            floats(&self.norm_out, 0, h)?,
-            floats(&self.proj, q_rows + kv_rows, kv_rows)?,
+            bytes_range(&self.rows.norm_q8, q8_row(h)?)?,
+            floats(&self.rows.norm_out, 0, h)?,
+            floats(&self.rows.proj, q_rows + kv_rows, kv_rows)?,
         )?;
         let slot = self
             .attn_slot
@@ -880,12 +725,12 @@ impl<'a> LoopStep<'a> {
                     rope_base: self.rope.freq_base,
                 },
                 admit_pos: 0,
-                proj: floats(&self.proj, 0, row_len)?,
+                proj: floats(&self.rows.proj, 0, row_len)?,
                 q_norm: floats(q_norm, 0, hd)?,
                 k_norm: floats(k_norm, 0, hd)?,
                 k_cache: bytes_range(k_cache, k_cache.bytes())?,
                 v_cache: bytes_range(v_cache, v_cache.bytes())?,
-                q: floats(&self.q_out, 0, hq * hd)?,
+                q: floats(&self.rows.q_out, 0, hq * hd)?,
                 pos: self.params_word(OFFSET_POS)?,
                 status: self.params_word(OFFSET_STATUS)?,
                 inv_freq: Some(floats(&self.inv_freq, 0, self.rope.dims / 2)?),
@@ -903,19 +748,19 @@ impl<'a> LoopStep<'a> {
                 },
                 split: AttnSplit::STAGE1,
                 scale: ATTN_SCALE,
-                q: floats(&self.q_out, 0, hq * hd)?,
-                proj: Some(floats(&self.proj, 0, row_len)?),
+                q: floats(&self.rows.q_out, 0, hq * hd)?,
+                proj: Some(floats(&self.rows.proj, 0, row_len)?),
                 k_cache: bytes_range(k_cache, k_cache.bytes())?,
                 v_cache: bytes_range(v_cache, v_cache.bytes())?,
                 kv_len: self.params_word(OFFSET_KV_LEN)?,
-                part: bytes_range(&self.part, self.part.bytes())?,
+                part: bytes_range(&self.rows.part, attn_loop_part_bytes(1, GROUP, MAX_SPLITS)?)?,
                 // The dq route's matvec refuses an output over its own input; delta_out is
                 // free on an attention visit.
                 out: floats(
                     if self.dq {
-                        &self.delta_out
+                        &self.rows.delta_out
                     } else {
-                        &self.branch
+                        &self.rows.mix_out
                     },
                     0,
                     hq * hd,
@@ -927,8 +772,8 @@ impl<'a> LoopStep<'a> {
             self.ctx.quantize_q8_1(
                 &self.stream,
                 crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
-                    x: floats(&self.branch, 0, branch_floats)?,
-                    y: bytes_range(&self.out_q8, q8_row(branch_floats)?)?,
+                    x: floats(&self.rows.mix_out, 0, branch_floats)?,
+                    y: bytes_range(&self.rows.q8a, q8_row(branch_floats)?)?,
                     k: branch_floats,
                     ncols: 1,
                 },
@@ -936,38 +781,9 @@ impl<'a> LoopStep<'a> {
         }
         self.project(
             o,
-            bytes_range(&self.out_q8, q8_row(branch_floats)?)?,
-            floats(&self.delta_out, 0, branch_floats)?,
-            floats(&self.branch, 0, h)?,
-        )
-    }
-
-    /// The FFN of physical layer `p`: the gate and up matvecs into one strided row, the
-    /// SwiGLU (the column-split rows kernel: `swiglu_q8` is one block for the whole row), its
-    /// q8 quantize, the down matvec into `ffn_out`.
-    fn ffn(&mut self, p: usize) -> Result<(), EngError> {
-        let ff = self.shape.feed_forward;
-        let gu = floats(&self.gu, 0, 2 * ff)?;
-        ffn::gated(
-            &self.io(self.dq),
-            self.phys[p].ffn(),
-            ffn::Join::Swiglu,
-            StepRows::both(&self.norm_q8, &self.norm_out),
-            1,
-            ffn::Scratch {
-                gate: StepOut {
-                    dst: gu,
-                    ld: 2 * ff,
-                    col_off: 0,
-                },
-                up: StepOut {
-                    dst: gu,
-                    ld: 2 * ff,
-                    col_off: ff,
-                },
-                act: StepRows::both(&self.gu_q8, &self.rows.act),
-            },
-            &self.ffn_out,
+            bytes_range(&self.rows.q8a, q8_row(branch_floats)?)?,
+            floats(&self.rows.delta_out, 0, branch_floats)?,
+            floats(&self.rows.mix_out, 0, h)?,
         )
     }
 
