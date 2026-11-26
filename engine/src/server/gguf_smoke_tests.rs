@@ -1,5 +1,5 @@
 //! The HTTP smoke of the opt-in Flash-Next GGUF serving path: the real server, in process, one
-//! engine over the pinned GGUF, a greedy three-token continuation checked against the host oracle.
+//! engine over the pinned GGUF, a greedy continuation checked against the host oracle.
 
 use super::{config::EngineConfig, run, state::AppState, testkit};
 use crate::{family::qwen::flash_next::settings::FlashEnv, sched::worker::Engine};
@@ -15,10 +15,70 @@ const EXPECTED: &str = "FIFI_FLASH_GGUF_SMOKE_EXPECTED";
 const CONTEXT: &str = "FIFI_FLASH_GGUF_SMOKE_CONTEXT";
 const SWITCH: &str = "INFERENCE_FLASH_NEXT_GGUF_SERVE";
 const MODEL: &str = "flash-next-gguf";
-/// The prompt ids of the host oracle (`full-host-oracle.json`: prompt `[9707, 11, 1879]`).
+/// The prompt ids of the pinned host oracle (`full-host-oracle.json`: prompt `[9707, 11, 1879]`),
+/// the reference when no oracle file is named.
 const PROMPT_IDS: [u32; 3] = [9707, 11, 1879];
+/// The host oracle file, the same one the full-model probe reads; optional `…_SHA256` pins another one.
+const ORACLE: &str = "FIFI_FLASH_GGUF_HOST_ORACLE";
+const ORACLE_SHA256: &str = "FIFI_FLASH_GGUF_HOST_ORACLE_SHA256";
+/// The content hash of the pinned oracle, which the probe pins an unnamed oracle to as well.
+const PINNED_ORACLE_SHA256: &str =
+    "2c2133dccb289ad6f3e244d304f655189c04497bf19cd3b609779eb5af235ffa";
 /// The maximum wait for the engine to load (the 84 GB trunk uploads from the files in place).
 const LOAD_WAIT: Duration = Duration::from_secs(3600);
+
+/// What the smoke compares: the ids its prompt must encode to, and the greedy tokens of the host
+/// after it.
+struct Reference {
+    prompt: Vec<u32>,
+    greedy: Vec<u32>,
+}
+
+impl Reference {
+    /// The host oracle file, when one is named. The probe reads the same file the same way, so one
+    /// oracle serves both and the two cannot disagree.
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os(ORACLE)?;
+        let pinned = match std::env::var(ORACLE_SHA256) {
+            Ok(digest) => digest,
+            Err(std::env::VarError::NotPresent) => PINNED_ORACLE_SHA256.to_string(),
+            Err(_) => panic!("{ORACLE_SHA256} is not Unicode"),
+        };
+        Some(Self::read(std::path::Path::new(&path), &pinned))
+    }
+
+    /// An oracle file that is as its content hash says.
+    fn read(path: &std::path::Path, pinned: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            pinned,
+            "unexpected host oracle {}",
+            path.display()
+        );
+        Self::parse(&bytes)
+            .unwrap_or_else(|message| panic!("host oracle {}: {message}", path.display()))
+    }
+
+    /// The `prompt` and the `greedy` tokens of an oracle file; each holds at least one token.
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let oracle: Value =
+            serde_json::from_slice(bytes).map_err(|error| format!("not JSON ({error})"))?;
+        let ids = |field: &str| -> Result<Vec<u32>, String> {
+            serde_json::from_value(oracle[field].clone())
+                .map_err(|error| format!("field {field}: {error}"))
+        };
+        let reference = Self {
+            prompt: ids("prompt")?,
+            greedy: ids("greedy")?,
+        };
+        if reference.prompt.is_empty() || reference.greedy.is_empty() {
+            return Err("prompt and greedy must each hold at least one token".to_string());
+        }
+        Ok(reference)
+    }
+}
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -153,8 +213,8 @@ async fn serve_pinned() -> (
 }
 
 /// The opt-in serving path end to end: `INFERENCE_FLASH_NEXT_GGUF_SERVE=1`, the real server on a
-/// loopback port, the pinned GGUF, and a greedy three-token continuation checked against the host
-/// oracle's ids (`5854, 11, 59710`, the text `_len, eos`).
+/// loopback port, the pinned GGUF, and a greedy continuation checked against the host oracle's ids
+/// (three for the pinned oracle: `5854, 11, 59710`, the text `_len, eos`).
 ///
 /// Route: `POST /v1/completions` is the one route whose prompt the tokenizer "encodes as written:
 /// no chat template, no start token" (`completions.rs`), so the engine consumes exactly the bare
@@ -168,11 +228,18 @@ async fn serve_pinned() -> (
 /// re-encodes to the same three ids (59710 is the ordinary text token ` eos`, not a special
 /// token). `logprobs` is not served on this route.
 ///
+/// What the two lists are compared with is the host oracle file named by `FIFI_FLASH_GGUF_HOST_ORACLE`
+/// when there is one: its `prompt` (the prompt text must encode to exactly these ids) and its
+/// `greedy` tokens, as many as the request asks for. Its content hash must be the pinned oracle's,
+/// or the one `FIFI_FLASH_GGUF_HOST_ORACLE_SHA256` names. The full-model probe reads that file the
+/// same way, so one oracle serves the probe and the smoke.
+///
 /// Inputs: `FIFI_FLASH_GGUF_MODEL_DIR` (the GGUF shards), `FIFI_FLASH_GGUF_TOKENIZER_DIR` (the
 /// tokenizer files AND a `download-manifest.json` with the four pinned entries: the GGUF start
 /// keeps the pack's manifest rule and refuses, with the lookup's own message, without one),
-/// optional `FIFI_FLASH_GGUF_SMOKE_PROMPT` (default `.Q, input`), `FIFI_FLASH_GGUF_SMOKE_EXPECTED`
-/// (default `5854,11,59710`) and `FIFI_FLASH_GGUF_SMOKE_CONTEXT` (default 64).
+/// optional `FIFI_FLASH_GGUF_SMOKE_PROMPT` (default `.Q, input`, the pinned oracle's prompt),
+/// `FIFI_FLASH_GGUF_SMOKE_EXPECTED` (default `5854,11,59710`; only the reference when no oracle
+/// file is named) and `FIFI_FLASH_GGUF_SMOKE_CONTEXT` (default 64).
 ///
 /// The switch is read from the process environment when the start captures `FlashEnv`. A test does
 /// not write that environment, so the runner sets `INFERENCE_FLASH_NEXT_GGUF_SERVE=1`, and without
@@ -185,7 +252,10 @@ async fn flash_next_gguf_http_smoke_greedy_matches_host() {
         "{SWITCH} must be set to 1 in the environment this test runs in"
     );
     let prompt = std::env::var(PROMPT).unwrap_or(".Q, input".to_string());
-    let expected = expected();
+    let reference = Reference::from_env().unwrap_or_else(|| Reference {
+        prompt: PROMPT_IDS.to_vec(),
+        greedy: expected(),
+    });
     let (engine, address, server) = serve_pinned().await;
 
     let prompt_ids = encode(address, &prompt).await;
@@ -193,7 +263,7 @@ async fn flash_next_gguf_http_smoke_greedy_matches_host() {
         address,
         "POST",
         "/v1/completions",
-        &json!({"model": MODEL, "prompt": prompt, "max_tokens": 3, "temperature": 0.0}),
+        &json!({"model": MODEL, "prompt": prompt, "max_tokens": reference.greedy.len(), "temperature": 0.0}),
     )
     .await;
     let text = reply["choices"][0]["text"]
@@ -207,11 +277,47 @@ async fn flash_next_gguf_http_smoke_greedy_matches_host() {
     server.abort();
     let _ = engine.shutdown();
     assert_eq!(
-        prompt_ids, PROMPT_IDS,
-        "the prompt must be the oracle's three ids"
+        prompt_ids, reference.prompt,
+        "the prompt {prompt:?} must encode to the oracle's ids"
     );
     assert_eq!(
-        generated, expected,
+        generated, reference.greedy,
         "the greedy continuation (text {text:?})"
     );
+}
+
+#[test]
+fn a_reference_reads_the_prompt_and_the_greedy_tokens_of_an_oracle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("oracle.json");
+    let oracle =
+        br#"{"prompt": [760, 6511, 314, 9338, 369], "greedy": [11751, 13, 561], "logits": []}"#;
+    std::fs::write(&path, oracle).expect("write the oracle");
+    let digest = format!("{:x}", sha2::Sha256::digest(oracle));
+    let reference = Reference::read(&path, &digest);
+    assert_eq!(reference.prompt, [760, 6511, 314, 9338, 369]);
+    assert_eq!(reference.greedy, [11751, 13, 561]);
+    let refused = [
+        &br#"{"prompt": [], "greedy": [1]}"#[..],
+        &br#"{"prompt": [1], "greedy": []}"#[..],
+        &br#"{"prompt": [1]}"#[..],
+        &br#"{"prompt": [760, "Paris"], "greedy": [1]}"#[..],
+        &b"not json"[..],
+    ];
+    for bytes in refused {
+        assert!(
+            Reference::parse(bytes).is_err(),
+            "accepted {}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "unexpected host oracle")]
+fn a_reference_refuses_an_oracle_that_is_not_its_hash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("oracle.json");
+    std::fs::write(&path, br#"{"prompt": [1], "greedy": [2]}"#).expect("write the oracle");
+    let _ = Reference::read(&path, &"0".repeat(64));
 }
