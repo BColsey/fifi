@@ -25,7 +25,7 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
-use crate::family::step::walk::ChunkStep;
+use crate::family::step::walk::{self, ChunkStep, Half, Visits};
 use crate::family::step::{experts, ffn, site};
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
@@ -586,11 +586,7 @@ impl Raon1Device {
         self.sc
             .resid_a
             .write_at(&self.stream, 0, &f32_bytes(&resid))?;
-        for layer in 0..self.spec.layers {
-            self.attn_half(layer, n, pos0)?;
-            self.ffn_half(layer, n)?;
-        }
-        Ok(())
+        walk::visits(self, n, pos0, |_, _| Ok(()))
     }
 
     fn site(&self) -> site::Mixed<'_> {
@@ -638,28 +634,6 @@ impl Raon1Device {
         out: &DeviceBuffer,
     ) -> Result<(), EngError> {
         self.site().apply(&self.io(), resid, out, &self.sc.proj, n)
-    }
-
-    fn attn_half(&self, layer: usize, n: usize, pos0: usize) -> Result<(), EngError> {
-        let names = &self.names[layer];
-        let sc = &self.sc;
-        self.site_read(&names.hc_attn, &names.attn_norm, n, &sc.resid_a)?;
-        if self.trace.borrow().is_some() {
-            self.snap(&format!("attn_norm-{layer}"), &sc.cur, n * HIDDEN)?;
-        }
-        match names.kind {
-            RaonKind::Rda => self.rda_mixer(names, n)?,
-            RaonKind::Mla => self.mla_mixer(names, n, pos0)?,
-        }
-        self.site_apply(n, &sc.resid_a, &sc.resid_b)?;
-        if self.trace.borrow().is_some() {
-            self.snap(
-                &format!("hc_attn_out-{layer}"),
-                &sc.resid_b,
-                n * STREAMS * HIDDEN,
-            )?;
-        }
-        Ok(())
     }
 
     fn rda_mixer(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
@@ -871,25 +845,6 @@ impl Raon1Device {
             &sc.proj,
             n,
         )
-    }
-
-    fn ffn_half(&self, layer: usize, n: usize) -> Result<(), EngError> {
-        let names = &self.names[layer];
-        let sc = &self.sc;
-        self.site_read(&names.hc_ffn, &names.ffn_norm, n, &sc.resid_b)?;
-        if self.trace.borrow().is_some() {
-            self.snap(&format!("ffn_norm-{layer}"), &sc.cur, n * HIDDEN)?;
-        }
-        if names.moe {
-            self.moe_block(names, n)?;
-        } else {
-            self.dense_block(names, n)?;
-        }
-        self.site_apply(n, &sc.resid_b, &sc.resid_a)?;
-        if self.trace.borrow().is_some() {
-            self.snap(&format!("l_out-{layer}"), &sc.resid_a, n * STREAMS * HIDDEN)?;
-        }
-        Ok(())
     }
 
     fn dense_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
@@ -1153,6 +1108,54 @@ impl Raon1Device {
         let mut bytes = vec![0u8; self.vocab * 4];
         sc.logits.read_at(&self.stream, 0, &mut bytes)?;
         Ok(f32_values(&bytes))
+    }
+}
+
+impl Visits for Raon1Device {
+    fn count(&self) -> usize {
+        self.spec.layers
+    }
+
+    fn begin(&self, _n: usize) -> Result<(), EngError> {
+        Ok(())
+    }
+
+    /// The mixer half reads the streams a feed or the last layer left in `resid_a`, the
+    /// feed-forward half the streams the mixer half left in `resid_b`.
+    fn read(&self, layer: usize, half: Half, n: usize) -> Result<(), EngError> {
+        let (names, sc) = (&self.names[layer], &self.sc);
+        let (site, norm, resid, stage) = match half {
+            Half::Mixer => (&names.hc_attn, &names.attn_norm, &sc.resid_a, "attn_norm"),
+            Half::Forward => (&names.hc_ffn, &names.ffn_norm, &sc.resid_b, "ffn_norm"),
+        };
+        self.site_read(site, norm, n, resid)?;
+        if self.trace.borrow().is_some() {
+            self.snap(&format!("{stage}-{layer}"), &sc.cur, n * HIDDEN)?;
+        }
+        Ok(())
+    }
+
+    fn branch(&self, layer: usize, half: Half, n: usize, pos0: usize) -> Result<(), EngError> {
+        let names = &self.names[layer];
+        match (half, names.kind) {
+            (Half::Mixer, RaonKind::Rda) => self.rda_mixer(names, n),
+            (Half::Mixer, RaonKind::Mla) => self.mla_mixer(names, n, pos0),
+            (Half::Forward, _) if names.moe => self.moe_block(names, n),
+            (Half::Forward, _) => self.dense_block(names, n),
+        }
+    }
+
+    fn apply(&self, layer: usize, half: Half, n: usize) -> Result<(), EngError> {
+        let sc = &self.sc;
+        let (resid, out, stage) = match half {
+            Half::Mixer => (&sc.resid_a, &sc.resid_b, "hc_attn_out"),
+            Half::Forward => (&sc.resid_b, &sc.resid_a, "l_out"),
+        };
+        self.site_apply(n, resid, out)?;
+        if self.trace.borrow().is_some() {
+            self.snap(&format!("{stage}-{layer}"), out, n * STREAMS * HIDDEN)?;
+        }
+        Ok(())
     }
 }
 

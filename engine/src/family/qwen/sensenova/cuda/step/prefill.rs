@@ -14,6 +14,7 @@ use std::cell::Cell;
 
 use super::*;
 use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
+use crate::family::step::walk::{self, Half, Visits};
 use crate::family::step::{attend, delta, ffn, site};
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
@@ -204,70 +205,21 @@ impl LoopStep<'_> {
     }
 
     /// The visits of one fed chunk, in order. It queues launches only unless `trace` is set,
-    /// and for one row the launches do not depend on `p0`.
+    /// and for one row the launches do not depend on `p0`. `trace` takes row 0 of every
+    /// visit's mixer output and residual.
     pub(super) fn visits(
         &self,
         m: usize,
         p0: usize,
         mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        self.rows.cur_ix.set(0);
-        if m == 1 {
-            self.ctx
-                .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
-        }
-        for il in 0..TRUNK_LAYERS {
-            let p = self.plan.physical(il);
-            let mhc = self.plan.mhc_active(il);
-            if mhc && p == self.plan.mhc_start {
-                self.routed()
-                    .fork(&self.io(false), &self.rows.resid[self.rows.cur_ix.get()], m)?;
-            }
-            if mhc {
-                self.route(p, "hc_attn_fn", m)?;
-                // The branch consumes the routed input, normed with this layer's attn_norm.
-                let routed = floats(&self.rows.routed, 0, m * h)?;
-                self.norm_site(routed, None, self.phys[p].attn_norm, m)?;
-            } else {
-                let cur = self.resid_rows(m)?;
-                self.norm_site(cur, None, self.phys[p].attn_norm, m)?;
-            }
-            self.mixer(il, p, m, p0)?;
-            self.snap(&mut trace, &self.rows.mix_out)?;
-            if mhc {
-                self.routed()
-                    .merge(&self.io(false), &self.rows.mix_out, m)?;
-                self.route(p, "hc_ffn_fn", m)?;
-                // The ffn norm reads the routed input the second router wrote.
-                let routed = floats(&self.rows.routed, 0, m * h)?;
-                self.norm_site(routed, None, self.phys[p].post_norm, m)?;
-                self.ffn(p, m)?;
-                self.routed()
-                    .merge(&self.io(false), &self.rows.ffn_out, m)?;
-                self.routed()
-                    .mean(&self.io(false), self.resid_rows(m)?, m)?;
-            } else {
-                // Fused residual add and post norm: the branch lands in the residual.
-                let cur = self.resid_rows(m)?;
-                let branch = Some(floats(&self.rows.mix_out, 0, m * h)?);
-                self.norm_site(cur, branch, self.phys[p].post_norm, m)?;
-                self.ffn(p, m)?;
-                // The add writes a distinct out: rotate the residual pair.
-                let next = self.rows.cur_ix.get() ^ 1;
-                let out = floats(&self.rows.resid[next], 0, m * h)?;
-                site::add(
-                    &self.io(false),
-                    out,
-                    cur,
-                    floats(&self.rows.ffn_out, 0, m * h)?,
-                    m * h,
-                )?;
-                self.rows.cur_ix.set(next);
-            }
-            self.snap(&mut trace, &self.rows.resid[self.rows.cur_ix.get()])?;
-        }
-        Ok(())
+        walk::visits(self, m, p0, |_, half| {
+            let rows = match half {
+                Half::Mixer => &self.rows.mix_out,
+                Half::Forward => &self.rows.resid[self.rows.cur_ix.get()],
+            };
+            self.snap(&mut trace, rows)
+        })
     }
 
     /// The `m` rows of the current residual plane.
@@ -499,5 +451,79 @@ impl LoopStep<'_> {
             fixup: &self.rows.fixup,
             exact,
         }
+    }
+}
+
+impl Visits for LoopStep<'_> {
+    fn count(&self) -> usize {
+        TRUNK_LAYERS
+    }
+
+    fn begin(&self, n: usize) -> Result<(), EngError> {
+        self.rows.cur_ix.set(0);
+        if n == 1 {
+            self.ctx
+                .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
+        }
+        Ok(())
+    }
+
+    /// A routed visit reads the input a router writes from both streams; a plain visit reads
+    /// the residual, and its feed-forward read adds the mixer rows in the same launch.
+    fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
+        let p = self.plan.physical(visit);
+        let phys = &self.phys[p];
+        let (part, norm) = match half {
+            Half::Mixer => ("hc_attn_fn", phys.attn_norm),
+            Half::Forward => ("hc_ffn_fn", phys.post_norm),
+        };
+        let h = self.shape.hidden;
+        if !self.plan.mhc_active(visit) {
+            let branch = match half {
+                Half::Mixer => None,
+                Half::Forward => Some(floats(&self.rows.mix_out, 0, n * h)?),
+            };
+            return self.norm_site(self.resid_rows(n)?, branch, norm, n);
+        }
+        if half == Half::Mixer && p == self.plan.mhc_start {
+            let cur = &self.rows.resid[self.rows.cur_ix.get()];
+            self.routed().fork(&self.io(false), cur, n)?;
+        }
+        self.route(p, part, n)?;
+        self.norm_site(floats(&self.rows.routed, 0, n * h)?, None, norm, n)
+    }
+
+    fn branch(&self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError> {
+        let p = self.plan.physical(visit);
+        match half {
+            Half::Mixer => self.mixer(visit, p, n, p0),
+            Half::Forward => self.ffn(p, n),
+        }
+    }
+
+    /// A routed visit merges each branch into both streams and ends on their mean; a plain
+    /// visit adds the feed-forward rows into the other residual plane.
+    fn apply(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
+        let io = self.io(false);
+        if self.plan.mhc_active(visit) {
+            return match half {
+                Half::Mixer => self.routed().merge(&io, &self.rows.mix_out, n),
+                Half::Forward => {
+                    self.routed().merge(&io, &self.rows.ffn_out, n)?;
+                    self.routed().mean(&io, self.resid_rows(n)?, n)
+                }
+            };
+        }
+        if half == Half::Mixer {
+            return Ok(());
+        }
+        let len = n * self.shape.hidden;
+        // The add writes a distinct out: rotate the residual pair.
+        let next = self.rows.cur_ix.get() ^ 1;
+        let out = floats(&self.rows.resid[next], 0, len)?;
+        let branch = floats(&self.rows.ffn_out, 0, len)?;
+        site::add(&io, out, self.resid_rows(n)?, branch, len)?;
+        self.rows.cur_ix.set(next);
+        Ok(())
     }
 }

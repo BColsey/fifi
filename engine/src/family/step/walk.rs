@@ -1,5 +1,11 @@
-//! The feed of a step: tokens in pieces of the step's chunk size, with the bounds and the head
-//! rows. A model supplies the chunk itself.
+//! The walk of a step.
+//!
+//! [`feed`] cuts tokens into pieces of the step's chunk size, checks the bounds and collects the
+//! head rows. [`visits`] runs one chunk through a model's visits: every visit is a mixer half
+//! and a feed-forward half, and every half reads its input rows from the residual, runs its
+//! branch and returns the branch to the residual. A model supplies the three parts of a half
+//! ([`Visits`]); the order, and the point after each half where a caller may read rows, are
+//! shared.
 
 use crate::EngError;
 
@@ -83,4 +89,45 @@ pub(crate) fn feed<S: ChunkStep>(
         step.drain()?;
     }
     Ok(logits)
+}
+
+/// The two halves of a visit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Half {
+    Mixer,
+    Forward,
+}
+
+/// The visits of a model over one chunk of rows.
+pub(crate) trait Visits {
+    /// Visits of one walk.
+    fn count(&self) -> usize;
+    /// Queued before the first visit of a chunk of `n` rows.
+    fn begin(&self, n: usize) -> Result<(), EngError>;
+    /// The residual read of a half: its input rows, normed.
+    fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
+    /// The branch of a half over the rows the read left; `p0` is the position of row 0.
+    fn branch(&self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError>;
+    /// The return of the branch rows to the residual.
+    fn apply(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError>;
+}
+
+/// Runs a chunk of `n` rows whose first row sits at `p0` through every visit of `model`. `tap`
+/// runs after each half, behind its launches: a trace or a reader of the rows of that point.
+pub(crate) fn visits<V: Visits + ?Sized>(
+    model: &V,
+    n: usize,
+    p0: usize,
+    mut tap: impl FnMut(usize, Half) -> Result<(), EngError>,
+) -> Result<(), EngError> {
+    model.begin(n)?;
+    for visit in 0..model.count() {
+        for half in [Half::Mixer, Half::Forward] {
+            model.read(visit, half, n)?;
+            model.branch(visit, half, n, p0)?;
+            model.apply(visit, half, n)?;
+            tap(visit, half)?;
+        }
+    }
+    Ok(())
 }
