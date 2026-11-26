@@ -219,10 +219,7 @@ impl CpuForward {
             let outcome = self.pass_workspace(cuda, MAX_ROWS).and_then(|()| {
                 let plan_us = started.elapsed().as_micros() as u64;
                 self.run_block(weights, cuda, block, offset, &mut state)
-                    .map(|report| {
-                        report.plan_us.set(plan_us);
-                        report
-                    })
+                    .inspect(|report| report.plan_us.set(plan_us))
             });
             self.state = state;
             match outcome {
@@ -288,7 +285,7 @@ impl CpuForward {
 
     fn pass_admitted(&self, weights: &GgufTextWeights, cuda: &GgufCuda) -> Result<bool, EngError> {
         let core = &self.spec.core;
-        let width = core.core_end.checked_sub(core.core_start).unwrap_or(0);
+        let width = core.core_end.saturating_sub(core.core_start);
         let Some(end) = width
             .checked_mul(core.num_passes.max(1))
             .and_then(|n| n.checked_add(core.core_start))
@@ -495,7 +492,7 @@ impl CpuForward {
         let context = cuda.context();
         let mut block = Block {
             context,
-            stream: &stream,
+            stream,
             arena,
             l,
             constants: &plan.constants,
@@ -511,7 +508,7 @@ impl CpuForward {
             report: &mut report,
         };
         let zero_words = rows + l.visits * rows + 2 * l.visits;
-        context.inkling_pass_zero(&stream, block.at(l.health, zero_words)?, zero_words)?;
+        context.inkling_pass_zero(stream, block.at(l.health, zero_words)?, zero_words)?;
         block.report.launches.set(block.report.launches.get() + 1);
 
         // Embeddings, and the tails of the previous block when the host state owns them.
@@ -519,7 +516,7 @@ impl CpuForward {
         for id in tokens.iter().chain(tokens.last().filter(|_| committed == 1)) {
             embedded.extend_from_slice(self.embed(*id)?.current());
         }
-        plan.current[0].write_at(&stream, 0, &bytes(&embedded))?;
+        plan.current[0].write_at(stream, 0, &bytes(&embedded))?;
         if !plan.tails_valid {
             let mut tails = Vec::new();
             for (visit, consts) in self.visits.iter().zip(&plan.visits) {
@@ -529,12 +526,12 @@ impl CpuForward {
                     tails.extend(tail_bytes(&history, width));
                 }
             }
-            plan.tails[plan.tails_from].write_at(&stream, 0, &tails)?;
+            plan.tails[plan.tails_from].write_at(stream, 0, &tails)?;
             plan.tails_valid = true;
         }
         for kind in 0..2 {
             context.inkling_pass_positions(
-                &stream,
+                stream,
                 block.at(l.side[kind], rows * l.side_stride[kind])?,
                 [rows, l.side_stride[kind], 2 * l.raw_stride[kind] / 2, position],
             )?;
@@ -596,7 +593,7 @@ impl CpuForward {
             let current = block.current_range(live)?;
             if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
                 context.inkling_pass_seal(
-                    &stream,
+                    stream,
                     PassSealCall {
                         sealed,
                         current,
@@ -609,7 +606,7 @@ impl CpuForward {
                 blocks += 1;
             } else {
                 context.inkling_pass_add(
-                    &stream,
+                    stream,
                     PassAddCall {
                         current,
                         row: attn_conv,
@@ -651,7 +648,6 @@ impl CpuForward {
             .report
             .publish_us
             .set(published.elapsed().as_micros() as u64);
-        drop(block);
         plan.tails_from = 1 - plan.tails_from;
         Ok(report)
     }
@@ -669,14 +665,14 @@ impl CpuForward {
         if readback.len() < health_bytes + status_bytes {
             return Err(bad("the resident pass readback plane is too small"));
         }
-        block.context.copy_to_pinned(&block.stream, block.at(l.health, rows)?, readback, 0)?;
+        block.context.copy_to_pinned(block.stream, block.at(l.health, rows)?, readback, 0)?;
         block.context.copy_to_pinned(
-            &block.stream,
+            block.stream,
             block.at(l.status, status_words)?,
             readback,
             health_bytes,
         )?;
-        readback.synchronize(&block.stream)?;
+        readback.synchronize(block.stream)?;
         // Health words are f32 (zero when every row of every launch was finite); the status
         // and flag words are u32 read as bits. Any nonzero word invalidates the block.
         let mut words = vec![0f32; rows + status_words];
@@ -699,7 +695,7 @@ impl CpuForward {
         for (visit, consts) in self.visits.iter().zip(block.visits) {
             let slot = visit.state_slot;
             let (keys, values) =
-                attention.download_ring(&block.stream, slot, position + block.committed)?;
+                attention.download_ring(block.stream, slot, position + block.committed)?;
             let widths = [
                 consts.heads[1] * HEAD_DIM,
                 consts.heads[1] * HEAD_DIM,
@@ -710,12 +706,12 @@ impl CpuForward {
             let mut at = consts.tails.start * WORD;
             for width in widths {
                 let bytes = PAST * width * WORD;
-                block.tails[1].read_at(&block.stream, at, &mut tails[..bytes])?;
+                block.tails[1].read_at(block.stream, at, &mut tails[..bytes])?;
                 // The tail plane holds its rows oldest first, one history row per `width` words.
                 planes.push(
                     tails[..bytes]
                         .chunks_exact(width * WORD)
-                        .map(|row| words(row))
+                        .map(words)
                         .collect(),
                 );
                 at += bytes;
@@ -762,15 +758,21 @@ impl CpuForward {
         let rank = self.spec.core.gate_rank as usize;
 
         // Attention inputs: residual mix, control, norm, per role.
-        for role in 0..ROLES {
+        for (role, ((norm_range, mix), control)) in consts
+            .norms
+            .iter()
+            .zip(&consts.mix)
+            .zip(&consts.control)
+            .enumerate()
+        {
             if local && role > 0 && bank.is_none() {
                 continue;
             }
             let input = block.at(l.inputs + role * rows * h, rows * h)?;
-            let norm = block.constant(&consts.norms[role])?;
+            let norm = block.constant(norm_range)?;
             let norm_only = || -> Result<(), EngError> {
                 block.context.inkling_pass_apply(
-                    &block.stream,
+                    block.stream,
                     [input, input, input, input, norm, input, block.at(l.health, rows)?],
                     [rows, h],
                     eps,
@@ -781,11 +783,11 @@ impl CpuForward {
             };
             // The first layer has no residual mix: its input is the normed current row. Every
             // other visit mixes first and takes the norm below (or the controller's, if banked).
-            let from_current = consts.mix[role].is_empty();
+            let from_current = mix.is_empty();
             if from_current {
                 let current = block.current_range(live)?;
                 block.context.inkling_pass_apply(
-                    &block.stream,
+                    block.stream,
                     [current, current, current, current, norm, input, block.at(l.health, rows)?],
                     [rows, h],
                     eps,
@@ -793,14 +795,14 @@ impl CpuForward {
                 )?;
                 block.report.launches.set(block.report.launches.get() + 1);
             } else {
-                block.mix(live, blocks, 0, &consts.mix[role], h, input)?;
+                block.mix(live, blocks, 0, mix, h, input)?;
             }
             if let Some((bank_buffer, bank_blocks, bank_first)) = bank {
                 let message = block.at(l.messages + role * rows * h, rows * h)?;
-                block.mix(bank_buffer, bank_blocks, bank_first, &consts.control[role], h, message)?;
+                block.mix(bank_buffer, bank_blocks, bank_first, control, h, message)?;
                 let gate = block.at(l.gate, rows * 2 * h)?;
                 block.context.inkling_pass_gate(
-                    &block.stream,
+                    block.stream,
                     [input, message, gate, block.at(l.health, rows)?],
                     [rows, h, 2 * h],
                     MIX_EPS,
@@ -810,7 +812,7 @@ impl CpuForward {
                 let gain = block.at(l.gain, rows * h)?;
                 let forget = block.at(l.forget, rows * h)?;
                 block.context.inkling_pass_apply(
-                    &block.stream,
+                    block.stream,
                     [input, message, gain, forget, norm, input, block.at(l.health, rows)?],
                     [rows, h],
                     eps,
@@ -875,13 +877,13 @@ impl CpuForward {
                 y: block.at(y, (rows - 1) * ld_y + width)?,
             });
         }
-        q8_row_reuse::project_group(block.context, &block.stream, &calls, "pass_attention")?;
+        q8_row_reuse::project_group(block.context, block.stream, &calls, "pass_attention")?;
         block.report.launches.set(block.report.launches.get() + calls.len());
         // The raw K/V rows of this visit become convolution history for the next block.
         let past = PAST.min(position);
         for (source, which) in [(l.raw[kind], 0usize), (l.raw[kind] + kv_channels, 1)] {
             block.context.inkling_pass_tails(
-                &block.stream,
+                block.stream,
                 [
                     block.at(source, rows * raw_stride)?,
                     block.tail(0, index, which)?,
@@ -895,7 +897,7 @@ impl CpuForward {
         // Clip the packed queries, then prepare K/V (convolutions, norms, clip).
         let status = block.at(l.status + index * rows, rows)?;
         block.context.relative_attention_clip_queries(
-            &block.stream,
+            block.stream,
             parts.shape,
             rows,
             [
@@ -910,7 +912,7 @@ impl CpuForward {
         )?;
         let dynamic = kind == 1;
         block.context.inkling_pass_prep(
-            &block.stream,
+            block.stream,
             PassPrepCall {
                 raw: block.at(l.raw[kind], rows * raw_stride)?,
                 // The prep entry takes the exact extents it reads: the last row of `side` stops
@@ -970,7 +972,7 @@ impl CpuForward {
                 pos: at(l.side[kind] + 2 * kv_channels, side_stride, 1)?,
                 status: block.at(l.status + index * rows + first, count)?,
             };
-            block.context.relative_attention_tile(&block.stream, call, tile)?;
+            block.context.relative_attention_tile(block.stream, call, tile)?;
             tiles += 1;
         }
         block.report.launches.set(block.report.launches.get() + tiles);
@@ -982,7 +984,7 @@ impl CpuForward {
             .ok_or_else(|| bad("the resident pass needs the attention output projection"))?;
         q8_row_reuse::project_output(
             block.context,
-            &block.stream,
+            block.stream,
             DenseGemvCall {
                 shape: DenseGemvShape::packed(rows, projection.rows, channels),
                 dtype: projection.dtype,
@@ -992,7 +994,7 @@ impl CpuForward {
             },
         )?;
         block.context.inkling_output_conv(
-            &block.stream,
+            block.stream,
             [
                 block.at(l.attn_raw, rows * h)?,
                 block.tail(0, index, 2)?,
@@ -1007,7 +1009,7 @@ impl CpuForward {
             },
         )?;
         block.context.inkling_pass_tails(
-            &block.stream,
+            block.stream,
             [
                 block.at(l.attn_raw, rows * h)?,
                 block.tail(0, index, 2)?,
@@ -1058,7 +1060,7 @@ impl CpuForward {
                 y: outputs[i],
             });
         }
-        block.context.dense_gemv_group(&block.stream, &calls)?;
+        block.context.dense_gemv_group(block.stream, &calls)?;
         block.report.launches.set(block.report.launches.get() + calls.len());
         Ok(())
     }
@@ -1080,9 +1082,8 @@ impl CpuForward {
         layer: usize,
     ) -> Result<Option<Vec<MoeRoute>>, EngError> {
         // layer -> that layer's printed sets, in printed order
-        static ROUTES: std::sync::OnceLock<
-            Option<std::collections::HashMap<usize, Vec<Vec<Vec<usize>>>>>,
-        > = std::sync::OnceLock::new();
+        type PrintedRoutes = Option<std::collections::HashMap<usize, Vec<Vec<Vec<usize>>>>>;
+        static ROUTES: std::sync::OnceLock<PrintedRoutes> = std::sync::OnceLock::new();
         let (rows, offset) = (block.rows, block.offset);
         let of_layer = |i: usize| self.visits[i].weight_layer == layer;
         // The layer's visits in a piece, and this one's position among them.
@@ -1142,6 +1143,7 @@ impl CpuForward {
         Ok(Some(replayed))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pass_mlp(
         &self,
         block: &mut Block<'_>,
@@ -1168,7 +1170,7 @@ impl CpuForward {
             block.mix(bank_buffer, bank_blocks, bank_first, &consts.control[ROLES], h, message)?;
             let gate = block.at(l.gate, rows * 2 * h)?;
             block.context.inkling_pass_gate(
-                &block.stream,
+                block.stream,
                 [input, message, gate, health],
                 [rows, h, 2 * h],
                 MIX_EPS,
@@ -1178,7 +1180,7 @@ impl CpuForward {
             let gain = block.at(l.gain, rows * h)?;
             let forget = block.at(l.forget, rows * h)?;
             block.context.inkling_pass_apply(
-                &block.stream,
+                block.stream,
                 [input, message, gain, forget, norm, input, health],
                 [rows, h],
                 eps,
@@ -1187,7 +1189,7 @@ impl CpuForward {
             block.report.launches.set(block.report.launches.get() + 2);
         } else {
             block.context.inkling_pass_apply(
-                &block.stream,
+                block.stream,
                 [input, input, input, input, norm, input, health],
                 [rows, h],
                 eps,
@@ -1216,7 +1218,7 @@ impl CpuForward {
         let route_weights = block.at(l.route_weights, rows * top_k)?;
         let routed_status = block.at(l.flags + l.visits + index, 1)?;
         block.context.router_logits_rows(
-            &block.stream,
+            block.stream,
             RouterLogitsCall {
                 shape,
                 x: input,
@@ -1225,7 +1227,7 @@ impl CpuForward {
             },
         )?;
         block.context.router_sigmoid_select_rows(
-            &block.stream,
+            block.stream,
             RouterSigmoidCall {
                 shape,
                 bias: Some(RouterSigmoidBias {
@@ -1247,7 +1249,7 @@ impl CpuForward {
         let weight_layer = self.visits[index].weight_layer;
         let routed = weights.prefill_device_routed_experts(
             weight_layer as u32,
-            &block.stream,
+            block.stream,
             DeviceRoutedPrefill {
                 rows,
                 x: input,
@@ -1266,8 +1268,8 @@ impl CpuForward {
             if readback.len() < logits_bytes {
                 return Err(bad("the resident pass readback plane is too small for the router"));
             }
-            block.context.copy_to_pinned(&block.stream, logits, readback, 0)?;
-            readback.synchronize(&block.stream)?;
+            block.context.copy_to_pinned(block.stream, logits, readback, 0)?;
+            readback.synchronize(block.stream)?;
             let mut logits = vec![0f32; rows * experts];
             readback.read_f32(0, &mut logits)?;
             block.report.readbacks.set(block.report.readbacks.get() + 2);
@@ -1296,7 +1298,7 @@ impl CpuForward {
                     (batch, Some(expert_out)),
                     caps,
                     |row, id| routes[row].weight(id, self.math.route_scale),
-                    (&block.stream, block.at(l.flags + index, 1)?),
+                    (block.stream, block.at(l.flags + index, 1)?),
                 )?
                 .ok_or_else(|| bad("the resident pass expert window was not admitted"))?;
             block.report.readbacks.set(block.report.readbacks.get() + 1);
@@ -1306,7 +1308,7 @@ impl CpuForward {
         let past = PAST.min(position);
         let status = block.at(l.status + index * rows, rows)?;
         block.context.inkling_output_conv(
-            &block.stream,
+            block.stream,
             [
                 block.at(l.expert_out, rows * h)?,
                 block.tail(0, index, 3)?,
@@ -1321,7 +1323,7 @@ impl CpuForward {
             },
         )?;
         block.context.inkling_pass_tails(
-            &block.stream,
+            block.stream,
             [
                 block.at(l.expert_out, rows * h)?,
                 block.tail(0, index, 3)?,
@@ -1406,7 +1408,7 @@ impl Block<'_> {
         };
         let read = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, words: usize| {
             let mut bytes = vec![0u8; words * WORD];
-            buffer.read_at(&self.stream, start * WORD, &mut bytes)?;
+            buffer.read_at(self.stream, start * WORD, &mut bytes)?;
             Ok::<_, EngError>(
                 bytes
                     .as_chunks::<4>()
@@ -1428,7 +1430,7 @@ impl Block<'_> {
             "raw_stride": l.raw_stride[kind],
             "side_stride": l.side_stride[kind],
         });
-        std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
+        std::fs::write(path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
             .map_err(|e| bad(format!("resident pass dump: {e}")))?;
         eprintln!("Inkling resident pass dumped visit {index} after its K/V preparation");
         Ok(())
@@ -1460,7 +1462,7 @@ impl Block<'_> {
         };
         let read = |buffer: &crate::kernels::cuda::DeviceBuffer, start: usize, words: usize| {
             let mut bytes = vec![0u8; words * WORD];
-            buffer.read_at(&self.stream, start * WORD, &mut bytes)?;
+            buffer.read_at(self.stream, start * WORD, &mut bytes)?;
             Ok::<_, EngError>(
                 bytes
                     .as_chunks::<4>()
@@ -1495,7 +1497,7 @@ impl Block<'_> {
             "bank": bank,
             "bank_rows": bank_rows,
         });
-        std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
+        std::fs::write(path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
             .map_err(|e| bad(format!("resident pass dump: {e}")))?;
         eprintln!("Inkling resident pass dumped the control of visit {index}");
         Ok(())
@@ -1505,7 +1507,7 @@ impl Block<'_> {
     fn pass_add_to_current(&self, row: DeviceRange<'_>) -> Result<(), EngError> {
         let health = self.at(self.l.health, self.rows)?;
         self.context.inkling_pass_add(
-            &self.stream,
+            self.stream,
             PassAddCall {
                 current: self.current_range(self.live.get())?,
                 row,
@@ -1551,13 +1553,13 @@ impl Block<'_> {
     fn restore_stream(&self, live: usize, prelude: usize, blocks: usize) -> Result<(), EngError> {
         let row = self.rows * self.h * WORD;
         self.context.copy_device(
-            &self.stream,
+            self.stream,
             self.current[prelude].range(0, row)?,
             self.current[live].range(0, row)?,
         )?;
         if blocks > 0 {
             self.context.copy_device(
-                &self.stream,
+                self.stream,
                 self.sealed[prelude].range(0, blocks * row)?,
                 self.sealed[live].range(0, blocks * row)?,
             )?;
@@ -1577,7 +1579,7 @@ impl Block<'_> {
     ) -> Result<(), EngError> {
         let first = first.min(blocks);
         self.context.inkling_pass_mix(
-            &self.stream,
+            self.stream,
             PassMixCall {
                 sealed: self.sealed_range(buffer, blocks)?,
                 current: self.current_range(buffer)?,
@@ -1619,8 +1621,10 @@ fn bytes(values: &[f32]) -> Vec<u8> {
 
 fn words(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(WORD)
-        .map(|w| f32::from_ne_bytes(w.try_into().unwrap()))
+        .as_chunks::<WORD>()
+        .0
+        .iter()
+        .map(|w| f32::from_ne_bytes(*w))
         .collect()
 }
 
