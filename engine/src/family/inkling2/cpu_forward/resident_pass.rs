@@ -31,6 +31,8 @@
 //! operation takes host route ids.
 
 use std::ops::Range;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+use super::MoeRoute;
 
 use super::super::cpu_attention::VisitState;
 use super::super::cpu_weights::Projection;
@@ -1007,6 +1009,71 @@ impl CpuForward {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    /// Test aid (`FIFI_INKLING_PASS_ROUTES_IN=<flag-off log>`): the expert routes an earlier flag-off
+    /// run printed (`FIFI_INKLING_DEBUG_PREFILL_ROUTES=1`) take the place of this run's own
+    /// selection, per layer and call over the same number of rows. Two runs whose router logits
+    /// differ by float noise disagree on near-tie rows only; replaying the routes removes that
+    /// disagreement from the comparison.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    fn replayed_routes(
+        &self,
+        layer: usize,
+        logits: &[f32],
+        bias: &[f32],
+        rows: usize,
+    ) -> Result<Option<Vec<MoeRoute>>, EngError> {
+        static ROUTES: std::sync::OnceLock<Option<Vec<(usize, Vec<Vec<usize>>)>>> =
+            std::sync::OnceLock::new();
+        static CALLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let routes = ROUTES.get_or_init(|| {
+            let text = std::fs::read_to_string(std::env::var("FIFI_INKLING_PASS_ROUTES_IN").ok()?).ok()?;
+            let mut out = Vec::new();
+            for line in text
+                .lines()
+                .filter(|line| line.contains("Inkling grouped route diagnostic "))
+            {
+                let value: serde_json::Value = line
+                    .split("Inkling grouped route diagnostic ")
+                    .nth(1)?
+                    .trim()
+                    .parse()
+                    .ok()?;
+                out.push((
+                    value["layer"].as_u64()? as usize,
+                    serde_json::from_value(value["routes"].clone()).ok()?,
+                ));
+            }
+            Some(out)
+        });
+        let Some(routes) = routes else {
+            return Ok(None);
+        };
+        let mut calls = CALLS.lock().unwrap();
+        let call = *calls.entry((layer, rows)).or_insert(0);
+        *calls.get_mut(&(layer, rows)).unwrap() += 1;
+        let Some(picked) = routes
+            .iter()
+            .filter(|(printed, routes)| *printed == layer && routes.len() == rows)
+            .map(|(_, routes)| routes)
+            .nth(call)
+        else {
+            return Ok(None);
+        };
+        let mut replayed = Vec::with_capacity(rows);
+        for (row, selected) in logits.chunks_exact(bias.len()).zip(picked) {
+            let mut route = self.moe_route_from_logits(layer, row.to_vec(), bias)?;
+            route.total = selected
+                .iter()
+                .map(|&id| route.scores[id])
+                .sum::<f32>()
+                .max(ROUTE_NORMALIZATION_FLOOR);
+            route.selected = selected.clone();
+            replayed.push(route);
+        }
+        Ok(Some(replayed))
+    }
+
     fn pass_mlp(
         &self,
         block: &mut Block<'_>,
@@ -1137,6 +1204,12 @@ impl CpuForward {
             readback.read_f32(0, &mut logits)?;
             block.report.readbacks.set(block.report.readbacks.get() + 2);
             let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            let routes = match self.replayed_routes(weight_layer, &logits, &bias, rows)? {
+                Some(routes) => routes,
+                None => self.route_prefill_logits(weight_layer, &logits, &bias, rows)?,
+            };
+            #[cfg(not(all(test, feature = "native-cuda", target_os = "linux")))]
             let routes = self.route_prefill_logits(weight_layer, &logits, &bias, rows)?;
             let names = [
                 format!("{prefix}.experts.w13_weight"),
