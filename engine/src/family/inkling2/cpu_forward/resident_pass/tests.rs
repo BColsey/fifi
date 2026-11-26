@@ -146,6 +146,7 @@ fn resident_pass_parity() {
         let (mut control18, mut messages18, mut gains18, mut forgets18) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let rank = host.spec.core.gate_rank as usize;
+        let mut bank_rows = Vec::new();
         for &id in &tokens[..rows] {
             let mut stream = host.embed(id).unwrap();
             let mut taps = TapRow::new(&[], host.hidden());
@@ -159,6 +160,9 @@ fn resident_pass_parity() {
                 stream: std::mem::replace(&mut stream, prelude.clone()),
             };
             before18.extend(stream.current().iter().map(|x| x.to_bits()));
+            let mut bank_bytes = Vec::new();
+            bank.stream.append_device_state(&mut bank_bytes);
+            bank_rows.extend(bank_bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
             let inputs = host.attention_inputs(bank_visit, &bank_layer, &stream, Some(&bank)).unwrap();
             inputs18.extend(inputs.iter().flat_map(|r| r.iter().map(|x| x.to_bits())));
             // The pieces of the controlled input, per role: the residual mix before control, the
@@ -200,6 +204,9 @@ fn resident_pass_parity() {
                 "after": after,
                 "before18": before18, "inputs18": inputs18, "raw18": raw18,
                 "normed18": control18, "messages18": messages18, "gains18": gains18, "forgets18": forgets18,
+                // The bank stream as the host keeps it, per token: the current row, then the
+                // normalized sealed rows, oldest first.
+                "bank18": bank_rows,
             }))
             .unwrap(),
         )
