@@ -191,6 +191,39 @@ impl DevicePrompt {
     }
 }
 
+/// Rows of the next projection launch, of `left` rows and a stage of `capacity`: the
+/// tensor-core GEMM takes all it can hold, the exact kernels a whole tile of their weight visit
+/// (256, 128 or 64 rows) or what is left. Each row's outputs do not depend on the count.
+fn projection_rows(left: usize, capacity: usize, tensor_core: bool) -> usize {
+    let rows = left.min(capacity);
+    if tensor_core {
+        return rows;
+    }
+    [256, 128, 64]
+        .into_iter()
+        .find(|&tile| rows >= tile)
+        .unwrap_or(rows)
+}
+
+#[test]
+fn exact_projections_take_whole_visit_tiles() {
+    let runs = |mut left: usize, capacity, tensor_core| {
+        let mut runs = Vec::new();
+        while left > 0 {
+            let rows = projection_rows(left, capacity, tensor_core);
+            runs.push(rows);
+            left -= rows;
+        }
+        runs
+    };
+    assert_eq!(runs(512, 1024, false), [256, 256]);
+    assert_eq!(runs(511, 1024, false), [256, 128, 64, 63]);
+    assert_eq!(runs(512, 100, false), [64; 8]);
+    assert_eq!(runs(30, 1024, false), [30]);
+    assert_eq!(runs(512, 1024, true), [512]);
+    assert_eq!(runs(512, 300, true), [300, 212]);
+}
+
 fn constant(
     constants: &DeviceBuffer,
     index: usize,
@@ -243,10 +276,8 @@ impl CpuForward {
         else {
             return Ok(false);
         };
-        let capacity = bridge
-            .tile_capacity()
-            .min(projector.capacity_for(widths, keep)?);
-        if capacity < 2 {
+        let projected = projector.capacity_for(widths, keep)?;
+        if bridge.tile_capacity().min(projected) < 2 {
             return Ok(false);
         }
         let Some(mut conv) = bridge.admit_conv(self, state, rows)? else {
@@ -285,8 +316,10 @@ impl CpuForward {
             )?;
         }
         prompt.stream.synchronize()?;
-        for first in (0..rows).step_by(capacity) {
-            let count = (rows - first).min(capacity);
+        let mut first = 0;
+        while first < rows {
+            // The attention splits each projected run into its own tiles.
+            let count = projection_rows(rows - first, projected, false);
             let x = prompt
                 .inputs
                 .range(first * row_words * WORD, count * row_words * WORD)?;
@@ -297,6 +330,7 @@ impl CpuForward {
             {
                 return Err(bad("unexpected device prompt attention readback"));
             }
+            first += count;
         }
         let attended = conv.convolved_plane()?;
         if seal {
