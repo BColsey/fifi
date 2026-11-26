@@ -177,7 +177,7 @@ pub(in crate::kernels::cuda) fn effective_taps(
 
 pub(in crate::kernels::cuda) fn launch(
     stream: &RawStream,
-    ranges: [RawRange<'_>; 10],
+    ranges: [RawRange<'_>; 15],
     shape: PrepShape,
     history: usize,
     math: PrepMath,
@@ -192,7 +192,7 @@ pub(in crate::kernels::cuda) fn launch(
     {
         return Err(invalid_argument());
     }
-    validate_f32_ranges(&ranges, shape.words())?;
+    validate_f32_ranges(&ranges, shape.direct_words())?;
     let pointers = ranges.map(|r| r.address());
     let mut stage = STAGE_NONE;
     // SAFETY: the host pointer array lives for the call, and the CUDA spans are

@@ -1,11 +1,15 @@
 //! Prepare one local Inkling attention row before resident relative attention.
 
+use std::mem::size_of;
+
 use crate::EngError;
 use crate::kernels::cuda::{
     CudaContext, DeviceRange, DeviceStream,
     context::{Claim, require_apart, require_fit},
     native::resident,
 };
+
+const WORD: usize = size_of::<f32>();
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrepShape {
@@ -36,6 +40,50 @@ impl PrepShape {
             aux,
             1 + 2 * (queries + kv),
         ]
+    }
+
+    /// The words of the fifteen ranges of [`CudaContext::inkling_local_prep_direct`]: the
+    /// eight rows of [`Self::words`], then the caller's `q_scale`, `rel_scale`, key and value
+    /// conv kernels and the K and V conv histories (which the kernel shifts in place), then
+    /// the status words.
+    pub(crate) fn direct_words(self) -> [usize; 15] {
+        let Self { queries, kv, dims } = self;
+        let q = queries * Self::WIDTH;
+        let rel = queries * dims;
+        let kv_words = kv * Self::WIDTH;
+        let words = self.words();
+        let status = words[9];
+        [
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            words[4],
+            words[5],
+            words[6],
+            words[7],
+            q,
+            rel,
+            kv_words * Self::TAPS,
+            kv_words * Self::TAPS,
+            kv_words * (Self::TAPS - 1),
+            kv_words * (Self::TAPS - 1),
+            status,
+        ]
+    }
+
+    /// The aux block of [`Self::words`] split into the six ranges the kernel reads: the
+    /// position word leads, then `q_scale`, `rel_scale`, the key and value kernels, the K and
+    /// V histories.
+    pub(crate) fn split_aux(self, aux: DeviceRange<'_>) -> Result<[DeviceRange<'_>; 6], EngError> {
+        let words = self.direct_words();
+        let mut at = 1;
+        let mut ranges = Vec::with_capacity(6);
+        for words in &words[8..14] {
+            ranges.push(aux.slice(at * WORD, words * WORD)?);
+            at += words;
+        }
+        Ok(std::array::from_fn(|i| ranges[i]))
     }
 }
 
@@ -264,10 +312,32 @@ impl CudaContext {
         history: usize,
         math: PrepMath,
     ) -> Result<(), EngError> {
+        let [a, b, c, d, e, f, g, h, aux, status] = ranges;
+        let [qs, rs, kk, kv, pk, pv] = shape.split_aux(aux)?;
+        self.inkling_local_prep_direct(
+            stream,
+            [a, b, c, d, e, f, g, h, qs, rs, kk, kv, pk, pv, status],
+            shape,
+            history,
+            math,
+        )
+    }
+
+    /// [`Self::inkling_local_prep`] over the caller's own weight rows and K/V conv histories:
+    /// nothing is staged. The kernel shifts the two history ranges in place (`history` rows
+    /// of `kv * 128` words each, newest first).
+    pub(crate) fn inkling_local_prep_direct(
+        &self,
+        stream: &DeviceStream,
+        ranges: [DeviceRange<'_>; 15],
+        shape: PrepShape,
+        history: usize,
+        math: PrepMath,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        let ranges = ranges.each_ref().map(|range| self.raw_range(range));
-        let [a, b, c, d, e, f, g, h, i, j] = ranges;
-        let ranges = [a?, b?, c?, d?, e?, f?, g?, h?, i?, j?];
+        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o] =
+            ranges.each_ref().map(|range| self.raw_range(range));
+        let ranges = [a?, b?, c?, d?, e?, f?, g?, h?, i?, j?, k?, l?, m?, n?, o?];
         self.launch_on(stream, |raw| {
             resident::inkling_local_prep::launch(raw, ranges, shape, history, math)
         })
