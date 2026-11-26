@@ -549,6 +549,7 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
     let word = size_of::<f32>();
     let kernel = normal_row(&mut Rng::new(0x57a7_eadd), width * taps);
     let sequence = Sequence::new(&ctx, &stream, 8, width, taps, &kernel);
+    let mut host_history = Vec::new();
     for step in 0..6usize {
         let input = normal_row(&mut Rng::new(100 + step as u64), width);
         let history_before = download(
@@ -561,7 +562,6 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
             .conv(&ctx, &stream, step, &input, Output::Disjoint)
             .unwrap();
         let current = normal_row(&mut Rng::new(500 + step as u64), width);
-        let mut host_history = Vec::new();
         let expected = host::apply(&input, &kernel, taps, &mut host_history);
         assert_within_relative(&plain, &expected, "plain output");
         // The state row: the plain output added into it by the add launch ...
