@@ -2,7 +2,7 @@
 
 use crate::EngError;
 use crate::kernels::cuda::{
-    CudaContext, DeviceRange, DeviceStream, PinnedBuf,
+    CudaContext, DeviceRange, DeviceStream,
     context::{Claim, require_apart, require_fit},
     native::resident,
 };
@@ -183,48 +183,6 @@ fn validate_planes<const N: usize>(
 }
 
 impl CudaContext {
-    /// Ordered FP32 RMSNorm followed by gamma; only the status rows are read back.
-    pub(crate) fn inkling_weighted_norm(
-        &self,
-        stream: &DeviceStream,
-        transfer: &mut PinnedBuf,
-        ranges: [DeviceRange<'_>; 4],
-        [rows, width]: [usize; 2],
-        eps: f32,
-    ) -> Result<(), EngError> {
-        let [plane, ..] = (DepthShape {
-            rows,
-            width,
-            depth: 1,
-        })
-        .words()
-        .filter(|_| eps.is_finite() && eps > 0.0)
-        .ok_or_else(|| {
-            EngError::BadRequest("invalid CUDA Inkling norm geometry or epsilon".into())
-        })?;
-        validate_planes(
-            ["input", "gamma", "output", "status"],
-            &ranges,
-            [plane, width, plane, rows],
-        )?;
-        let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
-        let raw = [a?, b?, c?, d?];
-        let queued = self
-            .launch_on(stream, |stream| {
-                resident::inkling_local_prep::weighted_norm(stream, raw, [rows, width], eps)
-            })
-            .and_then(|()| self.copy_to_pinned(stream, ranges[3], transfer, 0));
-        transfer.synchronize_after_enqueue(stream, queued)?;
-        let mut status = vec![0.0; rows];
-        transfer.read_f32(0, &mut status)?;
-        if status.iter().any(|&v| v != 0.0) {
-            return Err(EngError::BadRequest(
-                "non-finite CUDA Inkling MLP norm".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Launch-only, single-row RMSNorm/gamma. The transaction owns the status
     /// word until its final fence; validation still precedes the launch.
     pub(crate) fn enqueue_row_weighted_norm(
@@ -248,91 +206,6 @@ impl CudaContext {
         let raw = [a?, b?, c?, d?];
         self.launch_on(stream, |s| {
             resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps)
-        })
-    }
-
-    /// Form the next raw residual and its normalized scoring plane from
-    /// `[prior, convolved_attention, next_raw, next_normalized]` on one stream.
-    /// At a block boundary the caller retains the sealed prior separately.
-    pub(crate) fn inkling_depth_current(
-        &self,
-        stream: &DeviceStream,
-        ranges: [DeviceRange<'_>; 4],
-        [rows, width]: [usize; 2],
-        boundary: bool,
-    ) -> Result<(), EngError> {
-        self.ensure_usable()?;
-        let [plane, ..] = (DepthShape {
-            rows,
-            width,
-            depth: 1,
-        })
-        .words()
-        .ok_or_else(|| EngError::BadRequest("invalid Inkling current depth shape".into()))?;
-        validate_planes(
-            ["prior", "attention", "raw", "normalized"],
-            &ranges,
-            [plane; 4],
-        )?;
-        let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
-        let ranges = [a?, b?, c?, d?];
-        self.launch_on(stream, |stream| {
-            resident::inkling_local_prep::depth_current(stream, ranges, [rows, width], boundary)
-        })
-    }
-
-    /// Keep normalized depth planes and the mixed output on device. The compact
-    /// round trip preserves host `f32::exp` rounding without moving hidden rows.
-    /// `planes` are in scoring order (newest sealed to oldest, then current).
-    pub(crate) fn inkling_depth_mix(
-        &self,
-        stream: &DeviceStream,
-        transfer: &mut PinnedBuf,
-        [planes, query, compact, output]: [DeviceRange<'_>; 4],
-        shape: DepthShape,
-    ) -> Result<(), EngError> {
-        let [_, _, scores, _] = shape
-            .words()
-            .ok_or_else(|| EngError::BadRequest("invalid CUDA Inkling depth shape".into()))?;
-        let queued = self
-            .inkling_depth_pass(stream, [planes, query, compact], shape, true)
-            .and_then(|()| self.copy_to_pinned(stream, compact, transfer, 0));
-        transfer.synchronize_after_enqueue(stream, queued)?;
-        let mut values = vec![0.0; scores];
-        transfer.read_f32(0, &mut values)?;
-        for row in values.chunks_exact_mut(shape.depth) {
-            if row.iter().any(|v| !v.is_finite()) {
-                return Err(EngError::BadRequest(
-                    "non-finite CUDA Inkling depth score".into(),
-                ));
-            }
-            let peak = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            for v in row {
-                *v = (*v - peak).exp();
-            }
-        }
-        let upload: Vec<_> = values.into_iter().map(f32::to_ne_bytes).collect();
-        transfer.write(0, upload.as_flattened())?;
-        let queued = self
-            .copy_from_pinned(stream, transfer, 0, compact)
-            .and_then(|()| {
-                self.inkling_depth_pass(stream, [planes, compact, output], shape, false)
-            });
-        transfer.synchronize_after_enqueue(stream, queued)
-    }
-
-    fn inkling_depth_pass(
-        &self,
-        stream: &DeviceStream,
-        ranges: [DeviceRange<'_>; 3],
-        shape: DepthShape,
-        scores_only: bool,
-    ) -> Result<(), EngError> {
-        self.ensure_usable()?;
-        let [a, b, c] = ranges.each_ref().map(|r| self.raw_range(r));
-        let ranges = [a?, b?, c?];
-        self.launch_on(stream, |stream| {
-            resident::inkling_local_prep::depth_mix(stream, ranges, shape, scores_only)
         })
     }
 
@@ -413,33 +286,6 @@ mod tests {
         values.iter().map(|x| x.to_ne_bytes()).collect()
     }
 
-    fn reference(planes: &[f32], query: &[f32], shape: DepthShape, row: usize) -> Vec<u32> {
-        let DepthShape { rows, width, depth } = shape;
-        let at = |d| (d * rows + row) * width;
-        let scale = (width as f32).sqrt().recip();
-        let dots: Vec<f32> = (0..depth)
-            .map(|d| {
-                planes[at(d)..][..width]
-                    .iter()
-                    .zip(query)
-                    .map(|(x, q)| x * q)
-                    .sum::<f32>()
-                    * scale
-            })
-            .collect();
-        let peak = dots.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut result = vec![0.0; width];
-        let mut mass = 0.0;
-        for (d, s) in dots.into_iter().enumerate() {
-            let weight = (s - peak).exp();
-            mass += weight;
-            for (sum, x) in result.iter_mut().zip(&planes[at(d)..][..width]) {
-                *sum += weight * x;
-            }
-        }
-        result.into_iter().map(|x| (x / mass).to_bits()).collect()
-    }
-
     /// `ordered_rms_scale` and the scaled output, op for op in scalar order.
     fn ordered_norm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<u32> {
         let squares = x.iter().fold(-0.0f32, |sum, v| sum + v * v);
@@ -466,99 +312,35 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        for [rows, width] in [[1, 129], [1, 1536], [1, 2304], [1, 4096], [3, 2304]] {
-            let shape = DepthShape {
-                rows,
-                width,
-                depth: 1,
-            };
-            let [plane, ..] = shape.words().unwrap();
-            let input = generate(plane);
+        for width in [129, 1536, 2304, 4096] {
+            let input = generate(width);
             let gamma = generate(width);
             let x = upload_bytes(&ctx, bytes(&input).as_flattened());
             let g = upload_bytes(&ctx, bytes(&gamma).as_flattened());
-            let y = ctx.allocate(plane * 4).unwrap();
-            let status = ctx.allocate(rows * 4).unwrap();
-            let mut transfer = ctx.pinned_buf(rows * 4).unwrap();
+            let y = ctx.allocate(width * 4).unwrap();
+            let status = upload_bytes(&ctx, &[0; 4]);
             let eps = 1.0e-6f32;
-            ctx.inkling_weighted_norm(
+            ctx.enqueue_row_weighted_norm(
                 &stream,
-                &mut transfer,
                 [
                     x.range(0, x.bytes()).unwrap(),
                     g.range(0, g.bytes()).unwrap(),
                     y.range(0, y.bytes()).unwrap(),
                     status.range(0, status.bytes()).unwrap(),
                 ],
-                [rows, width],
+                width,
                 eps,
             )
             .unwrap();
+            stream.synchronize().unwrap();
+            assert_eq!(read_bytes(&ctx, &status, 4), [0; 4], "width {width}");
             let actual = read_bytes(&ctx, &y, y.bytes());
-            for (r, row) in actual.chunks_exact(width * 4).enumerate() {
-                let row = row
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|v| u32::from_ne_bytes(*v));
-                assert!(
-                    row.eq(ordered_norm(&input[r * width..][..width], &gamma, eps)),
-                    "{rows} rows, width {width}, row {r}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn depth_mix_round_trips_only_compact_rows_and_matches_scalar_bits() {
-        if !device_present("Inkling CUDA depth mix") {
-            return;
-        }
-        let ctx = CudaContext::new().unwrap();
-        let stream = ctx.stream().unwrap();
-        let mut seed = 15_u32;
-        let mut generate = |n| {
-            (0..n)
-                .map(|_| {
-                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                    (seed >> 8) as f32 * (1.0 / 8388608.0) - 1.0
-                })
-                .collect::<Vec<_>>()
-        };
-        for [rows, width, depth] in [[1, 32, 1], [33, 129, 6], [511, 2304, 9]] {
-            let shape = DepthShape { rows, width, depth };
-            let [p, q, c, o] = shape.words().unwrap();
-            let planes = generate(p);
-            let query = generate(q);
-            let p = upload_bytes(&ctx, bytes(&planes).as_flattened());
-            let q = upload_bytes(&ctx, bytes(&query).as_flattened());
-            let c = ctx.allocate(c * 4).unwrap();
-            let o = ctx.allocate(o * 4).unwrap();
-            let mut transfer = ctx.pinned_buf(c.bytes()).unwrap();
-            ctx.inkling_depth_mix(
-                &stream,
-                &mut transfer,
-                [
-                    p.range(0, p.bytes()).unwrap(),
-                    q.range(0, q.bytes()).unwrap(),
-                    c.range(0, c.bytes()).unwrap(),
-                    o.range(0, o.bytes()).unwrap(),
-                ],
-                shape,
-            )
-            .unwrap();
-            let actual = read_bytes(&ctx, &o, o.bytes());
-            for (r, row) in actual.chunks_exact(width * 4).enumerate() {
-                let row = row
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|v| u32::from_ne_bytes(*v));
-                assert!(
-                    row.eq(reference(&planes, &query, shape, r)),
-                    "{rows}x{width} depth {depth} row {r}"
-                );
-            }
+            let row = actual
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_ne_bytes(*v));
+            assert!(row.eq(ordered_norm(&input, &gamma, eps)), "width {width}");
         }
     }
 

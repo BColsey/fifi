@@ -56,6 +56,21 @@ int inference_cuda_inkling_stream_add(float *state, const float *row, float *hea
 int inference_cuda_inkling_stream_norm(const float *src, float *dst, float *health, int width,
                                        float eps, void *stream, int *out_stage);
 
+/* Host-ordered mix and seal: the same layouts, with every reduction in the host's element order on
+ * one lane, so the results are the host's bits (`Stream::mix`, `Stream::seal`). The mix may take
+ * no query (the output is the raw current row) and a `gamma`: the output is then
+ * `norm(mix) * gamma` with `norm_eps`, as `CpuForward::norm`. Mix output rows are `out_stride`
+ * floats apart. Width at most 4096. */
+int inference_cuda_inkling_stream_mix_ordered(const float *state, const float *query,
+                                              const float *gamma, float *out, float *health,
+                                              int first_block, int blocks, int width,
+                                              float mix_eps, float norm_eps, int rows, int stride,
+                                              int out_stride, void *stream, int *out_stage);
+
+int inference_cuda_inkling_stream_seal_ordered(float *state, const float *next, float *health,
+                                               int blocks, int width, float eps, int rows,
+                                               int stride, void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,8 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 /// Largest `blocks` of a stream state: the mix reads this many sealed rows and the current row.
 pub(crate) const MAX_BLOCKS: usize = 63;
 const MAX_WIDTH: usize = 8192;
+/// Widest row of the host-ordered mix and seal.
+pub(crate) const MAX_ORDERED_WIDTH: usize = 4096;
 
 unsafe extern "C" {
     fn inference_cuda_inkling_stream_mix(
@@ -44,6 +46,37 @@ unsafe extern "C" {
         row: *const c_void,
         health: *mut c_void,
         width: c_int,
+        rows: c_int,
+        stride: c_int,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
+    fn inference_cuda_inkling_stream_mix_ordered(
+        state: *const c_void,
+        query: *const c_void,
+        gamma: *const c_void,
+        out: *mut c_void,
+        health: *mut c_void,
+        first_block: c_int,
+        blocks: c_int,
+        width: c_int,
+        mix_eps: f32,
+        norm_eps: f32,
+        rows: c_int,
+        stride: c_int,
+        out_stride: c_int,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
+    fn inference_cuda_inkling_stream_seal_ordered(
+        state: *mut c_void,
+        next: *const c_void,
+        health: *mut c_void,
+        blocks: c_int,
+        width: c_int,
+        eps: f32,
         rows: c_int,
         stride: c_int,
         stream: *mut c_void,
@@ -166,6 +199,94 @@ pub(in crate::kernels::cuda) fn mix(
     checked(status, stage)
 }
 
+/// Ranges of a host-ordered mix: `query` absent takes the raw current row, `gamma` present
+/// normalizes the mix and scales it (`CpuForward::norm`).
+pub(in crate::kernels::cuda) struct OrderedMixRaw<'a> {
+    pub(in crate::kernels::cuda) state: RawRange<'a>,
+    pub(in crate::kernels::cuda) query: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) gamma: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) out: RawRange<'a>,
+    pub(in crate::kernels::cuda) health: RawRange<'a>,
+}
+
+/// [`mix`] summed in the host's element order on one lane: the host's bits. Output rows are
+/// `out_stride` floats apart.
+pub(in crate::kernels::cuda) fn mix_ordered(
+    stream: &RawStream,
+    call: OrderedMixRaw<'_>,
+    [first_block, blocks, width, out_stride]: [usize; 4],
+    [mix_eps, norm_eps]: [f32; 2],
+    states: States,
+) -> Result<(), DeviceFailure> {
+    let row = width * size_of::<f32>();
+    let state_bytes = states
+        .bytes(blocks + 1, width)
+        .ok_or_else(invalid_argument)?;
+    let out_bytes = ((states.rows - 1) * out_stride + width) * size_of::<f32>();
+    let health_bytes = size_of::<f32>();
+    let valid = first_block <= blocks
+        && width <= MAX_ORDERED_WIDTH
+        && out_stride >= width
+        && c_int::try_from(out_stride).is_ok()
+        && shape(
+            blocks,
+            width,
+            if call.query.is_some() { mix_eps } else { 1.0 },
+        )
+        && shape(
+            blocks,
+            width,
+            if call.gamma.is_some() { norm_eps } else { 1.0 },
+        )
+        && sized(&call.state, state_bytes)
+        && call.query.as_ref().is_none_or(|q| sized(q, row))
+        && call.gamma.as_ref().is_none_or(|g| sized(g, row))
+        && sized(&call.out, out_bytes)
+        && sized(&call.health, health_bytes);
+    if !valid {
+        return Err(invalid_argument());
+    }
+    let out = Span::of(&call.out, out_bytes);
+    let health = Span::of(&call.health, health_bytes);
+    let mut reads = vec![Span::of(&call.state, state_bytes)];
+    reads.extend(
+        call.query
+            .iter()
+            .chain(&call.gamma)
+            .map(|r| Span::of(r, row)),
+    );
+    if !out.apart(&health) || reads.iter().any(|r| !out.apart(r) || !health.apart(r)) {
+        return Err(invalid_argument());
+    }
+    let address = |r: &Option<RawRange<'_>>| {
+        r.as_ref()
+            .map_or(std::ptr::null(), |r| r.address() as *const c_void)
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: the ranges are aligned, hold the extents above and the outputs share no byte with
+    // any other range; absent operands are null, which the entry accepts.
+    let status = unsafe {
+        inference_cuda_inkling_stream_mix_ordered(
+            call.state.address() as *const c_void,
+            address(&call.query),
+            address(&call.gamma),
+            call.out.address(),
+            call.health.address(),
+            first_block as c_int,
+            blocks as c_int,
+            width as c_int,
+            mix_eps,
+            norm_eps,
+            states.rows as c_int,
+            states.stride as c_int,
+            out_stride as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
 /// `sealed[blocks] = current * rms_scale(current)`, then `current = next` (`Stream::seal(next)`).
 /// `state` must hold the new sealed row: `blocks + 2` rows.
 pub(in crate::kernels::cuda) fn seal(
@@ -177,6 +298,45 @@ pub(in crate::kernels::cuda) fn seal(
     eps: f32,
     states: States,
 ) -> Result<(), DeviceFailure> {
+    seal_with(
+        false,
+        stream,
+        [state, next, health],
+        [blocks, width],
+        eps,
+        states,
+    )
+}
+
+/// [`seal`] with the scale summed in the host's element order: the host's bits.
+pub(in crate::kernels::cuda) fn seal_ordered(
+    stream: &RawStream,
+    [state, next, health]: [RawRange<'_>; 3],
+    [blocks, width]: [usize; 2],
+    eps: f32,
+    states: States,
+) -> Result<(), DeviceFailure> {
+    seal_with(
+        true,
+        stream,
+        [state, next, health],
+        [blocks, width],
+        eps,
+        states,
+    )
+}
+
+fn seal_with(
+    ordered: bool,
+    stream: &RawStream,
+    [state, next, health]: [RawRange<'_>; 3],
+    [blocks, width]: [usize; 2],
+    eps: f32,
+    states: States,
+) -> Result<(), DeviceFailure> {
+    if ordered && width > MAX_ORDERED_WIDTH {
+        return Err(invalid_argument());
+    }
     let row = width * size_of::<f32>();
     let state_bytes = states
         .bytes(blocks + 2, width)
@@ -203,8 +363,13 @@ pub(in crate::kernels::cuda) fn seal(
     }
     let mut stage = STAGE_NONE;
     // SAFETY: the ranges are aligned, hold the extents above and share no byte.
+    let entry = if ordered {
+        inference_cuda_inkling_stream_seal_ordered
+    } else {
+        inference_cuda_inkling_stream_seal
+    };
     let status = unsafe {
-        inference_cuda_inkling_stream_seal(
+        entry(
             state.address(),
             next.address() as *const c_void,
             health.address(),

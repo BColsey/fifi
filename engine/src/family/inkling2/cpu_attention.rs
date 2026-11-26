@@ -1076,6 +1076,11 @@ impl PrefillBridge<'_> {
         attention::prefill::projection_side(self.scales.is_some(), self.kv)
     }
 
+    /// The most rows one attention tile takes.
+    pub(super) fn tile_capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(super) fn admit_conv(
         &self,
         forward: &CpuForward,
@@ -1104,8 +1109,14 @@ impl PrefillBridge<'_> {
         let heads = self.heads;
         let channels = heads.kv_channels();
         let taps = forward.math.sconv_kernel_size;
-        // The host convolution's rule: per-row taps were projected exactly when they are dynamic.
+        // The host convolution's rule: per-row taps were projected exactly when they are dynamic,
+        // and only global visits project them.
         let dynamic = !coefficients.is_empty();
+        if dynamic != (self.visit.attention == Attention::Global) {
+            return Err(super::bad(
+                "Inkling K/V preparation taps disagree with the visit's attention",
+            ));
+        }
         let name = if dynamic { "static_w" } else { "weight" };
         let [k, v] = ["k", "v"].map(|plane| {
             forward.weights.vec(

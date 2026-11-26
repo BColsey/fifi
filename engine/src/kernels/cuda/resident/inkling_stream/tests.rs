@@ -86,7 +86,7 @@ mod host {
         let mut mass = 0.0f32;
         let mut output = vec![0.0f32; query.len()];
         for (score, row) in scores.into_iter().zip(&rows) {
-            let weight = (score - peak).exp();
+            let weight = crate::kernels::portable_exp::portable_exp(score - peak);
             mass += weight;
             for (out, value) in output.iter_mut().zip(row.iter()) {
                 *out += weight * value;

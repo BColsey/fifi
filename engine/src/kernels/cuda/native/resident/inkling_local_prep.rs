@@ -20,24 +20,6 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_inkling_depth_current(
-        ranges: *const *mut c_void,
-        rows: c_int,
-        width: c_int,
-        boundary: c_int,
-        stream: *mut c_void,
-        stage: *mut c_int,
-    ) -> c_int;
-    fn inference_cuda_inkling_depth_mix(
-        ranges: *const *mut c_void,
-        rows: c_int,
-        width: c_int,
-        depth: c_int,
-        scale: f32,
-        scores_only: c_int,
-        stream: *mut c_void,
-        stage: *mut c_int,
-    ) -> c_int;
     fn inference_cuda_inkling_output_conv(
         ranges: *const *mut c_void,
         rows: c_int,
@@ -95,68 +77,6 @@ pub(in crate::kernels::cuda) fn weighted_norm(
             rows as c_int,
             width as c_int,
             eps,
-            stream.0.as_ptr(),
-            &mut stage,
-        )
-    };
-    checked(status, stage)
-}
-
-pub(in crate::kernels::cuda) fn depth_current(
-    stream: &RawStream,
-    ranges: [RawRange<'_>; 4],
-    [rows, width]: [usize; 2],
-    boundary: bool,
-) -> Result<(), DeviceFailure> {
-    let [plane, ..] = (DepthShape {
-        rows,
-        width,
-        depth: 1,
-    })
-    .words()
-    .ok_or_else(invalid_argument)?;
-    validate_f32_ranges(&ranges, [plane; 4])?;
-    let pointers = ranges.map(|r| r.address());
-    let mut stage = STAGE_NONE;
-    // SAFETY: bounded dimensions and disjoint aligned f32 planes above cover the launch.
-    let status = unsafe {
-        inference_cuda_inkling_depth_current(
-            pointers.as_ptr(),
-            rows as c_int,
-            width as c_int,
-            boundary.into(),
-            stream.0.as_ptr(),
-            &mut stage,
-        )
-    };
-    checked(status, stage)
-}
-
-pub(in crate::kernels::cuda) fn depth_mix(
-    stream: &RawStream,
-    ranges: [RawRange<'_>; 3],
-    shape: DepthShape,
-    scores_only: bool,
-) -> Result<(), DeviceFailure> {
-    let [planes, query, scores, output] = shape.words().ok_or_else(invalid_argument)?;
-    let words = if scores_only {
-        [planes, query, scores]
-    } else {
-        [planes, scores, output]
-    };
-    validate_f32_ranges(&ranges, words)?;
-    let pointers = ranges.map(|r| r.address());
-    let mut stage = STAGE_NONE;
-    // SAFETY: the pointer list is consumed by the host stub; exact, disjoint
-    // and aligned extents above cover all device accesses for this geometry.
-    let status = unsafe {
-        inference_cuda_inkling_depth_mix(
-            pointers.as_ptr(),
-            shape.rows as c_int,
-            shape.width as c_int,
-            shape.depth as c_int,
-            (shape.width as f32).sqrt().recip(),
-            scores_only.into(),
             stream.0.as_ptr(),
             &mut stage,
         )

@@ -21,7 +21,7 @@ use crate::{
 };
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-mod resident_first;
+mod device_visit;
 mod resident_mlp;
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -55,6 +55,73 @@ impl PromptRow<'_> {
             });
         }
         Ok(())
+    }
+}
+
+/// The device prompt streams of a grouped prefill: open across unbanked visits, written back
+/// to the host rows wherever a host stream is needed.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+struct DeviceRun {
+    prompt: Option<device_visit::DevicePrompt>,
+    enabled: bool,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl DeviceRun {
+    fn new(enabled: bool) -> Self {
+        Self {
+            prompt: None,
+            enabled,
+        }
+    }
+
+    /// Writes the device streams into the rows; `close` also drops them.
+    fn materialize(&mut self, rows: &mut [PromptRow<'_>], close: bool) -> Result<(), EngError> {
+        if let Some(prompt) = &self.prompt {
+            prompt.materialize(rows)?;
+        }
+        if close {
+            self.prompt = None;
+        }
+        Ok(())
+    }
+
+    /// Runs visit `index` on the device streams when it has no bank; false leaves it, and the
+    /// rows' host streams, to the host path. A decline ends the device run for this prompt.
+    fn visit(
+        &mut self,
+        forward: &CpuForward,
+        visit: LayerVisit,
+        state: &mut VisitState,
+        rows: &mut [PromptRow<'_>],
+        weights: &GgufTextWeights,
+        index: usize,
+    ) -> Result<bool, EngError> {
+        if !self.enabled || rows.iter().any(|row| row.bank.is_some()) {
+            return Ok(false);
+        }
+        if self.prompt.is_none() {
+            // Room for every block the remaining visits could seal.
+            let block = forward.spec.n_layers_per_attn_res_block;
+            let seals = forward.visits[index..]
+                .iter()
+                .filter(|v| v.weight_layer.is_multiple_of(block))
+                .count();
+            self.prompt = device_visit::DevicePrompt::open(forward, weights, rows, seals)?;
+        }
+        let Some(prompt) = self.prompt.as_mut() else {
+            self.enabled = false;
+            return Ok(false);
+        };
+        let physical = visit.weight_layer;
+        let layer = format!("model.llm.layers.{physical}");
+        let prefix = format!("{layer}.mlp");
+        if forward.device_prompt_visit(visit, state, prompt, weights, (&layer, &prefix))? {
+            return Ok(true);
+        }
+        self.materialize(rows, true)?;
+        self.enabled = false;
+        Ok(false)
     }
 }
 
@@ -274,11 +341,18 @@ impl CpuForward {
         let end = core.core_start + width * core.num_passes;
         let mut resident_mlp = (!verify && !self.draft_window_enabled() && resident_mlp::enabled())
             .then(resident_mlp::Workspace::default);
-        for &visit in &self.visits {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        let mut device = DeviceRun::new(!verify && !self.draft_window_enabled());
+        for (index, &visit) in self.visits.iter().enumerate() {
             let slot = visit.state_slot;
-            if (core.core_start..end).contains(&slot)
-                && (slot - core.core_start).is_multiple_of(width)
-            {
+            let pass_start = (core.core_start..end).contains(&slot)
+                && (slot - core.core_start).is_multiple_of(width);
+            // Passes and the coda start from the host streams.
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            if pass_start || slot == end {
+                device.materialize(&mut rows, slot != core.core_start)?;
+            }
+            if pass_start {
                 for row in &mut rows {
                     row.begin_pass((slot - core.core_start) / width)?;
                 }
@@ -288,6 +362,10 @@ impl CpuForward {
                     row.prelude = None;
                 }
             }
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            if device.visit(self, visit, &mut state[slot], &mut rows, weights, index)? {
+                continue;
+            }
             self.prompt_visit(
                 visit,
                 &mut state[slot],
@@ -296,6 +374,8 @@ impl CpuForward {
                 (verify, resident_mlp.as_mut()),
             )?;
         }
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        device.materialize(&mut rows, true)?;
         Ok(rows)
     }
 
@@ -362,20 +442,6 @@ impl CpuForward {
                 None
             };
         let control_batched = controller.is_some() || resident.is_some();
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        if batched_attention
-            && let Some((inputs, _)) = &attention_inputs
-            && self.try_resident_first_visit(
-                visit,
-                state,
-                rows,
-                weights,
-                (&layer, &prefix),
-                inputs,
-            )?
-        {
-            return Ok(());
-        }
         let batched = if let Some(chained) = chained {
             let outputs = match chained {
                 ChainedAttention::Host(p) => {

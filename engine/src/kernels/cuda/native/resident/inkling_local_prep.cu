@@ -198,55 +198,6 @@ __global__ void inkling_weighted_norm(const float *input, const float *gamma,
     const int failed = __syncthreads_or(bad);
     if (lane == 0) status[row] = failed ? 1.f : 0.f;
 }
-
-// One CTA per token, with ordered accumulation matching Rust's depth RMSNorm.
-// The raw result feeds the residual stream; the normalized plane feeds depth.
-__global__ void inkling_depth_current(const float *prior, const float *attention,
-    float *raw, float *normalized, int width, bool boundary) {
-    const int offset = blockIdx.x * width;
-    const int lane = threadIdx.x;
-    __shared__ float scale;
-    for (int i = lane; i < width; i += blockDim.x) {
-        const int at = offset + i;
-        const float out = attention[at];
-        raw[at] = boundary ? out : __fadd_rn(prior[at], __fmul_rn(out, 1.f));
-    }
-    __syncthreads();
-    // Poison the depth score on overflow instead of silently normalizing to zero.
-    if (lane == 0) scale = ordered_rms_scale(raw + offset, width, 1.e-6f);
-    __syncthreads();
-    for (int i = lane; i < width; i += blockDim.x)
-        normalized[offset + i] = __fmul_rn(raw[offset + i], scale);
-}
-
-// Planes are normalized and packed in the CPU traversal order: most recent
-// sealed block first and current last. Each dot accumulates in scalar order.
-__global__ void inkling_depth_scores(const float *planes, const float *query,
-                                      float *scores, int rows, int width, int depth, float scale) {
-    const int row = blockIdx.x;
-    const int d = threadIdx.x;
-    if (d >= depth) return;
-    const float *current = planes + (d * rows + row) * width;
-    float acc = -0.f;
-    for (int k = 0; k < width; ++k)
-        acc = __fadd_rn(acc, __fmul_rn(current[k], query[k]));
-    scores[row * depth + d] = __fmul_rn(acc, scale);
-}
-
-__global__ void inkling_depth_mix(const float *planes, const float *weights,
-                                   float *output, int rows, int width, int depth) {
-    const int row = blockIdx.y;
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= width) return;
-    float sum = 0.f;
-    float mass = 0.f;
-    for (int d = 0; d < depth; ++d) {
-        const float weight = weights[row * depth + d];
-        mass = __fadd_rn(mass, weight);
-        sum = __fadd_rn(sum, __fmul_rn(weight, planes[(d * rows + row) * width + k]));
-    }
-    output[row * width + k] = __fdiv_rn(sum, mass);
-}
 } // namespace
 
 extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, int width,
@@ -254,35 +205,6 @@ extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, in
     inkling_weighted_norm<<<rows, 128, 0, (cudaStream_t)stream>>>(
         static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
         static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
-    Failure failure;
-    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-    report_stage(out_stage, failure.stage);
-    return (int)failure.err;
-}
-
-extern "C" int inference_cuda_inkling_depth_current(void *const *p, int rows, int width,
-    int boundary, void *stream, int *out_stage) {
-    inkling_depth_current<<<rows, 128, 0, (cudaStream_t)stream>>>(
-        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
-        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, boundary != 0);
-    Failure failure;
-    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-    report_stage(out_stage, failure.stage);
-    return (int)failure.err;
-}
-
-extern "C" int inference_cuda_inkling_depth_mix(void *const *p, int rows, int width,
-    int depth, float scale, int scores_only, void *stream, int *out_stage) {
-    if (scores_only) {
-        inkling_depth_scores<<<rows, 32, 0, (cudaStream_t)stream>>>(
-            static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
-            static_cast<float *>(p[2]), rows, width, depth, scale);
-    } else {
-        constexpr int block = 128;
-        inkling_depth_mix<<<dim3((width + block - 1) / block, rows), block, 0, (cudaStream_t)stream>>>(
-            static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
-            static_cast<float *>(p[2]), rows, width, depth);
-    }
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

@@ -25,6 +25,30 @@ fn finish_borrowed<T>(
     }
 }
 
+/// Runs `project` and reads its host outputs back; without host outputs, fences the stream.
+fn project_and_read(
+    stream: &DeviceStream,
+    project: impl FnOnce() -> Result<(), EngError>,
+    output: Option<DeviceRange<'_>>,
+) -> Result<Vec<f32>, EngError> {
+    let mut bytes = vec![[0; 4]; output.map_or(0, |o| o.bytes()) / 4];
+    finish_borrowed(stream, || {
+        project()?;
+        match output {
+            Some(o) => o
+                .buffer()
+                .read_at(stream, o.offset(), bytes.as_flattened_mut()),
+            // Attention reads the sidecar on its own stream.
+            None => stream.synchronize(),
+        }
+    })?;
+    let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
+    if !values.iter().all(|v| v.is_finite()) {
+        return Err(bad("CUDA projection produced a nonfinite output"));
+    }
+    Ok(values)
+}
+
 pub(in crate::family::inkling2) struct PrefillProjection<'a> {
     pub(in crate::family::inkling2::cuda_projection) context: &'a CudaContext,
     pub(in crate::family::inkling2::cuda_projection) step: &'a DenseStep,
@@ -42,6 +66,18 @@ impl PrefillProjection<'_> {
             .projection_tile_capacity(&Layout::new(input, self.weights, keep), self.scratch)
     }
 
+    /// [`Self::capacity`] for inputs of these widths.
+    pub(in crate::family::inkling2) fn capacity_for(
+        &self,
+        widths: [usize; 3],
+        keep: &[usize],
+    ) -> Result<usize, EngError> {
+        self.step.projection_tile_capacity(
+            &Layout::with_widths(widths, self.weights, keep),
+            self.scratch,
+        )
+    }
+
     #[allow(clippy::type_complexity)]
     pub(in crate::family::inkling2) fn tile(
         &self,
@@ -51,19 +87,58 @@ impl PrefillProjection<'_> {
         let first = inputs
             .first()
             .ok_or_else(|| bad("empty Inkling prefill projection tile"))?;
-        let layout = Layout::new(*first, self.weights, keep);
+        self.tile_from(Source::Host(inputs), first.map(<[f32]>::len), keep)
+    }
+
+    /// [`Self::tile`] of `rows` rows whose three inputs the device already holds, packed per row
+    /// (`widths` summed apart) in `x`. The caller must have finished writing `x`.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::family::inkling2) fn tile_device(
+        &self,
+        x: DeviceRange<'_>,
+        (rows, widths): (usize, [usize; 3]),
+        keep: &[usize],
+    ) -> Result<(Vec<[Vec<f32>; 8]>, DeviceRange<'_>), EngError> {
+        self.tile_from(Source::Device(x, rows), widths, keep)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn tile_from(
+        &self,
+        source: Source<'_>,
+        widths: [usize; 3],
+        keep: &[usize],
+    ) -> Result<(Vec<[Vec<f32>; 8]>, DeviceRange<'_>), EngError> {
+        let layout = Layout::with_widths(widths, self.weights, keep);
+        let rows = source.rows();
         let (values, side) = self.step.project_group_tile(
             self.context,
-            inputs,
+            source,
             self.weights,
             &layout,
             self.scratch,
             true,
         )?;
         Ok((
-            layout.host_rows(&values, inputs.len()).collect(),
+            layout.host_rows(&values, rows).collect(),
             side.ok_or_else(|| bad("missing Inkling attention sidecar"))?,
         ))
+    }
+}
+
+/// Where a projection tile's inputs are: host rows, or `rows` rows already on the device.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Host(&'a [[&'a [f32]; 3]]),
+    Device(DeviceRange<'a>, usize),
+}
+
+impl Source<'_> {
+    fn rows(self) -> usize {
+        match self {
+            Self::Host(inputs) => inputs.len(),
+            Self::Device(_, rows) => rows,
+        }
     }
 }
 
@@ -79,16 +154,20 @@ impl<const N: usize> Layout<N> {
         weights: [Option<ResidentProjection<'_>>; N],
         keep: &[usize],
     ) -> Self {
+        Self::with_widths(inputs.map(<[f32]>::len), weights, keep)
+    }
+
+    fn with_widths(
+        input: [usize; 3],
+        weights: [Option<ResidentProjection<'_>>; N],
+        keep: &[usize],
+    ) -> Self {
         let mut host = weights.map(|projection| projection.map_or(0, |p| p.weight.shape[0]));
         let mut side = [0; N];
         for &i in keep {
             side[i] = std::mem::take(&mut host[i]);
         }
-        Self {
-            input: inputs.map(<[f32]>::len),
-            host,
-            side,
-        }
+        Self { input, host, side }
     }
 
     /// The `m` host rows of `values`, which are empty when every output stays on the device.
@@ -130,7 +209,7 @@ impl DenseStep {
         for chunk in inputs.chunks(tile) {
             let (values, _) = self.project_group_tile(
                 context,
-                chunk,
+                Source::Host(chunk),
                 weights,
                 &layout,
                 None,
@@ -165,15 +244,21 @@ impl DenseStep {
     fn project_group_tile<'a, const N: usize>(
         &'a self,
         context: &CudaContext,
-        inputs: &[[&[f32]; 3]],
+        source: Source<'_>,
         weights: [Option<ResidentProjection<'_>>; N],
         layout: &Layout<N>,
         scratch: Option<&'a DeviceBuffer>,
         allow_q8_row_reuse: bool,
     ) -> Result<(Vec<f32>, Option<DeviceRange<'a>>), EngError> {
-        if inputs
-            .iter()
-            .any(|row| row.map(<[f32]>::len) != layout.input)
+        let m = source.rows();
+        let ld_x: usize = layout.input.iter().sum();
+        let shape_differs = match source {
+            Source::Host(inputs) => inputs
+                .iter()
+                .any(|row| row.map(<[f32]>::len) != layout.input),
+            Source::Device(x, _) => m == 0 || Some(x.bytes()) != m.checked_mul(ld_x * 4),
+        };
+        if shape_differs
             || weights
                 .iter()
                 .flatten()
@@ -181,8 +266,6 @@ impl DenseStep {
         {
             return Err(bad("batched CUDA attention projection input shape differs"));
         }
-        let m = inputs.len();
-        let ld_x: usize = layout.input.iter().sum();
         let ld_host: usize = layout.host.iter().sum();
         let ld_side: usize = layout.side.iter().sum();
         let input_words = m * ld_x;
@@ -220,12 +303,16 @@ impl DenseStep {
                 ld_y,
             };
             let need = dense_gemv_bytes(shape, p.dtype)?;
-            let input_offset = layout.input[..p.input].iter().sum();
+            let input_offset: usize = layout.input[..p.input].iter().sum();
+            let x = match source {
+                Source::Host(_) => range(input_offset, need.x / size_of::<f32>())?,
+                Source::Device(x, _) => x.slice(float_bytes(input_offset)?, need.x)?,
+            };
             calls.push(DenseGemvCall {
                 shape,
                 dtype: p.dtype,
                 w: p.weight.codes.range(0, need.w)?,
-                x: range(input_offset, need.x / size_of::<f32>())?,
+                x,
                 y: range(output_offset, need.y / size_of::<f32>())?,
             });
         }
@@ -241,32 +328,23 @@ impl DenseStep {
                 context.dense_gemv_group(&self.stream, &calls)
             }
         };
-        let input_rows: Vec<_> = inputs.iter().flatten().copied().collect();
-        let values = if let Some(buffer) = scratch {
-            let mut encoded = Vec::with_capacity(input.bytes());
-            for row in &input_rows {
-                if !row.iter().all(|v| v.is_finite()) {
-                    return Err(bad("CUDA projection requires finite input"));
+        let values = match (source, scratch) {
+            (Source::Device(..), _) => project_and_read(&self.stream, project, output)?,
+            (Source::Host(inputs), Some(buffer)) => {
+                let mut encoded = Vec::with_capacity(input.bytes());
+                for row in inputs.iter().flatten() {
+                    if !row.iter().all(|v| v.is_finite()) {
+                        return Err(bad("CUDA projection requires finite input"));
+                    }
+                    encoded.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
                 }
-                encoded.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
+                buffer.write_at(&self.stream, input.offset(), &encoded)?;
+                project_and_read(&self.stream, project, output)?
             }
-            buffer.write_at(&self.stream, input.offset(), &encoded)?;
-            let mut bytes = vec![[0; 4]; output.map_or(0, |o| o.bytes()) / 4];
-            finish_borrowed(&self.stream, || {
-                project()?;
-                match output {
-                    Some(o) => buffer.read_at(&self.stream, o.offset(), bytes.as_flattened_mut()),
-                    // Attention reads the sidecar on its own stream.
-                    None => self.stream.synchronize(),
-                }
-            })?;
-            let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
-            if !values.iter().all(|v| v.is_finite()) {
-                return Err(bad("CUDA projection produced a nonfinite output"));
+            (Source::Host(inputs), None) => {
+                let input_rows: Vec<_> = inputs.iter().flatten().copied().collect();
+                self.run_rows_into(context, &self.stream, &input_rows, (input, output), project)?
             }
-            values
-        } else {
-            self.run_rows_into(context, &self.stream, &input_rows, (input, output), project)?
         };
         // run_rows fenced the producer stream; attention may consume this range on its own stream.
         Ok((values, side))
@@ -397,7 +475,14 @@ mod tests {
             7
         );
         let (values, side) = step
-            .project_group_tile(&context, &input, weights, &layout, Some(&scratch), true)
+            .project_group_tile(
+                &context,
+                Source::Host(&input),
+                weights,
+                &layout,
+                Some(&scratch),
+                true,
+            )
             .unwrap();
         assert!(side.is_none());
         assert_eq!(

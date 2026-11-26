@@ -32,6 +32,7 @@ pub mod expert_cpu_q8k;
 ))]
 mod gated_delta;
 mod packed;
+pub(crate) mod portable_exp;
 mod rope;
 // The CUDA sampler will consume the request encoding; until then
 // portable builds compile it for unit tests only.

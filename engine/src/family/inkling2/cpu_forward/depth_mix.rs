@@ -3,6 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use super::{MIX_EPS, add, dot, rms_norm};
+use crate::kernels::portable_exp::portable_exp;
 
 /// The current residual row and the sealed depth blocks. Each sealed block is stored
 /// RMS-normalized once, when its boundary publishes it, and the normalized current row is
@@ -21,6 +22,16 @@ impl Stream {
         Self {
             current,
             sealed: Vec::new(),
+            normalized: OnceLock::new(),
+        }
+    }
+
+    /// A stream from its current row and its sealed rows, already normalized, oldest first.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn from_parts(current: Vec<f32>, sealed: Vec<Vec<f32>>) -> Self {
+        Self {
+            current,
+            sealed: sealed.into_iter().map(Arc::new).collect(),
             normalized: OnceLock::new(),
         }
     }
@@ -139,7 +150,7 @@ fn weighted_mix<'a>(
     let mut mass = 0.0;
     let mut output = vec![0.0; width];
     for (score, row) in rows {
-        let weight = (score - peak).exp();
+        let weight = portable_exp(score - peak);
         mass += weight;
         add(&mut output, row, weight);
     }

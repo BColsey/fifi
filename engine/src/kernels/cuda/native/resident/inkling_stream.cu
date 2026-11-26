@@ -73,6 +73,29 @@ __device__ const float *mix_row(const float *state, int blocks, int rows, int r,
     return state + (static_cast<size_t>(blocks) - r) * width;
 }
 
+// e^x from IEEE double additions and multiplications only: the host's portable_exp
+// (kernels/portable_exp.rs), bit for bit, whatever the host's libm.
+__device__ float portable_exp(float x) {
+    if (isnan(x)) return x;
+    if (!(x > -110.0f)) return 0.0f;
+    if (x > 89.0f) return INFINITY;
+    // 2^r = sum of (r ln 2)^i / i! for |r| <= 1/2, to the ninth power.
+    const long long terms[10] = {0x3ff0000000000000LL, 0x3fe62e42fefa39efLL, 0x3fcebfbdff82c58fLL,
+                                 0x3fac6b08d704a0c0LL, 0x3f83b2ab6fba4e77LL, 0x3f55d87fe78a6731LL,
+                                 0x3f2430912f86c787LL, 0x3eeffcbfc588b0c7LL, 0x3eb62c0223a5c824LL,
+                                 0x3e7b5253d395e7c4LL};
+    // Adding and removing 1.5 * 2^52 rounds a double of magnitude below 2^51 to an integer.
+    const double shift = 6755399441055744.0;
+    const double z = __dmul_rn(static_cast<double>(x), __longlong_as_double(0x3ff71547652b82feLL));
+    const double k = __dadd_rn(__dadd_rn(z, shift), -shift);
+    const double r = __dadd_rn(z, -k);
+    double p = __longlong_as_double(terms[9]);
+#pragma unroll
+    for (int i = 8; i >= 0; --i) p = __dadd_rn(__dmul_rn(p, r), __longlong_as_double(terms[i]));
+    const double scale = __longlong_as_double((static_cast<long long>(k) + 1023) << 52);
+    return __double2float_rn(__dmul_rn(p, scale));
+}
+
 // Quiet NaN in the health word of a block whose inputs or outputs were not finite.
 __device__ void report(float *health, int invalid) {
     if (__syncthreads_or(invalid) != 0 && threadIdx.x == 0) health[0] = __int_as_float(0x7fc00000);
@@ -168,10 +191,7 @@ __global__ void inkling_stream_mix(const float *state, const float *query, float
         for (int r = 0; r < rows; ++r) peak = fmaxf(peak, scores[r]);
         float mass = 0.0f;
         for (int r = 0; r < rows; ++r) {
-            // The host takes f32::exp of (score - peak) through libm. exp in double, rounded,
-            // is within a half ulp of it; --use_fast_math leaves the double function alone.
-            const float weight =
-                static_cast<float>(exp(static_cast<double>(__fsub_rn(scores[r], peak))));
+            const float weight = portable_exp(__fsub_rn(scores[r], peak));
             weights[r] = weight;
             mass = __fadd_rn(mass, weight);
         }
@@ -265,6 +285,127 @@ __global__ void inkling_stream_norm(const float *src, float *dst, float *health,
         const float value = __fmul_rn(src[i], scale);
         dst[i] = value;
         invalid |= !isfinite(value);
+    }
+    report(health, invalid);
+}
+
+// Host-ordered variants of the mix and the seal (`Stream::mix`, `Stream::seal` and
+// `CpuForward::norm` of the host): every reduction runs on one lane in the host's element order,
+// so the results are the host's bits. One block per state; the other lanes stage the normalized
+// current row and write the outputs, and the states of a prompt keep the card busy.
+constexpr int ordered_max_width = 4096;
+
+// The host's rms_norm_with_scale scale, summed in element order on the calling lane.
+__device__ float ordered_scale(const float *row, int width, float eps) {
+    float squares = -0.0f;
+    for (int i = 0; i < width; ++i) squares = __fadd_rn(squares, __fmul_rn(row[i], row[i]));
+    return __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(squares, static_cast<float>(width)), eps)));
+}
+
+__device__ float ordered_dot(const float *x, const float *y, int width) {
+    float sum = -0.0f;
+    for (int i = 0; i < width; ++i) sum = __fadd_rn(sum, __fmul_rn(x[i], y[i]));
+    return sum;
+}
+
+// out = norm(mix) * gamma when `gamma` is set, else the mix. Without a query the mix is the raw
+// current row (the first visit's input). Output rows are `out_stride` floats apart.
+__global__ void inkling_stream_mix_ordered(const float *state, const float *query,
+                                           const float *gamma, float *out, float *health,
+                                           int first_block, int blocks, int width, float mix_eps,
+                                           float norm_eps, int stride, int out_stride) {
+    state += static_cast<size_t>(blockIdx.x) * stride * width;
+    out += static_cast<size_t>(blockIdx.x) * out_stride;
+    extern __shared__ float ordered[];
+    float *current = ordered;
+    float *mixed = ordered + width;
+    __shared__ float scores[max_rows];
+    __shared__ float weights[max_rows];
+    __shared__ float scalars[2];
+    const int lane = threadIdx.x;
+    int invalid = 0;
+    if (query) {
+        const int rows = blocks - first_block + 1;
+        // Lane 0 scales the current row while warp 1 scores the sealed rows, one lane each.
+        if (lane == 0) {
+            scalars[0] = ordered_scale(state, width, mix_eps);
+        } else if (lane >= 32 && lane - 32 < rows - 1) {
+            scores[lane - 32] = ordered_dot(mix_row(state, blocks, rows, lane - 32, width), query, width);
+        }
+        __syncthreads();
+        const float scale = scalars[0];
+        for (int i = lane; i < width; i += threads) {
+            const float value = state[i];
+            invalid |= !isfinite(value);
+            current[i] = __fmul_rn(value, scale);
+        }
+        __syncthreads();
+        if (lane == 0) {
+            scores[rows - 1] = ordered_dot(current, query, width);
+            const float inverse = __frcp_rn(__fsqrt_rn(static_cast<float>(width)));
+            float peak = -INFINITY;
+            for (int r = 0; r < rows; ++r) {
+                scores[r] = __fmul_rn(scores[r], inverse);
+                peak = fmaxf(peak, scores[r]);
+            }
+            float mass = 0.0f;
+            for (int r = 0; r < rows; ++r) {
+                const float weight = portable_exp(__fsub_rn(scores[r], peak));
+                weights[r] = weight;
+                mass = __fadd_rn(mass, weight);
+            }
+            scalars[1] = mass;
+            invalid |= !isfinite(mass) || !isfinite(peak);
+        }
+        __syncthreads();
+        const float mass = scalars[1];
+        for (int c = lane; c < width; c += threads) {
+            float sum = 0.0f;
+            for (int r = 0; r < rows - 1; ++r) {
+                sum = __fadd_rn(sum, __fmul_rn(weights[r], mix_row(state, blocks, rows, r, width)[c]));
+            }
+            sum = __fadd_rn(sum, __fmul_rn(weights[rows - 1], current[c]));
+            mixed[c] = __fdiv_rn(sum, mass);
+        }
+    } else {
+        for (int c = lane; c < width; c += threads) mixed[c] = state[c];
+    }
+    __syncthreads();
+    if (gamma) {
+        if (lane == 0) scalars[0] = ordered_scale(mixed, width, norm_eps);
+        __syncthreads();
+        const float scale = scalars[0];
+        for (int c = lane; c < width; c += threads) {
+            const float value = __fmul_rn(__fmul_rn(mixed[c], scale), gamma[c]);
+            out[c] = value;
+            invalid |= !isfinite(value);
+        }
+    } else {
+        for (int c = lane; c < width; c += threads) {
+            out[c] = mixed[c];
+            invalid |= !isfinite(mixed[c]);
+        }
+    }
+    report(health, invalid);
+}
+
+__global__ void inkling_stream_seal_ordered(float *state, const float *next, float *health,
+                                            int blocks, int width, float eps, int stride) {
+    state += static_cast<size_t>(blockIdx.x) * stride * width;
+    next += static_cast<size_t>(blockIdx.x) * width;
+    __shared__ float shared_scale;
+    const int lane = threadIdx.x;
+    if (lane == 0) shared_scale = ordered_scale(state, width, eps);
+    __syncthreads();
+    const float scale = shared_scale;
+    float *sealed = state + (static_cast<size_t>(blocks) + 1) * width;
+    int invalid = !isfinite(scale);
+    for (int i = lane; i < width; i += threads) {
+        const float value = __fmul_rn(state[i], scale);
+        const float replacement = next[i];
+        sealed[i] = value;
+        state[i] = replacement;
+        invalid |= !isfinite(value) || !isfinite(replacement);
     }
     report(health, invalid);
 }
@@ -377,6 +518,64 @@ extern "C" int inference_cuda_inkling_stream_norm(const float *src, float *dst, 
     }
     inkling_stream_norm<<<1, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         src, dst, health, width, eps);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return static_cast<int>(failure.err);
+}
+
+extern "C" int inference_cuda_inkling_stream_mix_ordered(
+    const float *state, const float *query, const float *gamma, float *out, float *health,
+    int first_block, int blocks, int width, float mix_eps, float norm_eps, int rows, int stride,
+    int out_stride, void *stream, int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    if (!state || !out || !health || !stream || !aligned(state) || !aligned(query) ||
+        !aligned(gamma) || !aligned(out) || !aligned(health) || width > ordered_max_width ||
+        !valid_shape(width, query ? mix_eps : 1.0f) || !valid_shape(width, gamma ? norm_eps : 1.0f) ||
+        out_stride < width || first_block < 0 || blocks < first_block || blocks > max_blocks) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const size_t row = static_cast<size_t>(width) * sizeof(float);
+    const size_t state_bytes = states_bytes(rows, stride, blocks + 1, width);
+    const size_t out_bytes =
+        ((static_cast<size_t>(rows) - 1) * out_stride + width) * sizeof(float);
+    if (state_bytes == 0 || overlaps(out, out_bytes, state, state_bytes) ||
+        (query && (overlaps(out, out_bytes, query, row) ||
+                   overlaps(health, sizeof(float), query, row))) ||
+        (gamma && (overlaps(out, out_bytes, gamma, row) ||
+                   overlaps(health, sizeof(float), gamma, row))) ||
+        overlaps(health, sizeof(float), state, state_bytes) ||
+        overlaps(health, sizeof(float), out, out_bytes)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    inkling_stream_mix_ordered<<<rows, threads, 2 * row, static_cast<cudaStream_t>(stream)>>>(
+        state, query, gamma, out, health, first_block, blocks, width, mix_eps, norm_eps, stride,
+        out_stride);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return static_cast<int>(failure.err);
+}
+
+extern "C" int inference_cuda_inkling_stream_seal_ordered(float *state, const float *next,
+                                                          float *health, int blocks, int width,
+                                                          float eps, int rows, int stride,
+                                                          void *stream, int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    if (!state || !next || !health || !stream || !aligned(state) || !aligned(next) ||
+        !aligned(health) || !valid_shape(width, eps) || blocks < 0 || blocks >= max_blocks) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const size_t row = static_cast<size_t>(width) * sizeof(float);
+    const size_t state_bytes = states_bytes(rows, stride, blocks + 2, width);
+    const size_t next_bytes = static_cast<size_t>(rows) * row;
+    if (state_bytes == 0 || overlaps(state, state_bytes, next, next_bytes) ||
+        overlaps(health, sizeof(float), state, state_bytes) ||
+        overlaps(health, sizeof(float), next, next_bytes)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    inkling_stream_seal_ordered<<<rows, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        state, next, health, blocks, width, eps, stride);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

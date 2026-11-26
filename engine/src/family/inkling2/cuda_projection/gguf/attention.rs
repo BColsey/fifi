@@ -658,92 +658,6 @@ mod tests {
         assert_eq!(ring_splits(2, 3, 4), [(2, 2), (0, 1)]);
     }
 
-    fn check_resident_depth(
-        ctx: &CudaContext,
-        stream: &DeviceStream,
-        attention: DeviceRange<'_>,
-        expected_attention: &[f32],
-    ) {
-        use crate::kernels::cuda::resident::inkling_local_prep::DepthShape;
-        let shape = DepthShape {
-            rows: 4,
-            width: 2,
-            depth: 2,
-        };
-        let [planes, _, compact, plane] = shape.words().unwrap().map(|n| n * 4);
-        let prior = [-0.0_f32, 1.25, 0.75, -1.0, 2.0, -3.5, -0.125, 0.25];
-        let sealed = [1.0_f32, -1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0];
-        let query = [0.25_f32, 0.75];
-        let bytes = |words: &[f32]| {
-            words
-                .iter()
-                .flat_map(|f| f.to_ne_bytes())
-                .collect::<Vec<_>>()
-        };
-        let shape_data = ctx.allocate(planes).unwrap();
-        shape_data.write_at(stream, 0, &bytes(&sealed)).unwrap();
-        let query_buf = ctx.allocate(8).unwrap();
-        query_buf.write_at(stream, 0, &bytes(&query)).unwrap();
-        let prior_buf = ctx.allocate(plane).unwrap();
-        prior_buf.write_at(stream, 0, &bytes(&prior)).unwrap();
-        let raw_buf = ctx.allocate(plane).unwrap();
-        let out_buf = ctx.allocate(plane).unwrap();
-        let scores_buf = ctx.allocate(compact).unwrap();
-        let mut transfer = ctx.pinned_buf(compact).unwrap();
-        let normed = shape_data.range(plane, plane).unwrap();
-        let step = [
-            prior_buf.range(0, plane).unwrap(),
-            attention,
-            raw_buf.range(0, plane).unwrap(),
-            normed,
-        ];
-        assert!(matches!(
-            ctx.inkling_depth_current(stream, [step[0], step[1], step[2], step[2]], [4, 2], false),
-            Err(EngError::BadRequest(_))
-        ));
-        let mix = [
-            shape_data.range(0, planes).unwrap(),
-            query_buf.range(0, 8).unwrap(),
-            scores_buf.range(0, compact).unwrap(),
-            out_buf.range(0, plane).unwrap(),
-        ];
-        for boundary in [false, true] {
-            ctx.inkling_depth_current(stream, step, [4, 2], boundary)
-                .unwrap();
-            ctx.inkling_depth_mix(stream, &mut transfer, mix, shape)
-                .unwrap();
-            let raw: Vec<_> = prior
-                .into_iter()
-                .zip(expected_attention)
-                .map(|(p, &a)| if boundary { a } else { p + a })
-                .collect();
-            let mut gpu = vec![0; plane];
-            raw_buf.read_at(stream, 0, &mut gpu).unwrap();
-            assert_eq!(gpu, bytes(&raw));
-            let mut expected = Vec::new();
-            for (s, x) in sealed
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(raw.as_chunks::<2>().0.iter())
-            {
-                let scale = (x.iter().map(|v| v * v).sum::<f32>() / 2.0 + 1e-6)
-                    .sqrt()
-                    .recip();
-                let current = [x[0] * scale, x[1] * scale];
-                let score = |row: &[f32]| {
-                    row.iter().zip(query).map(|(v, q)| v * q).sum::<f32>() * 2.0_f32.sqrt().recip()
-                };
-                let scores = [score(s), score(&current)];
-                let peak = scores[0].max(scores[1]);
-                let [a, b] = scores.map(|v| (v - peak).exp());
-                expected.extend((0..2).map(|i| ((0.0 + a * s[i]) + b * current[i]) / (a + b)));
-            }
-            out_buf.read_at(stream, 0, &mut gpu).unwrap();
-            assert_eq!(gpu, bytes(&expected));
-        }
-    }
-
     #[test]
     fn restored_attention_replaces_a_divergent_ring_at_the_same_position() {
         if !crate::kernels::cuda::device_present("Inkling CUDA restored relative attention") {
@@ -1099,12 +1013,6 @@ mod tests {
                 );
             } else {
                 assert!(outputs.is_empty());
-                check_resident_depth(
-                    &ctx,
-                    &attention.stream,
-                    visit_conv.convolved_plane().unwrap(),
-                    &expected,
-                );
             }
             let tail = attention.prefill_conv_tail(visit_conv).unwrap();
             assert_eq!(
