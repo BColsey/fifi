@@ -3,8 +3,7 @@
 use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use super::{
-    CONV_TAPS, CORE_END, CORE_START, HIDDEN, LAYERS, checkpoint_error, gguf::Weights,
-    gguf_metadata::Layout, is_local,
+    CONV_TAPS, CORE_END, CORE_START, HIDDEN, LAYERS, checkpoint_error, gguf::Weights, is_local,
 };
 use crate::{EngError, family::mapped_file::MappedFile};
 
@@ -146,16 +145,8 @@ impl Dense {
                 }
             }
             if (CORE_START..CORE_END).contains(&i) {
-                for (canonical, mainline) in [
-                    ("attn", "q_ctrl"),
-                    ("k", "k_ctrl"),
-                    ("v", "v_ctrl"),
-                    ("mlp", "ffn_ctrl"),
-                ] {
-                    let stream = match source.layout() {
-                        Layout::Mainline => mainline,
-                        Layout::Fork => canonical,
-                    };
+                for (index, canonical) in ["attn", "k", "v", "mlp"].into_iter().enumerate() {
+                    let stream = source.layout().controller_stream(index);
                     for kind in ["down", "gain", "forget"] {
                         layer(
                             &format!("controllers.{canonical}.{kind}_weight"),
@@ -275,21 +266,11 @@ impl Dense {
     }
 
     pub(super) fn loop_query(&self, layer: usize, stream: usize) -> Result<Vec<f32>, EngError> {
-        let result = match self.source.layout() {
-            Layout::Mainline => self
-                .source
-                .row(&format!("blk.{layer}.loop_msg_query.weight"), stream),
-            Layout::Fork => {
-                let (name, offset) = match stream {
-                    0 => ("loop_res_query.weight", 0),
-                    1 => ("loop_kv_res_query.weight", 0),
-                    2 => ("loop_kv_res_query.weight", 1),
-                    3 => ("loop_res_query.weight", 1),
-                    _ => return Err(checkpoint_error("invalid Inkling loop query stream")),
-                };
-                self.source.row(name, 2 * (layer - CORE_START) + offset)
-            }
-        }?;
+        if stream >= 4 {
+            return Err(checkpoint_error("invalid Inkling loop query stream"));
+        }
+        let (name, row) = self.source.layout().loop_query(layer, CORE_START, stream);
+        let result = self.source.row(&name, row)?;
         debug_assert_eq!(result.len(), HIDDEN);
         Ok(result)
     }

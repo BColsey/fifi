@@ -8,7 +8,7 @@
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
 | `gemma4` | Nemotron Bolt E4B | no | Bolt E4B only | The Bolt E4B Q8_0 GGUF or a K-quant conversion of it; a bare weights file is detected from `general.architecture` = `gemma4`. Other Gemma4 checkpoints are not served. |
-| `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md), or a text GGUF (mainline `inkling2_loop` or repository-root `inkling2` layout) |
+| `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md), or a text GGUF (mainline `inkling2_loop` or older `inkling2` layout) |
 | `inkling2_loop` | Inkling 2 Mini | CPU pilot | opt-in | Native ModelOpt safetensors and tokenizer files from the [pinned release](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7). |
 | `sensenova` | SenseNova-Loop-9B (text) | CPU only | no | Experimental host path for [SenseNova-Loop-9B GGUF](https://huggingface.co/sensenova/SenseNova-Loop-9B-GGUF). |
 | `raon1` | Raon-1-mini-preview, 28.8B total, 4.3B active | no | in the source tree | `raon-1-mini-preview-Q4_K_M.gguf` from `KRAFTON/Raon-1-mini-preview-gguf`. The tokenizer and chat template are read from the GGUF file, so the directory needs no tokenizer files. |
@@ -40,7 +40,7 @@ decoding, or context and KV overrides.
 
 ## Inkling 2 Mini
 
-On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling2_loop` in the `enginesrv` configuration. Use the pinned release directory for `model_dir` and `tokenizer_dir`. On a 64-bit Linux build with `native-cuda`, set `FIFI_INKLING_CUDA_REFERENCE=1` instead to run the BF16 and packed expert projections on the first visible CUDA device. Set `CUDA_VISIBLE_DEVICES` to choose the card. Set only one Inkling backend flag. Both pilots support raw completions and plain-text chat, with one active sequence. The default context is 128 tokens including the prompt. Set `FIFI_INKLING_CONTEXT_TOKENS` to opt into a larger context, up to 8,192 tokens on the pinned checkpoint. Routing, attention, KV and convolution state run on the host. On Linux, extended context and prefix storage use FiFi's cgroup-aware host admission. Routing expert page-cache warming receives the RAM budget after the text-state reserve.
+On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling2_loop` in the `enginesrv` configuration. Use the pinned release directory for `model_dir` and `tokenizer_dir`, or set `model_dir` to a text GGUF in either layout. On a 64-bit Linux build with `native-cuda`, set `FIFI_INKLING_CUDA_REFERENCE=1` instead to run the BF16 and packed expert projections on the first visible CUDA device. Set `CUDA_VISIBLE_DEVICES` to choose the card. Set only one Inkling backend flag. Both pilots support raw completions and plain-text chat, with one active sequence. The default context is 128 tokens including the prompt. Set `FIFI_INKLING_CONTEXT_TOKENS` to opt into a larger context, up to 8,192 tokens on the pinned checkpoint. Routing, attention, KV and convolution state run on the host. On Linux, extended context and prefix storage use FiFi's cgroup-aware host admission. Routing expert page-cache warming receives the RAM budget after the text-state reserve.
 
 `enginesrv check` inspects the safetensors inventory and reports the BF16 KV storage plan for the fixed loop. With a pilot enabled it also checks the pinned tokenizer and the short-context settings. CUDA admission checks available device memory at startup.
 
@@ -109,7 +109,7 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | GGUF with F16, Q4_K, Q5_0, Q6_K and Q8_0 tensors | Qwen3.6 on CUDA |
 | GGUF Q8_0, and K-quant conversions of it | Bolt E4B on CUDA |
 | GGUF, matrices dequantized on demand | SenseNova-Loop on CPU (the published Q4_K_M file) |
-| GGUF, mainline `inkling2_loop` or repository-root `inkling2` layout | Inkling 2 Mini on Apple Silicon |
+| GGUF, mainline `inkling2_loop` or older `inkling2` layout | Inkling 2 Mini on Apple Silicon, and on CPU or CUDA with family `inkling2_loop` |
 | EXL3 | Qwen3.6 and Flint on CUDA |
 | NVFP4 safetensors | Nemotron 3.5 Super |
 | Mixed NVFP4 and MXFP8 safetensors | Inkling 2 Mini on Apple Silicon |

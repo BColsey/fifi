@@ -5,15 +5,13 @@ use std::{fs::File, io::BufReader, ops::Range, path::Path, time::SystemTime};
 use super::timing::DenseIo;
 use super::{
     CONV_TAPS, CORE_END, CORE_START, EXPERTS, HEAD_DIM, HEADER_LIMIT, HIDDEN, INTERMEDIATE,
-    KV_HEADS, LAYERS, QUERY_HEADS, checkpoint_error,
-    gguf_metadata::{self, Layout},
-    is_local, read_exact_at,
+    KV_HEADS, LAYERS, QUERY_HEADS, checkpoint_error, gguf_metadata, is_local, read_exact_at,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::kernels::expert_cpu_q8g::{Q8DotProduct, Q8gRow, quantize_q8g};
 use crate::{
     EngError,
-    family::mapped_file::MappedFile,
+    family::{inkling_gguf_layout::Layout, mapped_file::MappedFile},
     weights::{GgufHeader, GgufTensor, GgufType, MetaValue},
 };
 
@@ -181,11 +179,7 @@ pub(crate) fn validate_tensors(header: &GgufHeader) -> Result<(), EngError> {
             }
         }
         if (CORE_START..CORE_END).contains(&i) {
-            let streams = match layout {
-                Layout::Mainline => ["q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl"],
-                Layout::Fork => ["attn", "k", "v", "mlp"],
-            };
-            for stream in streams {
+            for stream in (0..4).map(|stream| layout.controller_stream(stream)) {
                 layer(
                     &format!("loop_{stream}_down.weight"),
                     &[2 * hidden, 64],

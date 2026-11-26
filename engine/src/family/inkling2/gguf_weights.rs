@@ -1,4 +1,4 @@
-//! Bind the Unsloth fixed-loop GGUF layout to the Inkling text graph.
+//! Bind both fixed-loop Inkling 2 Mini GGUF layouts to the Inkling text graph.
 
 use std::{
     borrow::Cow,
@@ -13,7 +13,7 @@ use super::{LoopConfig, TextSpec, bad};
 use crate::{
     EngError,
     expert_tier::ExpertId,
-    family::mapped_file::MappedFile,
+    family::{inkling_gguf_layout::Layout, mapped_file::MappedFile},
     weights::{GgufHeader, GgufType, MetaValue, dequantize_into, project_f32_rows},
 };
 
@@ -101,26 +101,32 @@ impl<'a> Metadata<'a> {
     }
 }
 
-fn text_spec(header: &GgufHeader) -> Result<TextSpec, EngError> {
-    if !matches!(header.meta("general.architecture"), Some(MetaValue::String(a)) if a == "inkling2")
-        || header.split().is_some_and(|split| split.count > 1)
-    {
-        return Err(bad(
-            "expected a single-file Unsloth Inkling 2 Mini loop GGUF",
-        ));
+fn layout(header: &GgufHeader) -> Result<Layout, EngError> {
+    match Layout::from_header(header) {
+        Some(layout) if !header.split().is_some_and(|split| split.count > 1) => Ok(layout),
+        _ => Err(bad("expected a single-file Inkling 2 Mini loop GGUF")),
     }
+}
+
+fn text_spec(header: &GgufHeader, layout: Layout) -> Result<TextSpec, EngError> {
     let meta = Metadata::new(header);
-    let int = |key| meta.integer(&format!("inkling2.{key}"));
-    let core_start = int("loop.core_start")? as usize;
-    let core_end = int("loop.core_end")? as usize;
-    let num_passes = int("num_loops")? as usize;
+    let arch = layout.architecture();
+    let int = |key| meta.integer(&format!("{arch}.{key}"));
+    let [start, end, count] = layout.loop_keys();
+    let core_start = int(start)? as usize;
+    let core_end = int(end)? as usize;
+    let num_passes = int(count)? as usize;
     let blocks = int("block_count")? as usize;
-    let repeated = core_end
+    let added = core_end
         .checked_sub(core_start)
         .and_then(|width| width.checked_mul(num_passes.saturating_sub(1)))
-        .and_then(|added| blocks.checked_sub(added))
         .ok_or_else(|| bad("invalid GGUF loop geometry"))?;
-    if repeated != 24 || blocks != 48 {
+    let repeated = match layout {
+        Layout::Mainline => Some(blocks),
+        Layout::Fork => blocks.checked_sub(added),
+    }
+    .ok_or_else(|| bad("invalid GGUF loop geometry"))?;
+    if repeated != 24 || repeated.checked_add(added) != Some(48) {
         return Err(bad(
             "expected 24 stored layers and 48 visits in the Mini GGUF",
         ));
@@ -190,9 +196,18 @@ struct Tensor {
 
 type Tensors = BTreeMap<String, Tensor>;
 
+/// A native F32 tensor assembled at map time from whole rows of other tensors,
+/// for weights the GGUF layout stores split.
+struct Gather {
+    native: String,
+    rows: Vec<Range<usize>>,
+}
+
 struct Bindings<'a> {
     header: &'a GgufHeader,
+    layout: Layout,
     tensors: Tensors,
+    gathers: Vec<Gather>,
 }
 
 impl Bindings<'_> {
@@ -235,7 +250,6 @@ impl Bindings<'_> {
     fn globals(&mut self, spec: &TextSpec) -> Result<(), EngError> {
         let hidden = spec.hidden_size;
         let vocab = spec.vocab_size;
-        let queries = 2 * (spec.core.core_end - spec.core.core_start) as u64;
         for (native, gguf, dims) in [
             ("embed.weight", "token_embd.weight", &[hidden, vocab][..]),
             ("unembed.weight", "output.weight", &[hidden, vocab]),
@@ -246,18 +260,60 @@ impl Bindings<'_> {
                 "output_res_query.weight",
                 &[hidden],
             ),
-            (
-                "middle_cycle_cross_pass_queries",
-                "loop_res_query.weight",
-                &[hidden, queries],
-            ),
-            (
-                "middle_cycle_cross_pass_kv_queries",
-                "loop_kv_res_query.weight",
-                &[hidden, queries],
-            ),
         ] {
             self.bind(format!("model.llm.{native}"), gguf, dims)?;
+        }
+        self.loop_queries(spec)
+    }
+
+    /// Assemble the two cross-pass query tensors, one row per core layer and
+    /// stream: query and MLP rows in one, key and value rows in the other.
+    fn loop_queries(&mut self, spec: &TextSpec) -> Result<(), EngError> {
+        let hidden = spec.hidden_size as usize;
+        let (core_start, core_end) = (spec.core.core_start, spec.core.core_end);
+        let row_bytes = hidden * size_of::<f32>();
+        for (native, streams) in [
+            ("middle_cycle_cross_pass_queries", [0, 3]),
+            ("middle_cycle_cross_pass_kv_queries", [1, 2]),
+        ] {
+            let mut rows = Vec::with_capacity(2 * (core_end - core_start));
+            for layer in core_start..core_end {
+                for stream in streams {
+                    let (name, row) = self.layout.loop_query(layer, core_start, stream);
+                    let tensor = self
+                        .header
+                        .tensor(&name)
+                        .ok_or_else(|| bad(format!("GGUF is missing {name}")))?;
+                    let dims = tensor.dims();
+                    if tensor.ggml_type() != GgufType::F32
+                        || dims.len() != 2
+                        || dims[0] != hidden as u64
+                        || row as u64 >= dims[1]
+                    {
+                        return Err(bad(format!(
+                            "GGUF loop query {name} must be F32 with {hidden} columns and row {row}"
+                        )));
+                    }
+                    let start = tensor.abs_range().start as usize + row * row_bytes;
+                    rows.push(start..start + row_bytes);
+                }
+            }
+            self.tensors.insert(
+                format!("model.llm.{native}"),
+                Tensor {
+                    kind: GgufType::F32,
+                    bytes: 0..0,
+                    columns: hidden,
+                    rows: rows.len(),
+                    planes: 1,
+                    vector_order: VectorOrder::Stored,
+                    decoded: None,
+                },
+            );
+            self.gathers.push(Gather {
+                native: format!("model.llm.{native}"),
+                rows,
+            });
         }
         Ok(())
     }
@@ -448,7 +504,8 @@ impl Bindings<'_> {
     fn controllers(&mut self, spec: &TextSpec, layer: usize) -> Result<(), EngError> {
         let hidden = spec.hidden_size;
         let rank = spec.core.gate_rank;
-        for role in ["attn", "k", "v", "mlp"] {
+        for (stream, role) in ["attn", "k", "v", "mlp"].into_iter().enumerate() {
+            let source = self.layout.controller_stream(stream);
             for (part, dims) in [
                 ("down", [2 * hidden, rank]),
                 ("gain", [rank, hidden]),
@@ -456,7 +513,7 @@ impl Bindings<'_> {
             ] {
                 self.bind(
                     format!("model.llm.layers.{layer}.controllers.{role}.{part}_weight"),
-                    &format!("blk.{layer}.loop_{role}_{part}.weight"),
+                    &format!("blk.{layer}.loop_{source}_{part}.weight"),
                     &dims,
                 )?;
             }
@@ -467,8 +524,10 @@ impl Bindings<'_> {
 
 pub(crate) struct GgufPlan {
     pub(crate) header: GgufHeader,
+    pub(crate) layout: Layout,
     pub(crate) spec: TextSpec,
     tensors: Tensors,
+    gathers: Vec<Gather>,
 }
 
 impl GgufPlan {
@@ -480,12 +539,14 @@ impl GgufPlan {
             .map_err(|error| bad(format!("stat GGUF: {error}")))?
             .len();
         let header = GgufHeader::parse(&mut BufReader::new(file), len, HEADER_LIMIT)?;
-        let spec = text_spec(&header)?;
+        let layout = layout(&header)?;
+        let spec = text_spec(&header, layout)?;
         let meta = Metadata::new(&header);
-        let taps = meta.integer("inkling2.shortconv.l_cache")?;
+        let arch = layout.architecture();
+        let taps = meta.integer(&format!("{arch}.shortconv.l_cache"))?;
         let rel = [
-            meta.integer("inkling2.attention.relative_length")?,
-            meta.integer("inkling2.attention.relative_extent")?,
+            meta.integer(&format!("{arch}.attention.relative_length"))?,
+            meta.integer(&format!("{arch}.attention.relative_extent"))?,
         ];
         // These dimensions bound all shape products in the text binder.
         if spec.hidden_size != 2304
@@ -505,7 +566,9 @@ impl GgufPlan {
         }
         let mut bind = Bindings {
             header: &header,
+            layout,
             tensors: BTreeMap::new(),
+            gathers: Vec::new(),
         };
         bind.globals(&spec)?;
         for layer in 0..spec.stored_layers() {
@@ -516,20 +579,45 @@ impl GgufPlan {
                 bind.controllers(&spec, layer)?;
             }
         }
-        let tensors = bind.tensors;
+        let Bindings {
+            tensors, gathers, ..
+        } = bind;
         Ok(Self {
             header,
+            layout,
             spec,
             tensors,
+            gathers,
         })
     }
 
     pub(super) fn map(self, path: &Path) -> Result<(TextSpec, GgufTextWeights), EngError> {
         let mapping = MappedFile::open(path, self.header.file_len())
             .map_err(|error| bad(format!("map GGUF: {error}")))?;
+        let mut tensors = self.tensors;
+        for gather in self.gathers {
+            let mut values = Vec::new();
+            for range in gather.rows {
+                let bytes = mapping
+                    .as_ref()
+                    .get(range)
+                    .ok_or_else(|| bad(format!("{} escapes the mapping", gather.native)))?;
+                values.extend(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| f32::from_le_bytes(*word)),
+                );
+            }
+            tensors
+                .get_mut(&gather.native)
+                .expect("gathered tensor is bound")
+                .decoded = Some(values.into_boxed_slice());
+        }
         let mut weights = GgufTextWeights {
             mapping,
-            tensors: self.tensors,
+            tensors,
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             cuda: None,
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -615,6 +703,7 @@ impl GgufTextWeights {
             };
             if tensor.planes != 1
                 || tensor.rows == 1
+                || tensor.bytes.is_empty()
                 || name == "model.llm.embed.weight"
                 || !matches!(tensor.vector_order, VectorOrder::Stored)
             {
@@ -1103,7 +1192,7 @@ fn project_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::{EngError, GgufHeader, HEADER_LIMIT, text_spec};
+    use super::{EngError, GgufHeader, HEADER_LIMIT, layout, text_spec};
 
     fn str_kv(key: &str, value: &str) -> Vec<u8> {
         // GGUF v3 stores string lengths as u64.
@@ -1152,7 +1241,8 @@ mod tests {
         let bytes = header(kvs);
         let mut reader = bytes.as_slice();
         let parsed = GgufHeader::parse(&mut reader, bytes.len() as u64, HEADER_LIMIT);
-        match text_spec(&parsed.expect("the header parses")) {
+        let parsed = parsed.expect("the header parses");
+        match layout(&parsed).and_then(|layout| text_spec(&parsed, layout)) {
             Err(EngError::Checkpoint(message)) => message,
             Err(other) => panic!("refused with another kind: {other:?}"),
             Ok(_) => panic!("accepted"),
@@ -1163,6 +1253,36 @@ mod tests {
     fn a_header_without_the_loop_keys_is_refused_by_name() {
         let message = refusal_message(&[str_kv("general.architecture", "inkling2")]);
         assert!(message.contains("inkling2.loop.core_start"), "{message}");
+    }
+
+    /// The mainline loop keys under the arch `inkling2_loop`, which counts
+    /// stored layers, with `block_count` to vary.
+    fn mainline_loop_keys(block_count: u32) -> Vec<Vec<u8>> {
+        [
+            str_kv("general.architecture", "inkling2_loop"),
+            u32_kv("inkling2_loop.block_count", block_count),
+            u32_kv("inkling2_loop.loop.start", 6),
+            u32_kv("inkling2_loop.loop.end", 18),
+            u32_kv("inkling2_loop.loop.count", 3),
+        ]
+        .into()
+    }
+
+    #[test]
+    fn another_architecture_is_refused() {
+        let message = refusal_message(&[str_kv("general.architecture", "llama")]);
+        assert!(message.contains("single-file Inkling 2 Mini"), "{message}");
+    }
+
+    #[test]
+    fn the_mainline_layout_counts_stored_layers() {
+        let message = refusal_message(&mainline_loop_keys(48));
+        assert!(
+            message.contains("24 stored layers and 48 visits"),
+            "{message}"
+        );
+        let next = refusal_message(&mainline_loop_keys(24));
+        assert!(next.contains("inkling2_loop.context_length"), "{next}");
     }
 
     #[test]

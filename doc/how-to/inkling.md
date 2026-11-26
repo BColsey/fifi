@@ -24,7 +24,7 @@ With a Metal recommendation of at most 16 GiB, Inkling defaults to a 5 GiB worki
 
 For chat requests, disabling thinking sets the publisher's reasoning effort to 0.0. Inkling can still emit reasoning, so a short output limit can be reached before the first answer token. The server returns reasoning and answer text in their respective fields. [Publisher guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md#thinking-effort-set-it-everywhere)
 
-The GGUF inspector recognizes the mainline `inkling2_loop` and repository-root `inkling2` layouts. Both experimental text adapters need the pinned publisher tokenizer. Use a directory containing one text GGUF or pass the selected model file, including files with a `.gguf_file` suffix.
+The GGUF inspector and both experimental text backends read the mainline `inkling2_loop` layout, which the Unsloth repository root and fine-tunes in that layout use, and the older `inkling2` layout from the Unsloth `Old_Support/` folder. Both experimental text adapters need the pinned publisher tokenizer. Use a directory containing one text GGUF or pass the selected model file, including files with a `.gguf_file` suffix.
 
 The GGUF adapters advance prompt tokens serially and can group expert projections within each visit. The safetensors worker can group multiple prompt tokens per visit.
 

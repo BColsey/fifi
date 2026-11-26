@@ -49,7 +49,7 @@ pub(super) fn populate(weights: &mut GgufTextWeights) -> Result<(usize, usize), 
     let mut count = 0;
     let mut bytes = 0;
     for (name, tensor) in &mut weights.tensors {
-        if !selected(name) || tensor.planes != 1 {
+        if !selected(name) || tensor.planes != 1 || tensor.decoded.is_some() {
             continue;
         }
         let Some(size) = tensor

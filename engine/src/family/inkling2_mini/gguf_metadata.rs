@@ -6,37 +6,13 @@ use serde::Serialize;
 
 use super::{
     CORE_END, CORE_START, EXPERTS, HEAD_DIM, HIDDEN, INTERMEDIATE, KV_HEADS, LAYERS, MAX_CONTEXT,
-    MODEL_TYPE, PASSES, QUERY_HEADS, TOP_K, WINDOW, checkpoint_error,
+    PASSES, QUERY_HEADS, TOP_K, WINDOW, checkpoint_error,
 };
 use crate::{
     EngError,
+    family::inkling_gguf_layout::Layout,
     weights::{GgufHeader, MetaValue},
 };
-
-/// The fork advertises logical visits as its block count. Both formats store
-/// only the physical layers, but their loop message queries use different names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Layout {
-    Mainline,
-    Fork,
-}
-
-impl Layout {
-    pub(super) fn from_header(header: &GgufHeader) -> Option<Self> {
-        match header.meta("general.architecture") {
-            Some(MetaValue::String(arch)) if arch == MODEL_TYPE => Some(Self::Mainline),
-            Some(MetaValue::String(arch)) if arch == "inkling2" => Some(Self::Fork),
-            _ => None,
-        }
-    }
-
-    pub(super) fn architecture(self) -> &'static str {
-        match self {
-            Self::Mainline => MODEL_TYPE,
-            Self::Fork => "inkling2",
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Geometry {
@@ -66,15 +42,8 @@ pub(crate) fn inspect(
     let layout = Layout::from_header(header)
         .ok_or_else(|| checkpoint_error("unsupported Inkling GGUF architecture"))?;
     let logical_layers = LAYERS + (CORE_END - CORE_START) * (PASSES - 1);
-    let (block_count, core_start, core_end, loop_count) = match layout {
-        Layout::Mainline => (LAYERS, "loop.start", "loop.end", "loop.count"),
-        Layout::Fork => (
-            logical_layers,
-            "loop.core_start",
-            "loop.core_end",
-            "num_loops",
-        ),
-    };
+    let block_count = layout.block_count(LAYERS, logical_layers);
+    let [core_start, core_end, loop_count] = layout.loop_keys();
     let arch = layout.architecture();
     for (name, expected) in [
         ("block_count", block_count as u32),

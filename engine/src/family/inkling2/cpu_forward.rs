@@ -1113,11 +1113,12 @@ fn validate_tokenizer(
 impl CpuConfig {
     fn from_gguf(plan: &GgufPlan, context: usize) -> Result<Self, EngError> {
         let meta = Metadata::new(&plan.header);
+        let arch = plan.layout.architecture();
         let int = |key| {
-            meta.integer(&format!("inkling2.{key}"))
+            meta.integer(&format!("{arch}.{key}"))
                 .map(|value| value as usize)
         };
-        let float = |key| meta.float(&format!("inkling2.{key}"));
+        let float = |key| meta.float(&format!("{arch}.{key}"));
         let eos = meta.integer("tokenizer.ggml.eos_token_id")?;
         if eos >= plan.spec.unpadded_vocab_size {
             return Err(bad("GGUF EOS is outside the unpadded vocabulary"));
