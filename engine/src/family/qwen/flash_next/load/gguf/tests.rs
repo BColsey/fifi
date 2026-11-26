@@ -3388,6 +3388,38 @@ fn real_file_host_forward_continues_a_sentence() {
     assert_eq!(top[0].0.trim(), "Paris", "top five: {top:?}");
 }
 
+/// The prompt whose oracle this test writes. Without a setting it is the prompt of the pinned
+/// oracle, whose content hash fixes its rows. `FIFI_FLASH_GGUF_ORACLE_PROMPT` (token ids separated
+/// by commas) names another prompt; pair it with a new `FIFI_FLASH_GGUF_ORACLE_OUT`, because the
+/// pinned oracle is never rewritten.
+fn oracle_prompt() -> Vec<u32> {
+    let text = match std::env::var("FIFI_FLASH_GGUF_ORACLE_PROMPT") {
+        Ok(text) => text,
+        Err(std::env::VarError::NotPresent) => return vec![9707, 11, 1879],
+        Err(_) => panic!("FIFI_FLASH_GGUF_ORACLE_PROMPT is not Unicode"),
+    };
+    parse_prompt(&text).unwrap_or_else(|| {
+        panic!("FIFI_FLASH_GGUF_ORACLE_PROMPT: whole token ids, separated by commas, at least one")
+    })
+}
+
+/// Token ids separated by commas, at least one. Anything else is `None`.
+fn parse_prompt(text: &str) -> Option<Vec<u32>> {
+    if text.is_empty() {
+        return None;
+    }
+    text.split(',').map(|id| id.trim().parse().ok()).collect()
+}
+
+#[test]
+fn an_oracle_prompt_is_token_ids_separated_by_commas() {
+    let expected = Some(vec![760, 6511, 314, 9338, 369]);
+    assert_eq!(parse_prompt("760, 6511,314,9338 , 369"), expected);
+    for refused in ["", "760,,314", "760,-1", "760,3.0", "760,Paris"] {
+        assert_eq!(parse_prompt(refused), None, "{refused:?}");
+    }
+}
+
 /// Fixed token IDs, so the CPU and CUDA probes can compare greedy decisions without a
 /// separate tokenizer or a text comparison. Unlike exploratory probes, this never skips.
 #[test]
@@ -3395,7 +3427,7 @@ fn real_file_host_forward_continues_a_sentence() {
 fn real_file_host_greedy_parity_baseline() {
     let model = real_model().expect("set FIFI_FLASH_GGUF to the pinned Flash-Next checkpoint");
     let host = super::host::HostModel::load(&model, model.config().layers()).expect("load");
-    let prompt = [9707, 11, 1879];
+    let prompt = oracle_prompt();
     let rows = super::host::greedy_rows(&model, &host, &prompt, 3, 8).expect("host greedy trace");
     assert_eq!(rows.len(), 3);
     let width = rows[0].len();
