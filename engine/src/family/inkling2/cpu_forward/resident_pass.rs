@@ -25,8 +25,8 @@
 //! checked); the K/V rows follow from the visit rings. The host `VisitState` and the device
 //! cursors both end the block holding the rows.
 //!
-//! Blocks of 1 to [`MAX_ROWS`] rows share one plan; only the `rows` argument of each launch
-//! changes. A single row runs as a block of two (the token twice), because the attention tile
+//! A prompt is cut into blocks of at most [`BLOCK_ROWS`] rows; blocks of 1 to [`MAX_ROWS`] rows
+//! share one plan and only the `rows` argument of each launch changes. A single row runs as a block of two (the token twice), because the attention tile
 //! refuses one query row; the padded row is never committed (tails, ring cursors and the rows
 //! published take the one). The router logits are the one readback inside a block: the
 //! routed-expert operation takes host route ids.
@@ -80,6 +80,14 @@ pub(super) fn enabled() -> bool {
 /// Rows one block takes at most: the output-convolution, clip and router kernels bound their
 /// row counts at 512.
 pub(super) const MAX_ROWS: usize = 512;
+/// Rows a prompt is cut into while it is longer. The weight-visit projection kernels of this tree
+/// exist for 8, 12, 64, 128 and 256 rows (`inkling_prefetch_select`, `inkling_large_select`);
+/// any other count falls back to a GEMV that reads the weights once per row. On the RTX 2080 Ti
+/// (nsys traces `pass-nsys-pass-{256,512}-50a9e761-*`) a 512-row block takes 2.85 s of stream
+/// time against 2 x 0.65 s for two 256-row blocks, and cuts smaller than 256 pay the expert
+/// stage's per-block cost (about 250 ms) more often. `FIFI_INKLING_PASS_BLOCK_ROWS` overrides it
+/// (1..=MAX_ROWS); revisit once every row count has a weight-visit or tensor kernel.
+pub(super) const BLOCK_ROWS: usize = 256;
 
 const WORD: usize = 4;
 const PAST: usize = TAPS - 1;
@@ -188,7 +196,7 @@ fn reporting() -> bool {
 }
 
 impl CpuForward {
-    /// Runs one prompt through the device plan in blocks of at most [`MAX_ROWS`] rows when
+    /// Runs one prompt through the device plan in blocks of at most [`BLOCK_ROWS`] rows when
     /// admitted; `Ok(false)` leaves the sequence untouched for the flag-off path.
     pub(super) fn resident_pass(&mut self, tokens: &[u32]) -> Result<bool, EngError> {
         if !enabled() || self.draft_window_enabled() || !self.taps.is_empty() {
@@ -203,7 +211,7 @@ impl CpuForward {
         if !self.pass_admitted(weights, cuda)? {
             return Ok(false);
         }
-        for block in tokens.chunks(MAX_ROWS) {
+        for block in tokens.chunks(Self::block_rows()) {
             let rows = block.len();
             let mut state = std::mem::take(&mut self.state);
             let started = std::time::Instant::now();
@@ -239,7 +247,19 @@ impl CpuForward {
         Ok(true)
     }
 
-    /// Whether a visit reads the message bank and so runs the depth-mix controllers: the passes
+    /// The block size of a prompt, from `FIFI_INKLING_PASS_BLOCK_ROWS` or [`BLOCK_ROWS`].
+    fn block_rows() -> usize {
+        static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *ROWS.get_or_init(|| {
+            std::env::var("FIFI_INKLING_PASS_BLOCK_ROWS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|&rows| (1..=MAX_ROWS).contains(&rows))
+                .unwrap_or(BLOCK_ROWS)
+        })
+    }
+
+/// Whether a visit reads the message bank and so runs the depth-mix controllers: the passes
     /// after the first over the core layers (the prelude pass and the suffix layers have none).
     fn pass_visit_banked(&self, slot: usize) -> bool {
         let core = &self.spec.core;
