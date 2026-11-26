@@ -918,7 +918,7 @@ impl VisitState {
         ]
     }
 
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn resident_history_identity(&self) -> Option<std::sync::Weak<Vec<f32>>> {
         self.keys.front().map(Arc::downgrade)
     }
