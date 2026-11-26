@@ -4,39 +4,28 @@ use std::{cell::OnceCell, sync::Arc};
 
 use super::{MIX_EPS, add, dot, rms_norm};
 
+/// The current residual row and the sealed depth blocks. Each sealed block is stored
+/// RMS-normalized once, when its boundary publishes it, and the normalized current row is
+/// cached until the current row changes; every mix reads the same bits it would compute
+/// from the raw rows.
 #[derive(Clone)]
 pub(super) struct Stream {
     current: Vec<f32>,
-    blocks: Blocks,
-}
-
-#[derive(Clone)]
-enum Blocks {
-    Raw(Vec<Vec<f32>>),
-    Normalized {
-        sealed: Vec<Arc<Vec<f32>>>,
-        current: OnceCell<Arc<Vec<f32>>>,
-    },
+    sealed: Vec<Arc<Vec<f32>>>,
+    normalized: OnceCell<Arc<Vec<f32>>>,
 }
 
 impl Stream {
-    pub(super) fn new(current: Vec<f32>, cache: bool) -> Self {
-        let blocks = if cache {
-            Blocks::Normalized {
-                sealed: Vec::new(),
-                current: OnceCell::new(),
-            }
-        } else {
-            Blocks::Raw(Vec::new())
-        };
-        Self { current, blocks }
+    pub(super) fn new(current: Vec<f32>) -> Self {
+        Self {
+            current,
+            sealed: Vec::new(),
+            normalized: OnceCell::new(),
+        }
     }
 
     pub(super) fn block_count(&self) -> usize {
-        match &self.blocks {
-            Blocks::Raw(rows) => rows.len(),
-            Blocks::Normalized { sealed, .. } => sealed.len(),
-        }
+        self.sealed.len()
     }
 
     pub(super) fn current(&self) -> &[f32] {
@@ -51,10 +40,7 @@ impl Stream {
     pub(super) fn append_device_state(&self, bytes: &mut Vec<u8>) {
         let mut append = |row: &[f32]| bytes.extend(row.iter().flat_map(|v| v.to_ne_bytes()));
         append(&self.current);
-        match &self.blocks {
-            Blocks::Raw(rows) => rows.iter().for_each(|row| append(&normalize(row))),
-            Blocks::Normalized { sealed, .. } => sealed.iter().for_each(|row| append(row)),
-        }
+        self.sealed.iter().for_each(|row| append(row));
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -63,67 +49,35 @@ impl Stream {
             // Keep the host's sealed blocks canonical for the next host visit.
             self.seal(next);
         } else {
-            if let Blocks::Normalized { current, .. } = &mut self.blocks {
-                current.take();
-            }
+            self.normalized.take();
             self.current = next;
         }
     }
 
     pub(super) fn add_current(&mut self, row: &[f32]) {
-        if let Blocks::Normalized { current, .. } = &mut self.blocks {
-            current.take();
-        }
+        self.normalized.take();
         add(&mut self.current, row, 1.0);
     }
 
     pub(super) fn seal(&mut self, next: Vec<f32>) {
         let mut previous = std::mem::replace(&mut self.current, next);
-        match &mut self.blocks {
-            Blocks::Raw(rows) => rows.push(previous),
-            Blocks::Normalized { sealed, current } => {
-                let normalized = current.take().unwrap_or_else(|| {
-                    rms_norm(&mut previous, MIX_EPS);
-                    Arc::new(previous)
-                });
-                sealed.push(normalized);
-            }
-        }
+        let normalized = self.normalized.take().unwrap_or_else(|| {
+            rms_norm(&mut previous, MIX_EPS);
+            Arc::new(previous)
+        });
+        self.sealed.push(normalized);
     }
 
     pub(super) fn mix(&self, first_block: usize, query: &[f32]) -> Vec<f32> {
-        match &self.blocks {
-            Blocks::Raw(rows) => {
-                let scale = (query.len() as f32).sqrt().recip();
-                let rows: Vec<_> = rows[first_block..]
-                    .iter()
-                    .rev()
-                    .chain(std::iter::once(&self.current))
-                    .map(|row| {
-                        let normalized = normalize(row);
-                        (dot(&normalized, query) * scale, normalized)
-                    })
-                    .collect();
-                let peak = rows
-                    .iter()
-                    .map(|(score, _)| *score)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                weighted_mix(
-                    rows.iter().map(|(score, row)| (*score, row.as_slice())),
-                    query.len(),
-                    peak,
-                )
-            }
-            Blocks::Normalized { sealed, current } => {
-                let last = current.get_or_init(|| Arc::new(normalize(&self.current)));
-                let rows = sealed[first_block..]
-                    .iter()
-                    .rev()
-                    .map(|row| row.as_slice())
-                    .chain(std::iter::once(last.as_slice()));
-                mix_rows(rows, query)
-            }
-        }
+        let last = self
+            .normalized
+            .get_or_init(|| Arc::new(normalize(&self.current)));
+        let rows = self.sealed[first_block..]
+            .iter()
+            .rev()
+            .map(|row| row.as_slice())
+            .chain(std::iter::once(last.as_slice()));
+        mix_rows(rows, query)
     }
 }
 
@@ -200,39 +154,50 @@ mod tests {
 
     #[test]
     fn depth_mix_can_exclude_the_first_core_boundary() {
-        for cache in [false, true] {
-            let mut stream = Stream::new(vec![0.0, 2.0], cache);
-            stream.seal(vec![2.0, 0.0]);
-            let both = stream.mix(0, &[0.0; 2]);
-            let current = stream.mix(1, &[0.0; 2]);
-            assert!((both[0] - both[1]).abs() < 1e-6);
-            assert!((current[0] - std::f32::consts::SQRT_2).abs() < 1e-6);
-            assert_eq!(current[1], 0.0);
-        }
+        let mut stream = Stream::new(vec![0.0, 2.0]);
+        stream.seal(vec![2.0, 0.0]);
+        let both = stream.mix(0, &[0.0; 2]);
+        let current = stream.mix(1, &[0.0; 2]);
+        assert!((both[0] - both[1]).abs() < 1e-6);
+        assert!((current[0] - std::f32::consts::SQRT_2).abs() < 1e-6);
+        assert_eq!(current[1], 0.0);
+    }
+
+    /// The mix from raw rows: normalize every block at each mix, as the stored form must match.
+    fn raw_mix(rows: &[Vec<f32>], current: &[f32], first: usize, query: &[f32]) -> Vec<f32> {
+        let normalized: Vec<_> = rows[first..]
+            .iter()
+            .rev()
+            .map(|row| normalize(row))
+            .chain(std::iter::once(normalize(current)))
+            .collect();
+        mix_rows(normalized.iter().map(Vec::as_slice), query)
     }
 
     #[test]
-    fn cached_depth_mix_keeps_exact_bits_across_branch_and_invalidation() {
+    fn stored_blocks_mix_to_the_same_bits_as_raw_rows_across_branch_and_invalidation() {
         let input = vec![3.0, -6.0, 0.75, -0.0];
-        let mut raw = Stream::new(input.clone(), false);
-        let mut cached = Stream::new(input, true);
+        let mut raw = (Vec::new(), input.clone());
+        let mut stream = Stream::new(input);
         for new in [[-1.0, -0.0, 0.0, 2.0], [0.0, -4.0, 0.5, 0.0]] {
-            same_bits(&raw, &cached);
-            raw.seal(new.to_vec());
-            cached.seal(new.to_vec());
+            same_bits(&raw, &stream);
+            raw.0.push(std::mem::replace(&mut raw.1, new.to_vec()));
+            stream.seal(new.to_vec());
         }
-        same_bits(&raw, &cached);
+        same_bits(&raw, &stream);
         let mut raw_fork = raw.clone();
-        let mut cached_fork = cached.clone();
-        raw_fork.add_current(&[0.0, 2.0, -8.0, 1.0]);
-        cached_fork.add_current(&[0.0, 2.0, -8.0, 1.0]);
-        same_bits(&raw_fork, &cached_fork);
-        same_bits(&raw, &cached);
-        raw_fork.add_current(&[0.0, 3.0, 0.0, -1.0]);
-        cached_fork.add_current(&[0.0, 3.0, 0.0, -1.0]);
-        raw_fork.seal(vec![0.0; 4]);
-        cached_fork.seal(vec![0.0; 4]);
-        same_bits(&raw_fork, &cached_fork);
+        let mut fork = stream.clone();
+        add(&mut raw_fork.1, &[0.0, 2.0, -8.0, 1.0], 1.0);
+        fork.add_current(&[0.0, 2.0, -8.0, 1.0]);
+        same_bits(&raw_fork, &fork);
+        same_bits(&raw, &stream);
+        add(&mut raw_fork.1, &[0.0, 3.0, 0.0, -1.0], 1.0);
+        fork.add_current(&[0.0, 3.0, 0.0, -1.0]);
+        raw_fork
+            .0
+            .push(std::mem::replace(&mut raw_fork.1, vec![0.0; 4]));
+        fork.seal(vec![0.0; 4]);
+        same_bits(&raw_fork, &fork);
     }
 
     #[test]
@@ -249,19 +214,16 @@ mod tests {
         }
     }
 
-    fn same_bits(raw: &Stream, cached: &Stream) {
-        assert_eq!(raw.current(), cached.current());
-        assert_eq!(raw.block_count(), cached.block_count());
-        for first in 0..=raw.block_count() {
+    fn same_bits((rows, current): &(Vec<Vec<f32>>, Vec<f32>), stream: &Stream) {
+        assert_eq!(current.as_slice(), stream.current());
+        assert_eq!(rows.len(), stream.block_count());
+        for first in 0..=rows.len() {
             for query in [[0.0; 4], [2.0, -1.0, 0.0, 3.0], [-5.0, 4.0, 0.0, 0.0]] {
-                let bits = |stream: &Stream| {
-                    stream
-                        .mix(first, &query)
-                        .into_iter()
-                        .map(f32::to_bits)
-                        .collect::<Vec<_>>()
-                };
-                assert_eq!(bits(raw), bits(cached));
+                let bits = |row: Vec<f32>| row.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(raw_mix(rows, current, first, &query)),
+                    bits(stream.mix(first, &query))
+                );
             }
         }
     }

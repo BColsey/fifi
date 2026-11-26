@@ -112,11 +112,10 @@ impl CpuForward {
             })
             .count() as u128;
 
-        // Current stream, prelude, prior pass bank, and a transient stream clone.
-        // Bound the optional current-row cache for each stream, even though
-        // prelude clones and message banks share immutable normalized rows.
-        let cached_rows = if self.cache_depth_mix { 4 } else { 0 };
-        let stream_values = (4 * (blocks + 1) + cached_rows) * hidden;
+        // Current stream, prelude, prior pass bank, and a transient stream clone,
+        // each with its cached normalized current row, even though prelude clones
+        // and message banks share immutable normalized rows.
+        let stream_values = (4 * (blocks + 1) + 4) * hidden;
         // Routed contributions, MLP input, accumulated output, and staging
         // copies of the input, output, and gate/up and down intermediates.
         let mut projection_values = (top_k + 6) * hidden + 6 * middle;

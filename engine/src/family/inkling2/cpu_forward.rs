@@ -67,7 +67,6 @@ pub(super) struct CpuForward {
     pub(super) weights: Weights,
     pub(super) context: usize,
     pub(super) phase_profile: Option<Box<PhaseProfile>>,
-    cache_depth_mix: bool,
     visits: Vec<LayerVisit>,
     state: Vec<VisitState>,
     position: usize,
@@ -187,11 +186,6 @@ impl CpuForward {
         let gguf = matches!(&weights, Weights::Gguf(_));
         let profile =
             gguf && std::env::var("FIFI_INKLING_GGUF_PHASE_PROFILE").as_deref() == Ok("1");
-        let cache_depth_mix =
-            gguf && std::env::var("FIFI_INKLING_GGUF_CACHE_DEPTH_MIX").as_deref() == Ok("1");
-        if cache_depth_mix {
-            eprintln!("Inkling GGUF depth mix cache enabled");
-        }
         let visits = spec.visits();
         let state = (0..visits.len()).map(|_| VisitState::default()).collect();
         Ok(Self {
@@ -200,7 +194,6 @@ impl CpuForward {
             weights,
             context,
             phase_profile: profile.then(Box::default),
-            cache_depth_mix,
             visits,
             state,
             position: 0,
@@ -433,7 +426,7 @@ impl CpuForward {
             .row("model.llm.embed.weight", id as usize, self.hidden())?
             .into_owned();
         self.norm(&mut input, "model.llm.embed_norm.weight")?;
-        Ok(Stream::new(input, self.cache_depth_mix))
+        Ok(Stream::new(input))
     }
 
     fn forward(
