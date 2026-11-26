@@ -1321,6 +1321,19 @@ impl Block<'_> {
         let l = self.l;
         let rows = self.rows;
         let h = self.h;
+        let mut bank_rows = serde_json::Map::new();
+        if let Some((buffer, blocks, _)) = bank {
+            let sealed = &self
+                .sealed
+                .get(buffer)
+                .ok_or_else(|| bad("resident pass dump: no bank buffer"))?;
+            let current = &self
+                .current
+                .get(buffer)
+                .ok_or_else(|| bad("resident pass dump: no bank buffer"))?;
+            bank_rows.insert("sealed".into(), read(sealed, 0, blocks * rows * h)?.into());
+            bank_rows.insert("current".into(), read(current, 0, rows * h)?.into());
+        }
         let value = serde_json::json!({
             "inputs": read(self.arena, l.inputs, 3 * rows * h)?,
             "messages": read(self.arena, l.messages, 3 * rows * h)?,
@@ -1328,6 +1341,7 @@ impl Block<'_> {
             "gain": read(self.arena, l.gain, rows * h)?,
             "forget": read(self.arena, l.forget, rows * h)?,
             "bank": bank,
+            "bank_rows": bank_rows,
         });
         std::fs::write(&path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
             .map_err(|e| bad(format!("resident pass dump: {e}")))?;
