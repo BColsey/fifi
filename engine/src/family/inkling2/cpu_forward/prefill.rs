@@ -599,10 +599,28 @@ impl CpuForward {
             .map(|scores| self.moe_route_from_logits(layer, scores.to_vec(), bias))
             .collect::<Result<Vec<_>, _>>()?;
         if std::env::var("FIFI_INKLING_DEBUG_PREFILL_ROUTES").as_deref() == Ok("1") {
-            let routes: Vec<_> = routes.iter().map(|route| &route.selected).collect();
+            let picked: Vec<_> = routes.iter().map(|route| &route.selected).collect();
+            // The selection margin of every row: the weakest selected score above the
+            // strongest unselected one (sigmoid score plus bias, the order `route` sorts by).
+            let margins: Vec<f32> = routes
+                .iter()
+                .map(|selected| {
+                    let key = |id: usize| selected.scores[id] + bias[id];
+                    let low = selected
+                        .selected
+                        .iter()
+                        .map(|&id| key(id))
+                        .fold(f32::INFINITY, f32::min);
+                    let high = (0..bias.len())
+                        .filter(|id| !selected.selected.contains(id))
+                        .map(key)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    low - high
+                })
+                .collect();
             eprintln!(
                 "Inkling grouped route diagnostic {}",
-                serde_json::json!({"layer":layer,"routes":routes})
+                serde_json::json!({"layer":layer,"routes":picked,"margins":margins})
             );
         }
         Ok(routes)
