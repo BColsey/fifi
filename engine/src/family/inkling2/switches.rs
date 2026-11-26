@@ -93,8 +93,14 @@ mod tests {
     }
 
     #[test]
-    fn the_diagnostic_paths_are_off_by_default() {
-        for switch in [Switch::Profile, Switch::PrefillQ8RowReuseReport] {
+    fn diagnostic_and_experimental_paths_are_off_by_default() {
+        for switch in [
+            Switch::Profile,
+            Switch::PrefillQ8RowReuseReport,
+            Switch::ResidentPassReport,
+            Switch::ResidentPrefillPass,
+            Switch::PrefillTensorGemm,
+        ] {
             assert!(!TABLE[switch as usize].2, "{switch:?}");
         }
     }
