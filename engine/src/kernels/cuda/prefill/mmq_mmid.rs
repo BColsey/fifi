@@ -896,7 +896,7 @@ mod dq_rows;
 mod routed;
 pub(crate) use dq::{DqMmidCall, SparseDqCall, grouped_dq_serves};
 pub(crate) use dq_rows::GroupedDqRows;
-pub(crate) use routed::{Q8Cursor, RoutedQuant, RoutedX, routed_gemm};
+pub(crate) use routed::{Q8Cursor, RoutedQuant, RoutedX, routed_gemm, routed_serves};
 
 #[cfg(all(test, feature = "native-cuda"))]
 pub(in crate::kernels::cuda) mod tests;

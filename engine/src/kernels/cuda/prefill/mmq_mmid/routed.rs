@@ -82,8 +82,23 @@ pub(crate) struct RoutedX<'a, 'q> {
     pub(crate) quant: RoutedQuant<'q>,
 }
 
-/// One routed GEMM of `weight` over `ids`: the dequantizing GEMM for the in-house types, the
-/// vendored grouped MMQ for the rest. `dst` receives the f32 slot rows at stride `ld`.
+/// Whether `weight` takes the dequantizing GEMM: the in-house types, and a type both routes
+/// decode whose row length is off the 256-value grid of the vendored grouped MMQ.
+fn takes_dq(weight: &NativeWeight) -> bool {
+    let quant = weight.quant();
+    quant.uses_dequantizing_gemm()
+        || (!weight.k().is_multiple_of(256) && super::grouped_dq_serves(quant))
+}
+
+/// Whether a routed GEMM serves the stack `weight`.
+pub(crate) fn routed_serves(weight: &NativeWeight) -> bool {
+    takes_dq(weight)
+        || (weight.k().is_multiple_of(256) && super::mmq_type_of(weight.quant()).is_ok())
+}
+
+/// One routed GEMM of `weight` over `ids`: the dequantizing GEMM for the in-house types and for
+/// row lengths off the MMQ grid, the vendored grouped MMQ for the rest. `dst` receives the f32
+/// slot rows at stride `ld`.
 #[allow(clippy::too_many_arguments)] // one launch description: weight, ids, input, output, scratch
 pub(crate) fn routed_gemm(
     ctx: &CudaContext,
@@ -97,7 +112,7 @@ pub(crate) fn routed_gemm(
 ) -> Result<(), EngError> {
     let n = weight.n_rows() / weight.experts().unwrap_or(1);
     let routed = routed_weight(weight, weight.k(), n)?;
-    if weight.quant().uses_dequantizing_gemm() {
+    if takes_dq(weight) {
         ctx.gemm_dq_mmid(
             stream,
             DqMmidCall {

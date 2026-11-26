@@ -5,8 +5,9 @@
 //! `kernels::cuda::resident::block_ops` (mixed residual, short convolution, delta-rule scan,
 //! latent attention, SiTU, biased router). Every operation works on a chunk of token rows, so
 //! prefill and decode share one path: a chunk of `n` tokens runs layer by layer, and decode is
-//! the chunk of one. Quantized dense projections take up to 8 activation rows per launch; the
-//! routed experts run per token.
+//! the chunk of one. Quantized dense projections take up to 8 activation rows per launch and
+//! larger chunks take the batched product; the routed experts run per token up to 8 rows and as
+//! grouped products, one per expert stack, above that.
 //!
 //! The embedding table stays in the file: each token's row is dequantized on the host and
 //! uploaded into the four residual streams. The latent keys of the seven attention layers are
@@ -25,22 +26,16 @@ use crate::family::project::cuda::{
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
 use crate::family::step::walk::ChunkStep;
-use crate::family::step::{ffn, site};
+use crate::family::step::{experts, ffn, site};
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
 };
-use crate::kernels::cuda::prefill::mmq_mmid::{
-    IdsGuardCall, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
-};
-use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
-use crate::kernels::cuda::prefill::mmq_size::{expert_bounds_ints, ids_dst_ints};
 use crate::kernels::cuda::resident::block_ops::{
     BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked,
 };
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
-use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::resident::router::{
     RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
@@ -267,6 +262,7 @@ struct Scratch {
     weights: DeviceBuffer,
     gu: DeviceBuffer,
     q8_experts: DeviceBuffer,
+    act_experts: DeviceBuffer,
     down: DeviceBuffer,
     shared: DeviceBuffer,
     head: DeviceBuffer,
@@ -278,6 +274,7 @@ struct Scratch {
     route_status: DeviceBuffer,
     mmq_q8: DeviceBuffer,
     mmq_q8_routed: DeviceBuffer,
+    mmq_q8_act: DeviceBuffer,
     fixup: DeviceBuffer,
     ids_g: DeviceBuffer,
     ids_src1: DeviceBuffer,
@@ -325,6 +322,7 @@ impl Scratch {
             + f(c * USED) * 2
             + f(c * USED * 2 * MOE_INTER)
             + q(MOE_INTER, c * USED)
+            + f(c * USED * MOE_INTER)
             + f(c * USED * HIDDEN)
             + f(c * HIDDEN)
             + f(HIDDEN)
@@ -336,6 +334,7 @@ impl Scratch {
             + fixup
             + f(c * EXPERTS)
             + mmq_q8_bytes(HIDDEN, c * USED).expect("mmq q8 size") as u64
+            + mmq_q8_bytes(MOE_INTER, c * USED).expect("mmq q8 size") as u64
             + f(c * USED) * 4
     }
 }
@@ -946,80 +945,17 @@ impl Raon1Device {
         )
     }
 
-    /// The gate and up projections of a chunk's routed picks as grouped GEMMs: tokens are
-    /// regrouped by expert, each expert's weights are read once, and the rows land in `gu` at
-    /// the slot rows the per-token launches write.
-    fn grouped_gate_up(
-        &self,
-        names: &LayerNames,
-        n: usize,
-        gu_row: usize,
-        stride: usize,
-    ) -> Result<(), EngError> {
+    fn picks(&self) -> experts::Picks<'_> {
         let sc = &self.sc;
-        let shape = MmidShape {
-            n_experts: EXPERTS,
-            m: n,
-            top_k: USED,
-        };
-        let ids = self.ctx.mmq_build_ids(
-            &self.stream,
-            IdsGuardCall {
-                shape,
-                ids: sc.ids.range(0, n * USED * 4)?,
-                ids_g: sc.ids_g.range(0, n * USED * 4)?,
-                status: None,
-            },
-            MmidIdsOut {
-                ids_src1: sc.ids_src1.range(0, n * USED * 4)?,
-                ids_dst: sc.ids_dst.range(0, ids_dst_ints(n * USED, n)? * 4)?,
-                expert_bounds: sc
-                    .expert_bounds
-                    .range(0, expert_bounds_ints(EXPERTS)? * 4)?,
-            },
-        )?;
-        let gate = self.io().native(&names.gate_exps)?;
-        let q8_rows = sc.mmq_q8_routed.range(0, mmq_q8_bytes(HIDDEN, n * USED)?)?;
-        self.ctx.mmq_quantize_scatter_ids(
-            &self.stream,
-            &ids,
-            MmidQuantCall {
-                packing: MmqPacking::CpuReference,
-                quant: gate.quant(),
-                k: HIDDEN,
-                row_stride: HIDDEN,
-                x: sc.cur.range(0, n * HIDDEN * 4)?,
-                y: q8_rows,
-            },
-        )?;
-        for (weight, offset) in [
-            (gate, 0),
-            (self.io().native(&names.up_exps)?, MOE_INTER * 4),
-        ] {
-            let quant = weight.quant();
-            let stride_bytes = quant
-                .weight_bytes(MOE_INTER, HIDDEN)
-                .ok_or_else(|| EngError::BadRequest("raon1: the expert stride overflows".into()))?;
-            self.ctx.mmq_mmid_launch(
-                &self.stream,
-                MmidLaunchCall {
-                    shape,
-                    weight: MmidWeight {
-                        base: StepIo::whole(weight.buffer())?,
-                        quant,
-                        k: HIDDEN,
-                        n: MOE_INTER,
-                        stride_bytes,
-                    },
-                    ids: &ids,
-                    y: q8_rows,
-                    dst: sc.gu.range(offset, n * gu_row - offset)?,
-                    ld: stride,
-                    fixup: StepIo::whole(&sc.fixup)?,
-                },
-            )?;
+        experts::Picks {
+            experts: EXPERTS,
+            used: USED,
+            ids: &sc.ids,
+            ids_g: &sc.ids_g,
+            ids_src1: &sc.ids_src1,
+            ids_dst: &sc.ids_dst,
+            expert_bounds: &sc.expert_bounds,
         }
-        Ok(())
     }
 
     fn moe_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
@@ -1078,13 +1014,25 @@ impl Raon1Device {
         )?;
         let gu_row = USED * 2 * MOE_INTER * 4;
         let stride = 2 * MOE_INTER;
-        let grouped = |name: &str| {
-            self.io()
-                .native(name)
-                .is_ok_and(|w| matches!(w.quant(), QuantType::Q4K | QuantType::Q6K))
+        let grouped = |name: &str| n > 8 && experts::serves(&io, name);
+        let gate_up = grouped(&names.gate_exps) && grouped(&names.up_exps);
+        let down = grouped(&names.down_exps);
+        let ids = if gate_up || down {
+            Some(self.picks().ids(&io, n)?)
+        } else {
+            None
         };
-        if n > 8 && grouped(&names.gate_exps) && grouped(&names.up_exps) {
-            self.grouped_gate_up(names, n, gu_row, stride)?;
+        if let Some(ids) = ids.as_ref().filter(|_| gate_up) {
+            let x = experts::token_rows(
+                ids,
+                sc.cur.range(0, n * HIDDEN * 4)?,
+                HIDDEN,
+                sc.mmq_q8_routed.range(0, mmq_q8_bytes(HIDDEN, n * USED)?)?,
+            );
+            for (name, offset) in [(&names.gate_exps, 0), (&names.up_exps, MOE_INTER * 4)] {
+                let dst = sc.gu.range(offset, n * gu_row - offset)?;
+                experts::grouped(&io, name, ids, &x, stride, dst)?;
+            }
         } else {
             let gu_span = ((USED - 1) * stride + MOE_INTER) * 4;
             let x_stride = q8(HIDDEN, 1);
@@ -1127,7 +1075,11 @@ impl Raon1Device {
                 ld,
                 col_off: MOE_INTER,
             },
-            act: Rows::q8(&sc.q8_experts),
+            act: if down {
+                Rows::both(&sc.q8_experts, &sc.act_experts)
+            } else {
+                Rows::q8(&sc.q8_experts)
+            },
         };
         ffn::joined(
             &self.io(),
@@ -1137,17 +1089,28 @@ impl Raon1Device {
             true,
         )?;
         let e_stride = q8(MOE_INTER, 1);
-        for t in 0..n {
-            self.expert_mv(
-                &names.down_exps,
-                sc.q8_experts.range(t * USED * e_stride, USED * e_stride)?,
-                true,
-                sc.ids.range(t * USED * 4, USED * 4)?,
-                sc.down.range(t * USED * HIDDEN * 4, USED * HIDDEN * 4)?,
-                HIDDEN,
-                HIDDEN,
+        if let Some(ids) = ids.as_ref().filter(|_| down) {
+            let x = experts::slot_rows(
+                ids,
+                sc.act_experts.range(0, n * USED * MOE_INTER * 4)?,
                 MOE_INTER,
-            )?;
+                sc.mmq_q8_act.range(0, mmq_q8_bytes(MOE_INTER, n * USED)?)?,
+            );
+            let dst = sc.down.range(0, n * USED * HIDDEN * 4)?;
+            experts::grouped(&io, &names.down_exps, ids, &x, HIDDEN, dst)?;
+        } else {
+            for t in 0..n {
+                self.expert_mv(
+                    &names.down_exps,
+                    sc.q8_experts.range(t * USED * e_stride, USED * e_stride)?,
+                    true,
+                    sc.ids.range(t * USED * 4, USED * 4)?,
+                    sc.down.range(t * USED * HIDDEN * 4, USED * HIDDEN * 4)?,
+                    HIDDEN,
+                    HIDDEN,
+                    MOE_INTER,
+                )?;
+            }
         }
         self.ctx.moe_combine(
             &self.stream,
@@ -1273,6 +1236,7 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         weights: f(c * USED)?,
         gu: f(c * USED * 2 * MOE_INTER)?,
         q8_experts: q(MOE_INTER, c * USED)?,
+        act_experts: f(c * USED * MOE_INTER)?,
         down: f(c * USED * HIDDEN)?,
         shared: f(c * HIDDEN)?,
         head: f(HIDDEN)?,
@@ -1284,10 +1248,11 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         logits_route: f(c * EXPERTS)?,
         route_status: ctx.upload(&[0u8; 4])?,
         mmq_q8_routed: ctx.allocate(mmq_q8_bytes(HIDDEN, c * USED)?)?,
+        mmq_q8_act: ctx.allocate(mmq_q8_bytes(MOE_INTER, c * USED)?)?,
         fixup: ctx.allocate(ctx.mmq_fixup_bytes()?)?,
         ids_g: f(c * USED)?,
         ids_src1: f(c * USED)?,
-        ids_dst: f(ids_dst_ints(c * USED, c)?)?,
+        ids_dst: f(experts::Picks::dst_ints(USED, c)?)?,
         expert_bounds: f(EXPERTS + 1)?,
     })
 }

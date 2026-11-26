@@ -590,7 +590,12 @@ fn grouped_type_id(ty: QuantType) -> Option<c_int> {
 pub(in crate::kernels::cuda) fn gemm_dq_mmid_type(ty: QuantType) -> bool {
     matches!(
         ty,
-        QuantType::Q40 | QuantType::Q3K | QuantType::Q5K | QuantType::Iq4Xs
+        QuantType::Q40
+            | QuantType::Q3K
+            | QuantType::Q5K
+            | QuantType::Q50
+            | QuantType::Q80
+            | QuantType::Iq4Xs
     ) || ty.is_codebook()
 }
 
