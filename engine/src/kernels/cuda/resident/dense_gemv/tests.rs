@@ -836,6 +836,106 @@ fn original_packed_gguf_gemv_matches_cpu_for_every_supported_format() {
     assert_eq!(covered, 19);
 }
 
+/// The packed GEMV's lane order, run on the host: lane `l` adds the products of columns
+/// `l, l + 32, ...` of each block, block by block, with one fused multiply-add each, then the
+/// warp sums the lanes with the XOR butterfly. `weights` holds the decoded row.
+fn packed_lane_order(weights: &[f32], x: &[f32], block: usize) -> f32 {
+    let mut lanes = [0.0_f32; 32];
+    for (w, x) in weights.chunks_exact(block).zip(x.chunks_exact(block)) {
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            for col in (lane..block).step_by(32) {
+                *sum = w[col].mul_add(x[col], *sum);
+            }
+        }
+    }
+    for offset in [16, 8, 4, 2, 1] {
+        let before = lanes;
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            *sum = before[lane] + before[lane ^ offset];
+        }
+    }
+    lanes[0]
+}
+
+/// Each row of the packed GEMV has the bits of its lane order whenever the host decodes the
+/// format's weights to the device's values: rows that span several staged chunks of a warp,
+/// weights that start off a 16-byte boundary, and rows of `x` at an odd stride.
+#[test]
+fn packed_gguf_gemv_keeps_its_lane_order_bits() {
+    use crate::weights::{GgufType, dequantize_into};
+
+    if !testkit::device_present("packed_gguf_gemv_keeps_its_lane_order_bits") {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = DenseGemvShape {
+        m: 2,
+        rows: 13,
+        cols: 5120,
+        ld_x: 5123,
+        ld_y: 16,
+    };
+    let mut rng = Rng::new(0xAB_54_30_23);
+    let input = draw(&mut rng, (shape.m - 1) * shape.ld_x + shape.cols, 1.0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&input), 4);
+    let y_bytes = ((shape.m - 1) * shape.ld_y + shape.rows) * 4;
+    let mut exact = Vec::new();
+    for id in 0..=42 {
+        let Ok(kind) = GgufType::from_id(id) else {
+            continue;
+        };
+        let Some(dtype @ DenseDtype::PackedGguf(_)) = DenseDtype::from_gguf(kind) else {
+            continue;
+        };
+        let values = shape.rows * shape.cols;
+        let blocks = test_packed_blocks(kind, values / kind.block_elems() as usize);
+        let mut decoded = vec![0.0; values];
+        dequantize_into(kind, &blocks, &mut decoded).unwrap();
+        for skew in [0, 2, 10] {
+            let w = Padded::new(&rig.ctx, &blocks, skew);
+            let y = Padded::new(&rig.ctx, &sentinel(y_bytes), 0);
+            rig.ctx
+                .dense_gemv(
+                    &rig.stream,
+                    DenseGemvCall {
+                        shape,
+                        dtype,
+                        w: w.all(),
+                        x: x.all(),
+                        y: y.all(),
+                    },
+                )
+                .unwrap();
+            rig.stream.synchronize().unwrap();
+            assert_eq!(w.read(&rig.ctx, "packed weight"), blocks);
+            let result = testkit::floats(&y.read(&rig.ctx, "GGUF packed output"));
+            let mut same = true;
+            for t in 0..shape.m {
+                let x = &input[t * shape.ld_x..][..shape.cols];
+                for (row, weights) in decoded.chunks_exact(shape.cols).enumerate() {
+                    let want = packed_lane_order(weights, x, kind.block_elems() as usize);
+                    same &= result[t * shape.ld_y + row].to_bits() == want.to_bits();
+                }
+            }
+            if skew == 0 && same {
+                exact.push(kind);
+            }
+            println!(
+                "packed GGUF {} skew {skew}: lane-order bits {same}",
+                kind.name()
+            );
+        }
+    }
+    // The formats whose host decoding is one product of the block scale and the code.
+    for kind in [GgufType::Q80, GgufType::Q40, GgufType::Iq4Nl, GgufType::Q20] {
+        assert!(
+            exact.contains(&kind),
+            "{} lost its lane-order bits",
+            kind.name()
+        );
+    }
+}
+
 #[test]
 fn indexed_gguf_experts_match_ordered_cpu_projection() {
     use super::{GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufMoeWeights};

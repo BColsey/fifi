@@ -154,25 +154,60 @@ __global__ void gguf_nvfp4_gemv(inference_cuda_dense_gemv_args a, Index index) {
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
 }
 
+// Bytes of weight row one warp stages at a time.
+constexpr int kStageBytes = 2048;
+
+// Copies the `bytes` bytes at `src` into a warp's shared `stage`, which starts on a 16-byte
+// boundary and holds bytes + 16, and returns the copy. The copy keeps the source's offset within
+// 16 bytes, so the aligned body moves in 16-byte words and only the head and tail (under 16 bytes
+// each) move bytewise; no read leaves the span. Every lane of the warp calls it; the copy is
+// visible to the whole warp.
+__device__ __forceinline__ const uint8_t *stage_span(const uint8_t *src, int bytes, uint8_t *stage,
+                                                     int lane) {
+    const int skew = int(uintptr_t(src) & 15);
+    uint8_t *dst = stage + skew;
+    const int head = min(bytes, (16 - skew) & 15);
+    const int words = (bytes - head) / 16;
+    const int tail = head + words * 16;
+    const auto *in = reinterpret_cast<const uint4 *>(src + head);
+    auto *out = reinterpret_cast<uint4 *>(dst + head);
+    for (int i = lane; i < words; i += 32) out[i] = __ldg(in + i);
+    if (lane < head) dst[lane] = src[lane];
+    if (tail + lane < bytes) dst[tail + lane] = src[tail + lane];
+    __syncwarp();
+    return dst;
+}
+
+// One warp per weight row. The warp stages its row a chunk of whole blocks at a time with wide
+// loads, so each warp has the chunk's bytes in flight at once, then each lane decodes its columns
+// from shared memory. Lane l adds the products of columns l, l + 32, ... of every block in block
+// order and the warp sums the lanes with the XOR butterfly: other kernels reproduce these bits.
 template <int Type, int Block, int Bytes, typename Index>
 __global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a, Index index) {
-    extern __shared__ float staged[];
-    const auto *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
-    for (int col = threadIdx.x; col < a.cols; col += blockDim.x) staged[col] = x[col];
-    __syncthreads();
-
-    const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    constexpr int kChunk = kStageBytes / Bytes;
+    // Each warp's stage starts on a 16-byte boundary, so the copy's offset within 16 bytes is
+    // the source's: the wide stores stay aligned and every decoder load keeps its alignment.
+    constexpr int kPitch = (kChunk * Bytes + 16 + 15) / 16 * 16;
+    __shared__ __align__(16) uint8_t stage[kWarps][kPitch];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * kWarps + warp;
     if (row >= a.rows) return;
+    const auto *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
     const int blocks = a.cols / Block;
     const auto *w = matrix_base(a.w, index, blockIdx.y) + size_t(row) * blocks * Bytes;
     float sum = 0.0f;
-    for (int block = 0; block < blocks; ++block) {
-        const auto *weights = w + block * Bytes;
+    for (int first = 0; first < blocks; first += kChunk) {
+        const int count = min(kChunk, blocks - first);
+        const uint8_t *staged = stage_span(w + size_t(first) * Bytes, count * Bytes, stage[warp], lane);
+        for (int block = 0; block < count; ++block) {
+            const auto *weights = staged + block * Bytes;
+            const float *in = x + (first + block) * Block;
 #pragma unroll
-        for (int col = lane; col < Block; col += 32) {
-            sum = fmaf(fifi_gguf::decode<Type>(weights, col), staged[block * Block + col], sum);
+            for (int col = lane; col < Block; col += 32) {
+                sum = fmaf(fifi_gguf::decode<Type>(weights, col), __ldg(in + col), sum);
+            }
         }
+        __syncwarp();
     }
     sum = warp_sum(sum);
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
@@ -498,7 +533,6 @@ template <typename Index>
 void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
                    Failure &failure, Index index) {
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
-    const size_t shared = size_t(a.cols) * sizeof(float);
     if (decode_split(a) && launch_decode_split(a, index, stream)) {
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         return;
@@ -511,7 +545,7 @@ void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
     switch (a.weight_dtype - fifi_gguf::kDtypeBase) {
 #define LAUNCH(id, block, bytes) \
     case id: \
-        gguf_packed_gemv<id, block, bytes, Index><<<grid, kWarps * 32, shared, stream>>>(a, index); \
+        gguf_packed_gemv<id, block, bytes, Index><<<grid, kWarps * 32, 0, stream>>>(a, index); \
         break;
         FIFI_GGUF_GEMV_TYPES(LAUNCH)
 #undef LAUNCH
