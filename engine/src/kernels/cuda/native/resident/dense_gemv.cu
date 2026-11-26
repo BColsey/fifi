@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <type_traits>
@@ -767,6 +768,7 @@ namespace {
 #include "resident/inkling_qkv_visit.cuh"
 #include "resident/inkling_prefetch_select.cuh"
 #include "resident/inkling_prefetch_large.cuh"
+#include "resident/inkling_prefetch_staged.cuh"
 #include "resident/inkling_split_visit_tile.cuh"
 #include "resident/inkling_iq2_visit_tile.cuh"
 #include "resident/inkling_controller_pair.cuh"
@@ -1011,7 +1013,7 @@ extern "C" int inference_cuda_inkling_packed_visit_launch(const inference_cuda_d
     if (err==cudaSuccess && !sm75) return inference_cuda_dense_gemv_launch(args,stream,stage);
     if(err==cudaSuccess){
         const auto s=static_cast<cudaStream_t>(stream);
-        if(variant==3 && (inkling_prefetch_select(a,codec,s) || inkling_large_select(a,codec,s))){
+        if(variant==3 && (inkling_staged_select(a,codec,s) || inkling_prefetch_select(a,codec,s) || inkling_large_select(a,codec,s))){
             err=cudaGetLastError();report_stage(stage,err==cudaSuccess?INFERENCE_CUDA_STAGE_NONE:INFERENCE_CUDA_STAGE_LAUNCH);return int(err);
         }
         if(variant==3 && expert && (codec==17 || codec==19 || codec==22)){
@@ -1311,7 +1313,7 @@ extern "C" int inference_cuda_gguf_q8_row_reuse_width_launch(
                 dim3 expert_tiles(a.rows/8, (a.m+7)/8);
                 if (codec == 16) inkling_exact_visit_tile<16,256,66,1><<<expert_tiles,256,0,s>>>(a);
                 else inkling_exact_visit_tile<42,64,18,1><<<expert_tiles,256,0,s>>>(a);
-            } else if (!inkling_prefetch_select(a,q6_visit?14:8,s)) {
+            } else if (!inkling_staged_select(a,q6_visit?14:8,s) && !inkling_prefetch_select(a,q6_visit?14:8,s)) {
                 if(q6_visit) inkling_exact_visit_tile<14,256,210><<<tiles,256,0,s>>>(a);
                 else inkling_exact_visit_tile<8,32,34><<<tiles,256,0,s>>>(a);
             }

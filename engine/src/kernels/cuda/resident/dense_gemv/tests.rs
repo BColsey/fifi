@@ -490,6 +490,73 @@ fn q6_attention_row_pairs_preserve_reference_bits_and_padding() {
     }
 }
 
+/// The Q8_0 prefill tiles of the weight visit give the ordinary GEMV's bits at the attention
+/// shapes: the staged tiles where the code is sm_80 or newer and the rows are whole 16-byte
+/// copies, the shipped tiles otherwise (an odd activation stride, a weight off the 16-byte grid).
+#[test]
+fn q8_prefill_tiles_match_the_ordinary_gemv_bit_for_bit() {
+    if !testkit::device_present("Q8_0 prefill tiles") {
+        return;
+    }
+    let rig = Rig::new();
+    let dtype = DenseDtype::PackedGguf(crate::weights::GgufType::Q80);
+    let shapes = [
+        (384, 2304, 0),
+        (1024, 2304, 0),
+        (3072, 2304, 0),
+        (2304, 3072, 0),
+        (3072, 2304, 2),
+    ];
+    for (rows, cols, offset) in shapes {
+        let w = (0..rows * cols / 32)
+            .flat_map(|block| {
+                let mut raw =
+                    std::array::from_fn::<_, 34, _>(|i| ((block * 13 + i * 37) % 251) as u8);
+                let scale = half::f16::from_f32((1 + block % 13) as f32 / 1024.0);
+                raw[..2].copy_from_slice(&scale.to_bits().to_le_bytes());
+                raw
+            })
+            .collect::<Vec<_>>();
+        let weights = Padded::new(&rig.ctx, &w, offset);
+        for (m, gap) in [(63, 4), (64, 0), (128, 4), (255, 0), (256, 4), (64, 3)] {
+            let shape = DenseGemvShape {
+                ld_x: cols + gap,
+                ld_y: rows + 5,
+                ..DenseGemvShape::packed(m, rows, cols)
+            };
+            let input = (0..m * shape.ld_x)
+                .map(|i| ((i * 109 % 1009) as f32 - 504.0) / 513.0)
+                .collect::<Vec<_>>();
+            let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+            let run = |weight_visit| {
+                rig.ctx.set_dense_group_policy(super::DenseGroupPolicy {
+                    weight_visit,
+                    ..super::DenseGroupPolicy::default()
+                });
+                let y = Padded::new(&rig.ctx, &sentinel(m * shape.ld_y * 4), 0);
+                let call = DenseGemvCall {
+                    shape,
+                    dtype,
+                    w: weights.all(),
+                    x: x.all(),
+                    y: y.all(),
+                };
+                rig.ctx.dense_gemv(&rig.stream, call).unwrap();
+                rig.stream.synchronize().unwrap();
+                y.read(&rig.ctx, "y")
+            };
+            let ordinary = run(false);
+            let tiled = run(true);
+            rig.ctx
+                .set_dense_group_policy(super::DenseGroupPolicy::default());
+            assert!(
+                tiled == ordinary,
+                "{rows}x{cols} m={m} gap={gap} offset={offset}"
+            );
+        }
+    }
+}
+
 #[test]
 fn bad_arguments_are_refused_before_any_launch() {
     if !testkit::device_present("bad_arguments_are_refused_before_any_launch") {
