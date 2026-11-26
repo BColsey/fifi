@@ -337,6 +337,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_f32_visit.cuh",
     "src/kernels/cuda/native/resident/inkling_q6_imma.cuh",
     "src/kernels/cuda/native/resident/inkling_panel_wide.cuh",
+    "src/kernels/cuda/native/resident/inkling_routed_prefill.cuh",
     "src/kernels/cuda/native/resident/inkling_weight_panel.cuh",
     "src/kernels/cuda/native/resident/gguf_gemv.cuh",
     "src/kernels/cuda/native/resident/inkling_conv.h",

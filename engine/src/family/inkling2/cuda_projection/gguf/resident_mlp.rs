@@ -67,6 +67,33 @@ fn require_packed(dtypes: [DenseDtype; 2]) -> Result<(), EngError> {
 }
 
 impl GgufCuda {
+    pub(in crate::family::inkling2) fn enqueue_device_routed_prefill(
+        &self,
+        stream: &DeviceStream,
+        layer: u32,
+        rows: crate::kernels::cuda::resident::dense_gemv::routed_prefill::DeviceRoutedPrefill<'_>,
+        dtypes: [DenseDtype; 2],
+        caps: [f32; 2],
+    ) -> Result<Option<()>, EngError> {
+        let r = self.routed(layer)?;
+        if (r.moe.experts, r.moe.hidden, r.moe.middle, r.shape.top_k) != (128, 2304, 1152, 8) {
+            return Ok(None);
+        }
+        let [Some(g), Some(d)] = dtypes.map(|t| match t {
+            DenseDtype::PackedGguf(k) => Some(k.id()),
+            DenseDtype::GgufNvfp4 => Some(40),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(g, 16 | 17 | 19 | 22) || !matches!(d, 40 | 42) {
+            return Ok(None);
+        }
+        self.context
+            .routed_prefill(stream, rows, r.stacks, r.scales, [g, d], caps)?;
+        Ok(Some(()))
+    }
+
     fn routed(&self, layer: u32) -> Result<Routed<'_>, EngError> {
         let name = format!("model.llm.layers.{layer}.mlp.gate.weight");
         let Some((router, DenseDtype::F32)) = self.dense.get(&name) else {
