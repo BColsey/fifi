@@ -614,10 +614,12 @@ fn mix_jobs_equal_the_single_launches_bit_for_bit() {
         return;
     }
     let ctx = CudaContext::new().unwrap();
-    ctx.set_dense_group_policy(crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
-        decode_glue: true,
-        ..Default::default()
-    });
+    ctx.set_dense_group_policy(
+        crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
+            decode_glue: true,
+            ..Default::default()
+        },
+    );
     let stream = ctx.stream().unwrap();
     let width = 2304;
     let row = row_bytes(width);

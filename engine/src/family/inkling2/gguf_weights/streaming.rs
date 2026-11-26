@@ -240,8 +240,7 @@ impl GgufTextWeights {
             &mut source,
             layer,
             (rows, destination),
-            dtypes,
-            caps,
+            (dtypes, caps),
             route_weight,
             (stream, flag_out),
         )

@@ -547,7 +547,7 @@ fn a_state_row_takes_the_convolved_row_as_the_add_launch_would() {
     let (width, taps) = (2304usize, 4usize);
     let row = row_bytes(width);
     let word = size_of::<f32>();
-    let kernel = normal_row(&mut Rng::new(0x57a7e_add), width * taps);
+    let kernel = normal_row(&mut Rng::new(0x57a7_eadd), width * taps);
     let sequence = Sequence::new(&ctx, &stream, 8, width, taps, &kernel);
     for step in 0..6usize {
         let input = normal_row(&mut Rng::new(100 + step as u64), width);

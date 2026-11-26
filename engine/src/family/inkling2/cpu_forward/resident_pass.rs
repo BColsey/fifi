@@ -79,7 +79,7 @@ pub(super) const MAX_ROWS: usize = 512;
 /// any other count falls back to a GEMV that reads the weights once per row. On the RTX 2080 Ti
 /// (nsys traces `pass-nsys-pass-{256,512}-50a9e761-*`) a 512-row block takes 2.85 s of stream
 /// time against 2 x 0.65 s for two 256-row blocks, and cuts smaller than 256 pay the expert
-/// stage's per-block cost (about 250 ms) more often. `FIFI_INKLING_PASS_BLOCK_ROWS` overrides it
+/// stage's per-block cost (about 250 ms) more often. Tests can override it with `FIFI_INKLING_PASS_BLOCK_ROWS`
 /// (1..=MAX_ROWS); revisit once every row count has a weight-visit or tensor kernel.
 pub(super) const BLOCK_ROWS: usize = 256;
 
@@ -240,7 +240,14 @@ impl CpuForward {
         Ok(true)
     }
 
-    /// The block size of a prompt, from `FIFI_INKLING_PASS_BLOCK_ROWS` or [`BLOCK_ROWS`].
+    /// Serving uses the measured block size, with no additional process-level tuning knob.
+    #[cfg(not(test))]
+    fn block_rows() -> usize {
+        BLOCK_ROWS
+    }
+
+    /// Test override to exercise partial and multi-block tails.
+    #[cfg(test)]
     fn block_rows() -> usize {
         static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *ROWS.get_or_init(|| {
