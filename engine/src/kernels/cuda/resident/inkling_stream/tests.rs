@@ -603,9 +603,8 @@ fn job_state(rng: &mut Rng, width: usize, blocks: usize) -> Vec<f32> {
         let sealed = host::seal(&mut current, normal_row(rng, width), EPS);
         state.push(sealed);
     }
-    let mut rows = state.concat();
-    rows.extend_from_slice(&current);
-    rows
+    current.extend(state.into_iter().flatten());
+    current
 }
 
 #[test]
@@ -823,17 +822,16 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
     let twin_query = normal_row(&mut rng, width);
     let state = job_state(&mut rng, width, blocks);
     let twin_state = job_state(&mut rng, width, blocks);
-    let rows = state.len() / width;
-    let sealed: Vec<Vec<f32>> = state[..(rows - 1) * width]
+    let sealed: Vec<Vec<f32>> = state[width..]
         .chunks_exact(width)
         .map(<[f32]>::to_vec)
         .collect();
-    let host_current: Vec<f32> = state[(rows - 1) * width..]
+    let host_current: Vec<f32> = state[..width]
         .iter()
         .zip(&addend)
         .map(|(a, b)| a + b)
         .collect();
-    let host_twin_current = twin_state[(rows - 1) * width..].to_vec();
+    let host_twin_current = twin_state[..width].to_vec();
     upload(&buffers.state, &stream, &state);
     upload(&twin.state, &stream, &twin_state);
     upload(&buffers.query, &stream, &query);
@@ -890,7 +888,7 @@ fn mix_jobs_add_and_norm_match_the_host_within_rounding() {
     let normed_row = download(&extra, &stream, 2 * row, width);
     let twin_out = download(&twin.out, &stream, 0, width);
     let expected = host::mix(&sealed, &host_current, 2, &query, EPS);
-    let twin_sealed: Vec<Vec<f32>> = twin_state[..(rows - 1) * width]
+    let twin_sealed: Vec<Vec<f32>> = twin_state[width..]
         .chunks_exact(width)
         .map(<[f32]>::to_vec)
         .collect();
