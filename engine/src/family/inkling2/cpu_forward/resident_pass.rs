@@ -76,6 +76,8 @@ const WORD: usize = 4;
 const PAST: usize = TAPS - 1;
 const ROLES: usize = 3;
 const STREAM_BLOCKS: usize = MAX_BLOCKS;
+/// The buffer index of the frozen prelude stream.
+const PRELUDE: usize = 2;
 /// Requests of `attention_requests`: q, k, v, relative, sinks, gates, k taps, v taps.
 const REQUEST_INPUTS: [usize; 8] = [0, 1, 2, 0, 0, 0, 1, 2];
 
@@ -87,8 +89,9 @@ pub(super) struct PassWorkspace {
     arena: DeviceBuffer,
     layout: Arena,
     constants: DeviceBuffer,
-    current: [DeviceBuffer; 2],
-    sealed: [DeviceBuffer; 2],
+    /// The depth streams: the live stream, the bank of the current pass and the prelude.
+    current: [DeviceBuffer; 3],
+    sealed: [DeviceBuffer; 3],
     /// Raw convolution tails per visit, oldest first: K, V, attention, MLP. The device flips
     /// them at the end of a block; the host uploads them when they are stale.
     tails: [DeviceBuffer; 2],
@@ -433,8 +436,10 @@ impl CpuForward {
         let width = core.core_end - core.core_start;
         let end = core.core_start + width * core.num_passes;
         let mut live = 0usize;
+        let blocks_pre = 0usize;
         let mut blocks = 0usize;
         let mut prelude: Option<(usize, usize)> = None;
+        let _ = blocks_pre;
         let mut bank: Option<(usize, usize, usize)> = None;
         let attention = cuda.resident_attention().expect("admitted").1;
         for (index, &visit) in self.visits.iter().enumerate() {
@@ -446,11 +451,14 @@ impl CpuForward {
             {
                 let pass_index = (slot - core.core_start) / width;
                 if pass_index == 0 {
-                    prelude = Some((live, blocks));
+                    // The prelude is a frozen copy of the stream at the start of pass 0.
+                    block.restore_stream(PRELUDE, live, blocks)?;
+                    prelude = Some((PRELUDE, blocks));
+                    block.report.launches.set(block.report.launches.get() + 2);
                 } else {
                     let (prelude_buffer, prelude_blocks) = prelude.expect("pass 0 ran");
                     bank = Some((live, blocks, prelude_blocks + 1));
-                    live = 1 - live;
+                    live = 3 - live - PRELUDE;
                     block.live.set(live);
                     blocks = prelude_blocks;
                     block.restore_stream(live, prelude_buffer, blocks)?;
@@ -983,7 +991,7 @@ impl CpuForward {
         readback.read_f32(0, &mut logits)?;
         block.report.readbacks.set(block.report.readbacks.get() + 2);
         let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
-        let routes = self.route_prefill_logits(index, &logits, &bias, rows)?;
+        let routes = self.route_prefill_logits(self.visits[index].weight_layer, &logits, &bias, rows)?;
 
         // The routed experts: the GEMM lane's one call site, enqueued behind this block.
         let names = [
@@ -1055,8 +1063,8 @@ struct Block<'a> {
     arena: &'a DeviceBuffer,
     l: &'a Arena,
     constants: &'a DeviceBuffer,
-    current: &'a [DeviceBuffer; 2],
-    sealed: &'a [DeviceBuffer; 2],
+    current: &'a [DeviceBuffer; 3],
+    sealed: &'a [DeviceBuffer; 3],
     /// `[read, write]`: the previous block's tails and the ones this block writes.
     tails: [&'a DeviceBuffer; 2],
     visits: &'a [VisitPlan],
@@ -1096,8 +1104,9 @@ impl Block<'_> {
         self.current[buffer].range(0, self.rows * self.h * WORD)
     }
 
+    /// The first `blocks` sealed blocks; a stream without blocks shows one spare block.
     fn sealed_range(&self, buffer: usize, blocks: usize) -> Result<DeviceRange<'_>, EngError> {
-        self.sealed[buffer].range(0, blocks * self.rows * self.h * WORD)
+        self.sealed[buffer].range(0, blocks.max(1) * self.rows * self.h * WORD)
     }
 
     /// The previous block's tail plane `which` of visit `index`, exactly `PAST * width` words.
@@ -1335,8 +1344,13 @@ impl PassWorkspace {
             arena: context.allocate(layout.words * WORD)?,
             layout,
             constants: context.upload(&constants)?,
-            current: [context.allocate(row)?, context.allocate(row)?],
+            current: [
+                context.allocate(row)?,
+                context.allocate(row)?,
+                context.allocate(row)?,
+            ],
             sealed: [
+                context.allocate(STREAM_BLOCKS * row)?,
                 context.allocate(STREAM_BLOCKS * row)?,
                 context.allocate(STREAM_BLOCKS * row)?,
             ],
@@ -1351,3 +1365,6 @@ impl PassWorkspace {
         })
     }
 }
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod tests;
