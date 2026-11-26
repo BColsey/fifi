@@ -52,8 +52,43 @@ struct SerialKv {
     }
 };
 
-// One warp computes the weighted sum over its interleaved subset of newest-first rows.
-// Only the source addresses vary by reader; the FP32 recurrence and order do not.
+// The score of the row at `distance`: the scaled QK dot of the lane's key columns, summed across
+// the warp, plus the learned bias.
+__device__ __forceinline__ float row_score(const Args &a, const float (&query)[kColumns], float rel,
+                                           int distance, const float (&key)[kColumns]) {
+    const int lane = threadIdx.x % kWarp;
+    float dot = 0.f;
+#pragma unroll
+    for (int i = 0; i < kColumns; ++i) {
+        dot = fmaf(query[i], key[i], dot);
+    }
+    float bias = 0.f;
+    if (distance < a.relative_extent) {
+        const float term = lane < a.relative_dims
+                               ? rel * a.table[size_t(lane) * a.relative_extent + distance]
+                               : 0.f;
+        bias = warp_sum(term);
+    }
+    return kScale * warp_sum(dot) + bias;
+}
+
+// The lane's columns of one K or V row.
+__device__ __forceinline__ void load_columns(const float *row, float (&out)[kColumns]) {
+    const int lane = threadIdx.x % kWarp;
+#pragma unroll
+    for (int i = 0; i < kColumns; ++i) {
+        out[i] = row[lane + i * kWarp];
+    }
+}
+
+// Rows a warp loads and scores before it folds them. The loads and the scores of a batch do not
+// depend on the running partial, so they are issued together; the folds then run in distance
+// order, as one row at a time would, so the results keep their bits.
+constexpr int kBatch = 4;
+
+// One warp computes the weighted sum over its interleaved subset of newest-first rows: warp w
+// adds the distances w, w + kWarps, ... Only the source addresses vary by reader; the FP32
+// recurrence and order do not.
 template <class ReadKv>
 __device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_kv) {
     const int lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
@@ -65,31 +100,38 @@ __device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_k
     }
     const float rel = lane < a.relative_dims ? a.relative[r.head * a.relative_dims + lane] : 0.f;
     float peak = -INFINITY, sum = 0.f;
-    for (int distance = warp; distance < r.count; distance += kWarps) {
-        const auto [key, value] = read_kv(a, r, distance);
-        float dot = 0.f;
+    for (int first = warp; first < r.count; first += kWarps * kBatch) {
+        float keys[kBatch][kColumns], values[kBatch][kColumns];
 #pragma unroll
-        for (int i = 0; i < kColumns; ++i) {
-            dot = fmaf(query[i], key[lane + i * kWarp], dot);
+        for (int j = 0; j < kBatch; ++j) {
+            const int distance = first + j * kWarps;
+            if (distance < r.count) {
+                const auto [key, value] = read_kv(a, r, distance);
+                load_columns(key, keys[j]);
+                load_columns(value, values[j]);
+            }
         }
-        float bias = 0.f;
-        if (distance < a.relative_extent) {
-            const float term = lane < a.relative_dims
-                                   ? rel * a.table[size_t(lane) * a.relative_extent + distance]
-                                   : 0.f;
-            bias = warp_sum(term);
-        }
-        const float score = kScale * warp_sum(dot) + bias;
-        if (score == -INFINITY) continue;
-        const float next = fmaxf(peak, score);
-        const float correction = expf(peak - next);
-        const float mass = expf(score - next);
-        sum = fmaf(sum, correction, mass);
+        float scores[kBatch];
 #pragma unroll
-        for (int i = 0; i < kColumns; ++i) {
-            acc[i] = fmaf(mass, value[lane + i * kWarp], acc[i] * correction);
+        for (int j = 0; j < kBatch; ++j) {
+            const int distance = first + j * kWarps;
+            scores[j] =
+                distance < r.count ? row_score(a, query, rel, distance, keys[j]) : -INFINITY;
         }
-        peak = next;
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const float score = scores[j];
+            if (score == -INFINITY) continue;
+            const float next = fmaxf(peak, score);
+            const float correction = expf(peak - next);
+            const float mass = expf(score - next);
+            sum = fmaf(sum, correction, mass);
+#pragma unroll
+            for (int i = 0; i < kColumns; ++i) {
+                acc[i] = fmaf(mass, values[j][i], acc[i] * correction);
+            }
+            peak = next;
+        }
     }
     if (lane == 0) {
         p.stats[warp * 2] = peak;
