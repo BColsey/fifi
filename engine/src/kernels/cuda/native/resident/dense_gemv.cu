@@ -195,11 +195,35 @@ __global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a, Index index) 
     const auto *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
     const int blocks = a.cols / Block;
     const auto *w = matrix_base(a.w, index, blockIdx.y) + size_t(row) * blocks * Bytes;
+    // A lane's columns of one block, and the blocks it decodes before it adds their products:
+    // the decodes and the loads of a batch do not wait on the sum, so they are issued together,
+    // and the adds then run in block and column order, as one block at a time would.
+    constexpr int kCols = Block / 32;
+    constexpr int kBatch = kCols >= 8 ? 1 : 8 / kCols;
     float sum = 0.0f;
     for (int first = 0; first < blocks; first += kChunk) {
         const int count = min(kChunk, blocks - first);
         const uint8_t *staged = stage_span(w + size_t(first) * Bytes, count * Bytes, stage[warp], lane);
-        for (int block = 0; block < count; ++block) {
+        int block = 0;
+        for (; block + kBatch <= count; block += kBatch) {
+            float value[kBatch][kCols], input[kBatch][kCols];
+#pragma unroll
+            for (int b = 0; b < kBatch; ++b) {
+                const auto *weights = staged + (block + b) * Bytes;
+                const float *in = x + (first + block + b) * Block;
+#pragma unroll
+                for (int c = 0; c < kCols; ++c) {
+                    value[b][c] = fifi_gguf::decode<Type>(weights, lane + 32 * c);
+                    input[b][c] = __ldg(in + lane + 32 * c);
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < kBatch; ++b) {
+#pragma unroll
+                for (int c = 0; c < kCols; ++c) sum = fmaf(value[b][c], input[b][c], sum);
+            }
+        }
+        for (; block < count; ++block) {
             const auto *weights = staged + block * Bytes;
             const float *in = x + (first + block) * Block;
 #pragma unroll

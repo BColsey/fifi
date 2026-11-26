@@ -58,6 +58,14 @@ __device__ __forceinline__ unsigned nibble(unsigned value, int upper) {
     return (value >> (4 * upper)) & 15u;
 }
 
+// kvalues_iq4nl[index] from four words of immediates: a select and a byte extract instead of a
+// load from the table in device memory, which every decoded weight would wait on. The words are
+// the table's bytes, so the values are the table's.
+__device__ __forceinline__ int iq4nl_value(unsigned index) {
+    const unsigned word = index < 8 ? (index < 4 ? 0xbfad9881u : 0xf6eaddcfu) : (index < 12 ? 0x26190d01u : 0x71594535u);
+    return int(int8_t(word >> (8 * (index & 3u))));
+}
+
 template <typename T>
 __device__ __forceinline__ float grid_value(T grid, int lane, float scale, unsigned signs) {
     const float value = scale * float((grid >> (8 * lane)) & 255u);
@@ -157,12 +165,12 @@ __device__ __forceinline__ float decode(const uint8_t *b, int i) {
         const int row = i / 32;
         const int lane = i % 32;
         if constexpr (Type == 20) {
-            return half_value(b) * float(kvalues_iq4nl[nibble(b[2 + lane % 16], lane / 16)]);
+            return half_value(b) * float(iq4nl_value(nibble(b[2 + lane % 16], lane / 16)));
         } else {
             const unsigned lower = nibble(b[4 + row / 2], row % 2);
             const unsigned higher = (read16(b + 2) >> (2 * row)) & 3;
             const float scale = half_value(b) * float(int(lower | (higher << 4)) - 32);
-            return scale * float(kvalues_iq4nl[nibble(b[8 + 16 * row + lane % 16], lane / 16)]);
+            return scale * float(iq4nl_value(nibble(b[8 + 16 * row + lane % 16], lane / 16)));
         }
     } else {
         const int row = i / 32, segment = (i % 32) / 8, lane = i % 8;
