@@ -923,6 +923,79 @@ fn card_reports_the_cost_of_a_k_row_step() {
     assert!(worst_abs(&row).is_finite(), "the logits row is not finite");
 }
 
+/// Accuracy probe, not a gate. Teacher-forces one stream of 240 tokens from position 0 in chunks
+/// of each row count of `SENSENOVA_K_ROWS` and writes the logits row of every position to
+/// `<SENSENOVA_ROWS_OUT>.k<rows>` as little-endian f32. The stream is `<that path>.ids`: when the
+/// file is missing, the first run makes it (16 fixed tokens, then its own greedy choices) and
+/// writes it. A run with `FIFI_SENSENOVA_DECODE_GEMM=dq` and one row is the reference: every
+/// projection and the head decode each weight and read f32 rows. Scoring the files against it
+/// says how far each route is from that reference.
+#[test]
+fn card_writes_the_rows_of_k_row_chunks() {
+    const TOKENS: usize = 240;
+    const SEED: usize = 16;
+    let Ok(out) = std::env::var("SENSENOVA_ROWS_OUT") else {
+        return;
+    };
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova rows of k-row chunks")
+    else {
+        return;
+    };
+    let vocab = weights.shape().vocab as u32;
+    let chunk_rows: Vec<usize> = match std::env::var("SENSENOVA_K_ROWS") {
+        Ok(list) => list.split(',').map(|k| k.parse().unwrap()).collect(),
+        Err(_) => vec![1],
+    };
+    // The rows of one chunk at `pos`: the walk, then the head on each of its rows.
+    let mut feed = |card: &mut LoopStep<'_>, tokens: &[u32], pos: usize| -> Vec<Vec<f32>> {
+        let embed = projector.rows(weights.token_embd(), tokens).unwrap();
+        card.prefill(&embed, pos).unwrap();
+        (0..tokens.len())
+            .map(|row| {
+                card.head_of_row(row).unwrap();
+                drain_row(&ctx, card)
+            })
+            .collect()
+    };
+    let ids_path = format!("{out}.ids");
+    let ids: Vec<u32> = match std::fs::read(&ids_path) {
+        Ok(bytes) => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect(),
+        Err(_) => {
+            let mut card = open_card(&ctx, &loaded, &weights, TOKENS + 1);
+            let mut ids: Vec<u32> = (1..=SEED as u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab)
+                .collect();
+            for pos in 0..TOKENS - 1 {
+                let row = feed(&mut card, &[ids[pos]], pos).remove(0);
+                if pos + 1 >= SEED {
+                    ids.push(argmax(&row));
+                }
+            }
+            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            std::fs::write(&ids_path, bytes).unwrap();
+            ids
+        }
+    };
+    assert_eq!(ids.len(), TOKENS, "the token stream has another length");
+    for k in chunk_rows {
+        let mut card = open_card(&ctx, &loaded, &weights, TOKENS + 1);
+        let mut bytes = Vec::with_capacity(TOKENS * vocab as usize * 4);
+        for (chunk, tokens) in ids.chunks(k).enumerate() {
+            for row in feed(&mut card, tokens, chunk * k) {
+                assert!(worst_abs(&row).is_finite(), "a logits row is not finite");
+                bytes.extend(row.iter().flat_map(|v| v.to_le_bytes()));
+            }
+        }
+        std::fs::write(format!("{out}.k{k}"), bytes).unwrap();
+        eprintln!("chunks of {k} rows: {TOKENS} logits rows written");
+    }
+}
+
 /// The prefill over a long prompt: 1061 pseudo-random tokens walked one by one on one card
 /// and prefilled on the other in chunks of 1, 63, 192, 256, 512 and 37 rows (a full 1024-row
 /// chunk among them), then four greedy steps on both. Reports the row diff at every cut: the

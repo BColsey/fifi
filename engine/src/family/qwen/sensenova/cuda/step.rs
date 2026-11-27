@@ -344,6 +344,13 @@ impl<'a> LoopStep<'a> {
         self.replay.recorded()
     }
 
+    /// Queues the head on row `row` of the chunk just walked, on the decoding route when the
+    /// one-row step takes it: the accuracy probe reads every row of a chunk this way.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn head_of_row(&self, row: usize) -> Result<(), EngError> {
+        self.head(row, self.dq)
+    }
+
     /// The logits row (device floats); valid after the stream drained.
     pub(crate) fn logits_row(&self) -> &DeviceBuffer {
         &self.rows.core.logits

@@ -15,6 +15,7 @@ use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, RowOutputs};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::kernels::cuda::resident::pack_rows::{PackRowsCall, PackSegment};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 
@@ -77,6 +78,17 @@ impl<'a> Map<'a> {
         buffer.range(0, buffer.bytes())
     }
 }
+
+/// The most rows of a chunk whose every projection goes through the matvec: up to four
+/// activation columns it reads the weights once and gives every column the bits of a
+/// one-column launch. On an RTX 3090 its weight sweep took 1.06 times one column at two columns
+/// and 1.45 at four. Against an exact route (every weight decoded, f32 activations) on
+/// SenseNova-Loop, rows of such chunks then sit as close as a one-row step (mean KL 0.0015),
+/// where the batched product left them at 0.0038.
+const FEW_ROWS: usize = 4;
+/// The most rows the matvec takes for rows that land back to back. From 5 to 8 rows the rows
+/// that land apart take the batched product: the matvec for those too measured slower.
+const MATVEC_ROWS: usize = 8;
 
 /// Width from which a row's norm takes the wide block, and the most rows of a chunk that do: a
 /// few rows then norm with the bits of a one-row step, and faster than in the narrow block.
@@ -254,10 +266,10 @@ impl<'a> StepIo<'a> {
     }
 
     /// Whether `n` rows through `weight` take the batched product: a chunk of more than 8 rows,
-    /// or any chunk of several rows whose output rows are not back to back, when the weight
+    /// or one of more than a few rows whose output rows are not back to back, when the weight
     /// type and the row length allow it and the rows exist as f32.
     fn batched(&self, weight: &NativeWeight, x: Rows<'_>, n: usize, packed: bool) -> bool {
-        (n > 8 || (n > 1 && !packed))
+        (n > MATVEC_ROWS || (n > FEW_ROWS && !packed))
             && weight.k().is_multiple_of(256)
             && mmq_dense::takes(weight.quant())
             && x.f32.is_some()
@@ -341,17 +353,51 @@ impl<'a> StepIo<'a> {
             );
         }
         if n > 1 && !packed {
-            // The matvec writes its rows back to back, so rows that are apart go one at a time.
-            let row = q8(k, 1);
-            for t in 0..n {
-                let y = y.slice(t * out.ld * 4, rows * 4)?;
-                self.ctx
-                    .matvec_native(self.stream, weight, x.q8.range(t * row, row)?, y, 1)?;
-            }
-            return Ok(());
+            return self.project_apart(weight, x, n, out);
         }
         self.ctx
             .matvec_native(self.stream, weight, x.q8.range(0, q8(k, n))?, y, n)
+    }
+
+    /// [`Self::project_into`] through the matvec for rows that land apart. The matvec writes its
+    /// rows back to back: a few rows go there in one launch, into the scratch of the batched
+    /// product, and one copy spreads them; more rows go one at a time.
+    fn project_apart(
+        &self,
+        weight: &NativeWeight,
+        x: Rows<'_>,
+        n: usize,
+        out: Out<'_>,
+    ) -> Result<(), EngError> {
+        let (k, rows) = (weight.k(), weight.n_rows());
+        let together = n * rows * 4;
+        if n <= FEW_ROWS && together <= self.mmq_q8.bytes() {
+            let spill = self.mmq_q8.range(0, together)?;
+            self.ctx
+                .matvec_native(self.stream, weight, x.q8.range(0, q8(k, n))?, spill, n)?;
+            let segment = PackSegment {
+                src: spill,
+                n: rows,
+                dst_off: out.col_off,
+            };
+            let span = ((n - 1) * out.ld + out.col_off + rows) * 4;
+            return self.ctx.pack_rows(
+                self.stream,
+                PackRowsCall {
+                    m: n,
+                    ld: out.ld,
+                    dst: out.dst.slice(0, span.min(out.dst.bytes()))?,
+                    segments: vec![segment],
+                },
+            );
+        }
+        let row = q8(k, 1);
+        for t in 0..n {
+            let y = out.dst.slice((t * out.ld + out.col_off) * 4, rows * 4)?;
+            self.ctx
+                .matvec_native(self.stream, weight, x.q8.range(t * row, row)?, y, 1)?;
+        }
+        Ok(())
     }
 
     /// Whether the projection of `n` rows through `weight`, written back to back, reads the
