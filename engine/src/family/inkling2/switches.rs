@@ -84,7 +84,11 @@ mod tests {
         for (index, &(switch, name, _)) in TABLE.iter().enumerate() {
             assert_eq!(switch as usize, index, "{switch:?} is out of order");
             assert_eq!(switch.name(), name);
-            assert!(name.starts_with("FIFI_INKLING_CUDA_") || name == "FIFI_INKLING_RESIDENT_PASS_REPORT", "{name}");
+            assert!(
+                name.starts_with("FIFI_INKLING_CUDA_")
+                    || name == "FIFI_INKLING_RESIDENT_PASS_REPORT",
+                "{name}"
+            );
         }
         let mut names: Vec<_> = TABLE.iter().map(|row| row.1).collect();
         names.sort_unstable();

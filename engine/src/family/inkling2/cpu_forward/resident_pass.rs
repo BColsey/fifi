@@ -31,43 +31,40 @@
 //! published take the one). The router logits are the one readback inside a block: the
 //! routed-expert operation takes host route ids.
 
-use std::ops::Range;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 use super::MoeRoute;
+use std::ops::Range;
 
 use super::super::cpu_attention::VisitState;
 use super::super::cpu_weights::Projection;
-use super::super::cuda_projection::gguf::attention::TileParts;
 use super::super::cuda_projection::gguf::ExpertPrefillRows;
+use super::super::cuda_projection::gguf::attention::TileParts;
 use super::super::cuda_projection::q8_row_reuse;
 use super::{
-    attention_norm_name, bad, control_names, Attention, CpuForward, LayerVisit, Role, Weights,
-    ATTENTION_ROLES, MIX_EPS, ROUTE_NORMALIZATION_FLOOR,
+    ATTENTION_ROLES, Attention, CpuForward, LayerVisit, MIX_EPS, ROUTE_NORMALIZATION_FLOOR, Role,
+    Weights, attention_norm_name, bad, control_names,
 };
+use crate::EngError;
 use crate::family::inkling2::cuda_projection::gguf::GgufCuda;
 use crate::family::inkling2::gguf_weights::GgufTextWeights;
 use crate::kernels::cuda::resident::dense_gemv::routed_prefill::{
-    routed_prefill_scratch_bytes, DeviceRoutedPrefill,
+    DeviceRoutedPrefill, routed_prefill_scratch_bytes,
 };
 use crate::kernels::cuda::resident::dense_gemv::{
-    dense_gemv_bytes, DenseDtype, DenseGemvCall, DenseGemvShape,
-};
-use crate::kernels::cuda::resident::router::{
-    RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
+    DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes,
 };
 use crate::kernels::cuda::resident::inkling_local_prep::OutputConvShape;
+use crate::kernels::cuda::resident::inkling_pass::MAX_BLOCKS;
 use crate::kernels::cuda::resident::inkling_pass::{
     PassAddCall, PassMixCall, PassPrepCall, PassSealCall, TAPS,
 };
 use crate::kernels::cuda::resident::relative_attention::{
-    RelativeAttentionCall, RelativeAttentionTile, HEAD_DIM,
-    QUERY_TILE_LIMIT,
+    HEAD_DIM, QUERY_TILE_LIMIT, RelativeAttentionCall, RelativeAttentionTile,
 };
-use crate::kernels::cuda::{
-    CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
+use crate::kernels::cuda::resident::router::{
+    RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
 };
-use crate::EngError;
-use crate::kernels::cuda::resident::inkling_pass::MAX_BLOCKS;
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf};
 
 /// Whether the pass is enabled; read once per process.
 pub(super) fn enabled() -> bool {
@@ -262,7 +259,7 @@ impl CpuForward {
         })
     }
 
-/// Whether a visit reads the message bank and so runs the depth-mix controllers: the passes
+    /// Whether a visit reads the message bank and so runs the depth-mix controllers: the passes
     /// after the first over the core layers (the prelude pass and the suffix layers have none).
     fn pass_visit_banked(&self, slot: usize) -> bool {
         let core = &self.spec.core;
@@ -298,8 +295,14 @@ impl CpuForward {
         };
         let checks = [
             ("math", self.math.validate(self.context, &self.spec).is_ok()),
-            ("core range", core.core_start < core.core_end && core.num_passes > 0),
-            ("visit count", end <= self.visits.len() && self.state.len() == self.visits.len()),
+            (
+                "core range",
+                core.core_start < core.core_end && core.num_passes > 0,
+            ),
+            (
+                "visit count",
+                end <= self.visits.len() && self.state.len() == self.visits.len(),
+            ),
             ("resident attention", cuda.resident_attention().is_some()),
         ];
         for (name, ok) in checks {
@@ -315,7 +318,11 @@ impl CpuForward {
             if !certified || !parts {
                 return Ok(self.pass_refused(format_args!(
                     "visit {slot}: {}",
-                    if !certified { "state position, or resident rows" } else { "no ring" }
+                    if !certified {
+                        "state position, or resident rows"
+                    } else {
+                        "no ring"
+                    }
                 )));
             }
         }
@@ -339,16 +346,18 @@ impl CpuForward {
         let h = self.hidden();
         let heads = self.pass_heads(visit.attention);
         let dynamic = visit.attention == Attention::Global;
-        let refused = |why: &str| self.pass_refused(format_args!("visit {index} (layer {physical}): {why}"));
+        let refused =
+            |why: &str| self.pass_refused(format_args!("visit {index} (layer {physical}): {why}"));
         let Some(requests) = self.pass_requests(&layer, visit.attention, heads) else {
             return Ok(refused("projection geometry"));
         };
-        let requests: [Option<Projection<'_>>; 8] =
-            requests.each_ref().map(|r| r.as_ref().map(|p| Projection {
+        let requests: [Option<Projection<'_>>; 8] = requests.each_ref().map(|r| {
+            r.as_ref().map(|p| Projection {
                 name: &p.name,
                 input: p.input,
                 rows: p.rows,
-            }));
+            })
+        });
         let Some(Ok(projections)) = cuda.attention_group([h; 3], requests) else {
             return Ok(refused("attention weights not grouped"));
         };
@@ -370,7 +379,10 @@ impl CpuForward {
                     .controller_weights(names.each_ref().map(String::as_str), 2 * h, [rank, h])
                     .is_some_and(|result| result.is_ok())
                 {
-                    return Ok(refused(&format!("{} controller weights not resident", role.name())));
+                    return Ok(refused(&format!(
+                        "{} controller weights not resident",
+                        role.name()
+                    )));
                 }
             }
         }
@@ -502,7 +514,10 @@ impl CpuForward {
             constants: &plan.constants,
             current: &plan.current,
             sealed: &plan.sealed,
-            tails: [&plan.tails[plan.tails_from], &plan.tails[1 - plan.tails_from]],
+            tails: [
+                &plan.tails[plan.tails_from],
+                &plan.tails[1 - plan.tails_from],
+            ],
             visits: &plan.visits,
             rows,
             committed,
@@ -517,7 +532,10 @@ impl CpuForward {
 
         // Embeddings, and the tails of the previous block when the host state owns them.
         let mut embedded = Vec::with_capacity(rows * h);
-        for id in tokens.iter().chain(tokens.last().filter(|_| committed == 1)) {
+        for id in tokens
+            .iter()
+            .chain(tokens.last().filter(|_| committed == 1))
+        {
             embedded.extend_from_slice(self.embed(*id)?.current());
         }
         plan.current[0].write_at(stream, 0, &bytes(&embedded))?;
@@ -537,7 +555,12 @@ impl CpuForward {
             context.inkling_pass_positions(
                 stream,
                 block.at(l.side[kind], rows * l.side_stride[kind])?,
-                [rows, l.side_stride[kind], 2 * l.raw_stride[kind] / 2, position],
+                [
+                    rows,
+                    l.side_stride[kind],
+                    2 * l.raw_stride[kind] / 2,
+                    position,
+                ],
             )?;
             block.report.launches.set(block.report.launches.get() + 1);
         }
@@ -587,10 +610,15 @@ impl CpuForward {
                 bank = None;
             }
             let attention = visit.attention;
-            let Some(parts) = cuda.resident_attention().and_then(|(_, a)| a.tile_parts(slot)) else {
+            let Some(parts) = cuda
+                .resident_attention()
+                .and_then(|(_, a)| a.tile_parts(slot))
+            else {
                 return Err(bad("the resident pass lost a visit ring"));
             };
-            self.pass_attention(&mut block, cuda, &parts, &layer, attention, index, position, live, blocks, bank)?;
+            self.pass_attention(
+                &mut block, cuda, &parts, &layer, attention, index, position, live, blocks, bank,
+            )?;
             let attn_conv = block.at(l.attn_conv, rows * h)?;
             let health = block.at(l.health, rows)?;
             let sealed = block.sealed_range(live, blocks + 1)?;
@@ -623,7 +651,9 @@ impl CpuForward {
             let mlp_input = block.at(l.mlp_input, rows * h)?;
             let mlp_mix = block.visits[index].consts.mlp_mix.clone();
             block.mix(live, blocks, 0, &mlp_mix, h, mlp_input)?;
-            self.pass_mlp(&mut block, readback, weights, cuda, &layer, index, position, bank)?;
+            self.pass_mlp(
+                &mut block, readback, weights, cuda, &layer, index, position, bank,
+            )?;
         }
         let block_end = if block_start.is_some() {
             let end = context.event_timing()?;
@@ -632,7 +662,10 @@ impl CpuForward {
         } else {
             None
         };
-        block.report.launch_us.set(started.elapsed().as_micros() as u64);
+        block
+            .report
+            .launch_us
+            .set(started.elapsed().as_micros() as u64);
         let fenced = std::time::Instant::now();
         self.pass_fence(&mut block, readback, rows)?;
         block
@@ -646,7 +679,10 @@ impl CpuForward {
         let published = std::time::Instant::now();
         self.pass_publish(&mut block, attention, state, position)?;
         for slot in 0..self.visits.len() {
-            cuda.resident_attention().expect("admitted").1.certify(slot, position + committed);
+            cuda.resident_attention()
+                .expect("admitted")
+                .1
+                .certify(slot, position + committed);
         }
         block
             .report
@@ -669,7 +705,9 @@ impl CpuForward {
         if readback.len() < health_bytes + status_bytes {
             return Err(bad("the resident pass readback plane is too small"));
         }
-        block.context.copy_to_pinned(block.stream, block.at(l.health, rows)?, readback, 0)?;
+        block
+            .context
+            .copy_to_pinned(block.stream, block.at(l.health, rows)?, readback, 0)?;
         block.context.copy_to_pinned(
             block.stream,
             block.at(l.status, status_words)?,
@@ -777,7 +815,15 @@ impl CpuForward {
             let norm_only = || -> Result<(), EngError> {
                 block.context.inkling_pass_apply(
                     block.stream,
-                    [input, input, input, input, norm, input, block.at(l.health, rows)?],
+                    [
+                        input,
+                        input,
+                        input,
+                        input,
+                        norm,
+                        input,
+                        block.at(l.health, rows)?,
+                    ],
                     [rows, h],
                     eps,
                     false,
@@ -792,7 +838,15 @@ impl CpuForward {
                 let current = block.current_range(live)?;
                 block.context.inkling_pass_apply(
                     block.stream,
-                    [current, current, current, current, norm, input, block.at(l.health, rows)?],
+                    [
+                        current,
+                        current,
+                        current,
+                        current,
+                        norm,
+                        input,
+                        block.at(l.health, rows)?,
+                    ],
                     [rows, h],
                     eps,
                     false,
@@ -812,12 +866,26 @@ impl CpuForward {
                     MIX_EPS,
                 )?;
                 let names = control_names(layer, ATTENTION_ROLES[role].0);
-                self.pass_controller(block, cuda, names.each_ref().map(String::as_str), gate, rank)?;
+                self.pass_controller(
+                    block,
+                    cuda,
+                    names.each_ref().map(String::as_str),
+                    gate,
+                    rank,
+                )?;
                 let gain = block.at(l.gain, rows * h)?;
                 let forget = block.at(l.forget, rows * h)?;
                 block.context.inkling_pass_apply(
                     block.stream,
-                    [input, message, gain, forget, norm, input, block.at(l.health, rows)?],
+                    [
+                        input,
+                        message,
+                        gain,
+                        forget,
+                        norm,
+                        input,
+                        block.at(l.health, rows)?,
+                    ],
                     [rows, h],
                     eps,
                     true,
@@ -835,12 +903,13 @@ impl CpuForward {
         let Some(requests) = self.pass_requests(layer, attention, heads) else {
             return Err(bad("invalid CUDA resident pass attention geometry"));
         };
-        let requests: [Option<Projection<'_>>; 8] =
-            requests.each_ref().map(|r| r.as_ref().map(|p| Projection {
+        let requests: [Option<Projection<'_>>; 8] = requests.each_ref().map(|r| {
+            r.as_ref().map(|p| Projection {
                 name: &p.name,
                 input: p.input,
                 rows: p.rows,
-            }));
+            })
+        });
         let projections = cuda
             .attention_group([h; 3], requests)
             .ok_or_else(|| bad("the resident pass needs grouped attention weights"))??;
@@ -860,11 +929,18 @@ impl CpuForward {
                 2 => (l.raw[kind] + kv_channels, raw_stride),
                 3 => (l.sidecar[kind] + channels, sidecar_stride),
                 4 => (l.sidecar[kind] + channels + relative, sidecar_stride),
-                5 => (l.sidecar[kind] + channels + relative + query, sidecar_stride),
+                5 => (
+                    l.sidecar[kind] + channels + relative + query,
+                    sidecar_stride,
+                ),
                 6 => (l.dynamic[kind], dynamic_stride),
                 _ => (l.dynamic[kind] + kv * TAPS, dynamic_stride),
             };
-            let x_role = if local && bank.is_none() { 0 } else { request.input };
+            let x_role = if local && bank.is_none() {
+                0
+            } else {
+                request.input
+            };
             let shape = DenseGemvShape {
                 m: rows,
                 rows: width,
@@ -882,7 +958,10 @@ impl CpuForward {
             });
         }
         q8_row_reuse::project_group(block.context, block.stream, &calls, "pass_attention")?;
-        block.report.launches.set(block.report.launches.get() + calls.len());
+        block
+            .report
+            .launches
+            .set(block.report.launches.get() + calls.len());
         // The raw K/V rows of this visit become convolution history for the next block.
         let past = PAST.min(position);
         for (source, which) in [(l.raw[kind], 0usize), (l.raw[kind] + kv_channels, 1)] {
@@ -926,7 +1005,10 @@ impl CpuForward {
                     (rows - 1) * l.side_stride[kind] + 2 * kv_channels,
                 )?,
                 history: [block.tail(0, index, 0)?, block.tail(0, index, 1)?],
-                kernel: [block.constant(&consts.conv_k)?, block.constant(&consts.conv_v)?],
+                kernel: [
+                    block.constant(&consts.conv_k)?,
+                    block.constant(&consts.conv_v)?,
+                ],
                 dynamic: block.at(l.dynamic[kind], (rows - 1) * dynamic_stride + 2 * kv * TAPS)?,
                 status,
             },
@@ -969,17 +1051,26 @@ impl CpuForward {
                 relative: at(l.sidecar[kind] + channels, sidecar_stride, relative)?,
                 table: parts.table,
                 sinks: at(l.sidecar[kind] + channels + relative, sidecar_stride, query)?,
-                gates: at(l.sidecar[kind] + channels + relative + query, sidecar_stride, channels)?,
+                gates: at(
+                    l.sidecar[kind] + channels + relative + query,
+                    sidecar_stride,
+                    channels,
+                )?,
                 k_cache: parts.k_cache,
                 v_cache: parts.v_cache,
                 out: block.at(l.out[kind] + first * channels, count * channels)?,
                 pos: at(l.side[kind] + 2 * kv_channels, side_stride, 1)?,
                 status: block.at(l.status + index * rows + first, count)?,
             };
-            block.context.relative_attention_tile(block.stream, call, tile)?;
+            block
+                .context
+                .relative_attention_tile(block.stream, call, tile)?;
             tiles += 1;
         }
-        block.report.launches.set(block.report.launches.get() + tiles);
+        block
+            .report
+            .launches
+            .set(block.report.launches.get() + tiles);
 
         // Output projection and its short convolution.
         let output_name = format!("{layer}.attn.wo_ud.weight");
@@ -1065,7 +1156,10 @@ impl CpuForward {
             });
         }
         block.context.dense_gemv_group(block.stream, &calls)?;
-        block.report.launches.set(block.report.launches.get() + calls.len());
+        block
+            .report
+            .launches
+            .set(block.report.launches.get() + calls.len());
         Ok(())
     }
 
@@ -1094,7 +1188,8 @@ impl CpuForward {
         let per_piece = (0..self.visits.len()).filter(|&i| of_layer(i)).count();
         let ordinal = (0..index).filter(|&i| of_layer(i)).count();
         let routes = ROUTES.get_or_init(|| {
-            let text = std::fs::read_to_string(std::env::var("FIFI_INKLING_PASS_ROUTES_IN").ok()?).ok()?;
+            let text =
+                std::fs::read_to_string(std::env::var("FIFI_INKLING_PASS_ROUTES_IN").ok()?).ok()?;
             let mut out = std::collections::HashMap::<usize, Vec<Vec<Vec<usize>>>>::new();
             for line in text
                 .lines()
@@ -1163,7 +1258,9 @@ impl CpuForward {
         let rows = block.rows;
         let h = block.h;
         let consts = &block.visits[index].consts;
-        let scratch_words = routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))?.div_ceil(WORD);
+        let scratch_words = routed_prefill_scratch_bytes(rows)
+            .ok_or_else(|| bad("rows"))?
+            .div_ceil(WORD);
         let eps = self.math.rms_norm_eps;
         let rank = self.spec.core.gate_rank as usize;
         let input = block.at(l.mlp_input, rows * h)?;
@@ -1171,7 +1268,14 @@ impl CpuForward {
         let health = block.at(l.health, rows)?;
         if let Some((bank_buffer, bank_blocks, bank_first)) = bank {
             let message = block.at(l.messages + ROLES * rows * h, rows * h)?;
-            block.mix(bank_buffer, bank_blocks, bank_first, &consts.control[ROLES], h, message)?;
+            block.mix(
+                bank_buffer,
+                bank_blocks,
+                bank_first,
+                &consts.control[ROLES],
+                h,
+                message,
+            )?;
             let gate = block.at(l.gate, rows * 2 * h)?;
             block.context.inkling_pass_gate(
                 block.stream,
@@ -1180,7 +1284,13 @@ impl CpuForward {
                 MIX_EPS,
             )?;
             let names = control_names(layer, Role::Mlp);
-            self.pass_controller(block, cuda, names.each_ref().map(String::as_str), gate, rank)?;
+            self.pass_controller(
+                block,
+                cuda,
+                names.each_ref().map(String::as_str),
+                gate,
+                rank,
+            )?;
             let gain = block.at(l.gain, rows * h)?;
             let forget = block.at(l.forget, rows * h)?;
             block.context.inkling_pass_apply(
@@ -1270,9 +1380,13 @@ impl CpuForward {
             // path does, then the host-planned window is enqueued launch-only.
             let logits_bytes = rows * experts * WORD;
             if readback.len() < logits_bytes {
-                return Err(bad("the resident pass readback plane is too small for the router"));
+                return Err(bad(
+                    "the resident pass readback plane is too small for the router",
+                ));
             }
-            block.context.copy_to_pinned(block.stream, logits, readback, 0)?;
+            block
+                .context
+                .copy_to_pinned(block.stream, logits, readback, 0)?;
             readback.synchronize(block.stream)?;
             let mut logits = vec![0f32; rows * experts];
             readback.read_f32(0, &mut logits)?;
@@ -1289,7 +1403,10 @@ impl CpuForward {
                 format!("{prefix}.experts.w13_weight"),
                 format!("{prefix}.experts.w2_weight"),
             ];
-            let ids: Vec<&[usize]> = routes.iter().map(|route| route.selected.as_slice()).collect();
+            let ids: Vec<&[usize]> = routes
+                .iter()
+                .map(|route| route.selected.as_slice())
+                .collect();
             let batch = ExpertPrefillRows::Resident {
                 ids: &ids,
                 hidden: h,
@@ -1434,8 +1551,11 @@ impl Block<'_> {
             "raw_stride": l.raw_stride[kind],
             "side_stride": l.side_stride[kind],
         });
-        std::fs::write(path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
-            .map_err(|e| bad(format!("resident pass dump: {e}")))?;
+        std::fs::write(
+            path,
+            serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?,
+        )
+        .map_err(|e| bad(format!("resident pass dump: {e}")))?;
         eprintln!("Inkling resident pass dumped visit {index} after its K/V preparation");
         Ok(())
     }
@@ -1444,7 +1564,11 @@ impl Block<'_> {
     /// inputs, the three role inputs, the controller messages, the gate and the controller rows
     /// of the last role, as bits.
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-    fn dump_control(&self, index: usize, bank: Option<(usize, usize, usize)>) -> Result<(), EngError> {
+    fn dump_control(
+        &self,
+        index: usize,
+        bank: Option<(usize, usize, usize)>,
+    ) -> Result<(), EngError> {
         static DUMP: std::sync::OnceLock<Vec<(usize, std::path::PathBuf)>> =
             std::sync::OnceLock::new();
         let dumps = DUMP.get_or_init(|| {
@@ -1501,8 +1625,11 @@ impl Block<'_> {
             "bank": bank,
             "bank_rows": bank_rows,
         });
-        std::fs::write(path, serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?)
-            .map_err(|e| bad(format!("resident pass dump: {e}")))?;
+        std::fs::write(
+            path,
+            serde_json::to_vec(&value).map_err(|e| bad(format!("resident pass dump: {e}")))?,
+        )
+        .map_err(|e| bad(format!("resident pass dump: {e}")))?;
         eprintln!("Inkling resident pass dumped the control of visit {index}");
         Ok(())
     }
@@ -1608,7 +1735,8 @@ struct Consts {
 impl Consts {
     fn add(&mut self, values: &[f32]) -> Range<usize> {
         let start = self.bytes.len();
-        self.bytes.extend(values.iter().flat_map(|v| v.to_ne_bytes()));
+        self.bytes
+            .extend(values.iter().flat_map(|v| v.to_ne_bytes()));
         start..self.bytes.len()
     }
 }
@@ -1677,9 +1805,10 @@ impl CpuForward {
         }
         let mut control: [Range<usize>; 4] = std::array::from_fn(|_| 0..0);
         if host.pass_visit_banked(visit.state_slot) {
-            for (range, role) in control
-                .iter_mut()
-                .zip([Role::Query, Role::Key, Role::Value, Role::Mlp])
+            for (range, role) in
+                control
+                    .iter_mut()
+                    .zip([Role::Query, Role::Key, Role::Value, Role::Mlp])
             {
                 *range = consts.add(&host.control_query(physical, role)?);
             }
@@ -1689,10 +1818,16 @@ impl CpuForward {
             *range = consts.add(&vec(&attention_norm_name(&layer, kind == 0, i), h)?);
         }
         let mut clip = vec(&format!("{prefix}.q_l2_clip.scale"), geometry.channels)?;
-        clip.extend_from_slice(&vec(&format!("{prefix}.rel_l2_clip.scale"), geometry.relative)?);
+        clip.extend_from_slice(&vec(
+            &format!("{prefix}.rel_l2_clip.scale"),
+            geometry.relative,
+        )?);
         let conv = |plane: &str| -> Result<Vec<f32>, EngError> {
             let name = if dynamic { "static_w" } else { "weight" };
-            vec(&format!("{prefix}.{plane}_sconv.{name}"), TAPS * geometry.kv_channels)
+            vec(
+                &format!("{prefix}.{plane}_sconv.{name}"),
+                TAPS * geometry.kv_channels,
+            )
         };
         Ok(VisitConsts {
             mix,
@@ -1702,7 +1837,10 @@ impl CpuForward {
             conv_k: consts.add(&conv("k")?),
             conv_v: consts.add(&conv("v")?),
             attn_sconv: consts.add(&vec(&format!("{layer}.attn_sconv.weight"), TAPS * h)?),
-            mlp_mix: consts.add(&vec(&format!("model.llm.attn_res.mlp_queries.{physical}"), h)?),
+            mlp_mix: consts.add(&vec(
+                &format!("model.llm.attn_res.mlp_queries.{physical}"),
+                h,
+            )?),
             mlp_norm: consts.add(&vec(&format!("{layer}.mlp_norm.weight"), h)?),
             mlp_sconv: consts.add(&vec(&format!("{layer}.mlp_sconv.weight"), TAPS * h)?),
             router_bias: consts.add(&vec(&format!("{layer}.mlp.gate.bias"), experts)?),
@@ -1711,11 +1849,7 @@ impl CpuForward {
 }
 
 impl PassWorkspace {
-    fn plan(
-        host: &CpuForward,
-        cuda: &GgufCuda,
-        rows: usize,
-    ) -> Result<Self, EngError> {
+    fn plan(host: &CpuForward, cuda: &GgufCuda, rows: usize) -> Result<Self, EngError> {
         let h = host.hidden();
         let visits_n = host.visits.len();
         let experts = host.spec.n_routed_experts as usize;
@@ -1729,7 +1863,9 @@ impl PassWorkspace {
         for visit in &host.visits {
             let heads = host.pass_heads(visit.attention);
             let kind = usize::from(visit.attention == Attention::Global);
-            let parts = attention.tile_parts(visit.state_slot).ok_or_else(|| bad("admitted"))?;
+            let parts = attention
+                .tile_parts(visit.state_slot)
+                .ok_or_else(|| bad("admitted"))?;
             let geometry = *geometries[kind].get_or_insert(Geometry {
                 query: heads[0],
                 kv: heads[1],
@@ -1753,9 +1889,16 @@ impl PassWorkspace {
         }
         let geometry = |kind: usize| geometries[kind].ok_or_else(|| bad("admitted"));
         let constants = consts.bytes;
-        let sidecar_stride =
-            [geometry(0)?.channels + geometry(0)?.relative + geometry(0)?.query + geometry(0)?.channels,
-             geometry(1)?.channels + geometry(1)?.relative + geometry(1)?.query + geometry(1)?.channels];
+        let sidecar_stride = [
+            geometry(0)?.channels
+                + geometry(0)?.relative
+                + geometry(0)?.query
+                + geometry(0)?.channels,
+            geometry(1)?.channels
+                + geometry(1)?.relative
+                + geometry(1)?.query
+                + geometry(1)?.channels,
+        ];
         let raw_stride = [2 * geometry(0)?.kv_channels, 2 * geometry(1)?.kv_channels];
         let dynamic_stride = [2 * geometry(0)?.kv * TAPS, 2 * geometry(1)?.kv * TAPS];
         let side_stride = [raw_stride[0] + 1, raw_stride[1] + 1];
@@ -1775,22 +1918,35 @@ impl PassWorkspace {
             logits: alloc(rows * experts),
             ids: alloc(rows * top_k),
             route_weights: alloc(rows * top_k),
-            routed_scratch: alloc(routed_prefill_scratch_bytes(rows).ok_or_else(|| bad("rows"))?.div_ceil(WORD)),
+            routed_scratch: alloc(
+                routed_prefill_scratch_bytes(rows)
+                    .ok_or_else(|| bad("rows"))?
+                    .div_ceil(WORD),
+            ),
             inputs: alloc(ROLES * rows * h),
             messages: alloc(4 * rows * h),
             gate: alloc(rows * 2 * h),
             reduced: alloc(rows * rank),
             gain: alloc(rows * h),
             forget: alloc(rows * h),
-            sidecar: [alloc(rows * sidecar_stride[0]), alloc(rows * sidecar_stride[1])],
+            sidecar: [
+                alloc(rows * sidecar_stride[0]),
+                alloc(rows * sidecar_stride[1]),
+            ],
             sidecar_stride,
             raw: [alloc(rows * raw_stride[0]), alloc(rows * raw_stride[1])],
             raw_stride,
-            dynamic: [alloc(rows * dynamic_stride[0]), alloc(rows * dynamic_stride[1])],
+            dynamic: [
+                alloc(rows * dynamic_stride[0]),
+                alloc(rows * dynamic_stride[1]),
+            ],
             dynamic_stride,
             side: [alloc(rows * side_stride[0]), alloc(rows * side_stride[1])],
             side_stride,
-            out: [alloc(rows * geometry(0)?.channels), alloc(rows * geometry(1)?.channels)],
+            out: [
+                alloc(rows * geometry(0)?.channels),
+                alloc(rows * geometry(1)?.channels),
+            ],
             attn_raw: alloc(rows * h),
             attn_conv: alloc(rows * h),
             mlp_input: alloc(rows * h),

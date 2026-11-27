@@ -1014,10 +1014,11 @@ impl VisitState {
         .map(|(name, (len, hash))| (name, len, hash))
         .collect();
         fn bits<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> serde_json::Value {
-            serde_json::json!(rows
-                .into_iter()
-                .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
-                .collect::<Vec<_>>())
+            serde_json::json!(
+                rows.into_iter()
+                    .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            )
         }
         fn firsts<'a>(rows: &[&'a Vec<f32>]) -> Vec<&'a Vec<f32>> {
             match rows {
@@ -1041,10 +1042,11 @@ impl VisitState {
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     pub(super) fn parity_rows(&self) -> serde_json::Value {
         fn bits<'a>(rows: impl IntoIterator<Item = &'a Vec<f32>>) -> serde_json::Value {
-            serde_json::json!(rows
-                .into_iter()
-                .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
-                .collect::<Vec<_>>())
+            serde_json::json!(
+                rows.into_iter()
+                    .map(|row| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            )
         }
         serde_json::json!({
             "keys": bits(self.keys.iter().map(Arc::as_ref)),

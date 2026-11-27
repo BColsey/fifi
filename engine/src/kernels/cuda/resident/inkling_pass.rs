@@ -19,8 +19,8 @@ use crate::kernels::cuda::{
     context::{Claim, require_apart, require_fit},
 };
 
-pub(crate) use super::super::native::resident::inkling_pass::{HEAD, MAX_BLOCKS, TAPS};
 use super::super::native::resident::inkling_pass::{self as native};
+pub(crate) use super::super::native::resident::inkling_pass::{HEAD, MAX_BLOCKS, TAPS};
 use crate::kernels::cuda::native::resident::RawRange;
 
 const MAX_WIDTH: usize = 8192;
@@ -100,7 +100,12 @@ impl CudaContext {
         }
         let row = width_row(width)?;
         let out = ((rows - 1) * out_stride + width) * size_of::<f32>();
-        require_fit("Inkling pass mix sealed", &call.sealed, blocks * rows * row, WORD)?;
+        require_fit(
+            "Inkling pass mix sealed",
+            &call.sealed,
+            blocks * rows * row,
+            WORD,
+        )?;
         require_fit("Inkling pass mix current", &call.current, rows * row, WORD)?;
         require_fit("Inkling pass mix query", &call.query, row, WORD)?;
         require_fit("Inkling pass mix output", &call.out, out, WORD)?;
@@ -133,7 +138,12 @@ impl CudaContext {
             self.raw_range(&call.health)?,
         ];
         self.launch_on(stream, |stream| {
-            native::mix(stream, ranges, [rows, blocks, first, width, out_stride], eps)
+            native::mix(
+                stream,
+                ranges,
+                [rows, blocks, first, width, out_stride],
+                eps,
+            )
         })
     }
 
@@ -161,12 +171,21 @@ impl CudaContext {
         let row = width_row(width)?;
         let current = rows * row;
         let health = rows * size_of::<f32>();
-        require_fit("Inkling pass seal sealed", &call.sealed, (blocks + 1) * current, WORD)?;
+        require_fit(
+            "Inkling pass seal sealed",
+            &call.sealed,
+            (blocks + 1) * current,
+            WORD,
+        )?;
         require_fit("Inkling pass seal current", &call.current, current, WORD)?;
         require_fit("Inkling pass seal next", &call.next, current, WORD)?;
         require_fit("Inkling pass seal health", &call.health, health, WORD)?;
         let spans = [
-            Claim::of("Inkling pass seal sealed", &call.sealed, (blocks + 1) * current),
+            Claim::of(
+                "Inkling pass seal sealed",
+                &call.sealed,
+                (blocks + 1) * current,
+            ),
             Claim::of("Inkling pass seal current", &call.current, current),
             Claim::of("Inkling pass seal next", &call.next, current),
             Claim::of("Inkling pass seal health", &call.health, health),
@@ -240,7 +259,9 @@ impl CudaContext {
         let channels = kv_heads
             .checked_mul(HEAD)
             .filter(|&channels| (1..=MAX_WIDTH).contains(&channels) && kv_heads >= 1)
-            .ok_or_else(|| EngError::BadRequest("the Inkling pass prep needs 1 to 64 K/V heads".into()))?;
+            .ok_or_else(|| {
+                EngError::BadRequest("the Inkling pass prep needs 1 to 64 K/V heads".into())
+            })?;
         if rows == 0
             || raw_stride < 2 * channels
             || key_at + channels > side_stride
@@ -265,12 +286,32 @@ impl CudaContext {
         let status = rows * size_of::<u32>();
         require_fit("Inkling pass prep raw", &call.raw, raw, word)?;
         require_fit("Inkling pass prep side", &call.side, side, word)?;
-        require_fit("Inkling pass prep history K", &call.history[0], history, word)?;
-        require_fit("Inkling pass prep history V", &call.history[1], history, word)?;
+        require_fit(
+            "Inkling pass prep history K",
+            &call.history[0],
+            history,
+            word,
+        )?;
+        require_fit(
+            "Inkling pass prep history V",
+            &call.history[1],
+            history,
+            word,
+        )?;
         require_fit("Inkling pass prep kernel K", &call.kernel[0], kernel, word)?;
         require_fit("Inkling pass prep kernel V", &call.kernel[1], kernel, word)?;
-        require_fit("Inkling pass prep dynamic", &call.dynamic, dynamic_bytes, word)?;
-        require_fit("Inkling pass prep status", &call.status, status, align_of::<u32>())?;
+        require_fit(
+            "Inkling pass prep dynamic",
+            &call.dynamic,
+            dynamic_bytes,
+            word,
+        )?;
+        require_fit(
+            "Inkling pass prep status",
+            &call.status,
+            status,
+            align_of::<u32>(),
+        )?;
         let spans = [
             Claim::of("Inkling pass prep raw", &call.raw, raw),
             Claim::of("Inkling pass prep side", &call.side, side),
@@ -362,15 +403,39 @@ impl CudaContext {
         }
         let extent = (rows - 1) * gate_stride + 2 * width;
         let parts = [
-            Part { name: "Inkling pass gate input", range: input, bytes: rows * row, writer: false },
-            Part { name: "Inkling pass gate message", range: message, bytes: rows * row, writer: false },
-            Part { name: "Inkling pass gate output", range: gate, bytes: extent * WORD, writer: true },
-            Part { name: "Inkling pass gate health", range: health, bytes: rows * WORD, writer: true },
+            Part {
+                name: "Inkling pass gate input",
+                range: input,
+                bytes: rows * row,
+                writer: false,
+            },
+            Part {
+                name: "Inkling pass gate message",
+                range: message,
+                bytes: rows * row,
+                writer: false,
+            },
+            Part {
+                name: "Inkling pass gate output",
+                range: gate,
+                bytes: extent * WORD,
+                writer: true,
+            },
+            Part {
+                name: "Inkling pass gate health",
+                range: health,
+                bytes: rows * WORD,
+                writer: true,
+            },
         ];
         prove(&parts, &[])?;
         self.ensure_usable()?;
-        let ranges = [self.raw_range(&parts[0].range)?, self.raw_range(&parts[1].range)?,
-            self.raw_range(&parts[2].range)?, self.raw_range(&parts[3].range)?];
+        let ranges = [
+            self.raw_range(&parts[0].range)?,
+            self.raw_range(&parts[1].range)?,
+            self.raw_range(&parts[2].range)?,
+            self.raw_range(&parts[3].range)?,
+        ];
         let shape = [rows, width, width, width, gate_stride];
         self.launch_on(stream, |stream| native::gate(stream, ranges, shape, eps))
     }
@@ -407,13 +472,33 @@ impl CudaContext {
         }
         let optional_bytes = if control { rows_bytes } else { WORD };
         let parts = [
-            Part { name: "Inkling pass apply input", range: input, bytes: rows_bytes, writer: false },
+            Part {
+                name: "Inkling pass apply input",
+                range: input,
+                bytes: rows_bytes,
+                writer: false,
+            },
             optional(message, "Inkling pass apply message", optional_bytes)?,
             optional(gain, "Inkling pass apply gain", optional_bytes)?,
             optional(forget, "Inkling pass apply forget", optional_bytes)?,
-            Part { name: "Inkling pass apply gamma", range: gamma, bytes: row, writer: false },
-            Part { name: "Inkling pass apply output", range: out, bytes: rows_bytes, writer: true },
-            Part { name: "Inkling pass apply health", range: health, bytes: rows * WORD, writer: true },
+            Part {
+                name: "Inkling pass apply gamma",
+                range: gamma,
+                bytes: row,
+                writer: false,
+            },
+            Part {
+                name: "Inkling pass apply output",
+                range: out,
+                bytes: rows_bytes,
+                writer: true,
+            },
+            Part {
+                name: "Inkling pass apply health",
+                range: health,
+                bytes: rows * WORD,
+                writer: true,
+            },
         ];
         prove(&parts, &[])?;
         self.ensure_usable()?;
@@ -442,15 +527,35 @@ impl CudaContext {
             ));
         }
         let parts = [
-            Part { name: "Inkling pass tails source", range: source, bytes: ((rows - 1) * stride + width) * WORD, writer: false },
-            Part { name: "Inkling pass tails old", range: old, bytes: (TAPS - 1) * row, writer: false },
-            Part { name: "Inkling pass tails output", range: out, bytes: (TAPS - 1) * row, writer: true },
+            Part {
+                name: "Inkling pass tails source",
+                range: source,
+                bytes: ((rows - 1) * stride + width) * WORD,
+                writer: false,
+            },
+            Part {
+                name: "Inkling pass tails old",
+                range: old,
+                bytes: (TAPS - 1) * row,
+                writer: false,
+            },
+            Part {
+                name: "Inkling pass tails output",
+                range: out,
+                bytes: (TAPS - 1) * row,
+                writer: true,
+            },
         ];
         prove(&parts, &[])?;
         self.ensure_usable()?;
-        let ranges = [self.raw_range(&parts[0].range)?, self.raw_range(&parts[1].range)?,
-            self.raw_range(&parts[2].range)?];
-        self.launch_on(stream, |stream| native::tails(stream, ranges, [rows, stride, width, past]))
+        let ranges = [
+            self.raw_range(&parts[0].range)?,
+            self.raw_range(&parts[1].range)?,
+            self.raw_range(&parts[2].range)?,
+        ];
+        self.launch_on(stream, |stream| {
+            native::tails(stream, ranges, [rows, stride, width, past])
+        })
     }
 
     /// `side[r * stride + pos_at] = u32(first + r)`: the position words of one visit's
@@ -466,10 +571,17 @@ impl CudaContext {
                 "the Inkling pass positions need rows and a position column inside the row".into(),
             ));
         }
-        require_fit("Inkling pass positions sidecar", &side, ((rows - 1) * stride + pos_at + 1) * WORD, WORD)?;
+        require_fit(
+            "Inkling pass positions sidecar",
+            &side,
+            ((rows - 1) * stride + pos_at + 1) * WORD,
+            WORD,
+        )?;
         self.ensure_usable()?;
         let range = self.raw_range(&side)?;
-        self.launch_on(stream, |stream| native::positions(stream, range, [rows, stride, pos_at, first]))
+        self.launch_on(stream, |stream| {
+            native::positions(stream, range, [rows, stride, pos_at, first])
+        })
     }
 
     /// Sets the `count` u32 status words of `words` to zero.
@@ -484,7 +596,12 @@ impl CudaContext {
                 "the Inkling pass zero takes 1 to 2^20 words".into(),
             ));
         }
-        require_fit("Inkling pass zero words", &words, count * size_of::<u32>(), WORD)?;
+        require_fit(
+            "Inkling pass zero words",
+            &words,
+            count * size_of::<u32>(),
+            WORD,
+        )?;
         self.ensure_usable()?;
         let range = self.raw_range(&words)?;
         self.launch_on(stream, |stream| native::zero(stream, range, count))
