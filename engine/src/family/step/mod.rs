@@ -6,8 +6,9 @@
 //! of a feed, the bounds and the head rows. [`rows`] holds the activation rows a projection reads
 //! and the projections themselves, chosen by the type of each weight tensor.
 //!
-//! [`ffn`] holds the gated feed-forward block over those projections, [`experts`] the routed
-//! expert projections of a chunk, and [`site`] the residual sites: the plain add and the routed
+//! [`ffn`] holds the gated feed-forward block over those projections, [`moe`] the routed block
+//! of a router, a shared expert and the kept experts, [`experts`] the routed expert projections
+//! of a chunk, and [`site`] the residual sites: the plain add and the routed
 //! two-stream site.
 //!
 //! [`delta`] and [`attend`] are the mixers of a visit: the gated delta rule and the gated full
@@ -26,6 +27,7 @@ pub(crate) mod delta;
 pub(crate) mod experts;
 pub(crate) mod ffn;
 pub(crate) mod head;
+pub(crate) mod moe;
 pub(crate) mod replay;
 pub(crate) mod rows;
 pub(crate) mod scratch;
