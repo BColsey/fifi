@@ -25,7 +25,7 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
-use crate::family::step::scratch::{Alloc, Count, OnDevice};
+use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths};
 use crate::family::step::walk::{self, ChunkStep, Half, Visits};
 use crate::family::step::{delta, experts, ffn, head, site};
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
@@ -212,17 +212,12 @@ struct MlaFactors {
 
 /// The scratch of one chunk, allocated once at load.
 struct Scratch<B = DeviceBuffer> {
-    resid_a: B,
-    resid_b: B,
+    core: Core<B>,
+    /// The mean of the streams of the row the head reads.
+    head: B,
     branch: B,
     post: B,
     comb: B,
-    cur: B,
-    q8_cur: B,
-    proj: B,
-    q8_wide: B,
-    proj_qkv: B,
-    scan_qkv: B,
     scan_decay: B,
     scan_proj: B,
     g1: B,
@@ -230,7 +225,6 @@ struct Scratch<B = DeviceBuffer> {
     fa: B,
     beta: B,
     delta: B,
-    scan_out: B,
     qa: B,
     q8_qa: B,
     qb: B,
@@ -249,17 +243,12 @@ struct Scratch<B = DeviceBuffer> {
     act_experts: B,
     down: B,
     shared: B,
-    head: B,
-    q8_head: B,
-    logits: B,
     mla_gated: B,
     act_ffn: B,
     logits_route: B,
     route_status: B,
-    mmq_q8: B,
     mmq_q8_routed: B,
     mmq_q8_act: B,
-    fixup: B,
     ids_g: B,
     ids_src1: B,
     ids_dst: B,
@@ -277,7 +266,7 @@ impl Scratch {
     }
 
     fn cur_rows(&self) -> Rows<'_> {
-        Rows::both(&self.q8_cur, &self.cur)
+        self.core.normed_rows()
     }
 }
 
@@ -494,8 +483,8 @@ impl Raon1Device {
             ctx: &self.ctx,
             stream: &self.stream,
             weights: &self.weights,
-            mmq_q8: &self.sc.mmq_q8,
-            fixup: &self.sc.fixup,
+            mmq_q8: &self.sc.core.product_q8,
+            fixup: &self.sc.core.fixup,
             exact: false,
         }
     }
@@ -539,9 +528,7 @@ impl Raon1Device {
                 resid[at..at + HIDDEN].copy_from_slice(&row);
             }
         }
-        self.sc
-            .resid_a
-            .write_at(&self.stream, 0, &f32_bytes(&resid))?;
+        self.sc.core.resid[0].write_at(&self.stream, 0, &f32_bytes(&resid))?;
         walk::visits(self, n, pos0, |_, _| Ok(()))
     }
 
@@ -577,8 +564,8 @@ impl Raon1Device {
             self.hy.norm_eps,
             &sc.branch,
             self.io().raw(norm)?,
-            &sc.cur,
-            &sc.q8_cur,
+            &sc.core.normed,
+            &sc.core.normed_q8,
         )
     }
 
@@ -589,7 +576,8 @@ impl Raon1Device {
         resid: &DeviceBuffer,
         out: &DeviceBuffer,
     ) -> Result<(), EngError> {
-        self.site().apply(&self.io(), resid, out, &self.sc.proj, n)
+        self.site()
+            .apply(&self.io(), resid, out, &self.sc.core.mix_out, n)
     }
 
     fn rda_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {
@@ -631,13 +619,7 @@ impl Raon1Device {
         delta::mix(
             &io,
             &layer,
-            &delta::DeltaRows {
-                input: sc.cur_rows(),
-                proj: &sc.proj_qkv,
-                conv_out: &sc.scan_qkv,
-                read: Rows::both(&sc.q8_wide, &sc.scan_out),
-                out: &sc.proj,
-            },
+            &sc.core.delta_rows(),
             delta::DeltaState {
                 ring: self.hist.range(rda * ring, ring)?,
                 record: self.state.range(rda * record, record)?,
@@ -659,7 +641,7 @@ impl Raon1Device {
             self.hy.latent_eps,
             &sc.qa,
             self.io().raw(&names.attn_q_a_norm)?,
-            &sc.proj,
+            &sc.core.mix_out,
             &sc.q8_qa,
         )?;
         self.io()
@@ -739,12 +721,12 @@ impl Raon1Device {
             WIDTH,
             &sc.mla_out,
             Some(&sc.g2),
-            Rows::both(&sc.q8_wide, &sc.mla_gated),
+            Rows::both(&sc.core.read_q8, &sc.mla_gated),
         )?;
         self.io().mv(
             &names.attn_output,
-            Rows::both(&sc.q8_wide, &sc.mla_gated),
-            &sc.proj,
+            Rows::both(&sc.core.read_q8, &sc.mla_gated),
+            &sc.core.mix_out,
             n,
         )
     }
@@ -759,7 +741,7 @@ impl Raon1Device {
             sc.cur_rows(),
             n,
             sc.ffn_scratch(n, DENSE_INTER, Rows::both(&sc.q8_ffn, &sc.act_ffn))?,
-            &sc.proj,
+            &sc.core.mix_out,
         )
     }
 
@@ -827,7 +809,7 @@ impl Raon1Device {
             &self.stream,
             RouterLogitsCall {
                 shape,
-                x: sc.cur.range(0, n * HIDDEN * 4)?,
+                x: sc.core.normed.range(0, n * HIDDEN * 4)?,
                 w: self.io().raw(&names.gate_inp)?,
                 logits: sc.logits_route.range(0, n * EXPERTS * 4)?,
             },
@@ -882,7 +864,7 @@ impl Raon1Device {
         if let Some(ids) = ids.as_ref().filter(|_| gate_up) {
             let x = experts::token_rows(
                 ids,
-                sc.cur.range(0, n * HIDDEN * 4)?,
+                sc.core.normed.range(0, n * HIDDEN * 4)?,
                 HIDDEN,
                 sc.mmq_q8_routed.range(0, mmq_q8_bytes(HIDDEN, n * USED)?)?,
             );
@@ -895,7 +877,7 @@ impl Raon1Device {
             let x_stride = q8(HIDDEN, 1);
             for t in 0..n {
                 let ids = sc.ids.range(t * USED * 4, USED * 4)?;
-                let x = sc.q8_cur.range(t * x_stride, x_stride)?;
+                let x = sc.core.normed_q8.range(t * x_stride, x_stride)?;
                 let base = t * gu_row;
                 self.expert_mv(
                     &names.gate_exps,
@@ -982,7 +964,7 @@ impl Raon1Device {
                 down: sc.down.range(0, n * USED * HIDDEN * 4)?,
                 weights: sc.weights.range(0, n * USED * 4)?,
                 shared: None,
-                out: CombineOut::To(sc.proj.range(0, n * HIDDEN * 4)?),
+                out: CombineOut::To(sc.core.mix_out.range(0, n * HIDDEN * 4)?),
             },
         )
     }
@@ -993,19 +975,19 @@ impl Raon1Device {
         self.io().run(BlockOp::hc_mean(
             row,
             HIDDEN,
-            sc.resid_a.range(0, (row + 1) * STREAMS * HIDDEN * 4)?,
+            sc.core.resid[0].range(0, (row + 1) * STREAMS * HIDDEN * 4)?,
             sc.head.range(0, HIDDEN * 4)?,
         )?)?;
         let head = head::Head {
             norm: self.io().raw("output_norm.weight")?,
             eps: self.hy.norm_eps,
             weight: self.io().native("output.weight")?,
-            normed: Rows::both(&sc.q8_head, &sc.cur),
-            logits: &sc.logits,
+            normed: Rows::both(&sc.core.normed_q8, &sc.core.normed),
+            logits: &sc.core.logits,
         };
         head.logits(&self.io(), StepIo::whole(&sc.head)?)?;
         let mut bytes = vec![0u8; self.vocab * 4];
-        sc.logits.read_at(&self.stream, 0, &mut bytes)?;
+        sc.core.logits.read_at(&self.stream, 0, &mut bytes)?;
         Ok(f32_values(&bytes))
     }
 }
@@ -1024,12 +1006,22 @@ impl Visits for Raon1Device {
     fn read(&self, layer: usize, half: Half, n: usize) -> Result<(), EngError> {
         let (names, sc) = (&self.names[layer], &self.sc);
         let (site, norm, resid, stage) = match half {
-            Half::Mixer => (&names.hc_attn, &names.attn_norm, &sc.resid_a, "attn_norm"),
-            Half::Forward => (&names.hc_ffn, &names.ffn_norm, &sc.resid_b, "ffn_norm"),
+            Half::Mixer => (
+                &names.hc_attn,
+                &names.attn_norm,
+                &sc.core.resid[0],
+                "attn_norm",
+            ),
+            Half::Forward => (
+                &names.hc_ffn,
+                &names.ffn_norm,
+                &sc.core.resid[1],
+                "ffn_norm",
+            ),
         };
         self.site_read(site, norm, n, resid)?;
         if self.trace.borrow().is_some() {
-            self.snap(&format!("{stage}-{layer}"), &sc.cur, n * HIDDEN)?;
+            self.snap(&format!("{stage}-{layer}"), &sc.core.normed, n * HIDDEN)?;
         }
         Ok(())
     }
@@ -1047,8 +1039,8 @@ impl Visits for Raon1Device {
     fn apply(&self, layer: usize, half: Half, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
         let (resid, out, stage) = match half {
-            Half::Mixer => (&sc.resid_a, &sc.resid_b, "hc_attn_out"),
-            Half::Forward => (&sc.resid_b, &sc.resid_a, "l_out"),
+            Half::Mixer => (&sc.core.resid[0], &sc.core.resid[1], "hc_attn_out"),
+            Half::Forward => (&sc.core.resid[1], &sc.core.resid[0], "l_out"),
         };
         self.site_apply(n, resid, out)?;
         if self.trace.borrow().is_some() {
@@ -1102,18 +1094,25 @@ fn scratch<A: Alloc>(a: &A, vocab: usize, fixup: usize) -> Result<Scratch<A::Buf
     let f = |count: usize| a.floats(count);
     let q = |width: usize, rows: usize| a.q8(width, rows);
     let part = (c * (HEADS / MLA_GROUP)).max(320) * MLA_GROUP * (RANK + 4);
+    let core = Core::new(
+        a,
+        Widths {
+            rows: c,
+            hidden: HIDDEN,
+            streams: STREAMS,
+            proj: 3 * WIDTH,
+            conv: 3 * WIDTH,
+            read: WIDTH,
+            product: DENSE_INTER,
+            vocab,
+            fixup,
+        },
+    )?;
     Ok(Scratch {
-        resid_a: f(c * STREAMS * HIDDEN)?,
-        resid_b: f(c * STREAMS * HIDDEN)?,
+        core,
         branch: f(c * HIDDEN)?,
         post: f(c * STREAMS)?,
         comb: f(c * 16)?,
-        cur: f(c * HIDDEN)?,
-        q8_cur: q(HIDDEN, c)?,
-        proj: f(c * HIDDEN)?,
-        q8_wide: q(WIDTH, c)?,
-        proj_qkv: f(c * 3 * WIDTH)?,
-        scan_qkv: f(c * 3 * WIDTH)?,
         scan_decay: f(c * WIDTH)?,
         scan_proj: f(c * (WIDTH + HEADS))?,
         g1: f(c * WIDTH)?,
@@ -1121,7 +1120,6 @@ fn scratch<A: Alloc>(a: &A, vocab: usize, fixup: usize) -> Result<Scratch<A::Buf
         fa: f(c * TIME_RANK)?,
         beta: f(c * HEADS)?,
         delta: f(c * HEADS)?,
-        scan_out: f(c * WIDTH)?,
         qa: f(c * Q_LORA)?,
         q8_qa: q(Q_LORA, c)?,
         qb: f(c * HEADS * Q_ROW)?,
@@ -1141,16 +1139,12 @@ fn scratch<A: Alloc>(a: &A, vocab: usize, fixup: usize) -> Result<Scratch<A::Buf
         down: f(c * USED * HIDDEN)?,
         shared: f(c * HIDDEN)?,
         head: f(HIDDEN)?,
-        q8_head: q(HIDDEN, 1)?,
-        logits: f(vocab)?,
         mla_gated: f(c * WIDTH)?,
         act_ffn: f(c * DENSE_INTER)?,
-        mmq_q8: a.bytes(mmq_q8_bytes(DENSE_INTER, c)?)?,
         logits_route: f(c * EXPERTS)?,
         route_status: a.zeroed(4)?,
         mmq_q8_routed: a.bytes(mmq_q8_bytes(HIDDEN, c * USED)?)?,
         mmq_q8_act: a.bytes(mmq_q8_bytes(MOE_INTER, c * USED)?)?,
-        fixup: a.bytes(fixup)?,
         ids_g: f(c * USED)?,
         ids_src1: f(c * USED)?,
         ids_dst: f(experts::Picks::dst_ints(USED, c)?)?,

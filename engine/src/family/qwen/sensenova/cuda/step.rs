@@ -24,8 +24,9 @@ use std::{iter::once, rc::Rc};
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
-use crate::family::step::ffn;
 use crate::family::step::replay::Replay;
+use crate::family::step::rows::StepIo;
+use crate::family::step::{delta, ffn};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, STEP_PARAMS_BYTES, StepParams, ensure_rows,
@@ -68,15 +69,7 @@ impl<'a> Phys<'a> {
 }
 
 enum Mixer<'a> {
-    Delta {
-        qkvz: &'a NativeWeight,
-        beta_alpha: &'a NativeWeight,
-        out: &'a NativeWeight,
-        conv: &'a DeviceBuffer,
-        a: &'a DeviceBuffer,
-        dt_bias: &'a DeviceBuffer,
-        norm: &'a DeviceBuffer,
-    },
+    Delta(Box<delta::Delta<'a>>),
     Attn {
         q: &'a NativeWeight,
         k: &'a NativeWeight,
@@ -131,7 +124,6 @@ pub(crate) struct LoopStep<'a> {
     v_cache: Vec<DeviceBuffer>,
     // scratch rows
     params: DeviceBuffer,
-    logits: DeviceBuffer,
     ones_router: DeviceBuffer,
     inv_freq: DeviceBuffer,
     /// The scratch rows of a chunk, sized for `PREFILL_ROWS` rows; a decode step works in
@@ -220,15 +212,25 @@ impl<'a> LoopStep<'a> {
             .map(|p| {
                 let stem = format!("blk.{}", plan.block(p));
                 let mixer = if plan.recurrent[plan.block(p)] {
-                    Mixer::Delta {
-                        qkvz: native(weights, &format!("{stem}.attn_qkv_gate.weight"))?,
-                        beta_alpha: native(weights, &format!("{stem}.ssm_beta_alpha.weight"))?,
+                    let range =
+                        |name: &str| StepIo::whole(side(weights, &format!("{stem}.{name}"))?);
+                    Mixer::Delta(Box::new(delta::Delta {
+                        rule: delta::Rule::Heads {
+                            qkvz: native(weights, &format!("{stem}.attn_qkv_gate.weight"))?,
+                            beta_alpha: native(weights, &format!("{stem}.ssm_beta_alpha.weight"))?,
+                        },
                         out: native(weights, &format!("{stem}.ssm_out.weight"))?,
-                        conv: side(weights, &format!("{stem}.ssm_conv1d.weight"))?,
-                        a: side(weights, &format!("{stem}.ssm_a"))?,
-                        dt_bias: side(weights, &format!("{stem}.ssm_dt.bias"))?,
-                        norm: side(weights, &format!("{stem}.ssm_norm.weight"))?,
-                    }
+                        conv: range("ssm_conv1d.weight")?,
+                        a: range("ssm_a")?,
+                        dt_bias: range("ssm_dt.bias")?,
+                        norm: range("ssm_norm.weight")?,
+                        key_heads: shape.delta_key_heads,
+                        key_dim: shape.delta_key_dim,
+                        value_heads: shape.delta_value_heads,
+                        value_dim: shape.delta_value_dim,
+                        conv_kernel: shape.conv_kernel,
+                        conv_dim: shape.conv_dim(),
+                    }))
                 } else {
                     Mixer::Attn {
                         q: native(weights, &format!("{stem}.attn_q.weight"))?,
@@ -264,7 +266,6 @@ impl<'a> LoopStep<'a> {
                 .map(|_| ctx.upload(&vec![0u8; cache_bytes]))
                 .collect::<Result<Vec<_>, _>>()?,
             params: ctx.upload(&[0u8; STEP_PARAMS_BYTES])?,
-            logits: ctx.upload(&zeros(shape.vocab))?,
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
             replay: Replay::default(),
@@ -360,7 +361,7 @@ impl<'a> LoopStep<'a> {
 
     /// The logits row (device floats); valid after the stream drained.
     pub(crate) fn logits_row(&self) -> &DeviceBuffer {
-        &self.logits
+        &self.rows.core.logits
     }
 
     /// Clears the carried state for a new session on the same card: the GDN state, the conv
@@ -386,12 +387,7 @@ impl<'a> LoopStep<'a> {
     #[cfg(all(test, feature = "native-cuda"))]
     pub(super) fn step_weight_bytes(&self) -> usize {
         let mixer_bytes = |mixer: &Mixer<'_>| match mixer {
-            Mixer::Delta {
-                qkvz,
-                beta_alpha,
-                out,
-                ..
-            } => qkvz.bytes() + beta_alpha.bytes() + out.bytes(),
+            Mixer::Delta(layer) => layer.projections().map(NativeWeight::bytes).sum(),
             Mixer::Attn { q, k, v, o, .. } => q.bytes() + k.bytes() + v.bytes() + o.bytes(),
         };
         (0..TRUNK_LAYERS)
@@ -464,12 +460,7 @@ impl<'a> LoopStep<'a> {
         for il in 0..TRUNK_LAYERS {
             let phys = &self.phys[self.plan.physical(il)];
             match &phys.mixer {
-                Mixer::Delta {
-                    qkvz,
-                    beta_alpha,
-                    out,
-                    ..
-                } => weights.extend([*qkvz, *beta_alpha, *out]),
+                Mixer::Delta(layer) => weights.extend(layer.projections()),
                 Mixer::Attn { q, k, v, o, .. } => weights.extend([*q, *k, *v, *o]),
             }
             weights.extend([phys.ffn_gate, phys.ffn_up, phys.ffn_down]);
@@ -545,7 +536,7 @@ impl<'a> LoopStep<'a> {
         }
         out.push((
             Carried::Hidden,
-            &self.rows.resid[self.rows.cur_ix.get()],
+            &self.rows.core.resid[self.rows.cur_ix.get()],
             0,
             shape.hidden * 4,
         ));

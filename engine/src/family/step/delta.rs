@@ -107,7 +107,17 @@ pub(crate) struct Channels<'a> {
     pub(crate) strengths: &'a DeviceBuffer,
 }
 
-impl Delta<'_> {
+impl<'a> Delta<'a> {
+    /// The quantized projections of the layer, inputs first and the output last.
+    #[cfg(test)]
+    pub(crate) fn projections(&self) -> impl Iterator<Item = &'a NativeWeight> {
+        let inputs = match self.rule {
+            Rule::Heads { qkvz, beta_alpha } => [Some(qkvz), Some(beta_alpha), None, None],
+            Rule::Channels(c) => [Some(c.q), Some(c.k), Some(c.v), Some(c.gate)],
+        };
+        inputs.into_iter().flatten().chain([self.out])
+    }
+
     /// Floats of the convolution ring of one visit.
     pub(crate) fn ring_floats(&self) -> usize {
         self.conv_dim * (self.conv_kernel - 1)

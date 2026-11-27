@@ -14,7 +14,7 @@ use std::cell::Cell;
 
 use super::*;
 use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
-use crate::family::step::scratch::{Alloc, OnDevice};
+use crate::family::step::scratch::{Alloc, Core, OnDevice, Widths, Zeroed};
 use crate::family::step::walk::{self, Half, Visits};
 use crate::family::step::{attend, delta, ffn, head, site};
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
@@ -40,7 +40,7 @@ fn exact_gemm() -> bool {
 /// The prefill scratch: every decode row buffer at [`PREFILL_ROWS`] rows, the MMQ q8_1
 /// columns of the four projection widths, and the attention partials at the part cap.
 pub(super) struct Rows {
-    pub(super) resid: [DeviceBuffer; 2],
+    pub(super) core: Core,
     pub(super) cur_ix: Cell<usize>,
     /// The two mHC streams of every row, adjacent as `[a || b]`.
     pub(super) streams: DeviceBuffer,
@@ -50,25 +50,16 @@ pub(super) struct Rows {
     pub(super) router_q8: DeviceBuffer,
     pub(super) router_logits: DeviceBuffer,
     pub(super) route_cell: DeviceBuffer,
-    pub(super) norm_out: DeviceBuffer,
-    pub(super) norm_q8: DeviceBuffer,
-    /// The mixer output rows: the GDN out projection or the attention o projection.
-    pub(super) mix_out: DeviceBuffer,
     /// The attention context rows of the chunk, before the o projection.
     attn_out: DeviceBuffer,
-    pub(super) proj: DeviceBuffer,
-    pub(super) conv_out: DeviceBuffer,
-    pub(super) delta_out: DeviceBuffer,
     pub(super) gu: DeviceBuffer,
     /// The activation rows; the decode FFN borrows the first row (the column-split SwiGLU
     /// writes it, the vendored quantize reads it).
     pub(super) act: DeviceBuffer,
     pub(super) ffn_out: DeviceBuffer,
     pub(super) q_out: DeviceBuffer,
-    pub(super) q8d: DeviceBuffer,
     pub(super) q8a: DeviceBuffer,
     pub(super) q8f: DeviceBuffer,
-    fixup: DeviceBuffer,
     pub(super) part: DeviceBuffer,
     /// The SM count the attention launch plan fills.
     nsm: usize,
@@ -99,8 +90,22 @@ pub(super) fn open_rows(
     let floats = |width: usize| a.zeroed(PREFILL_ROWS * width * F32);
     let mmq =
         |k: usize| -> Result<DeviceBuffer, EngError> { a.zeroed(mmq_q8_1_bytes(k, PREFILL_ROWS)?) };
+    let core = Core::new(
+        &Zeroed(OnDevice(ctx)),
+        Widths {
+            rows: PREFILL_ROWS,
+            hidden: h,
+            streams: 1,
+            proj: proj_width,
+            conv: shape.conv_dim(),
+            read: value_width,
+            product: ff,
+            vocab: shape.vocab,
+            fixup: fixup_floats_max(nsm)? * F32,
+        },
+    )?;
     Ok(Rows {
-        resid: [floats(h)?, floats(h)?],
+        core,
         cur_ix: Cell::new(0),
         streams: floats(2 * h)?,
         routed: floats(h)?,
@@ -108,21 +113,13 @@ pub(super) fn open_rows(
         router_q8: a.zeroed(q8_rows(2 * h, PREFILL_ROWS)?)?,
         router_logits: floats(8)?,
         route_cell: floats(6)?,
-        norm_out: floats(h)?,
-        norm_q8: a.zeroed(q8_rows(h, PREFILL_ROWS)?)?,
-        mix_out: floats(h)?,
         attn_out: floats(q_width)?,
-        proj: floats(proj_width)?,
-        conv_out: floats(shape.conv_dim())?,
-        delta_out: floats(value_width)?,
         gu: floats(2 * ff)?,
         act: floats(ff)?,
         ffn_out: floats(h)?,
         q_out: floats(q_width)?,
-        q8d: mmq(value_width)?,
         q8a: mmq(q_width)?,
         q8f: mmq(ff)?,
-        fixup: floats(fixup_floats_max(nsm)?)?,
         part: a.zeroed(CPF_ATTN_PART_CAP)?,
         nsm,
     })
@@ -157,10 +154,10 @@ impl LoopStep<'_> {
             norm: StepIo::whole(self.output_norm)?,
             eps: self.shape.eps,
             weight: self.head,
-            normed: StepRows::both(&self.rows.norm_q8, &self.rows.norm_out),
-            logits: &self.logits,
+            normed: self.rows.core.normed_rows(),
+            logits: &self.rows.core.logits,
         };
-        let last = floats(&self.rows.resid[self.rows.cur_ix.get()], row * h, h)?;
+        let last = floats(&self.rows.core.resid[self.rows.cur_ix.get()], row * h, h)?;
         head.logits(&self.io(exact), last)
     }
 
@@ -200,7 +197,7 @@ impl LoopStep<'_> {
     pub(super) fn feed(&self, embed: &[u8], m: usize, p0: usize) -> Result<(), EngError> {
         // Behind the last chunk's kernels: a blocking copy would land at once, and the
         // chunk before would write its final residual over it.
-        self.rows.resid[0].write_at_enqueue(&self.stream, 0, embed)?;
+        self.rows.core.resid[0].write_at_enqueue(&self.stream, 0, embed)?;
         if m == 1 {
             let params = StepParams::new(0, p0 as i32)?;
             self.params
@@ -220,8 +217,8 @@ impl LoopStep<'_> {
     ) -> Result<(), EngError> {
         walk::visits(self, m, p0, |_, half| {
             let rows = match half {
-                Half::Mixer => &self.rows.mix_out,
-                Half::Forward => &self.rows.resid[self.rows.cur_ix.get()],
+                Half::Mixer => &self.rows.core.mix_out,
+                Half::Forward => &self.rows.core.resid[self.rows.cur_ix.get()],
             };
             self.snap(&mut trace, rows)
         })
@@ -230,7 +227,7 @@ impl LoopStep<'_> {
     /// The `m` rows of the current residual plane.
     fn resid_rows(&self, m: usize) -> Result<DeviceRange<'_>, EngError> {
         floats(
-            &self.rows.resid[self.rows.cur_ix.get()],
+            &self.rows.core.resid[self.rows.cur_ix.get()],
             0,
             m * self.shape.hidden,
         )
@@ -272,7 +269,7 @@ impl LoopStep<'_> {
         m: usize,
     ) -> Result<(), EngError> {
         let h = self.shape.hidden;
-        let (out, q8) = (&self.rows.norm_out, &self.rows.norm_q8);
+        let (out, q8) = (&self.rows.core.normed, &self.rows.core.normed_q8);
         let norm = Norm {
             d: h,
             eps: self.shape.eps,
@@ -294,42 +291,14 @@ impl LoopStep<'_> {
         let s = &self.shape;
         let io = self.io(self.exact(m));
         let rows = &self.rows;
-        let input = StepRows::both(&rows.norm_q8, &rows.norm_out);
+        let input = rows.core.normed_rows();
         match &self.phys[p].mixer {
-            Mixer::Delta {
-                qkvz,
-                beta_alpha,
-                out,
-                conv,
-                a,
-                dt_bias,
-                norm,
-            } => {
-                let layer = delta::Delta {
-                    rule: delta::Rule::Heads { qkvz, beta_alpha },
-                    out,
-                    conv: StepIo::whole(conv)?,
-                    a: StepIo::whole(a)?,
-                    dt_bias: StepIo::whole(dt_bias)?,
-                    norm: StepIo::whole(norm)?,
-                    key_heads: s.delta_key_heads,
-                    key_dim: s.delta_key_dim,
-                    value_heads: s.delta_value_heads,
-                    value_dim: s.delta_value_dim,
-                    conv_kernel: s.conv_kernel,
-                    conv_dim: s.conv_dim(),
-                };
+            Mixer::Delta(layer) => {
                 let (ring, record) = (layer.ring_floats(), layer.record_floats());
                 delta::mix(
                     &io,
-                    &layer,
-                    &delta::DeltaRows {
-                        input,
-                        proj: &rows.proj,
-                        conv_out: &rows.conv_out,
-                        read: StepRows::both(&rows.q8d, &rows.delta_out),
-                        out: &rows.mix_out,
-                    },
+                    layer,
+                    &rows.core.delta_rows(),
                     delta::DeltaState {
                         ring: floats(&self.ring, il * ring, ring)?,
                         record: floats(&self.rec, il * record, record)?,
@@ -388,11 +357,11 @@ impl LoopStep<'_> {
                     &layer,
                     &attend::AttendRows {
                         input,
-                        proj: &rows.proj,
+                        proj: &rows.core.proj,
                         query: &rows.q_out,
                         attended: StepRows::both(&rows.q8a, &rows.attn_out),
                         part: &rows.part,
-                        out: &rows.mix_out,
+                        out: &rows.core.mix_out,
                     },
                     attend::Cache {
                         k: &self.k_cache[slot],
@@ -416,7 +385,7 @@ impl LoopStep<'_> {
             &self.io(self.exact(m)),
             phys.ffn(),
             ffn::Join::Swiglu,
-            StepRows::both(&self.rows.norm_q8, &self.rows.norm_out),
+            self.rows.core.normed_rows(),
             m,
             ffn::Scratch {
                 gate: StepOut {
@@ -451,8 +420,8 @@ impl LoopStep<'_> {
             ctx: &self.ctx,
             stream: &self.stream,
             weights: self.weights,
-            mmq_q8: &self.rows.q8f,
-            fixup: &self.rows.fixup,
+            mmq_q8: &self.rows.core.product_q8,
+            fixup: &self.rows.core.fixup,
             exact,
         }
     }
@@ -485,12 +454,12 @@ impl Visits for LoopStep<'_> {
         if !self.plan.mhc_active(visit) {
             let branch = match half {
                 Half::Mixer => None,
-                Half::Forward => Some(floats(&self.rows.mix_out, 0, n * h)?),
+                Half::Forward => Some(floats(&self.rows.core.mix_out, 0, n * h)?),
             };
             return self.norm_site(self.resid_rows(n)?, branch, norm, n);
         }
         if half == Half::Mixer && p == self.plan.mhc_start {
-            let cur = &self.rows.resid[self.rows.cur_ix.get()];
+            let cur = &self.rows.core.resid[self.rows.cur_ix.get()];
             self.routed().fork(&self.io(false), cur, n)?;
         }
         self.route(p, part, n)?;
@@ -511,7 +480,7 @@ impl Visits for LoopStep<'_> {
         let io = self.io(false);
         if self.plan.mhc_active(visit) {
             return match half {
-                Half::Mixer => self.routed().merge(&io, &self.rows.mix_out, n),
+                Half::Mixer => self.routed().merge(&io, &self.rows.core.mix_out, n),
                 Half::Forward => {
                     self.routed().merge(&io, &self.rows.ffn_out, n)?;
                     self.routed().mean(&io, self.resid_rows(n)?, n)
@@ -524,7 +493,7 @@ impl Visits for LoopStep<'_> {
         let len = n * self.shape.hidden;
         // The add writes a distinct out: rotate the residual pair.
         let next = self.rows.cur_ix.get() ^ 1;
-        let out = floats(&self.rows.resid[next], 0, len)?;
+        let out = floats(&self.rows.core.resid[next], 0, len)?;
         let branch = floats(&self.rows.ffn_out, 0, len)?;
         site::add(&io, out, self.resid_rows(n)?, branch, len)?;
         self.rows.cur_ix.set(next);
