@@ -982,7 +982,7 @@ impl CpuForward {
         block.context.relative_attention_clip_queries(
             block.stream,
             parts.shape,
-            rows,
+            [rows, 0], // Raw K/V is in its own plane, not in the sidecar.
             [
                 self.math.qk_l2_clip_threshold,
                 self.math.rel_l2_clip_threshold,
@@ -1344,7 +1344,7 @@ impl CpuForward {
             block.stream,
             RouterSigmoidCall {
                 shape,
-                bias: Some(RouterSigmoidBias {
+                bias: Some(RouterSigmoidBias::HostRounded {
                     values: block.constant(&consts.router_bias)?,
                     floor: ROUTE_NORMALIZATION_FLOOR,
                     scale: self.math.route_scale,
