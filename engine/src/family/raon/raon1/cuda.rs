@@ -25,7 +25,8 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
-use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths};
+use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths, Zeroed};
+use crate::family::step::state::{Slots, State};
 use crate::family::step::walk::{self, ChunkStep, Half, Visits};
 use crate::family::step::{delta, experts, ffn, head, site};
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
@@ -283,10 +284,8 @@ pub(crate) struct Raon1Device {
     /// The joined taps of the `[q | k | v]` convolution of every delta-rule layer, by name.
     derived: CudaWeights,
     sc: Scratch,
-    /// `[rda layers][heads][head_dim][head_dim]` f32 delta-rule state.
-    state: DeviceBuffer,
-    /// `[rda layers][taps][3 * width]` f32 convolution history.
-    hist: DeviceBuffer,
+    /// The record and the convolution history of every delta-rule layer.
+    state: State,
     /// `[mla layers][cells][576]` f16 latent cache.
     cache: DeviceBuffer,
     cells: usize,
@@ -341,7 +340,7 @@ impl Raon1Device {
         scratch(&plan, vocab, fixup)?;
         let scratch_bytes = plan.total();
         let fixed =
-            tensors + mla_factor_bytes + scratch_bytes + state_bytes(spec) + DEVICE.raon_headroom;
+            tensors + mla_factor_bytes + scratch_bytes + state_bytes(spec)? + DEVICE.raon_headroom;
         let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
         let room = free.checked_sub(fixed).ok_or_else(|| {
             plan_error(format!(
@@ -374,7 +373,7 @@ impl Raon1Device {
         announce(cells);
         let reserve = Reserve {
             kv_cache: cells as u64 * KV_BYTES_PER_POSITION,
-            work: mla_factor_bytes + scratch_bytes + state_bytes(spec),
+            work: mla_factor_bytes + scratch_bytes + state_bytes(spec)?,
             headroom: DEVICE.raon_headroom,
         };
         let loader = BorrowedLoader::new(&ctx)?;
@@ -416,9 +415,7 @@ impl Raon1Device {
         }
         let derived = CudaWeights::from_weights(conv)?;
         let sc = scratch(&OnDevice(&ctx), vocab, fixup)?;
-        let rda_layers = spec.layers - spec.mla_layers.len();
-        let state = ctx.upload(&vec![0u8; rda_layers * HEADS * HEAD_DIM * HEAD_DIM * 4])?;
-        let hist = ctx.upload(&vec![0u8; rda_layers * 3 * CONV_TAPS * WIDTH * 4])?;
+        let state = State::new(&Zeroed(OnDevice(&ctx)), slots(spec, cells))?;
         let cache = ctx.upload(&vec![0u8; spec.mla_layers.len() * cells * MLA_ROW * 2])?;
         Ok(Self {
             ctx,
@@ -432,7 +429,6 @@ impl Raon1Device {
             derived,
             sc,
             state,
-            hist,
             cache,
             cells,
             vocab,
@@ -452,11 +448,7 @@ impl Raon1Device {
     /// Starts a new sequence: clears the delta-rule state and the convolution history. The
     /// latent cache is position-addressed and needs no clearing.
     pub(crate) fn reset(&mut self) -> Result<(), EngError> {
-        for buffer in [&self.state, &self.hist] {
-            let count = buffer.bytes() / 4;
-            self.io()
-                .run(BlockOp::fill(count, 0.0, buffer.range(0, buffer.bytes())?)?)?;
-        }
+        self.state.reset(&self.stream)?;
         self.stream.synchronize()
     }
 
@@ -616,13 +608,7 @@ impl Raon1Device {
             }),
             ..sc.core.delta_rows()
         };
-        let (ring, record) = (layer.ring_floats() * 4, layer.record_floats() * 4);
-        let state = delta::DeltaState {
-            ring: self.hist.range(rda * ring, ring)?,
-            record: self.state.range(rda * record, record)?,
-            context: self.cells,
-        };
-        delta::mix(&io, &layer, &rows, state, n, pos0)
+        delta::mix(&io, &layer, &rows, self.state.delta(rda, &layer)?, n, pos0)
     }
 
     fn mla_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {
@@ -1075,11 +1061,25 @@ impl ChunkStep for Raon1Device {
     }
 }
 
-fn state_bytes(spec: Raon1Spec) -> u64 {
-    let rda = (spec.layers - spec.mla_layers.len()) as u64;
-    // The record, the convolution history and the convolution taps of every delta-rule layer.
-    rda * (HEADS * HEAD_DIM * HEAD_DIM * 4) as u64
-        + rda * 3 * ((CONV_TAPS + SPEC.conv_kernel as usize) * WIDTH * 4) as u64
+/// What the delta-rule layers carry, over a context of `cells` rows.
+fn slots(spec: Raon1Spec, cells: usize) -> Slots {
+    Slots {
+        delta: spec.layers - spec.mla_layers.len(),
+        ring: 3 * CONV_TAPS * WIDTH,
+        record: HEADS * HEAD_DIM * HEAD_DIM,
+        attend: 0,
+        plane: 0,
+        rows: cells,
+    }
+}
+
+/// The bytes of the carried state and of the joined convolution taps.
+fn state_bytes(spec: Raon1Spec) -> Result<u64, EngError> {
+    let plan = Count::default();
+    let carried = slots(spec, 0);
+    State::new(&plan, carried)?;
+    let taps = carried.delta * 3 * WIDTH * SPEC.conv_kernel as usize * 4;
+    Ok(plan.total() + taps as u64)
 }
 
 /// The scratch of one chunk, declared once: `fixup` is the bytes of the batched product's

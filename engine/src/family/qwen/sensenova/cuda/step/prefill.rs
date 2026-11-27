@@ -288,34 +288,14 @@ impl LoopStep<'_> {
     /// The mixer of visit `il` over `m` rows whose first row sits at `p0`: the delta rule or
     /// the attention of physical layer `p`, reading the normed rows.
     fn mixer(&self, il: usize, p: usize, m: usize, p0: usize) -> Result<(), EngError> {
-        let s = &self.shape;
         let io = self.io(self.exact(m));
         let rows = &self.rows;
-        let input = rows.core.normed_rows();
         match &self.phys[p].mixer {
             Mixer::Delta(layer) => {
-                let (ring, record) = (layer.ring_floats(), layer.record_floats());
-                delta::mix(
-                    &io,
-                    layer,
-                    &rows.core.delta_rows(),
-                    delta::DeltaState {
-                        ring: floats(&self.ring, il * ring, ring)?,
-                        record: floats(&self.rec, il * record, record)?,
-                        context: self.cache_rows,
-                    },
-                    m,
-                    p0,
-                )
+                let state = self.state.delta(il, layer)?;
+                delta::mix(&io, layer, &rows.core.delta_rows(), state, m, p0)
             }
-            Mixer::Attn {
-                q,
-                k,
-                v,
-                o,
-                q_norm,
-                k_norm,
-            } => {
+            Mixer::Attn(layer) => {
                 let slot = self
                     .attn_slot
                     .iter()
@@ -323,23 +303,6 @@ impl LoopStep<'_> {
                     .ok_or_else(|| {
                         EngError::BadRequest("the visit has no attention cache slot".to_owned())
                     })?;
-                let layer = attend::Attend {
-                    q,
-                    k,
-                    v,
-                    o,
-                    q_norm,
-                    k_norm,
-                    heads: s.heads_q,
-                    kv_heads: s.heads_kv,
-                    head_dim: s.head_dim,
-                    scale: ATTN_SCALE,
-                    eps: s.eps,
-                    rot_dims: self.rope.dims,
-                    freq_base: self.rope.freq_base,
-                    inv_freq: &self.inv_freq,
-                    row_splits: MAX_SPLITS,
-                };
                 let at = if m == 1 {
                     attend::At::Row {
                         pos: self.params_word(OFFSET_POS)?,
@@ -352,25 +315,16 @@ impl LoopStep<'_> {
                         sm_count: rows.nsm,
                     }
                 };
-                attend::mix(
-                    &io,
-                    &layer,
-                    &attend::AttendRows {
-                        input,
-                        proj: &rows.core.proj,
-                        query: &rows.q_out,
-                        attended: StepRows::both(&rows.q8a, &rows.attn_out),
-                        part: &rows.part,
-                        out: &rows.core.mix_out,
-                    },
-                    attend::Cache {
-                        k: &self.k_cache[slot],
-                        v: &self.v_cache[slot],
-                        rows: self.cache_rows,
-                    },
-                    m,
-                    at,
-                )
+                let attend_rows = attend::AttendRows {
+                    input: rows.core.normed_rows(),
+                    proj: &rows.core.proj,
+                    query: &rows.q_out,
+                    attended: StepRows::both(&rows.q8a, &rows.attn_out),
+                    part: &rows.part,
+                    inv_freq: &self.inv_freq,
+                    out: &rows.core.mix_out,
+                };
+                attend::mix(&io, layer, &attend_rows, self.state.cache(slot)?, m, at)
             }
         }
     }

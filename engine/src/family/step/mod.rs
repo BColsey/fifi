@@ -13,7 +13,8 @@
 //! [`delta`] and [`attend`] are the mixers of a visit: the gated delta rule and the gated full
 //! attention, each over one row or a chunk.
 //!
-//! [`scratch`] is where a step's scratch comes from: one declaration both plans and allocates
+//! [`state`] is what a step carries from token to token: the rings, records and cache planes of
+//! its visits. [`scratch`] is where a step's scratch comes from: one declaration both plans and allocates
 //! it. [`head`] is the final norm and the projection onto the vocabulary. [`replay`] records a
 //! one-row step once and replays it, so a decode step is one call.
 //!
@@ -29,4 +30,5 @@ pub(crate) mod replay;
 pub(crate) mod rows;
 pub(crate) mod scratch;
 pub(crate) mod site;
+pub(crate) mod state;
 pub(crate) mod walk;

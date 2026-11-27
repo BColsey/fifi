@@ -282,7 +282,8 @@ impl<'b> BlockOp<'b> {
         outs.attach(op, rows, w)
     }
 
-    /// Fills `count` f32 values.
+    /// Fills `count` f32 values. No step uses it now; the device tests of the operations do.
+    #[cfg(test)]
     pub(crate) fn fill(count: usize, value: f32, out: DeviceRange<'b>) -> Result<Self, EngError> {
         Ok(Self::new(15, &[count], &[value])?.write(0, out, bytes(&[count, 4])?))
     }

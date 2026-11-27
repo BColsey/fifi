@@ -20,13 +20,15 @@
 //! returns without synchronizing (the caller drains via [`LoopStep::stream`]), so the same
 //! list is what a later capture slice replays.
 
-use std::{iter::once, rc::Rc};
+use std::rc::Rc;
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
 use crate::family::step::replay::Replay;
 use crate::family::step::rows::Map;
-use crate::family::step::{delta, ffn};
+use crate::family::step::scratch::{OnDevice, Zeroed};
+use crate::family::step::state::{Slots, State};
+use crate::family::step::{attend, delta, ffn};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, STEP_PARAMS_BYTES, StepParams, ensure_rows,
@@ -70,14 +72,7 @@ impl<'a> Phys<'a> {
 
 enum Mixer<'a> {
     Delta(Box<delta::Delta<'a>>),
-    Attn {
-        q: &'a NativeWeight,
-        k: &'a NativeWeight,
-        v: &'a NativeWeight,
-        o: &'a NativeWeight,
-        q_norm: &'a DeviceBuffer,
-        k_norm: &'a DeviceBuffer,
-    },
+    Attn(Box<attend::Attend<'a>>),
 }
 
 /// A piece of the trunk's carried state, for the parity rigs; the visit index is what
@@ -110,18 +105,14 @@ pub(crate) struct LoopStep<'a> {
     output_norm: &'a DeviceBuffer,
     shape: LoopShape,
     plan: LoopPlan,
-    rope: RopePlan,
     cache_rows: usize,
     /// The projections' route: the f32 decode matvec over f32 rows, or the matvec over q8_1.
     dq: bool,
     /// GDN state and conv rings, one slot per trunk visit (an attention visit's slot is
     /// unused; direct visit indexing keeps the mapping arithmetic-free).
-    rec: DeviceBuffer,
-    ring: DeviceBuffer,
+    state: State,
     /// Attention cache planes, one pair per attention visit, in visit order.
     attn_slot: Vec<usize>,
-    k_cache: Vec<DeviceBuffer>,
-    v_cache: Vec<DeviceBuffer>,
     // scratch rows
     params: DeviceBuffer,
     ones_router: DeviceBuffer,
@@ -213,6 +204,16 @@ impl<'a> LoopStep<'a> {
             weights,
             derived: None,
         };
+        let attn_dims = attend::Dims {
+            heads: shape.heads_q,
+            kv_heads: shape.heads_kv,
+            head_dim: shape.head_dim,
+            scale: ATTN_SCALE,
+            eps: shape.eps,
+            rot_dims: rope.dims,
+            freq_base: rope.freq_base,
+            row_splits: MAX_SPLITS,
+        };
         let dims = delta::Dims {
             key_heads: shape.delta_key_heads,
             key_dim: shape.delta_key_dim,
@@ -228,14 +229,7 @@ impl<'a> LoopStep<'a> {
                     let names = delta::DeltaNames::fused(&stem);
                     Mixer::Delta(Box::new(names.resolve(&map, dims)?))
                 } else {
-                    Mixer::Attn {
-                        q: native(weights, &format!("{stem}.attn_q.weight"))?,
-                        k: native(weights, &format!("{stem}.attn_k.weight"))?,
-                        v: native(weights, &format!("{stem}.attn_v.weight"))?,
-                        o: native(weights, &format!("{stem}.attn_output.weight"))?,
-                        q_norm: side(weights, &format!("{stem}.attn_q_norm.weight"))?,
-                        k_norm: side(weights, &format!("{stem}.attn_k_norm.weight"))?,
-                    }
+                    Mixer::Attn(Box::new(attend::resolve(&map, &stem, attn_dims)?))
                 };
                 Ok(Phys {
                     attn_norm: side(weights, &format!("{stem}.attn_norm.weight"))?,
@@ -247,20 +241,22 @@ impl<'a> LoopStep<'a> {
                 })
             })
             .collect::<Result<Vec<Phys<'a>>, EngError>>()?;
-        let zeros = |floats: usize| le_f32(&vec![0.0; floats]);
         let step = Self {
             stream: ctx.stream()?,
             phys,
             head: native(weights, "output.weight")?,
             output_norm: side(weights, "output_norm.weight")?,
-            rec: ctx.upload(&zeros(rec_floats * visits))?,
-            ring: ctx.upload(&zeros(ring_floats * visits))?,
-            k_cache: (0..attn_slot.len())
-                .map(|_| ctx.upload(&vec![0u8; cache_bytes]))
-                .collect::<Result<Vec<_>, _>>()?,
-            v_cache: (0..attn_slot.len())
-                .map(|_| ctx.upload(&vec![0u8; cache_bytes]))
-                .collect::<Result<Vec<_>, _>>()?,
+            state: State::new(
+                &Zeroed(OnDevice(&ctx)),
+                Slots {
+                    delta: visits,
+                    ring: ring_floats,
+                    record: rec_floats,
+                    attend: attn_slot.len(),
+                    plane: cache_bytes,
+                    rows: cache_rows,
+                },
+            )?,
             params: ctx.upload(&[0u8; STEP_PARAMS_BYTES])?,
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
@@ -268,7 +264,6 @@ impl<'a> LoopStep<'a> {
             rows: prefill::open_rows(&ctx, shape, ctx.sm_count() as usize)?,
             shape: *shape,
             plan: plan.clone(),
-            rope: rope.clone(),
             cache_rows,
             dq: decode_dq(),
             ctx,
@@ -367,13 +362,7 @@ impl<'a> LoopStep<'a> {
     /// overwrites every scratch row before its first read. The fills are enqueued on the step's
     /// stream, behind a step that is still in flight.
     pub(crate) fn reset(&mut self) -> Result<(), EngError> {
-        let carried = once(&self.rec)
-            .chain(once(&self.ring))
-            .chain(self.k_cache.iter())
-            .chain(self.v_cache.iter());
-        for buffer in carried {
-            buffer.zero_at(&self.stream, 0, buffer.bytes())?;
-        }
+        self.state.reset(&self.stream)?;
         self.rows.cur_ix.set(0);
         Ok(())
     }
@@ -383,8 +372,8 @@ impl<'a> LoopStep<'a> {
     #[cfg(all(test, feature = "native-cuda"))]
     pub(super) fn step_weight_bytes(&self) -> usize {
         let mixer_bytes = |mixer: &Mixer<'_>| match mixer {
-            Mixer::Delta(layer) => layer.projections().map(NativeWeight::bytes).sum(),
-            Mixer::Attn { q, k, v, o, .. } => q.bytes() + k.bytes() + v.bytes() + o.bytes(),
+            Mixer::Delta(layer) => layer.projections().map(NativeWeight::bytes).sum::<usize>(),
+            Mixer::Attn(layer) => layer.projections().iter().map(|w| w.bytes()).sum(),
         };
         (0..TRUNK_LAYERS)
             .map(|il| {
@@ -457,7 +446,7 @@ impl<'a> LoopStep<'a> {
             let phys = &self.phys[self.plan.physical(il)];
             match &phys.mixer {
                 Mixer::Delta(layer) => weights.extend(layer.projections()),
-                Mixer::Attn { q, k, v, o, .. } => weights.extend([*q, *k, *v, *o]),
+                Mixer::Attn(layer) => weights.extend(layer.projections()),
             }
             weights.extend([phys.ffn_gate, phys.ffn_up, phys.ffn_down]);
         }
@@ -520,14 +509,16 @@ impl<'a> LoopStep<'a> {
         for il in 0..TRUNK_LAYERS {
             if self.attn_slot.get(slot) == Some(&il) {
                 let plane = rows * shape.heads_kv * shape.head_dim * 2;
-                out.push((Carried::K(il), &self.k_cache[slot], 0, plane));
-                out.push((Carried::V(il), &self.v_cache[slot], 0, plane));
+                let cache = self.state.cache(slot)?;
+                out.push((Carried::K(il), cache.k, 0, plane));
+                out.push((Carried::V(il), cache.v, 0, plane));
                 slot += 1;
             } else {
                 let rec = shape.delta_value_heads * shape.delta_key_dim * shape.delta_value_dim;
                 let ring = shape.conv_dim() * (shape.conv_kernel - 1);
-                out.push((Carried::Rec(il), &self.rec, il * rec * 4, rec * 4));
-                out.push((Carried::Ring(il), &self.ring, il * ring * 4, ring * 4));
+                let (rings, records) = self.state.delta_buffers()?;
+                out.push((Carried::Rec(il), records, il * rec * 4, rec * 4));
+                out.push((Carried::Ring(il), rings, il * ring * 4, ring * 4));
             }
         }
         out.push((

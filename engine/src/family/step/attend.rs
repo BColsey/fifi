@@ -7,7 +7,7 @@
 //! the step, so its launches are the same for every token; a chunk takes the position of its
 //! first row as a launch argument.
 
-use super::rows::{Out, Rows, StepIo, q8};
+use super::rows::{Map, Out, Rows, StepIo, q8};
 use crate::EngError;
 use crate::kernels::cuda::prefill::attn_prefill::{
     AttnKvStorage, AttnPrefillCall, AttnPrefillShape, CPF_ATTN_Q_TILE, CpfAttnGeometry,
@@ -43,8 +43,8 @@ pub(crate) struct Attend<'a> {
     pub(crate) k: &'a NativeWeight,
     pub(crate) v: &'a NativeWeight,
     pub(crate) o: &'a NativeWeight,
-    pub(crate) q_norm: &'a DeviceBuffer,
-    pub(crate) k_norm: &'a DeviceBuffer,
+    pub(crate) q_norm: DeviceRange<'a>,
+    pub(crate) k_norm: DeviceRange<'a>,
     pub(crate) heads: usize,
     pub(crate) kv_heads: usize,
     pub(crate) head_dim: usize,
@@ -53,9 +53,51 @@ pub(crate) struct Attend<'a> {
     /// The rotary positions: the turned dimensions, the base and the inverse frequencies.
     pub(crate) rot_dims: usize,
     pub(crate) freq_base: f32,
-    pub(crate) inv_freq: &'a DeviceBuffer,
     /// The most key splits of a one-row step.
     pub(crate) row_splits: usize,
+}
+
+/// The widths of an attention layer and its rotary positions.
+#[derive(Clone, Copy)]
+pub(crate) struct Dims {
+    pub(crate) heads: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) scale: f32,
+    pub(crate) eps: f32,
+    pub(crate) rot_dims: usize,
+    pub(crate) freq_base: f32,
+    pub(crate) row_splits: usize,
+}
+
+/// The layer of block `stem` over the tensors of `map`, under the names a GGUF gives them.
+pub(crate) fn resolve<'a>(map: &Map<'a>, stem: &str, dims: Dims) -> Result<Attend<'a>, EngError> {
+    let native = |name: &str| map.native(&format!("{stem}.{name}.weight"));
+    let raw = |name: &str| map.raw(&format!("{stem}.{name}.weight"));
+    Ok(Attend {
+        q: native("attn_q")?,
+        k: native("attn_k")?,
+        v: native("attn_v")?,
+        o: native("attn_output")?,
+        q_norm: raw("attn_q_norm")?,
+        k_norm: raw("attn_k_norm")?,
+        heads: dims.heads,
+        kv_heads: dims.kv_heads,
+        head_dim: dims.head_dim,
+        scale: dims.scale,
+        eps: dims.eps,
+        rot_dims: dims.rot_dims,
+        freq_base: dims.freq_base,
+        row_splits: dims.row_splits,
+    })
+}
+
+impl<'a> Attend<'a> {
+    /// The quantized projections of the layer, the output last.
+    #[cfg(test)]
+    pub(crate) fn projections(&self) -> [&'a NativeWeight; 4] {
+        [self.q, self.k, self.v, self.o]
+    }
 }
 
 /// The rows an attention visit works in.
@@ -69,6 +111,8 @@ pub(crate) struct AttendRows<'a> {
     /// The attention output rows before the output projection, and their q8_1 rows.
     pub(crate) attended: Rows<'a>,
     pub(crate) part: &'a DeviceBuffer,
+    /// The inverse frequencies of the rotary positions, one per turned pair.
+    pub(crate) inv_freq: &'a DeviceBuffer,
     /// The mixer output rows, hidden wide.
     pub(crate) out: &'a DeviceBuffer,
 }
@@ -126,8 +170,11 @@ pub(crate) fn mix(
         eps: layer.eps,
         rope_base: layer.freq_base,
     };
-    let (q_norm, k_norm) = (floats(layer.q_norm, hd)?, floats(layer.k_norm, hd)?);
-    let inv_freq = Some(floats(layer.inv_freq, layer.rot_dims / 2)?);
+    let (q_norm, k_norm) = (
+        layer.q_norm.slice(0, hd * F32)?,
+        layer.k_norm.slice(0, hd * F32)?,
+    );
+    let inv_freq = Some(floats(rows.inv_freq, layer.rot_dims / 2)?);
     let (query, attended) = (
         floats(rows.query, n * width)?,
         floats(attended_f32, n * width)?,
