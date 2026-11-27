@@ -19,8 +19,8 @@
 //! it. [`head`] is the final norm and the projection onto the vocabulary. [`replay`] records a
 //! one-row step once and replays it, so a decode step is one call.
 //!
-//! A model supplies its layers (the mixer and the feed-forward of each visit) and its weights by
-//! name.
+//! [`recipe`] is a model's list of layers, each naming its tensors, and the one walk over them. A
+//! model supplies that list, its widths, the rows it works in and the mixers nobody else has.
 
 pub(crate) mod attend;
 pub(crate) mod delta;
@@ -28,6 +28,7 @@ pub(crate) mod experts;
 pub(crate) mod ffn;
 pub(crate) mod head;
 pub(crate) mod moe;
+pub(crate) mod recipe;
 pub(crate) mod replay;
 pub(crate) mod rows;
 pub(crate) mod scratch;

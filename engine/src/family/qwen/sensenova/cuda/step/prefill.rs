@@ -10,12 +10,12 @@
 //! the shared state where the same tokens decoded one by one would; the head runs on the
 //! last row.
 
-use std::cell::Cell;
-
 use super::*;
-use crate::family::step::rows::{Norm, Out as StepOut, Rows as StepRows, StepIo};
+use crate::family::step::recipe::{Layer, Model, Walk};
+use crate::family::step::rows::{Out as StepOut, Rows as StepRows, StepIo};
 use crate::family::step::scratch::{Alloc, Core, OnDevice, Widths, Zeroed};
-use crate::family::step::walk::{self, Half, Visits};
+use crate::family::step::state::State;
+use crate::family::step::walk::{self, Half};
 use crate::family::step::{attend, delta, ffn, head, site};
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes as mmq_q8_1_bytes};
@@ -41,7 +41,6 @@ fn exact_gemm() -> bool {
 /// columns of the four projection widths, and the attention partials at the part cap.
 pub(super) struct Rows {
     pub(super) core: Core,
-    pub(super) cur_ix: Cell<usize>,
     /// The two mHC streams of every row, adjacent as `[a || b]`.
     pub(super) streams: DeviceBuffer,
     /// The routed input rows of the current mHC visit.
@@ -56,7 +55,6 @@ pub(super) struct Rows {
     /// The activation rows; the decode FFN borrows the first row (the column-split SwiGLU
     /// writes it, the vendored quantize reads it).
     pub(super) act: DeviceBuffer,
-    pub(super) ffn_out: DeviceBuffer,
     pub(super) q_out: DeviceBuffer,
     pub(super) q8a: DeviceBuffer,
     pub(super) q8f: DeviceBuffer,
@@ -106,7 +104,6 @@ pub(super) fn open_rows(
     )?;
     Ok(Rows {
         core,
-        cur_ix: Cell::new(0),
         streams: floats(2 * h)?,
         routed: floats(h)?,
         router_normed: floats(2 * h)?,
@@ -116,7 +113,6 @@ pub(super) fn open_rows(
         attn_out: floats(q_width)?,
         gu: floats(2 * ff)?,
         act: floats(ff)?,
-        ffn_out: floats(h)?,
         q_out: floats(q_width)?,
         q8a: mmq(q_width)?,
         q8f: mmq(ff)?,
@@ -157,7 +153,7 @@ impl LoopStep<'_> {
             normed: self.rows.core.normed_rows(),
             logits: &self.rows.core.logits,
         };
-        let last = floats(&self.rows.core.resid[self.rows.cur_ix.get()], row * h, h)?;
+        let last = floats(&self.rows.core.resid[self.rows.core.cur.get()], row * h, h)?;
         head.logits(&self.io(exact), last)
     }
 
@@ -215,28 +211,129 @@ impl LoopStep<'_> {
         p0: usize,
         mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<(), EngError> {
-        walk::visits(self, m, p0, |_, half| {
+        walk::visits(&Walk(self), m, p0, |_, half| {
             let rows = match half {
                 Half::Mixer => &self.rows.core.mix_out,
-                Half::Forward => &self.rows.core.resid[self.rows.cur_ix.get()],
+                Half::Forward => &self.rows.core.resid[self.rows.core.cur.get()],
             };
             self.snap(&mut trace, rows)
         })
     }
 
-    /// The `m` rows of the current residual plane.
-    fn resid_rows(&self, m: usize) -> Result<DeviceRange<'_>, EngError> {
-        floats(
-            &self.rows.core.resid[self.rows.cur_ix.get()],
-            0,
-            m * self.shape.hidden,
-        )
+    /// What the shared projections of this step need. `exact` puts them on the decoding
+    /// routes.
+    pub(super) fn io(&self, exact: bool) -> StepIo<'_> {
+        Model::io(self, exact)
+    }
+}
+
+impl Model for LoopStep<'_> {
+    fn family(&self) -> &'static str {
+        "sensenova"
     }
 
-    /// The routed site over the chunk's rows.
-    pub(super) fn routed(&self) -> site::Routed<'_> {
+    fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    fn io(&self, exact: bool) -> StepIo<'_> {
+        StepIo {
+            family: "sensenova",
+            ctx: &self.ctx,
+            stream: &self.stream,
+            weights: self.weights,
+            derived: None,
+            mmq_q8: &self.rows.core.product_q8,
+            fixup: &self.rows.core.fixup,
+            exact,
+        }
+    }
+
+    /// Each row count has its own switch for the decoding routes.
+    fn exact(&self, n: usize) -> bool {
+        if n == 1 { self.dq } else { exact_gemm() }
+    }
+
+    fn core(&self) -> &Core {
+        &self.rows.core
+    }
+
+    fn state(&self) -> &State {
+        &self.state
+    }
+
+    fn hidden(&self) -> usize {
+        self.shape.hidden
+    }
+
+    fn eps(&self) -> f32 {
+        self.shape.eps
+    }
+
+    /// One row reads its position from the step parameters.
+    fn begin(&self, n: usize) -> Result<(), EngError> {
+        if n == 1 {
+            self.ctx
+                .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
+        }
+        Ok(())
+    }
+
+    fn delta(&self) -> (delta::Dims, Option<delta::ChannelRows<'_>>) {
+        (self.delta_dims, None)
+    }
+
+    fn attend(
+        &self,
+        n: usize,
+        p0: usize,
+    ) -> Result<(attend::Dims, attend::AttendRows<'_>, attend::At<'_>), EngError> {
         let rows = &self.rows;
-        site::Routed {
+        let at = if n == 1 {
+            attend::At::Row {
+                pos: self.params_word(OFFSET_POS)?,
+                kv_len: self.params_word(OFFSET_KV_LEN)?,
+                status: self.params_word(OFFSET_STATUS)?,
+            }
+        } else {
+            attend::At::Chunk {
+                p0,
+                sm_count: rows.nsm,
+            }
+        };
+        let attend_rows = attend::AttendRows {
+            input: rows.core.normed_rows(),
+            proj: &rows.core.proj,
+            query: &rows.q_out,
+            attended: StepRows::both(&rows.q8a, &rows.attn_out),
+            part: &rows.part,
+            inv_freq: &self.inv_freq,
+            out: &rows.core.mix_out,
+        };
+        Ok((self.attn_dims, attend_rows, at))
+    }
+
+    /// The gate and up rows share one strided row for the swiglu.
+    fn dense(&self, n: usize) -> Result<(ffn::Join, ffn::Scratch<'_>), EngError> {
+        let ff = self.shape.feed_forward;
+        let gu = floats(&self.rows.gu, 0, n * 2 * ff)?;
+        let half = |col_off| StepOut {
+            dst: gu,
+            ld: 2 * ff,
+            col_off,
+        };
+        let scratch = ffn::Scratch {
+            gate: half(0),
+            up: half(ff),
+            // The matvec route reads these q8_1 rows; the batched route reads the f32 rows.
+            act: StepRows::both(&self.rows.q8f, &self.rows.act),
+        };
+        Ok((ffn::Join::Swiglu, scratch))
+    }
+
+    fn routed_site(&self) -> Result<site::Routed<'_>, EngError> {
+        let rows = &self.rows;
+        Ok(site::Routed {
             hidden: self.shape.hidden,
             eps: self.shape.eps,
             pre_scale: self.plan.mhc_pre_scale,
@@ -249,209 +346,6 @@ impl LoopStep<'_> {
             logits: &rows.router_logits,
             input: &rows.routed,
             cell: &rows.route_cell,
-        }
-    }
-
-    /// One router pass of physical layer `p` over `m` rows; `part` names the router.
-    pub(super) fn route(&self, p: usize, part: &str, m: usize) -> Result<(), EngError> {
-        let stem = format!("blk.{}", self.plan.block(p));
-        let weight = side(self.weights, &format!("{stem}.{part}.weight"))?;
-        let bias = side(self.weights, &format!("{stem}.{part}.bias"))?;
-        self.routed().route(&self.io(false), weight, bias, m)
-    }
-
-    /// The fused add (optional), RMS norm and q8 quantize of `m` rows into the norm rows.
-    pub(super) fn norm_site(
-        &self,
-        x: DeviceRange<'_>,
-        delta: Option<DeviceRange<'_>>,
-        weight: &DeviceBuffer,
-        m: usize,
-    ) -> Result<(), EngError> {
-        let h = self.shape.hidden;
-        let (out, q8) = (&self.rows.core.normed, &self.rows.core.normed_q8);
-        let norm = Norm {
-            d: h,
-            eps: self.shape.eps,
-            x,
-            delta,
-            weight: floats(weight, 0, h)?,
-        };
-        self.io(false).norm(
-            m,
-            norm,
-            floats(out, 0, m * h)?,
-            bytes_range(q8, q8_rows(h, m)?)?,
-        )
-    }
-
-    /// The mixer of visit `il` over `m` rows whose first row sits at `p0`: the delta rule or
-    /// the attention of physical layer `p`, reading the normed rows.
-    fn mixer(&self, il: usize, p: usize, m: usize, p0: usize) -> Result<(), EngError> {
-        let io = self.io(self.exact(m));
-        let rows = &self.rows;
-        match &self.phys[p].mixer {
-            Mixer::Delta(layer) => {
-                let state = self.state.delta(il, layer)?;
-                delta::mix(&io, layer, &rows.core.delta_rows(), state, m, p0)
-            }
-            Mixer::Attn(layer) => {
-                let slot = self
-                    .attn_slot
-                    .iter()
-                    .position(|&visit| visit == il)
-                    .ok_or_else(|| {
-                        EngError::BadRequest("the visit has no attention cache slot".to_owned())
-                    })?;
-                let at = if m == 1 {
-                    attend::At::Row {
-                        pos: self.params_word(OFFSET_POS)?,
-                        kv_len: self.params_word(OFFSET_KV_LEN)?,
-                        status: self.params_word(OFFSET_STATUS)?,
-                    }
-                } else {
-                    attend::At::Chunk {
-                        p0,
-                        sm_count: rows.nsm,
-                    }
-                };
-                let attend_rows = attend::AttendRows {
-                    input: rows.core.normed_rows(),
-                    proj: &rows.core.proj,
-                    query: &rows.q_out,
-                    attended: StepRows::both(&rows.q8a, &rows.attn_out),
-                    part: &rows.part,
-                    inv_freq: &self.inv_freq,
-                    out: &rows.core.mix_out,
-                };
-                attend::mix(&io, layer, &attend_rows, self.state.cache(slot)?, m, at)
-            }
-        }
-    }
-
-    /// The FFN of physical layer `p` over the chunk: the gate and up projections into one
-    /// strided row, the SwiGLU, the down projection.
-    fn ffn(&self, p: usize, m: usize) -> Result<(), EngError> {
-        let phys = &self.phys[p];
-        let ff = self.shape.feed_forward;
-        let gu = floats(&self.rows.gu, 0, m * 2 * ff)?;
-        ffn::gated(
-            &self.io(self.exact(m)),
-            phys.ffn(),
-            ffn::Join::Swiglu,
-            self.rows.core.normed_rows(),
-            m,
-            ffn::Scratch {
-                gate: StepOut {
-                    dst: gu,
-                    ld: 2 * ff,
-                    col_off: 0,
-                },
-                up: StepOut {
-                    dst: gu,
-                    ld: 2 * ff,
-                    col_off: ff,
-                },
-                // The matvec route reads these q8_1 rows and the batched route uses the same
-                // buffer as its own scratch; a block takes one route or the other.
-                act: StepRows::both(&self.rows.q8f, &self.rows.act),
-            },
-            &self.rows.ffn_out,
-        )
-    }
-
-    /// Whether the projections of an `m`-row chunk take the decoding routes: each row count
-    /// has its own switch.
-    fn exact(&self, m: usize) -> bool {
-        if m == 1 { self.dq } else { exact_gemm() }
-    }
-
-    /// What the shared projections of this step need. `exact` puts them on the decoding
-    /// routes.
-    pub(super) fn io(&self, exact: bool) -> StepIo<'_> {
-        StepIo {
-            family: "sensenova",
-            ctx: &self.ctx,
-            stream: &self.stream,
-            weights: self.weights,
-            derived: None,
-            mmq_q8: &self.rows.core.product_q8,
-            fixup: &self.rows.core.fixup,
-            exact,
-        }
-    }
-}
-
-impl Visits for LoopStep<'_> {
-    fn count(&self) -> usize {
-        TRUNK_LAYERS
-    }
-
-    fn begin(&self, n: usize) -> Result<(), EngError> {
-        self.rows.cur_ix.set(0);
-        if n == 1 {
-            self.ctx
-                .step_begin(&self.stream, bytes_range(&self.params, STEP_PARAMS_BYTES)?)?;
-        }
-        Ok(())
-    }
-
-    /// A routed visit reads the input a router writes from both streams; a plain visit reads
-    /// the residual, and its feed-forward read adds the mixer rows in the same launch.
-    fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
-        let p = self.plan.physical(visit);
-        let phys = &self.phys[p];
-        let (part, norm) = match half {
-            Half::Mixer => ("hc_attn_fn", phys.attn_norm),
-            Half::Forward => ("hc_ffn_fn", phys.post_norm),
-        };
-        let h = self.shape.hidden;
-        if !self.plan.mhc_active(visit) {
-            let branch = match half {
-                Half::Mixer => None,
-                Half::Forward => Some(floats(&self.rows.core.mix_out, 0, n * h)?),
-            };
-            return self.norm_site(self.resid_rows(n)?, branch, norm, n);
-        }
-        if half == Half::Mixer && p == self.plan.mhc_start {
-            let cur = &self.rows.core.resid[self.rows.cur_ix.get()];
-            self.routed().fork(&self.io(false), cur, n)?;
-        }
-        self.route(p, part, n)?;
-        self.norm_site(floats(&self.rows.routed, 0, n * h)?, None, norm, n)
-    }
-
-    fn branch(&self, visit: usize, half: Half, n: usize, p0: usize) -> Result<(), EngError> {
-        let p = self.plan.physical(visit);
-        match half {
-            Half::Mixer => self.mixer(visit, p, n, p0),
-            Half::Forward => self.ffn(p, n),
-        }
-    }
-
-    /// A routed visit merges each branch into both streams and ends on their mean; a plain
-    /// visit adds the feed-forward rows into the other residual plane.
-    fn apply(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
-        let io = self.io(false);
-        if self.plan.mhc_active(visit) {
-            return match half {
-                Half::Mixer => self.routed().merge(&io, &self.rows.core.mix_out, n),
-                Half::Forward => {
-                    self.routed().merge(&io, &self.rows.ffn_out, n)?;
-                    self.routed().mean(&io, self.resid_rows(n)?, n)
-                }
-            };
-        }
-        if half == Half::Mixer {
-            return Ok(());
-        }
-        let len = n * self.shape.hidden;
-        // The add writes a distinct out: rotate the residual pair.
-        let next = self.rows.cur_ix.get() ^ 1;
-        let out = floats(&self.rows.core.resid[next], 0, len)?;
-        let branch = floats(&self.rows.ffn_out, 0, len)?;
-        site::add(&io, out, self.resid_rows(n)?, branch, len)?;
-        self.rows.cur_ix.set(next);
-        Ok(())
+        })
     }
 }

@@ -115,10 +115,13 @@ pub(crate) struct Widths {
 /// mixer, the scratch of the batched product and the logits row.
 pub(crate) struct Core<B = DeviceBuffer> {
     pub(crate) resid: [B; 2],
+    /// Which plane of the pair holds the residual.
+    pub(crate) cur: Cell<usize>,
     pub(crate) normed: B,
     pub(crate) normed_q8: B,
-    /// The mixer output rows, hidden wide.
+    /// The mixer output rows and the feed-forward output rows, hidden wide.
     pub(crate) mix_out: B,
+    pub(crate) forward_out: B,
     pub(crate) proj: B,
     pub(crate) conv_out: B,
     pub(crate) read: B,
@@ -136,9 +139,11 @@ impl<B> Core<B> {
         let read_q8 = q8(w.read, n).max(product_q8_bytes(w.read, n)?);
         Ok(Self {
             resid: [a.floats(stream_rows)?, a.floats(stream_rows)?],
+            cur: Cell::new(0),
             normed: a.floats(n * w.hidden)?,
             normed_q8: a.q8(w.hidden, n)?,
             mix_out: a.floats(n * w.hidden)?,
+            forward_out: a.floats(n * w.hidden)?,
             proj: a.floats(n * w.proj)?,
             conv_out: a.floats(n * w.conv)?,
             read: a.floats(n * w.read)?,
