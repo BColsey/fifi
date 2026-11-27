@@ -164,6 +164,7 @@ impl Core {
             conv_out: &self.conv_out,
             read: Rows::both(&self.read_q8, &self.read),
             out: &self.mix_out,
+            channel: None,
         }
     }
 }

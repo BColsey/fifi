@@ -22,7 +22,7 @@ use super::{RAON_1_MINI_PREVIEW, Raon1Model, Raon1Spec, RaonKind, open_raon_1_mi
 use crate::EngError;
 use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
-    BorrowedLoader, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
+    BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
 use crate::family::step::rows::{Out, Rows, StepIo, q8};
 use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths};
@@ -36,6 +36,7 @@ use crate::kernels::cuda::resident::router::{
     RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
 };
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
+use crate::weights::GgufType;
 use crate::weights::dequantize;
 
 /// Token rows per chunk: the scratch is sized for this many.
@@ -72,8 +73,10 @@ const _: () = assert!(
         && HEADS.is_multiple_of(8)
 );
 
-/// The three convolutions of a delta-rule layer in the order of their columns.
+/// The three convolutions of a delta-rule layer in the order of their columns, and the name
+/// their joined taps take in the derived tensors.
 const CONVS: [&str; 3] = ["ssm_conv1d_q", "ssm_conv1d_k", "ssm_conv1d_v"];
+const CONV: &str = "ssm_conv1d.weight";
 /// Bytes of KV cache per position: seven attention layers of 576 f16 values.
 const KV_BYTES_PER_POSITION: u64 = SPEC.mla_layers.len() as u64 * MLA_ROW as u64 * 2;
 /// Smallest context a start accepts.
@@ -108,17 +111,8 @@ struct LayerNames {
     hc_attn: SiteNames,
     hc_ffn: SiteNames,
     attn_output: String,
-    attn_q: String,
-    attn_k: String,
-    attn_v: String,
-    ssm_g: String,
-    ssm_f_a: String,
-    ssm_f_b: String,
-    ssm_beta: String,
-    ssm_rda: String,
-    ssm_dt: String,
-    ssm_a: String,
-    ssm_norm: String,
+    /// The delta-rule layer, for a layer of that kind.
+    delta: Option<delta::DeltaNames>,
     attn_gate: String,
     attn_q_a: String,
     attn_q_a_norm: String,
@@ -147,7 +141,7 @@ struct SiteNames {
 }
 
 impl LayerNames {
-    fn new(spec: Raon1Spec, layer: usize) -> Self {
+    fn new(spec: Raon1Spec, hy: &Hyper, layer: usize) -> Self {
         let kind = if spec.mla_layers.contains(&layer) {
             RaonKind::Mla
         } else {
@@ -170,17 +164,24 @@ impl LayerNames {
             hc_attn: site("attn"),
             hc_ffn: site("ffn"),
             attn_output: n("attn_output.weight"),
-            attn_q: n("attn_q.weight"),
-            attn_k: n("attn_k.weight"),
-            attn_v: n("attn_v.weight"),
-            ssm_g: n("ssm_g.weight"),
-            ssm_f_a: n("ssm_f_a.weight"),
-            ssm_f_b: n("ssm_f_b.weight"),
-            ssm_beta: n("ssm_beta.weight"),
-            ssm_rda: n("ssm_rda.weight"),
-            ssm_dt: n("ssm_dt.bias"),
-            ssm_a: n("ssm_a"),
-            ssm_norm: n("ssm_norm.weight"),
+            delta: (kind == RaonKind::Rda).then(|| delta::DeltaNames {
+                rule: delta::RuleNames::Channels {
+                    inputs: ["attn_q", "attn_k", "attn_v", "ssm_g"]
+                        .map(|t| n(&format!("{t}.weight"))),
+                    decay_a: n("ssm_f_a.weight"),
+                    decay_b: n("ssm_f_b.weight"),
+                    rank: TIME_RANK,
+                    beta: n("ssm_beta.weight"),
+                    delta: n("ssm_rda.weight"),
+                    lower_bound: hy.gate_lower_bound,
+                    norm_eps: hy.norm_eps,
+                },
+                out: n("attn_output.weight"),
+                conv: n(CONV),
+                a: n("ssm_a"),
+                dt_bias: n("ssm_dt.bias"),
+                norm: n("ssm_norm.weight"),
+            }),
             attn_gate: n("attn_gate.weight"),
             attn_q_a: n("attn_q_a.weight"),
             attn_q_a_norm: n("attn_q_a_norm.weight"),
@@ -279,8 +280,8 @@ pub(crate) struct Raon1Device {
     hy: Hyper,
     names: Vec<LayerNames>,
     mla: Vec<MlaFactors>,
-    /// The taps of the `[q | k | v]` convolution of every delta-rule layer.
-    conv: Vec<DeviceBuffer>,
+    /// The joined taps of the `[q | k | v]` convolution of every delta-rule layer, by name.
+    derived: CudaWeights,
     sc: Scratch,
     /// `[rda layers][heads][head_dim][head_dim]` f32 delta-rule state.
     state: DeviceBuffer,
@@ -388,8 +389,9 @@ impl Raon1Device {
             &[],
             0,
         )?;
-        let layer_names: Vec<LayerNames> =
-            (0..spec.layers).map(|l| LayerNames::new(spec, l)).collect();
+        let layer_names: Vec<LayerNames> = (0..spec.layers)
+            .map(|l| LayerNames::new(spec, &hy, l))
+            .collect();
         let mut mla = Vec::new();
         for &layer in spec.mla_layers {
             let upload = |name: &str| -> Result<DeviceBuffer, EngError> {
@@ -406,8 +408,13 @@ impl Raon1Device {
             for name in CONVS {
                 taps.extend(model.read_f32(&format!("blk.{layer}.{name}.weight"))?);
             }
-            conv.push(ctx.upload(&f32_bytes(&taps))?);
+            conv.push(CudaWeight::Raw {
+                name: format!("blk.{layer}.{CONV}"),
+                ty: GgufType::F32,
+                buffer: ctx.upload(&f32_bytes(&taps))?,
+            });
         }
+        let derived = CudaWeights::from_weights(conv)?;
         let sc = scratch(&OnDevice(&ctx), vocab, fixup)?;
         let rda_layers = spec.layers - spec.mla_layers.len();
         let state = ctx.upload(&vec![0u8; rda_layers * HEADS * HEAD_DIM * HEAD_DIM * 4])?;
@@ -422,7 +429,7 @@ impl Raon1Device {
             hy,
             names: layer_names,
             mla,
-            conv,
+            derived,
             sc,
             state,
             hist,
@@ -483,6 +490,7 @@ impl Raon1Device {
             ctx: &self.ctx,
             stream: &self.stream,
             weights: &self.weights,
+            derived: Some(&self.derived),
             mmq_q8: &self.sc.core.product_q8,
             fixup: &self.sc.core.fixup,
             exact: false,
@@ -582,32 +590,12 @@ impl Raon1Device {
 
     fn rda_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {
         let (sc, io, rda) = (&self.sc, self.io(), names.ordinal);
-        let layer = delta::Delta {
-            rule: delta::Rule::Channels(delta::Channels {
-                q: io.native(&names.attn_q)?,
-                k: io.native(&names.attn_k)?,
-                v: io.native(&names.attn_v)?,
-                gate: io.native(&names.ssm_g)?,
-                decay_a: io.raw(&names.ssm_f_a)?,
-                decay_b: io.raw(&names.ssm_f_b)?,
-                rank: TIME_RANK,
-                beta: io.raw(&names.ssm_beta)?,
-                delta: io.raw(&names.ssm_rda)?,
-                lower_bound: self.hy.gate_lower_bound,
-                norm_eps: self.hy.norm_eps,
-                low: &sc.fa,
-                decay_in: &sc.g1,
-                decay: &sc.scan_decay,
-                gate_in: &sc.g2,
-                beta_rows: &sc.beta,
-                delta_rows: &sc.delta,
-                strengths: &sc.scan_proj,
-            }),
-            out: io.native(&names.attn_output)?,
-            conv: StepIo::whole(&self.conv[rda])?,
-            a: io.raw(&names.ssm_a)?,
-            dt_bias: io.raw(&names.ssm_dt)?,
-            norm: io.raw(&names.ssm_norm)?,
+        let Some(delta_names) = &names.delta else {
+            return Err(EngError::BadRequest(
+                "raon1: the layer has no delta rule".to_owned(),
+            ));
+        };
+        let dims = delta::Dims {
             key_heads: HEADS,
             key_dim: HEAD_DIM,
             value_heads: HEADS,
@@ -615,19 +603,26 @@ impl Raon1Device {
             conv_kernel: SPEC.conv_kernel as usize,
             conv_dim: 3 * WIDTH,
         };
+        let layer = delta_names.resolve(&io.map(), dims)?;
+        let rows = delta::DeltaRows {
+            channel: Some(delta::ChannelRows {
+                low: &sc.fa,
+                decay_in: &sc.g1,
+                decay: &sc.scan_decay,
+                gate_in: &sc.g2,
+                beta: &sc.beta,
+                delta: &sc.delta,
+                strengths: &sc.scan_proj,
+            }),
+            ..sc.core.delta_rows()
+        };
         let (ring, record) = (layer.ring_floats() * 4, layer.record_floats() * 4);
-        delta::mix(
-            &io,
-            &layer,
-            &sc.core.delta_rows(),
-            delta::DeltaState {
-                ring: self.hist.range(rda * ring, ring)?,
-                record: self.state.range(rda * record, record)?,
-                context: self.cells,
-            },
-            n,
-            pos0,
-        )
+        let state = delta::DeltaState {
+            ring: self.hist.range(rda * ring, ring)?,
+            record: self.state.range(rda * record, record)?,
+            context: self.cells,
+        };
+        delta::mix(&io, &layer, &rows, state, n, pos0)
     }
 
     fn mla_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {

@@ -52,6 +52,32 @@ pub(crate) fn raw<'a>(
     }
 }
 
+/// The weight map of a step: the tensors of the device load and the tensors a model derived
+/// from them at load, each under its name. `family` names the model in refusals.
+#[derive(Clone, Copy)]
+pub(crate) struct Map<'a> {
+    pub(crate) family: &'static str,
+    pub(crate) weights: &'a CudaWeights,
+    pub(crate) derived: Option<&'a CudaWeights>,
+}
+
+impl<'a> Map<'a> {
+    /// The tensor `name`, resident in the blocks of its file type.
+    pub(crate) fn native(&self, name: &str) -> Result<&'a NativeWeight, EngError> {
+        native(self.weights, self.family, name)
+    }
+
+    /// The tensor `name`, resident as its raw bytes: a derived tensor when the model made one
+    /// under that name.
+    pub(crate) fn raw(&self, name: &str) -> Result<DeviceRange<'a>, EngError> {
+        let buffer = match self.derived {
+            Some(derived) if derived.get(name).is_some() => raw(derived, self.family, name)?,
+            _ => raw(self.weights, self.family, name)?,
+        };
+        buffer.range(0, buffer.bytes())
+    }
+}
+
 /// Width from which one row's norm takes the wide block.
 const WIDE_NORM: usize = 4096;
 
@@ -90,6 +116,8 @@ pub(crate) struct StepIo<'a> {
     pub(crate) ctx: &'a CudaContext,
     pub(crate) stream: &'a DeviceStream,
     pub(crate) weights: &'a CudaWeights,
+    /// Tensors the model derived at load, looked up by name before the load's.
+    pub(crate) derived: Option<&'a CudaWeights>,
     /// Scratch of the batched product: the q8_1 rows of its input.
     pub(crate) mmq_q8: &'a DeviceBuffer,
     /// Scratch of the batched product: its fix-up words.
@@ -128,14 +156,22 @@ impl<'a> StepIo<'a> {
         self.ctx.block_op(self.stream, op)
     }
 
+    pub(crate) fn map(&self) -> Map<'a> {
+        Map {
+            family: self.family,
+            weights: self.weights,
+            derived: self.derived,
+        }
+    }
+
     /// The tensor `name`, resident in the blocks of its file type.
     pub(crate) fn native(&self, name: &str) -> Result<&'a NativeWeight, EngError> {
-        native(self.weights, self.family, name)
+        self.map().native(name)
     }
 
     /// The tensor `name`, resident as its raw bytes.
     pub(crate) fn raw(&self, name: &str) -> Result<DeviceRange<'a>, EngError> {
-        Self::whole(raw(self.weights, self.family, name)?)
+        self.map().raw(name)
     }
 
     pub(crate) fn whole<'b>(buffer: &'b DeviceBuffer) -> Result<DeviceRange<'b>, EngError> {

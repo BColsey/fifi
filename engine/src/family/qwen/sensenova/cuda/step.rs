@@ -25,7 +25,7 @@ use std::{iter::once, rc::Rc};
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
 use crate::family::step::replay::Replay;
-use crate::family::step::rows::StepIo;
+use crate::family::step::rows::Map;
 use crate::family::step::{delta, ffn};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::step_params::{
@@ -208,29 +208,25 @@ impl<'a> LoopStep<'a> {
         // One Phys per PHYSICAL layer (a loop revisit reads the same weights through its
         // own visit state); `recurrent` is block-indexed, so the mixer test goes through
         // `block(p)` exactly as the load template does.
+        let map = Map {
+            family: "sensenova",
+            weights,
+            derived: None,
+        };
+        let dims = delta::Dims {
+            key_heads: shape.delta_key_heads,
+            key_dim: shape.delta_key_dim,
+            value_heads: shape.delta_value_heads,
+            value_dim: shape.delta_value_dim,
+            conv_kernel: shape.conv_kernel,
+            conv_dim: shape.conv_dim(),
+        };
         let phys = (0..PHYSICAL_LAYERS)
             .map(|p| {
                 let stem = format!("blk.{}", plan.block(p));
                 let mixer = if plan.recurrent[plan.block(p)] {
-                    let range =
-                        |name: &str| StepIo::whole(side(weights, &format!("{stem}.{name}"))?);
-                    Mixer::Delta(Box::new(delta::Delta {
-                        rule: delta::Rule::Heads {
-                            qkvz: native(weights, &format!("{stem}.attn_qkv_gate.weight"))?,
-                            beta_alpha: native(weights, &format!("{stem}.ssm_beta_alpha.weight"))?,
-                        },
-                        out: native(weights, &format!("{stem}.ssm_out.weight"))?,
-                        conv: range("ssm_conv1d.weight")?,
-                        a: range("ssm_a")?,
-                        dt_bias: range("ssm_dt.bias")?,
-                        norm: range("ssm_norm.weight")?,
-                        key_heads: shape.delta_key_heads,
-                        key_dim: shape.delta_key_dim,
-                        value_heads: shape.delta_value_heads,
-                        value_dim: shape.delta_value_dim,
-                        conv_kernel: shape.conv_kernel,
-                        conv_dim: shape.conv_dim(),
-                    }))
+                    let names = delta::DeltaNames::fused(&stem);
+                    Mixer::Delta(Box::new(names.resolve(&map, dims)?))
                 } else {
                     Mixer::Attn {
                         q: native(weights, &format!("{stem}.attn_q.weight"))?,

@@ -9,7 +9,7 @@
 //! query, key and value have a projection each, low-rank projections write the decay and the
 //! strengths, and every chunk runs the scan.
 
-use super::rows::{Out, Rows, StepIo, q8};
+use super::rows::{Map, Out, Rows, StepIo, q8};
 use crate::EngError;
 use crate::kernels::cuda::prefill::gdn_scan_seq::{
     GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, GdnScanSeqCall,
@@ -77,7 +77,7 @@ pub(crate) enum Rule<'a> {
     Channels(Channels<'a>),
 }
 
-/// The weights and the rows of the per-channel rule. The F16 matrices read the f32 input rows.
+/// The weights of the per-channel rule. The F16 matrices read the f32 input rows.
 #[derive(Clone, Copy)]
 pub(crate) struct Channels<'a> {
     pub(crate) q: &'a NativeWeight,
@@ -94,6 +94,11 @@ pub(crate) struct Channels<'a> {
     /// The log of the smallest decay.
     pub(crate) lower_bound: f32,
     pub(crate) norm_eps: f32,
+}
+
+/// The rows the per-channel rule works in beside [`DeltaRows`].
+#[derive(Clone, Copy)]
+pub(crate) struct ChannelRows<'a> {
     /// Rows of `rank` floats.
     pub(crate) low: &'a DeviceBuffer,
     /// Rows of one float per channel: the decay logits, then the decay, and the gate inputs.
@@ -101,10 +106,113 @@ pub(crate) struct Channels<'a> {
     pub(crate) decay: &'a DeviceBuffer,
     pub(crate) gate_in: &'a DeviceBuffer,
     /// Rows of one float per head.
-    pub(crate) beta_rows: &'a DeviceBuffer,
-    pub(crate) delta_rows: &'a DeviceBuffer,
+    pub(crate) beta: &'a DeviceBuffer,
+    pub(crate) delta: &'a DeviceBuffer,
     /// The `[gate | strength]` rows the scan reads.
     pub(crate) strengths: &'a DeviceBuffer,
+}
+
+/// The widths of a delta-rule layer.
+#[derive(Clone, Copy)]
+pub(crate) struct Dims {
+    pub(crate) key_heads: usize,
+    pub(crate) key_dim: usize,
+    pub(crate) value_heads: usize,
+    pub(crate) value_dim: usize,
+    pub(crate) conv_kernel: usize,
+    pub(crate) conv_dim: usize,
+}
+
+/// The tensors of one delta-rule layer by their names in the weight map.
+pub(crate) struct DeltaNames {
+    pub(crate) rule: RuleNames,
+    pub(crate) out: String,
+    pub(crate) conv: String,
+    pub(crate) a: String,
+    pub(crate) dt_bias: String,
+    pub(crate) norm: String,
+}
+
+pub(crate) enum RuleNames {
+    Heads {
+        qkvz: String,
+        beta_alpha: String,
+    },
+    Channels {
+        /// The query, key, value and gate projections.
+        inputs: [String; 4],
+        decay_a: String,
+        decay_b: String,
+        rank: usize,
+        beta: String,
+        delta: String,
+        lower_bound: f32,
+        norm_eps: f32,
+    },
+}
+
+impl DeltaNames {
+    /// The names a GGUF gives the layer of block `stem` under [`RuleNames::Heads`].
+    pub(crate) fn fused(stem: &str) -> Self {
+        let n = |name: &str| format!("{stem}.{name}");
+        Self {
+            rule: RuleNames::Heads {
+                qkvz: n("attn_qkv_gate.weight"),
+                beta_alpha: n("ssm_beta_alpha.weight"),
+            },
+            out: n("ssm_out.weight"),
+            conv: n("ssm_conv1d.weight"),
+            a: n("ssm_a"),
+            dt_bias: n("ssm_dt.bias"),
+            norm: n("ssm_norm.weight"),
+        }
+    }
+
+    /// The layer over the tensors of `map`.
+    pub(crate) fn resolve<'a>(&self, map: &Map<'a>, dims: Dims) -> Result<Delta<'a>, EngError> {
+        let rule = match &self.rule {
+            RuleNames::Heads { qkvz, beta_alpha } => Rule::Heads {
+                qkvz: map.native(qkvz)?,
+                beta_alpha: map.native(beta_alpha)?,
+            },
+            RuleNames::Channels {
+                inputs: [q, k, v, gate],
+                decay_a,
+                decay_b,
+                rank,
+                beta,
+                delta,
+                lower_bound,
+                norm_eps,
+            } => Rule::Channels(Channels {
+                q: map.native(q)?,
+                k: map.native(k)?,
+                v: map.native(v)?,
+                gate: map.native(gate)?,
+                decay_a: map.raw(decay_a)?,
+                decay_b: map.raw(decay_b)?,
+                rank: *rank,
+                beta: map.raw(beta)?,
+                delta: map.raw(delta)?,
+                lower_bound: *lower_bound,
+                norm_eps: *norm_eps,
+            }),
+        };
+        Ok(Delta {
+            rule,
+            out: map.native(&self.out)?,
+            conv: map.raw(&self.conv)?,
+            a: map.raw(&self.a)?,
+            dt_bias: map.raw(&self.dt_bias)?,
+            norm: map.raw(&self.norm)?,
+            key_heads: dims.key_heads,
+            key_dim: dims.key_dim,
+            value_heads: dims.value_heads,
+            value_dim: dims.value_dim,
+            conv_kernel: dims.conv_kernel,
+            conv_dim: dims.conv_dim,
+        })
+    }
 }
 
 impl<'a> Delta<'a> {
@@ -141,6 +249,8 @@ pub(crate) struct DeltaRows<'a> {
     pub(crate) read: Rows<'a>,
     /// The mixer output rows, hidden wide.
     pub(crate) out: &'a DeviceBuffer,
+    /// The rows of the per-channel rule, for a layer that follows it.
+    pub(crate) channel: Option<ChannelRows<'a>>,
 }
 
 /// The carried state of one visit: its convolution ring and its record.
@@ -267,15 +377,21 @@ pub(crate) fn mix(
         }
         Rule::Channels(c) => {
             let x = f32_rows(io, rows.input.f32, "its low-rank projections")?;
+            let Some(r) = rows.channel else {
+                return Err(EngError::BadRequest(format!(
+                    "{}: the per-channel delta rule has no rows to work in",
+                    io.family
+                )));
+            };
             let (width, in_dim) = (read_floats, c.q.k());
-            io.project(c.gate, rows.input, c.gate_in, n)?;
-            io.f16_project(c.decay_a, x, c.low, n, c.rank, in_dim)?;
-            io.f16_project(c.decay_b, c.low, c.decay_in, n, width, c.rank)?;
-            io.f16_project(c.beta, x, c.beta_rows, n, vh, in_dim)?;
-            io.f16_project(c.delta, x, c.delta_rows, n, vh, in_dim)?;
+            io.project(c.gate, rows.input, r.gate_in, n)?;
+            io.f16_project(c.decay_a, x, r.low, n, c.rank, in_dim)?;
+            io.f16_project(c.decay_b, r.low, r.decay_in, n, width, c.rank)?;
+            io.f16_project(c.beta, x, r.beta, n, vh, in_dim)?;
+            io.f16_project(c.delta, x, r.delta, n, vh, in_dim)?;
             let (decay, strengths) = (
-                floats(c.decay, n * width)?,
-                floats(c.strengths, n * (width + vh))?,
+                floats(r.decay, n * width)?,
+                floats(r.strengths, n * (width + vh))?,
             );
             io.run(BlockOp::rda_pack(
                 n,
@@ -283,12 +399,12 @@ pub(crate) fn mix(
                 vd,
                 c.lower_bound,
                 RdaInputs {
-                    g1: floats(c.decay_in, n * width)?,
+                    g1: floats(r.decay_in, n * width)?,
                     dt_bias: layer.dt_bias.slice(0, width * F32)?,
                     a,
-                    beta: floats(c.beta_rows, n * vh)?,
-                    delta: floats(c.delta_rows, n * vh)?,
-                    g2: floats(c.gate_in, n * width)?,
+                    beta: floats(r.beta, n * vh)?,
+                    delta: floats(r.delta, n * vh)?,
+                    g2: floats(r.gate_in, n * width)?,
                 },
                 RdaPacked {
                     qkv: conv,

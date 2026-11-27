@@ -420,6 +420,7 @@ impl LoopStep<'_> {
             ctx: &self.ctx,
             stream: &self.stream,
             weights: self.weights,
+            derived: None,
             mmq_q8: &self.rows.core.product_q8,
             fixup: &self.rows.core.fixup,
             exact,
