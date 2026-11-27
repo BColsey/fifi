@@ -1067,7 +1067,7 @@ fn mix_job_with_addend_and_norm_matches_the_separate_launches() {
         ctx.inkling_stream_mix_jobs(&stream, &[job, reader], &health_range, (width, EPS))
             .is_err()
     );
-    let two_states = ctx.allocate(state.len()).unwrap();
+    let two_states = ctx.allocate(state.len() * size_of::<f32>()).unwrap();
     upload(&two_states, &stream, &state);
     let apart = MixJob {
         state: two_states.range(0, (blocks + 1) * row).unwrap(),

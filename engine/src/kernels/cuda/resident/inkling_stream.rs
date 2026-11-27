@@ -229,11 +229,27 @@ fn require_claims_apart(
                 require_apart(write, read)?;
             }
         }
+        // Within one job the state shares no byte with the query; with the glue's extras it
+        // shares none with the addend, the gamma, the output or the normed row either (the
+        // native entry refuses both, and a native refusal is terminal).
+        let state = &claim.reads[0];
+        require_apart(state, &claim.reads[1])?;
         if let Some(current) = &claim.current {
             require_apart(current, &health)?;
-            // The job's own state (its first read) holds the current row; the rest is apart.
-            for read in claim.reads.iter().skip(1) {
+            // The current row an addend writes is part of the state; the rest is apart.
+            for read in claim.reads.iter().skip(2) {
+                require_apart(state, read)?;
                 require_apart(current, read)?;
+            }
+            for write in &claim.writes {
+                require_apart(state, write)?;
+            }
+        } else if claim.reads.len() > 2 {
+            for read in claim.reads.iter().skip(2) {
+                require_apart(state, read)?;
+            }
+            for write in &claim.writes {
+                require_apart(state, write)?;
             }
         }
         let others = claims
