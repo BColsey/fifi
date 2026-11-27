@@ -6,12 +6,14 @@
 
 #include "resident/inkling_stream.h"
 #include "resident/ordered_sum.cuh"
+#include "resident/inkling_stream_norm.cuh"
 
 #include "abi.h"
 #include "device.h"
 
 namespace {
 constexpr int threads = 256;
+static_assert(threads == kNormThreads, "the gate norm adds one partial per thread");
 constexpr int warps = threads / 32;
 constexpr int max_blocks = 63;
 constexpr int max_width = 8192;
@@ -28,45 +30,9 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
-// Sum of the 256 per-thread partials: thread 0 adds them in lane order.
-__device__ float block_sum(float value, float *scratch) {
-    const int lane = threadIdx.x;
-    scratch[lane] = value;
-    __syncthreads();
-    if (lane == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < threads; ++i) total = __fadd_rn(total, scratch[i]);
-        scratch[0] = total;
-    }
-    __syncthreads();
-    const float total = scratch[0];
-    __syncthreads();
-    return total;
-}
-
-// Rust rms_norm_with_scale: scale = (dot(x, x) / len + eps).sqrt().recip().
-__device__ float rms_scale(const float *row, int width, float eps, float *scratch, int &invalid) {
-    const int lane = threadIdx.x;
-    float squares = 0.0f;
-    for (int i = lane; i < width; i += threads) {
-        const float value = row[i];
-        invalid |= !isfinite(value);
-        squares = __fadd_rn(squares, __fmul_rn(value, value));
-    }
-    const float total = block_sum(squares, scratch);
-    __shared__ float shared;
-    if (lane == 0) {
-        const float mean = __fdiv_rn(total, static_cast<float>(width));
-        const float root = __fsqrt_rn(__fadd_rn(mean, eps));
-        const float scale = __frcp_rn(root);
-        invalid |= !isfinite(total) || !isfinite(root) || !isfinite(scale);
-        shared = scale;
-    }
-    __syncthreads();
-    const float scale = shared;
-    __syncthreads();
-    return scale;
-}
+// `block_sum` and `rms_scale` (Rust rms_norm_with_scale: scale = (dot(x, x) / len
+// + eps).sqrt().recip()) live in resident/inkling_stream_norm.cuh, which the fused decode
+// controller launch shares.
 
 // Row r of the mix order: the sealed rows newest first, then the current row.
 __device__ const float *mix_row(const float *state, int blocks, int rows, int r, int width) {
