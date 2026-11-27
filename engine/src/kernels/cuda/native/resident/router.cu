@@ -21,7 +21,7 @@
  *                    the bandwidth part (2.1 MB of f32 weights per layer), and it is the decode
  *                    kernel: every token re-reads W.
  *   router_logits_tiled_k  the same logits, bit for bit (see there for one sign of zero), for
- *                    m >= kTiledMinRows (a prefill chunk): a warp takes 4 rows of W against 8 tokens, so each load of W serves 8
+ *                    a launch `tiled` admits (a prefill chunk): a warp takes 4 rows of W against 8 tokens, so each load of W serves 8
  *                    tokens and each load of x serves 4 rows of W.
  *   router_select_k  grid m, 32 threads. One warp per row: softmax, top_k rounds of a warp-wide
  *                    best-of, renormalization, gate, fault check. No shared memory, no barrier.
@@ -71,6 +71,16 @@ constexpr int kTileThreads = kTileWarpsE * kTileWarpsT * 32;
 // Below one tile of tokens the tiled kernel has too little to share: it was slower than
 // router_logits_k at 2 to 4 rows and equal at 5, so decode-sized launches keep the decode kernel.
 constexpr int kTiledMinRows = 8;
+// A tiled launch of fewer blocks than this leaves the card idle: 8 rows of W against 8 to 16
+// tokens is one block, which took 23 to 29 us where router_logits_k's 32 to 64 blocks take a few.
+constexpr int kTiledMinBlocks = 4;
+
+// Whether `m` tokens against `rows` rows of W take the tiled kernel.
+inline bool tiled(int rows, int m) {
+    const int blocks = ((rows + kTileExperts * kTileWarpsE - 1) / (kTileExperts * kTileWarpsE)) *
+                       ((m + kTileTokens * kTileWarpsT - 1) / (kTileTokens * kTileWarpsT));
+    return m >= kTiledMinRows && blocks >= kTiledMinBlocks;
+}
 
 __device__ inline float warp_sum_r(float v) {
 #pragma unroll
@@ -512,7 +522,7 @@ extern "C" int inference_cuda_router_launch(const inference_cuda_router_args *a,
         const cudaStream_t s = (cudaStream_t)stream;
         Failure failure;
         const int rows = a->n_expert + (a->w_shared != NULL ? 1 : 0);  // the extra row is w_shared
-        if (a->m >= kTiledMinRows) {
+        if (tiled(rows, a->m)) {
             const dim3 grid((rows + kTileExperts * kTileWarpsE - 1) / (kTileExperts * kTileWarpsE),
                             (a->m + kTileTokens * kTileWarpsT - 1) / (kTileTokens * kTileWarpsT));
             router_logits_tiled_k<<<grid, kTileThreads, 0, s>>>(
@@ -545,7 +555,7 @@ extern "C" int inference_cuda_router_logits_launch(const inference_cuda_router_l
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!stream || !valid_split_logits(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         const cudaStream_t s = (cudaStream_t)stream;
-        if (a->m >= kTiledMinRows) {
+        if (tiled(a->n_expert, a->m)) {
             const dim3 grid((a->n_expert + kTileExperts * kTileWarpsE - 1) / (kTileExperts * kTileWarpsE),
                             (a->m + kTileTokens * kTileWarpsT - 1) / (kTileTokens * kTileWarpsT));
             router_logits_tiled_k<<<grid, kTileThreads, 0, s>>>(

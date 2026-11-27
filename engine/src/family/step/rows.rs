@@ -78,8 +78,10 @@ impl<'a> Map<'a> {
     }
 }
 
-/// Width from which one row's norm takes the wide block.
+/// Width from which a row's norm takes the wide block, and the most rows of a chunk that do: a
+/// few rows then norm with the bits of a one-row step, and faster than in the narrow block.
 const WIDE_NORM: usize = 4096;
+const WIDE_ROWS: usize = 16;
 
 /// One RMS norm: rows of `d` values at `x`, plus the rows at `delta` when given, scaled by
 /// `weight`. With `delta`, the sum also lands back in `x`.
@@ -179,8 +181,8 @@ impl<'a> StepIo<'a> {
     }
 
     /// The norm of `n` rows: the f32 rows into `y` and their q8_1 rows into `q8_out`, through the
-    /// fused add, norm and quantize kernel. One wide row takes the kernel's 1024-thread block,
-    /// which sums the squares in another order than the 256-thread block of every other call.
+    /// fused add, norm and quantize kernel. A few wide rows take the kernel's 1024-thread block,
+    /// which sums the squares in another order than the 256-thread block of a larger chunk.
     pub(crate) fn norm(
         &self,
         n: usize,
@@ -188,7 +190,7 @@ impl<'a> StepIo<'a> {
         y: DeviceRange<'_>,
         q8_out: DeviceRange<'_>,
     ) -> Result<(), EngError> {
-        let wide = n == 1 && norm.d >= WIDE_NORM;
+        let wide = n <= WIDE_ROWS && norm.d >= WIDE_NORM;
         let call = AddNormQ8Call {
             n: norm.d,
             eps: norm.eps,

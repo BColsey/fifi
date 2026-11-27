@@ -874,8 +874,12 @@ fn card_prefill_throughput() {
 #[test]
 fn card_reports_the_cost_of_a_k_row_step() {
     const PROMPT: usize = 512;
-    const ROWS: [usize; 8] = [1, 2, 4, 5, 8, 9, 16, 32];
     const REPEATS: usize = 9;
+    // `SENSENOVA_K_ROWS=8` measures that one row count, for a kernel trace of it.
+    let rows: Vec<usize> = match std::env::var("SENSENOVA_K_ROWS") {
+        Ok(list) => list.split(',').map(|k| k.parse().unwrap()).collect(),
+        Err(_) => vec![1, 2, 4, 5, 8, 9, 16, 32],
+    };
     let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova k-row step cost") else {
         return;
     };
@@ -885,7 +889,7 @@ fn card_reports_the_cost_of_a_k_row_step() {
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab)
             .collect()
     };
-    let total: usize = PROMPT + ROWS.iter().map(|k| k * REPEATS).sum::<usize>();
+    let total: usize = PROMPT + rows.iter().map(|k| k * REPEATS).sum::<usize>();
     let mut card = open_card(&ctx, &loaded, &weights, total);
     let embed = projector
         .rows(weights.token_embd(), &ids(0, PROMPT))
@@ -894,7 +898,7 @@ fn card_reports_the_cost_of_a_k_row_step() {
     card.stream().synchronize().unwrap();
     let mut pos = PROMPT;
     let mut one_row = 0.0f64;
-    for k in ROWS {
+    for k in rows {
         let mut ms = Vec::new();
         for _ in 0..REPEATS {
             let embed = projector.rows(weights.token_embd(), &ids(pos, k)).unwrap();
